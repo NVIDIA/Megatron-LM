@@ -1251,7 +1251,7 @@ class TextGenerationController:
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
         return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
-    def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
+    def _dynamic_step_calculate_log_probs(self):
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1263,10 +1263,15 @@ class TextGenerationController:
             else context.padded_active_token_count
         )
 
+        log_prob_request_count = (
+            context.active_request_metadata["return_log_probs"][:active_request_count].sum().item()
+        )
+
         return context.calculate_log_probs(
             self._all_logits_cuda[:, :logits_seq_len, :],
             self._sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=context.config.materialize_only_last_token_logits,
+            log_prob_request_count=log_prob_request_count,
         )
 
     def _dynamic_step_calculate_log_probs_speculative(self) -> Tuple[List[List[float]], Tensor]:
@@ -1909,7 +1914,8 @@ class TextGenerationController:
                             log_probs_tensor
                         )
                 else:
-                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
+                    log_probs = self._dynamic_step_calculate_log_probs()
+                    log_probs_tensor = None
                     if return_top_n_logprobs:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             log_probs_tensor

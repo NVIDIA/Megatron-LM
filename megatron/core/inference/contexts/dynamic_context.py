@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -865,6 +865,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
         }
 
+        self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
+        self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
+
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
@@ -1080,9 +1083,27 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_metadata[label][padded_slice], non_blocking=True
             )
 
+        self.active_request_query_lengths[:batch_size].copy_(
+            self.request_query_lengths[padded_slice]
+        )
+
+        torch.cumsum(
+            self.active_request_query_lengths[:batch_size],
+            dim=0,
+            out=self.active_request_last_token_idxs[:batch_size],
+        )
+        self.active_request_last_token_idxs[:batch_size] -= 1
+
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
-        pass
+        # Request-level padding.
+        active_request_count = self.total_request_count - self.paused_request_count
+        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
+        self.active_request_query_lengths[padding_request_slice].fill_(
+            self.num_speculative_tokens + 1
+        )
+        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
+        self.active_request_metadata["return_log_probs"][padding_request_slice] = False
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -3113,77 +3134,353 @@ class DynamicInferenceContext(BaseInferenceContext):
             "evict_request_ids": evict_request_ids,
         }
 
-    def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
-        """Calculate log probs for all active requests and return them.
-
-        TODO: @wdykas support top-n log probs.
-
-        Args:
-            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
-            new_tokens (Tensor): The newly sampled tokens.
-            only_last_token_logits (bool): If set, the logits are from only the last token in each request
+    def log_probs_decode_indexing_kernel(self) -> Tuple[Tensor, Tensor]:
+        """Graphable pre-forward: select which requests need decode log probs.
 
         Returns:
-            List of lists where each inner list contains log probs for a request in the
-            same order as the active requests (from paused_request_count to total_request_count).
-            log_probs (Tensor): Used to compute top n logprobs later if required.
+            padded (request_indices, padded_arange)
         """
+        # Graphable keys.
+        padded_count = self.padded_active_request_count
 
-        # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0).float()
+        # Select only the desired requests.
+        request_indices = torch.nonzero_static(
+            self.active_request_metadata["return_log_probs"][:padded_count], size=padded_count
+        ).squeeze(1)
+        # Pre-calculate the arange.
+        padded_arange = torch.arange(padded_count, device=request_indices.device)
+        return request_indices, padded_arange
+
+    def log_probs_decode_softmax_kernel(
+        self, logits: Tensor, new_tokens: Tensor, request_indices: Tensor, padded_arange: Tensor
+    ) -> Tensor:
+        """Graphable post-forward: gather logits and compute decode log probs.
+
+        Args:
+            logits (shape [1, total_active_requests, vocab_size]): logits
+            new_tokens (shape [total_active_requests]): newly-generated tokens
+            request_indices (shape [padded_active_requests]): indices of requests to select
+            padded_arange (shape [padded_active_requests]): arange for padded indexing
+        """
+        # Insert the newly-generated tokens.
+        selected_tokens = new_tokens[request_indices]
+        selected_logits = logits.squeeze(0)[request_indices].float()
+
+        # Softmax using the high-memory, low-latency, implementation.
+        log_softmax_result = F.log_softmax(selected_logits, dim=-1)
+        selected_log_probs = log_softmax_result[padded_arange, selected_tokens]
+        return selected_log_probs
+
+    def log_probs_decode_extract(
+        self, request_indices: Tensor, selected_log_probs: Tensor, log_prob_request_count: int
+    ) -> List[Optional[List[float]]]:
+        """Extract decode log-prob kernel outputs into a per-request list."""
+        active_request_count = self.total_request_count - self.paused_request_count
+
+        req_idx_list = request_indices[:log_prob_request_count].tolist()
+        lp_list = selected_log_probs[:log_prob_request_count].tolist()
+        result: List[Optional[List[float]]] = [None] * active_request_count
+        for i, req_idx in enumerate(req_idx_list):
+            result[req_idx] = [lp_list[i]]
+        return result
+
+    def log_probs_prefill_indexing_kernel(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Graphable pre-forward: build per-token indices for prefill log probs.
+
+        Everything here depends only on request metadata and the existing
+        token buffer — not on the forward-pass logits or sampled tokens.
+
+        Returns:
+            padded (request_indices, cu_masked_lengths, logit_indices,
+            logit_indices_range, masked_tokens)
+        """
+        # Graphable keys.
+        padded_count = self.padded_active_request_count
+        padded_token_count = self.padded_active_token_count
+
+        # Select only the desired requests.
+        request_indices = torch.nonzero_static(
+            self.active_request_metadata["return_log_probs"][:padded_count], size=padded_count
+        ).squeeze(1)
+        last_token_idxs = self.active_request_last_token_idxs[:padded_count]
+        active_query_lengths = self.active_request_query_lengths[:padded_count]
+        masked_lengths = active_query_lengths[request_indices]
+
+        # Pad the final element of masked_lengths, representing the final desired request.
+        slack = padded_token_count - masked_lengths.sum()
+        masked_lengths[-1] = masked_lengths[-1] + slack
+
+        # Figure out which logits to select.
+        cu_masked_lengths = masked_lengths.cumsum(0)
+        masked_ends = last_token_idxs[request_indices]
+        logit_indices_offset = torch.repeat_interleave(
+            masked_ends - cu_masked_lengths + 1, masked_lengths, output_size=padded_token_count
+        )
+        logit_indices_range = torch.arange(padded_token_count, device=torch.cuda.current_device())
+        logit_indices = logit_indices_offset + logit_indices_range
+        # Need to roll by 1 because the newly-generated tokens are not present yet.
+        masked_tokens = self.token_to_input_ids[logit_indices].roll(-1, 0)
+
+        return request_indices, cu_masked_lengths, logit_indices, logit_indices_range, masked_tokens
+
+    def log_probs_prefill_softmax_kernel(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        request_indices: Tensor,
+        cu_masked_lengths: Tensor,
+        logit_indices: Tensor,
+        logit_indices_range: Tensor,
+        masked_tokens: Tensor,
+    ) -> Tensor:
+        """Graphable post-forward: insert sampled tokens and compute prefill log probs.
+
+        Args:
+            logits (shape [1, total_active_tokens, vocab_size]): logits
+            new_tokens (shape [total_active_requests]): newly-generated tokens
+            request_indices (shape [padded_active_requests]): indices of requests to select
+            cu_masked_lengths (shape [padded_active_requests]): cumulative masked lengths
+            logit_indices (shape [padded_active_token_count]): indices of logits to select
+            logit_indices_range (shape [padded_active_token_count]): arange for padded indexing
+            masked_tokens (shape [padded_active_token_count]): tokens to gather log probs for
+        """
+        # Insert the newly-generated tokens at request boundaries.
+        masked_tokens[cu_masked_lengths - 1] = new_tokens[request_indices]
+        selected_logits = logits.squeeze(0)[logit_indices].float()
+
+        # Softmax using the high-memory, low-latency, implementation.
+        log_softmax_result = F.log_softmax(selected_logits, dim=-1)
+        selected_log_probs = log_softmax_result[logit_indices_range, masked_tokens]
+        return selected_log_probs
+
+    def log_probs_prefill_extract(
+        self,
+        request_indices: Tensor,
+        cu_masked_lengths: Tensor,
+        token_log_probs: Tensor,
+        log_prob_request_count: int,
+    ) -> List[Optional[List[float]]]:
+        """Extract prefill log-prob kernel outputs into a per-request list."""
+        active_request_count = self.total_request_count - self.paused_request_count
+
+        ri = request_indices[:log_prob_request_count]
+        selected_token_count = cu_masked_lengths[log_prob_request_count - 1].item()
+        # Recover per-request lengths from the cumulative sum.
+        cu_ml_cpu = cu_masked_lengths[:log_prob_request_count].cpu()
+        masked_lengths_cpu = torch.diff(cu_ml_cpu, prepend=cu_ml_cpu.new_zeros(1)).tolist()
+
+        per_request = token_log_probs[:selected_token_count].cpu().split(masked_lengths_cpu, dim=0)
+        req_idx_list = ri.tolist()
+        result: List[Optional[List[float]]] = [None] * active_request_count
+        for i, req_idx in enumerate(req_idx_list):
+            result[req_idx] = per_request[i].tolist()
+        return result
+
+    def calculate_log_probs(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: bool = False,
+        log_prob_request_count: int = 0,
+        accepted_tokens: Optional[Tensor] = None,
+        accepted_token_counts: Optional[Tensor] = None,
+    ) -> List[Optional[List[float]]]:
+        """Calculate log probs for active requests that want them.
+
+        This is a graph-unaware entry point that runs all kernels eagerly.
+        For CUDA-graph-wrapped execution, the controller calls the individual
+        kernel/extract methods directly.
+
+        Args:
+            logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
+            new_tokens (Tensor): Newly sampled tokens for active requests.
+            only_last_token_logits (bool): Whether logits contain only last-token outputs.
+            log_prob_request_count (int): Number of requests wanting log probs.
+            accepted_tokens (Optional[Tensor]): Speculative-verified token IDs.
+            accepted_token_counts (Optional[Tensor]): Per-decode-request accepted counts.
+
+        Returns:
+            Per-request log probs list (None for requests not wanting log probs).
+        """
+        if log_prob_request_count == 0:
+            return []
+
+        if self.num_speculative_tokens > 0:
+            assert accepted_tokens is not None and accepted_token_counts is not None, (
+                "accepted_tokens and accepted_token_counts are required when "
+                "num_speculative_tokens > 0"
+            )
+            return self.calculate_log_probs_speculative(
+                logits, new_tokens, only_last_token_logits, accepted_tokens, accepted_token_counts
+            )
 
         if only_last_token_logits or self.is_decode_only():
-            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
-            selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
+            ri, padded_arange = self.log_probs_decode_indexing_kernel()
+            slp = self.log_probs_decode_softmax_kernel(logits, new_tokens, ri, padded_arange)
+            return self.log_probs_decode_extract(ri, slp, log_prob_request_count)
+        else:
+            ri, cu_ml, li, li_range, mt = self.log_probs_prefill_indexing_kernel()
+            slp = self.log_probs_prefill_softmax_kernel(
+                logits, new_tokens, ri, cu_ml, li, li_range, mt
+            )
+            return self.log_probs_prefill_extract(ri, cu_ml, slp, log_prob_request_count)
 
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
-        # Get the selected token ids for all tokens.
-        # We shift the active token window left by one to remove the first prompt token for
-        # prefill requests and then set the token ids explicitly for the newly generated tokens.
-        # This is necessary because we calculate the log probs *before* updating the request metadata.
-        #
-        # Example (decode & prefill mix):
-        #
-        #   active_query_lengths: [ 1 | 1 | 2 | 5 ]
-        #
-        #   new_tokens          : [ 52 | 12 | 3 | 86 ]
-        #
-        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
-        #
-        #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
-        #
-        #   active_token_ids before left shift:
-        #                       : [ 31 | 75 | 45 16 | 90 12 72 24 88 ]
-        #
-        #   active_token_ids after shift:
-        #                       : [ XX | XX | 16 XX | 12 72 24 88 XX ]   (XX = undefined)
-        #
-        #   active_token_ids[new_token_idx] = new_tokens
-        #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        active_token_ids = self.token_to_input_ids[: self.active_token_count].roll(-1, 0)
-        active_query_lengths = self.request_query_lengths[
-            self.paused_request_count : self.total_request_count
+    def log_probs_speculative_softmax_kernel(self, logits: Tensor) -> Tuple[Tensor, Tensor]:
+        """Graphable post-forward: log-softmax over all speculative logit rows.
+
+        Returns:
+            (decode_log_probs [padded_decode, spec+1, vocab],
+             prefill_log_probs [padded_prefill, vocab])
+        """
+        # Graphable keys.
+        padded_decode_count = self.padded_batch_dimensions.decode_req_count
+        padded_prefill_count = self.padded_batch_dimensions.prefill_req_count
+
+        # Constants.
+        spec_plus_one = self.num_speculative_tokens + 1
+        decode_len = padded_decode_count * spec_plus_one
+        total_len = decode_len + padded_prefill_count
+
+        # Softmax using the high-memory, low-latency, implementation.
+        all_log_probs = F.log_softmax(logits.squeeze(0)[:total_len].float(), dim=-1)
+        decode_log_probs = all_log_probs[:decode_len].reshape(
+            padded_decode_count, spec_plus_one, -1
+        )
+        prefill_log_probs = all_log_probs[decode_len:]
+        return decode_log_probs, prefill_log_probs
+
+    def log_probs_speculative_gather_kernel(
+        self,
+        decode_log_probs: Tensor,
+        prefill_log_probs: Tensor,
+        new_tokens: Tensor,
+        accepted_tokens: Tensor,
+        accepted_token_counts: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """Graphable post-verification: gather log probs for speculative decode and materialized prefill.
+
+        Returns (decode_gathered [padded_decode, spec+1], prefill_gathered [padded_prefill]).
+        """
+        padded_decode_count = self.padded_batch_dimensions.decode_req_count
+        padded_prefill_count = self.padded_batch_dimensions.prefill_req_count
+        spec_plus_one = self.num_speculative_tokens + 1
+        device = decode_log_probs.device
+
+        # Decode: gather accepted + newly sampled token log probs.
+        gather_tokens = torch.zeros(
+            padded_decode_count, spec_plus_one, device=device, dtype=torch.long
+        )
+        gather_tokens[:, : self.num_speculative_tokens] = accepted_tokens[
+            :padded_decode_count
+        ].clamp(min=0)
+        decode_row_range = torch.arange(padded_decode_count, device=device)
+        gather_tokens[decode_row_range, accepted_token_counts[:padded_decode_count]] = new_tokens[
+            :padded_decode_count
         ]
+        decode_gathered = decode_log_probs.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
 
-        new_token_idx = active_query_lengths.cumsum(0) - 1
-        active_token_ids[new_token_idx] = new_tokens
+        # Materialized prefill: one log prob per request.
+        prefill_new_tokens = new_tokens[
+            padded_decode_count : padded_decode_count + padded_prefill_count
+        ]
+        prefill_row_range = torch.arange(padded_prefill_count, device=device)
+        prefill_gathered = prefill_log_probs[prefill_row_range, prefill_new_tokens]
 
-        # Extract the log probs for only the selected tokens.
-        # (sequence_length x vocab_size) -> (sequence_length)
-        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        return decode_gathered, prefill_gathered
 
-        # Split the log probs across request boundaries
-        selected_log_probs_list = selected_log_probs.cpu().split(
-            active_query_lengths.tolist(), dim=0
+    def log_probs_speculative_extract(
+        self,
+        decode_gathered: Tensor,
+        prefill_gathered: Tensor,
+        accepted_token_counts: Tensor,
+        result: List[Optional[List[float]]],
+    ) -> None:
+        """CPU extraction for speculative log probs. Populates result in-place."""
+        num_decode = self.num_decode_requests
+        num_prefill = self.total_request_count - self.paused_request_count - num_decode
+
+        # Decode: variable-length list per request.
+        decode_gathered_cpu = decode_gathered[:num_decode].cpu()
+        accepted_counts_cpu = accepted_token_counts[:num_decode].tolist()
+        mask_cpu: List[bool] = self.active_request_metadata["return_log_probs"][
+            :num_decode
+        ].tolist()
+        for i in range(num_decode):
+            if mask_cpu[i]:
+                result[i] = decode_gathered_cpu[i, : accepted_counts_cpu[i] + 1].tolist()
+
+        # Materialized prefill: single log prob per request.
+        prefill_gathered_cpu = prefill_gathered[:num_prefill].cpu()
+        prefill_mask_cpu: List[bool] = self.active_request_metadata["return_log_probs"][
+            num_decode : num_decode + num_prefill
+        ].tolist()
+        for i in range(num_prefill):
+            if prefill_mask_cpu[i]:
+                result[num_decode + i] = [prefill_gathered_cpu[i].item()]
+
+    def log_probs_spec_prefill_indexing_kernel(
+        self,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Graphable pre-forward: mask out decode, build prefill indices, restore mask.
+
+        Returns:
+            (request_indices, cu_masked_lengths, logit_indices,
+            logit_indices_range, masked_tokens, prefill_log_prob_count_gpu)
+        """
+        # Graphable keys.
+        padded_decode_count = self.padded_batch_dimensions.decode_req_count
+
+        # Mask out decode entries.
+        saved_mask = self.active_request_metadata["return_log_probs"][:padded_decode_count].clone()
+        self.active_request_metadata["return_log_probs"][:padded_decode_count] = False
+
+        # Fire count reduction while mask is zeroed.
+        prefill_log_prob_count_gpu = self.active_request_metadata["return_log_probs"][
+            : self.padded_active_request_count
+        ].sum()
+
+        # Build prefill indices.
+        ri, cu_ml, li, li_range, mt = self.log_probs_prefill_indexing_kernel()
+
+        # Restore decode mask entries.
+        self.active_request_metadata["return_log_probs"][:padded_decode_count] = saved_mask
+
+        return ri, cu_ml, li, li_range, mt, prefill_log_prob_count_gpu
+
+    def calculate_log_probs_speculative(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: bool,
+        accepted_tokens: Tensor,
+        accepted_token_counts: Tensor,
+    ) -> List[Optional[List[float]]]:
+        """Graph-unaware speculative log-prob calculation; parallel to `calculate_log_probs`."""
+        active_request_count = self.total_request_count - self.paused_request_count
+        num_decode = self.num_decode_requests
+        num_prefill = active_request_count - num_decode
+        result: List[Optional[List[float]]] = [None] * active_request_count
+
+        decode_log_probs, prefill_log_probs = self.log_probs_speculative_softmax_kernel(logits)
+        decode_gathered, prefill_gathered = self.log_probs_speculative_gather_kernel(
+            decode_log_probs, prefill_log_probs, new_tokens, accepted_tokens, accepted_token_counts
+        )
+        self.log_probs_speculative_extract(
+            decode_gathered, prefill_gathered, accepted_token_counts, result
         )
 
-        # Convert each log prob tensor into a list
-        return [lp.tolist() for lp in selected_log_probs_list], log_probs
+        # When we materialize prefill logits we need an entirely separate calculation.
+        if not only_last_token_logits and num_prefill > 0:
+            ri, cu_ml, li, li_range, mt, count_gpu = self.log_probs_spec_prefill_indexing_kernel()
+            slp = self.log_probs_prefill_softmax_kernel(
+                logits, new_tokens, ri, cu_ml, li, li_range, mt
+            )
+            prefill_result = self.log_probs_prefill_extract(ri, cu_ml, slp, count_gpu.item())
+            for i, lp in enumerate(prefill_result):
+                if lp is not None:
+                    result[i] = lp
+
+        return result
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.
