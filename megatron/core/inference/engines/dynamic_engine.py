@@ -283,8 +283,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self._sol_dtype_bytes = model_config.params_dtype.itemsize
         self._sol_tp_size = tp_size
         self._sol_ep_size = ep_size
+        self._sol_num_moe_layers = get_num_moe_layers(
+            controller.inference_wrapped_model.model
+        )
         layers_per_stage = model_config.num_layers // max(pp_size, 1)
-        self._sol_num_moe_layers = get_num_moe_layers(model_config, max(pp_size, 1))
         self._sol_num_dense_layers = layers_per_stage - self._sol_num_moe_layers
         self._sol_moe_topk = model_config.moe_router_topk if model_config.num_moe_experts else 0
 

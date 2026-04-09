@@ -140,40 +140,22 @@ def get_model_weight_bytes(model):
     return sum(seen_storages.values())
 
 
-def get_num_moe_layers(model_config, pp_size):
-    """Compute the number of MoE layers on this pipeline-parallel stage.
+def get_num_moe_layers(model):
+    """Count the number of MoE layers on this rank by inspecting the model.
 
-    Uses ``num_moe_experts`` and ``moe_layer_freq`` from the config to determine
-    which of the ``num_layers // pp_size`` local layers are MoE layers.
+    Walks the module tree and counts ``MoELayer`` instances.
 
     Args:
-        model_config: TransformerConfig with num_layers, num_moe_experts, moe_layer_freq.
-        pp_size: Pipeline parallel size.
+        model: A PyTorch model (possibly wrapped).
 
     Returns:
-        Number of MoE layers on this PP stage (0 if the model is not MoE).
+        Number of MoE layers found in the model.
     """
-    if model_config.num_moe_experts is None:
-        return 0
-
-    layers_per_stage = model_config.num_layers // pp_size
-    freq = model_config.moe_layer_freq
-
-    if isinstance(freq, list):
-        # Custom pattern list — count nonzero entries for the local stage slice.
-        # The pattern repeats over num_layers; take the local slice.
-        pattern = (freq * math.ceil(model_config.num_layers / max(len(freq), 1)))[
-            : model_config.num_layers
-        ]
-        # Assume stage 0 gets the first layers_per_stage layers.  For a true
-        # per-stage count we would need the PP rank, but the volume estimate is
-        # the same across stages for a uniform model.
-        return sum(1 for v in pattern[:layers_per_stage] if v != 0)
-    else:
-        # Integer frequency: 1 means every layer is MoE, N means 1-in-N.
-        if freq <= 0:
-            return 0
-        return sum(1 for i in range(layers_per_stage) if (i % freq) == 0)
+    count = 0
+    for module in model.modules():
+        if isinstance(module, MoELayer):
+            count += 1
+    return count
 
 
 def measure_allreduce_bandwidth(group, device=None, iters=50):
