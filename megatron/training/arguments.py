@@ -1467,6 +1467,63 @@ def validate_args(args, defaults={}):
         assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
+    if getattr(args, 'inference_dynamic_batching_autotune', False):
+        try:
+            import torch_memory_saver  # noqa: F401
+        except ImportError:
+            raise AssertionError(
+                "--inference-dynamic-batching-autotune requires torch_memory_saver to be "
+                "installed. See https://github.com/fzyzcjy/torch_memory_saver."
+            )
+
+        # Auto-enable required prerequisites, warn if we had to set them.
+        if args.cuda_graph_impl == "none":
+            warn_rank_0(
+                'Setting --cuda-graph-impl=local (required by --inference-dynamic-batching-autotune).'
+            )
+            args.cuda_graph_impl = "local"
+        if not args.enable_chunked_prefill:
+            warn_rank_0(
+                'Enabling --enable-chunked-prefill (required by --inference-dynamic-batching-autotune).'
+            )
+            args.enable_chunked_prefill = True
+        if args.decode_only_cuda_graphs:
+            warn_rank_0(
+                'Disabling --decode-only-cuda-graphs (incompatible with '
+                '--inference-dynamic-batching-autotune, which requires prefill CUDA graphs '
+                'for profiling and for graphed prefill steps at max_tokens > max_requests).'
+            )
+            args.decode_only_cuda_graphs = False
+        if args.inference_dynamic_batching_unified_memory_level != 0:
+            warn_rank_0(
+                'Setting --inference-dynamic-batching-unified-memory-level=0 (autotune uses '
+                'TMS per-chunk memory management which is incompatible with UVM).'
+            )
+            args.inference_dynamic_batching_unified_memory_level = 0
+        if args.inference_dynamic_batching_paused_buffer_size_gb is not None:
+            warn_rank_0(
+                '--inference-dynamic-batching-paused-buffer-size-gb is set but will be '
+                'overridden by --inference-dynamic-batching-autotune.'
+            )
+
+        # Warn about arguments that will be overridden by the auto-tuner.
+        overridden_args = {
+            'inference_dynamic_batching_max_requests': '--inference-dynamic-batching-max-requests',
+            'inference_dynamic_batching_max_tokens': '--inference-dynamic-batching-max-tokens',
+            'inference_dynamic_batching_mamba_memory_ratio': '--inference-dynamic-batching-mamba-memory-ratio',
+        }
+        for attr, flag in overridden_args.items():
+            if getattr(args, attr, None) is not None:
+                warn_rank_0(
+                    f'{flag} is set but will be overridden by --inference-dynamic-batching-autotune.'
+                )
+        if args.inference_dynamic_batching_buffer_size_gb != 40.:
+            warn_rank_0(
+                '--inference-dynamic-batching-buffer-size-gb is set but will be overridden '
+                'by --inference-dynamic-batching-autotune (buffer size is auto-determined '
+                'from available GPU memory).'
+            )
+
     if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
        assert args.moe_pad_experts_for_cuda_graph_inference, \
         "--moe-pad-experts-for-cuda-graph-inference must be set when using CUDA graphs with expert parallelism"
@@ -1797,6 +1854,17 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
+    group.add_argument('--inference-dynamic-batching-autotune',
+                       action='store_true', default=False,
+                       help='Automatically tune inference memory parameters '
+                       '(buffer_size_gb, mamba_memory_ratio, max_requests, '
+                       'max_tokens) based on available GPU memory.')
+    group.add_argument('--inference-dynamic-batching-autotune-dynamic',
+                       action='store_true', default=False,
+                       help='Enable runtime dynamic memory management via per-chunk TMS. '
+                       'Allows max_tokens > max_requests for larger prefill chunks '
+                       'by converting freed KV cache to activation headroom. '
+                       'Requires --inference-dynamic-batching-autotune.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
                        help='Amount of on-GPU memory allocated for the KV cache. '

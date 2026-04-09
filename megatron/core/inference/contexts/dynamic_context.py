@@ -238,7 +238,79 @@ class DynamicInferenceContext(BaseInferenceContext):
     DEFAULT_MAX_TOKENS = 16384
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
-    TMS_TAG = "inference_context"
+    _tms_counter = 0  # unique suffix for TMS tags across context lifetimes
+
+    # Per-request metadata: 8 int32 tensors (request_ids, query_lengths, etc.)
+    PER_REQUEST_SCALAR_BYTES = 8 * 4
+    # Per-request tracking metadata: ~30 bytes (temperature, top_k, top_p, etc.)
+    PER_REQUEST_METADATA_BYTES = 30
+    # Per-token metadata: 6 int64 tensors (input_ids, pos_ids, request_idx, etc.)
+    PER_TOKEN_METADATA_BYTES = 6 * 8
+
+    @staticmethod
+    def compute_context_memory_params(model_config, inference_config):
+        """Compute memory accounting constants for the auto-tuner.
+
+        Returns a dict with:
+            block_size_bytes: bytes per KV cache block
+            mamba_memory_per_request: bytes per Mamba request (0 if not hybrid)
+            max_kv_block_count: max blocks per request
+            per_request_bytes: fixed metadata bytes per request slot
+            per_token_bytes: fixed metadata bytes per token slot
+        """
+        kv_dtype_size = model_config.params_dtype.itemsize
+        block_size_tokens = inference_config.block_size_tokens
+        num_layers = model_config.num_layers
+        pp_size = 1  # conservative; actual PP handled at context init
+
+        cache_mla_latent = getattr(model_config, 'qk_pos_emb_head_dim', 0) > 0
+        if cache_mla_latent:
+            kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
+            block_size_bytes = (
+                kv_dtype_size * num_layers * block_size_tokens * kv_reduced_dim
+            )
+        else:
+            block_size_bytes = (
+                kv_dtype_size * 2 * num_layers * block_size_tokens
+                * model_config.num_attention_heads * model_config.kv_channels
+            )
+
+        max_kv_block_count = math.ceil(
+            inference_config.max_sequence_length / block_size_tokens
+        )
+
+        mamba_memory_per_request = 0
+        mamba_config = inference_config.mamba_inference_state_config
+        if mamba_config is not None:
+            layer_type_list = mamba_config.layer_type_list or []
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+            num_mamba_layers = sum(
+                1 for lt in layer_type_list if lt == Symbols.MAMBA
+            )
+            mamba_memory_per_request += (
+                math.prod(mamba_config.conv_states_shape)
+                * mamba_config.conv_states_dtype.itemsize
+            )
+            mamba_memory_per_request += (
+                math.prod(mamba_config.ssm_states_shape)
+                * mamba_config.ssm_states_dtype.itemsize
+            )
+            mamba_memory_per_request *= num_mamba_layers
+
+        per_request_bytes = (
+            DynamicInferenceContext.PER_REQUEST_SCALAR_BYTES
+            + max_kv_block_count * 4  # request_to_kv_block_ids (int32)
+            + DynamicInferenceContext.PER_REQUEST_METADATA_BYTES
+        )
+        per_token_bytes = DynamicInferenceContext.PER_TOKEN_METADATA_BYTES
+
+        return {
+            'block_size_bytes': block_size_bytes,
+            'mamba_memory_per_request': mamba_memory_per_request,
+            'max_kv_block_count': max_kv_block_count,
+            'per_request_bytes': per_request_bytes,
+            'per_token_bytes': per_token_bytes,
+        }
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -249,6 +321,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
+
+        # Unique TMS tag names per context instance to avoid conflicts
+        # when TMS's C++ side retains old (paused) allocations under a tag.
+        DynamicInferenceContext._tms_counter += 1
+        suffix = DynamicInferenceContext._tms_counter
+        self.TMS_TAG = f"inference_context_{suffix}"
+        self.TMS_KV_TAG = f"autotune_kv_cache_{suffix}"
+        self.TMS_MAMBA_TAG = f"autotune_mamba_states_{suffix}"
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -591,7 +671,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
-                cuda_graph_max_tokens=self.max_requests * (self.num_speculative_tokens + 1),
+                cuda_graph_max_tokens=self.max_tokens,
                 cuda_graph_mixed_prefill_request_count=inference_config.cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
@@ -693,30 +773,55 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
-        if self.cache_mla_latent:
-            self.memory_buffer = torch.empty(
-                (
-                    self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
-                    self.block_size_tokens,
-                    self.kv_reduced_dim,
-                ),
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
+        self.kv_chunk_tracker = None
+        total_blocks = self.kv_block_allocator.total_count
+
+        if self.config.autotune_dynamic and HAVE_TORCH_MEMORY_SAVER:
+            from megatron.core.inference.contexts.mamba_chunk_manager import ChunkTracker
+
+            num_kv_chunks = 8
+            needs_cpu_backup = (
+                self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            )
+            self.kv_chunk_tracker = ChunkTracker(
+                total_slots=total_blocks,
+                num_chunks=num_kv_chunks,
+                tms_tag=self.TMS_KV_TAG,
+            )
+            kv_ctx = torch_memory_saver.region(
+                tag=self.TMS_KV_TAG,
+                enable_cpu_backup=needs_cpu_backup,
+                num_chunks=num_kv_chunks,
             )
         else:
-            self.memory_buffer = torch.empty(
-                (
-                    2,  # key and value
-                    self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
-                    self.block_size_tokens,
-                    self.num_attention_heads_per_partition,
-                    self.hidden_size_per_attention_head,
-                ),
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
+            kv_ctx = nullcontext()
+
+        with kv_ctx:
+            if self.cache_mla_latent:
+                self.memory_buffer = torch.empty(
+                    (
+                        self.num_attention_layers,
+                        total_blocks,
+                        self.block_size_tokens,
+                        self.kv_reduced_dim,
+                    ),
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+            else:
+                self.memory_buffer = torch.empty(
+                    (
+                        2,  # key and value
+                        self.num_attention_layers,
+                        total_blocks,
+                        self.block_size_tokens,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
+                    ),
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -729,22 +834,50 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
+        self.mamba_chunk_tracker = None
+
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
-            self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                dtype=self.mamba_conv_states_dtype,
-                device=torch.cuda.current_device(),
-            )
-            self.mamba_ssm_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                dtype=self.mamba_ssm_states_dtype,
-                device=torch.cuda.current_device(),
-            )
+
+            if self.config.autotune_dynamic and HAVE_TORCH_MEMORY_SAVER:
+                from megatron.core.inference.contexts.mamba_chunk_manager import (
+                    ChunkTracker,
+                )
+
+                num_mamba_chunks = 8
+                needs_cpu_backup = (
+                    self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+                )
+                self.mamba_chunk_tracker = ChunkTracker(
+                    total_slots=self.max_requests,
+                    num_chunks=num_mamba_chunks,
+                    tms_tag=self.TMS_MAMBA_TAG,
+                )
+                ctx = torch_memory_saver.region(
+                    tag=self.TMS_MAMBA_TAG,
+                    enable_cpu_backup=needs_cpu_backup,
+                    num_chunks=num_mamba_chunks,
+                )
+            else:
+                from contextlib import nullcontext
+                ctx = nullcontext()
+
+            with ctx:
+                self.mamba_conv_states = torch.empty(
+                    (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                    dtype=self.mamba_conv_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.mamba_ssm_states = torch.empty(
+                    (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
+                    dtype=self.mamba_ssm_states_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
             if self.num_speculative_tokens > 0:
                 self.mamba_intermediate_conv_states = torch.empty(
                     (
@@ -864,6 +997,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Allocate large non-graphed buffers.
+        # The outer context manager handles UVM or static-address TMS.
+        # When autotune is enabled, _allocate_memory_buffer() and
+        # _allocate_mamba_states() create inner per-chunk TMS regions that
+        # nest cleanly inside the outer context (each tag has its own pool).
+        self._tms_tags = []  # active TMS tags for suspend/resume
         need_static_addr = (
             self.static_kv_memory_pointers
             and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -878,9 +1016,23 @@ class DynamicInferenceContext(BaseInferenceContext):
                 enable_cpu_backup=(self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD),
             )
             self._uses_torch_memory_saver = True
+            self._tms_tags.append(self.TMS_TAG)
+
         with ctx_manager:
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
+
+        # When autotune creates per-chunk TMS regions (nested inside the
+        # outer context), add their tags for suspend/resume.
+        if self.config.autotune_dynamic and HAVE_TORCH_MEMORY_SAVER:
+            self._uses_torch_memory_saver = True
+            self._tms_tags.append(self.TMS_KV_TAG)
+            if self.mamba_chunk_tracker is not None:
+                self._tms_tags.append(self.TMS_MAMBA_TAG)
+
+        # Wire KV chunk tracker to the block allocator.
+        if self.kv_chunk_tracker is not None:
+            self.kv_block_allocator.chunk_tracker = self.kv_chunk_tracker
 
         # Allocate Mamba prefix cache if configured
         self.mamba_slot_allocator: Optional[MambaSlotAllocator] = None
@@ -910,16 +1062,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
             # Need to bring back the memory block before we reset it.
             if self._uses_torch_memory_saver:
-                tag = self.TMS_TAG
-                if torch.distributed.get_rank() == 0:
-                    logging.info(
-                        "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
-                    )
-                torch_memory_saver.resume(tag)
-                if torch.distributed.get_rank() == 0:
-                    logging.info(
-                        "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
-                    )
+                for tag in self._tms_tags:
+                    if torch.distributed.get_rank() == 0:
+                        logging.info(
+                            "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
+                        )
+                    torch_memory_saver.resume(tag)
+                    if torch.distributed.get_rank() == 0:
+                        logging.info(
+                            "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
+                        )
             if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
                 self.reset_metadata()
             return
@@ -948,16 +1100,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self._uses_torch_memory_saver:
-            tag = self.TMS_TAG
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
-                )
-            torch_memory_saver.pause(tag)
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
-                )
+            for tag in self._tms_tags:
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
+                    )
+                torch_memory_saver.pause(tag)
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
+                    )
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -1446,6 +1598,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                     raise ContextOverflowError(
                         requests[logical_idx].request_id, "No Mamba slots available"
                     )
+                if self.mamba_chunk_tracker is not None:
+                    self.mamba_chunk_tracker.activate_slot(mamba_idx)
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
                 self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
@@ -1680,13 +1834,47 @@ class DynamicInferenceContext(BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens,
+                    self.round_up_tokens(self.active_token_count),
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
                 )
                 padded_decode_req_count = self.num_decode_requests
                 padded_prefill_req_count = target_padding_req_count - padded_decode_req_count
+
+            # Sync padded dimensions across EP ranks so that MoE all-to-all
+            # communication sees identical tensor sizes on every rank.
+            # match_graph_config already calls adjust_batch_dims_for_expert_parallelism
+            # for the CG path, but when it returns None (eager mode) the
+            # synchronized result is discarded and we fall through to here
+            # with locally-computed dimensions that can differ across EP ranks.
+            ep_group = self.expert_model_parallel_group
+            if ep_group is not None:
+                from megatron.core.utils import get_pg_size
+
+                ep_size = get_pg_size(ep_group)
+                if ep_size > 1:
+                    sync_tensor = torch.tensor(
+                        [padded_token_count, padded_prefill_req_count, padded_decode_req_count],
+                        dtype=torch.int32,
+                        device=torch.cuda.current_device(),
+                    )
+                    torch.distributed.all_reduce(
+                        sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
+                    )
+                    padded_token_count = int(sync_tensor[0].item())
+                    padded_prefill_req_count = int(sync_tensor[1].item())
+                    padded_decode_req_count = int(sync_tensor[2].item())
+
+            # Clamp to max_tokens after EP sync — the token buffers are
+            # allocated for max_tokens, so padded_token_count must not
+            # exceed it (otherwise [:padded_token_count] silently clamps
+            # to the buffer size, producing fewer tokens than expected).
+            padded_token_count = min(padded_token_count, self.max_tokens)
+
             self.padded_batch_dimensions = InferenceBatchDimensions(
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
@@ -2282,6 +2470,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 restored = self.mamba_slot_allocator.restore_to_live(
                     self.total_request_count, restore_block_id
                 )
+            if self.mamba_chunk_tracker is not None:
+                self.mamba_chunk_tracker.activate_slot(mamba_idx)
             if not restored:
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
@@ -2408,6 +2598,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Free Mamba slots.
         if self.is_hybrid_model:
+            if self.mamba_chunk_tracker is not None:
+                mamba_indices = self.mamba_metadata.request_to_mamba_state_idx[request_indexes]
+                for idx in mamba_indices.tolist():
+                    if idx >= 0:
+                        self.mamba_chunk_tracker.deactivate_slot(idx)
             self.mamba_metadata.free_slots(request_indexes)
 
         # Clear intermediate offset entries for released requests
