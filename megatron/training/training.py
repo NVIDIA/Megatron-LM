@@ -1382,7 +1382,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     pre_process=pre_process,
                     post_process=post_process,
                     vp_stage=i,
-                    config=config,
+                    config=config if i==0 else get_model_config(model[0]),
                     pg_collection=pg_collection,
                 )
                 this_model.model_type = model_type

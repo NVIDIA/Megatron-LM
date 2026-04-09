@@ -1164,6 +1164,7 @@ class PagedStashRunner:
                 data_iterator_saved.append(iter(data_list))
                 data_list = [iter(data_list)]
             else:
+                data_iterator_saved.append(None)
                 data_list.append(None)
         else:
             assert isinstance(data_iterator, list) and len(data_iterator) == len(model)
@@ -1176,6 +1177,7 @@ class PagedStashRunner:
                     data_iterator_saved.append(iter(data_list_i))
                     data_list.append(iter(data_list_i))
                 else:
+                    data_iterator_saved.append(None)
                     data_list.append(None)
         return data_iterator_saved, data_list
 
@@ -1282,6 +1284,7 @@ class PagedStashRunner:
             assert num_tries < 2, f"PagedStashRunner: num_tries {num_tries} exceeded max attempts!!!"
             num_tries += 1
             data_iterator, data_list = self.data_read(data_iterator, model, training, num_microbatches)
+
             kwargs['data_iterator'] = data_list
             result = self.forward_backward_func(*args, **kwargs)
 
