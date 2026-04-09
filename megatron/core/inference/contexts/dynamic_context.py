@@ -3199,11 +3199,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             'max_requests': int(self.max_requests),
         }
 
-    def get_active_state_memory_bytes(self) -> int:
-        """Compute state tensor memory (KV cache + Mamba state) for active requests.
+    def get_active_state_memory_breakdown(self) -> Tuple[int, int]:
+        """Compute state tensor memory for active requests, broken down by type.
 
         Returns:
-            Total state memory in bytes for the current active batch.
+            Tuple of (kv_bytes, mamba_bytes) for the current active batch.
         """
         # KV cache: active blocks * per-block bytes
         active_kv_blocks = self.kv_block_allocator.get_active_used()
@@ -3226,4 +3226,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 per_request += intermediate_per_request
             mamba_bytes = active_requests * per_request
 
+        return kv_bytes, mamba_bytes
+
+    def get_active_state_memory_bytes(self) -> int:
+        """Compute state tensor memory (KV cache + Mamba state) for active requests.
+
+        Returns:
+            Total state memory in bytes for the current active batch.
+        """
+        kv_bytes, mamba_bytes = self.get_active_state_memory_breakdown()
         return kv_bytes + mamba_bytes

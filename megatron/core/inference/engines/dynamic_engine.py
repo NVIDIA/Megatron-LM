@@ -1695,6 +1695,21 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             kvcache_util_stats = None
 
+        mamba_state_info = {}
+        if self.context.is_hybrid_model:
+            active_reqs = self.context.get_active_request_count()
+            paused_reqs = self.context.paused_request_count
+            mamba_state_info = {
+                "mamba_active_requests": active_reqs,
+                "mamba_paused_requests": paused_reqs,
+                "mamba_max_requests": self.context.max_requests,
+                "mamba_num_layers": self.context.num_mamba_layers,
+            }
+            if self.context.mamba_slot_allocator is not None:
+                alloc = self.context.mamba_slot_allocator
+                mamba_state_info["mamba_cache_slots_used"] = alloc.max_slots - alloc.free_count
+                mamba_state_info["mamba_cache_slots_total"] = alloc.max_slots
+
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
             "finished_request_count": self.finished_request_count,
@@ -1706,6 +1721,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "total_paused_block_count": self.context.kv_block_allocator.paused_count,
             "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
             "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            **mamba_state_info,
         }
 
         context_state = {**pre_step_context_state, **post_step_context_state}
@@ -1860,15 +1876,34 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_blocks_matched
                 )
 
+            # Add Mamba state metrics.
+            if self.context.is_hybrid_model:
+                metrics['inference/mamba_active_requests'] = int(
+                    context_state["mamba_active_requests"]
+                )
+                metrics['inference/mamba_paused_requests'] = int(
+                    context_state["mamba_paused_requests"]
+                )
+                if "mamba_cache_slots_used" in context_state:
+                    metrics['inference/mamba_cache_slots_used'] = int(
+                        context_state["mamba_cache_slots_used"]
+                    )
+                    metrics['inference/mamba_cache_slots_total'] = int(
+                        context_state["mamba_cache_slots_total"]
+                    )
+
             # Add SOL latency metrics for decode-only steps.
             if context_state["is_decode_only"]:
-                state_bytes = self.context.get_active_state_memory_bytes()
+                kv_bytes, mamba_bytes = self.context.get_active_state_memory_breakdown()
+                state_bytes = kv_bytes + mamba_bytes
                 sol_latency_s = (
                     (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
                 )
                 sol_pct = sol_latency_s / step_time * 100.0
                 metrics['inference/sol_latency_pct'] = float(sol_pct)
                 metrics['inference/sol_latency_ms'] = float(sol_latency_s * 1000)
+                metrics['inference/sol_kv_bytes'] = float(kv_bytes)
+                metrics['inference/sol_mamba_bytes'] = float(mamba_bytes)
 
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
@@ -1927,28 +1962,55 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_tokens_proposed,
                     self._spec_steps,
                 )
+            if self.context.is_hybrid_model:
+                mamba_str = "mamba: a %d/%d, p %d" % (
+                    context_state["mamba_active_requests"],
+                    context_state["mamba_max_requests"],
+                    context_state["mamba_paused_requests"],
+                )
+                if "mamba_cache_slots_used" in context_state:
+                    mamba_str += ", slots %d/%d" % (
+                        context_state["mamba_cache_slots_used"],
+                        context_state["mamba_cache_slots_total"],
+                    )
+                output_str += " ... %s" % mamba_str
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
                 output_str += " ... prefix cache: %d hits, %d blocks matched" % (
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
             if context_state["is_decode_only"]:
-                state_bytes = self.context.get_active_state_memory_bytes()
+                kv_bytes, mamba_bytes = self.context.get_active_state_memory_breakdown()
+                state_bytes = kv_bytes + mamba_bytes
                 sol_latency_s = (
                     (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
                 )
                 sol_pct = sol_latency_s / step_time * 100.0
-                output_str += (
-                    " ... SOL: %.1f%% (proj %.3f ms = "
-                    "(%.2f gb weights + %.2f gb state) / %.0f gb/s)"
-                    % (
-                        sol_pct,
-                        sol_latency_s * 1000,
-                        self._model_weight_bytes / 1e9,
-                        state_bytes / 1e9,
-                        self._measured_hbm_bandwidth / 1e9,
+                if mamba_bytes > 0:
+                    output_str += (
+                        " ... SOL: %.1f%% (proj %.3f ms = "
+                        "(%.2f gb weights + %.2f gb kv + %.2f gb mamba) / %.0f gb/s)"
+                        % (
+                            sol_pct,
+                            sol_latency_s * 1000,
+                            self._model_weight_bytes / 1e9,
+                            kv_bytes / 1e9,
+                            mamba_bytes / 1e9,
+                            self._measured_hbm_bandwidth / 1e9,
+                        )
                     )
-                )
+                else:
+                    output_str += (
+                        " ... SOL: %.1f%% (proj %.3f ms = "
+                        "(%.2f gb weights + %.2f gb state) / %.0f gb/s)"
+                        % (
+                            sol_pct,
+                            sol_latency_s * 1000,
+                            self._model_weight_bytes / 1e9,
+                            state_bytes / 1e9,
+                            self._measured_hbm_bandwidth / 1e9,
+                        )
+                    )
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
 
