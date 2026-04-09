@@ -123,7 +123,6 @@ def test_get_mlp_module_spec_interface():
         "num_experts": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "moe_grouped_gemm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "fp8": inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        "moe_use_legacy_grouped_gemm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "use_te_op_fuser": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
@@ -132,7 +131,6 @@ def test_get_mlp_module_spec_interface():
         "num_experts": None,
         "moe_grouped_gemm": False,
         "fp8": None,
-        "moe_use_legacy_grouped_gemm": False,
         "use_te_op_fuser": False,
     }
 
