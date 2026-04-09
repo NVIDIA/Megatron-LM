@@ -15,7 +15,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
@@ -882,19 +882,20 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
-        # Calc logits for the current Multi-Token Prediction (MTP) layers.
+        cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+
         input_ids, _ = roll_tensor(
             input_ids,
             shifts=-1,
             dims=-1,
-            cp_group=self.cp_group,
+            cp_group=cp_group,
             packed_seq_params=packed_seq_params,
         )
         position_ids, _ = roll_tensor(
             position_ids,
             shifts=-1,
             dims=-1,
-            cp_group=self.cp_group,
+            cp_group=cp_group,
             packed_seq_params=packed_seq_params,
         )
         # embedding
@@ -1136,8 +1137,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
         _orig_cp_group = self.cp_group
-        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
-            self.cp_group = packed_seq_params.cp_group
+        self.cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,

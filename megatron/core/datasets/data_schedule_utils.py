@@ -5,7 +5,6 @@ from functools import lru_cache
 from math import ceil, log2
 from typing import Callable, Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 
 from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
@@ -26,7 +25,13 @@ def get_cp_slice_for_thd(batch, cp_group):
     if cp_size <= 1:
         return
     cp_rank = cp_group.rank()
-    total_tokens = batch['tokens'].size(0)
+    # Use whichever data field is available to determine total_tokens
+    for _key in ['tokens', 'labels', 'loss_mask', 'position_ids']:
+        if _key in batch and batch[_key] is not None:
+            total_tokens = batch[_key].size(0)
+            break
+    else:
+        raise ValueError("Cannot determine total_tokens: no data field found in batch")
     # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
     # cu_seqlens to get the correct result.
     # TODO: Revert this workaround once TE fixes the issue.
@@ -45,9 +50,11 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
     the entire packed sample.
     """
     batch_unpacked = []
-    dev = batch[0]["tokens"].device
+    dev = batch[0]["cu_seqlens"].device
     original_seq_lens = []
     padded_seq_lens = []
+    # Determine which data fields exist in the batch
+    data_keys = [k for k in ["tokens", "labels", "loss_mask", "position_ids"] if k in batch[0]]
     for sample in batch:
         for key in sample.keys():
             if len(sample[key].shape) == 2:
@@ -63,7 +70,7 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
             end_idx = sample["cu_seqlens"][sub_sample + 1]
             if end_idx - start_idx == 0:
                 continue
-            for key in ["tokens", "labels", "loss_mask", "position_ids"]:
+            for key in data_keys:
                 sub_sample_dict[key] = sample[key][start_idx:end_idx]
             # Since sft_dataset.py does not provide cu_seqlens_original,
             # we assume original_seq_len equals padded_seq_len here.
@@ -151,16 +158,10 @@ def _pack_sequences(
     def _pack_tensors(tensors):
         return torch.cat([t.reshape(-1) for t in tensors], dim=0)
 
-    tokens = _pack_tensors([sample["tokens"] for sample in samples])
-    labels = _pack_tensors([sample["labels"] for sample in samples])
-    loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
-    position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
-
     new_sample = {}
-    new_sample["tokens"] = tokens
-    new_sample["labels"] = labels
-    new_sample["loss_mask"] = loss_mask
-    new_sample["position_ids"] = position_ids
+    for key in ['tokens', 'labels', 'loss_mask', 'position_ids']:
+        if key in samples[0]:
+            new_sample[key] = _pack_tensors([sample[key] for sample in samples])
 
     padded_lengths = padded_lengths.to(device=dev, dtype=torch.int32, non_blocking=True).reshape(-1)
     cu_seqlens_padded = torch.empty(padded_lengths.numel() + 1, device=dev, dtype=torch.int32)
@@ -189,103 +190,6 @@ def broadcast_tensor(item, src_rank, group) -> None:
     """Broadcast a tensor from src_rank to all ranks in the group."""
     if item is not None:
         torch.distributed.broadcast(item, src_rank, group=group)
-
-
-def broadcast_to_pp_group(
-    new_samples,
-    num_micro_batches,
-    seqlen_sum_this_global_batch,
-    seqlen_squared_sum_this_global_batch,
-    pp_group,
-    dev,
-    is_dynamic_cp: bool = False,
-):
-    """
-    Broadcast num_micro_batches, seqlen_sum_this_global_batch,
-    seqlen_squared_sum_this_global_batch and metadata to middle PP stages.
-    Before this broadcast, the new_samples on middle PP stages are None,
-    after this broadcast, the new_samples on middle PP stages contain the metadata but
-    without tokens, labels, loss_mask, position_ids.
-    """
-
-    pp_src_rank = torch.distributed.get_process_group_ranks(pp_group)[0]
-
-    if pp_group.size() > 2:
-        if pp_group.rank() == 0:
-            tensor_list = [
-                torch.tensor(
-                    [
-                        num_micro_batches,
-                        seqlen_sum_this_global_batch,
-                        seqlen_squared_sum_this_global_batch,
-                    ],
-                    dtype=torch.float32,
-                ).cuda()
-            ]
-            for sample in new_samples:
-                tensor_list.append(sample["max_seqlen"].unsqueeze(0))
-
-            if is_dynamic_cp:
-                for sample in new_samples:
-                    tensor_list.append(sample["local_cp_size"].unsqueeze(0))
-
-            for sample in new_samples:
-                tensor_list.append(sample["cu_seqlens"])
-                tensor_list.append(sample["cu_seqlens_padded"])
-            info_to_broadcast = torch.cat(tensor_list, dim=0).to(device=dev, dtype=torch.float32)
-            info_length_tensor = torch.tensor(info_to_broadcast.shape[0], dtype=torch.int32).cuda()
-            broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
-            broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
-        else:
-            info_length_tensor = torch.tensor(0, dtype=torch.int32).cuda()
-            broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
-            info_to_broadcast = torch.empty(info_length_tensor.item(), dtype=torch.float32).cuda()
-            broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
-            if pp_group.rank() != pp_group.size() - 1:
-                # middle PP stages receive the broadcasted info and unpack it
-                info_numpy = info_to_broadcast.cpu().numpy()
-                num_micro_batches = int(info_numpy[0])
-                seqlen_sum_this_global_batch = info_numpy[1]
-                seqlen_squared_sum_this_global_batch = info_numpy[2]
-                max_seqlens = info_to_broadcast[3 : 3 + num_micro_batches]
-                local_cp_sizes = (
-                    info_to_broadcast[3 + num_micro_batches : 3 + 2 * num_micro_batches]
-                    if is_dynamic_cp
-                    else None
-                )
-                cu_seqlens_list = []
-                cu_seqlens_padded_list = []
-                # cu_seqlens always starts with 0, and the other metadata values
-                # (num_micro_batches, seqlen_sum, seqlen_squared_sum, max_seqlens)
-                # are always positive, so we can use 0 as the delimiter to locate
-                # the start of each cu_seqlens / cu_seqlens_padded tensor.
-                # This avoids an extra broadcast for the lengths of cu_seqlens.
-                indices = np.where(info_numpy == 0)[0]
-                for i in range(num_micro_batches):
-                    cu_seqlens_list.append(info_to_broadcast[indices[i * 2] : indices[i * 2 + 1]])
-                    if i == num_micro_batches - 1:
-                        cu_seqlens_padded_list.append(info_to_broadcast[indices[i * 2 + 1] :])
-                    else:
-                        cu_seqlens_padded_list.append(
-                            info_to_broadcast[indices[i * 2 + 1] : indices[i * 2 + 2]]
-                        )
-
-                new_samples = []
-                for i in range(num_micro_batches):
-                    new_sample = {}
-                    new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
-                    new_sample["cu_seqlens"] = cu_seqlens_list[i].to(torch.int32)
-                    new_sample["cu_seqlens_padded"] = cu_seqlens_padded_list[i].to(torch.int32)
-                    if is_dynamic_cp:
-                        new_sample["local_cp_size"] = local_cp_sizes[i].to(torch.int32)
-                    new_samples.append(new_sample)
-
-    return (
-        new_samples,
-        num_micro_batches,
-        seqlen_sum_this_global_batch,
-        seqlen_squared_sum_this_global_batch,
-    )
 
 
 def broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:
@@ -321,21 +225,21 @@ def broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:
 
 
 def create_data_iterator(
-    new_samples, tp_group, config, vpp_has_data=None, is_dynamic_cp: bool = False
+    new_samples, tp_group, config, vpp_needs_data=None, is_dynamic_cp: bool = False
 ):
     """Handle virtual pipeline parallelism.
 
     For VPP, each PP rank needs a list of data iterators (one per VPP stage).
-    VPP stages that originally had a data_iterator (indicated by vpp_has_data)
-    get full samples; others get metadata only (cu_seqlens, cu_seqlens_padded,
+    VPP stages that need full data (first/last pipeline stage, or MTP) get
+    full samples; others get metadata only (cu_seqlens, cu_seqlens_padded,
     max_seqlen).
 
     Args:
         new_samples: The packed samples after scheduling.
         tp_group: Tensor parallel process group.
         config: Model parallel config.
-        vpp_has_data: A list of booleans (one per VPP stage) indicating which
-            VPP stages originally had a data_iterator. None if VPP is disabled.
+        vpp_needs_data: A list of booleans (one per VPP stage) indicating which
+            VPP stages need full samples (data fields). None if VPP is disabled.
     """
     if (
         config.virtual_pipeline_model_parallel_size is not None
@@ -346,14 +250,16 @@ def create_data_iterator(
             metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
-            metadata = [
-                {k: sample[k] for k in metadata_keys if k in sample} for sample in new_samples
-            ]
             new_data_iterator = []
             for i in range(vpp_size):
-                if vpp_has_data is not None and vpp_has_data[i]:
+                if vpp_needs_data is not None and vpp_needs_data[i]:
                     new_data_iterator.append(RerunDataIterator(iter(new_samples)))
                 else:
+                    # Create independent metadata dicts to avoid shared-reference mutation
+                    metadata = [
+                        {k: sample[k] for k in metadata_keys if k in sample}
+                        for sample in new_samples
+                    ]
                     new_data_iterator.append(RerunDataIterator(iter(metadata)))
         else:
             new_data_iterator = [None for _ in range(vpp_size)]

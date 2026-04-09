@@ -219,7 +219,6 @@ Phase 1        │  (once per global      │   ────────►   �
           ├─ get_groups_and_subsamples()              └─ PackedSeqParams(...)
           ├─ reroute_samples_to_dcp_ranks()  [utils]
           ├─ build_packed_microbatches()     [utils]
-          ├─ broadcast_to_pp_group()         [utils]
           ├─ broadcast_scalars()             [utils]
           └─ create_data_iterator()          [utils]
 ```
@@ -249,7 +248,6 @@ Utility functions consumed by the schedulers above:
 | `get_batch_and_global_seqlens()` | Fetch `num_microbatches` batches from the data iterator and all-gather sequence lengths across DP ranks. |
 | `reroute_samples_to_dcp_ranks()` | All-to-all communication to transfer sub-samples to their scheduled DP×CP rank. |
 | `build_packed_microbatches()` | Concatenate sub-samples within each microbatch group and produce `cu_seqlens`. |
-| `broadcast_to_pp_group()` | Broadcast packed samples and metadata from the first/last PP stage to middle stages. |
 | `broadcast_scalars()` | Broadcast scalar values (e.g. `num_microbatches`, FLOPs stats) across a process group. |
 | `broadcast_tensor()` | Broadcast a single tensor within a process group. |
 | `create_data_iterator()` | Wrap packed sample lists into a data iterator; handles VPP stage splitting. |
