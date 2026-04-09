@@ -2115,7 +2115,7 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
+                        choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
                         help='Position embedding type.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')

@@ -15,6 +15,21 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
         config = core_transformer_config_from_args(args, TransformerConfig)
     assert args.use_legacy_models is False, "Mamba only supported in Mcore!"
 
+    # YaRN-specific attributes are not part of TransformerConfig and must be set
+    # dynamically before constructing MambaModel (read via getattr in YarnRotaryEmbedding).
+    if args.position_embedding_type == 'yarn':
+        config.yarn_rotary_scaling_factor = getattr(args, 'yarn_rotary_scaling_factor', 8.0)
+        config.yarn_original_max_position_embeddings = getattr(
+            args, 'yarn_original_max_position_embeddings', args.max_position_embeddings // 8
+        )
+        config.yarn_beta_fast = getattr(args, 'yarn_beta_fast', 32.0)
+        config.yarn_beta_slow = getattr(args, 'yarn_beta_slow', 1.0)
+        config.yarn_mscale = getattr(args, 'yarn_mscale', 1.0)
+        config.yarn_mscale_all_dim = getattr(args, 'yarn_mscale_all_dim', 0.0)
+        config.yarn_correction_range_round_to_int = getattr(
+            args, 'yarn_correction_range_round_to_int', True
+        )
+
     if config.transformer_impl == "inference_optimized":
         mamba_stack_spec = mamba_inference_stack_spec
         assert (
