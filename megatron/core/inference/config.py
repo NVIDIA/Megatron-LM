@@ -309,6 +309,10 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
+    time_update_requests: bool = False
+    """Whether to time update_requests() with CUDA events. When enabled,
+    accumulates GPU-accurate timing across all calls and reports total/avg."""
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""

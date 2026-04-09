@@ -270,6 +270,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
 
+        # Optional CUDA event timing for update_requests()
+        self._time_update_requests = inference_config.time_update_requests
+        if self._time_update_requests:
+            self._ur_start_event = torch.cuda.Event(enable_timing=True)
+            self._ur_end_event = torch.cuda.Event(enable_timing=True)
+            self._update_requests_total_ms = 0.0
+            self._update_requests_call_count = 0
+            # Per-section timing (sections 1-7 of update_requests)
+            self._ur_section_names = [
+                "section_1_counts",
+                "section_2_early_return",
+                "section_3_token_concat",
+                "section_4_classify_release_compact",
+                "section_5_pause_detect_reorder",
+                "section_6_resume_evict_chunked",
+                "section_7_token_setup",
+            ]
+            n = len(self._ur_section_names)
+            self._ur_section_events = [
+                (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+                for _ in range(n)
+            ]
+            self._ur_section_total_ms = [0.0] * n
+
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
@@ -2587,9 +2611,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Newly paused request IDs.
         """
+        if self._time_update_requests:
+            self._ur_start_event.record()
+            _se = self._ur_section_events
+
+            def _record_update_requests_time():
+                self._ur_end_event.record()
+                torch.cuda.synchronize()
+                self._update_requests_total_ms += self._ur_start_event.elapsed_time(
+                    self._ur_end_event
+                )
+                self._update_requests_call_count += 1
+                for i, (s, e) in enumerate(_se):
+                    self._ur_section_total_ms[i] += s.elapsed_time(e)
+
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
+
+        if self._time_update_requests:
+            _se[0][0].record()
 
         self.num_prefill_requests = 0  # all turns to decode
         # All request that were in prefill become decode requests.
@@ -2617,8 +2658,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Update total_request_count.
         self.total_request_count = active_request_count + self.paused_request_count
 
+        if self._time_update_requests:
+            _se[0][1].record()
+
         # 2. If no paused requests are present and no active requests we release memory and reset.
         # Note that this requires no pending chunked prefill request
+        if self._time_update_requests:
+            _se[1][0].record()
+
         if (
             active_request_count + self.paused_request_count == 0
             and self.get_index_of_chunked_prefill_request(safe=False) == -1
@@ -2637,9 +2684,21 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
+            if self._time_update_requests:
+                _se[1][1].record()
+                for j in range(2, len(_se)):
+                    _se[j][0].record()
+                    _se[j][1].record()
+                _record_update_requests_time()
             return
 
+        if self._time_update_requests:
+            _se[1][1].record()
+
         # 3. Concatenate the paused tokens to the active tokens if present.
+        if self._time_update_requests:
+            _se[2][0].record()
+
         if self.paused_request_count != 0:
             assert self.paused_tokens is not None
             next_tokens = torch.cat((self.paused_tokens, new_tokens))
@@ -2650,9 +2709,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             next_tokens = new_tokens
 
+        if self._time_update_requests:
+            _se[2][1].record()
+
         # 4. For the finished requests we release memory blocks and move them to the right:-
         #       a) Release all their memory
         #       b) Swap them to the right, so that we have this order [Paused, Active, Finished]
+        if self._time_update_requests:
+            _se[3][0].record()
+
         if finished_request_count > 0:
             finished_idxs = (
                 torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
@@ -2685,10 +2750,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 if self.is_hybrid_model:
                     self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
 
+        if self._time_update_requests:
+            _se[3][1].record()
+
         # 5. We identify requests that require a new block and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current block and  require a new one in a pause state temporarily
         #       b) Move the paused requests to the left, and active requets to the right
         #       c) Update the paused request count and active_request_count appropriately
+        if self._time_update_requests:
+            _se[4][0].record()
+
         newly_paused_request_ids = None
         if active_request_count > 0:
             num_tokens_in_last_block = self.request_last_kv_block_offset[
@@ -2761,8 +2832,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count += active_requests_requiring_new_block_count
             active_request_count -= active_requests_requiring_new_block_count
 
+        if self._time_update_requests:
+            _se[4][1].record()
+
         # 6. Now that we have the requests in following order [Paused, Active, Finished]
         # We determine how many requests we can resume and resume them
+        if self._time_update_requests:
+            _se[5][0].record()
 
         # For multi-token generation: store previous block IDs BEFORE resume allocates new blocks.
         # This allows us to know which block tokens should go to if they don't cross the boundary.
@@ -2833,7 +2909,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                         new_speculative_tokens=None,
                     )
 
+        if self._time_update_requests:
+            _se[5][1].record()
+
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        if self._time_update_requests:
+            _se[6][0].record()
+
         assert self.total_request_count == active_request_count + self.paused_request_count
 
         if self.paused_request_count > 0:
@@ -2983,6 +3065,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
+
+        if self._time_update_requests:
+            _se[6][1].record()
+            _record_update_requests_time()
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,

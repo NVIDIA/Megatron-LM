@@ -470,6 +470,24 @@ def main():
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
             json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
+            if engine.context._time_update_requests:
+                call_count = max(engine.context._update_requests_call_count, 1)
+                section_timing = {
+                    name: {
+                        "total_ms": total,
+                        "avg_ms": total / call_count,
+                    }
+                    for name, total in zip(
+                        engine.context._ur_section_names,
+                        engine.context._ur_section_total_ms,
+                    )
+                }
+                json_results["update_requests_timing"] = {
+                    "total_ms": engine.context._update_requests_total_ms,
+                    "call_count": engine.context._update_requests_call_count,
+                    "avg_ms": engine.context._update_requests_total_ms / call_count,
+                    "sections": section_timing,
+                }
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
