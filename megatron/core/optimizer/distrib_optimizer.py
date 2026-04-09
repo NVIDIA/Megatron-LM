@@ -948,6 +948,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
+                    if (
+                        getattr(self.optimizer, 'store_param_remainders', False)
+                        and sharded_model_param.dtype == torch.bfloat16
+                        and v.dtype != torch.int16
+                    ):
+                        if v.min() < -32768 or v.max() > 32767:
+                            raise ValueError(
+                                f"Cannot convert param state (dtype={v.dtype}) to int16: "
+                                f"values [{v.min():.4f}, {v.max():.4f}] out of int16 range "
+                                f"[-32768, 32767]. The checkpoint may have been saved with "
+                                f"store_param_remainders=False."
+                            )
+                        v = v.to(torch.int16)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
