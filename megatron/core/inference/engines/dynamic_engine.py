@@ -2034,18 +2034,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_tokens_proposed,
                     self._spec_steps,
                 )
-            if self.context.is_hybrid_model:
-                mamba_str = "mamba: a %d/%d, p %d" % (
-                    context_state["mamba_active_requests"],
-                    context_state["mamba_max_requests"],
-                    context_state["mamba_paused_requests"],
-                )
-                if "mamba_cache_slots_used" in context_state:
-                    mamba_str += ", slots %d/%d" % (
-                        context_state["mamba_cache_slots_used"],
-                        context_state["mamba_cache_slots_total"],
-                    )
-                output_str += " ... %s" % mamba_str
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
                 output_str += " ... prefix cache: %d hits, %d blocks matched" % (
                     self._prefix_cache_hits,
