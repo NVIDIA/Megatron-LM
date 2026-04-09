@@ -97,18 +97,37 @@ def measure_hbm_bandwidth(device=None, iters=50):
 
 
 def get_model_weight_bytes(model):
-    """Compute total bytes of model parameters on GPU.
+    """Compute total bytes of model weights on GPU.
+
+    Walks all modules checking parameters, buffers, and plain tensor
+    attributes to capture weights that may not be registered as nn.Parameter
+    (e.g., expert weight buffers in MoE inference, MXFP8 quantized weights).
+    Deduplicates by underlying storage to avoid double-counting views.
 
     Args:
         model: A PyTorch model (possibly wrapped).
 
     Returns:
-        Total parameter memory in bytes.
+        Total weight memory in bytes on GPU.
     """
-    total = 0
-    for p in model.parameters():
-        total += p.nelement() * p.element_size()
-    return total
+    seen_storages = {}  # storage data_ptr -> nbytes
+    for module in model.modules():
+        # nn.Parameter objects
+        for tensor in module._parameters.values():
+            if tensor is not None and tensor.is_cuda:
+                ptr = tensor.untyped_storage().data_ptr()
+                seen_storages[ptr] = tensor.untyped_storage().nbytes()
+        # Registered buffers (e.g., concatenated expert weight buffers)
+        for tensor in module._buffers.values():
+            if tensor is not None and tensor.is_cuda:
+                ptr = tensor.untyped_storage().data_ptr()
+                seen_storages[ptr] = tensor.untyped_storage().nbytes()
+        # Plain tensor attributes (e.g., MXFP8Tensor weights)
+        for attr in module.__dict__.values():
+            if isinstance(attr, torch.Tensor) and attr.is_cuda:
+                ptr = attr.untyped_storage().data_ptr()
+                seen_storages[ptr] = attr.untyped_storage().nbytes()
+    return sum(seen_storages.values())
 
 
 class Counter:
