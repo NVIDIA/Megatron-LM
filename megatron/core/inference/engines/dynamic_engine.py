@@ -350,6 +350,10 @@ class DynamicInferenceEngine(AbstractEngine):
         context = self.context
         controller = self.controller
 
+        # Avoid running sampling during warmup.
+        # TODO: Disable this once sampling is also graphed.
+        controller._sampled_tokens_cuda.zero_()
+
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
@@ -398,6 +402,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
+            # Force all dummy requests to request log probs so graphs cover
+            # the full padded shape.
+            active_request_count = context.total_request_count - context.paused_request_count
+            context.active_request_metadata["return_log_probs"][:active_request_count] = True
+
+            controller._dynamic_step_log_probs_bookkeeping()
+            controller._dynamic_step_log_probs_indexing()
+
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
             if model_config.moe_enable_routing_replay:
@@ -406,6 +418,12 @@ class DynamicInferenceEngine(AbstractEngine):
             # Forward pass -> logits.
             with torch.inference_mode():
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+                # Capture speculative softmax graph post-forward.
+                controller._post_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(controller._post_forward_bookkeeping_stream):
+                    controller._dynamic_step_log_probs_softmax()
+                    controller._post_forward_bookkeeping_event.record()
 
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:
@@ -431,6 +449,9 @@ class DynamicInferenceEngine(AbstractEngine):
                                 depth=depth,
                                 cache_key=("mtp", n, depth),
                             )
+
+                # Capture remaining log-prob graphs (gather, extract).
+                controller._dynamic_step_calculate_log_probs()
 
                 context.reset()
 
