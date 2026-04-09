@@ -77,10 +77,42 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
 def schedule_async_save(async_request: AsyncRequest | NVRxAsyncRequest):
     """Schedule the async save request.
 
+    When using a persistent checkpoint worker the AsyncRequest is serialized into a
+    multiprocessing queue.  Any CUDA tensors inside it are transferred between processes
+    via ``pidfd_getfd``-based IPC handles.  If the parent-process file descriptors backing
+    those handles are closed (e.g. by GC) before the worker calls ``queue.get()``, the
+    reconstruction fails with ``RuntimeError: pidfd_getfd: Bad file descriptor``.  This is
+    more likely on large models that use virtual pipeline parallelism (VPP > 1) because
+    ``write_buckets`` is proportionally larger, leading to more IPC handles and a longer
+    pipe transit time.
+
+    To avoid this, pre-stage CUDA tensors to CPU (call ``preload_fn``) in the training
+    process before the request enters the queue.  The worker then receives only CPU tensors
+    and no CUDA IPC is required.
+
     Args:
         async_request (AsyncRequest | NVRxAsyncRequest): the async save request.
     """
-    _get_async_calls_queue().schedule_async_request(async_request)
+    args = get_args()
+    queue = _get_async_calls_queue()
+    # Pre-stage CUDA tensors to CPU before queuing to avoid CUDA IPC pidfd_getfd failures
+    # with the persistent worker (see filesystem_async.py TODO on shared memory).
+    # The persistent worker serialises the AsyncRequest through a multiprocessing queue.
+    # In spawn/forkserver mode CUDA tensors are transferred via pidfd_getfd IPC handles;
+    # if the parent closes those handles (e.g. via GC) before the worker's queue.get()
+    # reconstructs them, the call fails with EBADF.  This is reliably triggered on
+    # configs with VPP > 1 because write_buckets is proportionally larger.
+    if (
+        getattr(args, 'use_persistent_ckpt_worker', False)
+        and getattr(async_request, 'preload_fn', None) is not None
+    ):
+        preloaded_args = list(async_request.async_fn_args)
+        preloaded_args[1] = async_request.preload_fn()
+        async_request = async_request._replace(
+            async_fn_args=tuple(preloaded_args),
+            preload_fn=None,
+        )
+    queue.schedule_async_request(async_request)
 
 
 def maybe_finalize_async_save(blocking: bool = False, terminate=False):
