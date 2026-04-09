@@ -1397,6 +1397,103 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_calculate_log_probs_partial_mask(self):
+        """Verify that requests with return_log_probs=False get None in the result list."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        # Three requests; only request 0 and 2 want log probs.
+        request_lengths = [6, 4, 5]
+        for i, req_len in enumerate(request_lengths):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=2001 + i,
+                    prompt_tokens=torch.randint(0, 100, (req_len,), device='cuda'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=dynamic_context.max_tokens - req_len
+                    ),
+                )
+            )
+
+        num_active = dynamic_context.total_request_count - dynamic_context.paused_request_count
+        total_tokens = dynamic_context.active_token_count
+        vocab_size = 50000
+
+        # ── Prefill step with partial mask ──
+        logits = torch.randn(1, total_tokens, vocab_size, device='cuda', dtype=torch.float32)
+        new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
+
+        dynamic_context.initialize_attention_state()
+        # Mask: request 0 = True, request 1 = False, request 2 = True
+        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.active_request_metadata["return_log_probs"][0] = True
+        dynamic_context.active_request_metadata["return_log_probs"][2] = True
+
+        log_probs, _ = dynamic_context.calculate_log_probs(
+            logits, new_tokens, log_prob_request_count=2
+        )
+
+        # Request 0 should have log probs (length = request_lengths[0])
+        assert log_probs[0] is not None
+        assert len(log_probs[0]) == request_lengths[0]
+
+        # Request 1 should be None (masked out)
+        assert log_probs[1] is None
+
+        # Request 2 should have log probs (length = request_lengths[2])
+        assert log_probs[2] is not None
+        assert len(log_probs[2]) == request_lengths[2]
+
+        # Verify request 0's values against reference
+        expected = torch.nn.functional.log_softmax(logits.squeeze(0), dim=-1)
+        # Request 0 occupies token positions 0..5
+        prompt_tokens_0 = dynamic_context.token_to_input_ids[: request_lengths[0]]
+        shifted_0 = prompt_tokens_0[1:].tolist() + [new_tokens[0].item()]
+        for j, tok in enumerate(shifted_0):
+            assert abs(log_probs[0][j] - expected[j, tok].item()) < 1e-5
+
+        # ── Decode step with partial mask ──
+        active_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
+        dynamic_context.update_requests(active_requests_mask=active_mask, new_tokens=new_tokens)
+
+        decode_logits = torch.randn(1, num_active, vocab_size, device='cuda', dtype=torch.float32)
+        decode_new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
+
+        dynamic_context.initialize_attention_state()
+        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.active_request_metadata["return_log_probs"][0] = True
+        dynamic_context.active_request_metadata["return_log_probs"][2] = True
+
+        decode_log_probs, _ = dynamic_context.calculate_log_probs(
+            decode_logits, decode_new_tokens, log_prob_request_count=2
+        )
+
+        assert decode_log_probs[0] is not None and len(decode_log_probs[0]) == 1
+        assert decode_log_probs[1] is None
+        assert decode_log_probs[2] is not None and len(decode_log_probs[2]) == 1
+
+        # Verify decode values
+        decode_expected = torch.nn.functional.log_softmax(decode_logits.squeeze(0), dim=-1)
+        assert (
+            abs(decode_log_probs[0][0] - decode_expected[0, decode_new_tokens[0].item()].item())
+            < 1e-5
+        )
+        assert (
+            abs(decode_log_probs[2][0] - decode_expected[2, decode_new_tokens[2].item()].item())
+            < 1e-5
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_pipeline_parallel_uneven_layers(self):
         """
         Test that DynamicInferenceContext synchronizes the total block count across
