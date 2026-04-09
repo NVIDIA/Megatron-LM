@@ -500,9 +500,9 @@ def need_environment_rollouts(
             need_inference denotes whether we should enter colocated_inference to collect rollouts.
     """
     global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size
-    if not (
-        buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration +
+    if (
+        buffered_rollouts is not None and
+        iteration != runtime_state.last_collection_iteration +
         (grpo_iterations * global_batches_per_collection)
     ):
         return False, False
