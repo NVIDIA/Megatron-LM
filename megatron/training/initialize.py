@@ -32,12 +32,9 @@ from megatron.training import (
     get_tensorboard_writer,
     inprocess_restart,
 )
-from megatron.training.arguments import parse_args, validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.checkpointing import load_args_from_checkpoint
-from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
-from megatron.training.yaml_arguments import validate_yaml
 
 logger = logging.getLogger(__name__)
 
@@ -65,32 +62,7 @@ def initialize_megatron(
         # Make sure cuda is available.
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
-    # Parse arguments
-    if parsed_args is None:
-        args = parse_args(extra_args_provider, ignore_unknown_args)
-    else:
-        args = parsed_args
-
-    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
-        assert (
-            args.load is not None or args.pretrained_checkpoint is not None
-        ), "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
-        assert args.non_persistent_ckpt_type != "local", (
-            "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
-            "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
-            "before initializing LocalCheckpointManager."
-        )
-        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
-        load_args_from_checkpoint(args)
-
-    if args.yaml_cfg is not None:
-        args = validate_yaml(args, args_defaults)
-    else:
-        validate_args(args, args_defaults)
-
-    # set global args, build tokenizer, and set adlr-autoresume,
-    # tensorboard-writer, and timers.
-    set_global_variables(args)
+    args = parse_and_validate_args(extra_args_provider=extra_args_provider, ignore_unknown_args=ignore_unknown_args, args_defaults=args_defaults)
 
     # set logging level
     setup_logging()
