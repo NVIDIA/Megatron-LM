@@ -78,6 +78,32 @@ else:
     ) = (None, None, None, None, None, None)
 
 
+def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
+    """Prepare value tensor for MLA core attention THD execution."""
+    orig_v_dim = value.shape[-1] if value is not None else None
+    padded_v_dim = orig_v_dim
+    need_v_pad = (
+        packed_seq_params is not None
+        and packed_seq_params.qkv_format == "thd"
+        and parallel_attention.config.experimental_attention_variant is None
+        and value is not None
+        and query.shape[-1] != orig_v_dim
+    )
+    if need_v_pad:
+        value = F.pad(value, [0, query.shape[-1] - orig_v_dim])
+        padded_v_dim = value.shape[-1]
+    return value, need_v_pad, orig_v_dim, padded_v_dim
+
+
+def _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim):
+    """Trim THD MLA core attention output back to the original V dimension."""
+    if need_v_pad:
+        if core_attn_out.ndim == 2:
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-1], -1, padded_v_dim)
+        core_attn_out = core_attn_out[..., :orig_v_dim]
+    return core_attn_out
+
+
 @dataclass
 class MLASelfAttentionSubmodules:
     """Submodules for the MLA self-attention layer."""
@@ -214,6 +240,51 @@ class MultiLatentAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _run_core_attention(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        packed_seq_params=None,
+        attn_mask_type=None,
+        **extra_kwargs,
+    ):
+        """Run MLA core attention with the THD value pad/trim workaround."""
+        value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
+            self, query, value, packed_seq_params
+        )
+        if attn_mask_type is None:
+            attn_mask_type = self.attn_mask_type
+
+        orig_v_head_dim = None
+        if (
+            need_v_pad
+            and value is not None
+            and hasattr(self.core_attention, 'hidden_size_per_attention_head_v')
+        ):
+            orig_v_head_dim = self.core_attention.hidden_size_per_attention_head_v
+            if value.shape[-1] == orig_v_head_dim:
+                orig_v_head_dim = None
+            else:
+                self.core_attention.hidden_size_per_attention_head_v = value.shape[-1]
+
+        try:
+            core_attn_out = self.core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                attn_mask_type=attn_mask_type,
+                **extra_kwargs,
+            )
+        finally:
+            if orig_v_head_dim is not None:
+                self.core_attention.hidden_size_per_attention_head_v = orig_v_head_dim
+
+        return _trim_mla_core_attention_output(core_attn_out, need_v_pad, orig_v_dim, padded_v_dim)
+
     def forward(
         self,
         hidden_states,
@@ -288,22 +359,13 @@ class MultiLatentAttention(Attention):
         if value is not None:
             value = value.contiguous()
 
-        orig_v_dim = value.shape[-1] if value is not None else None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
-        need_v_pad = (
-            thd_packed_seq
-            and self.config.experimental_attention_variant is None
-            and value is not None
-            and query.shape[-1] != orig_v_dim
-        )
-        if need_v_pad:
-            # Pad V so THD attention can run when Q/V head dims differ.
-            value = F.pad(value, [0, query.shape[-1] - orig_v_dim])
 
         # ==================================
         # core attention computation
         # ==================================
         # Need corresponding TE change
+        needs_output_trim = False
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
@@ -319,7 +381,7 @@ class MultiLatentAttention(Attention):
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:
-                    core_attn_out = self.core_attention(
+                    core_attn_out = self._run_core_attention(
                         query,
                         key,
                         value,
@@ -329,6 +391,9 @@ class MultiLatentAttention(Attention):
                         **extra_kwargs,
                     )
             elif self.cache_mla_latents:
+                value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
+                    self, query, value, packed_seq_params
+                )
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
@@ -348,6 +413,7 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                needs_output_trim = need_v_pad
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
@@ -362,13 +428,12 @@ class MultiLatentAttention(Attention):
             # Flatten back: [seq, batch, num_heads * v_head_dim]
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
 
+        if needs_output_trim:
+            core_attn_out = _trim_mla_core_attention_output(
+                core_attn_out, need_v_pad, orig_v_dim, padded_v_dim
+            )
+
         if thd_packed_seq:
-            if need_v_pad:
-                if core_attn_out.ndim == 2:
-                    core_attn_out = core_attn_out.reshape(
-                        *core_attn_out.shape[:-1], -1, value.shape[-1]
-                    )
-                core_attn_out = core_attn_out[..., :orig_v_dim]
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)

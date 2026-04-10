@@ -785,24 +785,18 @@ class TestParallelMLAAttentionPrecision:
             assert torch.equal(_q_compressed_sbhd, q_compressed_thd)
             assert torch.equal(_kv_compressed_sbhd, kv_compressed_thd)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -950,24 +944,18 @@ class TestContextParallelMLAAttentionPrecision:
             torch.testing.assert_close(_q_compressed_sbhd, q_compressed_thd, atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(_kv_compressed_sbhd, kv_compressed_thd, atol=1e-6, rtol=1e-6)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -1101,24 +1089,18 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             assert torch.equal(_q_compressed_sbhd, q_compressed_thd)
             assert torch.equal(_kv_compressed_sbhd, kv_compressed_thd)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
