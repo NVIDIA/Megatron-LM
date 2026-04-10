@@ -34,8 +34,8 @@
    1032,
    1049
   ],
-  "latency": 2.5350613594055176,
-  "ttft": 0.8584995269775391,
+  "latency": 2.511375904083252,
+  "ttft": 0.8137891292572021,
   "cuda_graph_request_count_map": null,
   "step_count": 40,
   "top_n_logprobs": null,
