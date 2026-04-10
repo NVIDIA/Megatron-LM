@@ -207,7 +207,12 @@ def verify_checkpoint(checkpoint_dir: str):
     Args:
         checkpoint_dir (str): checkpoint directory
     """
-    if not Path(checkpoint_dir).exists():
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        if not msc.Path(checkpoint_dir).exists():
+            raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist.')
+
+    elif not Path(checkpoint_dir).exists():
         raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
     if not check_is_distributed_checkpoint(checkpoint_dir):
