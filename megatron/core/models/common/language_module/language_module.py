@@ -30,6 +30,8 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 
@@ -343,19 +345,23 @@ class LanguageModule(MegatronModule):
         """
         layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
 
+        nvtx_range_push(f"mtp-single-step/depth-{depth}/mtp-layer")
         mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
             hidden_states=hidden_states,
             next_token_ids=next_token_ids,
             position_ids=position_ids,
             embedding=self.embedding,
         )
+        nvtx_range_pop(f"mtp-single-step/depth-{depth}/mtp-layer")
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
+        nvtx_range_push(f"mtp-single-step/depth-{depth}/output-layer")
         logits, _ = self.output_layer(mtp_hidden, weight=output_weight, runtime_gather_output=True)
         logits = self._scale_logits(logits)
+        nvtx_range_pop(f"mtp-single-step/depth-{depth}/output-layer")
 
         return mtp_hidden, logits
 

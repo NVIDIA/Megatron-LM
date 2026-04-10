@@ -39,6 +39,8 @@ from megatron.core.utils import (
     get_asyncio_loop,
     get_model_config,
     get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
     unwrap_model,
 )
 
@@ -905,6 +907,7 @@ class TextGenerationController:
 
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
         for depth in range(num_depths):
+            nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
             position_ids = (base_position + depth).unsqueeze(0)  # [1, active_request_count]
             token_ids = next_token_ids.unsqueeze(0)  # [1, active_request_count]
 
@@ -915,12 +918,14 @@ class TextGenerationController:
                     token_ids = F.pad(token_ids, (0, pad_count))
                     position_ids = F.pad(position_ids, (0, pad_count))
 
+                nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids,
                     position_ids=position_ids,
                     depth=depth,
                 )
+                nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
                 # Strip padding from logits only.  Hidden states stay padded+SP
                 # between depths to avoid redundant gather/scatter round-trips.
@@ -932,19 +937,24 @@ class TextGenerationController:
 
             # Broadcast MTP logits across pipeline stages.
             if self.model_is_pipeline_parallel:
+                nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/pp-broadcast")
                 mtp_logits_2d = broadcast_from_last_pipeline_stage(
                     [active_request_count, self.vocab_size],
                     dtype=self.model_config.params_dtype,
                     tensor=mtp_logits_2d,
                     pp_group=self.pp_group,
                 )
+                nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/pp-broadcast")
 
             # Sample speculative token using the same sampling parameters.
+            nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/sample")
             spec_tokens = self._sample_from_logits_2d(mtp_logits_2d)
             self._sampled_mtp_tokens_cuda[depth, :active_request_count] = spec_tokens
+            nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/sample")
 
             # Use sampled token as input for the next depth.
             next_token_ids = spec_tokens
+            nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}")
 
         # Clean up cached hidden states.
         if has_mtp:
@@ -1715,6 +1725,7 @@ class TextGenerationController:
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
         for depth in range(num_depths):
+            nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
@@ -1733,6 +1744,7 @@ class TextGenerationController:
                     tensor=mtp_logits_2d,
                     pp_group=self.pp_group,
                 )
+            nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
@@ -1873,9 +1885,13 @@ class TextGenerationController:
 
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
+                nvtx_range_push("mtp-spec-decoding/verify")
                 self._dynamic_step_sample_logits_and_verify_tokens(logits, input_ids)
+                nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
+                nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 self._rewind_kv_cache()
+                nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation
                 if self.model_config.moe_pad_experts_for_cuda_graph_inference:
@@ -1883,7 +1899,9 @@ class TextGenerationController:
                     set_decode_expert_padding(unwrapped_model, False)
 
                 # Phase 3: Compute MTP serially with correct (verified) inputs.
+                nvtx_range_push("mtp-spec-decoding/serial-mtp")
                 self._compute_serial_mtp_and_sample()
+                nvtx_range_pop("mtp-spec-decoding/serial-mtp")
             else:
                 self._dynamic_step_sample_logits(logits)
 
