@@ -1133,10 +1133,28 @@ class PagedStashRunner:
         self.optimizer = optimizer
         self.forward_backward_func = forward_backward_func
         self.moe_layers = []
+        # TransformerConfig objects that must stay in sync for moe_paged_stash: the training
+        # loop `config` (schedules / paged_stash_reset) plus each VP chunk's GPT root config
+        # (GPTModel.forward). MoE mlps use the same config reference as that root, so we do
+        # not track mlp.config separately.
+        seen_cfg_ids = set()
+        self._configs_to_sync_moe_paged_stash = []
+
+        def _track_cfg(c):
+            if c is None:
+                return
+            cid = id(c)
+            if cid not in seen_cfg_ids:
+                seen_cfg_ids.add(cid)
+                self._configs_to_sync_moe_paged_stash.append(c)
+
+        _track_cfg(config)
+
         for model_chunk in self.model:
             model_with_decoder = get_attr_wrapped_model(
                 model_chunk, "decoder", allow_none=False, return_model_obj=True
             )
+            _track_cfg(model_with_decoder.config)
             for layer in model_with_decoder.decoder.layers:
                 mlp = layer.mlp
                 if hasattr(mlp, 'token_dispatcher') and hasattr(
@@ -1150,6 +1168,11 @@ class PagedStashRunner:
                         mlp.token_dispatcher, 'check_over_budget'
                     ):
                         self.moe_layers.append(mlp)
+
+    def _set_moe_paged_stash_all(self, value: bool) -> None:
+        """Set moe_paged_stash on every tracked config (train + per VP chunk root)."""
+        for c in self._configs_to_sync_moe_paged_stash:
+            c.moe_paged_stash = value
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -1221,7 +1244,7 @@ class PagedStashRunner:
             self.stash_manager.overflow.zero_()
         if self.stash_manager.host_spill is not None:
             self.stash_manager.host_spill.zero_()
-        self.config.moe_paged_stash = False
+        self._set_moe_paged_stash_all(False)
 
         # Set grad to zero.
         for model_chunk in self.model:
@@ -1304,7 +1327,7 @@ class PagedStashRunner:
                         mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
                     ):
                         mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = mlp.token_dispatcher.config.moe_expert_rank_capacity_factor
-                self.config.moe_paged_stash = saved_moe_paged_stash
+                self._set_moe_paged_stash_all(saved_moe_paged_stash)
                 break
 
             # if overflow or overbudget, set the expert_rank_capacity_factor to None
