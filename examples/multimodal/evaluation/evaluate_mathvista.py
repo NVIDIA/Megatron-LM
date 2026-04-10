@@ -1,3 +1,5 @@
+# Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import argparse
 import json
 import re
@@ -29,6 +31,7 @@ def merge_input_files(input_path):
 
     with open(output_file_path, "w") as output_file:
         json.dump(results, output_file, indent=4, sort_keys=True)
+        output_file.write("\n")  # End file in newline
 
     return output_file_path
 
