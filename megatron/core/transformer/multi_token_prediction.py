@@ -678,9 +678,10 @@ def process_mtp_loss(
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
+            # Safe divide without sync: mask numerator when num_tokens==0, divide by clamp(min=1)
             mtp_loss_for_log = (
-                torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
-            )
+                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+            ) / num_tokens.clamp(min=1)
             MTPLossLoggingHelper.save_loss_to_tracker(
                 mtp_loss_for_log,
                 mtp_layer_number,
