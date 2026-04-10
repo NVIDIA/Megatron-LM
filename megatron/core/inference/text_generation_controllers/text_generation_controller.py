@@ -836,6 +836,39 @@ class TextGenerationController:
             spec_tokens[indices] = tokens
         return spec_tokens
 
+    def _resolve_mtp_cuda_graph_batch_size(self, local_padded_count: int) -> int:
+        """Resolve MTP CUDA graph batch size, syncing across EP ranks if needed.
+
+        Finds the smallest pre-captured CUDA graph batch size that fits
+        ``local_padded_count``, then all-reduces (MAX) across the EP group so
+        every EP rank — including the dummy rank which sends 0 — agrees on the
+        same graph size.
+
+        Returns ``local_padded_count`` unchanged when MTP CUDA graphs are not
+        active or EP is not in use.
+        """
+        mtp_cuda_graph_sizes = getattr(self, '_mtp_cuda_graph_batch_sizes', None)
+        if not mtp_cuda_graph_sizes:
+            return local_padded_count
+
+        padded_count = local_padded_count
+        for size in mtp_cuda_graph_sizes:
+            if size >= padded_count:
+                padded_count = size
+                break
+
+        ep_group = self.inference_wrapped_model.inference_context.expert_model_parallel_group
+        if ep_group is not None:
+            sync_tensor = torch.tensor(
+                [padded_count], dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
+            )
+            padded_count = sync_tensor.item()
+
+        return padded_count
+
     def _compute_serial_mtp_and_sample(self):
         """Compute MTP logits serially after verification and sample speculative tokens.
 
@@ -895,14 +928,9 @@ class TextGenerationController:
         else:
             padded_count = active_request_count
 
-        # Further pad to match a pre-captured CUDA graph batch size.
-        mtp_cuda_graph_sizes = getattr(self, '_mtp_cuda_graph_batch_sizes', None)
-        if mtp_cuda_graph_sizes:
-            for size in mtp_cuda_graph_sizes:
-                if size >= padded_count:
-                    padded_count = size
-                    break
-
+        # Further pad to match a pre-captured CUDA graph batch size and sync
+        # across EP ranks so the dummy rank uses the same graph.
+        padded_count = self._resolve_mtp_cuda_graph_batch_size(padded_count)
         pad_count = padded_count - active_request_count
 
         # Pad hidden states and scatter for sequence parallelism.
@@ -1727,12 +1755,10 @@ class TextGenerationController:
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
         padded_count = tp_size if sp_enabled else 1
 
-        # When MTP CUDA graphs are active, pad to the smallest captured batch
-        # size so the dummy rank also replays a pre-captured graph (the EP
-        # collectives must match the real ranks).
-        mtp_cuda_graph_sizes = getattr(self, '_mtp_cuda_graph_batch_sizes', None)
-        if mtp_cuda_graph_sizes:
-            padded_count = mtp_cuda_graph_sizes[0]
+        # When MTP CUDA graphs are active, sync with real EP ranks to agree
+        # on batch size (dummy's local value is small; the EP all-reduce MAX
+        # picks the real ranks' padded_count).
+        padded_count = self._resolve_mtp_cuda_graph_batch_size(padded_count)
 
         dummy_hidden = None
         if has_mtp:
