@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -12,11 +13,13 @@ from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
+    record_dispatch_token_counts,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -233,6 +236,8 @@ class MoELayer(BaseMoELayer):
         )
 
         self.tp_group = pg_collection.tp
+        self.tp_ep_group = pg_collection.tp_ep
+        self.dp_group = pg_collection.dp
 
         # Initialize router.
         self.router = self.submodules.router(
@@ -345,6 +350,11 @@ class MoELayer(BaseMoELayer):
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
+        if self.config.log_overload_factor:
+            get_moe_overload_factor_tracker().set_process_groups(
+                tp_ep_group=self.tp_ep_group, dp_group=self.dp_group
+            )
+
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
 
@@ -441,6 +451,15 @@ class MoELayer(BaseMoELayer):
         )
         return hidden_states, probs
 
+    @staticmethod
+    def _num_token_rows_from_moe_hidden_states(hidden_states: torch.Tensor) -> int:
+        """Product of all dimensions except the hidden/last dim (same as ``view(-1, H)`` row count)."""
+        if hidden_states.dim() < 2:
+            raise ValueError(
+                f"MoE hidden_states must be at least 2D [..., hidden_size], got shape {tuple(hidden_states.shape)}"
+            )
+        return int(math.prod(hidden_states.shape[:-1]))
+
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
 
@@ -480,6 +499,36 @@ class MoELayer(BaseMoELayer):
 
         return shared_expert_output
 
+    def _maybe_record_overload_factor(
+        self, dispatched_input: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> torch.Tensor:
+        """Wrap ``dispatched_input`` with overload logging when ``log_overload_factor`` is set.
+
+        Uses ``_overload_log_num_local_tokens`` captured from forward ``hidden_states`` and
+        applies AllGather fair-share scaling so ``report()``'s SUM over TP×EP matches one
+        global balanced count when the map is replicated on every rank.
+        """
+        if not self.config.log_overload_factor:
+            return dispatched_input
+        num_local_tokens = getattr(self, "_overload_log_num_local_tokens", None)
+        if num_local_tokens is None:
+            return dispatched_input
+        tp_ep_world_size = float(self.tp_ep_group.size())
+        local_balanced_count = float(num_local_tokens) * float(self.config.moe_router_topk)
+        token_dispatcher = self.token_dispatcher
+        if isinstance(token_dispatcher, MoEAllGatherTokenDispatcher) and (
+            token_dispatcher.tp_size > 1 or token_dispatcher.ep_size > 1
+        ):
+            local_balanced_count = local_balanced_count / tp_ep_world_size
+        local_balanced = torch.empty((), device=dispatched_input.device, dtype=torch.float32)
+        local_balanced.fill_(local_balanced_count)
+        return record_dispatch_token_counts(
+            tensor=dispatched_input,
+            tokens_per_expert=tokens_per_expert,
+            local_balanced_token_count=local_balanced,
+            layer_number=self.layer_number,
+        )
+
     @internal_api
     def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
@@ -492,8 +541,12 @@ class MoELayer(BaseMoELayer):
             hidden_states = _RecordExpertDgradCompletion.apply(
                 self._delayed_wgrad_event, hidden_states
             )
+
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
+        )
+        dispatched_input = self._maybe_record_overload_factor(
+            dispatched_input, tokens_per_expert
         )
         if (
             hasattr(self, "_inference_token_dispatcher")
@@ -576,6 +629,10 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
+                    if self.config.log_overload_factor:
+                        self._overload_log_num_local_tokens = (
+                            self._num_token_rows_from_moe_hidden_states(hidden_states)
+                        )
                     probs, routing_map = self.route(hidden_states, padding_mask)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
