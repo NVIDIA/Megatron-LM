@@ -187,9 +187,9 @@ def mcore_fused_moe(
     # Write output directly into the RSV symmetric buffer to avoid a separate copy
     # in token_combine before multimem_reduce_scatter_v.
     from megatron.core.transformer.moe.token_dispatcher_inference import (
-        MoEAllGatherVTokenDispatcher,
+        NVLSAllGatherVDispatcher,
     )
-    rsv_out = MoEAllGatherVTokenDispatcher._get_rsv_tensor()
+    rsv_out = NVLSAllGatherVDispatcher._get_rsv_tensor()
     return unpermute_tokens(
         fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens,
         out=rsv_out,

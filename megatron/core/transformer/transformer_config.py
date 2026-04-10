@@ -941,6 +941,14 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
+    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
+    """Token dispatcher to use for MoE expert parallelism during inference.
+    - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
+      decode-only CUDA graphs (forced automatically). Default.
+    - 'nvls': Variable-count AllGather-V/ReduceScatter-V via NVLS multimem kernels.
+      Requires Hopper+ GPUs with NVLink and symmetric memory. Opt-in.
+    Only applies when transformer_impl='inference_optimized' and EP > 1."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """

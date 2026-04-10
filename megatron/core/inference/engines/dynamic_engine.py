@@ -2285,7 +2285,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         else:
                             # Dummy forward to participate in the EP collective.
                             self.step_start_event.record()
-                            self.controller._agv_dummy_forward()
+                            self.controller.dummy_forward()
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.context.step_count += 1

@@ -579,9 +579,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
-        # CUDA graph config list
+        # CUDA graph config list.
+        # NCCLAllGatherDispatcher requires all EP ranks to contribute the same token count,
+        # so force decode-only CUDA graphs (no prefill graphs) when it is selected.
+        self._nccl_ep_dispatcher = (
+            self.expert_model_parallel_group is not None
+            and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
+        )
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
+            and not self._nccl_ep_dispatcher
         )
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
@@ -601,12 +608,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             inference_config.cuda_graph_mixed_prefill_count, self.max_requests
         )
 
-        # Set engine max tokens on the AGV dispatcher (used to size symmetric buffers).
-        if self.expert_model_parallel_group is not None:
+        # Set engine max tokens on the NVLS dispatcher (used to size symmetric buffers).
+        if self.expert_model_parallel_group is not None and not self._nccl_ep_dispatcher:
             from megatron.core.transformer.moe.token_dispatcher_inference import (
-                MoEAllGatherVTokenDispatcher,
+                NVLSAllGatherVDispatcher,
             )
-            MoEAllGatherVTokenDispatcher.set_engine_max_tokens(self.max_tokens)
+            NVLSAllGatherVDispatcher.set_engine_max_tokens(self.max_tokens)
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1615,6 +1622,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
+            nvls_dispatcher=not self._nccl_ep_dispatcher,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
@@ -1737,18 +1745,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-        if self.expert_model_parallel_group is not None:
-            self._update_moe_dispatcher_metadata()
+        if self.expert_model_parallel_group is not None and not self._nccl_ep_dispatcher:
+            self._update_nvls_dispatcher_metadata()
 
-    def _update_moe_dispatcher_metadata(self) -> None:
-        """All-gather per-rank token counts over the EP group and update dispatcher metadata.
+    def _update_nvls_dispatcher_metadata(self) -> None:
+        """All-gather per-rank token counts over the EP group and update NVLS dispatcher metadata.
 
         Each rank contributes its padded_active_token_count. The dispatcher then
         computes valid_tokens, rank_token_offset, and ep_max_tokens from the result.
+        Only called when inference_moe_token_dispatcher_type='nvls'.
         """
         import torch.distributed as dist
         from megatron.core.transformer.moe.token_dispatcher_inference import (
-            MoEAllGatherVTokenDispatcher,
+            NVLSAllGatherVDispatcher,
         )
 
         local_count = torch.tensor(
@@ -1757,7 +1766,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ep_size = dist.get_world_size(group=self.expert_model_parallel_group)
         gathered = torch.empty(ep_size, dtype=torch.int32, device="cuda")
         dist.all_gather_into_tensor(gathered, local_count, group=self.expert_model_parallel_group)
-        MoEAllGatherVTokenDispatcher.set_step_metadata(gathered, self.expert_model_parallel_group)
+        NVLSAllGatherVDispatcher.set_step_metadata(gathered, self.expert_model_parallel_group)
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""

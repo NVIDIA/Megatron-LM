@@ -500,6 +500,7 @@ class CUDAGraphBatchDimensionBuilder:
         strict: bool = False,
         decode_only_cuda_graphs: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        nvls_dispatcher: bool = False,
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -515,6 +516,10 @@ class CUDAGraphBatchDimensionBuilder:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            nvls_dispatcher: If True, the NVLS dispatcher is active and handles per-rank token
+                count variation internally via AGV/RSV — EP sync is skipped. If False (default),
+                the NCCL dispatcher is active and requires EP sync to ensure all ranks agree on
+                the same CUDA graph.
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """
@@ -523,21 +528,21 @@ class CUDAGraphBatchDimensionBuilder:
             # no need to match if no cuda graph batch dimensions are provided
             return None
 
-        # adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-        #     real_batch_dim,
-        #     strict=strict,
-        #     decode_only_cuda_graphs=decode_only_cuda_graphs,
-        #     ep_group=ep_group,
-        #     smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
-        # )
-
-        # if adjusted_batch_dim is None:
-        #     # we hit this scenario if decode_only_cuda_graphs is true,
-        #     # and one of the EP ranks is running a non-decode step
-        #     # in that case, all ranks have to run in eager mode
-        #     return None
-
-        adjusted_batch_dim = real_batch_dim
+        if not nvls_dispatcher and ep_group is not None:
+            # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
+            # across the EP group so graph selection is consistent. If any rank has a prefill
+            # step and decode_only_cuda_graphs is True, all ranks fall back to eager mode.
+            adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
+                real_batch_dim,
+                strict=strict,
+                decode_only_cuda_graphs=decode_only_cuda_graphs,
+                ep_group=ep_group,
+                smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
+            )
+            if adjusted_batch_dim is None:
+                return None
+        else:
+            adjusted_batch_dim = real_batch_dim
 
         # first filter out batch dimensions with smaller token count, prefill req count,
         # or decode req count, as they are not applicable

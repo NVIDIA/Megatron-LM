@@ -26,7 +26,8 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
-    MoEAllGatherVTokenDispatcher,
+    NCCLAllGatherDispatcher,
+    NVLSAllGatherVDispatcher,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -352,17 +353,19 @@ class MoELayer(BaseMoELayer):
         """Set up inference-optimized token dispatcher.
 
         Called from __init__ when config.transformer_impl == "inference_optimized".
-        Stores the training dispatcher and creates a MoEAllGatherVTokenDispatcher.
+        Stores the training dispatcher and creates the inference dispatcher selected
+        by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
         The active dispatcher is swapped automatically via the train() override:
-        eval mode → AGV dispatcher, train mode → standard dispatcher.
+        eval mode → inference dispatcher, train mode → standard dispatcher.
         """
+        dispatcher_type = self.config.inference_moe_token_dispatcher_type
+        if dispatcher_type == 'nvls':
+            dispatcher_cls = NVLSAllGatherVDispatcher
+        else:
+            dispatcher_cls = NCCLAllGatherDispatcher
 
-        assert self.config.moe_token_dispatcher_type == "alltoall", (
-            f"Inference-optimized MoE requires 'alltoall' dispatcher, "
-            f"got '{self.config.moe_token_dispatcher_type}'"
-        )
         self._training_token_dispatcher = self.token_dispatcher
-        self._inference_token_dispatcher = MoEAllGatherVTokenDispatcher(
+        self._inference_token_dispatcher = dispatcher_cls(
             self.num_local_experts,
             self.local_expert_indices,
             config=self.config,
