@@ -202,6 +202,7 @@ class GPTModel(LanguageModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                interleaved_mrope=self.config.mrope_interleaved,
             )
             self.mrope_section = self.config.mrope_section
             assert (

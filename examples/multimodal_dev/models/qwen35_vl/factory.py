@@ -19,6 +19,7 @@ def post_language_config(language_config, args):
     fields that cannot be expressed via CLI args alone.
     """
     language_config.mrope_section = list(MROPE_SECTION)
+    language_config.mrope_interleaved = True
 
 
 def set_vision_flops_metadata(args, language_config, vision_config):

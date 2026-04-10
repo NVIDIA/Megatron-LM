@@ -280,6 +280,9 @@ class MultimodalRotaryEmbedding(nn.Module):
             for longer sequences. The value must be a float larger than 1.0. Defaults to None
         rotary_base (int, optional): Base period for rotary position embeddings. Defaults to
             10000.
+        interleaved_mrope (bool, optional): If True, use the interleaved T/H/W MRoPE layout
+            (Qwen3.5-VL style). If False (default), use the original section-based layout
+            (Qwen2-VL style).
     """
 
     def __init__(
@@ -290,6 +293,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         seq_len_interpolation_factor: Optional[float] = None,
         rotary_base: int = 10000,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        interleaved_mrope: bool = False,
     ) -> None:
         super().__init__()
 
@@ -297,6 +301,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         if rotary_percent < 1.0:
             dim = int(dim * rotary_percent)
         self.rotary_interleaved = rotary_interleaved
+        self.interleaved_mrope = interleaved_mrope
 
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.inv_freq = 1.0 / (
@@ -361,19 +366,34 @@ class MultimodalRotaryEmbedding(nn.Module):
         # shape (3, bs, seq_length, dim)
         freqs = (inv_freq_expanded @ seq_expanded).transpose(2, 3)
 
-        # Merge T/H/W channels with interleaved layout: [T₀,H₀,W₀,T₁,H₁,W₁,...].
-        # freqs becomes shape (bs, seq_length, dim).
-        freqs = self._apply_interleaved_mrope(freqs, mrope_section)
-
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
-        if not self.rotary_interleaved:
-            emb = torch.cat((freqs, freqs), dim=-1)  # shape (bs, seq_length, 2 * dim)
+        if self.interleaved_mrope:
+            # Qwen3.5-VL: merge T/H/W with interleaved layout [T₀,H₀,W₀,T₁,H₁,W₁,...].
+            # freqs becomes shape (bs, seq_length, dim).
+            freqs = self._apply_interleaved_mrope(freqs, mrope_section)
+            if not self.rotary_interleaved:
+                emb = torch.cat((freqs, freqs), dim=-1)  # shape (bs, seq_length, 2 * dim)
+            else:
+                bs = freqs.shape[0]
+                emb = torch.stack(
+                    (freqs.view(bs, -1, 1), freqs.view(bs, -1, 1)), dim=-1
+                ).view(bs, freqs.shape[1], -1)
         else:
-            bs = freqs.shape[0]
-            emb = torch.stack(
-                (freqs.view(bs, -1, 1), freqs.view(bs, -1, 1)), dim=-1
-            ).view(bs, freqs.shape[1], -1)
+            # Original section-based layout (Qwen2-VL style).
+            if not self.rotary_interleaved:
+                emb = torch.cat((freqs, freqs), dim=-1)  # shape (3, bs, seq_length, 2 * dim)
+            else:
+                bs = freqs.shape[1]
+                emb = torch.stack(
+                    (freqs.view(3, bs, -1, 1), freqs.view(3, bs, -1, 1)), dim=-1
+                ).view(3, bs, freqs.shape[0], -1)
+            # generate freqs with mrope_section: cycle T/H/W per section chunk
+            mrope_section_doubled = list(mrope_section) * 2
+            emb = torch.cat(
+                [m[i % 3] for i, m in enumerate(emb.split(mrope_section_doubled, dim=-1))],
+                dim=-1,
+            )  # shape (bs, seq_length, 2 * dim)
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()

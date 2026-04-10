@@ -194,8 +194,9 @@ def get_qwen35_vl_language_config(
         apply_residual_connection_post_layernorm=False,
         gated_linear_unit=True,
         activation_func=torch.nn.functional.silu,
-        # MRoPE section
+        # MRoPE section (interleaved T/H/W layout, Qwen3.5-VL style)
         mrope_section=list(MROPE_SECTION),
+        mrope_interleaved=True,
         rotary_interleaved=False,
         # Attention
         qk_layernorm=True,
