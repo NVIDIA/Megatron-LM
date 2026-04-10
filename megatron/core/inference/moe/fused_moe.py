@@ -86,6 +86,7 @@ def mcore_fused_moe(
     activation_type: ActivationType,
     num_local_experts: int,
     local_expert_start: int,
+    valid_tokens: torch.Tensor,
     routing_map: Optional[torch.Tensor] = None,
     tokens_per_expert: Optional[torch.Tensor] = None,
     skip_permute: bool = False,
@@ -105,30 +106,36 @@ def mcore_fused_moe(
     kernel launches.
 
     Args:
-        hidden_states: [num_tokens, hidden_size] BF16 input.
-        probs: routing probabilities. Shape is [num_tokens, topk] when
-            skip_permute=False, or [num_tokens] (already gathered) when
+        hidden_states: [max_tokens, hidden_size] BF16 input. With AllGatherV,
+            max_tokens = max_local_tokens * ep_size and only the first valid_tokens
+            rows are valid. With the legacy path, max_tokens == valid_tokens.
+        probs: routing probabilities. Shape is [max_tokens, topk] when
+            skip_permute=False, or [max_tokens] (already gathered) when
             skip_permute=True.
         fc1_weight: stacked weight for FC1 (torch.Tensor for BF16, MXFP8Tensor for MXFP8).
         fc2_weight: stacked weight for FC2 (same type as fc1_weight).
         activation_type: ActivationType enum (SQUARED_RELU).
         num_local_experts: number of experts on this rank.
         local_expert_start: first global expert index on this rank.
-        routing_map: [num_tokens, topk] int expert assignments. Required when skip_permute=False.
+        routing_map: [max_tokens, topk] int expert assignments. Required when skip_permute=False.
         tokens_per_expert: [num_local_experts] int32 token counts. Required when skip_permute=True.
+        valid_tokens: scalar int32 CUDA tensor holding the number of valid tokens this
+            iteration. Kernels use this to ignore rows beyond the valid prefix — required
+            for CUDA graph compatibility since hidden_states is always max-sized.
         skip_permute: if True, skip permute/unpermute (tokens already in expert order).
         disable_fused_quant_kernels: if True, disable fused permute+quantize and
             activation+quantize kernels for MXFP8, using separate launches instead.
             Useful for debugging. Ignored when weights are BF16.
 
     Returns:
-        [num_tokens, hidden_size] BF16 output.
+        [max_tokens, hidden_size] BF16 output. Only the first valid_tokens rows are
+        meaningful; rows beyond that are undefined.
     """
     assert (
         hidden_states.dtype == torch.bfloat16
     ), f"mcore_fused_moe requires bf16 input, got {hidden_states.dtype}"
 
-    num_tokens = hidden_states.shape[0]
+    max_tokens = hidden_states.shape[0]
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     # Fused quant kernels only apply to MXFP8 path
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
@@ -157,7 +164,7 @@ def mcore_fused_moe(
         tokens_per_expert = tokens_per_expert.cuda().int()
         assert routing_map is None, "routing_map must be None when skip_permute=True"
         hidden_states, permutation_map, offs = pad_to_alignment(
-            hidden_states, tokens_per_expert, expert_alignment
+            hidden_states, tokens_per_expert, expert_alignment, valid_tokens
         )
         permuted_probs = None
 
@@ -171,6 +178,7 @@ def mcore_fused_moe(
                 routing_map,
                 local_expert_start,
                 num_local_experts,
+                valid_tokens,
                 alignment=expert_alignment,
             )
         else:
@@ -180,6 +188,7 @@ def mcore_fused_moe(
                 routing_map,
                 local_expert_start,
                 num_local_experts,
+                valid_tokens,
                 alignment=expert_alignment,
             )
 
@@ -191,7 +200,11 @@ def mcore_fused_moe(
         hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
     fc1_output = mm_fn(hidden_states, fc1_weight, offs)
 
-    activation_out = activation_func(fc1_output, permutation_map)
+    # offs[-1:] is a 1-element view pointing to inclusive_expert_offsets[-1] — the total
+    # number of rows actually used by experts this iteration (valid tokens + alignment
+    # padding within expert blocks). Passed to activation and unpermute to skip unused rows.
+    n_used = offs[-1:]
+    activation_out = activation_func(fc1_output, permutation_map, n_used)
     # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.
     if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
         activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
@@ -199,6 +212,6 @@ def mcore_fused_moe(
     # --- Post-processing: unpermute or unpad ---
     if skip_permute:
         probs_1d = probs.squeeze(-1) if probs.dim() > 1 else probs
-        return unpad_from_alignment(fc2_output, permutation_map, num_tokens, probs=probs_1d)
+        return unpad_from_alignment(fc2_output, permutation_map, max_tokens, probs=probs_1d)
     else:
-        return unpermute_tokens(fc2_output, permuted_probs, permutation_map, num_tokens)
+        return unpermute_tokens(fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens)

@@ -30,9 +30,17 @@ def _ceil_div(a, b):
 
 
 @triton.jit
-def _squared_relu_kernel(input_ptr, output_ptr, src_idx_ptr, M, N, BLOCK_N: tl.constexpr):
-    """Squared ReLU that skips padding rows (permutation_map == -1)."""
+def _squared_relu_kernel(
+    input_ptr, output_ptr, src_idx_ptr, n_used_ptr, N, BLOCK_N: tl.constexpr
+):
+    """Squared ReLU that skips rows beyond n_used and alignment-padding rows (perm_map == -1).
+
+    Grid is launched at max output_size; n_used_ptr gates how many rows are processed.
+    """
     row = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if row >= n_used:
+        return
     if tl.load(src_idx_ptr + row) < 0:
         return
     for n in tl.range(0, N, BLOCK_N):
@@ -43,12 +51,20 @@ def _squared_relu_kernel(input_ptr, output_ptr, src_idx_ptr, M, N, BLOCK_N: tl.c
         tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
 
 
-def padded_squared_relu(x: torch.Tensor, permutation_map: torch.Tensor) -> torch.Tensor:
-    """Squared ReLU activation that skips padding rows."""
+def padded_squared_relu(
+    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
+) -> torch.Tensor:
+    """Squared ReLU activation that skips rows beyond n_used and alignment-padding rows.
+
+    Args:
+        x: [output_size, ffn_hidden] BF16 FC1 output.
+        permutation_map: [output_size] int32, original token index or -1 for padding.
+        n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
+    """
     M, N = x.shape
     out = torch.zeros(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
-    _squared_relu_kernel[(M,)](x, out, permutation_map, M, N, BLOCK_N=BLOCK_N)
+    _squared_relu_kernel[(M,)](x, out, permutation_map, n_used, N, BLOCK_N=BLOCK_N)
     return out
 
 
@@ -58,23 +74,24 @@ def _squared_relu_quantize_kernel(
     out_fp8_ptr,
     out_scale_ptr,
     src_idx_ptr,
+    n_used_ptr,  # pointer to inclusive_expert_offsets[-1]: number of used rows this iteration
     K,
     n_col_blocks,
-    skip_padding: tl.constexpr,
     REAL_GROUPS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
 ):
     """Fused squared ReLU + MXFP8 quantize + swizzle in one kernel.
 
-    Grid: (M,) — one program per row.
-    Reads BF16 FC1 output, applies squared ReLU, quantizes to FP8,
-    writes FP8 data + swizzled scales in place.
+    Grid: (M,) — one program per row, launched at max output_size.
+    Rows beyond n_used and alignment-padding rows (perm_map == -1) are skipped.
     """
     row = tl.program_id(0)
-    if skip_padding:
-        if tl.load(src_idx_ptr + row) < 0:
-            return
+    n_used = tl.load(n_used_ptr)
+    if row >= n_used:
+        return
+    if tl.load(src_idx_ptr + row) < 0:
+        return
 
     offs = tl.arange(0, BLOCK_K)
     mask = offs < K
@@ -119,7 +136,7 @@ def _squared_relu_quantize_kernel(
 
 
 def squared_relu_and_quantize_mxfp8(
-    x: torch.Tensor, permutation_map: torch.Tensor, skip_padding: bool = True
+    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
 ):
     """Fused squared ReLU + MXFP8 quantize + swizzle.
 
@@ -127,12 +144,13 @@ def squared_relu_and_quantize_mxfp8(
     swizzled scales. Single kernel replaces padded_squared_relu + mxfp8_quantize.
 
     Args:
-        x: [M, K] BF16 FC1 output.
-        permutation_map: [M] int32, original token index or -1 for padding.
-        skip_padding: if True, skip rows where permutation_map == -1.
+        x: [output_size, K] BF16 FC1 output.
+        permutation_map: [output_size] int32, original token index or -1 for padding.
+        n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1]. Rows beyond
+            this are skipped before even checking the permutation_map.
 
     Returns:
-        MXFP8Tensor with .data [M, K] float8_e4m3fn and .scale (swizzled e8m0).
+        MXFP8Tensor with .data [output_size, K] float8_e4m3fn and .scale (swizzled e8m0).
     """
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
@@ -155,9 +173,9 @@ def squared_relu_and_quantize_mxfp8(
         out_fp8,
         out_scale,
         permutation_map,
+        n_used,
         K,
         n_col_blocks,
-        skip_padding,
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,

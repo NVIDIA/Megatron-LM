@@ -39,6 +39,7 @@ def _pad_tokens_kernel(
     dst_ptr,
     perm_map_ptr,
     tpe_ptr,  # tokens_per_expert [num_experts]
+    valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     hidden_dim,
     num_experts: tl.constexpr,
     alignment: tl.constexpr,
@@ -48,8 +49,14 @@ def _pad_tokens_kernel(
 
     Computes unpadded and padded cumulative offsets inline from
     tokens_per_expert, avoiding a separate cumsum kernel launch.
+
+    Grid is launched at max size (max_tokens); rows beyond valid_tokens exit
+    immediately — required for CUDA graph compatibility.
     """
     row = tl.program_id(0)
+    valid_tokens = tl.load(valid_tokens_ptr)
+    if row >= valid_tokens:
+        return
 
     # Walk tokens_per_expert to find which expert this row belongs to
     # and compute both unpadded and padded start offsets on the fly.
@@ -90,14 +97,20 @@ def _pad_tokens_kernel(
 
 
 def pad_to_alignment(
-    hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor, alignment: int
+    hidden_states: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    alignment: int,
+    valid_tokens: torch.Tensor,
 ) -> tuple:
     """Pad already-permuted tokens so each expert's block is aligned.
 
     Args:
-        hidden_states: [total_tokens, hidden_size] already permuted by dispatcher.
+        hidden_states: [max_tokens, hidden_size] already permuted by dispatcher.
+            Only the first valid_tokens rows are valid; the rest are ignored.
         tokens_per_expert: [num_local_experts] int32 token counts.
         alignment: per-expert alignment.
+        valid_tokens: scalar int32 CUDA tensor with the number of valid tokens this
+            iteration. Fixed address; value updated each step before graph replay.
 
     Returns:
         (padded_hidden, permutation_map, inclusive_offsets)
@@ -106,7 +119,7 @@ def pad_to_alignment(
         - inclusive_offsets: [num_local_experts] int32 cumulative aligned offsets for grouped_mm.
     """
     num_experts = tokens_per_expert.shape[0]
-    total_tokens = hidden_states.shape[0]
+    max_tokens = hidden_states.shape[0]
     hidden_dim = hidden_states.shape[1]
 
     # We still need padded_inc for the return value (used as offs by grouped_mm)
@@ -120,13 +133,15 @@ def pad_to_alignment(
         (padded_total,), -1, dtype=torch.int32, device=hidden_states.device
     )
 
-    if total_tokens > 0:
+    if max_tokens > 0:
         BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
-        _pad_tokens_kernel[(total_tokens,)](
+        # Grid is max_tokens (fixed); kernel exits early for rows >= valid_tokens.
+        _pad_tokens_kernel[(max_tokens,)](
             hidden_states,
             padded_hidden,
             permutation_map,
             tokens_per_expert,
+            valid_tokens,
             hidden_dim,
             num_experts,
             alignment,
