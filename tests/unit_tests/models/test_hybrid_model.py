@@ -610,9 +610,7 @@ class TestHybridModelWithYarn:
             inference_context.sequence_len_offset = offset
 
             data = list(range(sequence_length))
-            input_ids = (
-                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-            )
+            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
             position_ids = (
                 torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
             )
