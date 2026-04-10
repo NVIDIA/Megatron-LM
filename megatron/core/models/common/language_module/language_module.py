@@ -352,6 +352,10 @@ class LanguageModule(MegatronModule):
             position_ids=position_ids,
             embedding=self.embedding,
         )
+        # CudaGraphManager.replay_graph_capture always wraps outputs in a
+        # tuple.  Unwrap when forward_single_position is CUDA-graphed.
+        if isinstance(mtp_hidden, tuple):
+            mtp_hidden = mtp_hidden[0]
         nvtx_range_pop(f"mtp-single-step/depth-{depth}/mtp-layer")
 
         output_weight = None
