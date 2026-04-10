@@ -87,7 +87,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     return parser
 
 def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
-    # Parse arguments
     args = parse_args(extra_args_provider, ignore_unknown_args)
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
