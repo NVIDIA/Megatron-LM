@@ -12,7 +12,7 @@ from megatron.core.utils import is_te_min_version, nvtx_decorator
 try:
     import transformer_engine  # pylint: disable=unused-import
     import transformer_engine_torch as tex
-    from transformer_engine.pytorch import Float8CurrentScalingQuantizer
+    from transformer_engine.pytorch.tensor.float8_tensor import Float8CurrentScalingQuantizer
 
     HAVE_TE = is_te_min_version("2.2.0.dev0")
 
