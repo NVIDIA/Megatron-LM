@@ -182,46 +182,49 @@ def _permute_tokens_kernel(
     out_hidden_ptr,  # [output_size, hidden_dim] output: permuted hidden states
     out_probs_ptr,  # [output_size] output: permuted probabilities
     out_src_idx_ptr,  # [output_size] output: permutation_map (original token index, -1 for padding)
-    counters_ptr,  # [num_local_experts] exclusive offsets,
-    # atomically incremented to assign positions
+    counters_ptr,  # [num_local_experts] exclusive offsets, atomically incremented
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     hidden_dim,  # hidden dimension
+    max_pairs,  # max_tokens * topk (fixed for CG)
     topk: tl.constexpr,  # number of expert choices per token
     local_expert_start,  # first global expert index on this rank
     num_local_experts: tl.constexpr,  # number of experts on this rank
     BLOCK_H: tl.constexpr,  # tile size for copying hidden_dim
+    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
     """Permute tokens into expert-grouped order.
 
-    Grid: one program per (token, topk) pair, launched at max size (max_tokens * topk).
-    Programs beyond valid_tokens exit immediately — required for CUDA graph compatibility.
+    Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple (token, topk) pairs.
+    valid_tokens gates which pairs are actually processed — required for CUDA graph
+    compatibility since the grid size never changes across steps.
     """
-    # Each program handles one (token, topk) pair
-    pair = tl.program_id(0)
-    tok = pair // topk
-    k = pair % topk
+    pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    if tok >= valid_tokens:
+    valid_pairs = valid_tokens * topk
+    if pid >= valid_pairs:
         return
-    eid = tl.load(routing_map_ptr + tok * topk + k)
-    lid = eid - local_expert_start
-    # Skip tokens routed to non-local experts
-    if lid < 0 or lid >= num_local_experts:
-        return
-    # Atomically claim a position within this expert's aligned block
-    pos = tl.atomic_add(counters_ptr + lid, 1)
-    # Copy hidden state row
-    for h in tl.range(0, hidden_dim, BLOCK_H):
-        o = h + tl.arange(0, BLOCK_H)
-        m = o < hidden_dim
-        tl.store(
-            out_hidden_ptr + pos * hidden_dim + o,
-            tl.load(hidden_ptr + tok * hidden_dim + o, mask=m),
-            mask=m,
-        )
-    tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
-    # Record source token index for unpermute
-    tl.store(out_src_idx_ptr + pos, tok)
+    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
+        tok = pair // topk
+        if tok < valid_tokens:    
+            k = pair % topk
+            eid = tl.load(routing_map_ptr + tok * topk + k)
+            lid = eid - local_expert_start
+            # Skip tokens routed to non-local experts
+            if lid >= 0 and lid < num_local_experts:
+                # Atomically claim a position within this expert's aligned block
+                pos = tl.atomic_add(counters_ptr + lid, 1)
+                # Copy hidden state row
+                for h in tl.range(0, hidden_dim, BLOCK_H):
+                    o = h + tl.arange(0, BLOCK_H)
+                    m = o < hidden_dim
+                    tl.store(
+                        out_hidden_ptr + pos * hidden_dim + o,
+                        tl.load(hidden_ptr + tok * hidden_dim + o, mask=m),
+                        mask=m,
+                    )
+                tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
+                # Record source token index for unpermute
+                tl.store(out_src_idx_ptr + pos, tok)
 
 
 def permute_tokens(
@@ -286,7 +289,9 @@ def permute_tokens(
     # by the same inclusive_expert_offsets[-1] pointer so they never read beyond n_used.
     init_permutation_map(permutation_map, inclusive_expert_offsets[-1:])
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
-    _permute_tokens_kernel[(max_tokens * topk,)](
+    max_pairs = max_tokens * topk
+    NUM_BLOCKS = min(max_pairs, 512)
+    _permute_tokens_kernel[(NUM_BLOCKS,)](
         hidden_states,
         probs,
         routing_map,
@@ -296,10 +301,12 @@ def permute_tokens(
         exclusive_expert_offsets,
         valid_tokens,
         hidden_dim,
+        max_pairs,
         topk,
         local_expert_start,
         num_local_experts,
         BLOCK_H=BLOCK_H,
+        NUM_BLOCKS=NUM_BLOCKS,
     )
     return permuted_hidden, permuted_probs, permutation_map, inclusive_expert_offsets
 
@@ -309,22 +316,26 @@ def _zero_output_rows_kernel(
     output_ptr,       # [num_tokens, hidden_dim] fp32 buffer to partially zero
     valid_tokens_ptr, # scalar int32 CUDA tensor: number of rows to zero
     hidden_dim,       # hidden dimension
+    num_tokens,       # max token count (fixed for CG)
     BLOCK_H: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
     """Zero rows [0, valid_tokens) of the fp32 output buffer.
 
-    Grid is launched at num_tokens (max, fixed for CG); rows >= valid_tokens
-    exit immediately so the grid size never changes across steps.
+    Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
+    valid_tokens gates which rows are zeroed — required for CUDA graph compatibility.
     """
-    row = tl.program_id(0)
+    pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    if row >= valid_tokens:
+    if pid >= valid_tokens:
         return
     zero = tl.zeros([BLOCK_H], dtype=tl.float32)
-    for h in tl.range(0, hidden_dim, BLOCK_H):
-        o = h + tl.arange(0, BLOCK_H)
-        m = o < hidden_dim
-        tl.store(output_ptr + row * hidden_dim + o, zero, mask=m)
+    for row in tl.range(pid, num_tokens, NUM_BLOCKS):
+        if row < valid_tokens:
+            for h in tl.range(0, hidden_dim, BLOCK_H):
+                o = h + tl.arange(0, BLOCK_H)
+                m = o < hidden_dim
+                tl.store(output_ptr + row * hidden_dim + o, zero, mask=m)
 
 
 @triton.jit
@@ -335,30 +346,33 @@ def _unpermute_tokens_kernel(
     output_ptr,  # [max_tokens, hidden_dim] fp32 output buffer (zeroed by caller)
     n_used_ptr,  # pointer to inclusive_expert_offsets[-1]: number of used rows this iteration
     hidden_dim,  # hidden dimension
+    max_rows,    # output_size (fixed for CG)
     BLOCK_H: tl.constexpr,  # tile size for processing hidden_dim
+    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
     """Scatter weighted expert outputs back to original token positions.
 
-    Grid is launched at max output_size; rows beyond n_used exit immediately.
-    Padding rows within n_used (src_idx == -1) are also skipped. Multiple topk
-    selections for the same token are accumulated via atomic adds. All arithmetic
-    is in fp32 to avoid precision loss.
+    Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
+    Rows beyond n_used and alignment-padding rows (src_idx == -1) are skipped.
+    Multiple topk selections for the same token are accumulated via atomic adds.
+    All arithmetic is in fp32 to avoid precision loss.
     """
-    row = tl.program_id(0)
+    pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
-    if row >= n_used:
+    if pid >= n_used:
         return
-    source_idx = tl.load(src_idx_ptr + row)
-    # Skip alignment-padding rows within the used range
-    if source_idx < 0:
-        return
-    prob = tl.load(probs_ptr + row)  # fp32
-    for h in tl.range(0, hidden_dim, BLOCK_H):
-        offsets = h + tl.arange(0, BLOCK_H)
-        m = offsets < hidden_dim
-        # Upcast bf16 expert output to fp32 before multiply + accumulate
-        v = tl.load(expert_out_ptr + row * hidden_dim + offsets, mask=m).to(tl.float32)
-        tl.atomic_add(output_ptr + source_idx * hidden_dim + offsets, v * prob, mask=m)
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            source_idx = tl.load(src_idx_ptr + row)
+            # Skip alignment-padding rows within the used range
+            if source_idx >= 0:
+                prob = tl.load(probs_ptr + row)  # fp32
+                for h in tl.range(0, hidden_dim, BLOCK_H):
+                    offsets = h + tl.arange(0, BLOCK_H)
+                    m = offsets < hidden_dim
+                    # Upcast bf16 expert output to fp32 before multiply + accumulate
+                    v = tl.load(expert_out_ptr + row * hidden_dim + offsets, mask=m).to(tl.float32)
+                    tl.atomic_add(output_ptr + source_idx * hidden_dim + offsets, v * prob, mask=m)
 
 
 def unpermute_tokens(
@@ -396,9 +410,14 @@ def unpermute_tokens(
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     if out is None:
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
-    _zero_output_rows_kernel[(num_tokens,)](out, valid_tokens, hidden_dim, BLOCK_H=BLOCK_H)
-    _unpermute_tokens_kernel[(output_size,)](
-        expert_output, permuted_probs, permutation_map, out, n_used, hidden_dim, BLOCK_H=BLOCK_H
+    NUM_BLOCKS_ZERO = min(num_tokens, 512)
+    _zero_output_rows_kernel[(NUM_BLOCKS_ZERO,)](
+        out, valid_tokens, hidden_dim, num_tokens, BLOCK_H=BLOCK_H, NUM_BLOCKS=NUM_BLOCKS_ZERO
+    )
+    NUM_BLOCKS = min(output_size, 512)
+    _unpermute_tokens_kernel[(NUM_BLOCKS,)](
+        expert_output, permuted_probs, permutation_map, out, n_used, hidden_dim, output_size,
+        BLOCK_H=BLOCK_H, NUM_BLOCKS=NUM_BLOCKS,
     )
     return out
 

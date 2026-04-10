@@ -393,7 +393,8 @@ def multimem_all_gather_v(
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather-v."
     assert input_tensor.ndim == 2 and output_tensor.ndim == 2, (
-        "input_tensor and output_tensor must be 2-D [tokens, hidden_size]."
+        f"input_tensor and output_tensor must be 2-D [tokens, hidden_size], "
+        f"got input_tensor.shape={input_tensor.shape}, output_tensor.shape={output_tensor.shape}."
     )
     assert is_device_nvls_capable(
         input_tensor.device

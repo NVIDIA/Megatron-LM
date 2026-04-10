@@ -1649,6 +1649,35 @@ class TextGenerationController:
         # clear the context of any temporary state from the dummy forward
         context.reset()
 
+    def _agv_dummy_forward(self):
+        """Dummy forward for MoEAllGatherVTokenDispatcher (AGV path).
+
+        Uses initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+        to populate dummy requests for the smallest decode-only CUDA graph.
+        This sets padded_active_token_count correctly so the EP all-gather in
+        _update_moe_dispatcher_metadata uses the right token count, matching what
+        the real ranks contribute. Then replays that CUDA graph.
+
+        Falls back to eager dummy_forward if no CUDA graphs are available.
+
+        NOTE: MTP dummy forward is not yet handled here.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        if not context.cuda_graph_batch_dimensions_list:
+            self.inference_wrapped_model.dummy_forward()
+            return
+
+        # this is running the AGV dummy forward with the smallest decode-only CUDA graph.
+        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+
+        if context.using_cuda_graph_this_step():
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+        else:
+            self.inference_wrapped_model.dummy_forward()
+
+        context.reset()
+
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
         """Run dummy MTP forward passes to participate in EP collectives.

@@ -523,19 +523,21 @@ class CUDAGraphBatchDimensionBuilder:
             # no need to match if no cuda graph batch dimensions are provided
             return None
 
-        adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-            real_batch_dim,
-            strict=strict,
-            decode_only_cuda_graphs=decode_only_cuda_graphs,
-            ep_group=ep_group,
-            smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
-        )
+        # adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
+        #     real_batch_dim,
+        #     strict=strict,
+        #     decode_only_cuda_graphs=decode_only_cuda_graphs,
+        #     ep_group=ep_group,
+        #     smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
+        # )
 
-        if adjusted_batch_dim is None:
-            # we hit this scenario if decode_only_cuda_graphs is true,
-            # and one of the EP ranks is running a non-decode step
-            # in that case, all ranks have to run in eager mode
-            return None
+        # if adjusted_batch_dim is None:
+        #     # we hit this scenario if decode_only_cuda_graphs is true,
+        #     # and one of the EP ranks is running a non-decode step
+        #     # in that case, all ranks have to run in eager mode
+        #     return None
+
+        adjusted_batch_dim = real_batch_dim
 
         # first filter out batch dimensions with smaller token count, prefill req count,
         # or decode req count, as they are not applicable

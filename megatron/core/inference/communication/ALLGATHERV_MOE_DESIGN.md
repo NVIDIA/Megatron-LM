@@ -237,7 +237,7 @@ The existing `MoEAlltoAllTokenDispatcher` has convoluted EP sync points in the i
 | 2 | Expert index dtype? | **Resolved: int64** |
 | 3 | Preprocessing in model CUDA graph? | **Resolved: outside graph, on-device kernel, fixed tensors** |
 | 4 | Metadata propagation mechanism? | **Resolved: `classmethod set_metadata` on dispatcher** |
-| 5 | `multimem_reduce_scatter_v` kernel design? | Not started. |
+| 5 | `multimem_reduce_scatter_v` kernel design? | **Resolved: implemented, 10/10 tests passing.** |
 | 6 | What does the new dispatcher inherit from? | TBD. |
 | 7 | CUDA graph capture strategy (ep sync points)? | Deferred. |
 | 8 | 64-bit multicast store (`multimem.st v2.f32`) verified on Blackwell? | **Resolved: verified, all tests pass.** |

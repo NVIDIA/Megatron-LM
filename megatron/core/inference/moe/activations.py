@@ -31,24 +31,33 @@ def _ceil_div(a, b):
 
 @triton.jit
 def _squared_relu_kernel(
-    input_ptr, output_ptr, src_idx_ptr, n_used_ptr, N, BLOCK_N: tl.constexpr
+    input_ptr,
+    output_ptr,
+    src_idx_ptr,
+    n_used_ptr,
+    N,
+    max_rows,       # output_size (fixed for CG)
+    BLOCK_N: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
     """Squared ReLU that skips rows beyond n_used and alignment-padding rows (perm_map == -1).
 
-    Grid is launched at max output_size; n_used_ptr gates how many rows are processed.
+    Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
+    n_used_ptr gates how many rows are processed — required for CUDA graph compatibility.
     """
-    row = tl.program_id(0)
+    pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
-    if row >= n_used:
+    if pid >= n_used:
         return
-    if tl.load(src_idx_ptr + row) < 0:
-        return
-    for n in tl.range(0, N, BLOCK_N):
-        o = n + tl.arange(0, BLOCK_N)
-        m = o < N
-        x = tl.load(input_ptr + row * N + o, mask=m).to(tl.float32)
-        r = tl.maximum(x, 0.0)
-        tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            if tl.load(src_idx_ptr + row) >= 0:
+                for n in tl.range(0, N, BLOCK_N):
+                    o = n + tl.arange(0, BLOCK_N)
+                    m = o < N
+                    x = tl.load(input_ptr + row * N + o, mask=m).to(tl.float32)
+                    r = tl.maximum(x, 0.0)
+                    tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
 
 
 def padded_squared_relu(
@@ -62,9 +71,12 @@ def padded_squared_relu(
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
     """
     M, N = x.shape
-    out = torch.zeros(M, N, dtype=x.dtype, device=x.device)
+    out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
-    _squared_relu_kernel[(M,)](x, out, permutation_map, n_used, N, BLOCK_N=BLOCK_N)
+    NUM_BLOCKS = min(M, 512)
+    _squared_relu_kernel[(NUM_BLOCKS,)](
+        x, out, permutation_map, n_used, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+    )
     return out
 
 
@@ -77,62 +89,64 @@ def _squared_relu_quantize_kernel(
     n_used_ptr,  # pointer to inclusive_expert_offsets[-1]: number of used rows this iteration
     K,
     n_col_blocks,
+    max_rows,       # output_size (fixed for CG)
     REAL_GROUPS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
     """Fused squared ReLU + MXFP8 quantize + swizzle in one kernel.
 
-    Grid: (M,) — one program per row, launched at max output_size.
+    Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
     Rows beyond n_used and alignment-padding rows (perm_map == -1) are skipped.
     """
-    row = tl.program_id(0)
+    pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
-    if row >= n_used:
+    if pid >= n_used:
         return
-    if tl.load(src_idx_ptr + row) < 0:
-        return
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            if tl.load(src_idx_ptr + row) >= 0:
+                offs = tl.arange(0, BLOCK_K)
+                mask = offs < K
 
-    offs = tl.arange(0, BLOCK_K)
-    mask = offs < K
+                # Load and apply squared ReLU
+                x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
+                relu = tl.maximum(x, 0.0)
+                activated = relu * relu
 
-    # Load and apply squared ReLU
-    x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
-    relu = tl.maximum(x, 0.0)
-    activated = relu * relu
+                # Per-group-of-32 quantization
+                x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])
+                abs_grouped = tl.abs(x_grouped)
+                max_vals = tl.max(abs_grouped, axis=1)
 
-    # Per-group-of-32 quantization
-    x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])
-    abs_grouped = tl.abs(x_grouped)
-    max_vals = tl.max(abs_grouped, axis=1)
+                dequant_scale = max_vals / 448.0
+                dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+                dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+                quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
 
-    dequant_scale = max_vals / 448.0
-    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+                quantized = x_grouped * quant_scale[:, None]
+                quantized_flat = tl.reshape(quantized, [BLOCK_K])
+                out_fp8 = quantized_flat.to(tl.float8e4nv)
 
-    quantized = x_grouped * quant_scale[:, None]
-    quantized_flat = tl.reshape(quantized, [BLOCK_K])
-    out_fp8 = quantized_flat.to(tl.float8e4nv)
+                # Store FP8 data
+                tl.store(out_fp8_ptr + row * K + offs, out_fp8, mask=mask)
 
-    # Store FP8 data
-    tl.store(out_fp8_ptr + row * K + offs, out_fp8, mask=mask)
+                # Store swizzled scales
+                scale_exp = (dequant_exp >> 23).to(tl.uint8)
+                col_offs = tl.arange(0, BLOCK_GROUPS)
+                col_mask = col_offs < REAL_GROUPS
 
-    # Store swizzled scales
-    scale_exp = (dequant_exp >> 23).to(tl.uint8)
-    col_offs = tl.arange(0, BLOCK_GROUPS)
-    col_mask = col_offs < REAL_GROUPS
+                macro_row_block = row // 128
+                macro_col_block = col_offs // 4
+                local_row = row % 128
+                local_col = col_offs % 4
+                group = local_row // 32
+                sub_row = local_row % 32
+                tile_idx = macro_row_block * n_col_blocks + macro_col_block
+                swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
 
-    macro_row_block = row // 128
-    macro_col_block = col_offs // 4
-    local_row = row % 128
-    local_col = col_offs % 4
-    group = local_row // 32
-    sub_row = local_row % 32
-    tile_idx = macro_row_block * n_col_blocks + macro_col_block
-    swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
-
-    tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+                tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
 
 
 def squared_relu_and_quantize_mxfp8(
@@ -167,8 +181,9 @@ def squared_relu_and_quantize_mxfp8(
 
     BLOCK_K = triton.next_power_of_2(K)
     BLOCK_GROUPS = BLOCK_K // 32
+    NUM_BLOCKS = min(M, 512)
 
-    _squared_relu_quantize_kernel[(M,)](
+    _squared_relu_quantize_kernel[(NUM_BLOCKS,)](
         x,
         out_fp8,
         out_scale,
@@ -176,9 +191,11 @@ def squared_relu_and_quantize_mxfp8(
         n_used,
         K,
         n_col_blocks,
+        M,
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,
+        NUM_BLOCKS=NUM_BLOCKS,
     )
 
     return MXFP8Tensor(data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), backend="triton")

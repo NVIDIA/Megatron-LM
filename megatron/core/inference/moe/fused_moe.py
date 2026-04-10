@@ -6,7 +6,7 @@ All permutation logic is handled internally — callers invoke a single function
 """
 
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 
@@ -14,7 +14,6 @@ from megatron.core.inference.moe.activations import (
     padded_squared_relu,
     squared_relu_and_quantize_mxfp8,
 )
-from megatron.core.inference.moe.pad import pad_to_alignment, unpad_from_alignment
 from megatron.core.inference.moe.permute import (
     permute_and_quantize_mxfp8,
     permute_tokens,
@@ -87,42 +86,28 @@ def mcore_fused_moe(
     num_local_experts: int,
     local_expert_start: int,
     valid_tokens: torch.Tensor,
-    routing_map: Optional[torch.Tensor] = None,
-    tokens_per_expert: Optional[torch.Tensor] = None,
-    skip_permute: bool = False,
+    routing_map: torch.Tensor,
     disable_fused_quant_kernels: bool = False,
 ) -> torch.Tensor:
-    """Fused MoE: [permute ->] pad -> FC1 -> activation -> FC2 -> unpad [-> unpermute].
-
-    Two modes:
-    - skip_permute=False (default): tokens are unpermuted. Requires routing_map.
-      Performs full permute -> compute -> unpermute.
-    - skip_permute=True: tokens are already permuted by the dispatcher. Requires
-      tokens_per_expert. Pads to alignment, computes, then unpads. Probs are
-      applied during unpad.
+    """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
     Unless disable_fused_quant_kernels=True, when weights are MXFP8, uses fused
     kernels that combine permute/activation with MXFP8 quantization into single
     kernel launches.
 
     Args:
-        hidden_states: [max_tokens, hidden_size] BF16 input. With AllGatherV,
-            max_tokens = max_local_tokens * ep_size and only the first valid_tokens
-            rows are valid. With the legacy path, max_tokens == valid_tokens.
-        probs: routing probabilities. Shape is [max_tokens, topk] when
-            skip_permute=False, or [max_tokens] (already gathered) when
-            skip_permute=True.
+        hidden_states: [max_tokens, hidden_size] BF16 input. max_tokens =
+            max_local_tokens * ep_size; only the first valid_tokens rows are valid.
+        probs: [max_tokens, topk] routing probabilities.
         fc1_weight: stacked weight for FC1 (torch.Tensor for BF16, MXFP8Tensor for MXFP8).
         fc2_weight: stacked weight for FC2 (same type as fc1_weight).
         activation_type: ActivationType enum (SQUARED_RELU).
         num_local_experts: number of experts on this rank.
         local_expert_start: first global expert index on this rank.
-        routing_map: [max_tokens, topk] int expert assignments. Required when skip_permute=False.
-        tokens_per_expert: [num_local_experts] int32 token counts. Required when skip_permute=True.
         valid_tokens: scalar int32 CUDA tensor holding the number of valid tokens this
             iteration. Kernels use this to ignore rows beyond the valid prefix — required
             for CUDA graph compatibility since hidden_states is always max-sized.
-        skip_permute: if True, skip permute/unpermute (tokens already in expert order).
+        routing_map: [max_tokens, topk] int expert assignments.
         disable_fused_quant_kernels: if True, disable fused permute+quantize and
             activation+quantize kernels for MXFP8, using separate launches instead.
             Useful for debugging. Ignored when weights are BF16.
@@ -158,45 +143,33 @@ def mcore_fused_moe(
 
     activation_func = _get_activation_func(activation_type, fused_quant=use_fused_quant)
 
-    # --- Pre-processing: permute or pad ---
-    if skip_permute:
-        assert tokens_per_expert is not None, "tokens_per_expert is required when skip_permute=True"
-        tokens_per_expert = tokens_per_expert.cuda().int()
-        assert routing_map is None, "routing_map must be None when skip_permute=True"
-        hidden_states, permutation_map, offs = pad_to_alignment(
-            hidden_states, tokens_per_expert, expert_alignment, valid_tokens
+    # --- Pre-processing: permute ---
+    if use_fused_quant:
+        # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
+        hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
+            hidden_states,
+            probs,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            valid_tokens,
+            alignment=expert_alignment,
         )
-        permuted_probs = None
-
     else:
-        assert routing_map is not None, "routing_map is required when skip_permute=False"
-        if use_fused_quant:
-            # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
-            hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
-                hidden_states,
-                probs,
-                routing_map,
-                local_expert_start,
-                num_local_experts,
-                valid_tokens,
-                alignment=expert_alignment,
-            )
-        else:
-            hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
-                hidden_states,
-                probs,
-                routing_map,
-                local_expert_start,
-                num_local_experts,
-                valid_tokens,
-                alignment=expert_alignment,
-            )
+        hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
+            hidden_states,
+            probs,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            valid_tokens,
+            alignment=expert_alignment,
+        )
 
     # --- FC1 -> activation -> FC2 ---
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
-    # produces MXFP8Tensor directly; skip_permute path always needs separate quant).
-    needs_quant = use_mxfp8 and not isinstance(hidden_states, MXFP8Tensor)
-    if needs_quant:
+    # produces MXFP8Tensor directly).
+    if use_mxfp8 and not isinstance(hidden_states, MXFP8Tensor):
         hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
     fc1_output = mm_fn(hidden_states, fc1_weight, offs)
 
@@ -209,9 +182,15 @@ def mcore_fused_moe(
     if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
         activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
-    # --- Post-processing: unpermute or unpad ---
-    if skip_permute:
-        probs_1d = probs.squeeze(-1) if probs.dim() > 1 else probs
-        return unpad_from_alignment(fc2_output, permutation_map, max_tokens, probs=probs_1d)
-    else:
-        return unpermute_tokens(fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens)
+
+    # --- Post-processing: unpermute ---
+    # Write output directly into the RSV symmetric buffer to avoid a separate copy
+    # in token_combine before multimem_reduce_scatter_v.
+    from megatron.core.transformer.moe.token_dispatcher_inference import (
+        MoEAllGatherVTokenDispatcher,
+    )
+    rsv_out = MoEAllGatherVTokenDispatcher._get_rsv_tensor()
+    return unpermute_tokens(
+        fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens,
+        out=rsv_out,
+    )
