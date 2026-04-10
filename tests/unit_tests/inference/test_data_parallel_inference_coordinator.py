@@ -2,6 +2,7 @@
 
 import asyncio
 import itertools
+import logging
 import multiprocessing
 import os
 import time
@@ -209,7 +210,7 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
             client.pause_engines()
         try:
             await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
-        except Exception:
+        except (asyncio.TimeoutError, Exception):
             logging.warning("cleanup_engine: PAUSE did not complete, proceeding to STOP anyway.")
 
         if client is not None:
@@ -218,8 +219,14 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except asyncio.CancelledError:
             pass  # Expected — task.cancel() from the engine's own shutdown path.
-        except Exception:
+        except (asyncio.TimeoutError, Exception):
             logging.warning("cleanup_engine: engine loop did not exit cleanly, force-cancelling.")
+            cc = getattr(engine, 'coordinator_client', None)
+            if cc is not None:
+                for ep in getattr(cc, '_endpoints', []):
+                    for s in getattr(ep, '_sockets', []):
+                        if not s.closed:
+                            s.close(linger=0)
             task.cancel()
             try:
                 await task
@@ -257,10 +264,6 @@ async def test_case_communicator():
 
     Use this instead of engine._world_barrier() when the engine loop may be
     calling _world_barrier() concurrently (e.g. during state transitions).
-
-    The fixture creates a private ZMQ context and passes it to the channel, then
-    terminates it after shutdown. This keeps the fixture's sockets isolated from
-    any context owned by the engine or other fixtures in the same process.
     """
     ctx = zmq.asyncio.Context()
     comm = _CollectiveChannel(process_group=None, context=ctx)

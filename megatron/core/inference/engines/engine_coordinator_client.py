@@ -129,12 +129,14 @@ class _MPChannel(AsyncZmqEndpoint):
         context: zmq.asyncio.Context,
         process_group,
         is_leader: bool,
+        bind_host: str | None = None,
     ):
         socket_type = "PUB" if is_leader else "SUB"
         super().__init__(
             socket_type,
             context=context,
             bind=True,
+            bind_host=bind_host,
             process_group=process_group,
             is_leader=is_leader,
         )
@@ -180,6 +182,7 @@ class _CollectiveChannel(AsyncZmqEndpoint):
         *,
         context: zmq.asyncio.Context,
         cond: asyncio.Condition | None = None,
+        bind_host: str | None = None,
     ):
         if process_group is not None:
             self._rank = get_pg_rank(process_group)
@@ -198,6 +201,7 @@ class _CollectiveChannel(AsyncZmqEndpoint):
             socket_types,
             context=context,
             bind=True,
+            bind_host=bind_host,
             process_group=process_group,
             is_leader=self._is_leader,
         )
@@ -255,24 +259,19 @@ class _CollectiveChannel(AsyncZmqEndpoint):
             return result[0] if n == 1 else result
 
     def notify_has_signal(self):
-        """Inject a signal into the channel. Any rank can call this.
+        """Broadcast a wakeup signal to EP peers.
 
-        The signal is just a wakeup — the receiving side only cares that some peer has work,
-        not what the specific signal was, so no payload is sent.
+        Called when the local engine has new work. The signal carries no payload — peers
+        only need to know *some* peer has work so they participate in EP consensus.
+
+        The originator does NOT set its own ``has_signal_event`` or notify ``_cond``:
+        it already knows it has work (``has_unfinished_requests`` is true), so both would
+        be no-ops. The ``_recv_task`` on remote peers handles the event + cond wake.
         """
         if self._is_leader:
             self._isend(Headers.COLLECTIVE_SIGNAL, sock=self.BCAST)
-            # The leader will not receive its own broadcast, so handle the signal locally.
-            self.has_signal_event.set()
-            # Wake the engine's wait_for loop so it re-evaluates ep_peer_has_work.
-            if self._cond is not None:
-                get_asyncio_loop().create_task(self._notify_cond())
         else:
             self._isend(Headers.COLLECTIVE_SIGNAL, sock=self.GATHER)
-
-    async def _notify_cond(self):
-        async with self._cond:
-            self._cond.notify_all()
 
 
 class EngineCoordinatorClient:
@@ -299,23 +298,21 @@ class EngineCoordinatorClient:
         cond: asyncio.Condition,
         listening_timeout: float = 0,
         steps_before_listen: int = 1,
+        bind_host: str | None = None,
     ):
         self.is_mp_coordinator = is_mp_coordinator
         self.listening_timeout = listening_timeout
         self.steps_before_listen = steps_before_listen
 
-        # Private ZMQ context shared by all endpoints this client owns. Never use
-        # `zmq.asyncio.Context.instance()` here — a process-wide singleton means a
-        # `term()` in one consumer (InferenceClient, tests, etc.) would tear down
-        # sockets owned by this client too.
+        self._deferred_requests: list[tuple] = []
+        self._deferred_epoch: int | None = None
+        self._deferred_signals: list = []
+
         self._ctx = zmq.asyncio.Context()
 
-        # Shared mutable state consumed by endpoints and schedule_requests.
         self.pending_messages = deque()
         self.messages_processing_event = asyncio.Event()
 
-        # Combined PUB/SUB channel for all MP ranks.
-        # Leader (MP coordinator) binds PUB; followers connect SUB.
         self._mp_channel = _MPChannel(
             self.pending_messages,
             self.messages_processing_event,
@@ -323,10 +320,13 @@ class EngineCoordinatorClient:
             context=self._ctx,
             process_group=mp_group,
             is_leader=is_mp_coordinator,
+            bind_host=bind_host,
         )
 
-        # Track all AsyncZmqEndpoint instances for lifecycle management.
         self._endpoints = [self._mp_channel]
+
+        # Ensure all MP ranks have completed their PUB/SUB socket setup.
+        torch.distributed.barrier(group=mp_group)
 
         if is_mp_coordinator:
             # dp_addr is broadcast from DP rank 0 via process_group.
@@ -347,14 +347,14 @@ class EngineCoordinatorClient:
         self.ep_world_size = get_pg_size(ep_group)
 
         self._ep_channel = (
-            _CollectiveChannel(ep_group, context=self._ctx, cond=cond)
+            _CollectiveChannel(ep_group, context=self._ctx, cond=cond, bind_host=bind_host)
             if self.ep_world_size > 1
             else None
         )
 
         total_world_size = torch.distributed.get_world_size()
         self._world_channel = (
-            _CollectiveChannel(None, context=self._ctx, cond=cond)
+            _CollectiveChannel(None, context=self._ctx, cond=cond, bind_host=bind_host)
             if total_world_size > 1
             else None
         )
@@ -425,111 +425,29 @@ class EngineCoordinatorClient:
         range_pop()
         return global_work, global_consensus == -1
 
-    async def world_barrier(self):
-        """World-wide ZMQ all-reduce barrier for global rank consensus.
+    def projected_pending_count(self, engine) -> int:
+        """Pending request count including drained-but-not-yet-applied SUBMIT_REQUESTs."""
+        return (
+            engine.context.get_active_request_count()
+            + len(engine.waiting_request_ids)
+            + len(self._deferred_requests)
+        )
 
-        Used for all state transitions that require global synchronization:
-        PAUSING -> PAUSED, UNPAUSING -> RUNNING, SUSPENDING -> SUSPENDED,
-        RESUMING -> PAUSED, and STOPPING -> STOPPED.
+    def _apply_signals(self, signals, engine):
+        """Apply at most one control signal. Extra signals are put back for re-broadcast.
 
-        No-op when world_size == 1 (communicator is not created).
-        """
-        range_push("world_barrier")
-        if self._world_channel is not None:
-            await self._world_channel.all_reduce_max(1)
-        range_pop()
-
-    async def schedule_requests(self, engine):
-        """Drains pending ZMQ messages and adds requests to the engine.
-
-        This method is a collective operation that must be called by all ranks in an MP group.
-        It does not block; idle-blocking is handled by the engine's `_cond`.
-
-        .. note:: EngineState is imported here to avoid a circular import with dynamic_engine.
-
-        The synchronization uses a batched message pattern:
-        1.  Background `_DPCoordinator._recv_task` continuously receives messages from the
-            coordinator and stores them in `pending_messages` without deserialization.
-        2.  The MP coordinator sends the accumulated messages as a single `MESSAGES` to TP ranks.
-        3.  Background `_MPChannel._recv_task` on follower ranks unpacks
-            the batch into `pending_messages` and sets `messages_processing_event`.
+        Only the MP coordinator puts unprocessed signals back into ``pending_messages`` —
+        they'll be rebroadcast to followers on the next iteration as part of the normal
+        batch. Followers must NOT put back, or they accumulate duplicates of every signal
+        the leader rebroadcasts.
         """
         from megatron.core.inference.engines.dynamic_engine import EngineState
 
-        # If the engine has active requests and is not at (step % N) == 0, return early.
-        engine_idle = engine.state in (EngineState.PAUSED, EngineState.SUSPENDED)
-        count_trigger = (engine.context.step_count % self.steps_before_listen) == 0
-        if not engine_idle and engine.has_unfinished_requests() and (not count_trigger):
-            return
-
-        # Yield to the event loop so ZMQ recv tasks can process pending I/O.
-        await asyncio.sleep(self.listening_timeout)
-
-        # MP coordinator: snapshot pending_messages and send as a single batch.
-        # We always send, even when the snapshot is empty, because followers block on
-        # messages_processing_event each iteration — skipping the send would leave them
-        # hanging. The empty batch is an intentional heartbeat that keeps followers in
-        # lockstep with the leader.
         if self.is_mp_coordinator:
-            messages = list(self.pending_messages)
-            self.pending_messages.clear()
-            self._mp_channel._isend(
-                Headers.MESSAGES, [(h.value, d) for h, d in messages]
-            )
-        else:
-            await self.messages_processing_event.wait()
-            self.messages_processing_event.clear()
-            messages = list(self.pending_messages)
-            self.pending_messages.clear()
-
-        # Process batch. Data is raw msgpack bytes — deserialize at consumption.
-        # Control signals arrive here via _DPCoordinator → pending_messages → _MPChannel batch.
-        new_generation_epoch = None
-        pending_signals = []
-        has_new_requests = False
-        for header, raw_data in messages:
-            if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = msgpack.unpackb(raw_data, raw=False)
-                sampling_params = SamplingParams.deserialize(sampling_params)
-                range_push("add_request")
-                engine.add_request(request_id, prompt, sampling_params)
-                range_pop()
-                has_new_requests = True
-            elif header == Headers.SET_GENERATION_EPOCH:
-                new_generation_epoch = msgpack.unpackb(raw_data, raw=False)[0]
-            else:
-                pending_signals.append(header)
-
-        # Notify EP peers that new work arrived.
-        if has_new_requests and self._ep_channel is not None:
-            self._ep_channel.notify_has_signal()
-
-        if new_generation_epoch is not None:
-            engine._generation_epoch = new_generation_epoch
-            # Stamp all active requests with the new epoch.
-            for entry in engine.requests.values():
-                request = entry.record[-1]
-                total = len(request.prompt_tokens) + len(request.generated_tokens)
-                if total > 0:
-                    boundary = (total - 1, new_generation_epoch)
-                    if request.policy_epoch is None:
-                        request.policy_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.policy_epoch.append(boundary)
-                    if request.kv_cache_epoch is None:
-                        request.kv_cache_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.kv_cache_epoch.append(boundary)
-
-        # Apply at most one control signal per iteration. Only the MP coordinator puts
-        # unprocessed signals back into its own pending_messages — they'll be rebroadcast
-        # to followers on the next iteration as part of the normal batch. Followers must
-        # NOT put back, or they accumulate duplicates of every signal the leader rebroadcasts.
-        if self.is_mp_coordinator:
-            for sig in reversed(pending_signals[1:]):
+            for sig in reversed(signals[1:]):
                 self.pending_messages.appendleft((sig, None))
-        if pending_signals:
-            header = pending_signals[0]
+        if signals:
+            header = signals[0]
 
             if header == Headers.PAUSE:
                 if engine.state == EngineState.RUNNING:
@@ -569,3 +487,154 @@ class EngineCoordinatorClient:
 
             else:
                 raise UnknownHeaderError(header)
+
+    def apply_deferred(self, engine):
+        """Apply state mutations drained by a pipelined `schedule_requests` call.
+
+        Must be called from the main loop AFTER `async_step` has finished;
+        never while a step is in flight!
+        """
+        if self._deferred_requests:
+            for request_id, prompt, sampling_params in self._deferred_requests:
+                range_push("add_request")
+                engine.add_request(request_id, prompt, sampling_params)
+                range_pop()
+            self._deferred_requests = []
+
+        if self._deferred_epoch is not None:
+            engine._generation_epoch = self._deferred_epoch
+            # Stamp all active requests with the new epoch.
+            for entry in engine.requests.values():
+                request = entry.record[-1]
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+                if total > 0:
+                    boundary = (total - 1, self._deferred_epoch)
+                    if request.policy_epoch is None:
+                        request.policy_epoch = [(0, self._deferred_epoch)]
+                    else:
+                        request.policy_epoch.append(boundary)
+                    if request.kv_cache_epoch is None:
+                        request.kv_cache_epoch = [(0, self._deferred_epoch)]
+                    else:
+                        request.kv_cache_epoch.append(boundary)
+            self._deferred_epoch = None
+
+        if self._deferred_signals:
+            signals = self._deferred_signals
+            self._deferred_signals = []
+            self._apply_signals(signals, engine)
+
+    async def schedule_and_consensus(self, engine) -> tuple[int, bool]:
+        """Fuse schedule_requests and ep_establish_consensus for pipelined execution.
+
+        Runs as a background task while `async_step` is in flight;
+        must NOT mutate engine state.
+
+        Args:
+            engine: The DynamicInferenceEngine instance, used to read state for consensus.
+
+        Returns:
+            (global_work, all_pausing): max work across EP; whether all peers signaled consensus.
+        """
+        from megatron.core.inference.engines.dynamic_engine import EngineState
+
+        await self.schedule_requests(engine, defer=True)
+        local_pending = self.projected_pending_count(engine)
+        return await self.ep_establish_consensus(
+            local_pending, signal_consensus=(engine.state == EngineState.PAUSING)
+        )
+
+    async def world_barrier(self):
+        """World-wide ZMQ all-reduce barrier for global rank consensus.
+
+        Used for all state transitions that require global synchronization:
+        PAUSING -> PAUSED, UNPAUSING -> RUNNING, SUSPENDING -> SUSPENDED,
+        RESUMING -> PAUSED, and STOPPING -> STOPPED.
+
+        No-op when world_size == 1 (communicator is not created).
+        """
+        range_push("world_barrier")
+        if self._world_channel is not None:
+            await self._world_channel.all_reduce_max(1)
+        range_pop()
+
+    async def schedule_requests(self, engine, *, defer: bool = False):
+        """Drains pending ZMQ messages.
+
+        This method is a collective operation that must be called by all ranks in an MP group.
+        It does not block; idle-blocking is handled by the engine's `_cond`.
+
+        The synchronization uses a batched message pattern:
+        1.  Background `_DPCoordinator._recv_task` continuously receives messages from the
+            coordinator and stores them in `pending_messages` without deserialization.
+        2.  The MP coordinator sends the accumulated messages as a single `MESSAGES` to TP ranks.
+        3.  Background `_MPChannel._recv_task` on follower ranks unpacks
+            the batch into `pending_messages` and sets `messages_processing_event`.
+
+        Args:
+            engine: The DynamicInferenceEngine instance.
+            defer: If True (set by the pipelined `schedule_and_consensus` background task),
+                ALL engine mutations are deferred: SUBMIT_REQUEST and SET_GENERATION_EPOCH
+                are stashed in `_deferred_requests` / `_deferred_epoch`, and control signals
+                (PAUSE, UNPAUSE, etc.) are stashed in `_deferred_signals`. The caller must
+                invoke `apply_deferred(engine)` from the main loop after `async_step`
+                finishes to commit everything atomically.
+                When False (foreground path), requests, epochs, and signals are applied
+                immediately since no step is in flight.
+        """
+        from megatron.core.inference.engines.dynamic_engine import EngineState
+
+        # If the engine has active requests and is not at (step % N) == 0, return early.
+        engine_idle = engine.state in (EngineState.PAUSED, EngineState.SUSPENDED)
+        count_trigger = (engine.context.step_count % self.steps_before_listen) == 0
+        if not engine_idle and engine.has_unfinished_requests() and (not count_trigger):
+            return
+
+        # Yield to the event loop so ZMQ recv tasks can process pending I/O.
+        await asyncio.sleep(self.listening_timeout)
+
+        # MP coordinator: snapshot pending_messages and send as a single batch.
+        # We always send, even when the snapshot is empty, because followers block on
+        # messages_processing_event each iteration — skipping the send would leave them
+        # hanging. The empty batch is an intentional heartbeat that keeps followers in
+        # lockstep with the leader.
+        if self.is_mp_coordinator:
+            messages = list(self.pending_messages)
+            self.pending_messages.clear()
+            self._mp_channel._isend(
+                Headers.MESSAGES, [(h.value, d) for h, d in messages]
+            )
+        else:
+            await self.messages_processing_event.wait()
+            self.messages_processing_event.clear()
+            messages = list(self.pending_messages)
+            self.pending_messages.clear()
+
+        # Process batch. Data is raw msgpack bytes — deserialize at consumption.
+        # Control signals arrive here via _DPCoordinator → pending_messages → _MPChannel batch.
+        pending_signals = []
+        has_new_requests = False
+        for header, raw_data in messages:
+            if header == Headers.SUBMIT_REQUEST:
+                request_id, prompt, sampling_params = msgpack.unpackb(raw_data, raw=False)
+                sampling_params = SamplingParams.deserialize(sampling_params)
+                self._deferred_requests.append((request_id, prompt, sampling_params))
+                has_new_requests = True
+            elif header == Headers.SET_GENERATION_EPOCH:
+                self._deferred_epoch = msgpack.unpackb(raw_data, raw=False)[0]
+            else:
+                pending_signals.append(header)
+
+        # Notify EP peers that new work arrived.
+        if has_new_requests and self._ep_channel is not None:
+            self._ep_channel.notify_has_signal()
+
+        if defer:
+            # Pipelined path: stash signals for apply_deferred. No engine mutation
+            # occurs during the step — all state changes are deferred until the main
+            # loop calls apply_deferred after the step completes.
+            self._deferred_signals.extend(pending_signals)
+        else:
+            # Foreground path: apply requests, epoch, and signals immediately.
+            self.apply_deferred(engine)
+            self._apply_signals(pending_signals, engine)

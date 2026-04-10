@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
-from megatron.core.utils import trace_async_exceptions
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 try:
     import msgpack
@@ -67,6 +67,7 @@ class AsyncZmqEndpoint:
         context: "zmq.asyncio.Context | None" = None,
         connect: "str | list[str] | None" = None,
         bind: "bool | list[bool]" = False,
+        bind_host: "str | None" = None,
         bind_port: "int | list[int] | None" = None,
         identity: "str | list[str] | None" = None,
         process_group=_NO_PROCESS_GROUP,
@@ -82,6 +83,10 @@ class AsyncZmqEndpoint:
             self._ctx = context
             self._owns_ctx = False
         has_pg = process_group is not _NO_PROCESS_GROUP
+
+        # Bind host: explicit override falls back to gethostname(). Multi-node deployments
+        # where gethostname() resolves to 127.0.0.1 should pass an explicit routable address.
+        local_ip = bind_host if bind_host is not None else _socket_mod.gethostname()
 
         # Normalize parameters to lists.
         socket_type = [socket_type] if not isinstance(socket_type, list) else socket_type
@@ -114,11 +119,12 @@ class AsyncZmqEndpoint:
             broadcast_bind = has_pg and bind[i]
             if bind[i] or bind_port[i] is not None:
                 if not broadcast_bind or is_leader:
-                    local_ip = _socket_mod.gethostname()
+                    bound = False
                     port = bind_port[i]
                     if port is not None:
                         try:
                             sock.bind(f"tcp://{local_ip}:{port}")
+                            bound = True
                         except zmq.error.ZMQError as e:
                             if e.errno == errno.EADDRINUSE:
                                 logging.warning(
@@ -130,7 +136,7 @@ class AsyncZmqEndpoint:
                                     f"Unknown error when binding to port {port}: {e}. "
                                     "Attempting to bind to a random available port instead."
                                 )
-                    if sock.getsockopt_string(zmq.LAST_ENDPOINT) == '':
+                    if not bound:
                         sock.bind_to_random_port(f"tcp://{local_ip}")
                     self.address = sock.getsockopt_string(zmq.LAST_ENDPOINT)
                     if broadcast_bind:
@@ -164,6 +170,8 @@ class AsyncZmqEndpoint:
         sock: int = 0,
     ):
         """Send a message, buffering it if the endpoint is not yet running."""
+        if self.is_shutdown:
+            return  # Drop sends issued after shutdown — sockets are gone.
         if not self.is_running.is_set():
             self._startup_sends.append((header, data, identity, serialize, sock))
             return
@@ -180,7 +188,7 @@ class AsyncZmqEndpoint:
 
     async def _irecv(
         self, deserialize: bool = True, *, sock: int = 0
-    ) -> tuple[Optional[bytes], Headers, list | bytes | None]:
+    ) -> tuple[Optional[bytes], Headers, "list | bytes | None"]:
         """Receive and decode a multipart message from a socket."""
         raw = await self._sockets[sock].recv_multipart()
         if self._socket_uses_identity[sock]:
@@ -196,8 +204,6 @@ class AsyncZmqEndpoint:
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None, *, set_running: bool = True):
         """Start background tasks (send queue, startup buffer, recv task)."""
-        from megatron.core.utils import get_asyncio_loop
-
         loop = get_asyncio_loop(loop)
 
         @trace_async_exceptions
@@ -249,6 +255,14 @@ class AsyncZmqEndpoint:
         if self._owns_ctx and not self._ctx.closed:
             self._ctx.term()
 
+    def _handle_unreachable_identity(self, identity):
+        """Hook called when a send fails with EHOSTUNREACH.
+
+        Default behavior is to log a warning. Subclasses (e.g. the DP coordinator) override
+        this to prune the dead identity from any routing tables they own.
+        """
+        logging.warning("ZMQ send failed, recipient unreachable (identity=%s)", identity)
+
     @trace_async_exceptions
     async def _send_task(self):
         """Background task: drain the send queue and await each send."""
@@ -261,9 +275,7 @@ class AsyncZmqEndpoint:
                 break
             except zmq.error.ZMQError as e:
                 if e.errno == zmq.EHOSTUNREACH:
-                    logging.warning(
-                        "ZMQ send failed, recipient unreachable (identity=%s)", identity
-                    )
+                    self._handle_unreachable_identity(identity)
                     self._send_awaitables.task_done()
                 elif self.is_shutdown:
                     logging.debug("ZMQ send error during shutdown: %s", e)

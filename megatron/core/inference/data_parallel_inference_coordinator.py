@@ -113,7 +113,12 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         self.deterministic_mode = deterministic_mode
         self.ready_event = ready_event
 
-        super().__init__("ROUTER", bind=True, bind_port=inference_coordinator_port)
+        super().__init__(
+            "ROUTER",
+            bind=True,
+            bind_host=hostname,
+            bind_port=inference_coordinator_port,
+        )
 
         # Send the address to the parent process.
         self.pipe_connection.send(self.address)
@@ -129,7 +134,6 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         self.next_request_id = 0
         self.tokenizer = tokenizer
         self.state = self.CoordinatorState.RUNNING
-        self.is_shutdown = False
 
         # Prefix caching state for routing.
         self.block_size_tokens = block_size_tokens
@@ -151,6 +155,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         # Starts empty; populated by _register_rank_identity as engines connect.
         self._identities_list = []  # rank_index → identity
         self._pending_counts = np.zeros(0, dtype=np.int32)
+        self._quorum_reached = False
 
         # Hash → {rank_idx: timestamp} dict for prefix cache affinity routing.
         # Each key is a block hash; each value maps rank indices to assignment
@@ -193,7 +198,14 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         )
 
     def _remove_engine(self, identity):
-        """Remove a disconnected engine from the routing pool."""
+        """Remove a disconnected engine from the routing and scoring pools.
+
+        Prunes the engine from all data structures: the round-robin deque,
+        the scoring arrays (_identities_list, _pending_counts), the
+        identity_to_rank_index map, and the prefix-cache _hash_table.
+        Indices above the removed rank are shifted down by one so that the
+        _hash_table, _pending_counts, and _identities_list stay consistent.
+        """
         self.identities_of_data_parallel_ranks.remove(identity)
         # Clamp round-robin index so it doesn't skip an engine after removal.
         n = len(self.identities_of_data_parallel_ranks)
@@ -201,15 +213,48 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
             self._round_robin_idx = self._round_robin_idx % n
         else:
             self._round_robin_idx = 0
-        rank_idx = self.identity_to_rank_index.get(identity)
+
+        rank_idx = self.identity_to_rank_index.pop(identity, None)
         if rank_idx is not None:
-            for rank_info in self._hash_table.values():
-                rank_info.pop(rank_idx, None)
+            # Remove from the parallel scoring arrays.
+            self._identities_list.pop(rank_idx)
+            self._pending_counts = np.delete(self._pending_counts, rank_idx)
+
+            # Rebuild identity_to_rank_index since indices after rank_idx shifted.
+            self.identity_to_rank_index = {
+                ident: idx for idx, ident in enumerate(self._identities_list)
+            }
+
+            # Remap _hash_table: drop the removed rank, shift higher indices down.
+            remapped = {}
+            for h, rank_info in self._hash_table.items():
+                new_info = {}
+                for ridx, ts in rank_info.items():
+                    if ridx < rank_idx:
+                        new_info[ridx] = ts
+                    elif ridx > rank_idx:
+                        new_info[ridx - 1] = ts
+                    # ridx == rank_idx → dropped
+                if new_info:
+                    remapped[h] = new_info
+            self._hash_table = remapped
+
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
             n,
         )
+
+    def _handle_unreachable_identity(self, identity):
+        """Override: prune the dead engine instead of just logging.
+
+        EHOSTUNREACH means the peer DEALER socket on the other side has gone away. A
+        crashed engine never sends DISCONNECT, so without this hook the coordinator would
+        keep round-robining requests to a dead identity forever.
+        """
+        super()._handle_unreachable_identity(identity)
+        if identity in self.identities_of_data_parallel_ranks:
+            self._remove_engine(identity)
 
     def compute_request_hashes(self, prompt):
         """Compute block hashes for a prompt on CPU.
@@ -347,18 +392,20 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                 self._register_rank_identity(identity)
                 logging.info(f"Inference Coordinator: Data parallel rank connected: {identity}")
                 if len(self.identities_of_data_parallel_ranks) == self.data_parallel_size:
-                    # In deterministic mode, sort identities for consistent scheduling order.
-                    if self.deterministic_mode:
-                        self.identities_of_data_parallel_ranks = deque(
-                            sorted(self.identities_of_data_parallel_ranks)
-                        )
-                    # Rebuild all scoring data structures in sorted order.
-                    sorted_ids = sorted(self.identities_of_data_parallel_ranks)
-                    self.identity_to_rank_index = {
-                        ident: idx for idx, ident in enumerate(sorted_ids)
-                    }
-                    self._identities_list = list(sorted_ids)
-                    self._pending_counts = np.zeros(len(sorted_ids), dtype=np.int32)
+                    if not self._quorum_reached:
+                        self._quorum_reached = True
+                        # In deterministic mode, sort identities for consistent scheduling.
+                        if self.deterministic_mode:
+                            self.identities_of_data_parallel_ranks = deque(
+                                sorted(self.identities_of_data_parallel_ranks)
+                            )
+                        # Rebuild all scoring data structures in sorted order.
+                        sorted_ids = sorted(self.identities_of_data_parallel_ranks)
+                        self.identity_to_rank_index = {
+                            ident: idx for idx, ident in enumerate(sorted_ids)
+                        }
+                        self._identities_list = list(sorted_ids)
+                        self._pending_counts = np.zeros(len(sorted_ids), dtype=np.int32)
                     self.is_running.set()
                     if self.ready_event is not None:
                         self.ready_event.set()
@@ -495,11 +542,11 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                         "Coordinator: ENGINE_REPLY from unknown engine %s, ignoring.", identity
                     )
                     continue
-                finished_request_records = data
+                finished_requests = data
 
-                for finished_request_record in finished_request_records:
-                    self.detokenize(finished_request_record)
-                    fid = finished_request_record["request_id"]
+                for finished_request in finished_requests:
+                    self.detokenize(finished_request)
+                    fid = finished_request["request_id"]
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
@@ -513,7 +560,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
 
                     self._isend(
                         Headers.ENGINE_REPLY,
-                        [client_request_identity, finished_request_record],
+                        [client_request_identity, finished_request],
                         identity=client_identity,
                     )
 
@@ -521,7 +568,10 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                 if identity not in known_clients:
                     logging.warning("Coordinator: ignoring signal from unknown client.")
                     continue
-                await self.shutdown()
+                # Signal the entrypoint to exit; its finally block calls shutdown()
+                # cleanly from outside this task. Calling shutdown() from inside
+                # _recv_task would self-cancel and skip socket/context cleanup.
+                self._shutdown_event.set()
                 return
 
             elif header == Headers.DISCONNECT:

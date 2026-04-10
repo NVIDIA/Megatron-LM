@@ -1,9 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for AsyncZmqEndpoint -- no torch.distributed required."""
+"""Unit tests for AsyncZmqEndpoint and coordinator -- no torch.distributed required."""
 
 import asyncio
 import multiprocessing
+from collections import deque
 
 import pytest
 
@@ -22,6 +23,13 @@ try:
 except ImportError:
     HAVE_MSGPACK = False
 
+try:
+    import torch  # noqa: F401
+
+    HAVE_TORCH = True
+except ImportError:
+    HAVE_TORCH = False
+
 pytestmark = [
     pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq required"),
     pytest.mark.skipif(not HAVE_MSGPACK, reason="msgpack required"),
@@ -29,228 +37,16 @@ pytestmark = [
 ]
 
 from megatron.core.inference.async_zmq_communicator import AsyncZmqEndpoint
+from megatron.core.inference.data_parallel_inference_coordinator import (
+    DataParallelInferenceCoordinator,
+)
 from megatron.core.inference.headers import Headers
 
-# ── Fixtures ─────────────────────────────────────────────────────────────────
-
-
-@pytest.fixture
-async def zmq_ctx():
-    """Fresh ZMQ async context, terminated after test."""
-    ctx = zmq.asyncio.Context()
-    yield ctx
-    ctx.term()
-
-
-@pytest.fixture
-async def push_pull():
-    """PUSH/PULL AsyncZmqEndpoint pair on a random TCP port."""
-    sender = AsyncZmqEndpoint("PUSH", bind=True)
-    receiver = AsyncZmqEndpoint("PULL", connect=sender.address)
-    sender.start()
-    receiver.start()
-    yield sender, receiver
-    await sender.shutdown()
-    await receiver.shutdown()
-
-
-@pytest.fixture
-async def router_dealer():
-    """ROUTER/DEALER AsyncZmqEndpoint pair on a random TCP port."""
-    router = AsyncZmqEndpoint("ROUTER", bind=True)
-    dealer = AsyncZmqEndpoint("DEALER", identity="test-dealer", connect=router.address)
-    router.start()
-    dealer.start()
-    # Brief sleep to let ZMQ handshake complete.
-    await asyncio.sleep(0.05)
-    yield router, dealer
-    await router.shutdown()
-    await dealer.shutdown()
-
-
-# ── TestAsyncZmqEndpoint ────────────────────────────────────────────────────
-
-
-class TestAsyncZmqEndpoint:
-    """Tests for the AsyncZmqEndpoint send/recv and lifecycle."""
-
-    # -- Roundtrip tests --
-
-    async def test_roundtrip_push_pull(self, push_pull):
-        """PUSH/PULL roundtrip with serialized data."""
-        sender, receiver = push_pull
-
-        data = [1, "hello", {"key": True}]
-        sender._isend(Headers.SUBMIT_REQUEST, data)
-
-        identity, header, received = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
-
-        assert identity is None
-        assert header == Headers.SUBMIT_REQUEST
-        assert received == data
-
-    async def test_roundtrip_no_data(self, push_pull):
-        """Header-only message (no payload)."""
-        sender, receiver = push_pull
-
-        sender._isend(Headers.PAUSE)
-
-        identity, header, received = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
-
-        assert identity is None
-        assert header == Headers.PAUSE
-        assert received is None
-
-    async def test_roundtrip_serialize_false(self, push_pull):
-        """Raw bytes with serialize=False / deserialize=False."""
-        sender, receiver = push_pull
-
-        raw_data = b"\x01\x02\x03\xff"
-        sender._isend(Headers.ENGINE_REPLY, raw_data, serialize=False)
-
-        identity, header, received = await asyncio.wait_for(
-            receiver._irecv(deserialize=False), timeout=2.0
-        )
-
-        assert identity is None
-        assert header == Headers.ENGINE_REPLY
-        assert received == raw_data
-
-    async def test_roundtrip_router_dealer(self, router_dealer):
-        """ROUTER/DEALER roundtrip with identity routing."""
-        router, dealer = router_dealer
-
-        # ROUTER -> DEALER: send with explicit identity.
-        router._isend(Headers.ACK, [42], identity=b"test-dealer")
-
-        identity, header, data = await asyncio.wait_for(dealer._irecv(), timeout=2.0)
-        assert identity is None  # DEALER strips identity frame
-        assert header == Headers.ACK
-        assert data == [42]
-
-        # DEALER -> ROUTER: send without identity; ROUTER adds it.
-        dealer._isend(Headers.ENGINE_CONNECT)
-
-        identity, header, data = await asyncio.wait_for(router._irecv(), timeout=2.0)
-        assert identity == b"test-dealer"
-        assert header == Headers.ENGINE_CONNECT
-        assert data is None
-
-    # -- Send queue behavior tests --
-
-    async def test_send_drains_queue(self, push_pull):
-        """Send queue drains and delivers multiple sends in order."""
-        sender, receiver = push_pull
-
-        n = 5
-        for i in range(n):
-            sender._isend(Headers.SUBMIT_REQUEST, [i])
-
-        received = []
-        for _ in range(n):
-            _, header, data = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
-            assert header == Headers.SUBMIT_REQUEST
-            received.append(data[0])
-
-        assert received == list(range(n))
-
-    async def test_shutdown_empty(self):
-        """shutdown() on an endpoint with an empty send queue exits cleanly."""
-        ep = AsyncZmqEndpoint("PUSH", bind=True)
-        ep.start()
-        await asyncio.sleep(0.01)
-        await asyncio.wait_for(ep.shutdown(), timeout=2.0)
-
-    async def test_ehostunreach_handled(self):
-        """EHOSTUNREACH on ROUTER is logged as a warning, not raised."""
-        router = AsyncZmqEndpoint("ROUTER", bind=True)
-        router.start()
-
-        # Send to a non-existent identity -- ROUTER_MANDATORY makes this fail
-        # with EHOSTUNREACH.  The send task catches it and logs a warning.
-        router._isend(Headers.ACK, identity=b"nonexistent")
-
-        await asyncio.wait_for(router.shutdown(), timeout=2.0)
-
-    async def test_shutdown_preserves_pending(self):
-        """A send issued before shutdown() is delivered to the receiver.
-
-        shutdown() drains the send queue before closing sockets, so the
-        message is fully sent before the sender shuts down.
-        """
-        sender = AsyncZmqEndpoint("PUSH", bind=True)
-        receiver = AsyncZmqEndpoint("PULL", connect=sender.address)
-        sender.start()
-        receiver.start()
-
-        sender._isend(Headers.DISCONNECT)
-        await asyncio.wait_for(sender.shutdown(), timeout=2.0)
-
-        # The message should have been sent before shutdown completed.
-        _, header, _ = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
-        assert header == Headers.DISCONNECT
-
-        await receiver.shutdown()
-
-
-# ── TestRecvDoesNotBlockOtherCoroutines ──────────────────────────────────────
-
-
-class TestRecvDoesNotBlockOtherCoroutines:
-    """Regression test: blocking recv must not prevent other coroutines from running."""
-
-    async def test_recv_does_not_block_lock(self, zmq_ctx):
-        """A coroutine blocked on recv does not prevent another from acquiring a lock.
-
-        If recv were called inside a held lock (an old bug), this test would
-        deadlock because the recv coroutine holds the lock while blocked on
-        recv, and no other coroutine can acquire it.
-        """
-        lock = asyncio.Lock()
-
-        # Create a PULL socket that will never receive anything.
-        pull = zmq_ctx.socket(zmq.PULL)
-        pull.bind_to_random_port("tcp://127.0.0.1")
-
-        recv_started = asyncio.Event()
-
-        async def mock_coord_recv_task():
-            """Simulates _mp_coord_recv_task with recv OUTSIDE the lock."""
-            recv_started.set()
-            # This recv blocks forever (no sender), but does NOT hold the lock.
-            await pull.recv_multipart()
-
-        got_lock = asyncio.Event()
-
-        async def mock_schedule_requests():
-            """Simulates schedule_requests acquiring the lock."""
-            await recv_started.wait()
-            # Brief sleep to ensure recv task is blocked on recv.
-            await asyncio.sleep(0.05)
-            async with lock:
-                got_lock.set()
-
-        t1 = asyncio.create_task(mock_coord_recv_task())
-        t2 = asyncio.create_task(mock_schedule_requests())
-
-        # If this times out, the lock pattern is broken.
-        await asyncio.wait_for(got_lock.wait(), timeout=2.0)
-
-        t1.cancel()
-        t2.cancel()
-        try:
-            await t1
-        except asyncio.CancelledError:
-            pass
-        try:
-            await t2
-        except asyncio.CancelledError:
-            pass
-
-        pull.close(linger=0)
-
-
-# ── TestStartupBuffering ─────────────────────────────────────────────────────
+if HAVE_TORCH:
+    from megatron.core.inference.engines.dynamic_engine import EngineState
+    from megatron.core.inference.engines.engine_coordinator_client import (
+        EngineCoordinatorClient,
+    )
 
 
 class _DummyTokenizer:
@@ -268,75 +64,267 @@ class _DummyTokenizer:
         return ""
 
 
-class TestStartupBuffering:
-    """Test that client sends are buffered until all engines connect."""
+def _spawn_coordinator(dp_size=1):
+    """Spawn a DataParallelInferenceCoordinator process, return (proc, addr, ready_event)."""
+    spawn_ctx = multiprocessing.get_context("spawn")
+    pipe_parent, pipe_child = spawn_ctx.Pipe()
+    ready_event = spawn_ctx.Event()
 
-    async def test_client_ack_buffered_until_engine_connects(self):
-        """Client ACK is not sent until the required engines have connected.
+    proc = spawn_ctx.Process(
+        target=DataParallelInferenceCoordinator.entrypoint,
+        args=(pipe_child, ready_event, dp_size, _DummyTokenizer()),
+    )
+    proc.start()
+    assert pipe_parent.poll(timeout=10.0), "Coordinator didn't send address"
+    addr = pipe_parent.recv()
+    pipe_parent.close()
+    return proc, addr, ready_event
 
-        1. Spawn coordinator with data_parallel_size=1.
-        2. Connect client DEALER, send CLIENT_CONNECT.
-        3. Verify no ACK arrives (coordinator buffers it).
-        4. Connect engine DEALER, send ENGINE_CONNECT.
-        5. Verify client now receives ACK.
-        """
-        from megatron.core.inference.data_parallel_inference_coordinator import (
-            DataParallelInferenceCoordinator,
+
+async def test_async_zmq_endpoint():
+    """Exercise AsyncZmqEndpoint send/recv, queue draining, error handling, and lifecycle."""
+
+    # ── PUSH/PULL roundtrips ──
+    sender = AsyncZmqEndpoint("PUSH", bind=True)
+    receiver = AsyncZmqEndpoint("PULL", connect=sender.address)
+    sender.start()
+    receiver.start()
+
+    # Serialized data
+    data = [1, "hello", {"key": True}]
+    sender._isend(Headers.SUBMIT_REQUEST, data)
+    identity, header, received = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
+    assert identity is None and header == Headers.SUBMIT_REQUEST and received == data
+
+    # Header-only (no payload)
+    sender._isend(Headers.PAUSE)
+    _, header, received = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
+    assert header == Headers.PAUSE and received is None
+
+    # Raw bytes (serialize=False / deserialize=False)
+    raw = b"\x01\x02\x03\xff"
+    sender._isend(Headers.ENGINE_REPLY, raw, serialize=False)
+    _, header, received = await asyncio.wait_for(receiver._irecv(deserialize=False), timeout=2.0)
+    assert header == Headers.ENGINE_REPLY and received == raw
+
+    # Queue draining: 5 sends arrive in order
+    for i in range(5):
+        sender._isend(Headers.SUBMIT_REQUEST, [i])
+    for i in range(5):
+        _, _, d = await asyncio.wait_for(receiver._irecv(), timeout=2.0)
+        assert d == [i]
+
+    await sender.shutdown()
+    await receiver.shutdown()
+
+    # ── ROUTER/DEALER roundtrips ──
+    router = AsyncZmqEndpoint("ROUTER", bind=True)
+    dealer = AsyncZmqEndpoint("DEALER", identity="test-dealer", connect=router.address)
+    router.start()
+    dealer.start()
+    await asyncio.sleep(0.05)
+
+    router._isend(Headers.ACK, [42], identity=b"test-dealer")
+    _, header, d = await asyncio.wait_for(dealer._irecv(), timeout=2.0)
+    assert header == Headers.ACK and d == [42]
+
+    dealer._isend(Headers.ENGINE_CONNECT)
+    identity, header, _ = await asyncio.wait_for(router._irecv(), timeout=2.0)
+    assert identity == b"test-dealer" and header == Headers.ENGINE_CONNECT
+
+    await router.shutdown()
+    await dealer.shutdown()
+
+    # ── EHOSTUNREACH handled gracefully ──
+    router = AsyncZmqEndpoint("ROUTER", bind=True)
+    router.start()
+    router._isend(Headers.ACK, identity=b"nonexistent")
+    await asyncio.wait_for(router.shutdown(), timeout=2.0)
+
+    # ── Shutdown drains pending sends, then exits cleanly even when empty ──
+    s = AsyncZmqEndpoint("PUSH", bind=True)
+    r = AsyncZmqEndpoint("PULL", connect=s.address)
+    s.start()
+    r.start()
+    s._isend(Headers.DISCONNECT)
+    await asyncio.wait_for(s.shutdown(), timeout=2.0)
+    _, header, _ = await asyncio.wait_for(r._irecv(), timeout=2.0)
+    assert header == Headers.DISCONNECT
+    await r.shutdown()
+
+    ep = AsyncZmqEndpoint("PUSH", bind=True)
+    ep.start()
+    await asyncio.sleep(0.01)
+    await asyncio.wait_for(ep.shutdown(), timeout=2.0)
+
+
+async def test_coordinator_lifecycle():
+    """End-to-end coordinator test: startup buffering, routing, engine disconnect, clean shutdown.
+
+    Spawns a coordinator process (dp_size=1) and exercises the full lifecycle through
+    raw ZMQ sockets:
+    1. Client connects BEFORE any engine -> ACK is buffered (startup buffering).
+    2. Engine connects -> quorum reached -> client receives buffered ACK.
+    3. Request routes to the only engine.
+    4. Second engine registers dynamically; first engine disconnects.
+    5. Subsequent requests all route to the survivor (_remove_engine pruned scoring).
+    6. SHUTDOWN exits the coordinator cleanly within 2 s (no SIGTERM needed).
+    """
+    proc, addr, ready_event = _spawn_coordinator(dp_size=1)
+
+    try:
+        ctx = zmq.asyncio.Context()
+
+        # ── Startup buffering: client ACK withheld until engine connects ──
+        client = ctx.socket(zmq.DEALER)
+        client.setsockopt(zmq.IDENTITY, b"test-client")
+        client.connect(addr)
+        await asyncio.sleep(0.05)
+        client.send_multipart([Headers.CLIENT_CONNECT.value.to_bytes()])
+
+        await asyncio.sleep(0.2)
+        with pytest.raises(zmq.Again):
+            client.recv_multipart(flags=zmq.NOBLOCK)
+
+        # Engine-a connects -> quorum -> client gets ACK.
+        engine_a = ctx.socket(zmq.DEALER)
+        engine_a.setsockopt(zmq.IDENTITY, b"engine-a")
+        engine_a.connect(addr)
+        await asyncio.sleep(0.05)
+        engine_a.send_multipart([Headers.ENGINE_CONNECT.value.to_bytes()])
+
+        frames = await asyncio.wait_for(client.recv_multipart(), timeout=5.0)
+        assert Headers(int.from_bytes(frames[0])) == Headers.ACK
+        assert ready_event.wait(timeout=5.0)
+
+        # ── Request routing to single engine ──
+        req = msgpack.packb([0, "prompt-0", {}], use_bin_type=True)
+        client.send_multipart([Headers.SUBMIT_REQUEST.value.to_bytes(), req])
+        frames = await asyncio.wait_for(engine_a.recv_multipart(), timeout=5.0)
+        assert Headers(int.from_bytes(frames[0])) == Headers.SUBMIT_REQUEST
+
+        # ── Dynamic registration + disconnect: route to survivor ──
+        engine_b = ctx.socket(zmq.DEALER)
+        engine_b.setsockopt(zmq.IDENTITY, b"engine-b")
+        engine_b.connect(addr)
+        await asyncio.sleep(0.05)
+        engine_b.send_multipart([Headers.ENGINE_CONNECT.value.to_bytes()])
+        await asyncio.sleep(0.1)
+
+        engine_a.send_multipart([Headers.DISCONNECT.value.to_bytes()])
+        await asyncio.sleep(0.1)
+
+        for i in range(3):
+            req = msgpack.packb([i + 1, f"prompt-{i + 1}", {}], use_bin_type=True)
+            client.send_multipart([Headers.SUBMIT_REQUEST.value.to_bytes(), req])
+
+        for _ in range(3):
+            frames = await asyncio.wait_for(engine_b.recv_multipart(), timeout=5.0)
+            assert Headers(int.from_bytes(frames[0])) == Headers.SUBMIT_REQUEST
+
+        with pytest.raises(zmq.Again):
+            engine_a.recv_multipart(flags=zmq.NOBLOCK)
+
+        # ── Clean shutdown ──
+        client.send_multipart([Headers.SHUTDOWN.value.to_bytes()])
+        proc.join(timeout=2.0)
+        assert not proc.is_alive(), (
+            "Coordinator did not exit within 2 s of SHUTDOWN"
         )
 
-        spawn_ctx = multiprocessing.get_context("spawn")
-        pipe_parent, pipe_child = spawn_ctx.Pipe()
-        ready_event = spawn_ctx.Event()
+        engine_a.close(linger=0)
+        engine_b.close(linger=0)
+        client.close(linger=0)
+        ctx.term()
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=2.0)
 
-        proc = spawn_ctx.Process(
-            target=DataParallelInferenceCoordinator.entrypoint,
-            args=(pipe_child, ready_event, 1, _DummyTokenizer()),
-        )
-        proc.start()
 
-        try:
-            # Wait for coordinator to bind and send address.
-            assert pipe_parent.poll(timeout=10.0), "Coordinator didn't start"
-            addr = pipe_parent.recv()
-            pipe_parent.close()
+@pytest.mark.skipif(not HAVE_TORCH, reason="torch required for EngineCoordinatorClient")
+@pytest.mark.parametrize(
+    "is_leader,requests,epoch,signals,expect_state,expect_n_added,expect_epoch,expect_putback",
+    [
+        # Only requests
+        (True, [(1, "a", None), (2, "b", None)], None, [], "RUNNING", 2, 0, 0),
+        # Only epoch
+        (True, [], 42, [], "RUNNING", 0, 42, 0),
+        # PAUSE signal
+        (True, [], None, ["PAUSE"], "PAUSING", 0, 0, 0),
+        # All together
+        (True, [(1, "a", None)], 7, ["PAUSE"], "PAUSING", 1, 7, 0),
+        # Leader puts back extra signals
+        (True, [], None, ["PAUSE", "STOP"], "PAUSING", 0, 0, 1),
+        # Follower discards extra signals
+        (False, [], None, ["PAUSE", "STOP"], "PAUSING", 0, 0, 0),
+        # Empty (no-op)
+        (True, [], None, [], "RUNNING", 0, 0, 0),
+    ],
+    ids=[
+        "requests-only",
+        "epoch-only",
+        "pause-signal",
+        "all-together",
+        "leader-puts-back-extras",
+        "follower-discards-extras",
+        "empty-noop",
+    ],
+)
+async def test_deferred_application(
+    is_leader, requests, epoch, signals,
+    expect_state, expect_n_added, expect_epoch, expect_putback,
+):
+    """Verify apply_deferred commits all deferred state to the engine correctly.
 
-            ctx = zmq.asyncio.Context()
+    Exercises the pipelined defer/apply mechanism by populating _deferred_requests,
+    _deferred_epoch, and _deferred_signals on a mock EngineCoordinatorClient, then
+    calling apply_deferred and checking that the engine state matches expectations.
+    """
+    # Minimal client mock — bypass __init__, set only the fields apply_deferred reads.
+    client = object.__new__(EngineCoordinatorClient)
+    client.is_mp_coordinator = is_leader
+    client.pending_messages = deque()
+    client._deferred_requests = list(requests)
+    client._deferred_epoch = epoch
+    client._deferred_signals = [Headers[s] for s in signals]
 
-            # Connect a client.
-            client = ctx.socket(zmq.DEALER)
-            client.setsockopt(zmq.IDENTITY, b"test-client")
-            client.connect(addr)
-            await asyncio.sleep(0.05)
+    # Minimal engine mock.
+    class Engine:
+        def __init__(self):
+            self.state = EngineState.RUNNING
+            self._state_events = {
+                s: asyncio.Event()
+                for s in (
+                    EngineState.RUNNING, EngineState.PAUSED, EngineState.SUSPENDED,
+                    EngineState.RESUMED, EngineState.STOPPED,
+                )
+            }
+            self._state_events[EngineState.RUNNING].set()
+            self.requests = {}
+            self.waiting_request_ids = deque()
+            self._generation_epoch = 0
+            self._added = []
 
-            # Send CLIENT_CONNECT.
-            client.send_multipart([Headers.CLIENT_CONNECT.value.to_bytes()])
+        def add_request(self, rid, prompt, sp):
+            self._added.append((rid, prompt, sp))
 
-            # The coordinator should NOT send ACK yet (no engines connected).
-            await asyncio.sleep(0.2)
-            with pytest.raises(zmq.Again):
-                client.recv_multipart(flags=zmq.NOBLOCK)
+        def suspend(self):
+            pass
 
-            # Now connect an engine.
-            engine = ctx.socket(zmq.DEALER)
-            engine.setsockopt(zmq.IDENTITY, b"test-engine")
-            engine.connect(addr)
-            await asyncio.sleep(0.05)
-            engine.send_multipart([Headers.ENGINE_CONNECT.value.to_bytes()])
+        def resume(self):
+            pass
 
-            # Client should now receive the buffered ACK.
-            frames = await asyncio.wait_for(client.recv_multipart(), timeout=5.0)
-            header = Headers(int.from_bytes(frames[0]))
-            assert header == Headers.ACK
+    engine = Engine()
+    client.apply_deferred(engine)
 
-            # Clean up: send SHUTDOWN.
-            client.send_multipart([Headers.SHUTDOWN.value.to_bytes()])
-            await asyncio.sleep(0.1)
-
-            engine.close(linger=0)
-            client.close(linger=0)
-            ctx.term()
-        finally:
-            proc.join(timeout=5.0)
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=2.0)
+    assert engine.state == EngineState[expect_state]
+    assert len(engine._added) == expect_n_added
+    if expect_n_added:
+        assert engine._added == list(requests)
+    assert engine._generation_epoch == expect_epoch
+    assert len(client.pending_messages) == expect_putback
+    # All deferred state must be cleared after apply.
+    assert client._deferred_requests == []
+    assert client._deferred_epoch is None
+    assert client._deferred_signals == []

@@ -17,6 +17,10 @@ except ImportError:
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+    start_text_gen_server,
+    stop_text_gen_server,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
@@ -102,10 +106,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-                start_text_gen_server,
-            )
-
             client = InferenceClient(inference_coordinator_address=dp_addr)
             client.start()
 
@@ -159,30 +159,22 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.stop_engines()
         await self._inference_engine.wait_until(EngineState.STOPPED)
 
-        # Await the engine loop task to completion on every rank. `wait_until(STOPPED)`
-        # returns when the stopped event fires inside the engine's own shutdown, but the
-        # task itself may still be finalizing. Awaiting guarantees the engine has fully
-        # released its coordinator-client sockets and ZMQ context before we proceed to
-        # client shutdown and coordinator-process teardown.
-        engine_task = getattr(self._inference_engine, 'engine_loop_task', None)
-        if engine_task is not None and not engine_task.done():
-            try:
-                await engine_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        # Await the engine loop task to completion on every rank.
+        engine_task = self._inference_engine.engine_loop_task
+        try:
+            await engine_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()
             await self._client.shutdown()
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-                stop_text_gen_server,
-            )
             stop_text_gen_server()
 
             # Join the coordinator process (it should have exited from shutdown_coordinator).
-            proc = getattr(self._inference_engine, 'inference_coordinator_process', None)
+            proc = self._inference_engine.inference_coordinator_process
             if proc is not None:
                 proc.join(timeout=1)
                 if proc.is_alive():
