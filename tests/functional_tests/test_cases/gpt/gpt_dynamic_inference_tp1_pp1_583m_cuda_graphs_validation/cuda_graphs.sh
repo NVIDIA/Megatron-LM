@@ -3,7 +3,6 @@
 set -u
 
 # Libraries.
-uv pip install simpy
 uv pip install tiktoken
 
 # Environment variables.

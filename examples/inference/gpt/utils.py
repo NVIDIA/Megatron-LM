@@ -106,18 +106,13 @@ def get_time_offsets(
 
     random.seed(seed)
 
-    import simpy  # Guard against this import in test case
-
-    # Generate random time offsets.
-    def arrival(r):
-        while True:
-            yield env.timeout(random.expovariate(r))
-            time_offsets.append(env.now)
-
+    # Generate Poisson arrival times by accumulating exponential inter-arrival intervals.
     time_offsets = []
-    env = simpy.Environment()
-    env.process(arrival(incoming_requests_per_sec))
-    env.run(incoming_requests_duration)
+    current_time = 0.0
+    while current_time < incoming_requests_duration:
+        current_time += random.expovariate(incoming_requests_per_sec)
+        if current_time < incoming_requests_duration:
+            time_offsets.append(current_time)
 
     # Ensure at least a single request.
     if len(time_offsets) == 0:
