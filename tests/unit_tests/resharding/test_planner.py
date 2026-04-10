@@ -19,7 +19,6 @@ from megatron.core.resharding.planner import (
 )
 from megatron.core.resharding.utils import ParameterMetadata, ShardingDescriptor
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -209,12 +208,9 @@ class TestPlanBlockInterleaved:
         # Block sizes per rank: [32, 16] → full sizes: [64, 32]
         # Source local dim = 32+16 = 48, Dest local dim = 64+32 = 96
         src = _meta(
-            shape=(64, 48), is_tp=True, partition_dim=1,
-            partition_sizes=[32, 16], tp_ranks=[0, 1],
+            shape=(64, 48), is_tp=True, partition_dim=1, partition_sizes=[32, 16], tp_ranks=[0, 1]
         )
-        dst = _meta(
-            shape=(64, 96), is_tp=False, partition_sizes=None, tp_ranks=[0],
-        )
+        dst = _meta(shape=(64, 96), is_tp=False, partition_sizes=None, tp_ranks=[0])
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0])
 
         ops = _plan_block_interleaved("weight", src, dst, [desc], my_global_rank=0)
@@ -223,12 +219,9 @@ class TestPlanBlockInterleaved:
 
     def test_tp1_to_tp2_two_blocks(self):
         """TP1 → TP2 with two blocks."""
-        src = _meta(
-            shape=(64, 96), is_tp=False, partition_sizes=None, tp_ranks=[0],
-        )
+        src = _meta(shape=(64, 96), is_tp=False, partition_sizes=None, tp_ranks=[0])
         dst = _meta(
-            shape=(64, 48), is_tp=True, partition_dim=1,
-            partition_sizes=[32, 16], tp_ranks=[0, 1],
+            shape=(64, 48), is_tp=True, partition_dim=1, partition_sizes=[32, 16], tp_ranks=[0, 1]
         )
         desc = _tp_descriptor(dim=1, src_ranks=[0], dst_ranks=[0, 1])
 
@@ -251,8 +244,7 @@ class TestPlanBlockInterleaved:
     def test_rank_not_in_dst(self):
         """Rank not in destination returns empty."""
         src = _meta(
-            shape=(64, 48), is_tp=True, partition_dim=1,
-            partition_sizes=[32, 16], tp_ranks=[0, 1],
+            shape=(64, 48), is_tp=True, partition_dim=1, partition_sizes=[32, 16], tp_ranks=[0, 1]
         )
         dst = _meta(shape=(64, 96), tp_ranks=[2])
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[2])
@@ -264,12 +256,14 @@ class TestPlanBlockInterleaved:
         """TP2 → TP4 with three blocks (simulates Mamba z,x,B,C,dt packing)."""
         # Per-rank sizes: [16, 8, 4] → full: [32, 16, 8]
         src = _meta(
-            shape=(64, 28), is_tp=True, partition_dim=1,
-            partition_sizes=[16, 8, 4], tp_ranks=[0, 1],
+            shape=(64, 28), is_tp=True, partition_dim=1, partition_sizes=[16, 8, 4], tp_ranks=[0, 1]
         )
         dst = _meta(
-            shape=(64, 14), is_tp=True, partition_dim=1,
-            partition_sizes=[8, 4, 2], tp_ranks=[0, 1, 2, 3],
+            shape=(64, 14),
+            is_tp=True,
+            partition_dim=1,
+            partition_sizes=[8, 4, 2],
+            tp_ranks=[0, 1, 2, 3],
         )
         desc = _tp_descriptor(dim=1, src_ranks=[0, 1], dst_ranks=[0, 1, 2, 3])
 

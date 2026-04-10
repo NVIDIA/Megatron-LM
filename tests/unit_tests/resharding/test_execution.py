@@ -89,7 +89,9 @@ def _make_transfer_op(param_name, peer_rank, is_send, my_slice, peer_slice, task
 def _run(plan, src_module, dst_module, service, transform=None):
     """Execute a reshard plan, initializing a temporary process group if needed."""
     if not dist.is_initialized():
-        dist.init_process_group(backend="gloo", init_method="tcp://127.0.0.1:29500", rank=0, world_size=1)
+        dist.init_process_group(
+            backend="gloo", init_method="tcp://127.0.0.1:29500", rank=0, world_size=1
+        )
     execute_reshard_plan(plan, src_module, dst_module, service, transform=transform)
 
 
@@ -110,8 +112,16 @@ class TestExecuteReshard:
 
         s = _full_slice(2)
         plan = ReshardPlan(
-            send_ops=[_make_transfer_op("weight", peer_rank=1, is_send=True, my_slice=s, peer_slice=s, task_id=0)],
-            recv_ops=[_make_transfer_op("weight", peer_rank=0, is_send=False, my_slice=s, peer_slice=s, task_id=0)],
+            send_ops=[
+                _make_transfer_op(
+                    "weight", peer_rank=1, is_send=True, my_slice=s, peer_slice=s, task_id=0
+                )
+            ],
+            recv_ops=[
+                _make_transfer_op(
+                    "weight", peer_rank=0, is_send=False, my_slice=s, peer_slice=s, task_id=0
+                )
+            ],
         )
 
         service = MockCopyService()
@@ -139,10 +149,7 @@ class TestExecuteReshard:
         service = MockCopyService()
         _run(plan, src_module, dst_module, service)
 
-        assert torch.equal(
-            dict(dst_module.named_parameters())["weight"].data,
-            src_data[:4],
-        )
+        assert torch.equal(dict(dst_module.named_parameters())["weight"].data, src_data[:4])
 
 
 # ===========================================================================
@@ -160,8 +167,7 @@ class TestNonCollocated:
 
         s = _full_slice(2)
         plan = ReshardPlan(
-            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)],
-            recv_ops=[],
+            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)], recv_ops=[]
         )
 
         service = MockCopyService()
@@ -174,8 +180,7 @@ class TestNonCollocated:
 
         s = _full_slice(2)
         plan = ReshardPlan(
-            send_ops=[],
-            recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)],
+            send_ops=[], recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)]
         )
 
         service = MockCopyService()
@@ -186,7 +191,6 @@ class TestNonCollocated:
         plan = ReshardPlan(send_ops=[], recv_ops=[])
         service = MockCopyService()
         _run(plan, None, None, service)
-
 
 
 # ===========================================================================
@@ -208,8 +212,7 @@ class TestTransformPath:
 
         s = _full_slice(2)
         plan = ReshardPlan(
-            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)],
-            recv_ops=[],
+            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)], recv_ops=[]
         )
 
         service = MockCopyService()
@@ -228,8 +231,7 @@ class TestTransformPath:
 
         s = _full_slice(2)
         plan = ReshardPlan(
-            send_ops=[],
-            recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)],
+            send_ops=[], recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)]
         )
 
         service = MockCopyService()
@@ -247,8 +249,7 @@ class TestTransformPath:
 
         s = _full_slice(2)
         plan = ReshardPlan(
-            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)],
-            recv_ops=[],
+            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)], recv_ops=[]
         )
 
         service = MockCopyService()
@@ -276,8 +277,7 @@ class TestEdgeCases:
 
         s = _full_slice(2)
         plan = ReshardPlan(
-            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)],
-            recv_ops=[],
+            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)], recv_ops=[]
         )
 
         service = MockCopyService()
@@ -289,8 +289,7 @@ class TestEdgeCases:
 
         s = _full_slice(2)
         plan = ReshardPlan(
-            send_ops=[],
-            recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)],
+            send_ops=[], recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)]
         )
 
         service = MockCopyService()
