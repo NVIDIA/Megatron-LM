@@ -33,8 +33,8 @@ except ImportError:
     _SymmetricMemory = MagicMock()
 
 from .barrier import symm_mem_sync
-from .multimem_asm import ld_128, st_128
-from .utils import are_tensors_nvls_eligible, sync_threads
+from .multimem_asm import ld_64, ld_128, st_64, st_128
+from .utils import sync_threads, is_device_nvls_capable
 
 
 @triton.jit
@@ -44,10 +44,12 @@ def _multimem_all_gather_v_kernel(
     signal_pad_ptrs,
     local_tokens,
     rank_token_offset_ptr,
-    byte_offset,
+    ep_max_tokens_ptr,
+    output_byte_offset,
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
+    BITS: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
 ):
@@ -58,48 +60,83 @@ def _multimem_all_gather_v_kernel(
 
     Args:
         local_ptr: pointer to this rank's local input, shape [local_tokens, hidden_size].
-        multicast_ptr: multicast pointer to the symmetric memory buffer.
+        multicast_ptr: multicast pointer to the output symmetric memory buffer.
         signal_pad_ptrs: signal pads for barrier synchronization.
         local_tokens: number of tokens this rank contributes.
         rank_token_offset_ptr: pointer to a scalar int32 CUDA tensor holding the index
             of the first token this rank writes in the global output (prefix sum of
-            local_tokens for all lower-ranked ranks). The tensor is fixed at CUDA graph
-            capture time; its value is written by the engine before each graph replay.
-        byte_offset: byte offset of this tensor within the symmetric memory buffer.
-        HIDDEN_SIZE: hidden dimension (constexpr).
+            local_tokens for all lower-ranked ranks). Fixed address; value set each step.
+        ep_max_tokens_ptr: pointer to a scalar int32 CUDA tensor holding the
+            maximum local_tokens across all EP ranks for this iteration. Fixed address;
+            value set each step. CTAs with pid >= this value exit immediately. Safe
+            because the value is identical on all ranks, so paired CTAs on every rank
+            exit together — the barrier for those CTAs is never entered on any rank.
+        output_byte_offset: byte offset of this tensor within the symmetric memory buffer.
+        HIDDEN_SIZE: hidden dimension, i.e. number of elements per token row (constexpr).
         BLOCK_SIZE: threads per block (constexpr, >= numel_per_token).
-        NUMEL_PER_THREAD: 128-bit elements per thread, i.e. 128 / (element_bits) (constexpr).
+        NUMEL_PER_THREAD: elements per thread per load/store, i.e. BITS / element_bits (constexpr).
+        BITS: width of each load/store in bits — 128 for activations (bf16) and expert
+            indices (int64, always 16-byte aligned for any topk); 64 for routing probs
+            (fp32 with topk=6 or topk=22 yields 24/88-byte rows, not 16-byte aligned
+            but 8-byte aligned) (constexpr).
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
     """
     pid = tl.program_id(axis=0)
-    tid = tl.arange(0, BLOCK_SIZE)
 
+    # Exit before the barrier if this CTA's pid exceeds the iteration maximum.
+    # ep_max_tokens is the max over all EP ranks, so all ranks agree on
+    # which CTAs exit — the barrier slots for those CTAs are never touched on any rank.
+    ep_max_tokens = tl.load(ep_max_tokens_ptr)
+    if pid >= ep_max_tokens:
+        return
+
+    tid = tl.arange(0, BLOCK_SIZE)
     rank_token_offset = tl.load(rank_token_offset_ptr)
 
     numel_per_token = tl.cdiv(HIDDEN_SIZE, NUMEL_PER_THREAD)
     local_numel = local_tokens * numel_per_token
-    thread_mask = tid < numel_per_token
+    # BLOCK_SIZE is the next power of 2 >= numel_per_token, so it may be larger.
+    # channel_mask deactivates the extra padding threads (tid >= numel_per_token).
+    channel_mask = tid < numel_per_token
 
     for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
-        program_offset = token_offset * numel_per_token
-
-        for thread_offset in range(0, numel_per_token, BLOCK_SIZE):
-            local_offsets = program_offset + thread_offset + tid
-            mask = (local_offsets < local_numel) & thread_mask
+        for channel_offset in range(0, numel_per_token, BLOCK_SIZE):
+            local_offsets = token_offset * numel_per_token + channel_offset + tid
+            # Two independent masks in orthogonal dimensions:
+            #   channel_mask — deactivates power-of-2 padding threads (tid >= numel_per_token).
+            #   token_mask   — deactivates overflow threads in the last inner-loop chunk
+            #                  when numel_per_token > BLOCK_SIZE and the window
+            #                  [channel_offset, channel_offset+BLOCK_SIZE) extends past
+            #                  the final token row.
+            token_mask = local_offsets < local_numel
+            mask = token_mask & channel_mask
 
             # This rank's tokens start at rank_token_offset in the global output.
             global_offsets = rank_token_offset * numel_per_token + local_offsets
 
-            multicast_ptrs = (
-                multicast_ptr.to(tl.pointer_type(tl.uint64))
-                + byte_offset // 8
-                + global_offsets * 2
-            )
-            local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-
-            (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
-            st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
+            if BITS == 128:
+                # Each 128-bit pack occupies 2 uint64 units; output_byte_offset // 8 converts
+                # the tensor's byte offset within the symm-mem buffer to uint64 units.
+                # The global offset is multiplied by 2 to convert from 128-bit units to uint64 units.
+                multicast_ptrs = (
+                    multicast_ptr.to(tl.pointer_type(tl.uint64))
+                    + output_byte_offset // 8
+                    + global_offsets * 2
+                )
+                local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
+                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
+            else:
+                # Each 64-bit pack is exactly 1 uint64, so offsets index directly (no * 2 stride).
+                multicast_ptrs = (
+                    multicast_ptr.to(tl.pointer_type(tl.uint64))
+                    + output_byte_offset // 8
+                    + global_offsets
+                )
+                local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
+                (x, y) = ld_64(local_ptrs, mask=mask)
+                st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
     symm_mem_sync(
@@ -117,67 +154,82 @@ def multimem_all_gather_v(
     input_tensor: torch.Tensor,
     symm_mem_hdl: _SymmetricMemory,
     rank_token_offset: torch.Tensor,
-    hidden_size: int,
-    max_tokens: int,
-    byte_offset: int = 0,
+    ep_max_tokens: torch.Tensor,
+    engine_max_tokens: int,
+    output_byte_offset: int = 0,
     **kwargs,
 ) -> torch.Tensor:
-    """Variable-count multicast all-gather for a single tensor.
+    """Variable-count multicast all-gather for a single 2-D tensor.
 
-    Each EP rank may contribute a different number of tokens. rank_token_offset
-    is a scalar int32 CUDA tensor whose address is fixed at CUDA graph capture
-    time. The engine computes and writes its value once per step before graph
-    replay — the kernel loads it at runtime.
+    Gathers [local_tokens, hidden_size] from each EP rank into a shared
+    output_tensor of shape [global_tokens, hidden_size], where global_tokens is
+    the sum of all ranks' local_tokens. Each rank writes its slice starting at
+    rank_token_offset in the output.
 
-    output_tensor must be a symmetric memory buffer sized for the total global
-    tokens. input_tensor is a regular torch tensor of shape [local_tokens, hidden_size].
+    Both tensors must be 2-D; hidden_size is inferred from input_tensor.shape[1].
+    The 128-bit or 64-bit NVLS path is selected automatically based on row alignment.
 
     Args:
         output_tensor: symmetric memory buffer, shape [global_tokens, hidden_size].
         input_tensor: this rank's local input, shape [local_tokens, hidden_size].
-        symm_mem_hdl: symmetric memory handle.
-        rank_token_offset: scalar int32 CUDA tensor. Holds the index of the first
-            token this rank writes in the global output (prefix sum of local_tokens
-            for all lower-ranked ranks). Fixed address; value set before each replay.
-        hidden_size: hidden dimension of each token.
-        max_tokens: maximum number of tokens any rank can contribute. Used to
-            determine the grid size so that all ranks launch the same number of
-            CTAs — required for symm_mem_sync to complete on all ranks.
-        byte_offset: byte offset of this tensor within the symmetric memory buffer
-            (for packing multiple tensors; 0 if only one tensor).
+        symm_mem_hdl: symmetric memory handle for output_tensor.
+        rank_token_offset: pre-allocated scalar int32 CUDA tensor. The dispatcher
+            writes this rank's token offset (prefix sum over lower-ranked EP ranks)
+            into it each step before kernel launch.
+        ep_max_tokens: pre-allocated scalar int32 CUDA tensor. The dispatcher writes
+            the maximum local_tokens across all EP ranks into it each step. CTAs with
+            pid >= ep_max_tokens exit immediately — safe because all ranks agree on
+            this value, so the corresponding CTAs exit on every rank simultaneously.
+        engine_max_tokens: static int set at model init. Determines the CTA grid size
+            as min(engine_max_tokens, MAX_NUM_BLOCKS). Typically > MAX_NUM_BLOCKS so
+            we always launch MAX_NUM_BLOCKS CTAs.
+        output_byte_offset: byte offset of this tensor within the symmetric memory buffer
+            (for packing multiple tensors into one buffer; 0 if the buffer holds only
+            this tensor).
 
     Returns:
         output_tensor with all ranks' data written.
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather-v."
-    assert are_tensors_nvls_eligible(
-        input_tensor
-    ), "Input tensor must be 16-byte divisible on Hopper+ for NVLS."
+    assert input_tensor.ndim == 2 and output_tensor.ndim == 2, (
+        "input_tensor and output_tensor must be 2-D [tokens, hidden_size]."
+    )
+    assert is_device_nvls_capable(
+        input_tensor.device
+    ), "multimem_all_gather_v requires a Hopper+ GPU with NVLink (SM >= 9)."
     assert (
         rank_token_offset.numel() == 1
         and rank_token_offset.dtype == torch.int32
         and rank_token_offset.is_cuda
     ), "rank_token_offset must be a scalar int32 CUDA tensor."
 
+    hidden_size = input_tensor.shape[1]
+    assert input_tensor.shape[1] == output_tensor.shape[1], (
+        f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {output_tensor.shape[1]}"
+    )
+
+    row_bytes = hidden_size * input_tensor.element_size()
+    assert row_bytes % 8 == 0, (
+        f"Row size ({hidden_size} elements × {input_tensor.element_size()} bytes) = "
+        f"{row_bytes} bytes is not 8-byte aligned; cannot use NVLS."
+    )
+    bits = 128 if row_bytes % 16 == 0 else 64
+
     MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
     MAX_BLOCK_SIZE = 1024
     WARP_SIZE = 32
 
     local_tokens = input_tensor.shape[0]
-    numel_per_thread = 128 // (input_tensor.element_size() * 8)
+    numel_per_thread = bits // (input_tensor.element_size() * 8)
     numel_per_token = (hidden_size + numel_per_thread - 1) // numel_per_thread
 
     # BLOCK_SIZE must be a constexpr and >= numel_per_token; round up to next power of 2.
-    block_size = 1
-    while block_size < numel_per_token:
-        block_size *= 2
-    block_size = min(block_size, MAX_BLOCK_SIZE)
+    block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
     num_warps = max(1, block_size // WARP_SIZE)
 
-    # Grid is sized from max_tokens (same across all ranks) so that every rank
-    # launches the same number of CTAs. CTAs with pid >= local_tokens skip the
-    # data movement loop but still participate in symm_mem_sync.
-    num_blocks = min(max_tokens, MAX_NUM_BLOCKS)
+    # All ranks launch the same fixed number of CTAs. CTAs with
+    # pid >= ep_max_tokens exit immediately at kernel entry.
+    num_blocks = min(engine_max_tokens, MAX_NUM_BLOCKS)
 
     _multimem_all_gather_v_kernel[(num_blocks, 1, 1)](
         input_tensor.data_ptr(),
@@ -185,10 +237,12 @@ def multimem_all_gather_v(
         symm_mem_hdl.signal_pad_ptrs_dev,
         local_tokens=local_tokens,
         rank_token_offset_ptr=rank_token_offset,
-        byte_offset=byte_offset,
+        ep_max_tokens_ptr=ep_max_tokens,
+        output_byte_offset=output_byte_offset,
         HIDDEN_SIZE=hidden_size,
         BLOCK_SIZE=block_size,
         NUMEL_PER_THREAD=numel_per_thread,
+        BITS=bits,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
         num_warps=num_warps,
