@@ -119,6 +119,14 @@ jobs:
               new tests). The git merge preserves both sides' non-conflicting
               additions, which is correct. Only intervene where there is an actual
               conflict.
+            - **Beware of squashed-merge chains:** Dev often develops features as
+              a series of PRs (PR1 → PR2 → PR3) but merges them to main as a
+              single squashed commit. If only PR1 is on main, using `-X theirs`
+              may restore PR1's original code and overwrite PR2/PR3's follow-up
+              changes on dev. When resolving conflicts in such cases, check
+              `git log origin/dev -- <file>` to see if dev has follow-up commits
+              that build on the conflicting code. If so, favor dev's version for
+              that specific section.
 
             **After merging, take main's version ONLY for these specific files**
             that are known to have semantic conflicts (dev's versions reference
@@ -145,9 +153,18 @@ jobs:
             missing imports like `BalancedCPScheduler`, `Any`, `List`) at the
             end. Then run `black` and `isort` on the result.
 
-            **Restore files that exist in main but were deleted/renamed in dev:**
-            Compare `git ls-tree` between `origin/main` and HEAD, and restore any
-            files from main that are missing (e.g. `hybrid_cp_schedule.py`).
+            **Handle files that exist in main but were deleted in dev:**
+            Compare `git ls-tree` between `origin/main` and HEAD to find files
+            in main that are missing from the merged tree. For EACH such file,
+            decide whether to restore it:
+            - **Restore** if main's code imports/references it and would break
+              without it (e.g. `hybrid_cp_schedule.py` if main's `schedules.py`
+              imports from it).
+            - **Do NOT restore** if dev intentionally deleted it to simplify
+              testing or remove unused code — check `git log origin/dev` for the
+              deletion commit to understand intent.
+            When in doubt, check whether any file in the merged tree imports
+            from the missing file. If nothing imports it, skip it.
 
             Run `black` (version 24, with `--config pyproject.toml`) on **all**
             changed Python files (relative to `origin/dev`) to fix formatting.
@@ -169,8 +186,15 @@ jobs:
 
             Create a **draft** PR targeting `dev`:
             - Title: `chore: nightly sync main into dev ($DATE)`
-            - Body: describe what was synced, how conflicts were resolved, and
-              that CI will be iterated on automatically.
+            - Body should include:
+              1. Summary of what was synced (number of commits from main)
+              2. List of files where main's version was taken over the merge
+              3. List of files that were deleted in dev but restored (and why)
+              4. The remerge-diff output (`git show --remerge-diff HEAD` on the
+                 merge commit) so reviewers can inspect ONLY the conflict
+                 resolutions without wading through the entire merge diff.
+                 If the output is very long, summarize the conflicts by file
+                 and include the full diff in a collapsed `<details>` block.
 
             Save the PR number.
 
