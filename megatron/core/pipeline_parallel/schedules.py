@@ -743,7 +743,6 @@ def forward_backward_no_pipelining(
             ):
                 model_chunk.synchronize_param_gather()
 
-
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
