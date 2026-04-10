@@ -7,8 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
-from megatron.core.utils import nvtx_decorator
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, nvtx_decorator
 
 try:
     import transformer_engine  # pylint: disable=unused-import
