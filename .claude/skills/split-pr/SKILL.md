@@ -17,7 +17,7 @@ pulls in many additional groups.
 
 ### 1. Analyze the PR
 
-1. Fetch the PR details: `gh pr view <number> --repo NVIDIA/Megatron-LM --json title,body,headRefName` and `gh pr diff <number> --repo NVIDIA/Megatron-LM --stat`.
+1. Fetch the PR details: `gh pr view <number> --repo NVIDIA/Megatron-LM --json title,body,headRefName,author` and `gh pr diff <number> --repo NVIDIA/Megatron-LM --stat`. Also determine the current GitHub user with `gh api user --jq .login`.
 2. Parse `.github/CODEOWNERS` to build a mapping from file path patterns to owner groups.
 3. For each changed file in the PR, determine which CODEOWNERS groups would be required to review it.
 4. Build a summary table grouped by CODEOWNERS group, showing which files pull in which groups.
@@ -59,3 +59,4 @@ For each new PR:
 - Test files should go with the production code they test, not in a separate PR.
 - Prefer a single clean commit per split PR over replaying the original commit history.
 - If a file is hard to categorize (e.g., it touches two groups), ask the user which PR it should go in.
+- If the current GitHub user is not the author of the original PR, each new PR's description must explicitly credit the original author (e.g., "Original changes by @<author> in #<number>").
