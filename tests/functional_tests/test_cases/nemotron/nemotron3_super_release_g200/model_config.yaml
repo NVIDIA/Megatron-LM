@@ -87,10 +87,8 @@ MODEL_ARGS:
   --moe-permute-fusion: true
   --moe-latent-size: 1024
   --moe-shared-expert-intermediate-size: 5376
-  --moe-shared-expert-compute-before-router: true
 
   # MTP args
-  --mtp-spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
   --mtp-num-layers: 2
   --mtp-hybrid-override-pattern: \"*E\"
   --calculate-per-token-loss: true
