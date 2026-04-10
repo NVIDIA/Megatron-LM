@@ -136,6 +136,11 @@ products:
   #     - environment: [dev]
   #       scope: [mr]
   #       platforms: [dgx_h100] # hang: #513
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_activation_func_fp8_input_store/]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer]
     products:
       - environment: [dev]
