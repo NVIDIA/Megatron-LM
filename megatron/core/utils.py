@@ -2212,9 +2212,7 @@ def _nvtx_decorator_get_func_path(func):
     return f"{module.__name__}.{caller_func}"
 
 
-def nvtx_decorator(
-    message: Optional[str] = None,
-) -> Callable[[_Wrapped], _Wrapped]:
+def nvtx_decorator(message: Optional[str] = None) -> Callable[[_Wrapped], _Wrapped]:
     """Decorator to add NVTX range to a function.
 
     The ``_nvtx_enabled`` flag is checked at **call time** inside
