@@ -1664,3 +1664,41 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         return wrapped_func
 
     return decorator
+
+
+class DenseMixerSTE(torch.autograd.Function):
+    """Straight-Through Estimator for DenseMixer dense forward pass.
+
+    During the forward pass, replaces the sparse Top-K routing map with a dense
+    all-ones mask so that ALL experts receive tokens and contribute to the output.
+    During the backward pass, passes gradients straight through to the original
+    sparse routing map, enabling the router to receive gradient signal from all
+    experts rather than only the selected Top-K ones.
+
+    This implements the core idea from DenseMixer (https://github.com/yaof20/DenseMixer):
+    use dense forward for better router gradient estimation while keeping sparse
+    routing at inference time (no inference overhead).
+
+    Args:
+        sparse_routing_map: Bool tensor [num_tokens, num_experts], True for Top-K selected experts.
+        dense_routing_map: Bool tensor [num_tokens, num_experts], all True (dense mask).
+
+    Returns:
+        dense_routing_map with gradients flowing to sparse_routing_map in backward.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, sparse_routing_map: torch.Tensor, dense_routing_map: torch.Tensor
+    ) -> torch.Tensor:
+        """Return dense_routing_map in forward; remember sparse for backward."""
+        ctx.save_for_backward(sparse_routing_map)
+        return dense_routing_map
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        """Pass gradient through to sparse_routing_map unchanged (STE)."""
+        (sparse_routing_map,) = ctx.saved_tensors
+        # Gradient w.r.t. sparse_routing_map: straight-through (identity)
+        # Gradient w.r.t. dense_routing_map: None (it's a constant)
+        return grad_output, None

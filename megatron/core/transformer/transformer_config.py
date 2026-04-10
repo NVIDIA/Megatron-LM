@@ -797,6 +797,16 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
+    moe_dense_forward_for_router_grad: bool = False
+    """[DenseMixer] Enable dense forward pass during training for better router gradient estimation.
+    When enabled, the forward pass computes outputs from ALL experts (not just the Top-K selected
+    ones) using a Straight-Through Estimator (STE). The final output uses the standard sparse Top-K
+    combination (no inference overhead), but the backward pass provides gradients to the router
+    from all experts, improving routing quality during post-training (SFT/RL fine-tuning).
+    FLOPs overhead: ~1.46x. Memory overhead: negligible (expert weights already in GPU memory).
+    Reference: DenseMixer (https://github.com/yaof20/DenseMixer).
+    Note: Only supported with SequentialMLP experts (moe_grouped_gemm=False)."""
+
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 

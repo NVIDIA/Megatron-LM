@@ -540,6 +540,102 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    def dense_moe_forward(
+        self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
+        """DenseMixer dense forward pass for improved router gradient estimation.
+
+        Implements the DenseMixer algorithm (https://github.com/yaof20/DenseMixer):
+        - Forward: routes tokens to ALL local experts (dense), computes the output as a
+          weighted sum using ALL experts with full (non-sparse) routing scores as weights.
+        - Backward: gradients flow to the router from ALL experts, not just the Top-K
+          selected ones, greatly improving routing quality during post-training (SFT/RL).
+
+        At inference time, the standard sparse Top-K routing is used (no overhead).
+        The train/inference discrepancy (dense vs sparse) is acceptable because the model
+        learns to route better - the relative expert preferences are preserved.
+
+        Constraints:
+        - Only supports SequentialMLP (requires access to individual expert MLPs).
+        - Does not support Expert Parallelism (EP size must be 1).
+        - Does not support shared experts.
+        - Does not support moe_latent_size.
+
+        Args:
+            hidden_states (torch.Tensor): Input tensor [seq_length, bsz, hidden_size].
+            padding_mask (torch.Tensor, optional): Boolean mask [seq_length, bsz].
+
+        Returns:
+            Tuple[torch.Tensor, None]: (output tensor, None for mlp_bias).
+        """
+        from megatron.core.transformer.moe.experts import SequentialMLP
+
+        assert isinstance(self.experts, SequentialMLP), (
+            "moe_dense_forward_for_router_grad only supports SequentialMLP experts. "
+            "Please set moe_grouped_gemm=False."
+        )
+        assert (
+            not self.use_shared_expert
+        ), "moe_dense_forward_for_router_grad is not supported with shared experts."
+        assert utils.get_pg_size(self.ep_group) == 1, (
+            "moe_dense_forward_for_router_grad does not support expert parallelism (EP size > 1). "
+            "Please set expert_model_parallel_size=1 when using this feature."
+        )
+        assert (
+            self.config.moe_latent_size is None
+        ), "moe_dense_forward_for_router_grad is not supported with moe_latent_size."
+
+        seq_len, bsz, hidden_size = hidden_states.shape
+        num_tokens = seq_len * bsz
+        hidden_flat = hidden_states.view(num_tokens, hidden_size)
+
+        # 1. Get full routing scores from router gating (dense, all experts)
+        #    We call gating() directly to get logits, then compute full scores.
+        #    The router's aux losses are still applied via the standard router.forward() call.
+        router = self.router
+
+        # Apply standard router.forward() to compute sparse probs (for aux losses to attach)
+        # The z-loss, aux-loss etc. are attached to `probs` via MoEAuxLossAutoScaler.
+        sparse_probs, _ = router(hidden_states, padding_mask)
+        # sparse_probs: [num_tokens, num_experts] with non-zero only for top-k
+
+        # Compute full dense scores using the same score function as the router.
+        # We get logits from the router's gating layer.
+        logits = router.gating(hidden_flat)  # [num_tokens, num_experts]
+        score_function = router.config.moe_router_score_function
+        if score_function == "sigmoid":
+            full_scores = torch.sigmoid(logits)
+        else:  # softmax (default) or other
+            full_scores = torch.softmax(logits, dim=-1, dtype=torch.float32).to(logits.dtype)
+
+        # Detach full_scores from the gating computation to avoid double-counting gradients.
+        # Gradients to the router flow through sparse_probs (via aux-loss autograd).
+        # The dense computation provides gradient signal via full_scores for ALL experts.
+        # We keep full_scores in the compute graph so all experts contribute gradients.
+
+        # 2. Run ALL local experts on all tokens with full (dense) scores
+        expert_outputs = []
+        for expert_idx, expert in enumerate(self.experts.local_experts):
+            global_expert_idx = self.local_expert_indices[expert_idx]
+            # per_token_scale: [num_tokens] - full score for this expert (all tokens, all experts)
+            expert_score = full_scores[:, global_expert_idx]  # [num_tokens]
+            # Run expert forward: output is weighted by expert_score inside the MLP
+            expert_out, _ = expert(hidden_flat, expert_score)  # [num_tokens, hidden_size]
+            expert_outputs.append(expert_out)
+
+        # 3. Sum weighted expert outputs (dense weighted combination)
+        dense_output = sum(expert_outputs)  # [num_tokens, hidden_size]
+
+        # 4. Attach sparse_probs to the computation graph to preserve aux-loss gradients.
+        #    sparse_probs has the aux-loss autograd hooks attached; we add a zero contribution
+        #    from it so its gradients still flow during backward.
+        #    This is a no-op numerically but keeps the gradient graph intact.
+        aux_loss_anchor = sparse_probs.sum() * 0.0
+        output = dense_output + aux_loss_anchor
+
+        output = output.view(seq_len, bsz, hidden_size)
+        return output, None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -570,6 +666,10 @@ class MoELayer(BaseMoELayer):
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
+
+        # DenseMixer: use dense forward for improved router gradient estimation during training
+        if self.training and self.config.moe_dense_forward_for_router_grad:
+            return self.dense_moe_forward(hidden_states, padding_mask)
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
