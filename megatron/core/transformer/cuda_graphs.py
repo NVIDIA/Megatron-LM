@@ -258,6 +258,12 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     if not hasattr(base_module, "layer_number"):
         return True, True
 
+    # MTP layers have their own numbering separate from the decoder stack.
+    # Treat each one as self-contained so the buffer-reuse logic does not
+    # try to chain them with decoder layers.
+    if getattr(base_module, 'is_mtp_layer', False):
+        return True, True
+
     # find all first/last layers of this PP stage
     first_layer_numbers = []
     last_layer_numbers = []
@@ -1485,6 +1491,15 @@ class CudaGraphManager(torch.nn.Module):
                 # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
 
+    @staticmethod
+    def _is_mtp_inference(megatron_module, kwargs):
+        """Check if this call is an MTP layer running under inference mode."""
+        return (
+            'inference_context' not in kwargs or not kwargs.get('inference_context')
+        ) and getattr(megatron_module, 'is_mtp_layer', False) and getattr(
+            megatron_module, '_mtp_cuda_graph_enabled', False
+        )
+
     def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs):
         '''Returns a valid cudagraph runner for the current forward call.
         The cudagraph corresponding to this call is the first element of 'self.cudagraph_runners'.
@@ -1494,6 +1509,7 @@ class CudaGraphManager(torch.nn.Module):
         over different microbatches by tracking their respective fwd and bwd passes.'''
         if reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+            is_mtp_inference = self._is_mtp_inference(megatron_module, kwargs)
             if is_inference_mode:
                 is_static_batching = kwargs['inference_context'].is_static_batching()
                 if is_static_batching:
@@ -1503,6 +1519,10 @@ class CudaGraphManager(torch.nn.Module):
                 else:
                     padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
                     runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
+            elif is_mtp_inference:
+                # MTP layers have no inference_context; key by hidden_states shape.
+                mtp_key = ('mtp', kwargs['hidden_states'].shape)
+                runner = self.inference_cudagraphs_lookup_table.get(mtp_key)
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 # If autograd is currently disabled, it doesnt matter if a runner was created
@@ -1545,6 +1565,8 @@ class CudaGraphManager(torch.nn.Module):
                             )
                         else:
                             self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
+                    elif is_mtp_inference:
+                        self.inference_cudagraphs_lookup_table[mtp_key] = runner
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1574,7 +1596,10 @@ class CudaGraphManager(torch.nn.Module):
 
             kwargs (dict):  The keyword args to be passed to the module.
         """
-        is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+        is_inference_mode = (
+            ('inference_context' in kwargs.keys() and kwargs['inference_context'])
+            or self._is_mtp_inference(megatron_module, kwargs)
+        )
         is_in_checkpoint_fwd = is_checkpointing()
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()

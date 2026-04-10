@@ -891,19 +891,28 @@ class TextGenerationController:
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
         if sp_enabled:
-            pad_count = (tp_size - active_request_count % tp_size) % tp_size
-            padded_count = active_request_count + pad_count
+            padded_count = active_request_count + (tp_size - active_request_count % tp_size) % tp_size
         else:
-            pad_count = 0
+            padded_count = active_request_count
 
-        # Pad hidden states to align with the tensor parallel size.
-        if has_mtp and sp_enabled:
+        # Further pad to match a pre-captured CUDA graph batch size.
+        mtp_cuda_graph_sizes = getattr(self, '_mtp_cuda_graph_batch_sizes', None)
+        if mtp_cuda_graph_sizes:
+            for size in mtp_cuda_graph_sizes:
+                if size >= padded_count:
+                    padded_count = size
+                    break
+
+        pad_count = padded_count - active_request_count
+
+        # Pad hidden states and scatter for sequence parallelism.
+        if has_mtp:
             if pad_count > 0:
                 current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
-
-            current_hidden = scatter_to_sequence_parallel_region(
-                current_hidden, group=self.inference_wrapped_model.tp_group
-            )
+            if sp_enabled:
+                current_hidden = scatter_to_sequence_parallel_region(
+                    current_hidden, group=self.inference_wrapped_model.tp_group
+                )
 
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
         for depth in range(num_depths):
@@ -1638,7 +1647,8 @@ class TextGenerationController:
         if not context.cuda_graph_batch_dimensions_list:
             self.inference_wrapped_model.dummy_forward()
 
-            # Disable MoE padding for MTP computation
+            # Disable MoE padding for MTP computation.
+            # No CUDA graphs in this path (cuda_graph_batch_dimensions_list is empty).
             if self.model_config.moe_pad_experts_for_cuda_graph_inference:
                 unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
                 set_decode_expert_padding(unwrapped_model, False)
@@ -1661,10 +1671,12 @@ class TextGenerationController:
             # fallback to eager dummy forward
             self.inference_wrapped_model.dummy_forward()
 
-        # Disable MoE padding for MTP computation
+        # Disable MoE padding for MTP computation, unless CUDA graphs
+        # are active (the graphs were captured with padding enabled).
         if self.model_config.moe_pad_experts_for_cuda_graph_inference:
-            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-            set_decode_expert_padding(unwrapped_model, False)
+            if not context.using_cuda_graph_this_step():
+                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                set_decode_expert_padding(unwrapped_model, False)
 
         # When speculative decoding is active, the real EP ranks perform serial
         # MTP forward passes after the main forward pass. MTP layers may contain
@@ -1715,12 +1727,23 @@ class TextGenerationController:
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
         padded_count = tp_size if sp_enabled else 1
 
+        # When MTP CUDA graphs are active, pad to the smallest captured batch
+        # size so the dummy rank also replays a pre-captured graph (the EP
+        # collectives must match the real ranks).
+        mtp_cuda_graph_sizes = getattr(self, '_mtp_cuda_graph_batch_sizes', None)
+        if mtp_cuda_graph_sizes:
+            padded_count = mtp_cuda_graph_sizes[0]
+
         dummy_hidden = None
         if has_mtp:
             # Minimal dummy tensors — just enough to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
             # Depth 0 uses full-format hidden; subsequent depths use SP format.
-            dummy_hidden = torch.zeros((1, 1, hidden_size), device=device, dtype=dtype)
+            dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
+            if sp_enabled:
+                dummy_hidden = scatter_to_sequence_parallel_region(
+                    dummy_hidden, group=self.inference_wrapped_model.tp_group
+                )
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
@@ -1893,10 +1916,12 @@ class TextGenerationController:
                 self._rewind_kv_cache()
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
-                # Disable MoE padding for MTP computation
+                # Disable MoE padding for MTP computation, unless CUDA graphs
+                # are active (the graphs were captured with padding enabled).
                 if self.model_config.moe_pad_experts_for_cuda_graph_inference:
-                    unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-                    set_decode_expert_padding(unwrapped_model, False)
+                    if not context.using_cuda_graph_this_step():
+                        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                        set_decode_expert_padding(unwrapped_model, False)
 
                 # Phase 3: Compute MTP serially with correct (verified) inputs.
                 nvtx_range_push("mtp-spec-decoding/serial-mtp")
