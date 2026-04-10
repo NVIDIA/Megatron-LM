@@ -3211,7 +3211,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_kv_blocks = self.kv_block_allocator.get_active_used()
         kv_bytes = active_kv_blocks * self.block_size_bytes
 
-        # Mamba state: active requests * per-request Mamba memory (computed once in __init__).
+        # Mamba state: active requests * per-request Mamba memory
         mamba_bytes = 0
         if self.is_hybrid_model:
             mamba_bytes = self.get_active_request_count() * self.mamba_states_memory_per_request
