@@ -142,8 +142,8 @@ class EngineSuspendedError(Exception):
 
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
-    for power, suffix in [(4, "TiB"), (3, "GiB"), (2, "MiB"), (1, "KiB"), (0, "bytes")]:
-        suffix_bytes = 1024**power
+    for power, suffix in [(4, "TB"), (3, "GB"), (2, "MB"), (1, "KB"), (0, "bytes")]:
+        suffix_bytes = 1000**power
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
@@ -304,17 +304,17 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if torch.distributed.get_rank() == 0:
             sol_parts = [
-                f"model weights = {self._model_weight_bytes / 2**30:.2f} GiB",
-                f"measured HBM bandwidth = {self._measured_hbm_bandwidth / 2**30:.0f} GiB/s",
+                f"model weights = {self._model_weight_bytes / 1e9:.2f} GB",
+                f"measured HBM bandwidth = {self._measured_hbm_bandwidth / 1e9:.0f} GB/s",
             ]
             if self._measured_tp_allreduce_bw > 0:
                 sol_parts.append(
-                    f"TP allreduce bandwidth = {self._measured_tp_allreduce_bw / 2**30:.1f} GiB/s "
+                    f"TP allreduce bandwidth = {self._measured_tp_allreduce_bw / 1e9:.1f} GB/s "
                     f"(tp={tp_size}, {self._num_tp_allreduces} allreduces/step)"
                 )
             if self._measured_ep_alltoall_bw > 0:
                 sol_parts.append(
-                    f"EP all-to-all bandwidth = {self._measured_ep_alltoall_bw / 2**30:.1f} GiB/s "
+                    f"EP all-to-all bandwidth = {self._measured_ep_alltoall_bw / 1e9:.1f} GB/s "
                     f"(ep={ep_size}, {self._num_moe_layers} MoE layers)"
                 )
             logging.info(f"SOL latency baseline: {', '.join(sol_parts)}")
@@ -726,20 +726,20 @@ class DynamicInferenceEngine(AbstractEngine):
             rank_str = torch.distributed.get_rank()
             dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
             relative_time_str = f"{end_time - start_time:.3f} sec"
-            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 2**30:.1f} GiB"
+            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1e9:.1f} GB"
 
             if HAVE_PSUTIL:
                 process = psutil.Process()
                 mem_info = process.memory_info()
-                cpu_mem_str = f"{mem_info.rss / 2**30:.1f} GiB"
+                cpu_mem_str = f"{mem_info.rss / 1e9:.1f} GB"
             else:
                 cpu_mem_str = "--"
 
             total_mem_str = ", ".join(
                 (
                     f"cpu: {cpu_mem_str}",
-                    f"gpu: alloc {end_mem_alloc / 2**30:.1f} GiB",
-                    f"res {end_mem_res / 2**30:.1f} GiB",
+                    f"gpu: alloc {end_mem_alloc / 1e9:.1f} GB",
+                    f"res {end_mem_res / 1e9:.1f} GB",
                 )
             )
             logging.info(
@@ -1797,16 +1797,16 @@ class DynamicInferenceEngine(AbstractEngine):
         """Format the SOL portion of the step log string."""
         if sol["mamba_bytes"] > 0:
             mem_str = (
-                f"({self._model_weight_bytes / 2**30:.2f} GiB weights + "
-                f"{sol['kv_bytes'] / 2**30:.2f} GiB kv + "
-                f"{sol['mamba_bytes'] / 2**30:.2f} GiB mamba) / "
-                f"{self._measured_hbm_bandwidth / 2**30:.0f} GiB/s"
+                f"({self._model_weight_bytes / 1e9:.2f} GB weights + "
+                f"{sol['kv_bytes'] / 1e9:.2f} GB kv + "
+                f"{sol['mamba_bytes'] / 1e9:.2f} GB mamba) / "
+                f"{self._measured_hbm_bandwidth / 1e9:.0f} GB/s"
             )
         else:
             mem_str = (
-                f"({self._model_weight_bytes / 2**30:.2f} GiB weights + "
-                f"{sol['state_bytes'] / 2**30:.2f} GiB state) / "
-                f"{self._measured_hbm_bandwidth / 2**30:.0f} GiB/s"
+                f"({self._model_weight_bytes / 1e9:.2f} GB weights + "
+                f"{sol['state_bytes'] / 1e9:.2f} GB state) / "
+                f"{self._measured_hbm_bandwidth / 1e9:.0f} GB/s"
             )
 
         comm_parts = []
@@ -1814,14 +1814,14 @@ class DynamicInferenceEngine(AbstractEngine):
             tp_ar_total_bytes = sol["num_allreduces"] * sol["msg_bytes"]
             comm_parts.append(
                 f"tp_ar {sol['sol_tp_comm_s'] * 1000:.3f} ms "
-                f"({tp_ar_total_bytes / 2**20:.2f} MiB / "
-                f"{self._measured_tp_allreduce_bw / 2**30:.1f} GiB/s)"
+                f"({tp_ar_total_bytes / 1e6:.2f} MB / "
+                f"{self._measured_tp_allreduce_bw / 1e9:.1f} GB/s)"
             )
         if sol["sol_ep_comm_s"] > 0:
             comm_parts.append(
                 f"ep_a2a {sol['sol_ep_comm_s'] * 1000:.3f} ms "
-                f"({sol['a2a_vol'] / 2**20:.2f} MiB / "
-                f"{self._measured_ep_alltoall_bw / 2**30:.1f} GiB/s)"
+                f"({sol['a2a_vol'] / 1e6:.2f} MB / "
+                f"{self._measured_ep_alltoall_bw / 1e9:.1f} GB/s)"
             )
 
         if comm_parts:
@@ -1864,8 +1864,8 @@ class DynamicInferenceEngine(AbstractEngine):
             f"p {context_state['total_paused_used_blocks']}"
             f"/{context_state['total_paused_block_count']} ... "
             f"mem: tensors {mem['allocation.all.current']}, "
-            f"alloc {mem['allocated_bytes.all.current'] / (2**30):.1f} GiB, "
-            f"res {mem['reserved_bytes.all.current'] / (2**30):.1f} GiB."
+            f"alloc {mem['allocated_bytes.all.current'] / 1e9:.1f} GB, "
+            f"res {mem['reserved_bytes.all.current'] / 1e9:.1f} GB."
         )
 
         if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
