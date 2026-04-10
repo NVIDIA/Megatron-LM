@@ -578,7 +578,7 @@ class GatedDeltaNet(MegatronModule):
         if total_cu != total_seq_len:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
-                f"total_sequence_length={total_seq_len}."
+                f"total_sequence_length={total_seq_len}. "
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
             )
 
