@@ -453,10 +453,11 @@ class MoELayer(BaseMoELayer):
 
     @staticmethod
     def _num_token_rows_from_moe_hidden_states(hidden_states: torch.Tensor) -> int:
-        """Product of all dimensions except the hidden/last dim (same as ``view(-1, H)`` row count)."""
+        """Product of all dims except the hidden/last (same as ``view(-1, H)`` row count)."""
         if hidden_states.dim() < 2:
             raise ValueError(
-                f"MoE hidden_states must be at least 2D [..., hidden_size], got shape {tuple(hidden_states.shape)}"
+                "MoE hidden_states must be at least 2D [..., hidden_size], "
+                f"got shape {tuple(hidden_states.shape)}"
             )
         return int(math.prod(hidden_states.shape[:-1]))
 
@@ -545,9 +546,7 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        dispatched_input = self._maybe_record_overload_factor(
-            dispatched_input, tokens_per_expert
-        )
+        dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
         if (
             hasattr(self, "_inference_token_dispatcher")
             and self.is_inference_cuda_graphed_iteration

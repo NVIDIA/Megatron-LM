@@ -178,7 +178,7 @@ class MoEOverloadFactorTracker:
         tokens_on_rank: torch.Tensor,
         local_balanced_token_count: torch.Tensor,
     ) -> None:
-        """Record forward-pass token total on this rank (0-dim float) and balanced token count scalar."""
+        """Record forward token total on this rank (0-dim float) and balanced count scalar."""
         self._flush_pending_clear()
         if layer_number is None:
             return
@@ -208,29 +208,23 @@ class MoEOverloadFactorTracker:
             else None
         )
         use_pp_reduce = (
-            pp_group is not None
-            and torch.distributed.get_world_size(group=pp_group) > 1
+            pp_group is not None and torch.distributed.get_world_size(group=pp_group) > 1
         )
         return pp_group, use_pp_reduce
 
-    def _flatten_recorded_tokens(
-        self,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def _flatten_recorded_tokens(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         fwd_tensors: List[torch.Tensor] = []
         balanced_tensors: List[torch.Tensor] = []
         if self._layer_fwd_tokens:
             for layer_idx in sorted(self._layer_fwd_tokens.keys()):
                 for t, b in zip(
-                    self._layer_fwd_tokens[layer_idx],
-                    self._layer_fwd_balanced[layer_idx],
+                    self._layer_fwd_tokens[layer_idx], self._layer_fwd_balanced[layer_idx]
                 ):
                     fwd_tensors.append(t)
                     balanced_tensors.append(b)
         return fwd_tensors, balanced_tensors
 
-    def _pp_allreduce_empty_tracker(
-        self, pp_group: torch.distributed.ProcessGroup
-    ) -> None:
+    def _pp_allreduce_empty_tracker(self, pp_group: torch.distributed.ProcessGroup) -> None:
         """Ranks without MoE still join PP collectives so peers do not hang."""
         device = (
             torch.device('cuda', torch.cuda.current_device())
@@ -238,9 +232,7 @@ class MoEOverloadFactorTracker:
             else torch.device('cpu')
         )
         pp_buf = torch.zeros(2, device=device, dtype=torch.float32)
-        torch.distributed.all_reduce(
-            pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX
-        )
+        torch.distributed.all_reduce(pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX)
 
     def _validate_overload_tensor_lists(
         self, num_entries: int, num_layers: int, num_balanced: int
@@ -325,9 +317,7 @@ class MoEOverloadFactorTracker:
         return tp_ep_overload, device
 
     def _dp_reduce_overload(
-        self,
-        tp_ep_overload: torch.Tensor,
-        dp_group: Optional[torch.distributed.ProcessGroup],
+        self, tp_ep_overload: torch.Tensor, dp_group: Optional[torch.distributed.ProcessGroup]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Average and worst-case overload across DP replicas (per entry)."""
         if dp_group is not None:
@@ -352,18 +342,12 @@ class MoEOverloadFactorTracker:
         pp_group: torch.distributed.ProcessGroup,
     ) -> Tuple[float, float]:
         max_cum_value = (
-            float(max_cum_overload_factor)
-            if max_cum_overload_factor is not None
-            else 0.0
+            float(max_cum_overload_factor) if max_cum_overload_factor is not None else 0.0
         )
         pp_buf = torch.tensor(
-            [max_overload_factor, max_cum_value],
-            device=device,
-            dtype=torch.float32,
+            [max_overload_factor, max_cum_value], device=device, dtype=torch.float32
         )
-        torch.distributed.all_reduce(
-            pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX
-        )
+        torch.distributed.all_reduce(pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX)
         return pp_buf[0].item(), pp_buf[1].item()
 
     def _log_overload_metrics(
@@ -384,9 +368,7 @@ class MoEOverloadFactorTracker:
             writer.add_scalar("moe/avg_overload_factor", avg_overload_factor, iteration)
             writer.add_scalar("moe/max_overload_factor", max_overload_factor, iteration)
             if max_cum_overload_factor is not None:
-                writer.add_scalar(
-                    "moe/max_cum_overload_factor", max_cum_overload_factor, iteration
-                )
+                writer.add_scalar("moe/max_cum_overload_factor", max_cum_overload_factor, iteration)
         if wandb_writer is not None:
             wandb_writer.log({"moe/avg_overload_factor": avg_overload_factor}, iteration)
             wandb_writer.log({"moe/max_overload_factor": max_overload_factor}, iteration)
@@ -402,12 +384,8 @@ class MoEOverloadFactorTracker:
             for i in range(num_layers):
                 avg_val, max_val = layer_avg[i].item(), layer_max[i].item()
                 if writer is not None:
-                    writer.add_scalar(
-                        f"moe/avg_overload_factor_layer_{i}", avg_val, iteration
-                    )
-                    writer.add_scalar(
-                        f"moe/max_overload_factor_layer_{i}", max_val, iteration
-                    )
+                    writer.add_scalar(f"moe/avg_overload_factor_layer_{i}", avg_val, iteration)
+                    writer.add_scalar(f"moe/max_overload_factor_layer_{i}", max_val, iteration)
                 if wandb_writer is not None:
                     wandb_writer.log(
                         {
@@ -418,13 +396,9 @@ class MoEOverloadFactorTracker:
                     )
 
     def report(
-        self,
-        iteration: int,
-        writer=None,
-        wandb_writer=None,
-        per_layer_logging: bool = False,
+        self, iteration: int, writer=None, wandb_writer=None, per_layer_logging: bool = False
     ) -> str:
-        """Reduce stored data, compute overload factors, log to TB/W&B, request deferred clear, return log string."""
+        """Reduce data, overload factors, log to TB/W&B, defer clear, return log string."""
         pp_group, use_pp_reduce = self._pipeline_group_and_use_reduce()
         tp_ep_group = self._tp_ep_group
         dp_group = self._dp_group
@@ -454,10 +428,7 @@ class MoEOverloadFactorTracker:
         if use_pp_reduce:
             assert pp_group is not None
             max_overload_factor, max_cum_reduced = self._pp_reduce_max_overload_scalars(
-                max_overload_factor,
-                max_cum_overload_factor,
-                device,
-                pp_group,
+                max_overload_factor, max_cum_overload_factor, device, pp_group
             )
             max_cum_overload_factor = max_cum_reduced
 
