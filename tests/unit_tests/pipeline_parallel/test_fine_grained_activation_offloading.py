@@ -23,6 +23,7 @@ from tests.unit_tests.test_utilities import Utils
 EPSILON = 0.30
 EPSILON_A2A = 0.30
 DELTA = 20  # MiB
+CUDA_GRAPH_DELTA = 200  # MiB — Considering some CG overhead
 
 
 def _reset_cuda_memory() -> None:
@@ -63,6 +64,7 @@ def _build_gpt_model(
         use_cpu_initialization=True,
         attention_backend=AttnBackend.unfused,
         bf16=True,
+        params_dtype=torch.bfloat16,
         # Recompute
         recompute_modules=recompute_modules,
         recompute_granularity="selective",
@@ -428,6 +430,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             recompute_modules=["layernorm", "moe_act"],
             recompute_granularity="selective",
             bf16=True,
+            params_dtype=torch.bfloat16,
             # MoE + EP overlap
             num_moe_experts=num_experts,
             moe_grouped_gemm=True,
@@ -619,6 +622,7 @@ def _build_gpt_model_with_cuda_graph(
         use_cpu_initialization=True,
         attention_backend=AttnBackend.unfused,
         bf16=True,
+        params_dtype=torch.bfloat16,
         # Recompute (note: "mhc" recompute is incompatible with offloading)
         recompute_modules=recompute_modules,
         recompute_granularity="selective",
@@ -645,7 +649,6 @@ def _build_gpt_model_with_cuda_graph(
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
-            moe_use_legacy_grouped_gemm=False,
             multi_latent_attention=is_mla,
             enable_hyper_connection=enable_hyper_connections,
         ),
@@ -673,7 +676,28 @@ def _run_iters_with_cuda_graph(
       - selected grads from last iteration (CPU float32)
       - peak_memory_allocated (bytes) during measurement iterations
     """
-    from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
+    from megatron.core.num_microbatches_calculator import (
+        destroy_num_microbatches_calculator,
+        init_num_microbatches_calculator,
+    )
+    from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+    # Switch to a non-default stream so AccumulateGrad nodes (created during warmup backward
+    # passes) are associated with this stream rather than the default stream.  If they are on
+    # the default stream, CUDA graph capture will fail with cudaErrorStreamCaptureImplicit.
+    te_side_stream = torch.cuda.Stream()
+    te_side_stream.wait_stream(torch.cuda.current_stream())
+    torch.cuda.set_stream(te_side_stream)
+
+    micro_batch_size = input_ids.shape[0]
+    init_num_microbatches_calculator(
+        rank=0,
+        rampup_batch_size=None,
+        global_batch_size=micro_batch_size,
+        micro_batch_size=micro_batch_size,
+        data_parallel_size=1,
+        decrease_batch_size_if_needed=False,
+    )
 
     if enable_offload_reset:
         off_interface.reset()
@@ -696,8 +720,20 @@ def _run_iters_with_cuda_graph(
     if enable_offload_reset:
         off_interface.reset()
 
+    # TECudaGraphHelper expects model chunks to have zero_grad_buffer() (from DDP wrappers).
+    # For a plain GPTModel, this is a no-op (same as the DataParallelBase base implementation).
+    if not hasattr(model, 'zero_grad_buffer'):
+        model.zero_grad_buffer = lambda: None
+
     # Create CUDA graphs after warmup
-    _CudagraphGlobalRecord.create_cudagraphs()
+    cuda_graph_helper = TECudaGraphHelper(
+        model=[model],
+        config=model.config,
+        seq_length=input_ids.shape[1],
+        micro_batch_size=input_ids.shape[0],
+        optimizers=[],
+    )
+    cuda_graph_helper.create_cudagraphs()
 
     # Measurement iterations (with CUDA graph replay)
     torch.cuda.reset_peak_memory_stats()
@@ -723,7 +759,10 @@ def _run_iters_with_cuda_graph(
         grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
 
     # Cleanup CUDA graphs
-    delete_cuda_graphs()
+    if cuda_graph_helper.graphs_created():
+        cuda_graph_helper.delete_cuda_graphs()
+
+    destroy_num_microbatches_calculator()
 
     return logits.detach().float().cpu(), grads, peak_bytes
 
@@ -825,7 +864,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             offload_modules=None,
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=is_mla,
-            cuda_graph_impl="local",
+            cuda_graph_impl="transformer_engine",
             cuda_graph_scope=cuda_graph_scope,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
         ).cuda()
@@ -858,7 +897,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,  # Force offloading for determinism
             is_mla=is_mla,
-            cuda_graph_impl="local",
+            cuda_graph_impl="transformer_engine",
             cuda_graph_scope=cuda_graph_scope,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
             delay_offload_until_cuda_graph=delay_offload,
@@ -914,7 +953,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
         # Note: With CUDA graphs, memory behavior may differ from eager mode.
         # We check that offloading doesn't significantly increase memory.
         # In some cases, graph capture overhead may offset offload savings.
-        assert saved_mib >= -DELTA, (
+        assert saved_mib >= -CUDA_GRAPH_DELTA, (
             f"Offloading with CUDA graph significantly increased memory: "
             f"saved={saved_mib:.2f}MiB (negative means increase)"
         )
@@ -995,7 +1034,7 @@ def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
             offload_modules=None,
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=False,
-            cuda_graph_impl="local",
+            cuda_graph_impl="transformer_engine",
             cuda_graph_scope=cuda_graph_scope,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
             enable_hyper_connections=True,
@@ -1030,7 +1069,7 @@ def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,
             is_mla=False,
-            cuda_graph_impl="local",
+            cuda_graph_impl="transformer_engine",
             cuda_graph_scope=cuda_graph_scope,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
             delay_offload_until_cuda_graph=delay_offload,
@@ -1082,7 +1121,7 @@ def test_mhc_fine_grained_activation_offloading_with_cuda_graph(
                 assert not torch.isnan(g).any(), f"NaN detected in mHC grad for {name}"
                 assert not torch.isinf(g).any(), f"Inf detected in mHC grad for {name}"
 
-        assert saved_mib >= -DELTA, (
+        assert saved_mib >= -CUDA_GRAPH_DELTA, (
             f"mHC offloading with CUDA graph significantly increased memory: "
             f"saved={saved_mib:.2f}MiB (negative means increase)"
         )
