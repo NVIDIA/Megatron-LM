@@ -42,7 +42,8 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.legacy.model.module import param_is_not_shared
+
+from megatron.core.transformer.module import param_is_not_shared
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -754,26 +755,45 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
 
 
 def get_nvtx_range():
-    """Create an NVTX range context manager."""
+    """Create an NVTX range context manager.
+
+    Returns a context manager that:
+    - Creates an NVTX range for profiling (nsight-systems compatible)
+    - Optionally tracks time via Megatron timers when time=True
+
+    Args (for returned context manager):
+        msg: Name of the range/timer
+        time: If True, also track with Megatron timers (default: False)
+        log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
+    """
     try:
         from torch.cuda import nvtx
 
         @contextmanager
-        def nvtx_range(msg, time=False):
+        def nvtx_range(msg, time=False, log_level=1):
             if time:
                 timers = get_timers()
-                timers(msg, log_level=0).start()
+                timers(msg, log_level=log_level).start()
             try:
                 nvtx.range_push(msg)
                 yield
             finally:
                 nvtx.range_pop()
                 if time:
-                    timers(msg, log_level=0).stop()
+                    timers(msg, log_level=log_level).stop()
 
         return nvtx_range
     except:
         @contextmanager
-        def dummy_range(msg):
+        def dummy_range(msg, time=False, log_level=1):
             yield
         return dummy_range
+
+
+def has_nvrx_installed():
+    """Checks if nvidia-resiliency-ext is installed."""
+    try:
+        import nvidia_resiliency_ext
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False

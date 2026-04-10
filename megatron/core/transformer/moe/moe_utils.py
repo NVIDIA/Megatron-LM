@@ -12,7 +12,11 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.tensor_parallel import (
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
+    get_expert_parallel_rng_tracker_name,
+)
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
@@ -303,7 +307,7 @@ def permute(
     fused: bool = False,
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
-    align_size: int = -1,
+    align_size: int = 0,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -365,7 +369,11 @@ def permute(
                 "fused_permute_with_probs typically requires TE >= 2.1.0, and "
                 "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
+        if (
+            fused_permute_and_pad_with_probs is not None
+            and tokens_per_expert is not None
+            and align_size > 0
+        ):
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
@@ -1237,6 +1245,55 @@ def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
     return RandomSTE.apply(logits)
 
 
+@internal_api
+class RandomSTEShared(torch.autograd.Function):
+    """
+    Straight-Through Estimator(STE) function that returns random values
+    with a shared seed across all ranks.
+    When std < 0, caches and reuses values per layer.
+    """
+
+    _cache = {}
+
+    @staticmethod
+    def forward(ctx, logits, std, layer_number):
+        """Forward pass: apply random bias to logits."""
+        # Check cache if reuse mode (negative std)
+        if std < 0 and layer_number in RandomSTEShared._cache:
+            return logits + RandomSTEShared._cache[layer_number]
+
+        # Generate random bias with shared seed across all ranks
+        with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+            bias = torch.empty(logits.shape[-1], device=logits.device, dtype=logits.dtype).normal_(
+                std=abs(std)
+            )
+
+        # Cache if reuse mode
+        if std < 0 and layer_number is not None:
+            RandomSTEShared._cache[layer_number] = bias
+
+        return logits + bias
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: pass through gradients."""
+        return grad_output, None, None
+
+
+def apply_biased_logits(logits, std, layer_number=None):
+    """
+    Apply random bias to logits. All ranks get the same random values.
+
+    Args:
+        logits: Input logits tensor [num_tokens, num_experts]
+        std: Standard deviation for random bias. If negative, generate once
+             per layer and reuse (using abs(std) as actual std).
+        layer_number: Layer number for caching when std is negative.
+    """
+    logits = apply_random_logits(logits)
+    return RandomSTEShared.apply(logits, std, layer_number)
+
+
 class RouterGatingLinearFunction(torch.autograd.Function):
     """
     Autograd function for router gating linear.
@@ -1353,7 +1410,8 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
         return get_fp8_align_size(config.fp8_recipe)
     elif config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    return 16
+    # Only FP8 or FP4 requires padding. Defaults to 0.
+    return 0
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
