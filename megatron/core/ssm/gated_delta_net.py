@@ -306,7 +306,6 @@ class GatedDeltaNet(MegatronModule):
             ), "Packed sequence does not support deterministic mode."
 
             # Resolve cu_seqlens with alignment padding handling.
-            # See: https://github.com/NVIDIA/Megatron-LM/issues/4194
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
@@ -571,27 +570,19 @@ class GatedDeltaNet(MegatronModule):
     def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name):
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
-            return cu_seqlens_padded
+            cu_seqlens = cu_seqlens_padded
+        else:
+            cu_seqlens = cu_seqlens_actual
 
-        if self.cp_size <= 1:
-            return cu_seqlens_actual
-
-        total_cu = cu_seqlens_actual[-1].item()
-        if total_cu == total_seq_len:
-            return cu_seqlens_actual
-        if total_cu > total_seq_len:
+        total_cu = cu_seqlens[-1].item()
+        if total_cu != total_seq_len:
             raise ValueError(
-                f"GDN: {name}[-1]={total_cu} exceeds "
+                f"GDN: {name}[-1]={total_cu} does not match "
                 f"total_sequence_length={total_seq_len}."
+                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
             )
 
-        raise ValueError(
-            f"GDN packed sequence with CP > 1 requires {name}_padded when "
-            f"alignment padding is present ({name}[-1]={total_cu} < "
-            f"total_sequence_length={total_seq_len}). "
-            f"Please set {name}_padded in PackedSeqParams. "
-            f"See https://github.com/NVIDIA/Megatron-LM/issues/4194"
-        )
+        return cu_seqlens
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
