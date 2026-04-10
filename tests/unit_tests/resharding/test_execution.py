@@ -10,12 +10,12 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-import torch.distributed as dist
 
 from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.execution import execute_reshard_plan
 from megatron.core.resharding.transforms import ReshardTransform
 from megatron.core.resharding.utils import ReshardPlan, TransferOp
+from tests.unit_tests.test_utilities import Utils
 
 _HAS_CUDA = torch.cuda.is_available()
 
@@ -88,10 +88,7 @@ def _make_transfer_op(param_name, peer_rank, is_send, my_slice, peer_slice, task
 
 def _run(plan, src_module, dst_module, service, transform=None):
     """Execute a reshard plan, initializing a temporary process group if needed."""
-    if not dist.is_initialized():
-        dist.init_process_group(
-            backend="gloo", init_method="tcp://127.0.0.1:29500", rank=0, world_size=1
-        )
+    Utils.initialize_distributed()
     execute_reshard_plan(plan, src_module, dst_module, service, transform=transform)
 
 
