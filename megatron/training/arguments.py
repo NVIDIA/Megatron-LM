@@ -1974,7 +1974,6 @@ def _add_network_size_args(parser):
         "softmax_scale",
         "gated_linear_unit",
         "bias_activation_fusion",
-        "activation_func_fp8_input_store",
         "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
@@ -2524,8 +2523,6 @@ def _add_training_args(parser):
                        '--use-legacy-models to not use core models.')
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
-    group.add_argument('--activation-func-fp8-input-store', action='store_true',
-                       help='Store swiglu inputs in fp8 to save activation memory.')
 
     return parser
 
