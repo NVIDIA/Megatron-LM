@@ -950,9 +950,25 @@ def validate_args(args, defaults={}):
         #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
         args.use_custom_fsdp = True
 
-        if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
+        # Megatron-FSDP requires the DistributedOptimizer.
+        if not args.use_distributed_optimizer:
             warn_rank_0(
-                'Please make sure your TransformerEngine support FSDP + gradient accumulation fusion',
+                'Megatron-FSDP is only compatible with --use-distributed-optimizer. Using DistributedOptimizer...',
+                args.rank,
+            )
+        args.use_distributed_optimizer = True
+        # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
+        args.reuse_grad_buf_for_mxfp8_param_ag = False
+        # Optimizer compatibility check.
+        assert args.optimizer in ('sgd', 'adam'), \
+            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+
+        if (
+            args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
+            and args.gradient_accumulation_fusion
+        ):
+            warn_rank_0(
+                'Verify that fused gradient accumulation is supported by TransformerEngine for Megatron-FSDP.',
                 args.rank,
             )
 
@@ -961,17 +977,14 @@ def validate_args(args, defaults={}):
                 'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
 
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
-            'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+            'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
 
         assert args.ckpt_format == "fsdp_dtensor", \
-            "Megatron FSDP only supports fsdp_dtensor checkpoint format"
+            "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
         
     if args.fsdp_manual_registration:
-        assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP"
-        assert args.nccl_ub, "FSDP manual registration is only supported with nccl-ub option"
-
-        if args.use_megatron_fsdp:
-            args.reuse_grad_buf_for_mxfp8_param_ag = False
+        assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
+        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
 
     # Parameters dtype.
     args.params_dtype = torch.float

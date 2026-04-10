@@ -150,15 +150,21 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
+                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                self.config.use_precision_aware_optimizer
+                and getattr(param, "__fsdp_param__", False)
+            ):
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
                 if (
                     getattr(param, "__fsdp_param__", False)
                     and grad is not None
                     and hasattr(grad, "_local_tensor")
                 ):
+                    # Megatron-FSDP gradients are DTensors.
                     grad = grad._local_tensor
             elif getattr(param, "__fsdp_param__", False):
+                # Megatron-FSDP gradients are DTensors.
                 grad = param.grad._local_tensor if param.grad is not None else None
             else:
                 grad = param.grad
@@ -227,7 +233,13 @@ class MegatronOptimizer(ABC):
                 params,
                 clip_grad,
                 grad_norm,
-                self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                # Decoupled Grad
+                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                or (
+                    # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                    self.config.use_precision_aware_optimizer
+                    and getattr(params[0], "__fsdp_param__", False)
+                ),
             )
         return grad_norm
 
@@ -237,7 +249,12 @@ class MegatronOptimizer(ABC):
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            or (
+                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                self.config.use_precision_aware_optimizer
+                and getattr(params[0], "__fsdp_param__", False)
+            ),
             tp_group=getattr(self, 'tp_group', None),
         )
 
@@ -1319,7 +1336,12 @@ class ChainedOptimizer(MegatronOptimizer):
             return count_zeros_fp32(
                 params,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                or (
+                    # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                    self.config.use_precision_aware_optimizer
+                    and getattr(params[0], "__fsdp_param__", False)
+                ),
             )
         else:
             num_zeros_in_grad = 0
@@ -1352,6 +1374,11 @@ class ChainedOptimizer(MegatronOptimizer):
                     total_norm=grad_norm,
                     use_decoupled_grad=(
                         optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                        or (
+                            # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                            self.config.use_precision_aware_optimizer
+                            and getattr(params[0], "__fsdp_param__", False)
+                        )
                     ),
                 )
 
