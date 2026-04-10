@@ -46,7 +46,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         init_state_fn_list: Optional[List[Callable]] = None,
         model_chunks: Optional[List] = None,
-        async_allgather: bool = False,
+        overlap_param_gather: bool = False,
     ) -> None:
         """
         Initialize LayerWiseDistributedOptimizer.
@@ -56,19 +56,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             config: OptimizerConfig.
             pg_collection: ProcessGroupCollection.
             init_state_fn_list: List of init state functions.
-            model_chunks: DDP-wrapped model chunks (needed for async_allgather).
-            async_allgather: If True, defer param all-gather to forward pre-hooks.
+            model_chunks: DDP-wrapped model chunks (needed for overlap_param_gather).
+            overlap_param_gather: If True, defer param all-gather to forward pre-hooks.
         """
 
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
 
-        # Set up async all-gather using DDP bucket infrastructure.
-        self.async_allgather = async_allgather
-        if self.async_allgather:
+        # Set up overlap param gather using DDP bucket infrastructure.
+        self.overlap_param_gather = overlap_param_gather
+        if self.overlap_param_gather:
             assert (
                 model_chunks is not None
-            ), "model_chunks must be provided if async_allgather is True"
+            ), "model_chunks must be provided if overlap_param_gather is True"
             self.set_bucket_layerwise_params_list(model_chunks)
 
         if init_state_fn_list:
@@ -76,19 +76,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 optimizers
             ), "init_state_fn_list must be the same length as optimizers if provided"
 
-        # wrap optimizer after sharding to avoid unnecessary master weight creation
-        # for higher precision, optimizers are wrapped with megatron already
+        # Wrap base torch optimizers with Float16 for bf16 training.
+        # Callers pass base optimizers; wrapping happens here *after*
+        # shard_params so master weights are only created for the local shard.
         if config.bf16:
-            # unwrap FP32 optimizer, possibly from reusing get_megatron_optimizer for adam
             for i in range(len(optimizers)):
                 opt = optimizers[i]
-                if isinstance(opt, Float16OptimizerWithFloat16Params):
+                if isinstance(opt, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
                     raise TypeError(
-                        'LayerWiseDistributedOptimizer received Float16 optimizer already.'
+                        'LayerWiseDistributedOptimizer expects base torch optimizers, '
+                        f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
-                # unwrap FP32 optimizer from reusing get_megatron_optimizer for adam
-                if isinstance(opt, FP32Optimizer):
-                    opt = opt.optimizer
                 optimizers[i] = Float16OptimizerWithFloat16Params(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
@@ -177,9 +175,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                                 bucket_list.append(param)
                     bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
-            if self.expt_dp_params_list is not None:
-                for group in model_chunk.expert_parallel_bucket_groups:
-                    for bucket in group.buckets:
+            for group in model_chunk.expert_parallel_bucket_groups:
+                for bucket in group.buckets:
+                    if self.expt_dp_params_list is not None:
                         bucket_params_list = [
                             [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
                         ]
@@ -189,7 +187,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                             for param in full_params_list:
                                 if param in bucket.params:
                                     bucket_list.append(param)
-                        bucket.set_layerwise_params_list(bucket_params_list)
+                    else:
+                        # expt_dp_size == 1: single rank owns all params, no
+                        # all-gather needed but data structures must be initialized.
+                        bucket_params_list = [list(bucket.params_list)]
+                    bucket.set_layerwise_params_list(bucket_params_list)
 
     @torch.no_grad()
     def allgather_params(self) -> None:
@@ -281,9 +283,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """step function for layer-wise optimizer."""
         update_successful, grad_norm, num_zeros_in_grad = super().step()
 
-        # All gather updated params. If async_allgather is True, the allgather
+        # All gather updated params. If overlap_param_gather is True, the allgather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
-        if not self.async_allgather:
+        if not self.overlap_param_gather:
             self.allgather_params()
 
         return update_successful, grad_norm, num_zeros_in_grad

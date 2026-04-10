@@ -1222,10 +1222,23 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
 
-        if self.num_moe_experts is None:
-            assert (
-                self.moe_ffn_hidden_size is None
-            ), "moe_ffn_hidden_size must be None when num_experts is not set."
+        if self.num_moe_experts is None and self.moe_ffn_hidden_size is not None:
+            is_mixed_model = (
+                isinstance(self.moe_layer_freq, list) and 0 in self.moe_layer_freq
+            ) or (isinstance(self.moe_layer_freq, int) and self.moe_layer_freq > 1)
+            if is_mixed_model:
+                warnings.warn(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "This is expected for dense layers in a mixed dense/MoE model "
+                    "(moe_layer_freq indicates some layers remain dense). "
+                    "moe_ffn_hidden_size will be ignored for this layer."
+                )
+                self.moe_ffn_hidden_size = None
+            else:
+                raise ValueError(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "Please set num_moe_experts or remove moe_ffn_hidden_size."
+                )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
@@ -1948,7 +1961,7 @@ class TransformerConfig(ModelParallelConfig):
                 "local",
             ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
-            if self.cpu_offloading:
+            if self.cpu_offloading and self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
             if self.cuda_graph_impl == "local":
@@ -2147,6 +2160,19 @@ class TransformerConfig(ModelParallelConfig):
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
                 )
+
+        if self.overlap_dispatch_backward_with_experts_wgrad:
+            assert not self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be disabled when enabling '
+                'overlap_dispatch_backward_with_experts_wgrad.'
+            )
+            assert is_te_min_version(
+                "2.3.0"
+            ), 'TE version >= 2.3.0 is required for overlap_dispatch_backward_with_experts_wgrad'
+            assert not self.delay_wgrad_compute, (
+                'delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad '
+                'are mutually exclusive; use only one'
+            )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (

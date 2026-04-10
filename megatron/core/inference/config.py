@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -309,7 +309,12 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
-    def __post_init__(self):
+    verbose: InitVar[bool] = False
+    """Whether to log detailed context configuration at initialization.
+    This is an InitVar and is not stored as a field on the config."""
+
+    def __post_init__(self, verbose: bool):
+        self._verbose = verbose
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
