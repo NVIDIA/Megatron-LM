@@ -96,10 +96,7 @@ MODEL_ARGS:
 
   # Mixed precision / quantization args
   --bf16: true
-  --keep-mtp-spec-in-bf16: true
-  --keep-mamba-stack-attention-linear-in-bf16: true
-  --keep-mamba-out-proj-in-mxfp8: true
-  --keep-moe-latent-projections-in-bf16: true
+  --te-precision-config-file: /mnt/artifacts/model/nemotron3_super_release_g200/te_quant.cfg
   --first-last-layers-bf16: true
   --num-layers-at-start-in-bf16: 0
   --num-layers-at-end-in-bf16: 14
