@@ -741,6 +741,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         mamba_submodules: Optional[MambaStackSubmodules] = None,
     ):
         super().__init__(config=config)
+        self.is_mtp_layer = True
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
@@ -846,6 +847,19 @@ class MultiTokenPredictionLayer(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
         self.offload_context = nullcontext()
+
+        # Create cuda graph manager wrapping forward_single_position so that
+        # the full MTP forward (embedding, projection, transformer, layernorm)
+        # is captured in a single graph.
+        if config.cuda_graph_impl == "local" and not config.cuda_graph_scope:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+            self.mtp_cudagraph_manager = CudaGraphManager(
+                config,
+                base_module=self,
+                function_name="forward_single_position",
+                need_backward=False,
+            )
 
     def _get_embeddings(
         self,

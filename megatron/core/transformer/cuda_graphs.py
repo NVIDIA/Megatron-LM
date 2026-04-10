@@ -241,8 +241,10 @@ def _check_supported_type(meta):
         DynamicInferenceContext,
         ArgMetadata,
     }
-    assert meta.type in _SUPPORTED_TYPES or is_dataclass(
-        meta.value
+    assert (
+        meta.type in _SUPPORTED_TYPES
+        or is_dataclass(meta.value)
+        or callable(meta.value)
     ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
 
 
@@ -260,7 +262,9 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
 
     # MTP layers have their own numbering separate from the decoder stack.
     # Treat each one as self-contained so the buffer-reuse logic does not
-    # try to chain them with decoder layers.
+    # try to chain them with decoder layers.  Uses getattr rather than
+    # isinstance so it covers both the inner TransformerLayer (is_mtp_layer=True)
+    # and the outer MultiTokenPredictionLayer (is_mtp_layer=True).
     if getattr(base_module, 'is_mtp_layer', False):
         return True, True
 
@@ -1494,11 +1498,11 @@ class CudaGraphManager(torch.nn.Module):
     @staticmethod
     def _is_mtp_inference(megatron_module, kwargs):
         """Check if this call is an MTP layer running under inference mode."""
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
         return (
             'inference_context' not in kwargs or not kwargs.get('inference_context')
-        ) and getattr(megatron_module, 'is_mtp_layer', False) and getattr(
-            megatron_module, '_mtp_cuda_graph_enabled', False
-        )
+        ) and isinstance(megatron_module, MultiTokenPredictionLayer)
 
     def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs):
         '''Returns a valid cudagraph runner for the current forward call.

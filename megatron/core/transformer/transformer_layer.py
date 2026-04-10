@@ -1278,17 +1278,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
             if using_cuda_graph:
                 return True
-        # MTP inference path: CUDA graphs for MTP layers during speculative decoding.
-        # MTP layers don't receive an inference_context, so they use their own flag.
-        elif (
-            not self.training
-            and hasattr(self, 'cudagraph_manager')
-            and getattr(self, 'is_mtp_layer', False)
-            and getattr(self, '_mtp_cuda_graph_enabled', False)
-            and kwargs.get('attention_mask') is None
-            and not self.config.cuda_graph_scope
-        ):
-            return True
         return False
 
     def get_layer_norm_weights(self):

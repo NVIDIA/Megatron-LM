@@ -426,14 +426,19 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     def _create_mtp_cuda_graphs(self, controller, context):
-        """Capture CUDA graphs for MTP TransformerLayers used in speculative decoding.
+        """Capture CUDA graphs for MTP layers used in speculative decoding.
 
         Derives the set of MTP batch sizes from the decoder CUDA graph batch dimensions
-        (decode-only entries), enables ``_mtp_cuda_graph_enabled`` on each MTP
-        TransformerLayer, then runs a single ``compute_mtp_single_step`` per batch
-        size to trigger graph capture.  With ``mtp_use_repeated_layer`` (the common
-        case) one call covers every depth; with unique layers the remaining depths
-        will capture lazily on first real inference call.
+        (decode-only entries), then runs a single ``compute_mtp_single_step`` per
+        batch size to trigger graph capture.  Each ``MultiTokenPredictionLayer``
+        already has a ``CudaGraphManager`` wrapping ``forward_single_position``
+        (created in ``__init__``), so the full MTP forward (embedding lookup,
+        projection, transformer layer, and final layernorm) is captured in a
+        single graph.
+
+        With ``mtp_use_repeated_layer`` (the common case) one call covers every
+        depth; with unique layers the remaining depths will capture lazily on
+        first real inference call.
         """
         num_mtp_heads = controller.num_mtp_heads
         num_spec_tokens = controller.num_speculative_tokens or 0
@@ -447,6 +452,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         model_config = model.config
 
+        # Only proceed when local CUDA graphs are enabled.
+        if model_config.cuda_graph_impl != "local":
+            return
+
         # Collect decode-only batch sizes from the decoder graph dimensions.
         tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
         sp_enabled = model_config.sequence_parallel and tp_size > 1
@@ -459,13 +468,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 mtp_batch_sizes.add(n)
         if not mtp_batch_sizes:
             return
-
-        # Enable the flag on every MTP TransformerLayer so that
-        # _should_call_local_cudagraph returns True.
-        for layer in unwrapped.mtp.layers:
-            tl = layer.mtp_model_layer
-            if hasattr(tl, 'cudagraph_manager'):
-                tl._mtp_cuda_graph_enabled = True
 
         # Store sorted batch sizes on the controller for runtime padding lookup.
         controller._mtp_cuda_graph_batch_sizes = sorted(mtp_batch_sizes)
