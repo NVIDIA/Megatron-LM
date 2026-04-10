@@ -726,20 +726,20 @@ class DynamicInferenceEngine(AbstractEngine):
             rank_str = torch.distributed.get_rank()
             dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
             relative_time_str = f"{end_time - start_time:.3f} sec"
-            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} GiB"
+            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 2**30:.1f} GiB"
 
             if HAVE_PSUTIL:
                 process = psutil.Process()
                 mem_info = process.memory_info()
-                cpu_mem_str = f"{mem_info.rss / 1024**3:.1f} GiB"
+                cpu_mem_str = f"{mem_info.rss / 2**30:.1f} GiB"
             else:
                 cpu_mem_str = "--"
 
             total_mem_str = ", ".join(
                 (
                     f"cpu: {cpu_mem_str}",
-                    f"gpu: alloc {end_mem_alloc / 1024**3:.1f} GiB",
-                    f"res {end_mem_res / 1024**3:.1f} GiB",
+                    f"gpu: alloc {end_mem_alloc / 2**30:.1f} GiB",
+                    f"res {end_mem_res / 2**30:.1f} GiB",
                 )
             )
             logging.info(
@@ -1864,8 +1864,8 @@ class DynamicInferenceEngine(AbstractEngine):
             f"p {context_state['total_paused_used_blocks']}"
             f"/{context_state['total_paused_block_count']} ... "
             f"mem: tensors {mem['allocation.all.current']}, "
-            f"alloc {mem['allocated_bytes.all.current'] / (1024**3):.1f} GiB, "
-            f"res {mem['reserved_bytes.all.current'] / (1024**3):.1f} GiB."
+            f"alloc {mem['allocated_bytes.all.current'] / (2**30):.1f} GiB, "
+            f"res {mem['reserved_bytes.all.current'] / (2**30):.1f} GiB."
         )
 
         if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
