@@ -453,7 +453,7 @@ class MoELayer(BaseMoELayer):
 
     @staticmethod
     def _num_token_rows_from_moe_hidden_states(hidden_states: torch.Tensor) -> int:
-        """Product of all dims except the hidden/last (same as ``view(-1, H)`` row count)."""
+        """Product of all dims except the hidden/last (same as view(-1, H) row count)."""
         if hidden_states.dim() < 2:
             raise ValueError(
                 "MoE hidden_states must be at least 2D [..., hidden_size], "
@@ -503,10 +503,10 @@ class MoELayer(BaseMoELayer):
     def _maybe_record_overload_factor(
         self, dispatched_input: torch.Tensor, tokens_per_expert: torch.Tensor
     ) -> torch.Tensor:
-        """Wrap ``dispatched_input`` with overload logging when ``log_overload_factor`` is set.
+        """Wrap dispatched_input with overload logging when log_overload_factor is set.
 
-        Uses ``_overload_log_num_local_tokens`` captured from forward ``hidden_states`` and
-        applies AllGather fair-share scaling so ``report()``'s SUM over TP×EP matches one
+        Uses _overload_log_num_local_tokens captured from forward hidden_states and
+        applies AllGather fair-share scaling so report()'s SUM over TP×EP matches one
         global balanced count when the map is replicated on every rank.
         """
         if not self.config.log_overload_factor:

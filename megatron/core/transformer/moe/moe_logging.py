@@ -87,55 +87,20 @@ def set_moe_overload_factor_tracker(tracker: 'MoEOverloadFactorTracker') -> None
 
 
 def destroy_moe_overload_factor_tracker() -> None:
-    """Reset the global MoE overload factor tracker to ``None``."""
+    """Reset the global MoE overload factor tracker to None."""
     global _MOE_OVERLOAD_FACTOR_TRACKER
     _MOE_OVERLOAD_FACTOR_TRACKER = None
 
 
 class MoEOverloadFactorTracker:
-    """Track MoE overload-factor metrics.
+    """Tracker for MoE overload-factor metrics.
 
-    Recorded values
-    ---------------
-    - Per-layer **actual tokens on this rank** after dispatch:
-      ``tokens_per_expert.sum()`` (0-dim tensor per microbatch entry), in
-      ``_layer_fwd_tokens`` keyed by layer index; balanced counts in
-      ``_layer_fwd_balanced``.
-    - Per-layer **balanced token count** before overload is computed:
-      ``num_local_tokens * moe_router_topk``, with ``num_local_tokens`` taken from
-      ``MoELayer`` forward ``hidden_states`` (product of leading dimensions, same row
-      count as ``view(-1, hidden_size)``). Both are attached via an autograd hook on
-      ``dispatched_input`` (``RecordDispatchTokenCountsFunction`` in ``moe_utils``).
-    - ``_cumulative_tokens_timeline`` and ``_cumulative_balanced_timeline`` store a
-      time-ordered sequence of ``+fwd`` / ``-bwd`` events so cumulative peaks of
-      actual vs balanced token counts can be compared for ``max_cum`` style metrics.
+    Lifecycle: MoELayer records counts when log_overload_factor is set → report()
+    at step end (sync, aggregate, log, deferred clear) → repeat.
 
-    How ``report()`` aggregates
-    -----------------------------
-    1. Over ``tp_ep_group``, ``all_reduce(MAX)`` on per-rank actual token totals per
-       entry, then divide by balanced tokens per rank (summed local balanced counts /
-       group size) to get **tp_ep overload** per entry.
-    2. Over ``dp_group``, ``all_reduce(AVG)`` and ``all_reduce(MAX)`` on that overload
-       for scalar summaries.
-    3. Over the **pipeline-parallel** group, ``max`` and ``max_cum`` use
-       ``all_reduce(MAX)`` so every stage agrees on the worst overload; ranks without
-       MoE layers contribute ``0``.
-    4. The **mean** overload scalar is not reduced across PP; each rank logs its local
-       mean (``0`` if nothing was recorded).
-
-    Lifecycle
-    ---------
-    ``set_process_groups()`` runs in ``MoELayer.__init__`` when ``log_overload_factor``
-    is enabled. ``record_fwd()`` / ``record_bwd()`` run during forward (hooked from
-    ``MoELayer``). ``report()`` runs at step end (sync, aggregate, log, then requests
-    deferred clear).
-
-    ``clear()`` behavior
-    --------------------
-    ``clear()`` does not immediately reset storage. It marks storage for reset on the
-    next ``record_fwd()`` or ``record_bwd()`` so tensor handles stay valid until Python
-    executes a recording hook again (for example across CUDA graph replay windows that
-    skip those hooks).
+    Example:
+        tracker = get_moe_overload_factor_tracker()
+        log_str = tracker.report(iteration=100, writer=tb_writer)
     """
 
     def __init__(self) -> None:
@@ -155,7 +120,7 @@ class MoEOverloadFactorTracker:
         tp_ep_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
-        """Set process groups for reduction (``MoELayer.__init__`` when ``log_overload_factor``)."""
+        """Set process groups for reduction (MoELayer.__init__ when log_overload_factor)."""
         if tp_ep_group is not None:
             self._tp_ep_group = tp_ep_group
         if dp_group is not None:
@@ -457,7 +422,7 @@ class MoEOverloadFactorTracker:
         return "".join(parts)
 
     def clear(self) -> None:
-        """Mark stored tensors for reset on the next :meth:`record_fwd` or :meth:`record_bwd`.
+        """Mark stored tensors for reset on the next record_fwd or record_bwd.
 
         Does not drop list contents yet, so captured tensor references stay valid
         until the next recording hook runs. Process groups are kept.

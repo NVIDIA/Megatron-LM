@@ -1008,7 +1008,7 @@ def clear_aux_losses_tracker() -> None:
 
 
 class RecordDispatchTokenCountsFunction(torch.autograd.Function):
-    """Autograd hook: post-dispatch token totals for overload reporting (see ``report()``)."""
+    """Autograd hook: post-dispatch token totals for overload reporting (see report())."""
 
     @staticmethod
     def forward(
@@ -1018,18 +1018,18 @@ class RecordDispatchTokenCountsFunction(torch.autograd.Function):
         local_balanced_token_count: torch.Tensor,
         layer_number: Optional[int],
     ):
-        """Record actual token total and balanced count on forward; pass ``tensor`` through.
+        """Record actual token total and balanced count on forward; pass tensor through.
 
         Args:
-            tensor: Tensor in the autograd graph (e.g. ``dispatched_input``) — pass-through.
-            tokens_per_expert: Per-local-expert counts from ``dispatch_postprocess`` (any
+            tensor: Tensor in the autograd graph (e.g. dispatched_input) — pass-through.
+            tokens_per_expert: Per-local-expert counts from dispatch_postprocess (any
                 device).
-            local_balanced_token_count: Scalar float, ``num_local_tokens * topk`` (token
-                rows from forward ``hidden_states``).
+            local_balanced_token_count: Scalar float, num_local_tokens * topk (token
+                rows from forward hidden_states).
             layer_number: Layer index (1-based).
 
         Returns:
-            ``tensor`` unchanged.
+            tensor unchanged.
         """
         if layer_number is None:
             return tensor
@@ -1061,22 +1061,22 @@ def record_dispatch_token_counts(
     local_balanced_token_count: torch.Tensor,
     layer_number: Optional[int],
 ) -> torch.Tensor:
-    """Wrap ``tensor`` with an autograd hook for dispatch token counts (overload metrics).
+    """Wrap tensor with an autograd hook for dispatch token counts (overload metrics).
 
-    Records ``tokens_per_expert.sum()`` on this rank and the **balanced token count** scalar.
-    Overload factors are computed later in ``MoEOverloadFactorTracker.report()``. Process groups
-    must already be registered on the global tracker (``MoELayer`` does this in ``__init__``
-    when ``log_overload_factor`` is enabled).
+    Records tokens_per_expert.sum() on this rank and the balanced token count scalar.
+    Overload factors are computed later in MoEOverloadFactorTracker.report(). Process groups
+    must already be registered on the global tracker (MoELayer does this in __init__
+    when log_overload_factor is enabled).
 
     Args:
-        tensor: Tensor in the autograd graph (typically ``dispatched_input``).
-        tokens_per_expert: Output of ``dispatch_postprocess`` (per-expert counts).
-        local_balanced_token_count: Scalar float, ``num_local_tokens * moe_router_topk``
-            (``num_local_tokens`` from MoE forward ``hidden_states`` shape).
+        tensor: Tensor in the autograd graph (typically dispatched_input).
+        tokens_per_expert: Output of dispatch_postprocess (per-expert counts).
+        local_balanced_token_count: Scalar float, num_local_tokens * moe_router_topk
+            (num_local_tokens from MoE forward hidden_states shape).
         layer_number: Layer index (1-based).
 
     Returns:
-        ``tensor`` unchanged.
+        tensor unchanged.
     """
     return RecordDispatchTokenCountsFunction.apply(
         tensor, tokens_per_expert, local_balanced_token_count, layer_number
