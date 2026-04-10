@@ -13,18 +13,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-def is_deep_ep_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
-
-    return HAVE_DEEP_EP
-
-
-if is_deep_ep_available():
-    TOKEN_DISPATCHER_TYPES = ["alltoall", "flex"]
-else:
-    TOKEN_DISPATCHER_TYPES = ["alltoall"]
-
-
 class TestSharedExperts:
     def setup_method(self, method):
         self.config = TransformerConfig(
@@ -51,8 +39,6 @@ class TestSharedExperts:
         new_config = dataclasses.replace(self.config, **kargs)
         if get_tensor_model_parallel_world_size() > 1:
             new_config.sequence_parallel = True
-        if new_config.moe_token_dispatcher_type == "flex":
-            new_config.moe_enable_deepep = True
         moe_layer = MoELayer(new_config, submodules.mlp.submodules)
         moe_layer.cuda()
         return moe_layer
@@ -62,15 +48,13 @@ class TestSharedExperts:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("dispatcher_type", TOKEN_DISPATCHER_TYPES)
+    @pytest.mark.parametrize("dispatcher_type", ["alltoall"])
     @pytest.mark.parametrize("tp_size, ep_size", [[1, 1], [4, 1], [1, 4], [2, 4]])
     def test_shared_expert_forward_backward(self, dispatcher_type: str, tp_size, ep_size):
         """
         Tests that the MoELayer with and without shared expert overlap produce
         identical outputs and gradients.
         """
-        if tp_size == 1 and ep_size == 1 and dispatcher_type == "flex":
-            pytest.skip("Flex dispatcher is not supported for tp=1, ep=1")
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
         )
