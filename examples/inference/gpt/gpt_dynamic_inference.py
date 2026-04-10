@@ -284,10 +284,6 @@ def main():
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
 
-    # Start Nsight profiler.
-    if os.environ.get("NSIGHT_PREFIX"):
-        torch.cuda.cudart().cudaProfilerStart()
-
     level_str = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_str, logging.INFO)
     logging.basicConfig(level=level, force=True)
@@ -350,8 +346,23 @@ def main():
     print(setup_prefix)
     print("~~~")
 
+    # Warmup: run one untimed iteration so CUDA caches, JIT kernels, and
+    # allocator pools are ready before the measured runs.
+    if args.inference_repeat_n > 1:
+        print("Running warmup iteration ...")
+        engine.reset()
+        run_inference(requests, engine)
+        torch.cuda.synchronize()
+        engine.reset()
+
+    # Start CUDA profiler after warmup so nsys traces only the measured runs.
+    if os.environ.get("NSIGHT_PREFIX"):
+        torch.cuda.cudart().cudaProfilerStart()
+
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
+    cuda_start_event = torch.cuda.Event(enable_timing=True)
+    cuda_end_event = torch.cuda.Event(enable_timing=True)
     for _ in range(args.inference_repeat_n):
 
         # Reset engine.
@@ -359,18 +370,28 @@ def main():
 
         torch.cuda.reset_peak_memory_stats()
 
-        # Trial.
+        # Synchronize before starting the timer to avoid measuring stale GPU work.
+        torch.cuda.synchronize()
+
+        # Trial — use both wall-clock and CUDA events for accurate GPU timing.
         t = get_curr_time()
+        cuda_start_event.record()
         result = run_inference(requests, engine)
+        cuda_end_event.record()
         step_times = result["step_times"]
         add_times = result["add_times"]
         output_times = result["output_times"]
         total_output_tokens = result["total_output_tokens"]
         torch.cuda.synchronize()
         total_time = get_curr_time() - t
+        cuda_elapsed_ms = cuda_start_event.elapsed_time(cuda_end_event)
         stats = torch.cuda.memory_stats()
         throughput = total_output_tokens / total_time
         throughputs.append(throughput)
+
+    # Stop CUDA profiler after measured runs.
+    if os.environ.get("NSIGHT_PREFIX"):
+        torch.cuda.cudart().cudaProfilerStop()
 
     # Validate all requests finished.
     for request in requests:
@@ -505,18 +526,16 @@ def main():
         #     f"count [ p {p_count}, d {d_count} ]."
         # )
         capture_str = f"{engine.capture_stats['time']:.2f} sec" if engine.capture_stats else "--"
+        cuda_throughput = total_output_tokens / (cuda_elapsed_ms / 1000.0)
         print(
             f"{setup_prefix} … " f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
+            f"cuda time: {cuda_elapsed_ms:.1f}ms ({cuda_throughput:.3f} tok/s) … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
             f"steps: {engine.context.step_count:d} … "
             f"capture {capture_str}",
         )
         print("~~~")
-
-    # Stop Nsight profiler.
-    if os.environ.get("NSIGHT_PREFIX"):
-        torch.cuda.cudart().cudaProfilerStop()
 
 
 if __name__ == "__main__":
