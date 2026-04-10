@@ -1115,10 +1115,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     len(request.generated_tokens) + len(tokens)
                     >= request.sampling_params.num_tokens_to_generate
                 ):
-                    tokens = tokens[
-                        : request.sampling_params.num_tokens_to_generate
-                        - len(request.generated_tokens)
-                    ]
+                    keep = request.sampling_params.num_tokens_to_generate - len(
+                        request.generated_tokens
+                    )
+                    tokens = tokens[:keep]
+                    # Trim log probs / top-n to match so the counts stay in sync.
+                    if request_log_probs is not None:
+                        request_log_probs = request_log_probs[:keep]
+                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens

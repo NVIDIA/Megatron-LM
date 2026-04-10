@@ -3727,6 +3727,6 @@ def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
     return (
         not args.use_megatron_fsdp
-        and (args.use_distributed_optimizer or 'dist' in args.optimizer)
+        and (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
         and args.overlap_param_gather
     )
