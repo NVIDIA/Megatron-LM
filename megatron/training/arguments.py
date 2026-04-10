@@ -3102,6 +3102,16 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--moe-dense-forward-for-router-grad', action='store_true',
+                       help='Enable DenseMixer-style dense forward pass for better router gradient '
+                            'estimation during post-training (SFT/RL). When enabled, all experts '
+                            'process all tokens during training and outputs are combined as a '
+                            'weighted sum using full (non-sparse) routing scores, allowing router '
+                            'gradients to flow from all experts rather than only Top-K selected '
+                            'ones. At inference, standard sparse Top-K routing is used with no '
+                            'overhead. Only supported with SequentialMLP (no --moe-grouped-gemm) '
+                            'and expert-model-parallel-size=1. '
+                            'See https://github.com/yaof20/DenseMixer for details.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 
