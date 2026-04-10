@@ -42,6 +42,21 @@ class RouterReplay:
             router_instance.set_target_indices(all_layers_topk_indices[i])
 
     @staticmethod
+    def set_rollout_routing_data(
+        all_layers_topk_indices: List[torch.Tensor], activate_replay: bool = True
+    ):
+        """Public API for training frameworks (e.g., veRL) to inject rollout-phase routing indices.
+
+        This is the main entry point for Rollout Routing Replay (R3).  Call this method once per
+        training forward pass to supply the expert-selection indices that were recorded by the
+        inference engine during the rollout phase.
+
+        """
+        RouterReplay.set_replay_data(all_layers_topk_indices)
+        if activate_replay:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+    @staticmethod
     def get_recorded_data() -> List[torch.Tensor]:
         """
         Collects the recorded topk indices from all RouterReplay instances.
