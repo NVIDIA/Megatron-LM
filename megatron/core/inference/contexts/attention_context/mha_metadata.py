@@ -33,6 +33,10 @@ class MHAMetadata(MetadataBase):
         )
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
+        # Packed GPU buffer for fused kernel to write max_seqlen_q and max_seqlen_k.
+        # Using a contiguous 2-element buffer allows a single .tolist() call
+        # instead of two separate .item() syncs.
+        self._max_seqlen_buf = torch.zeros(2, dtype=torch.int32, device=device)
         self.state_data = {}
 
     def update(
@@ -64,7 +68,7 @@ class MHAMetadata(MetadataBase):
         assert request_to_kv_block_ids.shape[0] == real_batch_size
 
         if HAVE_TRITON:
-            # Fused kernel: single launch for all 1D copy+pad+cumsum+add ops.
+            # Fused kernel: single launch for all 1D copy+pad+cumsum+add+max ops.
             fused_mha_metadata_update(
                 query_lengths=request_query_lengths,
                 kv_length_offsets=request_kv_length_offsets,
@@ -72,6 +76,8 @@ class MHAMetadata(MetadataBase):
                 cu_query_seq_lengths_buf=self._cu_query_seq_lengths_buf,
                 kv_seq_lengths_buf=self._kv_seq_lengths_buf,
                 cu_kv_seq_lengths_buf=self._cu_kv_seq_lengths_buf,
+                max_seqlen_q_buf=self._max_seqlen_buf[:1],
+                max_seqlen_k_buf=self._max_seqlen_buf[1:],
                 real_batch_size=real_batch_size,
                 padded_batch_size=padded_active_request_count,
             )
@@ -111,9 +117,7 @@ class MHAMetadata(MetadataBase):
             request_to_kv_block_ids,
             real_batch_size,
             padded_active_request_count,
-            pad_value=torch.tensor(self.max_kv_blocks, dtype=torch.int32, device=self.device).fill_(
-                -1
-            ),
+            pad_value=-1,
         )
 
         if padded_batch_dimensions.prefill_req_count == 0:
@@ -224,8 +228,19 @@ class NonGraphedMHAMetadata(MHAMetadata):
             num_speculative_tokens,
         )
         if len(self.state_data["query_lengths"]) > 0:
-            self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
-            self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"]).item()
+            if HAVE_TRITON:
+                # Max was already computed by the fused kernel into a packed
+                # 2-element buffer — one .tolist() sync instead of two .item() syncs.
+                max_vals = self._max_seqlen_buf.tolist()
+                self.state_data["max_seqlen_q"] = max_vals[0]
+                self.state_data["max_seqlen_k"] = max_vals[1]
+            else:
+                self.state_data["max_seqlen_q"] = torch.max(
+                    self.state_data["query_lengths"]
+                ).item()
+                self.state_data["max_seqlen_k"] = torch.max(
+                    self.state_data["kv_seq_lengths"]
+                ).item()
         else:
             self.state_data["max_seqlen_q"] = num_speculative_tokens + 1
             self.state_data["max_seqlen_k"] = 1

@@ -27,13 +27,16 @@ def _fused_mha_metadata_update_kernel(
     CU_QUERY_SEQ_LENGTHS_BUF_PTR,
     KV_SEQ_LENGTHS_BUF_PTR,
     CU_KV_SEQ_LENGTHS_BUF_PTR,
+    # Scalar outputs (max values, written as single-element tensors)
+    MAX_SEQLEN_Q_PTR,
+    MAX_SEQLEN_K_PTR,
     # Runtime dimensions
     real_bs,
     padded_bs,
     # Compile-time block size (next power of 2 of padded_bs)
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Fused kernel computing copy+pad, add, cumsum for MHA metadata buffers.
+    """Fused kernel computing copy+pad, add, cumsum, and max for MHA metadata buffers.
 
     Runs as a single program (grid=(1,)). The entire batch fits in one block
     since inference batch sizes are typically ≤ a few thousand.
@@ -58,6 +61,12 @@ def _fused_mha_metadata_update_kernel(
     cu_query = tl.cumsum(query_lengths, axis=0)
     cu_kv = tl.cumsum(kv_seq_lengths, axis=0)
 
+    # --- Max values over real entries (for NonGraphedMHAMetadata) ---
+    max_q = tl.max(query_lengths, axis=0)
+    max_k = tl.max(kv_seq_lengths, axis=0)
+    tl.store(MAX_SEQLEN_Q_PTR, max_q)
+    tl.store(MAX_SEQLEN_K_PTR, max_k)
+
     # --- Write query_lengths_buf  [0:padded_bs], pad=0 ---
     tl.store(QUERY_LENGTHS_BUF_PTR + offsets, query_lengths, mask=padded_mask)
 
@@ -80,24 +89,30 @@ def fused_mha_metadata_update(
     cu_query_seq_lengths_buf: torch.Tensor,
     kv_seq_lengths_buf: torch.Tensor,
     cu_kv_seq_lengths_buf: torch.Tensor,
+    max_seqlen_q_buf: torch.Tensor,
+    max_seqlen_k_buf: torch.Tensor,
     real_batch_size: int,
     padded_batch_size: int,
 ) -> None:
     """Launch the fused MHA metadata update kernel.
 
     Args:
-        query_lengths: ``[>=real_batch_size]`` int32 – per-request query lengths.
-        kv_length_offsets: ``[>=real_batch_size]`` int32 – per-request KV offsets.
-        query_lengths_buf: ``[>=padded_batch_size]`` int32 – output buffer.
-        cu_query_seq_lengths_buf: ``[>=padded_batch_size+1]`` int32 – output buffer.
-        kv_seq_lengths_buf: ``[>=padded_batch_size]`` int32 – output buffer.
-        cu_kv_seq_lengths_buf: ``[>=padded_batch_size+1]`` int32 – output buffer.
+        query_lengths: ``[>=real_batch_size]`` int32 - per-request query lengths.
+        kv_length_offsets: ``[>=real_batch_size]`` int32 - per-request KV offsets.
+        query_lengths_buf: ``[>=padded_batch_size]`` int32 - output buffer.
+        cu_query_seq_lengths_buf: ``[>=padded_batch_size+1]`` int32 - output buffer.
+        kv_seq_lengths_buf: ``[>=padded_batch_size]`` int32 - output buffer.
+        cu_kv_seq_lengths_buf: ``[>=padded_batch_size+1]`` int32 - output buffer.
+        max_seqlen_q_buf: ``[1]`` int32 - output: max query length across real requests.
+        max_seqlen_k_buf: ``[1]`` int32 - output: max kv length across real requests.
         real_batch_size: Number of real requests.
         padded_batch_size: Padded request count (≥ real_batch_size).
     """
     if padded_batch_size == 0:
         cu_query_seq_lengths_buf[0] = 0
         cu_kv_seq_lengths_buf[0] = 0
+        max_seqlen_q_buf[0] = 0
+        max_seqlen_k_buf[0] = 0
         return
 
     BLOCK_SIZE = triton.next_power_of_2(padded_batch_size)
@@ -109,6 +124,8 @@ def fused_mha_metadata_update(
         cu_query_seq_lengths_buf,
         kv_seq_lengths_buf,
         cu_kv_seq_lengths_buf,
+        max_seqlen_q_buf,
+        max_seqlen_k_buf,
         real_batch_size,
         padded_batch_size,
         BLOCK_SIZE=BLOCK_SIZE,

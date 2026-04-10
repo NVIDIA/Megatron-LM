@@ -57,6 +57,8 @@ def _alloc_buffers(max_bs, device="cuda"):
         torch.zeros(max_bs + 1, dtype=torch.int32, device=device),  # cu_query_seq_lengths_buf
         torch.zeros(max_bs, dtype=torch.int32, device=device),  # kv_seq_lengths_buf
         torch.zeros(max_bs + 1, dtype=torch.int32, device=device),  # cu_kv_seq_lengths_buf
+        torch.zeros(1, dtype=torch.int32, device=device),  # max_seqlen_q_buf
+        torch.zeros(1, dtype=torch.int32, device=device),  # max_seqlen_k_buf
     )
 
 
@@ -83,8 +85,12 @@ class TestFusedMhaMetadataUpdate:
         kv_length_offsets = torch.randint(0, 512, (real_bs,), dtype=torch.int32, device=device)
 
         # Allocate two sets of output buffers
-        ql_buf_fused, cu_q_buf_fused, kvl_buf_fused, cu_kv_buf_fused = _alloc_buffers(max_bs, device)
-        ql_buf_ref, cu_q_buf_ref, kvl_buf_ref, cu_kv_buf_ref = _alloc_buffers(max_bs, device)
+        ql_buf_fused, cu_q_buf_fused, kvl_buf_fused, cu_kv_buf_fused, mq_fused, mk_fused = (
+            _alloc_buffers(max_bs, device)
+        )
+        ql_buf_ref, cu_q_buf_ref, kvl_buf_ref, cu_kv_buf_ref, mq_ref, mk_ref = (
+            _alloc_buffers(max_bs, device)
+        )
 
         # Sentinel fill to ensure kernel writes all expected positions
         for buf in (ql_buf_fused, cu_q_buf_fused, kvl_buf_fused, cu_kv_buf_fused):
@@ -100,6 +106,8 @@ class TestFusedMhaMetadataUpdate:
             cu_q_buf_fused,
             kvl_buf_fused,
             cu_kv_buf_fused,
+            mq_fused,
+            mk_fused,
             real_bs,
             padded_bs,
         )
@@ -128,6 +136,13 @@ class TestFusedMhaMetadataUpdate:
         assert torch.equal(
             cu_kv_buf_fused[: padded_bs + 1], cu_kv_buf_ref[: padded_bs + 1]
         ), "cu_kv_seq_lengths_buf mismatch"
+
+        # Verify max values computed by the fused kernel.
+        if real_bs > 0:
+            expected_max_q = query_lengths.max().item()
+            expected_max_k = (kv_length_offsets + query_lengths).max().item()
+            assert mq_fused.item() == expected_max_q, "max_seqlen_q mismatch"
+            assert mk_fused.item() == expected_max_k, "max_seqlen_k mismatch"
 
     def test_basic(self):
         """Typical batch: 16 real requests padded to 32."""
@@ -190,12 +205,12 @@ class TestFusedMhaMetadataUpdate:
         query_lengths = torch.full((real_bs,), 10000, dtype=torch.int32, device=device)
         kv_length_offsets = torch.full((real_bs,), 50000, dtype=torch.int32, device=device)
 
-        ql_fused, cu_q_fused, kvl_fused, cu_kv_fused = _alloc_buffers(max_bs, device)
-        ql_ref, cu_q_ref, kvl_ref, cu_kv_ref = _alloc_buffers(max_bs, device)
+        ql_fused, cu_q_fused, kvl_fused, cu_kv_fused, mq_f, mk_f = _alloc_buffers(max_bs, device)
+        ql_ref, cu_q_ref, kvl_ref, cu_kv_ref, mq_r, mk_r = _alloc_buffers(max_bs, device)
 
         fused_mha_metadata_update(
             query_lengths, kv_length_offsets, ql_fused, cu_q_fused, kvl_fused, cu_kv_fused,
-            real_bs, padded_bs,
+            mq_f, mk_f, real_bs, padded_bs,
         )
         _reference_mha_metadata_update(
             query_lengths, kv_length_offsets, ql_ref, cu_q_ref, kvl_ref, cu_kv_ref,
@@ -222,9 +237,9 @@ class TestFusedMhaMetadataUpdate:
         query_lengths = torch.randint(1, 50, (real_bs,), dtype=torch.int32, device=device)
         kv_length_offsets = torch.randint(0, 200, (real_bs,), dtype=torch.int32, device=device)
 
-        ql, cu_q, kvl, cu_kv = _alloc_buffers(max_bs, device)
+        ql, cu_q, kvl, cu_kv, mq, mk = _alloc_buffers(max_bs, device)
         fused_mha_metadata_update(
-            query_lengths, kv_length_offsets, ql, cu_q, kvl, cu_kv, real_bs, padded_bs,
+            query_lengths, kv_length_offsets, ql, cu_q, kvl, cu_kv, mq, mk, real_bs, padded_bs,
         )
 
         cu_q_vals = cu_q[: padded_bs + 1]
