@@ -6,6 +6,7 @@ Run with:
 """
 import os
 import sys
+from itertools import product as iproduct
 
 import torch
 import torch.distributed as dist
@@ -15,8 +16,17 @@ DTYPE = torch.bfloat16
 BASE_TOKENS = 32
 TOKEN_STEP = 16
 ENGINE_MAX_TOKENS = 2048
-NUM_LOCAL_EXPERTS = 2
-TOPK = 2
+
+# (alignment, topk, num_local_experts)
+# num_total_experts = num_local_experts * world_size must be >= topk.
+# With world_size=4: num_local_experts=2 → 8 total (ok for topk≤8),
+#                    num_local_experts=8 → 32 total (ok for topk≤32).
+TEST_CASES = [
+    ("align1_k2",   1,  2,  2),   # baseline: no alignment padding
+    ("align16_k2",  16, 2,  2),   # BF16 grouped_mm alignment, topk=2
+    ("align16_k6",  16, 6,  8),   # topk=6,  needs ≥6 total experts → 4×8=32 ✓
+    ("align16_k22", 16, 22, 8),   # topk=22, needs ≥22 total experts → 4×8=32 ✓
+]
 
 
 def log(rank, msg):
@@ -36,43 +46,35 @@ def make_distributions(world_size):
     }
 
 
-def make_local_inputs(rank, local_tokens, num_total_experts):
+def make_local_inputs(rank, local_tokens, topk, num_total_experts):
     local_hidden = torch.full(
         (local_tokens, HIDDEN), float(rank + 1), dtype=DTYPE, device="cuda"
     )
-    # Sample TOPK unique experts per token without replacement via topk on random scores.
+    # Sample topk unique experts per token without replacement via topk on random scores.
     rand_scores = torch.rand(local_tokens, num_total_experts, device="cuda")
-    local_routing = torch.topk(rand_scores, TOPK, dim=1).indices.to(torch.int64)
+    local_routing = torch.topk(rand_scores, topk, dim=1).indices.to(torch.int64)
     local_probs = torch.full(
-        (local_tokens, TOPK), 1.0 / TOPK, dtype=torch.float32, device="cuda"
+        (local_tokens, topk), 1.0 / topk, dtype=torch.float32, device="cuda"
     )
     return local_hidden, local_routing, local_probs
 
 
 def verify_permute(rank, name, permuted_hidden, permuted_probs, permutation_map,
-                   n_used, symm_hidden, local_tokens_per_rank, psums, world_size):
-    """Every non-padding permuted row must match its source token in symm_hidden.
-
-    permutation_map[pos] = original global token index (or -1 for padding).
-    permuted_hidden[pos] must equal symm_hidden[permutation_map[pos]].
-    permuted_probs[pos] must equal 1/TOPK.
-
-    Only [0, n_used) is valid — elements beyond are uninitialized (torch.empty).
-    """
+                   n_used, symm_hidden, local_tokens_per_rank, psums, world_size, topk):
+    """Every non-padding permuted row must match its source token in symm_hidden."""
     log(rank, f"    [{name}] n_used={n_used}, output_size={permuted_hidden.shape[0]}")
 
     valid_mask = permutation_map[:n_used] >= 0
-    valid_pos = valid_mask.nonzero(as_tuple=True)[0]  # positions with real tokens
+    valid_pos = valid_mask.nonzero(as_tuple=True)[0]
 
     if valid_pos.numel() == 0:
         log(rank, f"    [{name}] no valid positions — all tokens routed off-rank")
         return True
 
-    src_indices = permutation_map[:n_used][valid_pos]  # original global token indices
+    src_indices = permutation_map[:n_used][valid_pos]
 
-    # Each permuted row must equal its source token's hidden state
-    expected_hidden = symm_hidden[src_indices]        # [n_valid, HIDDEN] bf16
-    actual_hidden = permuted_hidden[valid_pos]        # [n_valid, HIDDEN] bf16
+    expected_hidden = symm_hidden[src_indices]
+    actual_hidden = permuted_hidden[valid_pos]
 
     if not torch.equal(actual_hidden, expected_hidden):
         diff = (actual_hidden.float() - expected_hidden.float()).abs()
@@ -88,8 +90,7 @@ def verify_permute(rank, name, permuted_hidden, permuted_probs, permutation_map,
                   f"expected_fill={exp_val}, got={actual_hidden[bad, 0].item():.4f}")
         return False
 
-    # Each permuted row must have prob 1/TOPK
-    expected_prob = 1.0 / TOPK
+    expected_prob = 1.0 / topk
     prob_diff = (permuted_probs[valid_pos] - expected_prob).abs()
     if prob_diff.max().item() > 1e-5:
         log(rank, f"  FAIL [{name}] permuted_probs mismatch: "
@@ -102,9 +103,8 @@ def verify_permute(rank, name, permuted_hidden, permuted_probs, permutation_map,
 def verify_rsv_output(rank, name, rsv_output):
     """After AGV → permute → unpermute → RSV, each rank's output should equal float(rank+1).
 
-    probs sum to 1.0 (TOPK × 1/TOPK), so the weighted sum of hidden values for each
-    token recovers the original hidden value float(source_rank+1). After RSV, rank r
-    holds its own tokens, so all values should be float(rank+1).
+    probs sum to 1.0 (topk × 1/topk), so the weighted sum recovers the original hidden
+    value float(source_rank+1). After RSV, rank r holds its own tokens → all float(rank+1).
     """
     expected_val = float(rank + 1)
     diff = (rsv_output - expected_val).abs()
@@ -115,7 +115,8 @@ def verify_rsv_output(rank, name, rsv_output):
     return True
 
 
-def run_case(rank, world_size, name, local_tokens_per_rank, psums, ep_group):
+def run_case(rank, world_size, name, local_tokens_per_rank, psums, ep_group,
+             alignment, topk, num_local_experts):
     from megatron.core.inference.communication.torch_symm_triton.variable_collectives import (
         multimem_all_gather_v,
         multimem_reduce_scatter_v,
@@ -126,8 +127,8 @@ def run_case(rank, world_size, name, local_tokens_per_rank, psums, ep_group):
     local_tokens = local_tokens_per_rank[rank]
     total_tokens = sum(local_tokens_per_rank)
     total_max_tokens = ENGINE_MAX_TOKENS * world_size
-    num_total_experts = world_size * NUM_LOCAL_EXPERTS
-    local_expert_start = rank * NUM_LOCAL_EXPERTS
+    num_total_experts = world_size * num_local_experts
+    local_expert_start = rank * num_local_experts
 
     ep_max = max(local_tokens_per_rank)
     rank_token_offset = torch.tensor([psums[rank]], dtype=torch.int32, device="cuda")
@@ -141,24 +142,24 @@ def run_case(rank, world_size, name, local_tokens_per_rank, psums, ep_group):
     unperm_buf  = SymmetricMemoryManager.get_buffer(f"{name}_u", process_group=ep_group)
 
     hidden_r  = hidden_buf.maybe_get_tensor([total_max_tokens, HIDDEN], dtype=DTYPE)
-    routing_r = routing_buf.maybe_get_tensor([total_max_tokens, TOPK], dtype=torch.int64)
-    probs_r   = probs_buf.maybe_get_tensor([total_max_tokens, TOPK], dtype=torch.float32)
+    routing_r = routing_buf.maybe_get_tensor([total_max_tokens, topk], dtype=torch.int64)
+    probs_r   = probs_buf.maybe_get_tensor([total_max_tokens, topk], dtype=torch.float32)
     unperm_r  = unperm_buf.maybe_get_tensor([total_max_tokens, HIDDEN], dtype=torch.float32)
 
     if any(r["handle"] is None for r in (hidden_r, routing_r, probs_r, unperm_r)):
         return None
 
-    symm_hidden    = hidden_r["tensor"]
+    symm_hidden     = hidden_r["tensor"]
     symm_hidden_hdl = hidden_r["handle"]
-    symm_routing   = routing_r["tensor"]
+    symm_routing    = routing_r["tensor"]
     symm_routing_hdl = routing_r["handle"]
-    symm_probs     = probs_r["tensor"]
-    symm_probs_hdl = probs_r["handle"]
-    symm_unperm    = unperm_r["tensor"]
+    symm_probs      = probs_r["tensor"]
+    symm_probs_hdl  = probs_r["handle"]
+    symm_unperm     = unperm_r["tensor"]
     symm_unperm_hdl = unperm_r["handle"]
 
     local_hidden, local_routing, local_probs = make_local_inputs(
-        rank, local_tokens, num_total_experts
+        rank, local_tokens, topk, num_total_experts
     )
 
     # AGV all three input tensors into fixed-size symm buffers
@@ -188,16 +189,16 @@ def run_case(rank, world_size, name, local_tokens_per_rank, psums, ep_group):
         symm_probs,
         symm_routing,
         local_expert_start,
-        NUM_LOCAL_EXPERTS,
+        num_local_experts,
         valid_tokens_t,
-        alignment=1,
+        alignment=alignment,
     )
-    n_used = offs[-1].item()  # scalar: total rows used in permuted output
-    n_used_t = offs[-1:]      # device tensor view for kernels
+    n_used = offs[-1].item()
+    n_used_t = offs[-1:]
 
     passed_permute = verify_permute(
         rank, name, permuted_hidden, permuted_probs, permutation_map,
-        n_used, symm_hidden, local_tokens_per_rank, psums, world_size,
+        n_used, symm_hidden, local_tokens_per_rank, psums, world_size, topk,
     )
 
     # Unpermute directly into the symmetric fp32 buffer, then RSV to sum across all ranks.
@@ -242,15 +243,31 @@ def main():
         sys.exit(0)
 
     ep_group = dist.new_group(ranks=list(range(world_size)))
+    distributions = make_distributions(world_size)
     results = {}
 
-    for dist_name, counts in make_distributions(world_size).items():
+    for (tc_name, alignment, topk, num_local_experts), (dist_name, counts) in iproduct(
+        TEST_CASES, distributions.items()
+    ):
+        # Validate topk fits within the total expert count for this world_size
+        num_total_experts = world_size * num_local_experts
+        if topk > num_total_experts:
+            log(rank, f"  SKIP [{tc_name}/{dist_name}] topk={topk} > "
+                      f"num_total_experts={num_total_experts}")
+            results[f"{tc_name}/{dist_name}"] = None
+            continue
+
         psums = prefix_sum(counts)
-        log(rank, f"--- {dist_name} | tokens={counts} ---")
-        passed = run_case(rank, world_size, dist_name, counts, psums, ep_group)
+        name = f"{tc_name}/{dist_name}"
+        log(rank, f"--- {name} | align={alignment} topk={topk} "
+                  f"n_local_exp={num_local_experts} tokens={counts} ---")
+        passed = run_case(
+            rank, world_size, name, counts, psums, ep_group,
+            alignment, topk, num_local_experts,
+        )
         status = "SKIP" if passed is None else ("PASS" if passed else "FAIL")
-        log(rank, f"  {status} [{dist_name}]")
-        results[dist_name] = passed
+        log(rank, f"  {status} [{name}]")
+        results[name] = passed
 
     n_skip = sum(1 for v in results.values() if v is None)
     n_pass = sum(1 for v in results.values() if v is True)
