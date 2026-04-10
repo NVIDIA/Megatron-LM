@@ -25,7 +25,7 @@ from examples.multimodal_dev.models.qwen35_vl.factory import (
     set_vision_flops_metadata,
 )
 from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
-from examples.multimodal_dev.models.qwen35_vl.mrope import compute_mrope_position_ids
+from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 from examples.multimodal_dev.models.qwen35_vl.specs import (
     get_qwen35_vl_language_spec,
     get_qwen35_vl_vision_spec,
@@ -56,7 +56,7 @@ __all__ = [
     "get_qwen35_vl_language_spec",
     "get_qwen35_vl_vision_spec",
     # MRoPE
-    "compute_mrope_position_ids",
+    "get_rope_index",
     # Constants
     "QWEN35_VL_IMAGE_TOKEN_ID",
     "QWEN35_VL_VIDEO_TOKEN_ID",

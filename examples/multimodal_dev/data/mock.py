@@ -10,7 +10,12 @@ vision encoder, 3D MRoPE position IDs, and shifted labels.
 import torch
 from torch.utils.data import Dataset
 
-from examples.multimodal_dev.models.qwen35_vl.mrope import compute_mrope_position_ids
+from examples.multimodal_dev.models.qwen35_vl.configuration import (
+    QWEN35_VL_IMAGE_TOKEN_ID,
+    QWEN35_VL_VIDEO_TOKEN_ID,
+    QWEN35_VL_VISION_START_TOKEN_ID,
+)
+from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 
 
 class MockQwen35VLDataset(Dataset):
@@ -22,6 +27,8 @@ class MockQwen35VLDataset(Dataset):
         image_seq_length: Number of image tokens per sample.
         vocab_size: Vocabulary size for random text tokens.
         image_token_id: Token ID for image placeholders.
+        video_token_id: Token ID for video placeholders.
+        vision_start_token_id: Token ID marking start of a vision region.
         image_size: Image height and width in pixels.
         patch_size: Spatial patch size.
         temporal_patch_size: Temporal patch size.
@@ -34,7 +41,9 @@ class MockQwen35VLDataset(Dataset):
         seq_length: int = 1024,
         image_seq_length: int = 256,
         vocab_size: int = 248320,
-        image_token_id: int = 248056,
+        image_token_id: int = QWEN35_VL_IMAGE_TOKEN_ID,
+        video_token_id: int = QWEN35_VL_VIDEO_TOKEN_ID,
+        vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         image_size: int = 224,
         patch_size: int = 16,
         temporal_patch_size: int = 2,
@@ -44,6 +53,8 @@ class MockQwen35VLDataset(Dataset):
         self.seq_length = seq_length
         self.vocab_size = vocab_size
         self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
         self.image_size = image_size
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -68,16 +79,26 @@ class MockQwen35VLDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        text_length = self.seq_length - self.image_seq_length
+        # Reserve 1 slot for the vision_start sentinel before image tokens.
+        text_length = self.seq_length - self.image_seq_length - 1
         text_tokens = torch.randint(
             1, self.vocab_size, (text_length,), dtype=torch.long,
         )
-        text_tokens[text_tokens == self.image_token_id] = 1
+        special_ids = {
+            self.image_token_id,
+            self.video_token_id,
+            self.vision_start_token_id,
+        }
+        for sid in special_ids:
+            text_tokens[text_tokens == sid] = 1
 
         prefix_len = text_length // 2
         suffix_len = text_length - prefix_len
         input_ids = torch.cat([
             text_tokens[:prefix_len],
+            torch.tensor(
+                [self.vision_start_token_id], dtype=torch.long,
+            ),
             torch.full(
                 (self.image_seq_length,),
                 self.image_token_id,
@@ -103,12 +124,15 @@ class MockQwen35VLDataset(Dataset):
 
         image_grid_thw = self.grid_thw.clone()
 
-        position_ids = compute_mrope_position_ids(
+        position_ids, _ = get_rope_index(
+            spatial_merge_size=self.spatial_merge_size,
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
             input_ids=input_ids.unsqueeze(0),
             image_grid_thw=image_grid_thw,
-            image_token_id=self.image_token_id,
-            spatial_merge_size=self.spatial_merge_size,
-        ).squeeze(1)
+        )
+        position_ids = position_ids.squeeze(1)
 
         return {
             "input_ids": input_ids,

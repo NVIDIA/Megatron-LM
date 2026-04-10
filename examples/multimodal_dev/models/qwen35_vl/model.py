@@ -18,12 +18,14 @@ from examples.multimodal_dev.models.base import MultimodalModel
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     MROPE_SECTION,
     QWEN35_VL_IMAGE_TOKEN_ID,
+    QWEN35_VL_VIDEO_TOKEN_ID,
+    QWEN35_VL_VISION_START_TOKEN_ID,
     QWEN35_VL_VOCAB_SIZE,
     ROTARY_BASE,
     ROTARY_PERCENT,
     VISION_KWARGS,
 )
-from examples.multimodal_dev.models.qwen35_vl.mrope import compute_mrope_position_ids
+from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
     Qwen35VLVisionEncoder,
@@ -56,6 +58,8 @@ class Qwen35VLModel(MultimodalModel):
         vocab_size: int = QWEN35_VL_VOCAB_SIZE,
         max_sequence_length: int = 262144,
         image_token_id: int = QWEN35_VL_IMAGE_TOKEN_ID,
+        video_token_id: int = QWEN35_VL_VIDEO_TOKEN_ID,
+        vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         spatial_merge_size: int = 2,
         mtp_block_spec: ModuleSpec = None,
         parallel_output: bool = True,
@@ -64,6 +68,8 @@ class Qwen35VLModel(MultimodalModel):
         if vision_spec is None:
             vision_spec = get_qwen35_vl_vision_spec()
 
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
         self.spatial_merge_size = spatial_merge_size
 
         vkw = dict(VISION_KWARGS)
@@ -109,9 +115,12 @@ class Qwen35VLModel(MultimodalModel):
         Returns:
             ``[3, B, S]`` position IDs for MRoPE.
         """
-        return compute_mrope_position_ids(
+        position_ids, _ = get_rope_index(
+            spatial_merge_size=self.spatial_merge_size,
+            image_token_id=self.image_token_id,
+            video_token_id=self.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
-            image_token_id=self.image_token_id,
-            spatial_merge_size=self.spatial_merge_size,
         )
+        return position_ids
