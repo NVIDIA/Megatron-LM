@@ -137,7 +137,7 @@ class ParamKey:
 
 @dataclass
 class OptimizerConfig:
-    """Base optimizer configuration object."""
+    """Configuration object for Megatron optimizers."""
 
     ##############
     # General
@@ -306,6 +306,15 @@ class OptimizerConfig:
     soap_use_kl_shampoo: bool = True
     """Whether to use the KL-Shampoo preconditioner."""
 
+    adaptive_muon_moment2_method: str = "adamuon"
+    """The method to use for the moment2 update in Adaptive Muon optimizer."""
+
+    adaptive_muon_beta2: float = 0.95
+    """The beta2 parameter for the Adaptive Muon optimizer."""
+
+    adaptive_muon_eps: float = 1e-8
+    """The eps parameter for the Adaptive Muon optimizer."""
+
     #######################
     # Distributed optimizer
     #######################
@@ -373,6 +382,9 @@ class OptimizerConfig:
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
+
+    optimizer_cuda_graph: bool = False
+    """If true, enables CUDA graph for optimizer step."""
 
     def __post_init__(self):
         """Check the validity of the config."""
