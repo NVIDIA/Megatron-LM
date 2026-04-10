@@ -1224,10 +1224,7 @@ def test_mhc_recompute_with_non_conflicting_offload_modules():
             f"Expected GPU peak memory reduction for offload_modules={offload_modules}, "
             f"but got saved={saved_mib:.2f}MiB"
         )
-        print(
-            f"mHC recompute + offload ({offload_modules}): "
-            f"saved={saved_mib:.2f}MiB"
-        )
+        print(f"mHC recompute + offload ({offload_modules}): " f"saved={saved_mib:.2f}MiB")
 
     finally:
         Utils.destroy_model_parallel()
