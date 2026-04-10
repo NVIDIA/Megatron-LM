@@ -1295,6 +1295,7 @@ class SelfAttention(Attention):
         if self.config.qk_l2_norm:
             default_norm_cls = L2Norm
         elif self.config.qk_layernorm and TENorm is not None:
+            # TODO(yuzhongw, janpabloe): Support local backend.
             default_norm_cls = TENorm
 
         q_norm_cls = submodules.q_layernorm or default_norm_cls
