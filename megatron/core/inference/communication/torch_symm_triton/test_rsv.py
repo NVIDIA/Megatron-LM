@@ -1,27 +1,21 @@
-"""Exhaustive tests for multimem_all_gather_v (128-bit and 64-bit NVLS paths).
+"""Tests for multimem_reduce_scatter_v.
 
 Launch with:
-    torchrun --nproc_per_node=NUM_GPUS test_agv.py
+    torchrun --nproc_per_node=NUM_GPUS test_rsv.py
 
-Covers the cross-product of token distributions × tensor specs, plus multi-call
-and ep_max_tokens edge-case tests.
+Setup: each rank fills its entire symmetric buffer with float(rank + 1), simulating
+each rank's local expert contribution to every token position. After RSV, rank r's
+output slice (local_tokens rows) should equal the sum across all WS ranks:
 
-Token distributions (rank r):
-  linear_inc  BASE + r * STEP          (offset grows toward higher ranks)
-  linear_dec  BASE + (WS-1-r) * STEP   (offset grows toward lower ranks)
-  uniform     same count on all ranks  (degenerate variable case)
-  skewed      rank 0 has 4×, others 1× (stress-tests prefix-sum calculation)
+    expected = sum(float(r + 1) for r in range(WS)) = WS * (WS + 1) / 2
 
-Tensor specs (name, hidden, dtype, expected BITS path):
-  bf16_h2688   2688  bfloat16  128  (5376 B/row, 16B-aligned)
-  fp32_topk6      6  float32    64  (  24 B/row, 8B-aligned only)
-  fp32_topk22    22  float32    64  (  88 B/row, 8B-aligned only)
-  int64_topk6     6  int64     128  (  48 B/row, 16B-aligned)
-  int64_topk22   22  int64     128  ( 176 B/row, 16B-aligned)
+Token distributions and tensor specs mirror test_agv.py. Only 128-bit-aligned
+dtypes (bf16, fp32) are tested since RSV assumes 128-bit alignment.
 
-Not tested here:
-  - output_byte_offset != 0 (requires raw-buffer gymnastics with SymmetricMemoryManager)
-  - numel_per_token > BLOCK_SIZE inner-loop path (needs hidden > 8192 for bf16)
+Tests:
+  Cross-product: 4 token distributions × 2 tensor specs (8 cases)
+  multi_call:    second RSV with different fill overwrites first output
+  ep_max_eq:     ep_max_tokens == engine_max_tokens (no CTA early-exit)
 """
 import os
 import sys
@@ -33,13 +27,10 @@ import torch.distributed as dist
 BASE_TOKENS = 32
 TOKEN_STEP = 16
 
-# (name, hidden, dtype, expected_bits)
+# (name, hidden, dtype) — RSV is 128-bit only, so all rows must be 16B-aligned.
 TENSOR_SPECS = [
-    ("bf16_h2688",   2688, torch.bfloat16, 128),
-    ("fp32_topk6",      6, torch.float32,   64),
-    ("fp32_topk22",    22, torch.float32,   64),
-    ("int64_topk6",     6, torch.int64,    128),
-    ("int64_topk22",   22, torch.int64,    128),
+    ("bf16_h2688", 2688, torch.bfloat16),  # 5376 B/row ✓
+    ("fp32_h2688", 2688, torch.float32),   # 10752 B/row ✓
 ]
 
 
@@ -60,33 +51,31 @@ def prefix_sum(counts):
     return [sum(counts[:r]) for r in range(len(counts))]
 
 
-def verify(rank, world_size, name, output_tensor, local_tokens_per_rank, prefix_sums, fill_base=0.0):
-    """Check that rank r's slice equals fill_base + float(r) for every r."""
-    hidden = output_tensor.shape[1]
-    dtype = output_tensor.dtype
-    passed = True
-    for r in range(world_size):
-        start = prefix_sums[r]
-        end = start + local_tokens_per_rank[r]
-        expected = torch.full(
-            (local_tokens_per_rank[r], hidden),
-            fill_base + float(r),
-            dtype=dtype, device="cuda",
-        )
-        if not torch.equal(output_tensor[start:end], expected):
-            log(rank, f"  FAIL [{name}]: rank {r} slice mismatch")
-            passed = False
-    return passed
+def expected_val(world_size):
+    """Sum of float(r+1) for r in range(world_size) = WS*(WS+1)/2."""
+    return float(world_size * (world_size + 1) // 2)
 
 
-def run_agv(output_tensor, input_tensor, symm_mem_hdl,
+def verify(rank, name, output_tensor, local_tokens, hidden, dtype, exp_val):
+    """Check that every element of output_tensor equals exp_val."""
+    expected = torch.full((local_tokens, hidden), exp_val, dtype=dtype, device="cuda")
+    if torch.equal(output_tensor, expected):
+        return True
+    # Report first mismatch for debugging.
+    diff = (output_tensor - expected.to(output_tensor.dtype)).abs()
+    log(rank, f"  FAIL [{name}]: max_diff={diff.max().item():.4f}, "
+              f"first_bad_val={output_tensor.flatten()[diff.flatten().argmax()].item()}")
+    return False
+
+
+def run_rsv(symm_tensor, output_tensor, symm_mem_hdl,
             rank_token_offset, ep_max_tokens, engine_max_tokens, n_warmup=3):
     from megatron.core.inference.communication.torch_symm_triton.variable_collectives import (
-        multimem_all_gather_v,
+        multimem_reduce_scatter_v,
     )
     for _ in range(n_warmup):
-        multimem_all_gather_v(
-            output_tensor, input_tensor, symm_mem_hdl,
+        multimem_reduce_scatter_v(
+            output_tensor, symm_tensor, symm_mem_hdl,
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             engine_max_tokens=engine_max_tokens,
@@ -94,43 +83,38 @@ def run_agv(output_tensor, input_tensor, symm_mem_hdl,
     torch.cuda.synchronize()
 
 
-def alloc_and_run(
+def run_case(
     name, rank, world_size,
     local_tokens_per_rank, psums,
     ep_group, buf_key,
-    hidden, dtype, expected_bits,
+    hidden, dtype,
     rank_token_offset, ep_max_tokens, engine_max_tokens,
-    fill_base=0.0,
+    fill_scale=1.0,
 ):
     from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-
-    # Verify BITS path selection before launching.
-    row_bytes = hidden * torch.tensor([], dtype=dtype).element_size()
-    actual_bits = 128 if row_bytes % 16 == 0 else 64
-    assert actual_bits == expected_bits, (
-        f"[{name}] BITS mismatch: expected {expected_bits}, got {actual_bits} "
-        f"(hidden={hidden}, dtype={dtype}, row_bytes={row_bytes})"
-    )
 
     total_tokens = sum(local_tokens_per_rank)
     buf = SymmetricMemoryManager.get_buffer(buf_key, process_group=ep_group)
     result = buf.maybe_get_tensor([total_tokens, hidden], dtype=dtype)
     if result["handle"] is None:
-        return None  # symmetric memory unavailable — skip
+        return None  # skip
 
-    output_tensor = result["tensor"]
+    symm_tensor = result["tensor"]
     symm_mem_hdl = result["handle"]
 
     local_tokens = local_tokens_per_rank[rank]
-    input_tensor = torch.full(
-        (local_tokens, hidden), fill_base + float(rank), dtype=dtype, device="cuda"
-    ).contiguous()
+    output_tensor = torch.empty((local_tokens, hidden), dtype=dtype, device="cuda")
 
-    run_agv(output_tensor, input_tensor, symm_mem_hdl,
+    # Fill the full symmetric buffer with fill_scale * float(rank + 1).
+    # After RSV, output should equal fill_scale * WS*(WS+1)/2.
+    symm_tensor.fill_(fill_scale * float(rank + 1))
+    torch.cuda.synchronize()
+
+    run_rsv(symm_tensor, output_tensor, symm_mem_hdl,
             rank_token_offset, ep_max_tokens, engine_max_tokens)
 
-    passed = verify(rank, world_size, name, output_tensor,
-                    local_tokens_per_rank, psums, fill_base)
+    exp = fill_scale * expected_val(world_size)
+    passed = verify(rank, name, output_tensor, local_tokens, hidden, dtype, exp)
     SymmetricMemoryManager.destroy(buf_key)
     return passed
 
@@ -152,7 +136,7 @@ def main():
     dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    log(rank, f"init done, world_size={world_size}")
+    log(rank, f"init done, world_size={world_size}, expected_val={expected_val(world_size)}")
 
     from megatron.core.inference.communication.torch_symm_triton.utils import is_device_nvls_capable
     if not is_device_nvls_capable(torch.device("cuda")):
@@ -165,49 +149,52 @@ def main():
     results = {}
 
     # ── Cross-product: distributions × tensor specs ────────────────────────────
-    for (dist_name, counts), (tc_name, hidden, dtype, expected_bits) in iproduct(
+    for (dist_name, counts), (tc_name, hidden, dtype) in iproduct(
         distributions.items(), TENSOR_SPECS
     ):
         psums, _, rto, emt = make_metadata(rank, counts)
         name = f"{dist_name}/{tc_name}"
         buf_key = f"ep_{dist_name}_{tc_name}"
 
-        log(rank, f"--- {name} | tokens={counts} | BITS={expected_bits} ---")
-        passed = alloc_and_run(
+        log(rank, f"--- {name} | tokens={counts} | dtype={dtype} ---")
+        passed = run_case(
             name, rank, world_size, counts, psums,
             ep_group, buf_key,
-            hidden, dtype, expected_bits,
+            hidden, dtype,
             rto, emt, ENGINE_MAX_TOKENS,
         )
         status = "SKIP" if passed is None else ("PASS" if passed else "FAIL")
         log(rank, f"  {status} [{name}]")
         results[name] = passed
 
-    # ── Multi-call: second AGV with different fill must overwrite first ─────────
-    log(rank, "--- multi_call: second AGV overwrites first ---")
+    # ── Multi-call: second RSV with different fill must overwrite first output ──
+    log(rank, "--- multi_call: second RSV overwrites first ---")
     counts = distributions["linear_inc"]
     psums, _, rto, emt = make_metadata(rank, counts)
-    hidden, dtype, expected_bits = 2688, torch.bfloat16, 128
+    hidden, dtype = 2688, torch.bfloat16
     total_tokens = sum(counts)
+    local_tokens = counts[rank]
 
     from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-
     buf = SymmetricMemoryManager.get_buffer("ep_multi", process_group=ep_group)
     result = buf.maybe_get_tensor([total_tokens, hidden], dtype=dtype)
     if result["handle"] is not None:
-        output_tensor = result["tensor"]
+        symm_tensor = result["tensor"]
         symm_mem_hdl = result["handle"]
-        local_tokens = counts[rank]
+        output_tensor = torch.empty((local_tokens, hidden), dtype=dtype, device="cuda")
 
-        # Call 1: fill with float(rank)
-        inp1 = torch.full((local_tokens, hidden), float(rank), dtype=dtype, device="cuda").contiguous()
-        run_agv(output_tensor, inp1, symm_mem_hdl, rto, emt, ENGINE_MAX_TOKENS)
+        # Call 1: fill with scale=1
+        symm_tensor.fill_(float(rank + 1))
+        torch.cuda.synchronize()
+        run_rsv(symm_tensor, output_tensor, symm_mem_hdl, rto, emt, ENGINE_MAX_TOKENS)
 
-        # Call 2: fill with float(rank) + 100 — must fully overwrite call 1
-        inp2 = torch.full((local_tokens, hidden), float(rank) + 100.0, dtype=dtype, device="cuda").contiguous()
-        run_agv(output_tensor, inp2, symm_mem_hdl, rto, emt, ENGINE_MAX_TOKENS, n_warmup=1)
+        # Call 2: fill with scale=2 — must fully overwrite call 1's output
+        symm_tensor.fill_(2.0 * float(rank + 1))
+        torch.cuda.synchronize()
+        run_rsv(symm_tensor, output_tensor, symm_mem_hdl, rto, emt, ENGINE_MAX_TOKENS, n_warmup=1)
 
-        passed = verify(rank, world_size, "multi_call", output_tensor, counts, psums, fill_base=100.0)
+        exp = 2.0 * expected_val(world_size)
+        passed = verify(rank, "multi_call", output_tensor, local_tokens, hidden, dtype, exp)
         log(rank, f"  {'PASS' if passed else 'FAIL'} [multi_call]")
         results["multi_call"] = passed
         SymmetricMemoryManager.destroy("ep_multi")
@@ -218,10 +205,10 @@ def main():
     psums, _, rto, _ = make_metadata(rank, counts)
     # Set ep_max_tokens equal to ENGINE_MAX_TOKENS — no CTA exits early, all hit the barrier.
     emt_full = torch.tensor([ENGINE_MAX_TOKENS], dtype=torch.int32, device="cuda")
-    passed = alloc_and_run(
+    passed = run_case(
         "ep_max_eq_engine", rank, world_size, counts, psums,
         ep_group, "ep_max_eq",
-        hidden=2688, dtype=torch.bfloat16, expected_bits=128,
+        hidden=2688, dtype=torch.bfloat16,
         rank_token_offset=rto, ep_max_tokens=emt_full, engine_max_tokens=ENGINE_MAX_TOKENS,
     )
     status = "SKIP" if passed is None else ("PASS" if passed else "FAIL")
