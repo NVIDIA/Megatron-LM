@@ -2,9 +2,9 @@
 
 """Full iteration CUDA graph for training."""
 
+import gc
 import logging
 
-import gc
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states

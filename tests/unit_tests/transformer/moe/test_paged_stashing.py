@@ -7,9 +7,9 @@ import torch.nn.functional as F
 from megatron.core import config
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
-from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.paged_stash import (
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
@@ -125,9 +125,7 @@ class MoEModelTestContainer:
             moe_paged_stash_buffer_size_factor_cuda=0.5,
             moe_paged_stash_buffer_size_factor_cpu=1.5,
         )
-        self.moe_layers = [
-            self._create_moe_layer(layer_number=i) for i in range(num_layers)
-        ]
+        self.moe_layers = [self._create_moe_layer(layer_number=i) for i in range(num_layers)]
         self.moe_layer = self.moe_layers[0]
 
     def _create_moe_layer(self, layer_number=0):
@@ -175,16 +173,12 @@ def _forward_backward_all_layers(container: MoEModelTestContainer, hidden_states
         else None
     )
     output.backward(torch.ones_like(output))
-    return (
-        output.detach(),
-        initial_hidden_states.grad,
-        routing_map,
-        tokens_per_expert,
-    )
+    return (output.detach(), initial_hidden_states.grad, routing_map, tokens_per_expert)
 
 
 def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
+
     return HAVE_HYBRIDEP
 
 
@@ -237,9 +231,7 @@ class TestPagedStashing:
         seq_length = 1024
         batch_size = 1
         hidden_size = container.config.hidden_size
-        hidden_states = torch.randn(
-            (seq_length, batch_size, hidden_size), dtype=torch.bfloat16
-        )
+        hidden_states = torch.randn((seq_length, batch_size, hidden_size), dtype=torch.bfloat16)
 
         # First iteration: capture schedule, capacity, etc.
         paged_stash_reset(True, config=container.config)
@@ -260,24 +252,24 @@ class TestPagedStashing:
         overflow = check_paged_stash_overflow()
         assert overflow.any().item() == 0
 
-        assert torch.allclose(output, output_ref, atol=1e-4, rtol=1e-4), (
-            f"output != output_ref: max diff = {(output - output_ref).abs().max().item()}"
-        )
+        assert torch.allclose(
+            output, output_ref, atol=1e-4, rtol=1e-4
+        ), f"output != output_ref: max diff = {(output - output_ref).abs().max().item()}"
         assert torch.allclose(hidden_states_grad, hidden_states_grad_ref, atol=1e-4, rtol=1e-4), (
             f"hidden_states_grad != ref: max diff = "
             f"{(hidden_states_grad - hidden_states_grad_ref).abs().max().item()}"
         )
         if routing_map is not None and tokens_per_expert is not None:
             num_tokens_per_ep_rank = tokens_per_expert.sum().item()
-            assert num_tokens_per_ep_rank > 0, (
-                f"num_tokens_per_ep_rank={num_tokens_per_ep_rank} (expected > 0)"
-            )
+            assert (
+                num_tokens_per_ep_rank > 0
+            ), f"num_tokens_per_ep_rank={num_tokens_per_ep_rank} (expected > 0)"
             assert routing_map_ref is not None and tokens_per_expert_ref is not None
             tpe_f = tokens_per_expert.float()
             ref_f = tokens_per_expert_ref.float()
-            assert torch.allclose(tpe_f, ref_f, atol=1e-4, rtol=1e-4), (
-                f"tokens_per_expert != ref: max diff = {(tpe_f - ref_f).abs().max().item()}"
-            )
+            assert torch.allclose(
+                tpe_f, ref_f, atol=1e-4, rtol=1e-4
+            ), f"tokens_per_expert != ref: max diff = {(tpe_f - ref_f).abs().max().item()}"
 
 
 @pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")

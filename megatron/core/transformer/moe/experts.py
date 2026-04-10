@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
-from contextlib import nullcontext
 from functools import partial
 from itertools import chain
 from math import ceil
@@ -61,7 +61,6 @@ if HAVE_TE:
     import transformer_engine as te
 
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
-    import transformer_engine as te
 else:
     te = None  # type: ignore[assignment, misc]
     Fp8Padding, Fp8Unpadding = None, None
@@ -981,7 +980,9 @@ class TEGroupedMLP(MegatronModule):
             # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
             cap_factor = self.config.moe_expert_rank_capacity_factor
             avg_num_tokens = (
-                int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+                int(max_num_tokens // cap_factor)
+                if cap_factor is not None and cap_factor > 0
+                else None
             )
             stash_context = get_paged_stash_context(
                 name="grouped_mlp",

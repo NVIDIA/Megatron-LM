@@ -1103,7 +1103,7 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
-    
+
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward"""
 
@@ -1111,12 +1111,16 @@ class TransformerConfig(ModelParallelConfig):
     """Number of tokens per page for paged stash memory management."""
 
     moe_paged_stash_buffer_size_factor_cuda: float = 1.10
-    """Scale factor for paged stash CUDA buffer allocation. Sign selects sizing: positive = avg-based,
-    negative = actual-max. Magnitude is headroom (e.g. 1.10 = 10%)."""
+    """Scale factor for paged stash CUDA buffer allocation.
+
+    Sign selects sizing: positive = avg-based, negative = actual-max. Magnitude is headroom
+    (e.g. 1.10 = 10%)."""
 
     moe_paged_stash_buffer_size_factor_cpu: float = 0.0
-    """Scale factor for paged stash host buffer. 0 disables host buffer. Same sign convention as
-    moe_paged_stash_buffer_size_factor_cuda: positive = avg-based, negative = actual-max; scale = abs(factor)."""
+    """Scale factor for paged stash host buffer. 0 disables host buffer.
+
+    Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
+    negative = actual-max; scale = abs(factor)."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -1691,9 +1695,7 @@ class TransformerConfig(ModelParallelConfig):
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
         if self.moe_paged_stash:
-            assert not self.cpu_offloading, (
-                "moe_paged_stash cannot be enabled with cpu_offloading."
-            )
+            assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
             assert self.moe_expert_rank_capacity_factor is not None, (
                 "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                 "there is no need to use paged stashing without it."
