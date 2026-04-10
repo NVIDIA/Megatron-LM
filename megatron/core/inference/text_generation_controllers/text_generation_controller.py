@@ -583,6 +583,23 @@ class TextGenerationController:
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
 
+        # Precompute MTP CUDA graph padded batch size from the already EP-synced
+        # padded_batch_dimensions.  This avoids an extra EP all-reduce on the MTP
+        # hot path — all ranks derive the same value from the matched graph.
+        if (
+            getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None
+            and context.using_cuda_graph_this_step()
+        ):
+            self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
+            tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+            sp_enabled = self.model_config.sequence_parallel and tp_size > 1
+            if sp_enabled:
+                self._mtp_resolved_padded_count += (
+                    tp_size - self._mtp_resolved_padded_count % tp_size
+                ) % tp_size
+        else:
+            self._mtp_resolved_padded_count = None
+
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
         symmetric_ar_type = self.model_config.symmetric_ar_type
@@ -836,40 +853,6 @@ class TextGenerationController:
             spec_tokens[indices] = tokens
         return spec_tokens
 
-    @torch.compile()
-    def _resolve_mtp_cuda_graph_batch_size(self, local_padded_count: int) -> int:
-        """Resolve MTP CUDA graph batch size, syncing across EP ranks if needed.
-
-        Finds the smallest pre-captured CUDA graph batch size that fits
-        ``local_padded_count``, then all-reduces (MAX) across the EP group so
-        every EP rank — including the dummy rank which sends 0 — agrees on the
-        same graph size.
-
-        Returns ``local_padded_count`` unchanged when MTP CUDA graphs are not
-        active or EP is not in use.
-        """
-        mtp_cuda_graph_sizes = getattr(self, '_mtp_cuda_graph_batch_sizes', None)
-        if not mtp_cuda_graph_sizes:
-            return local_padded_count
-
-        padded_count = local_padded_count
-        for size in mtp_cuda_graph_sizes:
-            if size >= padded_count:
-                padded_count = size
-                break
-
-        ep_group = self.inference_wrapped_model.inference_context.expert_model_parallel_group
-        if ep_group is not None:
-            sync_tensor = torch.tensor(
-                [padded_count], dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            torch.distributed.all_reduce(
-                sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
-            )
-            padded_count = sync_tensor.item()
-
-        return padded_count
-
     def _compute_serial_mtp_and_sample(self):
         """Compute MTP logits serially after verification and sample speculative tokens.
 
@@ -921,17 +904,15 @@ class TextGenerationController:
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
         current_hidden = last_accepted_hidden if has_mtp else None
 
-        # Compute padding needed to make batch a multiple of tp_size for SP compatibility.
+        # Compute padding needed to make batch compatible with SP and CUDA graphs.
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
-        if sp_enabled:
+        if self._mtp_resolved_padded_count is not None:
+            padded_count = self._mtp_resolved_padded_count
+        elif sp_enabled:
             padded_count = active_request_count + (tp_size - active_request_count % tp_size) % tp_size
         else:
             padded_count = active_request_count
-
-        # Further pad to match a pre-captured CUDA graph batch size and sync
-        # across EP ranks so the dummy rank uses the same graph.
-        padded_count = self._resolve_mtp_cuda_graph_batch_size(padded_count)
         pad_count = padded_count - active_request_count
 
         # Pad hidden states and scatter for sequence parallelism.
@@ -1738,16 +1719,14 @@ class TextGenerationController:
         hidden_size = self.model_config.hidden_size
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
 
-        # Pad token_ids/position_ids to nearest multiple of tp_size so that the
-        # embedding can reduce-scatter evenly across TP ranks.
+        # Use precomputed MTP CUDA graph batch size when available;
+        # otherwise use minimal SP-compatible size.
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
-        padded_count = tp_size if sp_enabled else 1
-
-        # When MTP CUDA graphs are active, sync with real EP ranks to agree
-        # on batch size (dummy's local value is small; the EP all-reduce MAX
-        # picks the real ranks' padded_count).
-        padded_count = self._resolve_mtp_cuda_graph_batch_size(padded_count)
+        if getattr(self, '_mtp_resolved_padded_count', None) is not None:
+            padded_count = self._mtp_resolved_padded_count
+        else:
+            padded_count = tp_size if sp_enabled else 1
 
         dummy_hidden = None
         if has_mtp:

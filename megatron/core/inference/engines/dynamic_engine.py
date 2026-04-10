@@ -456,13 +456,15 @@ class DynamicInferenceEngine(AbstractEngine):
         if model_config.cuda_graph_impl != "local":
             return
 
-        # Collect decode-only batch sizes from the decoder graph dimensions.
+        # Collect batch sizes from all graph dimensions.  MTP serial forward
+        # runs on all active requests (decode + prefill), so we need graphs
+        # for total request counts, not just decode-only counts.
         tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
         sp_enabled = model_config.sequence_parallel and tp_size > 1
         mtp_batch_sizes = set()
         for dim in context.cuda_graph_batch_dimensions_list:
-            if dim.prefill_req_count == 0 and dim.decode_req_count > 0:
-                n = dim.decode_req_count
+            n = dim.req_count
+            if n > 0:
                 if sp_enabled:
                     n += (tp_size - n % tp_size) % tp_size
                 mtp_batch_sizes.add(n)
