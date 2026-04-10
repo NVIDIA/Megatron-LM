@@ -16,7 +16,8 @@ from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training import get_args, get_model, initialize_megatron
+from utils import get_hf_tokenizer
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
@@ -121,9 +122,7 @@ if __name__ == "__main__":
     else:
         dataset = load_dataset(args.finetune_hf_dataset, split=args.finetune_data_split)
 
-    tokenizer = get_tokenizer()._tokenizer
-    if hasattr(tokenizer, "tokenizer"):
-        tokenizer = tokenizer.tokenizer
+    tokenizer = get_hf_tokenizer()
 
 
     if args.load is not None:

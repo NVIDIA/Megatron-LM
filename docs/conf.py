@@ -109,16 +109,7 @@ html_theme_options = {
             "icon": "fa-brands fa-github",
         }
     ],
-    "extra_head": {
-        """
-    <script src="https://assets.adobedtm.com/5d4962a43b79/c1061d2c5e7b/launch-191c2462b890.min.js" ></script>
-    """
-    },
-    "extra_footer": {
-        """
-    <script type="text/javascript">if (typeof _satellite !== "undefined") {_satellite.pageBottom();}</script>
-    """
-    },
+    "public_docs_features": True
 }
 html_extra_path = ["project.json", "versions1.json"]
 

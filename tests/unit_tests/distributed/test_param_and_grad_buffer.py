@@ -26,14 +26,17 @@ def get_model_and_buffers(
     overlap_grad_reduce: bool,
     average_in_collective: bool,
     num_distributed_optimizer_instances: int = 1,
+    grad_reduce_in_fp32: bool = True,
+    param_name_patterns_for_fp32_local_accumulation: tuple = (),
 ):
     ddp_config = DistributedDataParallelConfig(
-        grad_reduce_in_fp32=True,
+        grad_reduce_in_fp32=grad_reduce_in_fp32,
         use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
         bucket_size=bucket_size,
         average_in_collective=average_in_collective,
         num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+        param_name_patterns_for_fp32_local_accumulation=param_name_patterns_for_fp32_local_accumulation,
     )
     model = TestModel(
         input_dim=input_dim,
@@ -373,3 +376,301 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
             ), "Expected all_reduce NOT to be called when force_all_reduce=False"
 
     Utils.destroy_model_parallel()
+
+
+def test_start_param_sync_dp_size_1():
+    """When dp_size == 1 (e.g., expt_dp_size == 1), start_param_sync should set
+    param_gather_dispatched=True and return immediately without launching any
+    all-gather collective."""
+    world_size = torch.distributed.get_world_size()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
+
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=True,
+        use_distributed_optimizer=False,
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        bucket_size=None,
+    )
+    module = TestModel(
+        input_dim=32, output_dim=32, num_layers=2, bias=False, shared_embedding=False
+    ).bfloat16()
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=module
+    )
+
+    # Confirm dp_size == 1 in the test environment.
+    for bg in model.bucket_groups:
+        assert bg.intra_distributed_optimizer_instance_size == 1
+
+    with mock.patch('torch.distributed.all_gather') as mock_all_gather:
+        for bg in model.bucket_groups:
+            assert not bg.param_gather_dispatched
+            bg.start_param_sync()
+            assert (
+                bg.param_gather_dispatched
+            ), "param_gather_dispatched should be True after start_param_sync with dp_size=1"
+        # No all-gather should have been called.
+        assert not mock_all_gather.called, "all_gather should not be called when dp_size == 1"
+
+    Utils.destroy_model_parallel()
+
+
+class TestFreeOverlapBuffers:
+    """Tests for free_overlap_buffers() which releases GPU memory before async checkpoint saves."""
+
+    @staticmethod
+    def _make_model():
+        """Create a DDP-wrapped model with overlap_param_gather enabled."""
+        Utils.initialize_model_parallel()
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=False,
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=None,
+        )
+        module = TestModel(
+            input_dim=32, output_dim=32, num_layers=2, bias=False, shared_embedding=False
+        ).bfloat16()
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config=ddp_config,
+            module=module,
+        )
+        return model
+
+    def test_bucket_group_clears_buffers(self):
+        """free_overlap_buffers on a bucket group should None-out per-bucket layerwise buffers."""
+        model = self._make_model()
+
+        for bg in model.bucket_groups:
+            # Simulate buffers that would be allocated by start_param_sync.
+            for bucket in bg.buckets:
+                bucket.layerwise_gather_list = [torch.empty(8), torch.empty(8)]
+                bucket._layerwise_src_buffer = torch.empty(16)
+
+            bg.free_overlap_buffers()
+
+            for bucket in bg.buckets:
+                assert (
+                    bucket.layerwise_gather_list is None
+                ), "layerwise_gather_list should be None after free_overlap_buffers"
+                assert (
+                    bucket._layerwise_src_buffer is None
+                ), "_layerwise_src_buffer should be None after free_overlap_buffers"
+
+        Utils.destroy_model_parallel()
+
+    def test_bucket_group_waits_on_pending_handle(self):
+        """free_overlap_buffers should wait() on any pending param_gather_handle."""
+        model = self._make_model()
+
+        for bg in model.bucket_groups:
+            mock_handle = mock.MagicMock()
+            bg.param_gather_handle = mock_handle
+
+            bg.free_overlap_buffers()
+
+            mock_handle.wait.assert_called_once()
+            assert (
+                bg.param_gather_handle is None
+            ), "param_gather_handle should be None after free_overlap_buffers"
+
+        Utils.destroy_model_parallel()
+
+    def test_bucket_group_noop_when_no_buffers(self):
+        """free_overlap_buffers should be safe to call when no buffers are allocated."""
+        model = self._make_model()
+
+        for bg in model.bucket_groups:
+            assert bg.param_gather_handle is None
+            for bucket in bg.buckets:
+                assert bucket.layerwise_gather_list is None
+                assert bucket._layerwise_src_buffer is None
+
+            # Should not raise.
+            bg.free_overlap_buffers()
+
+        Utils.destroy_model_parallel()
+
+    def test_ddp_free_overlap_buffers_delegates(self):
+        """DDP.free_overlap_buffers should call free_overlap_buffers on all bucket groups."""
+        model = self._make_model()
+
+        with mock.patch.object(type(model.bucket_groups[0]), 'free_overlap_buffers') as mock_free:
+            model.free_overlap_buffers()
+            assert mock_free.call_count == len(
+                model.bucket_groups + model.expert_parallel_bucket_groups
+            ), "free_overlap_buffers should be called on every bucket group"
+
+        Utils.destroy_model_parallel()
+
+
+class TestFP32LocalGradAccumulation:
+    """Tests for the FP32 local gradient accumulation feature
+    (param_name_patterns_for_fp32_local_accumulation)."""
+
+    @staticmethod
+    def _make_model(patterns, bucket_size=None):
+        """Create a DDP-wrapped model with FP32 local grad accumulation patterns."""
+        return get_model_and_buffers(
+            input_dim=100,
+            output_dim=100,
+            num_layers=3,
+            bias=True,
+            shared_embedding=False,
+            bucket_size=bucket_size,
+            use_distributed_optimizer=False,
+            overlap_grad_reduce=False,
+            average_in_collective=False,
+            grad_reduce_in_fp32=False,
+            param_name_patterns_for_fp32_local_accumulation=patterns,
+        )
+
+    def test_config_validation_with_grad_reduce_in_fp32(self):
+        """param_name_patterns_for_fp32_local_accumulation and grad_reduce_in_fp32 are
+        mutually exclusive."""
+        with pytest.raises(AssertionError):
+            DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True, param_name_patterns_for_fp32_local_accumulation=('all',)
+            )
+
+    def test_pattern_matching_creates_fp32_main_grad(self):
+        """Params matching patterns should get a float32 main_grad and a
+        main_grad_copy_in_grad_buffer; non-matching params should not."""
+        Utils.initialize_model_parallel()
+        # Match only weight params (not bias).
+        model, buf, _ = self._make_model(patterns=('*.weight',))
+
+        for name, param in model.module.named_parameters():
+            if 'weight' in name:
+                assert param.main_grad.dtype == torch.float32, f"{name} main_grad should be float32"
+                assert hasattr(param, 'main_grad_copy_in_grad_buffer')
+                assert param.main_grad_copy_in_grad_buffer is not None
+                # The copy in grad buffer should be in the buffer's grad dtype (bf16).
+                assert param.main_grad_copy_in_grad_buffer.dtype == buf.grad_dtype
+            else:
+                # Bias params should not be promoted.
+                assert (
+                    param.main_grad.dtype == buf.grad_dtype
+                ), f"{name} main_grad should remain in grad_dtype"
+                assert getattr(param, 'main_grad_copy_in_grad_buffer', None) is None
+
+        Utils.destroy_model_parallel()
+
+    def test_all_pattern_matches_every_param(self):
+        """The 'all' pattern should match every parameter."""
+        Utils.initialize_model_parallel()
+        model, buf, _ = self._make_model(patterns=('all',))
+
+        for name, param in model.module.named_parameters():
+            assert (
+                param.main_grad.dtype == torch.float32
+            ), f"{name} main_grad should be float32 with 'all' pattern"
+            assert getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None
+
+        Utils.destroy_model_parallel()
+
+    def test_bucket_tracks_params_with_extra_main_grads(self):
+        """Each bucket's params_with_extra_main_grads should contain exactly
+        the params that matched the patterns."""
+        Utils.initialize_model_parallel()
+        model, buf, _ = self._make_model(patterns=('*.weight',))
+
+        promoted_params = set()
+        for name, param in model.module.named_parameters():
+            if 'weight' in name:
+                promoted_params.add(param)
+
+        bucket_promoted = set()
+        for bucket in buf.buckets:
+            for param in bucket.params_with_extra_main_grads:
+                bucket_promoted.add(param)
+            # Every param in params_with_extra_main_grads should also be in bucket.params.
+            assert bucket.params_with_extra_main_grads == [] or set(
+                bucket.params_with_extra_main_grads
+            ).issubset(bucket.params)
+
+        assert (
+            bucket_promoted == promoted_params
+        ), "Bucket-tracked promoted params should match the set of pattern-matched params"
+
+        Utils.destroy_model_parallel()
+
+    def test_no_patterns_means_no_extra_main_grads(self):
+        """With no patterns, no params should have extra main_grads."""
+        Utils.initialize_model_parallel()
+        _, buf, _ = self._make_model(patterns=())
+
+        assert len(buf.extra_main_grads) == 0
+        for bucket in buf.buckets:
+            assert len(bucket.params_with_extra_main_grads) == 0
+
+        Utils.destroy_model_parallel()
+
+    def test_reset_zeros_extra_main_grads(self):
+        """reset() should zero out both grad_data and all extra main_grads."""
+        Utils.initialize_model_parallel()
+        _, buf, _ = self._make_model(patterns=('all',))
+
+        # Fill extra main_grads and grad_data with non-zero values.
+        buf.grad_data.fill_(1.0)
+        for grad in buf.extra_main_grads:
+            grad.fill_(42.0)
+
+        buf.reset()
+
+        assert torch.all(buf.grad_data == 0), "grad_data should be zeroed after reset"
+        for grad in buf.extra_main_grads:
+            assert torch.all(grad == 0), "extra main_grads should be zeroed after reset"
+
+        Utils.destroy_model_parallel()
+
+    def test_scale_gradients_scales_extra_main_grads(self):
+        """scale_gradients() should scale both grad_data and extra main_grads."""
+        Utils.initialize_model_parallel()
+        _, buf, _ = self._make_model(patterns=('all',))
+
+        buf.grad_data.fill_(2.0)
+        for grad in buf.extra_main_grads:
+            grad.fill_(4.0)
+
+        buf.scale_gradients(0.5)
+
+        assert torch.allclose(
+            buf.grad_data, torch.tensor(1.0, dtype=buf.grad_data.dtype)
+        ), "grad_data should be scaled"
+        for grad in buf.extra_main_grads:
+            assert torch.allclose(
+                grad, torch.tensor(2.0, dtype=grad.dtype)
+            ), "extra main_grads should be scaled"
+
+        Utils.destroy_model_parallel()
+
+    def test_grad_sync_copies_to_and_from_comm_buffer(self):
+        """During grad sync, values in FP32 main_grad should be copied to the comm buffer
+        before the collective, and the reduced result should be copied back afterward."""
+        Utils.initialize_model_parallel()
+        model, buf, bucket_groups = self._make_model(patterns=('all',))
+
+        # Simulate accumulated gradients in FP32 main_grad.
+        for param in model.parameters():
+            param.main_grad.fill_(1.0)
+
+        # Run grad sync (non-overlapped, so finish_grad_sync triggers start + wait).
+        model.finish_grad_sync()
+
+        # After sync, main_grad should contain the reduced result (not the original 1.0,
+        # since the collective may have scaled / averaged). The key invariant is that
+        # main_grad should equal main_grad_copy_in_grad_buffer (the comm buffer slice)
+        # after the copy-back.
+        for param in model.parameters():
+            if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
+                torch.testing.assert_close(
+                    param.main_grad,
+                    param.main_grad_copy_in_grad_buffer.float(),
+                    msg="main_grad should equal comm buffer after grad sync copy-back",
+                )
+
+        Utils.destroy_model_parallel()
