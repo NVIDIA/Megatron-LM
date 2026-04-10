@@ -101,7 +101,7 @@ class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
 
-    Provides a consistent interface for gradient management, parameter 
+    Provides a consistent interface for gradient management, parameter
     access, and state-dict handling across different optimization types.
 
     Args:
@@ -138,11 +138,10 @@ class MegatronOptimizer(ABC):
         return params
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        
         """Collects gradients for norm calculation, filtering duplicates.
 
-        This method filters parameters based on whether the gradient is not None, 
-        the parameter is not shared (to avoid double-counting gradients), and 
+        This method filters parameters based on whether the gradient is not None,
+        the parameter is not shared (to avoid double-counting gradients), and
         the parameter is not a replica due to tensor model parallelism.
 
         Returns:
