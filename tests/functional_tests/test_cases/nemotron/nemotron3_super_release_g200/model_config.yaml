@@ -42,7 +42,7 @@ MODEL_ARGS:
 
   # Network size args
   --use-mcore-models: true
-  --spec: megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
   --is-hybrid-model: true
   --mamba-num-heads: 128
   --num-layers: 88
