@@ -127,6 +127,15 @@ class SharedExpertMLP(MLP):
             output = output * gate_score
         return output
 
+    def _reset_parameters(self):
+        """Initialize parameters owned directly by SharedExpertMLP for meta init."""
+
+        if self.use_shared_expert_gate and self.gate_weight is not None:
+            if self.config.perform_initialization:
+                self.config.init_method(self.gate_weight)
+            self.gate_weight.data = self.gate_weight.data.to(dtype=self.config.params_dtype)
+            setattr(self.gate_weight, 'sequence_parallel', self.config.sequence_parallel)
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:

@@ -312,6 +312,25 @@ class MultimodalRotaryEmbedding(nn.Module):
             else parallel_state.get_context_parallel_group(check_initialized=False)
         )
 
+    @staticmethod
+    def _apply_interleaved_mrope(freqs: Tensor, mrope_section: List[int]) -> Tensor:
+        """Merge T/H/W frequency channels into a single interleaved vector.
+
+        Converts from the per-channel outer-product layout ``(3, bs, seq_len, dim)``
+        to the interleaved layout ``(bs, seq_len, dim)`` used by HF
+        ``Qwen3VLTextRotaryEmbedding.apply_interleaved_mrope`` (unified 2026-02-24)
+        and Megatron-Bridge ``Qwen3VLMultimodalRotaryEmbedding``.
+
+        H freqs occupy stride-3 positions ``{1, 4, 7, ...}`` and W freqs occupy
+        ``{2, 5, 8, ...}``, while T freqs remain at ``{0, 3, 6, ...}``.
+        """
+        freqs_out = freqs[0].clone()  # start with T channel: shape (bs, seq_len, dim)
+        for dim_idx, offset in enumerate((1, 2), start=1):  # H then W
+            length = mrope_section[dim_idx] * 3
+            idx = slice(offset, length, 3)
+            freqs_out[..., idx] = freqs[dim_idx, ..., idx]
+        return freqs_out
+
     def forward(
         self,
         position_ids: torch.Tensor,
@@ -341,20 +360,20 @@ class MultimodalRotaryEmbedding(nn.Module):
         seq_expanded = seq[:, :, None, :].float()
         # shape (3, bs, seq_length, dim)
         freqs = (inv_freq_expanded @ seq_expanded).transpose(2, 3)
+
+        # Merge T/H/W channels with interleaved layout: [T₀,H₀,W₀,T₁,H₁,W₁,...].
+        # freqs becomes shape (bs, seq_length, dim).
+        freqs = self._apply_interleaved_mrope(freqs, mrope_section)
+
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         if not self.rotary_interleaved:
-            emb = torch.cat((freqs, freqs), dim=-1)  # shape (3, bs, seq_length, 2 * dim)
+            emb = torch.cat((freqs, freqs), dim=-1)  # shape (bs, seq_length, 2 * dim)
         else:
-            bs = freqs.shape[1]
-            emb = torch.stack((freqs.view(3, bs, -1, 1), freqs.view(3, bs, -1, 1)), dim=-1).view(
-                3, bs, freqs.shape[0], -1
-            )
-
-        # generate freqs with mrope_section
-        # shape (bs, seq_length, 2 * dim)
-        mrope_section = mrope_section * 2
-        emb = torch.cat([m[i % 3] for i, m in enumerate(emb.split(mrope_section, dim=-1))], dim=-1)
+            bs = freqs.shape[0]
+            emb = torch.stack(
+                (freqs.view(bs, -1, 1), freqs.view(bs, -1, 1)), dim=-1
+            ).view(bs, freqs.shape[1], -1)
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
