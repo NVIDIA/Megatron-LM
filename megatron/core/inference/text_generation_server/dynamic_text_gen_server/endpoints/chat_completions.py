@@ -228,8 +228,11 @@ def _coerce_arguments_mapping(arguments):
 def _sanitize_messages_for_template(messages):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
-    This only normalizes tool-call argument payloads inside each message:
+    Normalizes:
     - messages[*].tool_calls[*].function.arguments is coerced to a dict.
+    - multimodal content lists are flattened to plain strings.
+    - tool role messages preserve tool_call_id and name (identity fields used
+      by Qwen3 and other chat templates to correlate tool results with calls).
 
     Example transformation:
     Input:
@@ -249,6 +252,7 @@ def _sanitize_messages_for_template(messages):
             continue
         msg_copy = dict(message)
         content = msg_copy.get("content")
+        role = msg_copy.get("role")
         # OpenAI-style multimodal/text content may arrive as a list of blocks.
         # HF/Jinja chat templates used by this server expect plain strings.
         if isinstance(content, list):
@@ -264,9 +268,12 @@ def _sanitize_messages_for_template(messages):
             msg_copy["content"] = "".join(text_chunks)
         elif isinstance(content, dict):
             msg_copy["content"] = str(content.get("text", ""))
-        elif content is None:
+        elif content is None and role != "tool":
+            # For tool result messages, preserve None content so the chat
+            # template can distinguish "no result" from "empty string result".
+            # For other roles, coerce to empty string for template safety.
             msg_copy["content"] = ""
-        elif not isinstance(content, str):
+        elif not isinstance(content, str) and content is not None:
             msg_copy["content"] = str(content)
 
         tool_calls = msg_copy.get("tool_calls")
