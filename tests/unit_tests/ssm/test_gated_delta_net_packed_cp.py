@@ -36,15 +36,14 @@ class TestGDNCuSeqlensResolve:
         result = mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
         assert torch.equal(result, actual)
 
-    def test_single_seq_auto_extended(self, mock_gdn):
-        actual = torch.tensor([0, 500], dtype=torch.int32)
-        result = mock_gdn._resolve_cu_seqlens(None, actual, 504, "cu_seqlens_q")
-        assert result[-1].item() == 504
-        assert actual[-1].item() == 500  # original not modified
-
-    def test_multi_seq_raises_on_mismatch(self, mock_gdn):
+    def test_raises_when_padding_mismatch(self, mock_gdn):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         with pytest.raises(ValueError, match="4194"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
+
+    def test_raises_when_cu_seqlens_exceeds_total(self, mock_gdn):
+        actual = torch.tensor([0, 500, 1100], dtype=torch.int32)
+        with pytest.raises(ValueError, match="exceeds"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
 
     def test_cp1_skips_validation(self, mock_gdn):

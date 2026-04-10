@@ -577,29 +577,18 @@ class GatedDeltaNet(MegatronModule):
             return cu_seqlens_actual
 
         total_cu = cu_seqlens_actual[-1].item()
-        if total_cu >= total_seq_len:
+        if total_cu == total_seq_len:
             return cu_seqlens_actual
-
-        # Alignment padding exists but padded cu_seqlens not provided
-        num_seqs = cu_seqlens_actual.shape[0] - 1
-        if num_seqs == 1:
-            # Single sequence: safe to extend to cover trailing padding
-            cu_seqlens = cu_seqlens_actual.clone()
-            cu_seqlens[-1] = total_seq_len
-            logger.warning(
-                "GDN: %s_padded not provided. Auto-extending single-sequence "
-                "cu_seqlens from %d to %d to cover alignment padding.",
-                name,
-                total_cu,
-                total_seq_len,
+        if total_cu > total_seq_len:
+            raise ValueError(
+                f"GDN: {name}[-1]={total_cu} exceeds "
+                f"total_sequence_length={total_seq_len}."
             )
-            return cu_seqlens
 
         raise ValueError(
             f"GDN packed sequence with CP > 1 requires {name}_padded when "
             f"alignment padding is present ({name}[-1]={total_cu} < "
-            f"total_sequence_length={total_seq_len}). Per-sequence padded "
-            f"boundaries cannot be inferred from the total tensor length. "
+            f"total_sequence_length={total_seq_len}). "
             f"Please set {name}_padded in PackedSeqParams. "
             f"See https://github.com/NVIDIA/Megatron-LM/issues/4194"
         )
