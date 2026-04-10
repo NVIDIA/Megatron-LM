@@ -1,0 +1,180 @@
+ENV_VARS:
+  SKIP_PYTEST: 1
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+  # Paths
+  MODEL_BF16_CKPT: "${DATA_PATH}/model/nemotron_v3_nano_a1b"
+  PTQ_QUANTIZED_CKPT: "${DATA_CACHE_PATH}/ptq_quantized_ckpt"
+  TOKENIZER: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+  HF_HOME: "${DATA_CACHE_PATH}/.hf_cache"
+BEFORE_SCRIPT: |
+  # Stage 1: PTQ quantization via quantize.py directly
+  echo -e "\n=== Stage 1: Running PTQ (NVFP4) ===\n"
+  cd /opt/megatron-lm
+  # Env vars that arguments.sh would normally set
+  export TOKENIZERS_PARALLELISM=False
+  export OMP_NUM_THREADS=1
+  export NCCL_IB_SL=1
+  export NCCL_IB_TIMEOUT=22
+  uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 \
+    examples/post_training/modelopt/quantize.py \
+    --micro-batch-size 1 \
+    --save-interval 100000 \
+    --bf16 \
+    --seq-length 4096 \
+    --max-position-embeddings 4096 \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model ${TOKENIZER} \
+    --tensor-model-parallel-size 1 \
+    --expert-model-parallel-size 8 \
+    --expert-tensor-parallel-size 1 \
+    --pipeline-model-parallel-size 1 \
+    --context-parallel-size 1 \
+    --hidden-size 1216 \
+    --num-attention-heads 32 \
+    --group-query-attention \
+    --num-query-groups 2 \
+    --ffn-hidden-size 896 \
+    --kv-channels 128 \
+    --squared-relu \
+    --normalization RMSNorm \
+    --disable-bias-linear \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
+    --position-embedding-type none \
+    --untie-embeddings-and-output-weights \
+    --init-method-std 0.0256 \
+    --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
+    --mamba-num-heads 64 \
+    --export-model-type MambaModel \
+    --num-experts 128 \
+    --moe-router-topk 6 \
+    --moe-aux-loss-coeff 1e-4 \
+    --moe-router-topk-scaling-factor 2.5 \
+    --moe-router-enable-expert-bias \
+    --moe-router-dtype fp32 \
+    --moe-router-score-function sigmoid \
+    --moe-router-load-balancing-type seq_aux_loss \
+    --moe-shared-expert-intermediate-size 3712 \
+    --moe-token-dispatcher-type alltoall \
+    --moe-permute-fusion \
+    --moe-grouped-gemm \
+    --use-fused-weighted-squared-relu \
+    --attention-backend fused \
+    --disable-gloo-process-groups \
+    --no-create-attention-mask-in-dataloader \
+    --ckpt-format torch_dist \
+    --ckpt-fully-parallel-load \
+    --load ${MODEL_BF16_CKPT} \
+    --save ${PTQ_QUANTIZED_CKPT} \
+    --finetune \
+    --auto-detect-ckpt-format \
+    --distributed-timeout-minutes 30 \
+    --export-default-te-spec \
+    --export-quant-cfg MAMBA_MOE_NVFP4_CONSERVATIVE_CFG \
+    --calib-size 256 \
+    --calib-batch-size 4 \
+    --skip-generate
+  echo -e "\n=== Stage 1 complete ===\n"
+MODEL_ARGS:
+  # KD teacher/config
+  --export-default-te-spec: true
+  --export-kd-teacher-load: ${MODEL_BF16_CKPT}
+  --auto-detect-ckpt-format: true
+  --finetune: true
+  # Architecture
+  --hidden-size: 1216
+  --num-attention-heads: 32
+  --group-query-attention: true
+  --num-query-groups: 2
+  --ffn-hidden-size: 896
+  --kv-channels: 128
+  --squared-relu: true
+  --normalization: RMSNorm
+  --disable-bias-linear: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --position-embedding-type: none
+  --untie-embeddings-and-output-weights: true
+  --init-method-std: 0.0256
+  --hybrid-layer-pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
+  --mamba-num-heads: 64
+  --export-model-type: MambaModel
+  # MoE
+  --num-experts: 128
+  --moe-router-topk: 6
+  --moe-aux-loss-coeff: 1e-4
+  --moe-router-topk-scaling-factor: 2.5
+  --moe-router-enable-expert-bias: true
+  --moe-router-dtype: fp32
+  --moe-router-score-function: sigmoid
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-shared-expert-intermediate-size: 3712
+  --moe-token-dispatcher-type: alltoall
+  --moe-permute-fusion: true
+  --moe-grouped-gemm: true
+  --use-fused-weighted-squared-relu: true
+  # Tokenizer
+  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-model: ${TOKENIZER}
+  --bf16: true
+  # Parallelism
+  --tensor-model-parallel-size: 2
+  --expert-model-parallel-size: 8
+  --expert-tensor-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --sequence-parallel: true
+  # Infrastructure
+  --attention-backend: fused
+  --disable-gloo-process-groups: true
+  --no-create-attention-mask-in-dataloader: true
+  --ddp-num-buckets: 8
+  --override-opt_param-scheduler: true
+  --no-mmap-bin-files: true
+  --num-workers: 1
+  --ckpt-format: torch_dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  # Training
+  --micro-batch-size: 1
+  --global-batch-size: 8
+  --seq-length: 4096
+  --max-position-embeddings: 4096
+  --train-iters: 3
+  --lr: 0.00015
+  --lr-decay-style: cosine
+  --lr-decay-iters: 320000
+  --min-lr: 1.0e-5
+  --weight-decay: 1e-2
+  --clip-grad: 1.0
+  --lr-warmup-fraction: .01
+  --use-distributed-optimizer: true
+  --overlap-param-gather: true
+  --overlap-grad-reduce: true
+  # Checkpoint & data
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${PTQ_QUANTIZED_CKPT}
+  --data-path: "${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document"
+  --split: "949,50,1"
+  --distributed-backend: nccl
+  --transformer-impl: transformer_engine
+  --data-cache-path: ${DATA_CACHE_PATH}
+  # Logging
+  --log-interval: 1
+  --save-interval: 1000
+  --eval-interval: 1000
+  --eval-iters: 10
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --log-memory-to-tensorboard: true
+  --timing-log-level: 0
+  --no-gradient-accumulation-fusion: true
+  --distributed-timeout-minutes: 30
+  --exit-interval: 50
+TEST_TYPE: regular
