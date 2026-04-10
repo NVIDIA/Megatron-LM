@@ -836,6 +836,7 @@ class TextGenerationController:
             spec_tokens[indices] = tokens
         return spec_tokens
 
+    @torch.compile()
     def _resolve_mtp_cuda_graph_batch_size(self, local_padded_count: int) -> int:
         """Resolve MTP CUDA graph batch size, syncing across EP ranks if needed.
 
@@ -1054,6 +1055,7 @@ class TextGenerationController:
 
         return output_tokens, repeats
 
+    @torch.compile()
     def _verify_speculative_tokens(
         self,
         output_tokens: Tensor,
@@ -1064,80 +1066,48 @@ class TextGenerationController:
         num_prefill_requests: int,
         active_request_count: int,
     ) -> tuple:
-        """Verify speculative tokens against input tokens and compute acceptance.
-
-        Creates an accepted tokens mask where:
-        - For prefill requests, the token is always accepted.
-        - For decode requests, the first token (base token) is always accepted, then we compare
-          sampled tokens with input tokens and accept consecutive matches.
-        Then finds the index of the last accepted token per request.
-
-        Example (assume 1, 2, and 0 spec tokens are accepted in the first 3 decode requests):
-            input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
-            Output tokens                       [ a6o a7o  a8o |  b40   b5o  b6o   |  c7o  c8o   c9o   |     d3o     |         e5o        ]
-            Output tokens right shift           [ d3o a6o  a7o |  a8o   b40  b5o   |  b6o  c7o   c8o   |     c9o     |         d3o        ]
-            Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
-            Last one indices                    [      1       |         5         |        6          |      9      |         10         ]
-
-        Returns:
-            tuple: (last_one_indices, accepted_tokens_mask, input_tokens_required) where
-                last_one_indices contains the index of the last accepted token per request.
-        """
+        """Verify speculative tokens against input tokens without data-dependent graph breaks."""
         if input_tokens_required.ndim == 2:
-            assert (
-                input_tokens_required.shape[0] == 1
-            ), f"Expected input_tokens_required to have 1 row, but got {input_tokens_required.shape}"
             input_tokens_required = input_tokens_required.squeeze(0)
 
-        # Initialize mask with False to prevent boundary bleed
+        device = input_tokens_required.device
+        
+        # Initialize mask functionally
         accepted_tokens_mask = torch.zeros_like(input_tokens_required, dtype=torch.bool)
 
         # Make all prefill tokens accepted
         token_to_prefill_idx = torch.repeat_interleave(request_in_prefill_status_tensor, repeats)
-        accepted_tokens_mask[token_to_prefill_idx == 1] = True
+        accepted_tokens_mask = accepted_tokens_mask | (token_to_prefill_idx == 1)
 
-        # Safe decode token verification without cross-batch boundary contamination
-        decode_mask_2d = None
-        if num_decode_requests > 0:
-            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+        decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+        last_one_indices = torch.full((active_request_count,), -1, device=device, dtype=torch.long)
 
-            decode_inputs = input_tokens_required[:decode_len].reshape(
-                num_decode_requests, self.num_speculative_tokens + 1
-            )
-            decode_outputs = output_tokens[:decode_len].reshape(
-                num_decode_requests, self.num_speculative_tokens + 1
-            )
+        # Vectorized decode token verification
+        # Using .view(-1, ...) safely handles cases where num_decode_requests == 0 without python branches
+        decode_inputs = input_tokens_required[:decode_len].view(-1, self.num_speculative_tokens + 1)
+        decode_outputs = output_tokens[:decode_len].view(-1, self.num_speculative_tokens + 1)
+        decode_outputs_shifted = decode_outputs.roll(1, dims=1)
 
-            # Shift outputs right by 1 *within* each request to align sampled tokens with input targets
-            decode_outputs_shifted = decode_outputs.roll(1, dims=1)
-            decode_mask_2d = decode_inputs == decode_outputs_shifted
-            # The first token (base token) is always accepted
-            decode_mask_2d[:, 0] = True
-            # Enforce consecutive acceptance: cummin propagates False to the right
-            decode_mask_2d = decode_mask_2d.cummin(dim=1).values
-            accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
+        # Functionally build the mask: The first token (base token) is always accepted
+        first_col_true = torch.ones_like(decode_inputs[:, :1], dtype=torch.bool)
+        rest_cols = (decode_inputs[:, 1:] == decode_outputs_shifted[:, 1:])
+        decode_mask_2d = torch.cat([first_col_true, rest_cols], dim=1)
 
-        last_one_indices = torch.full(
-            (active_request_count,), -1, device=input_tokens_required.device
-        )
+        # Enforce consecutive acceptance: cummin propagates False to the right
+        decode_mask_2d = decode_mask_2d.cummin(dim=1).values
+        accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
 
-        if num_decode_requests > 0:
-            # Summing the consecutive mask gives the count; subtract 1 for the local index
-            local_last_indices = decode_mask_2d.sum(dim=1) - 1
-            row_offsets = torch.arange(num_decode_requests, device=last_one_indices.device) * (
-                self.num_speculative_tokens + 1
-            )
-            last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
+        # Compute last accepted indices for decode requests
+        local_last_indices = decode_mask_2d.sum(dim=1) - 1
+        row_offsets = torch.arange(num_decode_requests, device=device) * (self.num_speculative_tokens + 1)
+        last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
 
-        if num_prefill_requests > 0:
-            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
-            prefill_valid = (
-                torch.nonzero(accepted_tokens_mask[decode_len:]).squeeze(-1) + decode_len
-            )
-            last_one_indices[num_decode_requests:] = prefill_valid
+        # Compute last accepted indices for prefill requests mathematically instead of using torch.nonzero
+        prefill_valid = decode_len + torch.arange(num_prefill_requests, device=device)
+        last_one_indices[num_decode_requests:] = prefill_valid
 
         return last_one_indices, accepted_tokens_mask, input_tokens_required
-
+    
     def _dynamic_step_sample_logits_and_verify_tokens(self, logits: Tensor, input_ids: Tensor):
         """
         Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
@@ -1186,7 +1156,26 @@ class TextGenerationController:
                 active_request_count,
             )
         )
+   
+        self._prepare_speculative_tokens_for_next_forward_pass(
+            num_decode_requests,
+            output_tokens,
+            required_logit_indices,
+            last_one_indices,
+            accepted_tokens_mask,
+            input_tokens_required,
+        )
 
+    @torch.compile()
+    def _prepare_speculative_tokens_for_next_forward_pass(
+        self,
+        num_decode_requests: int,
+        output_tokens: torch.Tensor,
+        required_logit_indices: torch.Tensor,
+        last_one_indices: torch.Tensor,
+        accepted_tokens_mask: torch.Tensor,
+        input_tokens_required: torch.Tensor,
+    ):
         # Store the final sampled tokens for the next forward pass.
         final_sampled_tokens = output_tokens[last_one_indices]
         self._sampled_tokens_cuda[: len(final_sampled_tokens)] = final_sampled_tokens
