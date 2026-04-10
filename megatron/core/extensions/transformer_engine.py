@@ -1,9 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import base64
 import dataclasses
 import enum
+import importlib
 import inspect
 import io
+import json
 import os
 import pickle
 import warnings
@@ -1669,6 +1672,88 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         )
 
 
+_FP8_STATE_JSON_MAGIC = b"MEGATRON_JSON_V1\n"
+_FP8_STATE_ALLOWED_MODULES = frozenset(
+    {
+        "transformer_engine.common.recipe",
+        "megatron.core.extensions.transformer_engine",
+    }
+)
+
+
+def _fp8_state_to_json(obj):
+    """Recursively convert FP8 extra state to a JSON-serializable structure."""
+    if isinstance(obj, torch.Tensor):
+        arr = obj.detach().cpu().numpy()
+        return {
+            "__tensor__": True,
+            "dtype": arr.dtype.str,
+            "shape": list(arr.shape),
+            "data": base64.b64encode(arr.tobytes()).decode("ascii"),
+        }
+    if isinstance(obj, dict):
+        return {"__dict__": {k: _fp8_state_to_json(v) for k, v in obj.items()}}
+    if isinstance(obj, (list, tuple)):
+        return [_fp8_state_to_json(v) for v in obj]
+    if isinstance(obj, enum.Enum):
+        module = type(obj).__module__
+        if module not in _FP8_STATE_ALLOWED_MODULES:
+            raise TypeError(f"Cannot serialize enum from untrusted module: {module!r}")
+        return {"__enum__": type(obj).__qualname__, "__module__": module, "value": obj.name}
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        module = type(obj).__module__
+        if module not in _FP8_STATE_ALLOWED_MODULES:
+            raise TypeError(f"Cannot serialize dataclass from untrusted module: {module!r}")
+        return {
+            "__dataclass__": type(obj).__qualname__,
+            "__module__": module,
+            "fields": {
+                f.name: _fp8_state_to_json(getattr(obj, f.name))
+                for f in dataclasses.fields(obj)
+            },
+        }
+    if isinstance(obj, (int, float, bool, str, bytes, type(None))):
+        return obj
+    raise TypeError(f"Cannot JSON-serialize FP8 state of type {type(obj)!r}")
+
+
+def _fp8_state_from_json(obj):
+    """Recursively reconstruct FP8 extra state from a JSON-decoded structure."""
+    if isinstance(obj, list):
+        return [_fp8_state_from_json(v) for v in obj]
+    if not isinstance(obj, dict):
+        return obj
+    if obj.get("__tensor__"):
+        import numpy as np
+
+        arr = np.frombuffer(
+            base64.b64decode(obj["data"]), dtype=np.dtype(obj["dtype"])
+        ).reshape(obj["shape"]).copy()
+        return torch.from_numpy(arr)
+    if "__dict__" in obj:
+        return {k: _fp8_state_from_json(v) for k, v in obj["__dict__"].items()}
+    if "__enum__" in obj:
+        module = obj["__module__"]
+        if module not in _FP8_STATE_ALLOWED_MODULES:
+            raise ValueError(f"Refusing to deserialize enum from module: {module!r}")
+        mod = importlib.import_module(module)
+        return getattr(mod, obj["__enum__"])[obj["value"]]
+    if "__dataclass__" in obj:
+        module = obj["__module__"]
+        if module not in _FP8_STATE_ALLOWED_MODULES:
+            raise ValueError(f"Refusing to deserialize dataclass from module: {module!r}")
+        mod = importlib.import_module(module)
+        cls = getattr(mod, obj["__dataclass__"])
+        # Use object.__new__ to bypass __init__ (e.g. TEDelayedScaling takes a
+        # config object, not the individual dataclass fields).
+        instance = object.__new__(cls)
+        instance.__dict__.update(
+            {k: _fp8_state_from_json(v) for k, v in obj["fields"].items()}
+        )
+        return instance
+    return {k: _fp8_state_from_json(v) for k, v in obj.items()}
+
+
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
@@ -1916,8 +2001,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # TE 2.0 changed the format of extra_state to be a byte tensor
             if is_te_min_version("2.0.0"):
                 torch.cuda.synchronize()
-                state_serialized = bytearray(pickle.dumps(state))
-                state_serialized = torch.frombuffer(state_serialized, dtype=torch.uint8)
+                json_bytes = json.dumps(_fp8_state_to_json(state)).encode("utf-8")
+                state_bytes = _FP8_STATE_JSON_MAGIC + json_bytes
+                state_serialized = torch.frombuffer(bytearray(state_bytes), dtype=torch.uint8)
             else:
                 state_serialized = io.BytesIO()
                 torch.save(state, state_serialized)
@@ -1925,10 +2011,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def _decode_extra_state(self, state):
             if isinstance(state, torch.Tensor):
-                # No FP8 is indicated by an empty tensor we don't need to unpickle.
+                # No FP8 is indicated by an empty tensor we don't need to decode.
                 if state.numel() == 0:
                     return
-                return pickle.loads(state.detach().cpu().numpy().tobytes())
+                state_bytes = state.detach().cpu().numpy().tobytes()
+                if state_bytes.startswith(_FP8_STATE_JSON_MAGIC):
+                    json_str = state_bytes[len(_FP8_STATE_JSON_MAGIC):].decode("utf-8")
+                    return _fp8_state_from_json(json.loads(json_str))
+                # Legacy pickle format — backward compat with pre-existing checkpoints
+                return pickle.loads(state_bytes)
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
                 return torch.load(state, map_location="cuda")
