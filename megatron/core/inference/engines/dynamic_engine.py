@@ -486,9 +486,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             set_inference_cuda_graphed_iteration_for_ep_inference(model)
 
-        logging.info(
-            "> MTP CUDA graph warmup: %d batch size(s)", len(mtp_batch_sizes),
-        )
+        logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_batch_sizes))
 
         for batch_size in sorted(mtp_batch_sizes):
             dummy_hidden = torch.zeros((batch_size, 1, hidden_size), device=device, dtype=dtype)

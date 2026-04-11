@@ -242,9 +242,7 @@ def _check_supported_type(meta):
         ArgMetadata,
     }
     assert (
-        meta.type in _SUPPORTED_TYPES
-        or is_dataclass(meta.value)
-        or callable(meta.value)
+        meta.type in _SUPPORTED_TYPES or is_dataclass(meta.value) or callable(meta.value)
     ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
 
 
@@ -1601,9 +1599,8 @@ class CudaGraphManager(torch.nn.Module):
             kwargs (dict):  The keyword args to be passed to the module.
         """
         is_inference_mode = (
-            ('inference_context' in kwargs.keys() and kwargs['inference_context'])
-            or self._is_mtp_inference(megatron_module, kwargs)
-        )
+            'inference_context' in kwargs.keys() and kwargs['inference_context']
+        ) or self._is_mtp_inference(megatron_module, kwargs)
         is_in_checkpoint_fwd = is_checkpointing()
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()

@@ -915,7 +915,9 @@ class TextGenerationController:
         if self._mtp_resolved_padded_count is not None:
             padded_count = self._mtp_resolved_padded_count
         elif sp_enabled:
-            padded_count = active_request_count + (tp_size - active_request_count % tp_size) % tp_size
+            padded_count = (
+                active_request_count + (tp_size - active_request_count % tp_size) % tp_size
+            )
         else:
             padded_count = active_request_count
         pad_count = padded_count - active_request_count
@@ -1021,9 +1023,7 @@ class TextGenerationController:
         for idx_tensor, (_, temp, top_k, top_p) in zip(
             self._torch_sampling_bucket_index_tensors, self._torch_sampling_buckets
         ):
-            required_indices = torch.where(
-                torch.isin(token_to_request_index, idx_tensor)
-            )[0]
+            required_indices = torch.where(torch.isin(token_to_request_index, idx_tensor))[0]
             output_tokens_jumbled_list.append(
                 self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
             )
@@ -1057,7 +1057,7 @@ class TextGenerationController:
             input_tokens_required = input_tokens_required.squeeze(0)
 
         device = input_tokens_required.device
-        
+
         # Initialize mask functionally
         accepted_tokens_mask = torch.zeros_like(input_tokens_required, dtype=torch.bool)
 
@@ -1076,7 +1076,7 @@ class TextGenerationController:
 
         # Functionally build the mask: The first token (base token) is always accepted
         first_col_true = torch.ones_like(decode_inputs[:, :1], dtype=torch.bool)
-        rest_cols = (decode_inputs[:, 1:] == decode_outputs_shifted[:, 1:])
+        rest_cols = decode_inputs[:, 1:] == decode_outputs_shifted[:, 1:]
         decode_mask_2d = torch.cat([first_col_true, rest_cols], dim=1)
 
         # Enforce consecutive acceptance: cummin propagates False to the right
@@ -1085,7 +1085,9 @@ class TextGenerationController:
 
         # Compute last accepted indices for decode requests
         local_last_indices = decode_mask_2d.sum(dim=1) - 1
-        row_offsets = torch.arange(num_decode_requests, device=device) * (self.num_speculative_tokens + 1)
+        row_offsets = torch.arange(num_decode_requests, device=device) * (
+            self.num_speculative_tokens + 1
+        )
         last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
 
         # Compute last accepted indices for prefill requests mathematically instead of using torch.nonzero
@@ -1093,7 +1095,7 @@ class TextGenerationController:
         last_one_indices[num_decode_requests:] = prefill_valid
 
         return last_one_indices, accepted_tokens_mask, input_tokens_required
-    
+
     def _dynamic_step_sample_logits_and_verify_tokens(self, logits: Tensor, input_ids: Tensor):
         """
         Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
