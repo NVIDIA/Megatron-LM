@@ -804,9 +804,7 @@ class TextGenerationController:
                 :, mamba_state_idx, accepted_tokens_per_request
             ]  # [L, N, *conv_shape]
             current_conv = context.mamba_conv_states[:, mamba_state_idx]  # [L, N, *conv_shape]
-            conv_mask = is_decode_mask.reshape(
-                1, -1, *([1] * (intermediate_conv.ndim - 2))
-            )
+            conv_mask = is_decode_mask.reshape(1, -1, *([1] * (intermediate_conv.ndim - 2)))
             context.mamba_conv_states[:, mamba_state_idx] = torch.where(
                 conv_mask, intermediate_conv, current_conv
             )
@@ -815,9 +813,7 @@ class TextGenerationController:
                 :, mamba_state_idx, accepted_tokens_per_request
             ]  # [L, N, *ssm_shape]
             current_ssm = context.mamba_ssm_states[:, mamba_state_idx]  # [L, N, *ssm_shape]
-            ssm_mask = is_decode_mask.reshape(
-                1, -1, *([1] * (intermediate_ssm.ndim - 2))
-            )
+            ssm_mask = is_decode_mask.reshape(1, -1, *([1] * (intermediate_ssm.ndim - 2)))
             context.mamba_ssm_states[:, mamba_state_idx] = torch.where(
                 ssm_mask, intermediate_ssm, current_ssm
             )
