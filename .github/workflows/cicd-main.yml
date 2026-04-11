@@ -23,6 +23,11 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      test_cases:
+        description: "Comma-separated list of test cases to run, or 'all'"
+        required: false
+        default: "all"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}
@@ -145,6 +150,7 @@ jobs:
       lts:           ${{ steps.configure.outputs.lts }}
       mbridge_suite: ${{ steps.configure.outputs.mbridge_suite }}
       dev:           ${{ steps.configure.outputs.dev }}
+      test_cases:    ${{ steps.configure.outputs.test_cases }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -190,12 +196,15 @@ jobs:
 
           DEV=true
 
+          TEST_CASES="${{ github.event.inputs.test_cases || 'all' }}"
+
           echo "scope=$SCOPE"                 | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"           | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"     | tee -a $GITHUB_OUTPUT
           echo "lts=$HAS_LTS"                 | tee -a $GITHUB_OUTPUT
           echo "mbridge_suite=$MBRIDGE_SUITE" | tee -a $GITHUB_OUTPUT
           echo "dev=$DEV"                     | tee -a $GITHUB_OUTPUT
+          echo "test_cases=$TEST_CASES"       | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -682,7 +691,7 @@ jobs:
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
             --time-limit 2700 \
-            --test-cases all \
+            --test-cases "${{ needs.configure.outputs.test_cases }}" \
             --container-image mcore_ci_dev \
             --container-tag latest \
             --dependent-job functional:configure \
@@ -793,7 +802,7 @@ jobs:
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
             --time-limit 2700 \
-            --test-cases all \
+            --test-cases "${{ needs.configure.outputs.test_cases }}" \
             --container-image mcore_ci_dev \
             --container-tag latest \
             --dependent-job functional:configure \
