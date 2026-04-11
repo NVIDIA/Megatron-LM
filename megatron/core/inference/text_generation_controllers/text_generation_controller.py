@@ -1026,13 +1026,11 @@ class TextGenerationController:
 
         return output_tokens, repeats
 
-    @torch.compile()
+    @torch.compile(dynamic=True)
     def _verify_speculative_tokens(
         self,
         output_tokens: Tensor,
         input_tokens_required: Tensor,
-        request_in_prefill_status_tensor: Tensor,
-        repeats: Tensor,
         num_decode_requests: int,
         num_prefill_requests: int,
         active_request_count: int,
@@ -1045,10 +1043,6 @@ class TextGenerationController:
 
         # Initialize mask functionally
         accepted_tokens_mask = torch.zeros_like(input_tokens_required, dtype=torch.bool)
-
-        # Make all prefill tokens accepted
-        token_to_prefill_idx = torch.repeat_interleave(request_in_prefill_status_tensor, repeats)
-        accepted_tokens_mask = accepted_tokens_mask | (token_to_prefill_idx == 1)
 
         decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
         last_one_indices = torch.full((active_request_count,), -1, device=device, dtype=torch.long)
@@ -1067,6 +1061,9 @@ class TextGenerationController:
         # Enforce consecutive acceptance: cummin propagates False to the right
         decode_mask_2d = decode_mask_2d.cummin(dim=1).values
         accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
+
+        # All prefill tokens are accepted
+        accepted_tokens_mask[decode_len:] = True
 
         # Compute last accepted indices for decode requests
         local_last_indices = decode_mask_2d.sum(dim=1) - 1
@@ -1124,8 +1121,6 @@ class TextGenerationController:
             self._verify_speculative_tokens(
                 output_tokens,
                 input_tokens_required,
-                request_in_prefill_status_tensor,
-                repeats,
                 num_decode_requests,
                 num_prefill_requests,
                 active_request_count,
