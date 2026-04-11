@@ -993,10 +993,10 @@ class TestOptimizerResharding:
     ):
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
             ) as ckpt_dir_B:
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
@@ -1073,10 +1073,10 @@ class TestOptimizerResharding:
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
             ) as ckpt_dir_B:
                 Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
                 model_A, optimizer_A = setup_moe_model_and_optimizer(

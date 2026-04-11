@@ -137,6 +137,21 @@ def main():
         help="FUNCTIONAL_TEST_CASES pipeline variable (default: all)",
     )
     parser.add_argument(
+        "--cluster-a100",
+        default=None,
+        help="CLUSTER_A100 pipeline variable (override the default cluster)",
+    )
+    parser.add_argument(
+        "--cluster-h100",
+        default=None,
+        help="CLUSTER_H100 pipeline variable (override the default cluster)",
+    )
+    parser.add_argument(
+        "--cluster-gb200",
+        default=None,
+        help="CLUSTER_GB200 pipeline variable (override the default cluster)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print actions without executing git push or pipeline trigger",
@@ -164,6 +179,14 @@ def main():
         "FUNCTIONAL_TEST_REPEAT": str(args.functional_test_repeat),
         "FUNCTIONAL_TEST_CASES": args.functional_test_cases,
     }
+
+    for var, val in [
+        ("CLUSTER_A100", args.cluster_a100),
+        ("CLUSTER_H100", args.cluster_h100),
+        ("CLUSTER_GB200", args.cluster_gb200),
+    ]:
+        if val is not None:
+            pipeline_vars[var] = val
 
     trigger_pipeline(
         gitlab_hostname, args.access_token, target_branch, pipeline_vars, dry_run=args.dry_run

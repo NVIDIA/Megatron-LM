@@ -690,6 +690,12 @@ class TestMegatronFSDPE2E:
             train_iters=NUM_TRAINING_STEPS,
             **kwargs,
         )
+        if kwargs.get("use_megatron_fsdp", False) and kwargs.get(
+            "use_precision_aware_optimizer", False
+        ):
+            assert (
+                not optim.optimizer.master_weights
+            ), "Megatron-FSDP should not use FusedAdam master weights."
 
         # Prepare data iterator
         data_iterator = make_gpt_mock_data_iterator(
@@ -761,6 +767,17 @@ class TestMegatronFSDPE2E:
             ),
             pytest.param(
                 dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    megatron_fsdp_main_params_dtype=torch.float32,
+                    use_precision_aware_optimizer=True,
+                    fp8_recipe="delayed",
+                    fp8_param_gather=True,
+                    bf16=True,
+                ),
+                id="optim_grads_params_fused_adam_e2e",
+            ),
+            pytest.param(
+                dict(
                     data_parallel_sharding_strategy="optim_grads_params", fsdp_double_buffer=False
                 ),
                 id="optim_grads_params_no_double_buffer",
@@ -776,8 +793,10 @@ class TestMegatronFSDPE2E:
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
-        if spec_configs.get("fp8_recipe") == "mxfp8" and not HAVE_TE_MXFP8TENSOR:
-            pytest.skip("Requires PyTorch with TE MXFP8Tensor support")
+        if spec_configs.get("fp8_recipe") == "mxfp8" and (
+            torch.cuda.get_device_capability()[0] < 10 or not HAVE_TE_MXFP8TENSOR
+        ):
+            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:

@@ -399,76 +399,10 @@ def reshard_model_weights(
             in independent torch.distributed worlds.
         transform: Optional ReshardTransform for custom format conversion.
     """
-    global _plan_cache
-
-    # Handle idle ranks (both models None) - they participate in collectives but have no work
-    if src_model is None and target_model is None:
-        cache_key = _build_plan_cache_key(
-            src_core=None, tgt_core=None, num_experts=None, group=group
-        )
-
-        # Use cached plan if available, otherwise build (with collective participation)
-        if cache_key not in _plan_cache:
-            plan = build_centralized_reshard_plan(
-                None,
-                None,
-                num_experts=None,
-                group=group,
-                src_rank_offset=src_rank_offset,
-                dst_rank_offset=dst_rank_offset,
-            )
-            _plan_cache[cache_key] = plan
-        else:
-            plan = _plan_cache[cache_key]
-        execute_reshard_plan(plan, None, None, service=service, group=group, transform=transform)
-        return
-
-    # Handle None models - extract core modules only from non-None models
-    src_core = None
-    tgt_core = None
-    num_experts = None
-
-    if src_model is not None:
-        # Handle list-wrapped modules
-        src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
-        num_experts = src_lm.config.num_moe_experts
-        # Unwrap to get owning modules (with parameters and pg_collection)
-        src_core = unwrap_model(src_lm)
-        # Ensure pg_collection exists
-        if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
-            raise RuntimeError("Source model missing pg_collection required for reshard")
-        # Fill missing DP group on the source using Megatron's parallel state if not provided
-        if getattr(src_core.pg_collection, "dp", None) is None:
-            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
-
-    if target_model is not None:
-        # Handle list-wrapped modules
-        tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
-        if num_experts is None:
-            num_experts = tgt_lm.config.num_moe_experts
-        # Unwrap to get owning modules (with parameters and pg_collection)
-        tgt_core = unwrap_model(tgt_lm)
-        # Ensure pg_collection exists
-        if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
-            raise RuntimeError("Target model missing pg_collection required for reshard")
-
-    # Build or retrieve cached plan
-    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts, group=group)
-
-    if cache_key not in _plan_cache:
-        # All ranks must participate in planning (collective operations)
-        plan = build_centralized_reshard_plan(
-            src_core,
-            tgt_core,
-            num_experts=num_experts,
-            group=group,
-            src_rank_offset=src_rank_offset,
-            dst_rank_offset=dst_rank_offset,
-        )
-        _plan_cache[cache_key] = plan
-    else:
-        plan = _plan_cache[cache_key]
-
+    src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
+    plan = _build_or_get_plan(
+        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+    )
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )

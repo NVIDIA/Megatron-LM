@@ -378,6 +378,44 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
     Utils.destroy_model_parallel()
 
 
+def test_start_param_sync_dp_size_1():
+    """When dp_size == 1 (e.g., expt_dp_size == 1), start_param_sync should set
+    param_gather_dispatched=True and return immediately without launching any
+    all-gather collective."""
+    world_size = torch.distributed.get_world_size()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
+
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=True,
+        use_distributed_optimizer=False,
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        bucket_size=None,
+    )
+    module = TestModel(
+        input_dim=32, output_dim=32, num_layers=2, bias=False, shared_embedding=False
+    ).bfloat16()
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=module
+    )
+
+    # Confirm dp_size == 1 in the test environment.
+    for bg in model.bucket_groups:
+        assert bg.intra_distributed_optimizer_instance_size == 1
+
+    with mock.patch('torch.distributed.all_gather') as mock_all_gather:
+        for bg in model.bucket_groups:
+            assert not bg.param_gather_dispatched
+            bg.start_param_sync()
+            assert (
+                bg.param_gather_dispatched
+            ), "param_gather_dispatched should be True after start_param_sync with dp_size=1"
+        # No all-gather should have been called.
+        assert not mock_all_gather.called, "all_gather should not be called when dp_size == 1"
+
+    Utils.destroy_model_parallel()
+
+
 class TestFreeOverlapBuffers:
     """Tests for free_overlap_buffers() which releases GPU memory before async checkpoint saves."""
 

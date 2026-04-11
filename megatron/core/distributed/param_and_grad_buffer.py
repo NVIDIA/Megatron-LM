@@ -330,6 +330,10 @@ class _ParamAndGradBucketGroup:
             # (falling back to grouped send/recv internally when sizes differ),
             # so no manual padding is needed.
             dp_size = self.intra_distributed_optimizer_instance_size
+            if dp_size == 1:
+                # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
+                self.param_gather_dispatched = True
+                return
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []

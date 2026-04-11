@@ -859,7 +859,7 @@ class TorchDistLoadShardedStrategy:
         fsr = _get_filesystem_reader(
             checkpoint_dir, cache_metadata=self.cache_metadata, async_strategy=async_strategy
         )
-        checkpoint.load_state_dict(
+        checkpoint.load(
             pyt_state_dict,
             fsr,
             planner=MCoreLoadPlanner(
@@ -868,6 +868,7 @@ class TorchDistLoadShardedStrategy:
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),
+            no_dist=True,
         )
 
         if self.cache_metadata:

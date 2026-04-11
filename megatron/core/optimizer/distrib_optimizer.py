@@ -2,7 +2,6 @@
 
 """Megatron distributed optimizer."""
 
-
 import gc
 import itertools
 import logging
@@ -97,7 +96,7 @@ class Range:
 class DistributedOptimizer(MixedPrecisionOptimizer):
     """Optimizer that shards state across data-parallel ranks.
 
-    This class reduces memory usage by distributing optimizer states (like 
+    This class reduces memory usage by distributing optimizer states (like
     momentum and variance buffers) across GPUs in the data-parallel group.
 
     Attributes:
@@ -231,9 +230,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
         """Builds a map between parameters and their ranges in the grad buffer.
 
-        These mappings are partitioned according to data type. This method 
-        iterates through all buckets of a grad buffer to construct param 
-        ranges that this rank "owns" (the dp_rank'th shard of each bucket, 
+        These mappings are partitioned according to data type. This method
+        iterates through all buckets of a grad buffer to construct param
+        ranges that this rank "owns" (the dp_rank'th shard of each bucket,
         where each shard is 1/dp_world_size of the bucket).
 
         Args:
@@ -483,33 +482,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     ):
         """Initializes the distributed optimizer for FP16, BF16, and FP32.
 
-        The steps in this method create the core mapping between param and grad 
-        buffers, parameters, and parameter shard ranges, that is needed for 
-        converting between model param indexes and main parameter shard indexes. 
-        This method also updates the optimizer parameter groups with the 
+        The steps in this method create the core mapping between param and grad
+        buffers, parameters, and parameter shard ranges, that is needed for
+        converting between model param indexes and main parameter shard indexes.
+        This method also updates the optimizer parameter groups with the
         newly created shards.
 
         Args:
             optimizer (torch.optim.Optimizer): Base optimizer such as Adam or SGD.
             config (OptimizerConfig): Configuration object for the optimizer.
-            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that 
-                this can be None for BF16 training if no loss scale is used. 
+            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that
+                this can be None for BF16 training if no loss scale is used.
                 For FP16, a grad scaler is always required.
-            init_state_fn (Callable, optional): Function to initialize state in 
+            init_state_fn (Callable, optional): Function to initialize state in
                 the optimizer.
             model_chunks (List[MegatronModule]): List of model chunks to optimize.
-            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The 
-                implementation of the distributed optimizer is centered on using 
-                a contiguous buffer for communicating grads & params between 
-                the model state and the optimizer state. For a detailed 
+            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The
+                implementation of the distributed optimizer is centered on using
+                a contiguous buffer for communicating grads & params between
+                the model state and the optimizer state. For a detailed
                 description, see `docs/source/distrib_optimizer.md`.
-            data_parallel_group (ProcessGroup): Data-parallel group used to 
+            data_parallel_group (ProcessGroup): Data-parallel group used to
                 all-gather params after optimizer.step().
-            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel 
+            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel
                 group used specifically for checkpoint loading and saving.
-            data_parallel_group_idx (int): Index in the data-parallel group 
+            data_parallel_group_idx (int): Index in the data-parallel group
                 used by distributed checkpointing logic.
-            distributed_optimizer_instance_id (int): Unique identifier for the 
+            distributed_optimizer_instance_id (int): Unique identifier for the
                 distributed optimizer instance.
         """
 
@@ -539,6 +538,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         self.is_stub_optimizer = False
         if self.ddp_config.use_megatron_fsdp:
+            # Megatron-FSDP will manage optimizer weights and gradients.
             return
 
         # Model grad buffer ranges.
@@ -596,7 +596,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param.main_param_sharded = True
 
         # Optimizer ranges.
-        (self.model_param_group_index_map, self.opt_group_ranges) = (
+        self.model_param_group_index_map, self.opt_group_ranges = (
             self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
         )
 
@@ -729,6 +729,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             list.
         """
         if self.ddp_config.use_megatron_fsdp:
+            # When using Megatron-FSDP, directly load the optimizer state
+            # into the wrapped optimizer.
             if "param_to_group_meta" in state_dict:
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
                     state_dict["param_to_group_meta"], self.optimizer.param_groups
@@ -1255,6 +1257,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 f"sharding_type {sharding_type} is not supported with Megatron FSDP."
             )
         if sharding_type == "fsdp_dtensor":
+            # Megatron-FSDP custom sharded state dict construction.
             state_dict = self.sharded_param_state_fsdp_dtensor(is_loading)
             return state_dict
 
@@ -2302,6 +2305,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         if self.ddp_config.use_megatron_fsdp:
             for model_chunk in self.model_chunks:
+                # Zero gradients managed by Megatron-FSDP.
                 model_chunk.zero_grad_buffer()
             return
 
@@ -2366,6 +2370,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_offsets_in_fp8 = []
 
         if self.ddp_config.use_megatron_fsdp:
+            # Retrieve Megatron-FSDP compute weights.
             buffers = []
             for m in self.model_chunks:
                 for group in m.param_and_grad_buffer.parameter_groups:
@@ -2419,6 +2424,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         if self.ddp_config.use_megatron_fsdp:
+            # Megatron-FSDP manages unsharded gradient buffer allocation
+            # (with zero-copy if using NCCL UB and wgrad accum fusion)
+            # during the backward pass.
             return
 
         # Utility method for copying group grads.
@@ -2462,6 +2470,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         if self.ddp_config.use_megatron_fsdp:
+            # Update Megatron-FSDP's compute weights with optimized main weights.
+            # If using quantized parameters, this will also perform quantization.
             for model_chunk in self.model_chunks:
                 model_chunk.param_and_grad_buffer.copy_main_weights_to_model_weights()
             return
@@ -2509,6 +2519,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param buffer is not mapped to model params for MXFP8 case.
 
         """
+        if self.ddp_config.use_megatron_fsdp:
+            raise NotImplementedError(
+                "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
+            )
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
@@ -2575,7 +2589,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         if self.ddp_config.use_megatron_fsdp:
-            return
+            raise NotImplementedError(
+                "Megatron-FSDP does not implement a model-to-main parameter update."
+            )
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
@@ -2631,6 +2647,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
 
         if self.ddp_config.use_megatron_fsdp:
+            # Optionally all-gather Megatron-FSDP sharded main weights
+            # early in preparation for the subsequent forward pass.
             for model_chunk in self.model_chunks:
                 model_chunk.start_param_sync()
         else:
@@ -2645,4 +2663,3 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather').stop()
 
         return update_successful
-    

@@ -214,12 +214,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.num_speculative_tokens > 0:
             assert (
-                self.num_speculative_tokens <= self.controller.num_mtp_heads
+                model_config.mtp_use_repeated_layer
+                or self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
-            assert (
-                not self.materialize_only_last_token_logits
-            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
-
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1117,10 +1114,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     len(request.generated_tokens) + len(tokens)
                     >= request.sampling_params.num_tokens_to_generate
                 ):
-                    tokens = tokens[
-                        : request.sampling_params.num_tokens_to_generate
-                        - len(request.generated_tokens)
-                    ]
+                    keep = request.sampling_params.num_tokens_to_generate - len(
+                        request.generated_tokens
+                    )
+                    tokens = tokens[:keep]
+                    # Trim log probs / top-n to match so the counts stay in sync.
+                    if request_log_probs is not None:
+                        request_log_probs = request_log_probs[:keep]
+                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1211,7 +1213,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
-            if request_log_probs is not None:
+            # Skip for requests being finished due to stop words — tokens are not
+            # appended for these requests, so log probs must also be skipped to keep
+            # the two lists in sync.
+            if (
+                request_log_probs is not None
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []
@@ -1244,7 +1252,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
-            if top_n_logprobs is not None and req_idx in top_n_logprobs:
+            # Same stop-word guard as log probs above.
+            if (
+                top_n_logprobs is not None
+                and req_idx in top_n_logprobs
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if request.prompt_top_n_logprobs is None:
                     request.prompt_top_n_logprobs = []
