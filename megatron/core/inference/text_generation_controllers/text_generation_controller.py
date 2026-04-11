@@ -901,7 +901,7 @@ class TextGenerationController:
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
         tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
-        if self._mtp_resolved_padded_count is not None:
+        if getattr(self, '_mtp_resolved_padded_count', None) is not None:
             padded_count = self._mtp_resolved_padded_count
         elif sp_enabled:
             padded_count = (
