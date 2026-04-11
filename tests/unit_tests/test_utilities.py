@@ -91,6 +91,10 @@ class Utils:
         os.environ.pop('NVTE_UNFUSED_ATTN', None)
         if not Utils.inited:
             return
+        # Flush pending CUDA work before the barrier so slow ranks don't
+        # time out while fast ranks tear down process groups.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         try:
             torch.distributed.barrier(timeout=timedelta(seconds=30))
         except Exception:
