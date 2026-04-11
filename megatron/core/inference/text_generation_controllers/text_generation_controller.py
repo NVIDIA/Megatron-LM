@@ -726,114 +726,109 @@ class TextGenerationController:
                 for indices, *_ in self._torch_sampling_buckets
             ]
 
-    def _rewind_kv_cache(self):
+    @torch.compile()
+    def _rewind_kv_cache(self) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
 
         After forward pass with speculative tokens, some tokens may be rejected.
-        This function "rewinds" the KV cache bookkeeping to reflect only the accepted tokens.
+        This function "rewinds" the KV cache bookkeeping to reflect only the accepted
+        tokens. All operations use fixed-shape tensors (no data-dependent branches,
+        no boolean indexing, no torch.nonzero) so the entire function is torch-compilable.
 
-        When speculative tokens are rejected, we need to:
-        1. Update request_kv_length_offsets (total sequence length)
-        2. Update request_last_kv_block_offset (position within last block)
-        3. If rewinding crosses a block boundary:
-           - Reduce request_kv_block_counts
-           - Update request_last_kv_block_id to point to the previous block
-           - Clear the entry in request_to_kv_block_ids for the released block
-           - Release the block back to the allocator
+        Returns (blocks_to_release, remove_mask) for the caller to release blocks
+        back to the allocator outside the compiled graph.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Get the accepted token counts for each request
-        # Note: _accepted_token_counts is indexed from 0 to active_request_count-1
         accepted_tokens_per_request = self._accepted_token_counts_per_request[:active_request_count]
 
-        # Number of tokens to rewind (rejected speculative tokens)
+        request_in_prefill_status = context.request_in_prefill_status_tensor[active_request_slice]
+        request_last_kv_block_offset = context.request_last_kv_block_offset[active_request_slice]
+        request_kv_length_offsets = context.request_kv_length_offsets[active_request_slice]
+        request_kv_block_counts = context.request_kv_block_counts[active_request_slice]
+        request_last_kv_block_id = context.request_last_kv_block_id[active_request_slice]
+        request_to_kv_block_ids = context.request_to_kv_block_ids[active_request_slice]
+        block_size_tokens = context.block_size_tokens
+
         num_tokens_to_rewind = self.num_speculative_tokens - accepted_tokens_per_request
 
-        # For prefill requests, no speculative tokens were forwarded through the model,
-        # so there is nothing to rewind.
-        request_in_prefill_status = context.request_in_prefill_status_tensor[active_request_slice]
-        num_tokens_to_rewind[request_in_prefill_status == 1] = 0
-
-        # Save the original offset BEFORE modifying to correctly detect block boundary crossing
-        original_offset = context.request_last_kv_block_offset[active_request_slice].clone()
-
-        # Check which requests need to rewind to a previous block BEFORE modifying
-        # A request crosses back to a previous block if: original_offset - num_tokens_to_rewind < 0
-        remove_allocated_blocks_mask = (original_offset - num_tokens_to_rewind) < 0
-
-        # Update the offsets
-        context.request_last_kv_block_offset[active_request_slice] = (
-            original_offset - num_tokens_to_rewind
-        ) % context.block_size_tokens
-
-        context.request_kv_length_offsets[active_request_slice] = (
-            context.request_kv_length_offsets[active_request_slice] - num_tokens_to_rewind
+        # Zero out rewind for prefill requests (no data-dependent branch)
+        num_tokens_to_rewind = torch.where(
+            request_in_prefill_status == 1, 0, num_tokens_to_rewind
         )
 
-        # No need to update request_query_lengths (It will be set correctly in the next iteration)
+        original_offset = request_last_kv_block_offset.clone()
+        remove_mask = (original_offset - num_tokens_to_rewind) < 0
 
-        # For requests that crossed back to a previous block, we need to:
-        # 1. Reduce the block count by 1
-        # 2. Get the block ID to release (current request_last_kv_block_id)
-        # 3. Update request_last_kv_block_id to point to the previous block
-        # 4. Clear the entry in request_to_kv_block_ids for the released block
-        # 5. Release the block back to the allocator
-        if remove_allocated_blocks_mask.any():
-            # Get indices of requests that need to release a block (relative to active requests)
-            requests_needing_release = torch.nonzero(remove_allocated_blocks_mask, as_tuple=True)[0]
-            # Convert to absolute indices in the context tensors
-            absolute_indices = requests_needing_release + context.paused_request_count
+        # Update offsets
+        request_last_kv_block_offset.copy_(
+            (original_offset - num_tokens_to_rewind) % block_size_tokens
+        )
+        request_kv_length_offsets -= num_tokens_to_rewind
 
-            # No clone needed: advanced (fancy) indexing with a tensor already returns
-            # a copy, not a view.
-            blocks_to_release = context.request_last_kv_block_id[absolute_indices]
+        # Save current last block IDs before modifications (blocks to potentially release)
+        blocks_to_release = request_last_kv_block_id.clone()
 
-            # Reduce block counts for requests that crossed back
-            context.request_kv_block_counts[absolute_indices] -= 1
+        # Conditionally decrement block counts where block boundary is crossed
+        request_kv_block_counts -= remove_mask.to(request_kv_block_counts.dtype)
 
-            # Get the new block counts after decrement
-            new_block_counts = context.request_kv_block_counts[absolute_indices]
+        # Get previous block IDs using gather (for requests crossing block boundary).
+        # For requests not crossing, the gathered value is unused (discarded by torch.where).
+        prev_block_idx = torch.clamp(request_kv_block_counts - 1, min=0)
+        prev_block_ids = request_to_kv_block_ids.gather(
+            1, prev_block_idx.unsqueeze(1)
+        ).squeeze(1)
 
-            # Update request_last_kv_block_id to point to the previous block
-            # and clear the released block entry in request_to_kv_block_ids
-            # Vectorized implementation using advanced indexing:
-            # Note: new_block_counts is guaranteed to be > 0 for all requests here, since
-            # crossing back to a previous block implies the request had at least 2 blocks.
+        # Conditionally update last block ID to point to previous block
+        request_last_kv_block_id.copy_(
+            torch.where(remove_mask, prev_block_ids, request_last_kv_block_id)
+        )
 
-            # Update request_last_kv_block_id to point to the previous block (at index new_count - 1)
-            context.request_last_kv_block_id[absolute_indices] = context.request_to_kv_block_ids[
-                absolute_indices, new_block_counts - 1
-            ]
+        # Clear released block entries using scatter.
+        # For requests crossing boundary: write -1 at index new_block_count.
+        # For others: write back the existing value (no-op).
+        scatter_idx = torch.clamp(
+            request_kv_block_counts, max=request_to_kv_block_ids.shape[1] - 1
+        )
+        current_vals = request_to_kv_block_ids.gather(
+            1, scatter_idx.unsqueeze(1)
+        ).squeeze(1)
+        clear_vals = torch.where(remove_mask, -1, current_vals)
+        request_to_kv_block_ids.scatter_(
+            1, scatter_idx.unsqueeze(1), clear_vals.unsqueeze(1)
+        )
 
-            # Clear the released block entry (at index new_count, which was the old last block)
-            context.request_to_kv_block_ids[absolute_indices, new_block_counts] = -1
-
-            # Release the blocks back to the allocator
-            context.kv_block_allocator.release_memory_blocks(blocks_to_release)
-
-        # Mamba speculative rewind state update
+        # Mamba speculative rewind state update.
+        # torch.compile treats `context.is_hybrid_model` as a static guard, so this
+        # compiles into two specializations (hybrid vs. non-hybrid) with no graph break.
         if context.is_hybrid_model:
-            active_mamba_indices = context.mamba_metadata.request_to_mamba_state_idx[
+            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
             ]
-            is_decode_mask = context.request_in_prefill_status_tensor[active_request_slice] == 0
-            decode_mamba_indices = active_mamba_indices[is_decode_mask]
-            accepted_tokens_per_decode_request = accepted_tokens_per_request[is_decode_mask]
+            is_decode_mask = request_in_prefill_status == 0  # [N]
 
-            if decode_mamba_indices.numel() > 0:
-                context.mamba_conv_states[:, decode_mamba_indices] = (
-                    context.mamba_intermediate_conv_states[
-                        :, decode_mamba_indices, accepted_tokens_per_decode_request
-                    ]
-                )
-                context.mamba_ssm_states[:, decode_mamba_indices] = (
-                    context.mamba_intermediate_ssm_states[
-                        :, decode_mamba_indices, accepted_tokens_per_decode_request
-                    ]
-                )
+            # Gather intermediate states for ALL active requests using fixed-shape
+            # advanced indexing (no boolean indexing / dynamic shapes).
+            # For prefill requests the gathered values are discarded by torch.where.
+            intermediate_conv = context.mamba_intermediate_conv_states[
+                :, mamba_state_idx, accepted_tokens_per_request
+            ]  # [L, N, D]
+            current_conv = context.mamba_conv_states[:, mamba_state_idx]  # [L, N, D]
+            context.mamba_conv_states[:, mamba_state_idx] = torch.where(
+                is_decode_mask[None, :, None], intermediate_conv, current_conv
+            )
+
+            intermediate_ssm = context.mamba_intermediate_ssm_states[
+                :, mamba_state_idx, accepted_tokens_per_request
+            ]  # [L, N, D]
+            current_ssm = context.mamba_ssm_states[:, mamba_state_idx]  # [L, N, D]
+            context.mamba_ssm_states[:, mamba_state_idx] = torch.where(
+                is_decode_mask[None, :, None], intermediate_ssm, current_ssm
+            )
+
+        return blocks_to_release, remove_mask
 
     def _sample_from_logits_2d(self, logits_2d: Tensor) -> Tensor:
         """Sample tokens from 2D logits using existing sampling parameters.
@@ -1919,7 +1914,13 @@ class TextGenerationController:
                 nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
-                self._rewind_kv_cache()
+                blocks_to_release, remove_mask = self._rewind_kv_cache()
+                # Release blocks back to the allocator (not compilable due to
+                # allocator state mutation). release_memory_blocks handles
+                # empty tensors.
+                context.kv_block_allocator.release_memory_blocks(
+                    blocks_to_release[remove_mask]
+                )
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs
