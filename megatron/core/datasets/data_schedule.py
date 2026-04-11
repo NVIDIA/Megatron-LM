@@ -9,7 +9,6 @@ from megatron.core.datasets.data_schedule_utils import (
     align_sample_id_groups,
     broadcast_scalars,
     broadcast_tensor,
-    broadcast_to_pp_group,
     build_packed_microbatches,
     create_data_iterator,
     dcp_get_total_workload,
@@ -22,6 +21,7 @@ from megatron.core.datasets.data_schedule_utils import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 
 
 class BasePackingScheduler:
@@ -203,26 +203,39 @@ class DpBalancedScheduler(BasePackingScheduler):
         """
 
         total_dcp_gpus = dp_cp_group.size()
+        is_first_pp = pp_group.rank() == 0
+        is_last_pp = pp_group.rank() == pp_group.size() - 1
+
+        mtp_on_this_pp = mtp_on_this_rank(config, ignore_virtual=True)
+        vpp_size = config.virtual_pipeline_model_parallel_size or 1
 
         # Handle VPP: extract the correct data_iterator for this PP stage.
         # When VPP is enabled, data_iterator is a list with one entry per VPP stage.
         # We only need one data_iterator to run the schedule (all VPP stages on the
         # same PP rank share the same underlying dataset), so pick the first non-None.
-        # Record which VPP stages had data so create_data_iterator knows which ones
-        # need full samples vs metadata only.
-        vpp_has_data = None
-        if (
-            config.virtual_pipeline_model_parallel_size is not None
-            and config.virtual_pipeline_model_parallel_size > 1
-        ):
-            assert len(data_iterator) == config.virtual_pipeline_model_parallel_size
-            vpp_has_data = [di is not None for di in data_iterator]
+        # Determine which VPP stages need full data based on pipeline position and MTP.
+        vpp_needs_data = None
+        if vpp_size > 1:
+            assert len(data_iterator) == vpp_size
             extracted = None
             for di in data_iterator:
                 if di is not None:
                     extracted = di
                     break
             data_iterator = extracted
+
+            # Only first VPP on first PP and last VPP on last PP need full data.
+            # MTP VPP stages also need full data (both tokens and labels).
+            # Middle VPP stages only need metadata (cu_seqlens, max_seqlen, etc.).
+            vpp_needs_data = [False] * vpp_size
+            if is_first_pp:
+                vpp_needs_data[0] = True
+            if is_last_pp:
+                vpp_needs_data[-1] = True
+            if mtp_on_this_pp:
+                for vp_i in range(vpp_size):
+                    if mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_i):
+                        vpp_needs_data[vp_i] = True
 
         # data_iterator is not None on TP rank 0 for PP stages that need data
         # (first stage, last stage, or any stage with MTP).
@@ -240,7 +253,20 @@ class DpBalancedScheduler(BasePackingScheduler):
                     key in batch[0]
                 ), f"Batch missing required key {key}, provided keys: {batch[0].keys()}"
 
-            # Step 3: Schedule samples into groups
+            # Step 3: Strip data fields not needed by this PP stage to avoid
+            # unnecessary all-to-all communication. First PP needs tokens/position_ids,
+            # last PP needs labels/loss_mask. MTP stages need all four.
+            keys_to_keep = {'original_seq_len', 'padded_seq_len'}
+            if is_first_pp or mtp_on_this_pp:
+                keys_to_keep.update(['tokens', 'position_ids'])
+            if is_last_pp or mtp_on_this_pp:
+                keys_to_keep.update(['labels', 'loss_mask'])
+            for sample in batch:
+                for key in list(sample.keys()):
+                    if key not in keys_to_keep:
+                        del sample[key]
+
+            # Step 4: Schedule samples into groups
             sample_id_groups = self.get_groups_and_subsamples(global_id_seqlens)
 
             # Validate scheduling result
@@ -253,7 +279,7 @@ class DpBalancedScheduler(BasePackingScheduler):
                 f"global_id_seqlens length: {len(global_id_seqlens)}"
             )
 
-            # Step 4: Reroute samples to DCP ranks
+            # Step 5: Reroute samples to DCP ranks
             samples_this_rank_with_id = reroute_samples_to_dcp_ranks(
                 batch,
                 global_ids_this_rank,
@@ -269,12 +295,12 @@ class DpBalancedScheduler(BasePackingScheduler):
             dcp_rank = dp_cp_group.rank()
             num_micro_batches = len(sample_id_groups)
 
-            # Step 5: Build packed microbatches
+            # Step 6: Build packed microbatches
             new_samples = build_packed_microbatches(
                 samples_this_rank_with_id, sample_id_groups, dcp_rank, dev, self.is_dynamic_cp
             )
 
-            # Step 6: Calculate FLOPs info
+            # Step 7: Calculate FLOPs info
             seqlen_sum_this_global_batch = float(sum(seqlens_gathered))
             seqlen_squared_sum_this_global_batch = float(
                 sum(seqlen**2 for seqlen in seqlens_gathered)
@@ -287,24 +313,7 @@ class DpBalancedScheduler(BasePackingScheduler):
                 seqlen_squared_sum_this_global_batch,
             ) = (None, None, None, None)
 
-        # Step 7: Broadcast to PP group (for middle PP stages)
-        if tp_group.rank() == 0:
-            (
-                new_samples,
-                num_micro_batches,
-                seqlen_sum_this_global_batch,
-                seqlen_squared_sum_this_global_batch,
-            ) = broadcast_to_pp_group(
-                new_samples,
-                num_micro_batches,
-                seqlen_sum_this_global_batch,
-                seqlen_squared_sum_this_global_batch,
-                pp_group,
-                dev,
-                is_dynamic_cp=self.is_dynamic_cp,
-            )
-
-        # Step 8: Broadcast to TP group (for non-TP-0 ranks)
+        # Broadcast to TP group (for non-TP-0 ranks)
         (num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch) = (
             broadcast_scalars(
                 [
@@ -318,9 +327,9 @@ class DpBalancedScheduler(BasePackingScheduler):
         )
         num_micro_batches = int(num_micro_batches)
 
-        # Step 9: create data_iterator and handle VPP if enabled
+        # Step 8: Broadcast to TP group and create data_iterator
         new_data_iterator = create_data_iterator(
-            new_samples, tp_group, config, vpp_has_data, self.is_dynamic_cp
+            new_samples, tp_group, config, vpp_needs_data, self.is_dynamic_cp
         )
 
         return (
@@ -550,7 +559,9 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     if is_first_or_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
-            total_tokens = torch.tensor(batch['tokens'].size(0), dtype=torch.int32, device=dev)
+            # Use whichever data field is available (first stage has tokens, last has labels)
+            _data_field = batch.get('tokens', batch.get('labels'))
+            total_tokens = torch.tensor(_data_field.size(0), dtype=torch.int32, device=dev)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
         broadcast_tensor(total_tokens, tp_src_rank, tp_group)
