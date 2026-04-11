@@ -1519,7 +1519,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
             submodules.append(self.self_attention_hyper_connection)
         if (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope) or (
-            self.is_moe_layer and CudaGraphScope.moe in self.config.cuda_graph_scope
+            self.is_moe_layer
+            and (
+                CudaGraphScope.moe in self.config.cuda_graph_scope
+                or CudaGraphScope.moe_router in self.config.cuda_graph_scope
+            )
         ):
             submodules.append(self.mlp_hyper_connection)
         return submodules
@@ -1726,6 +1730,23 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         nvtx_range_pop(suffix="mlp")
 
+        # During TE CUDA graph partial MoE capture, skip HC post-processing and return
+        # intermediate outputs + HC state. The post-processing will be done during replay.
+        if (
+            self.is_moe_layer
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.training
+            and is_graph_capturing()
+            and CudaGraphScope.moe_router in self.config.cuda_graph_scope
+        ):
+            if self.recompute_pre_mlp_layernorm or (
+                mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+            ):
+                for tensor in mlp_output_with_bias:
+                    self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
+            # Append HC state (mlp_hc_h_post, mlp_h_res, residual) for replay.
+            return list(mlp_output_with_bias) + [mlp_hc_h_post, mlp_h_res, residual]
+
         return self._forward_post_mlp_with_fused_hyper_connection(
             mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
         )
@@ -1780,6 +1801,100 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
         return output
+
+    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+        """Implementation of _te_cuda_graph_replay with hyper connection support.
+
+        Overrides the parent's _te_cuda_graph_replay_impl so that the
+        delay_offload_until_cuda_graph lifecycle (enter_replay/exit_replay) in
+        the parent's _te_cuda_graph_replay is preserved.
+
+        During MoE partial CUDA graph capture, the graph outputs include HC state
+        (mlp_hc_h_post, mlp_h_res) in addition to the base class outputs. This method
+        extracts the HC state and uses it for post-processing after resuming the MoE forward.
+        """
+        cuda_graph_output = list(
+            GraphableMegatronModule._te_cuda_graph_replay(self, *args, **kwargs)
+        )
+
+        # Flush delayed offload groups from previous layers after graph replay.
+        if self.config.delay_offload_until_cuda_graph:
+            self.off_interface.flush_delayed_groups()
+
+        if kwargs.get('context') is not None:
+            context = cuda_graph_output.pop()
+
+        if (
+            not self.config.cuda_graph_scope
+            or (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope)
+            or (self.is_moe_layer and CudaGraphScope.moe in self.config.cuda_graph_scope)
+        ):
+            assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
+            output = cuda_graph_output.pop()
+            assert (
+                not self.config.overlap_moe_expert_parallel_comm
+            ), "EP overlap must be \
+                disabled when CUDA graph captures the whole MLP/MoE part."
+        elif self.is_moe_layer and CudaGraphScope.moe_router in self.config.cuda_graph_scope:
+            # Pop HC state (appended during capture in _forward_mlp).
+            residual = cuda_graph_output.pop()
+            mlp_h_res = cuda_graph_output.pop()
+            mlp_hc_h_post = cuda_graph_output.pop()
+
+            shared_expert_output, routing_map = None, None
+            if (
+                self.config.moe_shared_expert_intermediate_size is not None
+                and not self.config.moe_shared_expert_overlap
+            ):
+                shared_expert_output = cuda_graph_output.pop()
+
+            if CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope:
+                (hidden_states, probs), attr_outputs = (
+                    cuda_graph_output[:2],
+                    cuda_graph_output[2:],
+                )
+                valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
+                assert len(attr_outputs) == len(
+                    valid_cudagraph_attrs
+                ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+                for i, attr_name in enumerate(valid_cudagraph_attrs):
+                    self.mlp.token_dispatcher.set_cudagraph_attr(attr_name, attr_outputs[i])
+            else:
+                assert len(cuda_graph_output) == 3, (
+                    "CUDA graph output should be [hidden_states, probs, routing_map], "
+                    f"but got {len(cuda_graph_output)} elements"
+                )
+                hidden_states, probs, routing_map = cuda_graph_output
+
+            # Resume the MoELayer forward pass from the end of the CUDA graph scope.
+            nvtx_range_push(suffix="mlp")
+            self.mlp.cudagraph_tensor_store.set(
+                hidden_states=hidden_states,
+                probs=probs,
+                routing_map=routing_map,
+                shared_expert_output=shared_expert_output,
+            )
+            # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
+            # and should be skipped here.
+            if self.config.overlap_moe_expert_parallel_comm:
+                probs, routing_map = self.mlp.route(hidden_states)
+                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                nvtx_range_pop(suffix="mlp")
+                return residual, hidden_states, probs, shared_expert_output
+            mlp_output_with_bias = self.mlp(hidden_states)
+            self.mlp.cudagraph_tensor_store.clear()
+            nvtx_range_pop(suffix="mlp")
+
+            # HC post-processing with fused h_res, h_post and BDA.
+            recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm
+            self.recompute_pre_mlp_layernorm = False
+            output = self._forward_post_mlp_with_fused_hyper_connection(
+                mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post
+            )
+            self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
+        else:
+            output = self._forward_mlp(*cuda_graph_output)
+        return output, context
 
 
 class MoETransformerLayer(TransformerLayer):

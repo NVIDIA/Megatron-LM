@@ -35,10 +35,7 @@ import gitlab  # python-gitlab
 GITLAB_PROJECT_ID = 19378
 GITLAB_BRANCH_PREFIX = "pull-request"
 
-PIPELINE_VARIABLES_FIXED = {
-    "UNIT_TEST": "no",
-    "INTEGRATION_TEST": "no",
-}
+PIPELINE_VARIABLES_FIXED = {"UNIT_TEST": "no", "INTEGRATION_TEST": "no"}
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +43,7 @@ logger = logging.getLogger(__name__)
 def get_remote_url(origin):
     """Return the fetch URL configured for the given git remote name."""
     result = subprocess.run(
-        ["git", "remote", "get-url", origin],
-        capture_output=True,
-        text=True,
-        check=True,
+        ["git", "remote", "get-url", origin], capture_output=True, text=True, check=True
     )
     return result.stdout.strip()
 
@@ -66,10 +60,7 @@ def get_gitlab_hostname(remote_url):
 def get_current_branch():
     """Return the name of the currently checked-out git branch."""
     result = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, check=True
     )
     return result.stdout.strip()
 
@@ -79,10 +70,7 @@ def git_push(origin, target_branch, dry_run=False):
     if dry_run:
         logger.info("[DRY RUN] Would push HEAD to remote '%s' as %s", origin, target_branch)
         return
-    subprocess.run(
-        ["git", "push", origin, f"HEAD:{target_branch}", "--force"],
-        check=True,
-    )
+    subprocess.run(["git", "push", origin, f"HEAD:{target_branch}", "--force"], check=True)
 
 
 def trigger_pipeline(gitlab_url, access_token, ref, pipeline_vars, dry_run=False):
@@ -137,6 +125,21 @@ def main():
         help="FUNCTIONAL_TEST_CASES pipeline variable (default: all)",
     )
     parser.add_argument(
+        "--cluster-a100",
+        default=None,
+        help="CLUSTER_A100 pipeline variable (override the default cluster)",
+    )
+    parser.add_argument(
+        "--cluster-h100",
+        default=None,
+        help="CLUSTER_H100 pipeline variable (override the default cluster)",
+    )
+    parser.add_argument(
+        "--cluster-gb200",
+        default=None,
+        help="CLUSTER_GB200 pipeline variable (override the default cluster)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print actions without executing git push or pipeline trigger",
@@ -164,6 +167,14 @@ def main():
         "FUNCTIONAL_TEST_REPEAT": str(args.functional_test_repeat),
         "FUNCTIONAL_TEST_CASES": args.functional_test_cases,
     }
+
+    for var, val in [
+        ("CLUSTER_A100", args.cluster_a100),
+        ("CLUSTER_H100", args.cluster_h100),
+        ("CLUSTER_GB200", args.cluster_gb200),
+    ]:
+        if val is not None:
+            pipeline_vars[var] = val
 
     trigger_pipeline(
         gitlab_hostname, args.access_token, target_branch, pipeline_vars, dry_run=args.dry_run

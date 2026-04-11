@@ -52,8 +52,11 @@ from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
+    import transformer_engine as te
+
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 else:
+    te = None  # type: ignore[assignment, misc]
     Fp8Padding, Fp8Unpadding = None, None
 
 try:
@@ -790,11 +793,18 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return False
 
-        # Check activation
-        if self.activation_func != F.silu or not self.config.gated_linear_unit:
-            return False  # Expected SwiGLU activation
+        # Check activation: SwiGLU (ScaledSwiGLU) or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
+        if self.config.gated_linear_unit:
+            if self.activation_func == F.silu:
+                return True
+            if self.activation_func == quick_gelu:
+                try:
+                    from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
+                except ImportError:
+                    return False
+                return True
 
-        return True
+        return False
 
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
@@ -845,10 +855,23 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs
-        op = te.pytorch.ops.ScaledSwiGLU(
-            glu_interleave_size=self.config.moe_mlp_glu_interleave_size
-        )
+        # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
+        glu_interleave = self.config.moe_mlp_glu_interleave_size
+        if self.activation_func == F.silu and self.config.gated_linear_unit:
+            op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
+        elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+            clamp = self.config.activation_func_clamp_value
+            if clamp is not None:
+                op = te.pytorch.ops.ScaledClampedQGeGLU(
+                    glu_interleave_size=glu_interleave, limit=clamp
+                )
+            else:
+                op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
+        else:
+            raise RuntimeError(
+                "_make_fused_ops expected SwiGLU or quick_gelu with gated_linear_unit; "
+                "call _is_fused_impl_supported() before constructing fused ops."
+            )
         ops.append(op)
 
         # FC2

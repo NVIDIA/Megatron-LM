@@ -305,6 +305,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_force_biased": None,
     "sequence_packing_scheduler": None,
     "use_transformer_engine_op_fuser": False,
+    "moe_single_grouped_weight": False,
+    "moe_single_grouped_bias": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

@@ -1708,11 +1708,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
 
             extra_kwargs = _get_extra_te_kwargs(config)
+
             self.delay_wgrad_compute = (
                 self.config.delay_wgrad_compute
                 or self.config.overlap_dispatch_backward_with_experts_wgrad
             )
-
             if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
                     extra_kwargs["delay_wgrad_compute"] = True
@@ -1755,6 +1755,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 parallel_mode = None
                 tp_size = 1
                 tp_group_for_te = None
+
+            if is_te_min_version("2.14.0"):
+                extra_kwargs["single_grouped_weight"] = getattr(
+                    config, "moe_single_grouped_weight", False
+                )
+                extra_kwargs["single_grouped_bias"] = getattr(
+                    config, "moe_single_grouped_bias", False
+                )
 
             super().__init__(
                 num_gemms=num_gemms,

@@ -744,6 +744,16 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_single_grouped_weight: bool = False
+    """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``.
+    """
+
+    moe_single_grouped_bias: bool = False
+    """When using TE GroupedLinear for MoE experts, store expert biases as a single grouped
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
+    and ``add_bias_linear=True``."""
+
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -1317,6 +1327,20 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_ffn_hidden_size is None
             ), "moe_ffn_hidden_size must be None when num_experts is not set."
 
+        if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+            if not self.moe_grouped_gemm:
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias require "
+                    "moe_grouped_gemm=True."
+                )
+            if not is_te_min_version("2.14.0"):
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias require "
+                    f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
+                )
+        if self.moe_single_grouped_bias and not self.add_bias_linear:
+            raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
+
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
@@ -1543,13 +1567,25 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_layer_num must be a positive integer when "
                     "'mhc' is in recompute_modules."
                 )
-            if self.fine_grained_activation_offloading:
-                raise ValueError(
-                    "'mhc' in recompute_modules is incompatible with "
-                    "fine_grained_activation_offloading. The mHC recompute hook fires "
-                    "before the offloading backward chunk is initialized, causing "
-                    "tensor_pop on a None chunk. Disable one of them."
-                )
+            if self.fine_grained_activation_offloading and self.offload_modules:
+                # mHC checkpoints wrap input_layernorm (inside attn_norm offload context)
+                # and pre_mlp_layernorm (inside mlp_norm offload context). The unified
+                # recompute hook fires before GroupCommitFunction.backward() initializes
+                # the backward chunk, so tensor_pop hits a None chunk for these modules.
+                # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
+                # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
+                # checkpoints, so they are safe to use with mHC recompute.
+                _MHC_CONFLICTING_OFFLOAD_MODULES = {"attn_norm", "mlp_norm"}
+                conflicting = _MHC_CONFLICTING_OFFLOAD_MODULES & set(self.offload_modules)
+                if conflicting:
+                    raise ValueError(
+                        f"'mhc' in recompute_modules is incompatible with "
+                        f"offload_modules {conflicting}. The mHC recompute hook fires "
+                        f"before the offloading backward chunk is initialized for these "
+                        f"modules, causing tensor_pop on a None chunk. Remove "
+                        f"{conflicting} from offload_modules or remove 'mhc' from "
+                        f"recompute_modules."
+                    )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
