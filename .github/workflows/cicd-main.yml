@@ -147,7 +147,7 @@ jobs:
   configure:
     runs-on: ubuntu-latest
     needs: [pre-flight]
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: github.repository == 'NVIDIA/Megatron-LM' && (needs.pre-flight.result == 'success' || needs.pre-flight.result == 'skipped')
     outputs:
       scope:         ${{ steps.configure.outputs.scope }}
       n_repeat:      ${{ steps.configure.outputs.n_repeat }}
