@@ -715,8 +715,15 @@ class TextGenerationController:
                 bucket_map[sampling_params].append(request_index)
 
             # Just unpack the key directly!
+            device = torch.cuda.current_device()
             self._torch_sampling_buckets = [
                 (indices, *sampling_params) for sampling_params, indices in bucket_map.items()
+            ]
+            # Pre-compute index tensors on GPU so that _sample_from_logits_2d
+            # (called once per MTP depth) avoids repeated H2D copies.
+            self._torch_sampling_bucket_index_tensors = [
+                torch.tensor(indices, device=device, dtype=torch.long)
+                for indices, *_ in self._torch_sampling_buckets
             ]
 
     def _rewind_kv_cache(self):
@@ -838,18 +845,15 @@ class TextGenerationController:
             Tensor: Sampled tokens of shape [num_requests].
         """
         spec_token_list = []
-        indices_list = []
-        for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
-            request_indices_tensor = torch.tensor(
-                request_indices, device=logits_2d.device, dtype=torch.long
-            )
+        for idx_tensor, (_, temp, top_k, top_p) in zip(
+            self._torch_sampling_bucket_index_tensors, self._torch_sampling_buckets
+        ):
             spec_token_list.append(
-                self._torch_sampling_func(logits_2d[request_indices_tensor, :], temp, top_k, top_p)
+                self._torch_sampling_func(logits_2d[idx_tensor, :], temp, top_k, top_p)
             )
-            indices_list.append(request_indices_tensor)
 
         spec_tokens = torch.empty(logits_2d.shape[0], device=logits_2d.device, dtype=torch.int64)
-        for tokens, indices in zip(spec_token_list, indices_list):
+        for tokens, indices in zip(spec_token_list, self._torch_sampling_bucket_index_tensors):
             spec_tokens[indices] = tokens
         return spec_tokens
 
@@ -1014,12 +1018,11 @@ class TextGenerationController:
         output_tokens_jumbled_list = []
         token_order_list = []
 
-        for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
-            request_indices_tensor = torch.tensor(
-                request_indices, device=token_to_request_index.device
-            )
+        for idx_tensor, (_, temp, top_k, top_p) in zip(
+            self._torch_sampling_bucket_index_tensors, self._torch_sampling_buckets
+        ):
             required_indices = torch.where(
-                torch.isin(token_to_request_index, request_indices_tensor)
+                torch.isin(token_to_request_index, idx_tensor)
             )[0]
             output_tokens_jumbled_list.append(
                 self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
