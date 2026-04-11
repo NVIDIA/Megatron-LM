@@ -86,9 +86,10 @@ jobs:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
+          IS_WORKFLOW_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
-          # Skip SSO check for scheduled jobs, main branch, or merge groups
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
+          # Skip SSO check for scheduled jobs, main branch, merge groups, or manual dispatches
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ] || [ "${IS_WORKFLOW_DISPATCH}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
@@ -140,7 +141,7 @@ jobs:
 
   pre-flight:
     needs: [is-not-external-contributor]
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
 
   configure:
@@ -168,6 +169,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
+          IS_WORKFLOW_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
@@ -179,8 +181,9 @@ jobs:
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
 
-          # Scheduled/CI workloads have no PR — treat as "Run functional tests"
+          # Scheduled/CI workloads and manual dispatches have no PR — treat as "Run functional tests"
           [ "$IS_CI_WORKLOAD" == "true" ] && HAS_RUN_FUNCTIONAL=true
+          [ "$IS_WORKFLOW_DISPATCH" == "true" ] && HAS_RUN_FUNCTIONAL=true
 
           if [ "$IS_MERGE_GROUP" == "true" ]; then
             SCOPE=mr-github; N_REPEAT=1; LIGHTWEIGHT=false
@@ -464,6 +467,7 @@ jobs:
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || github.event_name == 'workflow_dispatch'
       )
       && !cancelled()
     steps:
@@ -600,6 +604,7 @@ jobs:
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
+        || github.event_name == 'workflow_dispatch'
       )
       && !cancelled()
     steps:
@@ -637,6 +642,7 @@ jobs:
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
+        || github.event_name == 'workflow_dispatch'
       )
       && !cancelled()
     env:
@@ -677,6 +683,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.cicd-unit-tests-latest.result == 'skipped'
+        || github.event_name == 'workflow_dispatch'
       )
       && !cancelled()
     outputs:
@@ -750,6 +757,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.cicd-unit-tests-latest.result == 'skipped'
+        || github.event_name == 'workflow_dispatch'
       )
       && !cancelled()
     steps:
@@ -792,6 +800,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.cicd-unit-tests-latest.result == 'skipped'
+        || github.event_name == 'workflow_dispatch'
       )
       && !cancelled()
     outputs:
@@ -866,6 +875,7 @@ jobs:
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.cicd-unit-tests-latest.result == 'skipped'
+        || github.event_name == 'workflow_dispatch'
       )
       && !cancelled()
     steps:
