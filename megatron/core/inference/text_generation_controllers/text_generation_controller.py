@@ -791,8 +791,6 @@ class TextGenerationController:
         request_to_kv_block_ids.scatter_(1, scatter_idx.unsqueeze(1), clear_vals.unsqueeze(1))
 
         # Mamba speculative rewind state update.
-        # torch.compile treats `context.is_hybrid_model` as a static guard, so this
-        # compiles into two specializations (hybrid vs. non-hybrid) with no graph break.
         if context.is_hybrid_model:
             mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
@@ -1026,7 +1024,7 @@ class TextGenerationController:
 
         return output_tokens, repeats
 
-    @torch.compile(dynamic=True)
+    @torch.compile()
     def _verify_speculative_tokens(
         self,
         output_tokens: Tensor,
