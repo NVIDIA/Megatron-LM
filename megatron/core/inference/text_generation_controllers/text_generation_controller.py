@@ -802,18 +802,24 @@ class TextGenerationController:
             # For prefill requests the gathered values are discarded by torch.where.
             intermediate_conv = context.mamba_intermediate_conv_states[
                 :, mamba_state_idx, accepted_tokens_per_request
-            ]  # [L, N, D]
-            current_conv = context.mamba_conv_states[:, mamba_state_idx]  # [L, N, D]
+            ]  # [L, N, *conv_shape]
+            current_conv = context.mamba_conv_states[:, mamba_state_idx]  # [L, N, *conv_shape]
+            conv_mask = is_decode_mask.reshape(
+                1, -1, *([1] * (intermediate_conv.ndim - 2))
+            )
             context.mamba_conv_states[:, mamba_state_idx] = torch.where(
-                is_decode_mask[None, :, None], intermediate_conv, current_conv
+                conv_mask, intermediate_conv, current_conv
             )
 
             intermediate_ssm = context.mamba_intermediate_ssm_states[
                 :, mamba_state_idx, accepted_tokens_per_request
-            ]  # [L, N, D]
-            current_ssm = context.mamba_ssm_states[:, mamba_state_idx]  # [L, N, D]
+            ]  # [L, N, *ssm_shape]
+            current_ssm = context.mamba_ssm_states[:, mamba_state_idx]  # [L, N, *ssm_shape]
+            ssm_mask = is_decode_mask.reshape(
+                1, -1, *([1] * (intermediate_ssm.ndim - 2))
+            )
             context.mamba_ssm_states[:, mamba_state_idx] = torch.where(
-                is_decode_mask[None, :, None], intermediate_ssm, current_ssm
+                ssm_mask, intermediate_ssm, current_ssm
             )
 
         return blocks_to_release, remove_mask
