@@ -755,9 +755,7 @@ class TextGenerationController:
         num_tokens_to_rewind = self.num_speculative_tokens - accepted_tokens_per_request
 
         # Zero out rewind for prefill requests (no data-dependent branch)
-        num_tokens_to_rewind = torch.where(
-            request_in_prefill_status == 1, 0, num_tokens_to_rewind
-        )
+        num_tokens_to_rewind = torch.where(request_in_prefill_status == 1, 0, num_tokens_to_rewind)
 
         original_offset = request_last_kv_block_offset.clone()
         remove_mask = (original_offset - num_tokens_to_rewind) < 0
@@ -777,9 +775,7 @@ class TextGenerationController:
         # Get previous block IDs using gather (for requests crossing block boundary).
         # For requests not crossing, the gathered value is unused (discarded by torch.where).
         prev_block_idx = torch.clamp(request_kv_block_counts - 1, min=0)
-        prev_block_ids = request_to_kv_block_ids.gather(
-            1, prev_block_idx.unsqueeze(1)
-        ).squeeze(1)
+        prev_block_ids = request_to_kv_block_ids.gather(1, prev_block_idx.unsqueeze(1)).squeeze(1)
 
         # Conditionally update last block ID to point to previous block
         request_last_kv_block_id.copy_(
@@ -789,16 +785,10 @@ class TextGenerationController:
         # Clear released block entries using scatter.
         # For requests crossing boundary: write -1 at index new_block_count.
         # For others: write back the existing value (no-op).
-        scatter_idx = torch.clamp(
-            request_kv_block_counts, max=request_to_kv_block_ids.shape[1] - 1
-        )
-        current_vals = request_to_kv_block_ids.gather(
-            1, scatter_idx.unsqueeze(1)
-        ).squeeze(1)
+        scatter_idx = torch.clamp(request_kv_block_counts, max=request_to_kv_block_ids.shape[1] - 1)
+        current_vals = request_to_kv_block_ids.gather(1, scatter_idx.unsqueeze(1)).squeeze(1)
         clear_vals = torch.where(remove_mask, -1, current_vals)
-        request_to_kv_block_ids.scatter_(
-            1, scatter_idx.unsqueeze(1), clear_vals.unsqueeze(1)
-        )
+        request_to_kv_block_ids.scatter_(1, scatter_idx.unsqueeze(1), clear_vals.unsqueeze(1))
 
         # Mamba speculative rewind state update.
         # torch.compile treats `context.is_hybrid_model` as a static guard, so this
@@ -1918,9 +1908,7 @@ class TextGenerationController:
                 # Release blocks back to the allocator (not compilable due to
                 # allocator state mutation). release_memory_blocks handles
                 # empty tensors.
-                context.kv_block_allocator.release_memory_blocks(
-                    blocks_to_release[remove_mask]
-                )
+                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs
