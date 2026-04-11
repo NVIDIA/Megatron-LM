@@ -23,11 +23,15 @@ Index storage optimization:
 - To reconstruct: global_index = (bit_17 << 16) | low_16_bits
 """
 
+import concurrent.futures
+import glob
 import io
 import logging
 import os
+import re
 import tarfile
 import warnings
+from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -44,13 +48,70 @@ from megatron.core import parallel_state
 from megatron.core.msc_utils import open_file
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args
+from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
+
+# Module-level reference so checkpoint/shutdown code can call flush().
+_ACTIVE_LOGITS_SAVER: Optional["LogitsSaverHooks"] = None
+
+
+def get_logits_saver() -> Optional["LogitsSaverHooks"]:
+    """Return the active :class:`LogitsSaverHooks` instance, or *None*."""
+    return _ACTIVE_LOGITS_SAVER
+
+
+def get_current_iteration() -> int:
+    """Return the current training iteration from ``get_args()``.
+
+    Prefers ``args.curr_iteration`` (set during forward/backward) and
+    falls back to ``args.iteration``.
+    """
+    args = get_args()
+    iteration = getattr(args, 'curr_iteration', None)
+    if iteration is None:
+        iteration = getattr(args, 'iteration')
+    return iteration
 
 
 _MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
 
 FOLDER_NAMES_PREFIX = "logprobs_iter"
+
+# Batched tar naming: tp{T}_cp{C}_dp{D}__{B}.tar
+_BATCHED_TAR_RE = re.compile(
+    r"^tp(\d+)_cp(\d+)_dp(\d+)__(\d+)\.tar$"
+)
+
+
+def _batched_tar_filename(
+    tp_rank: int, cp_rank: int, dp_rank: int, last_iter: int,
+) -> str:
+    """Return the canonical filename for a batched tar shard."""
+    return f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}__{last_iter}.tar"
+
+
+def _batched_tar_rank_prefix(
+    tp_rank: int, cp_rank: int, dp_rank: int,
+) -> str:
+    """Return the rank-specific prefix shared by all batched tar shards for one rank."""
+    return f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}__"
+
+
+def _sorted_batched_tars(paths: List[str]) -> List[str]:
+    """Sort batched tar paths by their iteration number (numeric, ascending).
+
+    Filenames are not zero-padded, so a plain lexicographic sort would be
+    wrong (e.g. ``...10.tar`` before ``...9.tar``).  This extracts the
+    trailing iteration number via :data:`_BATCHED_TAR_RE` and sorts
+    numerically, dropping any paths that don't match the pattern.
+    """
+    keyed = []
+    for p in paths:
+        if m := _BATCHED_TAR_RE.match(os.path.basename(p)):
+            keyed.append((int(m.group(4)), p))
+    keyed.sort()
+    return [p for _, p in keyed]
 
 
 def _pack_indices(indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -116,10 +177,18 @@ class LogitsSaverHooks:
     Indices are stored efficiently: uint16 for lower 16 bits + separate high bit tensor.
     tp_rank and dp_rank are stored in the filename for flexibility with multi-digit values.
 
+    When ``flush_interval`` > 1, iteration data is accumulated in memory and
+    flushed as a single tar archive every *flush_interval* iterations via a
+    background thread, reducing inode usage and avoiding blocking the training
+    loop.  Call :meth:`flush` at checkpoint / shutdown to write any remaining
+    buffered data.
+
     Args:
         k: Number of top log-probabilities to save globally
         save_dir: Directory to save log-prob files
         compress_zstd: Whether to use zstd compression (requires zstandard package)
+        flush_interval: Number of iterations to batch before writing a single tar
+            archive.  1 (default) preserves the legacy one-file-per-iteration behaviour.
     """
 
     def __init__(
@@ -128,12 +197,15 @@ class LogitsSaverHooks:
         save_dir: str,
         *,
         compress_zstd: bool = False,
+        flush_interval: int = 1,
     ):
         assert k > 0, "Number of top log-probabilities to save must be positive"
         assert save_dir is not None, "Save directory must be provided"
+        assert flush_interval >= 1, "flush_interval must be >= 1"
 
         self.k = k
         self.save_dir = save_dir
+        self.flush_interval = flush_interval
 
         # Parallel state info
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -160,8 +232,21 @@ class LogitsSaverHooks:
             )
             self._zstd_compressor = None
 
+        # Batched tar state (active when flush_interval > 1)
+        self._pending_writes: OrderedDict[int, Tuple[bytes, str]] = OrderedDict()
+        self._flush_executor: Optional[concurrent.futures.ThreadPoolExecutor] = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            if self.flush_interval > 1
+            else None
+        )
+        self._flush_futures: List[concurrent.futures.Future] = []
+
         # Create save directory if needed
         os.makedirs(self.save_dir, exist_ok=True)
+
+        # Register as the active saver so checkpoint code can flush
+        global _ACTIVE_LOGITS_SAVER
+        _ACTIVE_LOGITS_SAVER = self
 
     def get_forward_hook(self) -> Callable:
         """Returns the forward hook to accumulate logits.
@@ -285,18 +370,20 @@ class LogitsSaverHooks:
         # Back to original dtype
         log_probs = log_probs.to(dtype)
 
-        # Step 1: Compute local top-K on log-probs
-        # (log-softmax is monotonically increasing, so top-K positions are the same as for logits)
+        # Step 1: Local top-K on fp32 logits for ranking precision,
+        # then gather the bf16 log-probs at those same positions.
         local_k = min(effective_k, local_vocab_size)
-        local_values, local_indices = torch.topk(log_probs, local_k, dim=-1)
+        local_logit_vals, local_indices = torch.topk(logits, local_k, dim=-1)
+        local_logprob_vals = torch.gather(log_probs, -1, local_indices)
 
         if self.tp_size > 1:
-            # Step 2: Compute global top-K across TP ranks
+            # Step 2: Global top-K across TP ranks (ranked by fp32 logits,
+            # log-probs gathered at the winning positions afterwards).
             global_values, global_indices = self._compute_global_topk(
-                local_values, local_indices, effective_k, local_vocab_size
+                local_logit_vals, local_logprob_vals, local_indices, effective_k, local_vocab_size
             )
         else:
-            global_values, global_indices = local_values, local_indices
+            global_values, global_indices = local_logprob_vals, local_indices
 
         # Step 3: Each rank saves its K/N slice
         # Since all ranks have identical copies after global topk,
@@ -315,58 +402,67 @@ class LogitsSaverHooks:
 
     def _compute_global_topk(
         self,
-        local_values: torch.Tensor,
+        local_logit_vals: torch.Tensor,
+        local_logprob_vals: torch.Tensor,
         local_indices: torch.Tensor,
         k: int,
         local_vocab_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute global top-K across all TP ranks efficiently.
 
+        The ranking is performed on fp32 *logit* values for numerical
+        precision, while the returned values are the corresponding bf16
+        *log-probabilities* gathered at the winning positions.
+
         Strategy:
         1. Convert local indices to global indices by adding rank offset
-        2. Concatenate values and indices to minimize all_gather calls (single communication)
-        3. All_gather the concatenated tensor
-        4. Compute top-K on gathered values
-        5. Re-index: gather the corresponding global indices using top-K positions
+        2. Pack (logits, log-probs, indices) and all_gather in one call
+        3. Compute top-K on gathered *logit* values (fp32)
+        4. Re-index: gather the corresponding log-probs and global indices
 
         Args:
-            local_values: Local top-K values (seq, batch, local_k)
-            local_indices: Local top-K indices in [0, local_vocab_size), fits in uint16
+            local_logit_vals: Local top-K fp32 logit values (seq, batch, local_k)
+            local_logprob_vals: Local top-K log-prob values at the same
+                positions, in the model's native dtype (seq, batch, local_k)
+            local_indices: Local top-K indices in [0, local_vocab_size)
             k: Target number of top elements
             local_vocab_size: Size of the local vocab shard (vocab_size / tp_size)
 
         Returns:
-            Tuple of (global_values, global_indices)
+            Tuple of (global_logprob_values, global_indices)
         """
-        # Compute vocab offset for this TP rank
-        # Local indices are in [0, local_vocab_size)
-        # Global indices are in [tp_rank * local_vocab_size, (tp_rank + 1) * local_vocab_size)
         vocab_offset = self.tp_rank * local_vocab_size
         global_indices = local_indices + vocab_offset
 
-        # Concatenate for a single all_gather to minimize communication
-        # float32 can exactly represent integers up to 2^24, sufficient for 17-bit vocab indices
-        # Stack along new dimension: shape becomes (seq, batch, local_k, 2)
-        combined = torch.stack([local_values.float(), global_indices.float()], dim=-1)
+        # Pack logits, log-probs, and indices into a single tensor for one
+        # all_gather call.  fp32 can exactly represent integers up to 2^24,
+        # sufficient for 17-bit vocab indices.
+        # Shape: (seq, batch, local_k, 3)
+        combined = torch.stack(
+            [local_logit_vals.float(),
+             local_logprob_vals.float(),
+             global_indices.float()],
+            dim=-1,
+        )
 
-        # All_gather across TP ranks
         gathered_list = [torch.empty_like(combined) for _ in range(self.tp_size)]
         dist.all_gather(gathered_list, combined, group=self.tp_group)
 
-        # Concatenate gathered results: (seq, batch, tp_size * local_k, 2)
+        # (seq, batch, tp_size * local_k, 3)
         gathered = torch.cat(gathered_list, dim=-2)
 
-        # Split back into values and indices: (seq, batch, tp_size * local_k)
-        gathered_values = gathered[..., 0].to(local_values.dtype)
-        gathered_indices = gathered[..., 1].to(local_indices.dtype)
+        gathered_logits = gathered[..., 0].to(local_logit_vals.dtype)
+        gathered_logprobs = gathered[..., 1].to(local_logprob_vals.dtype)
+        gathered_indices = gathered[..., 2].to(local_indices.dtype)
 
-        # Compute final global top-K
-        topk_values, topk_positions = torch.topk(gathered_values, k, dim=-1)
+        # Rank by fp32 logits
+        _, topk_positions = torch.topk(gathered_logits, k, dim=-1)
 
-        # Re-index: gather the corresponding global indices using top-K positions
+        # Gather log-probs and indices at the winning positions
+        topk_logprobs = torch.gather(gathered_logprobs, -1, topk_positions)
         topk_global_indices = torch.gather(gathered_indices, -1, topk_positions)
 
-        return topk_values, topk_global_indices
+        return topk_logprobs, topk_global_indices
 
     def _write_to_disk(
         self,
@@ -380,6 +476,9 @@ class LogitsSaverHooks:
         - values: list of bfloat16 tensors of log-probabilities (one per microbatch)
         - indices_low: list of uint16 tensors (lower 16 bits of vocab indices)
         - bit_17: list of bool tensors (17th bit, same shape as indices_low)
+
+        When ``flush_interval > 1``, the serialised bytes are buffered in
+        memory and flushed as a tar archive every *flush_interval* iterations.
         """
         # Serialize all tensors together
         buffer = io.BytesIO()
@@ -390,25 +489,99 @@ class LogitsSaverHooks:
         }, buffer)
         data = buffer.getvalue()
 
-        # Optional compression
-        suffix = ".pt"
+        # Optional per-entry compression
+        entry_suffix = ".pt"
         if self._zstd_compressor is not None:
             data = self._zstd_compressor.compress(data)
-            suffix += ".zst"
+            entry_suffix += ".zst"
 
-        # Generate filename
-        args = get_args()
-        iteration = getattr(args, 'curr_iteration', None)
-        if iteration is None:
-            iteration = getattr(args, 'iteration')
-        folder, filename = _format_folder_and_filename(
-            self.save_dir, iteration, self.tp_rank, self.cp_rank, self.dp_rank, suffix
+        iteration = get_current_iteration()
+
+        if self.flush_interval <= 1:
+            # Legacy: one file per iteration in a per-iteration folder
+            folder, filename = _format_folder_and_filename(
+                self.save_dir, iteration, self.tp_rank, self.cp_rank, self.dp_rank, entry_suffix
+            )
+            os.makedirs(folder, exist_ok=True)
+            with open_file(os.path.join(folder, filename), "wb") as f:
+                f.write(data)
+        else:
+            # Batched: accumulate in memory, flush when the iteration
+            # is a multiple of the flush interval.
+            self._pending_writes[iteration] = (data, entry_suffix)
+            if (iteration + 1) % self.flush_interval == 0:
+                self._flush_pending()
+
+    # ------------------------------------------------------------------
+    #  Batched-tar flush helpers
+    # ------------------------------------------------------------------
+
+    def _flush_pending(self) -> None:
+        """Flush buffered iteration data as a single tar archive (async)."""
+        if not self._pending_writes:
+            return
+
+        # Wait for any prior background flush to finish before handing off
+        # new data, bounding peak memory to one batch of pending writes.
+        self._wait_for_pending_flushes()
+
+        # Take ownership of the current pending buffer
+        writes = self._pending_writes
+        self._pending_writes = OrderedDict()
+
+        last_iter = max(writes.keys())
+        tar_filename = _batched_tar_filename(
+            self.tp_rank, self.cp_rank, self.dp_rank, last_iter,
         )
+        tar_path = os.path.join(self.save_dir, tar_filename)
 
-        # Write to disk
-        os.makedirs(folder, exist_ok=True)
-        with open_file(os.path.join(folder, filename), "wb") as f:
-            f.write(data)
+        future = self._flush_executor.submit(
+            LogitsSaverHooks._write_batched_tar, tar_path, writes,
+        )
+        self._flush_futures.append(future)
+
+        print_rank_0(f"Flushing {len(writes)} logit iterations to disk")
+
+    @staticmethod
+    def _write_batched_tar(
+        tar_path: str,
+        writes: "OrderedDict[int, Tuple[bytes, str]]",
+    ) -> None:
+        """Write a tar archive containing multiple iterations (runs in background thread).
+
+        Each member is named ``{iteration}{suffix}`` so that WebDataset
+        groups them as individual samples keyed by iteration number.
+        """
+        with tarfile.open(tar_path, "w") as tar:
+            for iteration, (data, entry_suffix) in writes.items():
+                member_name = f"{iteration}{entry_suffix}"
+                info = tarfile.TarInfo(name=member_name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+    def _wait_for_pending_flushes(self) -> None:
+        """Block until all background flush futures have completed."""
+        for future in self._flush_futures:
+            future.result()
+        self._flush_futures.clear()
+
+    def flush(self) -> None:
+        """Flush any remaining buffered data to disk.
+
+        Must be called at checkpoint / shutdown when ``flush_interval > 1``
+        to ensure no iteration data is lost.  Safe to call when there is
+        nothing pending (no-op).
+        """
+        if self.flush_interval > 1 and self._pending_writes:
+            self._flush_pending()
+        self._wait_for_pending_flushes()
+
+    def shutdown(self) -> None:
+        """Flush remaining data and shut down the background executor."""
+        self.flush()
+        if self._flush_executor is not None:
+            self._flush_executor.shutdown(wait=True)
+            self._flush_executor = None
 
 
 #################################################
@@ -460,6 +633,51 @@ def _read_logprobs_data(folder: str, base_filename: str) -> Optional[bytes]:
             return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
 
 
+def _read_from_batched_tar(
+    save_dir: str,
+    iteration: int,
+    tp_rank: int,
+    cp_rank: int,
+    dp_rank: int,
+) -> Optional[bytes]:
+    """Read a single iteration's data from a batched tar archive.
+
+    Batched tar files are named ``tp{tp}_cp{cp}_dp{dp}__{B}.tar``
+    and contain members ``{x}.pt[.zst]`` for every iteration
+    *x* in the batch.  *B* is the last iteration stored in the archive, so
+    we only open candidates where ``B >= iteration``.
+    """
+    prefix = _batched_tar_rank_prefix(tp_rank, cp_rank, dp_rank)
+    pattern = os.path.join(save_dir, f"{prefix}*.tar")
+
+    for tar_path in _sorted_batched_tars(glob.glob(pattern)):
+        basename = os.path.basename(tar_path)
+        m = _BATCHED_TAR_RE.match(basename)
+        if not m:
+            continue
+        # Verify rank matches (glob may over-match on the prefix)
+        if (int(m.group(1)), int(m.group(2)), int(m.group(3))) != (
+            tp_rank, cp_rank, dp_rank,
+        ):
+            continue
+        if (last_iter := int(m.group(4))) < iteration:
+            continue
+        try:
+            with tarfile.open(tar_path, "r") as tar:
+                for suffix in (".pt.zst", ".pt"):
+                    member_name = f"{iteration}{suffix}"
+                    try:
+                        member = tar.extractfile(member_name)
+                        if member is not None:
+                            raw = member.read()
+                            return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
+                    except KeyError:
+                        continue
+        except (tarfile.TarError, OSError):
+            continue
+    return None
+
+
 def load_log_probs_by_rank(
     save_dir: str,
     iteration: int,
@@ -469,12 +687,15 @@ def load_log_probs_by_rank(
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Load a saved log-probs file by specifying the root folder, iteration, and parallel ranks.
 
-    Finds the file matching the naming convention used by LogitsSaverHooks:
-    - Iteration folder pattern: logprobs_iter{iteration}
-    - Filename pattern: tp{tp_rank}_cp{cp_rank}_dp{dp_rank}.pt or .pt.zst
+    Supports three on-disk layouts (tried in order):
+
+    1. **Legacy folder** – ``logprobs_iter{iter}/tp{tp}_cp{cp}_dp{dp}.pt[.zst]``
+    2. **Legacy folder tar** – ``logprobs_iter{iter}.tar`` containing the folder
+    3. **Batched tar** – ``tp{tp}_cp{cp}_dp{dp}__{B}.tar``
+       containing ``{iter}.pt[.zst]`` for every iteration in the batch
 
     Args:
-        save_dir: Root path containing all log-probs iteration folders
+        save_dir: Root path containing all log-probs data
         iteration: Training iteration number
         tp_rank: Tensor parallel rank
         cp_rank: Context parallel rank
@@ -486,18 +707,24 @@ def load_log_probs_by_rank(
         Values are log-probabilities; indices are reconstructed full int64 global indices.
 
     Raises:
-        FileNotFoundError: If no matching folder or file is found
+        FileNotFoundError: If no matching data is found in any layout
     """
-    # Use shared formatting function to get folder and base filename
+    # 1 & 2: Legacy folder / folder.tar
     folder, base_filename = _format_folder_and_filename(
         save_dir, iteration, tp_rank, cp_rank, dp_rank,
     )
     data = _read_logprobs_data(folder, base_filename)
+
+    # 3: Batched tar
+    if data is None:
+        data = _read_from_batched_tar(save_dir, iteration, tp_rank, cp_rank, dp_rank)
+
     if data is None:
         raise FileNotFoundError(
             f"No log-probs file found for tp_rank={tp_rank}, cp_rank={cp_rank}, "
             f"dp_rank={dp_rank} at iteration {iteration} "
-            f"(checked folder {folder} and tar {folder}.tar)"
+            f"(checked folder '{folder}', tar '{folder}.tar', "
+            f"and batched tars in '{save_dir}')"
         )
 
     # Load tensors
@@ -510,3 +737,43 @@ def load_log_probs_by_rank(
     ]
 
     return tensors['values'], indices_list
+
+
+#################################################
+# WebDataset-based streaming loader
+#################################################
+
+
+def decode_logprobs_sample(
+    sample: dict,
+) -> Tuple[int, List[torch.Tensor], List[torch.Tensor]]:
+    """WebDataset map function: decode a single tar member into tensors.
+
+    Handles both ``.pt`` and ``.pt.zst`` extensions produced by
+    :class:`LogitsSaverHooks` when ``flush_interval > 1``.
+
+    Args:
+        sample: WebDataset sample dict with ``__key__`` and one data field.
+
+    Returns:
+        ``(iteration, values_list, indices_list)`` – the same tuple shape
+        returned by :func:`load_log_probs_by_rank`.
+    """
+    key: str = sample["__key__"]
+    iteration = int(key)
+
+    if "pt.zst" in sample:
+        data = _decompress_zstd(sample["pt.zst"])
+    elif "pt" in sample:
+        data = sample["pt"]
+    else:
+        raise ValueError(
+            f"Sample '{key}' contains neither .pt nor .pt.zst data"
+        )
+
+    tensors = torch.load(io.BytesIO(data), weights_only=True)
+    indices_list = [
+        _unpack_indices(low, bit17)
+        for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
+    ]
+    return iteration, tensors["values"], indices_list

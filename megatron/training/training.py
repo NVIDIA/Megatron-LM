@@ -1398,6 +1398,11 @@ def pretrain(
 
         print_datetime('after training is done')
 
+        # Flush any remaining buffered logits data before final checkpoint.
+        from megatron.training.logits_saver import get_logits_saver
+        if (logits_saver := get_logits_saver()) is not None:
+            logits_saver.shutdown()
+
         if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
             save_checkpoint_and_time(
                 iteration,
@@ -1707,6 +1712,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for module in model_module.modules():
                 if hasattr(module, "frozen_expert_bias"):
                     module.frozen_expert_bias = True
+    # Additional HACK: Ignore LM loss for speed
+    if args.logits_save_dir is not None:
+        from types import MethodType
+        def _compute_lm_loss(self, labels, logits):
+            return (logits * 0).sum(dim=-1).transpose(0, 1).contiguous()
+        for model_module in model:
+            model_module.compute_language_model_loss = MethodType(_compute_lm_loss, model_module)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -1957,7 +1969,10 @@ def setup_model_and_optimizer(
         from megatron.training.logits_saver import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
-            k=args.logits_save_top_k, save_dir=args.logits_save_dir, compress_zstd=args.logits_save_compress
+            k=args.logits_save_top_k,
+            save_dir=args.logits_save_dir,
+            compress_zstd=args.logits_save_compress,
+            flush_interval=getattr(args, 'logits_save_flush_interval', 1),
         )
         logits_saver.attach_hooks(unwrapped_model[0].output_layer)
 
@@ -2817,6 +2832,11 @@ def save_checkpoint_and_time(
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+
+    # Flush any buffered logits data before checkpointing
+    from megatron.training.logits_saver import get_logits_saver
+    if (logits_saver := get_logits_saver()) is not None:
+        logits_saver.flush()
 
     if should_report_memory:
         # Track memory before checkpoint save.

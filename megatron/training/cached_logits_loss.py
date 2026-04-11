@@ -50,6 +50,7 @@ Usage example
     #   loss, num_tokens, report = loss_func(loss_mask, output_tensor, model)
 """
 
+import glob
 import logging
 import os
 import re
@@ -65,11 +66,23 @@ try:
 except ImportError:
   zstandard = None
 
+try:
+  import webdataset as wds
+except ImportError:
+  wds = None
+
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.utils import unwrap_model
-from megatron.training import get_args
-from megatron.training.logits_saver import FOLDER_NAMES_PREFIX, load_log_probs_by_rank
+from megatron.training.logits_saver import (
+  _BATCHED_TAR_RE,
+  FOLDER_NAMES_PREFIX,
+  _batched_tar_rank_prefix,
+  _sorted_batched_tars,
+  decode_logprobs_sample,
+  get_current_iteration,
+  load_log_probs_by_rank,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +114,8 @@ class _TeacherDataset(torch.utils.data.Dataset):
         self.cp_rank = cp_rank
         self.dp_rank = dp_rank
 
-        # Set length to largest iteration folder name detected
+        # Set length to largest iteration number from legacy per-iteration
+        # folders/tars.  (Batched tars are handled by _TeacherWebDataset.)
         iter_numbers = []
         for fname in os.listdir(self.logprobs_dir):
             if match := re.match(rf"{FOLDER_NAMES_PREFIX}(\d+)", fname):
@@ -121,6 +135,93 @@ class _TeacherDataset(torch.utils.data.Dataset):
             self.cp_rank,
             self.dp_rank,
         )
+
+
+class _TeacherWebDataset(torch.utils.data.IterableDataset):
+    """Streaming dataset that reads teacher log-probs from batched tar shards via WebDataset.
+
+    More I/O-efficient than the map-style :class:`_TeacherDataset` for the
+    batched-tar layout (``tp{T}_cp{C}_dp{D}__{B}.tar``), because it
+    performs purely sequential reads across sorted shards — the access pattern
+    WebDataset is optimised for.
+
+    **Dynamic shard discovery**: instead of globbing once, the iterator
+    processes known shards and, when they are exhausted, re-globs the
+    directory to pick up newly-written shards (e.g. from a concurrent
+    training job).  If no new shards are found the iterator ends normally.
+
+    On each call to ``__iter__``:
+
+    1. Shards whose last iteration is below *start_iteration* are dropped
+       entirely (shard-level pre-filtering).
+    2. Individual samples within the first relevant shard whose iteration
+       precedes *start_iteration* are skipped.
+    3. After the current batch of shards is consumed, the directory is
+       re-scanned; only shards not yet processed are fed to the pipeline.
+
+    Yields ``(values_list, indices_list)`` — the same pair returned by
+    ``_TeacherDataset.__getitem__``.
+
+    Requires the ``webdataset`` package (``pip install webdataset``).
+    """
+
+    def __init__(
+        self,
+        logprobs_dir: str,
+        tp_rank: int,
+        cp_rank: int,
+        dp_rank: int,
+        start_iteration: int = 0,
+    ):
+        if wds is None:
+            raise ImportError("The 'webdataset' package is required for _TeacherWebDataset.")
+
+        self.logprobs_dir = logprobs_dir
+        self.tp_rank = tp_rank
+        self.cp_rank = cp_rank
+        self.dp_rank = dp_rank
+        self.start_iteration = start_iteration
+
+    def _discover_shards(self, already_processed: set) -> list:
+        """Glob for shards, filter out already-processed ones, return sorted."""
+        prefix = _batched_tar_rank_prefix(self.tp_rank, self.cp_rank, self.dp_rank)
+        all_urls = _sorted_batched_tars(
+            glob.glob(os.path.join(self.logprobs_dir, f"{prefix}*.tar"))
+        )
+        new_urls = []
+        for url in all_urls:
+            if url in already_processed:
+                continue
+            m = _BATCHED_TAR_RE.match(os.path.basename(url))
+            if m and int(m.group(4)) >= self.start_iteration:
+                new_urls.append(url)
+        return new_urls
+
+    def __iter__(self):
+        processed = set()
+
+        while True:
+            urls = self._discover_shards(processed)
+            if not urls:
+                if not processed:
+                    raise FileNotFoundError(
+                        f"No batched tar shards for "
+                        f"tp{self.tp_rank}_cp{self.cp_rank}_dp{self.dp_rank} "
+                        f"found at or after iteration {self.start_iteration} "
+                        f"in '{self.logprobs_dir}'"
+                    )
+                return
+            processed.update(urls)
+
+            pipeline = wds.WebDataset(
+                urls, nodesplitter=lambda urls: urls, shardshuffle=False,
+            )
+            for sample in pipeline:
+                iteration, values_list, indices_list = decode_logprobs_sample(sample)
+                if iteration < self.start_iteration:
+                    continue
+                yield values_list, indices_list
+
 
 # ---------------------------------------------------------------------------
 #  Top-K KL divergence
@@ -163,7 +264,10 @@ def topk_kl_div(
     if add_ghost_token:
         eps = 1e-6
         student_topk_logprobs_exp = student_topk_logprobs.exp() * mask  # don't sum duplicate indices if any
-        student_residual = torch.log(1.0 - student_topk_logprobs_exp.sum(dim=-1, keepdim=True) + eps)
+        student_topk_exp_sum = student_topk_logprobs_exp.sum(dim=-1, keepdim=True)
+        if tp_size > 1:
+            dist_nn.functional.all_reduce(student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group)
+        student_residual = torch.log(1.0 - student_topk_exp_sum + eps)
         teacher_residual = torch.log(1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True).clamp(max=1-eps))
         student_topk_logprobs = torch.cat([student_topk_logprobs, student_residual], dim=-1)
         teacher_topk_logprobs = torch.cat([teacher_topk_logprobs, teacher_residual], dim=-1)
@@ -198,19 +302,32 @@ class CachedLogitsKDLoss:
     memory, the subsequent ``tensor.to(device, non_blocking=True)`` call can
     overlap the DMA transfer with ongoing GPU kernels.
 
+    Two dataset backends are supported:
+
+    * **Map-style** (:class:`_TeacherDataset`) – random-access by iteration
+      number.  Works with every on-disk layout (legacy folders, folder tars,
+      batched tars).
+    * **WebDataset** (:class:`_TeacherWebDataset`) – sequential streaming of
+      batched tar shards.  Requires the ``webdataset`` package and the
+      batched-tar layout produced by ``LogitsSaverHooks(flush_interval>1)``.
+
+    By default the backend is auto-detected: if batched tar shards matching
+    this rank exist, WebDataset is used; otherwise the map-style fallback
+    is selected.
+
     The DataLoader is initialised lazily on the first ``__call__`` because the
-    starting iteration is not known at construction time.  Its sampler emits
-    the actual iteration numbers (e.g. 1000, 1001, …) so that
-    :meth:`_TeacherDataset.__getitem__` always receives the correct iteration
-    index.
+    starting iteration is not known at construction time.
 
     Args:
-        logprobs_dir: Root directory containing per-iteration subfolders
-            written by :class:`LogitsSaverHooks`.
+        logprobs_dir: Root directory containing log-probs data written by
+            :class:`LogitsSaverHooks`.
         num_workers: Number of DataLoader background workers (0 = main
             process).  ``1`` is recommended for sequential prefetching.
         prefetch_factor: How many iterations each worker pre-loads ahead
             (ignored when ``num_workers == 0``).
+        use_webdataset: Force dataset backend selection.  ``True`` = always
+            use :class:`_TeacherWebDataset`, ``False`` = always use
+            :class:`_TeacherDataset`, ``None`` (default) = auto-detect.
     """
 
     def __init__(
@@ -218,6 +335,7 @@ class CachedLogitsKDLoss:
         logprobs_dir: str,
         num_workers: int = 1,
         prefetch_factor: int = 2,
+        use_webdataset: Optional[bool] = None,
     ):
         self.logprobs_dir = logprobs_dir
         self._num_workers = num_workers
@@ -230,13 +348,8 @@ class CachedLogitsKDLoss:
         self.cp_rank = parallel_state.get_context_parallel_rank()
         self.dp_rank = parallel_state.get_data_parallel_rank()
 
-        # ---- dataset (created once at construction time) ----
-        self._dataset = _TeacherDataset(
-            logprobs_dir,
-            self.tp_rank,
-            self.cp_rank,
-            self.dp_rank,
-        )
+        # ---- backend selection ----
+        self._use_webdataset = self._resolve_backend(use_webdataset)
 
         # ---- DataLoader (lazy-initialised on first call) ----
         self._dataloader_iter: Optional[Iterator] = None
@@ -249,19 +362,45 @@ class CachedLogitsKDLoss:
         self._current_values: Optional[List[torch.Tensor]] = None
         self._current_indices: Optional[List[torch.Tensor]] = None
 
+    def _resolve_backend(self, use_webdataset: Optional[bool]) -> bool:
+        """Decide whether to use the WebDataset backend."""
+        if use_webdataset is not None:
+            return use_webdataset
+        prefix = _batched_tar_rank_prefix(self.tp_rank, self.cp_rank, self.dp_rank)
+        pattern = os.path.join(self.logprobs_dir, f"{prefix}*.tar")
+        return len(glob.glob(pattern, recursive=False)) > 0
+
     def _init_dataloader(self, start_iteration: int) -> None:
         """Create the DataLoader starting from *start_iteration*."""
-        if len(self._dataset) <= start_iteration:
-            raise ValueError(f"Start iteration {start_iteration} greater than dataset length {len(self._dataset)}")
-        # Sampler emits the actual iteration numbers to index dataset correctly
-        sampler = range(start_iteration, len(self._dataset))
+        if self._use_webdataset:
+            dataset = _TeacherWebDataset(
+                self.logprobs_dir,
+                self.tp_rank,
+                self.cp_rank,
+                self.dp_rank,
+                start_iteration=start_iteration,
+            )
+            sampler = None
+        else:
+            dataset = _TeacherDataset(
+                self.logprobs_dir, self.tp_rank, self.cp_rank, self.dp_rank,
+            )
+            if len(dataset) <= start_iteration:
+                raise ValueError(
+                    f"Start iteration {start_iteration} greater than "
+                    f"dataset length {len(dataset)}"
+                )
+            sampler = range(start_iteration, len(dataset))
+        # WebDataset yields a single ordered stream, so multiple workers
+        # would split shards and interleave results non-deterministically.
+        # Cap at 1 worker to keep iteration order while still prefetching.
         loader = torch.utils.data.DataLoader(
-            self._dataset,
+            dataset,
             sampler=sampler,
             batch_size=None,
             collate_fn=lambda x: x,
             pin_memory=True,
-            num_workers=self._num_workers,
+            num_workers=1 if self._use_webdataset else self._num_workers,
             prefetch_factor=self._prefetch_factor,
             persistent_workers=True,
         )
@@ -309,10 +448,7 @@ class CachedLogitsKDLoss:
         """
         # ---- resolve iteration ----
         if iteration is None:
-            args = get_args()
-            iteration = getattr(args, 'curr_iteration', None)
-            if iteration is None:
-                iteration = getattr(args, 'iteration')
+            iteration = get_current_iteration()
 
         # ---- lazy DataLoader init ----
         if self._dataloader_iter is None:
@@ -334,7 +470,7 @@ class CachedLogitsKDLoss:
             [local_missing], device=student_logits.device, dtype=torch.bool
         )
         if self.tp_size > 1:
-            dist.all_reduce(missing_any_tp, op=dist.ReduceOp.BOR, group=self.tp_group)
+            dist.all_reduce(missing_any_tp, op=dist.ReduceOp.MAX, group=self.tp_group)
         if missing_any_tp.item():
             logger.warning(f"Skipping KD for TP rank {self.tp_rank} due to missing teacher data for iteration {iteration}")
             # Sum over vocab so shape matches topk_kl_div (B, S); *0 keeps a grad path from logits.

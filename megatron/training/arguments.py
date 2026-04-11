@@ -2361,11 +2361,16 @@ def _add_logging_args(parser):
                        help='Directory to save logits.')
     group.add_argument('--logits-save-compress', action='store_true', default=False,
                        help='Use zstd compression for logits.')
+    group.add_argument('--logits-save-flush-interval', type=int, default=1,
+                       help='Number of iterations to buffer in memory before '
+                            'flushing as a single tar archive. 1 (default) '
+                            'preserves the legacy one-file-per-iteration behaviour. '
+                            'Higher values reduce inode usage.')
     group.add_argument('--logits-load-dir', type=str, default=None,
                        help='Directory to load logits.')
-    group.add_argument('--logits-load-num-workers', type=int, default=1,
+    group.add_argument('--logits-load-num-workers', type=int, default=4,
                        help='Number of workers for loading logits.')
-    group.add_argument('--logits-load-prefetch-factor', type=int, default=2,
+    group.add_argument('--logits-load-prefetch-factor', type=int, default=4,
                        help='Prefetch factor for loading logits.')
     group.add_argument('--logits-load-kd-loss-alpha', type=float, default=0.65,
                        help='KD loss alpha for loading logits.')
