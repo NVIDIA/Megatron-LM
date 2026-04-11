@@ -865,6 +865,7 @@ class TextGenerationController:
         (scattered along the first dimension) between MTP depths to avoid a
         redundant gather + scatter round-trip per depth.
         """
+        nvtx_range_push("mtp-spec-decoding/serial-mtp-init")
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
@@ -925,6 +926,7 @@ class TextGenerationController:
                 )
 
         num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+        nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
         for depth in range(num_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
             position_ids = (base_position + depth).unsqueeze(0)  # [1, active_request_count]
@@ -1109,6 +1111,7 @@ class TextGenerationController:
         # Get the logit indices for tokens that need sampling.
         # These indices are always needed for input_ids slicing and tracking
         # accepted sequence positions, even when logits are pre-sliced.
+        nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         required_logit_indices = context.speculative_required_logit_indices(logits.device)
 
         if context.config.materialize_only_last_token_logits:
@@ -1118,13 +1121,17 @@ class TextGenerationController:
             required_logits = logits.squeeze(0)[
                 required_logit_indices, :
             ]  # Shape [num_required, vocab_size]
+        nvtx_range_pop("mtp-spec-decoding/verify/logit-indices")
 
         # Sample tokens from logits
+        nvtx_range_push("mtp-spec-decoding/verify/sample")
         output_tokens, repeats = self._sample_speculative_logits(
             required_logits, request_in_prefill_status_tensor
         )
+        nvtx_range_pop("mtp-spec-decoding/verify/sample")
 
         # Verify speculative tokens against input tokens.
+        nvtx_range_push("mtp-spec-decoding/verify/verify-tokens")
         input_tokens_required = input_ids[0, required_logit_indices]
         last_one_indices, accepted_tokens_mask, input_tokens_required = (
             self._verify_speculative_tokens(
@@ -1137,7 +1144,9 @@ class TextGenerationController:
                 active_request_count,
             )
         )
-   
+        nvtx_range_pop("mtp-spec-decoding/verify/verify-tokens")
+
+        nvtx_range_push("mtp-spec-decoding/verify/prepare-next")
         self._prepare_speculative_tokens_for_next_forward_pass(
             num_decode_requests,
             output_tokens,
@@ -1146,6 +1155,7 @@ class TextGenerationController:
             accepted_tokens_mask,
             input_tokens_required,
         )
+        nvtx_range_pop("mtp-spec-decoding/verify/prepare-next")
 
     @torch.compile()
     def _prepare_speculative_tokens_for_next_forward_pass(
