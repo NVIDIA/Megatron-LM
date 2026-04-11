@@ -1048,9 +1048,8 @@ class TextGenerationController:
         last_one_indices = torch.full((active_request_count,), -1, device=device, dtype=torch.long)
 
         # Vectorized decode token verification
-        # Using .view(-1, ...) safely handles cases where num_decode_requests == 0 without python branches
-        decode_inputs = input_tokens_required[:decode_len].view(-1, self.num_speculative_tokens + 1)
-        decode_outputs = output_tokens[:decode_len].view(-1, self.num_speculative_tokens + 1)
+        decode_inputs = input_tokens_required[:decode_len].view(num_decode_requests, self.num_speculative_tokens + 1)
+        decode_outputs = output_tokens[:decode_len].view(num_decode_requests, self.num_speculative_tokens + 1)
         decode_outputs_shifted = decode_outputs.roll(1, dims=1)
 
         # Functionally build the mask: The first token (base token) is always accepted
