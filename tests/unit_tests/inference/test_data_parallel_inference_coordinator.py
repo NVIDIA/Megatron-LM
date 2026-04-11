@@ -2,20 +2,20 @@
 
 import asyncio
 import itertools
+import logging
 import multiprocessing
 import os
 import time
 import unittest.mock
 from collections import deque
 from typing import Dict, Optional
-
 import msgpack
 import pytest
 import torch
-
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference import data_parallel_inference_coordinator as coordinator_module
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
@@ -246,6 +246,366 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
 
     if client is not None:
         client.stop()
+
+
+class TestCoordinatorProtocolRobustness:
+    """Validation and error-handling coverage for coordinator inbound messages."""
+
+    def _make_minimal_coordinator(self):
+        coordinator = object.__new__(DataParallelInferenceCoordinator)
+        coordinator.identities_of_data_parallel_ranks = deque([b"engine_0"])
+        coordinator.request_id_to_client_id = {}
+        coordinator.request_id_to_client_request_id = {}
+        coordinator.next_request_id = 0
+        coordinator.prefix_caching_coordinator_policy = None
+        coordinator.schedule_records = None
+        coordinator.identity_to_rank_index = {b"engine_0": 0}
+        coordinator.state = DataParallelInferenceCoordinator.CoordinatorState.RUNNING
+        coordinator.compute_request_hashes = unittest.mock.MagicMock(return_value=[])
+        coordinator.get_best_data_parallel_rank = unittest.mock.MagicMock(return_value=b"engine_0")
+        coordinator._send_to_engine = unittest.mock.MagicMock(return_value=True)
+        coordinator._update_rank_hashes = unittest.mock.MagicMock()
+        coordinator._log_protocol_error = unittest.mock.MagicMock()
+        return coordinator
+
+    @pytest.mark.unit
+    def test_validate_message_none(self):
+        is_valid, reason = DataParallelInferenceCoordinator.validate_message(None)
+        assert not is_valid
+        assert reason == "payload is None"
+
+    @pytest.mark.unit
+    def test_validate_message_non_sequence(self):
+        is_valid, reason = DataParallelInferenceCoordinator.validate_message({"type": "bad"})
+        assert not is_valid
+        assert reason == "payload must be a list or tuple"
+
+    @pytest.mark.unit
+    def test_validate_message_unknown_type(self):
+        is_valid, reason = DataParallelInferenceCoordinator.validate_message([9999])
+        assert not is_valid
+        assert reason == "unknown message type"
+
+    @pytest.mark.unit
+    def test_validate_message_missing_type(self):
+        is_valid, reason = DataParallelInferenceCoordinator.validate_message([])
+        assert not is_valid
+        assert reason == "payload must be non-empty"
+
+    @pytest.mark.unit
+    def test_validate_submit_request_wrong_field_types(self):
+        payload = [Headers.SUBMIT_REQUEST.value, "bad-id", 1.23, []]
+        is_valid, reason = DataParallelInferenceCoordinator.validate_message(payload)
+        assert not is_valid
+        assert reason == "SUBMIT_REQUEST request_id must be int"
+
+    @pytest.mark.unit
+    def test_validate_submit_request_valid_payload(self):
+        payload = [Headers.SUBMIT_REQUEST.value, 1, "hello", {"temperature": 0.0}]
+        is_valid, reason = DataParallelInferenceCoordinator.validate_message(payload)
+        assert is_valid
+        assert reason is None
+
+    @pytest.mark.unit
+    def test_validate_set_generation_epoch_wrong_type(self):
+        payload = [Headers.SET_GENERATION_EPOCH.value, "not-an-int"]
+        is_valid, reason = DataParallelInferenceCoordinator.validate_message(payload)
+        assert not is_valid
+        assert reason == "SET_GENERATION_EPOCH epoch value must be int"
+
+    @pytest.mark.unit
+    def test_handle_message_unknown_header_no_crash_logs_client_error(self):
+        coordinator = self._make_minimal_coordinator()
+
+        should_stop = DataParallelInferenceCoordinator.handle_message(
+            coordinator, [9999], b"client_0", set()
+        )
+
+        assert should_stop is False
+        coordinator._log_protocol_error.assert_called_once()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "client_error"
+        assert "unknown message type" in args[1]
+
+    @pytest.mark.unit
+    def test_handle_engine_reply_from_unknown_sender_no_assert(self):
+        coordinator = self._make_minimal_coordinator()
+
+        should_stop = DataParallelInferenceCoordinator.handle_message(
+            coordinator,
+            [Headers.ENGINE_REPLY.value, []],
+            b"unknown_engine",
+            set(),
+        )
+
+        assert should_stop is False
+        coordinator._log_protocol_error.assert_called_once()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "client_error"
+        assert "unknown engine identity" in args[1]
+
+    @pytest.mark.unit
+    def test_handle_message_none_no_crash(self):
+        coordinator = self._make_minimal_coordinator()
+
+        should_stop = DataParallelInferenceCoordinator.handle_message(
+            coordinator, None, b"client_0", set()
+        )
+
+        assert should_stop is False
+        coordinator._log_protocol_error.assert_called_once()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "client_error"
+        assert "payload is None" in args[1]
+
+    @pytest.mark.unit
+    def test_submit_request_invalid_prompt_type_logs_client_error_and_no_state_leak(self):
+        coordinator = self._make_minimal_coordinator()
+        known_clients = {b"client_0"}
+
+        should_stop = coordinator._process_valid_message(
+            [Headers.SUBMIT_REQUEST.value, 17, 12345, {}], b"client_0", known_clients
+        )
+
+        assert should_stop is False
+        assert coordinator.request_id_to_client_id == {}
+        assert coordinator.request_id_to_client_request_id == {}
+        coordinator._log_protocol_error.assert_called()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "client_error"
+        assert "unsupported prompt type" in args[1]
+
+    @pytest.mark.unit
+    def test_submit_request_invalid_prompt_list_contents_logs_client_error_and_no_state_leak(self):
+        coordinator = self._make_minimal_coordinator()
+        known_clients = {b"client_0"}
+        coordinator.compute_request_hashes = unittest.mock.MagicMock(
+            side_effect=ValueError("bad prompt list contents")
+        )
+
+        should_stop = coordinator._process_valid_message(
+            [Headers.SUBMIT_REQUEST.value, 18, ["valid", None], {}],
+            b"client_0",
+            known_clients,
+        )
+
+        assert should_stop is False
+        assert coordinator.request_id_to_client_id == {}
+        assert coordinator.request_id_to_client_request_id == {}
+        coordinator._log_protocol_error.assert_called()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "client_error"
+        assert "invalid SUBMIT_REQUEST payload" in args[1]
+
+    @pytest.mark.unit
+    def test_submit_request_invalid_sampling_params_rejected_as_client_error(self):
+        coordinator = self._make_minimal_coordinator()
+
+        should_stop = DataParallelInferenceCoordinator.handle_message(
+            coordinator,
+            [Headers.SUBMIT_REQUEST.value, 7, "hello", 123],
+            b"client_0",
+            {b"client_0"},
+        )
+
+        assert should_stop is False
+        coordinator._log_protocol_error.assert_called_once()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "client_error"
+        assert "sampling_params must be dict" in args[1]
+
+    @pytest.mark.unit
+    def test_submit_request_exception_cleans_state(self):
+        coordinator = self._make_minimal_coordinator()
+        coordinator.compute_request_hashes = unittest.mock.MagicMock(
+            side_effect=RuntimeError("explode while hashing")
+        )
+
+        should_stop = DataParallelInferenceCoordinator.handle_message(
+            coordinator,
+            [Headers.SUBMIT_REQUEST.value, 19, [1, 2, 3, 4], {}],
+            b"client_0",
+            {b"client_0"},
+        )
+
+        assert should_stop is False
+        assert coordinator.request_id_to_client_id == {}
+        assert coordinator.request_id_to_client_request_id == {}
+        coordinator._log_protocol_error.assert_called_once()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "internal_error"
+        assert "explode while hashing" in args[1]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("bad_frames", [[], [b"only_identity"], [b"a", b"b", b"c"]])
+    def test_invalid_multipart_frame_no_crash(self, bad_frames):
+        coordinator = self._make_minimal_coordinator()
+        valid_payload = msgpack.packb([Headers.CONNECT.value], use_bin_type=True)
+        coordinator.router_socket = unittest.mock.MagicMock()
+        coordinator.router_socket.recv_multipart.side_effect = [bad_frames, [b"client_0", valid_payload]]
+        coordinator.handle_message = unittest.mock.MagicMock(return_value=True)
+        coordinator._log_protocol_error = unittest.mock.MagicMock()
+
+        coordinator.start()
+
+        coordinator._log_protocol_error.assert_called()
+        first_call_args = coordinator._log_protocol_error.call_args_list[0][0]
+        assert first_call_args[0] == "client_error"
+        assert "invalid multipart frame count" in first_call_args[1]
+
+    @pytest.mark.unit
+    def test_unknown_client_message_handled_as_client_error(self):
+        coordinator = self._make_minimal_coordinator()
+
+        should_stop = coordinator._process_valid_message(
+            [Headers.SUBMIT_REQUEST.value, 11, "prompt", {}],
+            b"unknown_client",
+            set(),
+        )
+
+        assert should_stop is False
+        coordinator._log_protocol_error.assert_called_once()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "client_error"
+        assert "unknown client" in args[1]
+
+    @pytest.mark.unit
+    def test_internal_exception_classified_correctly(self):
+        coordinator = self._make_minimal_coordinator()
+        coordinator._process_valid_message = unittest.mock.MagicMock(
+            side_effect=RuntimeError("unexpected internal failure")
+        )
+
+        should_stop = DataParallelInferenceCoordinator.handle_message(
+            coordinator, [Headers.CONNECT.value], b"client_0", set()
+        )
+
+        assert should_stop is False
+        coordinator._log_protocol_error.assert_called_once()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "internal_error"
+        assert "unexpected internal failure" in args[1]
+
+    @pytest.mark.unit
+    def test_duplicate_engine_identity_no_assert(self, monkeypatch):
+        class _FakePipe:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, value):
+                self.sent.append(value)
+
+            def close(self):
+                return None
+
+        class _FakeSocket:
+            def __init__(self):
+                self._recv = iter(
+                    [
+                        [b"bad_frame"],
+                        [b"engine_0", b""],
+                        [b"engine_0", b""],
+                        [b"engine_1", b""],
+                    ]
+                )
+
+            def setsockopt(self, *_args, **_kwargs):
+                return None
+
+            def bind(self, *_args, **_kwargs):
+                return None
+
+            def bind_to_random_port(self, *_args, **_kwargs):
+                return 5555
+
+            def getsockopt_string(self, *_args, **_kwargs):
+                return "tcp://fake:5555"
+
+            def recv_multipart(self):
+                return next(self._recv)
+
+        class _FakeContext:
+            def __init__(self):
+                self._socket = _FakeSocket()
+
+            def socket(self, *_args, **_kwargs):
+                return self._socket
+
+        class _FakeZmqError(Exception):
+            def __init__(self, errno=None):
+                self.errno = errno
+
+        class _FakeZmq:
+            ROUTER = object()
+            ROUTER_MANDATORY = object()
+            LAST_ENDPOINT = object()
+            EHOSTUNREACH = -1
+
+            class error:
+                ZMQError = _FakeZmqError
+
+            @staticmethod
+            def Context():
+                return _FakeContext()
+
+        log_mock = unittest.mock.MagicMock()
+        monkeypatch.setattr(coordinator_module, "HAVE_ZMQ", True)
+        monkeypatch.setattr(coordinator_module, "HAVE_MSGPACK", True)
+        monkeypatch.setattr(coordinator_module, "zmq", _FakeZmq)
+        monkeypatch.setattr(
+            coordinator_module.DataParallelInferenceCoordinator,
+            "_log_protocol_error",
+            staticmethod(log_mock),
+        )
+
+        coordinator = coordinator_module.DataParallelInferenceCoordinator(
+            pipe_connection=_FakePipe(),
+            data_parallel_size=2,
+            tokenizer=DummyTokenizer(),
+            inference_coordinator_port=None,
+        )
+
+        assert len(coordinator.identities_of_data_parallel_ranks) == 2
+        assert b"engine_0" in coordinator.identities_of_data_parallel_ranks
+        assert b"engine_1" in coordinator.identities_of_data_parallel_ranks
+        assert any(
+            call[0][0] == "client_error" and "duplicate engine identity" in call[0][1]
+            for call in log_mock.call_args_list
+        )
+        assert any(
+            call[0][0] == "client_error" and "invalid registration frame count" in call[0][1]
+            for call in log_mock.call_args_list
+        )
+
+    @pytest.mark.unit
+    def test_stress_invalid_messages_sequence_no_state_accumulation(self):
+        coordinator = self._make_minimal_coordinator()
+        known_clients = {b"client_0"}
+
+        coordinator.compute_request_hashes = unittest.mock.MagicMock(
+            side_effect=ValueError("bad prompt")
+        )
+
+        invalid_messages = [
+            None,
+            "not-a-payload",
+            [],
+            [9999],
+            [Headers.SUBMIT_REQUEST.value, 1, 1234, {}],
+            [Headers.SUBMIT_REQUEST.value, 2, ["ok", None], {}],
+            [Headers.SUBMIT_REQUEST.value, 3, "ok", "bad_sampling"],
+        ]
+
+        for msg in invalid_messages:
+            DataParallelInferenceCoordinator.handle_message(
+                coordinator,
+                msg,
+                b"client_0",
+                known_clients,
+            )
+
+        assert coordinator.request_id_to_client_id == {}
+        assert coordinator.request_id_to_client_request_id == {}
 
 
 @pytest.fixture

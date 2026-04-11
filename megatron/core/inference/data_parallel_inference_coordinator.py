@@ -10,11 +10,10 @@ from collections import deque
 from enum import Enum, auto
 from multiprocessing import Event
 from multiprocessing.connection import Connection
-
+from typing import Any, Optional, Tuple
 import torch
-
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
-from megatron.core.inference.headers import Headers, UnknownHeaderError
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -36,8 +35,9 @@ except:
 
 # Register faulthandler to emit stack traces upon process kill.
 faulthandler.enable()
-faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
-faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
+if hasattr(faulthandler, "register"):
+    faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
+    faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
 
 
 class DataParallelInferenceCoordinator:
@@ -163,9 +163,23 @@ class DataParallelInferenceCoordinator:
         # First wait for all data parallel ranks to establish connections.
         self.identities_of_data_parallel_ranks = deque([])
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
-        for _ in range(data_parallel_size):
-            identity, _ = self.router_socket.recv_multipart()
-            assert identity not in self.identities_of_data_parallel_ranks
+        while len(self.identities_of_data_parallel_ranks) < data_parallel_size:
+            frames = self.router_socket.recv_multipart()
+            if len(frames) != 2:
+                self._log_protocol_error(
+                    "client_error",
+                    f"invalid registration frame count: expected 2, got {len(frames)}",
+                    "ENGINE_REGISTRATION",
+                )
+                continue
+            identity, _ = frames
+            if identity in self.identities_of_data_parallel_ranks:
+                self._log_protocol_error(
+                    "client_error",
+                    f"duplicate engine identity during registration: {identity}",
+                    "ENGINE_REGISTRATION",
+                )
+                continue
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
 
@@ -301,78 +315,186 @@ class DataParallelInferenceCoordinator:
         for h in request_hashes:
             self.hash_to_rank_info.setdefault(h, {})[rank_identity] = ts
 
-    def start(self):
+    @staticmethod
+    def _message_type_from_payload(msg: Any) -> Optional[str]:
+        """Best-effort extraction of message type for logs."""
+        if not isinstance(msg, (list, tuple)) or len(msg) == 0:
+            return None
+
+        raw_type = msg[0]
+        if isinstance(raw_type, Headers):
+            return raw_type.name
+
+        try:
+            return Headers(raw_type).name
+        except Exception:
+            return str(raw_type)
+
+    @staticmethod
+    def _log_protocol_error(error_type: str, reason: str, message_type: Optional[str] = None):
+        """Log concise structured protocol errors."""
+        fields = {
+            "error_type": error_type,
+            "message_type": message_type,
+            "reason": reason,
+        }
+        log_fn = logging.warning if error_type == "client_error" else logging.error
+        log_fn("Coordinator protocol error: %s", fields)
+
+    @staticmethod
+    def validate_message(msg: Any) -> Tuple[bool, Optional[str]]:
+        """Validate inbound coordinator payloads.
+
+        Returns:
+            (True, None) if valid.
+            (False, reason) if invalid.
         """
-        Starts the main event loop for the coordinator.
+        if msg is None:
+            return False, "payload is None"
+        if not isinstance(msg, (list, tuple)):
+            return False, "payload must be a list or tuple"
+        if len(msg) == 0:
+            return False, "payload must be non-empty"
 
-        This method runs an infinite loop, continuously listening for incoming
-        messages on the ZMQ ROUTER socket. It parses the message header to
-        determine the message type and takes appropriate action, such as
-        handling new client connections, forwarding requests, broadcasting
-        control signals, or processing replies from the engines.
+        raw_header = msg[0]
+        try:
+            header = raw_header if isinstance(raw_header, Headers) else Headers(raw_header)
+        except Exception:
+            return False, "unknown message type"
+
+        if header == Headers.CONNECT:
+            if len(msg) != 1:
+                return False, "CONNECT payload must contain only header"
+            return True, None
+
+        if header == Headers.SUBMIT_REQUEST:
+            if len(msg) != 4:
+                return False, "SUBMIT_REQUEST payload must have 4 fields"
+            if not isinstance(msg[1], int):
+                return False, "SUBMIT_REQUEST request_id must be int"
+            if not isinstance(msg[2], (str, list, torch.Tensor)):
+                return False, "SUBMIT_REQUEST prompt must be str, list, or Tensor"
+            if not isinstance(msg[3], dict):
+                return False, "SUBMIT_REQUEST sampling_params must be dict"
+            return True, None
+
+        if header == Headers.ENGINE_REPLY:
+            if len(msg) != 2:
+                return False, "ENGINE_REPLY payload must have 2 fields"
+            if not isinstance(msg[1], list):
+                return False, "ENGINE_REPLY finished_requests must be list"
+            return True, None
+
+        if header in (
+            Headers.PAUSE,
+            Headers.UNPAUSE,
+            Headers.SUSPEND,
+            Headers.RESUME,
+            Headers.STOP,
+            Headers.DISCONNECT,
+            Headers.SHUTDOWN,
+        ):
+            if len(msg) != 1:
+                return False, f"{header.name} payload must contain only header"
+            return True, None
+
+        if header == Headers.SET_GENERATION_EPOCH:
+            if len(msg) < 2:
+                return False, "SET_GENERATION_EPOCH payload must include epoch value"
+            if not isinstance(msg[1], int):
+                return False, "SET_GENERATION_EPOCH epoch value must be int"
+            return True, None
+
+        return False, "unknown message type"
+
+    def handle_message(self, msg: Any, sender_identity: bytes, known_clients: set[bytes]) -> bool:
+        """Validate and safely process one inbound message.
+
+        Returns:
+            True if the coordinator should stop; otherwise False.
         """
-        # Todo [Siddharth]: Make this more robust to handle invalid messages.
-        known_clients = set()
-        while True:
-            sender_identity, serialized_payload = self.router_socket.recv_multipart()
+        message_type = self._message_type_from_payload(msg)
+        is_valid, reason = self.validate_message(msg)
+        if not is_valid:
+            self._log_protocol_error("client_error", reason or "invalid payload", message_type)
+            return False
 
-            # Allow for re-registration if connecting to a running coordinator.
-            if serialized_payload == b"":
-                if sender_identity not in self.identities_of_data_parallel_ranks:
-                    self.identities_of_data_parallel_ranks.append(sender_identity)
-                continue
+        try:
+            return self._process_valid_message(msg, sender_identity, known_clients)
+        except Exception as e:
+            self._log_protocol_error("internal_error", str(e), message_type)
+            return False
 
-            deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
-            header = Headers(deserialized_payload[0])
+    def _process_valid_message(self, deserialized_payload, sender_identity, known_clients):
+        """Process one already-validated payload."""
+        header = deserialized_payload[0]
+        if not isinstance(header, Headers):
+            header = Headers(header)
 
-            if header == Headers.CONNECT:
-                if sender_identity in known_clients:
-                    logging.info(
-                        f"Client {sender_identity} sent a duplicate connect request. Ignoring .."
-                    )
-                    continue
-
-                # print(f"New client connected: {sender_identity}")
-                known_clients.add(sender_identity)
-                self.router_socket.send_multipart(
-                    [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+        if header == Headers.CONNECT:
+            if sender_identity in known_clients:
+                self._log_protocol_error(
+                    "client_error",
+                    f"duplicate CONNECT from client {sender_identity}",
+                    header.name,
                 )
+                return False
 
-            elif header == Headers.SUBMIT_REQUEST:
-                # ToDo [Siddharth]: We might want to tokenize the prompt on the
-                # assigned data parallel rank for this process instead
-                # of the coordinator.
+            known_clients.add(sender_identity)
+            self.router_socket.send_multipart(
+                [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+            )
+            return False
 
-                # Message from a known client
-                if sender_identity not in known_clients:
-                    logging.info(
-                        f"Received message from unknown client {sender_identity}. Ignoring."
-                    )
-                    continue
-                # this is a message from a client.
-                # route it to a data parallel rank
-                client_request_id, prompt, sampling_params = deserialized_payload[1:]
-                # map client request_id to server request_id
-                # necessary because multiple clients might have the same request_id.
-                request_id = self.next_request_id
-                self.next_request_id += 1
-                self.request_id_to_client_id[request_id] = sender_identity
-                self.request_id_to_client_request_id[request_id] = client_request_id
+        if header == Headers.SUBMIT_REQUEST:
+            # Message from a known client.
+            if sender_identity not in known_clients:
+                self._log_protocol_error(
+                    "client_error",
+                    f"SUBMIT_REQUEST from unknown client {sender_identity}",
+                    header.name,
+                )
+                return False
 
+            client_request_id = deserialized_payload[1]
+            prompt = deserialized_payload[2]
+            sampling_params = deserialized_payload[3]
+
+            # Map client request_id to server request_id.
+            request_id = self.next_request_id
+            self.next_request_id += 1
+            self.request_id_to_client_id[request_id] = sender_identity
+            self.request_id_to_client_request_id[request_id] = client_request_id
+            request_succeeded = False
+            try:
                 # Serialize prompt.
-                if isinstance(prompt, (str, list)):
-                    pass
-                elif isinstance(prompt, torch.Tensor):
-                    prompt = prompt.tolist()
-                else:
-                    raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
+                try:
+                    if isinstance(prompt, (str, list)):
+                        pass
+                    elif isinstance(prompt, torch.Tensor):
+                        prompt = prompt.tolist()
+                    else:
+                        self._log_protocol_error(
+                            "client_error",
+                            f"unsupported prompt type: {type(prompt).__name__}",
+                            header.name,
+                        )
+                        return False
 
-                payload = msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
-                    use_bin_type=True,
-                )
+                    payload = msgpack.packb(
+                        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
+                        use_bin_type=True,
+                    )
 
-                request_hashes = self.compute_request_hashes(prompt)
+                    request_hashes = self.compute_request_hashes(prompt)
+                except (TypeError, ValueError) as e:
+                    self._log_protocol_error(
+                        "client_error",
+                        f"invalid SUBMIT_REQUEST payload: {e}",
+                        header.name,
+                    )
+                    return False
+
                 if (
                     self.prefix_caching_coordinator_policy
                     == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
@@ -387,9 +509,7 @@ class DataParallelInferenceCoordinator:
                 else:
                     # If all engines have died, we are in an abnormal state, and must exit cleanly.
                     logging.error("Coordinator: no reachable engines for request %d", request_id)
-                    del self.request_id_to_client_id[request_id]
-                    del self.request_id_to_client_request_id[request_id]
-                    return
+                    return True
 
                 if request_hashes:
                     self._update_rank_hashes(next_identity, request_hashes)
@@ -401,98 +521,202 @@ class DataParallelInferenceCoordinator:
                             "num_hashes": len(request_hashes),
                         }
                     )
+                request_succeeded = True
+                return False
+            finally:
+                if not request_succeeded:
+                    self.request_id_to_client_id.pop(request_id, None)
+                    self.request_id_to_client_request_id.pop(request_id, None)
 
-            elif header in (
-                Headers.PAUSE,
-                Headers.UNPAUSE,
-                Headers.SUSPEND,
-                Headers.RESUME,
-                Headers.SET_GENERATION_EPOCH,
-                Headers.STOP,
-            ):
-                # Start by checking the current state against the control signal.
-                if sender_identity not in known_clients:
-                    logging.warning("Coordinator: ignoring signal from unknown client.")
-                    continue
+        if header in (
+            Headers.PAUSE,
+            Headers.UNPAUSE,
+            Headers.SUSPEND,
+            Headers.RESUME,
+            Headers.SET_GENERATION_EPOCH,
+            Headers.STOP,
+        ):
+            # Start by checking the current state against the control signal.
+            if sender_identity not in known_clients:
+                self._log_protocol_error(
+                    "client_error",
+                    f"{header.name} signal from unknown client {sender_identity}",
+                    header.name,
+                )
+                return False
 
-                if header == Headers.PAUSE:
-                    idem_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
-                    if self.state == self.CoordinatorState.RUNNING:
-                        self.state = self.CoordinatorState.PAUSED
-                    elif self.state in idem_states:
-                        # Already paused/suspended, ignore redundant PAUSE.
-                        continue
-                    else:
-                        logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
-                        continue
-                elif header == Headers.UNPAUSE:
-                    if self.state != self.CoordinatorState.PAUSED:
-                        logging.warning("Coordinator: ignoring UNPAUSE in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.RUNNING
-                elif header == Headers.SUSPEND:
-                    if self.state != self.CoordinatorState.PAUSED:
-                        logging.warning("Coordinator: ignoring SUSPEND in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.SUSPENDED
-                elif header == Headers.RESUME:
-                    if self.state != self.CoordinatorState.SUSPENDED:
-                        logging.warning("Coordinator: ignoring RESUME in state %s", self.state)
-                        continue
+            if header == Headers.PAUSE:
+                idem_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                if self.state == self.CoordinatorState.RUNNING:
                     self.state = self.CoordinatorState.PAUSED
-                elif header == Headers.STOP:
-                    good_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
-                    if self.state not in good_states:
-                        logging.warning("Coordinator: ignoring STOP in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.STOPPING
-
-                # Broadcast the control signal if we're in a good state.
-                # Forward the full deserialized payload so that data-bearing
-                # signals (e.g. SET_GENERATION_EPOCH) retain their arguments.
-                broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
-                for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
-                    self._send_to_engine(data_parallel_rank_id, broadcast_payload)
-
-                # STOP affects engines; reset coordinator to RUNNING to allow future engines.
-                if header == Headers.STOP:
-                    self.state = self.CoordinatorState.RUNNING
-
-            elif header == Headers.ENGINE_REPLY:
-                # This is the output of a single engine step on some data parallel rank.
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                finished_requests = deserialized_payload[1]
-
-                for finished_request in finished_requests:
-                    self.detokenize(finished_request)
-                    fid = finished_request["request_id"]
-                    client_identity = self.request_id_to_client_id[fid]
-                    client_request_identity = self.request_id_to_client_request_id[fid]
-                    del self.request_id_to_client_id[fid]
-                    del self.request_id_to_client_request_id[fid]
-
-                    self.router_socket.send_multipart(
-                        [
-                            client_identity,
-                            msgpack.packb(
-                                [header.value, client_request_identity, finished_request],
-                                use_bin_type=True,
-                            ),
-                        ]
+                elif self.state in idem_states:
+                    # Already paused/suspended, ignore redundant PAUSE.
+                    return False
+                else:
+                    self._log_protocol_error(
+                        "client_error",
+                        f"ignoring PAUSE in state {self.state}",
+                        header.name,
                     )
+                    return False
+            elif header == Headers.UNPAUSE:
+                if self.state != self.CoordinatorState.PAUSED:
+                    self._log_protocol_error(
+                        "client_error",
+                        f"ignoring UNPAUSE in state {self.state}",
+                        header.name,
+                    )
+                    return False
+                self.state = self.CoordinatorState.RUNNING
+            elif header == Headers.SUSPEND:
+                if self.state != self.CoordinatorState.PAUSED:
+                    self._log_protocol_error(
+                        "client_error",
+                        f"ignoring SUSPEND in state {self.state}",
+                        header.name,
+                    )
+                    return False
+                self.state = self.CoordinatorState.SUSPENDED
+            elif header == Headers.RESUME:
+                if self.state != self.CoordinatorState.SUSPENDED:
+                    self._log_protocol_error(
+                        "client_error",
+                        f"ignoring RESUME in state {self.state}",
+                        header.name,
+                    )
+                    return False
+                self.state = self.CoordinatorState.PAUSED
+            elif header == Headers.STOP:
+                good_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                if self.state not in good_states:
+                    self._log_protocol_error(
+                        "client_error",
+                        f"ignoring STOP in state {self.state}",
+                        header.name,
+                    )
+                    return False
+                self.state = self.CoordinatorState.STOPPING
 
-            elif header == Headers.SHUTDOWN:
-                if sender_identity not in known_clients:
-                    logging.warning("Coordinator: ignoring signal from unknown client.")
+            # Broadcast the control signal if we're in a good state.
+            # Forward the full deserialized payload so that data-bearing
+            # signals (e.g. SET_GENERATION_EPOCH) retain their arguments.
+            broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
+            for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
+                self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+
+            # STOP affects engines; reset coordinator to RUNNING to allow future engines.
+            if header == Headers.STOP:
+                self.state = self.CoordinatorState.RUNNING
+            return False
+
+        if header == Headers.ENGINE_REPLY:
+            # This is the output of a single engine step on some data parallel rank.
+            if sender_identity not in self.identities_of_data_parallel_ranks:
+                self._log_protocol_error(
+                    "client_error", "ENGINE_REPLY from unknown engine identity", header.name
+                )
+                return False
+
+            finished_requests = deserialized_payload[1]
+            for finished_request in finished_requests:
+                if not isinstance(finished_request, dict):
+                    self._log_protocol_error(
+                        "client_error", "ENGINE_REPLY item must be dict", header.name
+                    )
                     continue
+
+                fid = finished_request.get("request_id")
+                if not isinstance(fid, int):
+                    self._log_protocol_error(
+                        "client_error", "ENGINE_REPLY item missing valid request_id", header.name
+                    )
+                    continue
+
+                client_identity = self.request_id_to_client_id.get(fid)
+                client_request_identity = self.request_id_to_client_request_id.get(fid)
+                if client_identity is None or client_request_identity is None:
+                    self._log_protocol_error(
+                        "client_error", f"unknown completed request_id: {fid}", header.name
+                    )
+                    continue
+
+                try:
+                    self.detokenize(finished_request)
+                except Exception as e:
+                    self._log_protocol_error(
+                        "client_error",
+                        f"failed to detokenize finished request: {e}",
+                        header.name,
+                    )
+                    continue
+
+                del self.request_id_to_client_id[fid]
+                del self.request_id_to_client_request_id[fid]
+
+                self.router_socket.send_multipart(
+                    [
+                        client_identity,
+                        msgpack.packb(
+                            [header.value, client_request_identity, finished_request],
+                            use_bin_type=True,
+                        ),
+                    ]
+                )
+            return False
+
+        if header == Headers.SHUTDOWN:
+            if sender_identity not in known_clients:
+                self._log_protocol_error(
+                    "client_error",
+                    f"SHUTDOWN signal from unknown client {sender_identity}",
+                    header.name,
+                )
+                return False
+            return True
+
+        if header == Headers.DISCONNECT:
+            if sender_identity in self.identities_of_data_parallel_ranks:
+                self._remove_engine(sender_identity)
+            return False
+
+        self._log_protocol_error("client_error", "unknown message type", str(header))
+        return False
+
+    def start(self):
+        """
+        Starts the main event loop for the coordinator.
+
+        This method runs an infinite loop, continuously listening for incoming
+        messages on the ZMQ ROUTER socket. It parses the message header to
+        determine the message type and takes appropriate action, such as
+        handling new client connections, forwarding requests, broadcasting
+        control signals, or processing replies from the engines.
+        """
+        known_clients = set()
+        while True:
+            frames = self.router_socket.recv_multipart()
+            if len(frames) != 2:
+                self._log_protocol_error(
+                    "client_error",
+                    f"invalid multipart frame count: expected 2, got {len(frames)}",
+                )
+                continue
+            sender_identity, serialized_payload = frames
+
+            # Allow for re-registration if connecting to a running coordinator.
+            if serialized_payload == b"":
+                if sender_identity not in self.identities_of_data_parallel_ranks:
+                    self.identities_of_data_parallel_ranks.append(sender_identity)
+                continue
+
+            try:
+                deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
+            except Exception as e:
+                self._log_protocol_error("client_error", f"failed to decode payload: {e}")
+                continue
+
+            if self.handle_message(deserialized_payload, sender_identity, known_clients):
                 break
-
-            elif header == Headers.DISCONNECT:
-                if sender_identity in self.identities_of_data_parallel_ranks:
-                    self._remove_engine(sender_identity)
-
-            else:
-                raise UnknownHeaderError(header)
 
     def detokenize(self, finished_request):
         """
