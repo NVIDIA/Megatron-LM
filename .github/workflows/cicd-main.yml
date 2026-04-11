@@ -28,6 +28,10 @@ on:
         description: "Comma-separated list of test cases to run, or 'all'"
         required: false
         default: "all"
+      test_type:
+        description: "Which test types to run: 'both', 'unit', or 'functional'"
+        required: false
+        default: "both"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref || github.ref }}
@@ -590,6 +594,7 @@ jobs:
       needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
+      && (github.event.inputs.test_type == '' || github.event.inputs.test_type == 'unit' || github.event.inputs.test_type == 'both')
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -626,6 +631,7 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-parse-unit-tests.result != 'cancelled'
+      && (github.event.inputs.test_type == '' || github.event.inputs.test_type == 'unit' || github.event.inputs.test_type == 'both')
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -664,11 +670,13 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && (github.event.inputs.test_type == '' || github.event.inputs.test_type == 'functional' || github.event.inputs.test_type == 'both')
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
+        || needs.cicd-unit-tests-latest.result == 'skipped'
       )
       && !cancelled()
     outputs:
@@ -735,11 +743,13 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-integration-tests-h100.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && (github.event.inputs.test_type == '' || github.event.inputs.test_type == 'functional' || github.event.inputs.test_type == 'both')
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
+        || needs.cicd-unit-tests-latest.result == 'skipped'
       )
       && !cancelled()
     steps:
@@ -775,11 +785,13 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && (github.event.inputs.test_type == '' || github.event.inputs.test_type == 'functional' || github.event.inputs.test_type == 'both')
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
+        || needs.cicd-unit-tests-latest.result == 'skipped'
       )
       && !cancelled()
     outputs:
@@ -847,11 +859,13 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-integration-tests-gb200.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && (github.event.inputs.test_type == '' || github.event.inputs.test_type == 'functional' || github.event.inputs.test_type == 'both')
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
+        || needs.cicd-unit-tests-latest.result == 'skipped'
       )
       && !cancelled()
     steps:
@@ -907,6 +921,7 @@ jobs:
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
+          TEST_TYPE: ${{ github.event.inputs.test_type }}
         run: |
           # Docs-only and deployment workflows intentionally skip all tests
           if [ "$DOCS_ONLY" == "true" ] || [ "$IS_DEPLOYMENT" == "true" ]; then
@@ -916,21 +931,28 @@ jobs:
 
           FAILED=false
 
-          # Unit tests must always succeed (never skipped or cancelled)
+          # Unit tests: allowed to be skipped when test_type == 'functional'
           if [ "$UNIT_RESULT" != "success" ]; then
-            echo "❌ cicd-unit-tests-latest: $UNIT_RESULT"
-            FAILED=true
+            if [ "$TEST_TYPE" == "functional" ] && [ "$UNIT_RESULT" == "skipped" ]; then
+              echo "⏭️ cicd-unit-tests-latest: skipped (test_type=functional)"
+            else
+              echo "❌ cicd-unit-tests-latest: $UNIT_RESULT"
+              FAILED=true
+            fi
           fi
 
-          # H100 integration tests must always succeed
+          # H100 integration tests: allowed to be skipped when test_type == 'unit'
           if [ "$H100_RESULT" != "success" ]; then
-            echo "❌ cicd-integration-tests-latest-h100: $H100_RESULT"
-            FAILED=true
+            if [ "$TEST_TYPE" == "unit" ] && [ "$H100_RESULT" == "skipped" ]; then
+              echo "⏭️ cicd-integration-tests-latest-h100: skipped (test_type=unit)"
+            else
+              echo "❌ cicd-integration-tests-latest-h100: $H100_RESULT"
+              FAILED=true
+            fi
           fi
 
-          # GB200 integration tests may be skipped only for non-maintainer PRs
-          # (no GB200 runners available); maintainer runs must always succeed
-          if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+          # GB200 integration tests may be skipped for non-maintainer PRs or when test_type == 'unit'
+          if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ] && [ "$TEST_TYPE" != "unit" ]; then
             echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
             FAILED=true
           elif [ "$GB200_RESULT" != "success" ] && [ "$GB200_RESULT" != "skipped" ]; then
