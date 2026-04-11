@@ -1101,12 +1101,6 @@ class TextGenerationController:
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
             context.paused_request_count : context.total_request_count
         ]
-        request_query_lengths = context.request_query_lengths[
-            context.paused_request_count : context.total_request_count
-        ]
-
-        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
-        num_decode_requests = active_request_count - num_prefill_requests
 
         # Get the logit indices for tokens that need sampling.
         # These indices are always needed for input_ids slicing and tracking
@@ -1129,6 +1123,9 @@ class TextGenerationController:
             required_logits, request_in_prefill_status_tensor
         )
         nvtx_range_pop("mtp-spec-decoding/verify/sample")
+
+        num_prefill_requests = context.num_prefill_requests
+        num_decode_requests = active_request_count - num_prefill_requests
 
         # Verify speculative tokens against input tokens.
         nvtx_range_push("mtp-spec-decoding/verify/verify-tokens")
