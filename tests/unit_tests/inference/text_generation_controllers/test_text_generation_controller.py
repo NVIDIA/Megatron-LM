@@ -1124,6 +1124,9 @@ class TestTextGenerationController:
 
         # Override sampling to return our predictable mock outputs
         self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
+        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
+            torch.tensor([0, 1], device='cuda', dtype=torch.long)
+        ]
         self.text_generation_controller._torch_sampling_func = mock.MagicMock(
             side_effect=mock_sampling_func
         )
