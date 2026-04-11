@@ -1255,6 +1255,9 @@ class TestTextGenerationController:
         # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
         # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
         self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
+        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
+            torch.tensor([0, 1], device='cuda', dtype=torch.long)
+        ]
 
         # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
         # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
@@ -1494,6 +1497,9 @@ class TestTextGenerationController:
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
         ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+        ctrl._torch_sampling_bucket_index_tensors = [
+            torch.arange(active_request_count, device='cuda', dtype=torch.long)
+        ]
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()
