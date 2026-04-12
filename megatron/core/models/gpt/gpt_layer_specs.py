@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
 import warnings
 from typing import Optional, Union
 
@@ -42,10 +43,10 @@ from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
+    from megatron.core.extensions.transformer_engine import TEFusedDenseMLP, TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 else:
-    TEFusedMLP, TENorm, TESpecProvider = None, None, None
+    TEFusedDenseMLP, TEFusedMLP, TENorm, TESpecProvider = None, None, None, None
 
 try:
     from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
@@ -183,6 +184,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     mla_down_proj_fusion: bool = False,
+    use_grouped_gemm_for_dense: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -231,6 +233,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         moe_grouped_gemm=moe_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
+        use_grouped_gemm_for_dense=use_grouped_gemm_for_dense,
     )
 
     if multi_latent_attention:
@@ -516,6 +519,7 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    use_grouped_gemm_for_dense: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
 
@@ -524,7 +528,13 @@ def get_mlp_module_spec_for_backend(
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        module = TEFusedMLP if use_te_op_fuser else MLP
+        _use_grouped_gemm = use_grouped_gemm_for_dense or os.getenv("USE_GROUPED_GEMM_FOR_DENSE") == "1"
+        if _use_grouped_gemm and use_te_op_fuser:
+            module = TEFusedDenseMLP
+        elif use_te_op_fuser:
+            module = TEFusedMLP
+        else:
+            module = MLP
         if backend.fuse_layernorm_and_linear():
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
