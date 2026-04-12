@@ -67,6 +67,7 @@ class TextGenerationControllerTestBase:
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
         hybrid_layer_pattern: str = None,
+        cuda_graph_impl: str = 'none',
     ):
         if use_training_random_init:
             # This is necessary to induce the training behavior which permutes the random seed
@@ -102,6 +103,7 @@ class TextGenerationControllerTestBase:
                 if hybrid_layer_pattern
                 else {}
             ),
+            cuda_graph_impl=cuda_graph_impl,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True

@@ -400,12 +400,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
-            model_config = controller.inference_wrapped_model.model.config
             if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Forward pass -> logits.
-            controller._dynamic_step_forward_logits(input_ids, position_ids)
+            # Capture all relevant graphs in the pipeline.
+            # Note that some steps of the pipeline may capture multiple different variant graphs.
+            for setup_variant in controller.graph_capture_variants():
+                setup_variant(context)
+                controller._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+                # Launch bookkeeping on a side stream so it overlaps with forward.
+                with torch.cuda.stream(controller._pre_forward_bookkeeping_stream):
+                    controller._pre_forward_bookkeeping_event.record()
+
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+                controller._pre_forward_bookkeeping_event.synchronize()
 
             # MTP CUDA graph warmup for this batch dimension.
             if mtp_warmup_enabled:
