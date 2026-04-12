@@ -42,7 +42,6 @@ import logging
 import math
 import os
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional, Dict
 
@@ -59,61 +58,6 @@ from .theoretical_memory_usage import report_theoretical_memory
 _LEGACY_TRAIN_START_TIME = time.time() # NOTE(asolergi-nv): Legacy timestamp
 
 import torch
-
-try:
-    from megatron.rl import rl_utils
-    has_rl_utils = True
-except ImportError:
-    has_rl_utils = False
-
-# Canonical list of RL timer names to include in timers_to_log.
-# When the profiling branch is merged, this will be imported from rl_profiling
-# as RL_LOGGABLE_TIMER_NAMES instead of being defined here.
-RL_LOGGABLE_TIMER_NAMES = [
-    # Top-level RL phases
-    'rl/rollout-collection',
-    'rl/prepare-data-for-update',
-    # Rollout collection breakdown
-    'rl/inference-setup',
-    'rl/collect-rollouts',
-    'rl/sync-rollouts',
-    'rl/suspend-engine',
-    # Optimizer offload/restore
-    'rl/offload-optimizer-before-inference',
-    'rl/restore-optimizer-after-inference',
-    'rl/offload-kv-cache-after-inference',
-    'rl/restore-kv-cache-before-inference',
-    # Fine-grained offload/restore breakdown
-    'rl/restore/grad-buffers',
-    'rl/restore/optimizer-state',
-    'rl/restore/wait-for-transfers',
-    'rl/offload/grad-buffers',
-    'rl/offload/optimizer-state',
-    # Weight prefetching
-    'rl/prefetch-weights-to-gpu',
-    'rl/prefetch-weights-to-cpu',
-    # Data preparation
-    'rl/compute-group-stats',
-    'rl/prepare-advantages',
-    'rl/prepare-trajectories',
-    'rl/get-ltor-masks',
-    'rl/create-dataloader',
-    'rl/sequence-packing',
-    'rl/align-inference-logprobs',
-    'rl/log-wandb-tb',
-    'rl/pack-sequences',
-    'rl/regather-trajectories',
-    # Logprobs computation
-    'rl/compute-logprobs',
-    'rl/compute-old-logprobs',
-    'rl/compute-ref-logprobs',
-    'rl/get-logprobs',
-    'rl/forward-pass',
-    'rl/log-softmax',
-    # Inference / cuda graphs
-    'rl/build-cuda-graphs',
-    'rl/wait-for-decode-only',
-]
 
 try:
     from modelopt.torch.distill.plugins.megatron import (
@@ -205,15 +149,6 @@ from megatron.core.parallel_state import (
     create_all_gather_groups,
 )
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.inference.unified_memory import create_unified_mempool
-from megatron.core.resharding.refit import swap_model_weights
-
-try:
-    from torch_memory_saver import torch_memory_saver
-    torch_memory_saver.hook_mode = "torch"
-    HAVE_TORCH_MEMORY_SAVER = True
-except ImportError:
-    HAVE_TORCH_MEMORY_SAVER = False
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -252,6 +187,11 @@ from .global_vars import (
 )
 from . import one_logger_utils
 from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
+from .pretrain_context import (
+    PretrainContext,
+    PretrainContextFactory,
+    default_pretrain_context_factory,
+)
 
 from . import ft_integration
 
@@ -833,6 +773,7 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[CallWrapper] = None,
+    pretrain_context_factory: PretrainContextFactory = default_pretrain_context_factory,
 ):
     """Main training program.
 
@@ -1025,130 +966,75 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    # Construct the pretrain context so that the setup-policy hooks are in-place for
+    # (should_build_optimizer, should_build_standard_dataloaders).
+    context = pretrain_context_factory(
+        args=args,
+        model_provider=model_provider,
+        model_type=model_type,
+    )
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_provider,
+        model_type,
+        checkpointing_context=checkpointing_context,
+        skip_optimizer=not context.should_build_optimizer(),
     )
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
 
-    # Build a separate inference model for RL if requested.
-    inference_model = None
-    if args.perform_rl_step:
-        if (
-            args.rl_inference_tensor_model_parallel_size is not None
-            or args.rl_inference_pipeline_model_parallel_size is not None
-            or args.rl_inference_expert_model_parallel_size is not None
-            or args.rl_inference_expert_tensor_model_parallel_size is not None
-        ):
-            from megatron.rl.parallel_utils import build_inference_pg_collection
-
-            print_rank_0(
-                "Building separate RL inference model with custom parallelism: "
-                f"TP={args.rl_inference_tensor_model_parallel_size}, "
-                f"PP={args.rl_inference_pipeline_model_parallel_size}, "
-                f"EP={args.rl_inference_expert_model_parallel_size}, "
-                f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
-            )
-            inference_pg_collection = build_inference_pg_collection(
-                args.world_size,
-                tp_size=args.rl_inference_tensor_model_parallel_size,
-                pp_size=args.rl_inference_pipeline_model_parallel_size,
-                ep_size=args.rl_inference_expert_model_parallel_size,
-                expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
-                use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
-            )
-
-            # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(config)
-            if args.rl_inference_tensor_model_parallel_size is not None:
-                inference_config.tensor_model_parallel_size = args.rl_inference_tensor_model_parallel_size
-            if args.rl_inference_pipeline_model_parallel_size is not None:
-                inference_config.pipeline_model_parallel_size = (
-                    args.rl_inference_pipeline_model_parallel_size
-                )
-            if args.rl_inference_expert_model_parallel_size is not None:
-                inference_config.expert_model_parallel_size = (
-                    args.rl_inference_expert_model_parallel_size
-                )
-            if args.rl_inference_expert_tensor_model_parallel_size is not None:
-                inference_config.expert_tensor_parallel_size = (
-                    args.rl_inference_expert_tensor_model_parallel_size
-                )
-
-            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
-            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
-            # Alternatively, use torch_memory_saver to offload the weights to CPU when idle.
-            uvm_mempool = None
-            uvm_level = args.rl_inference_model_unified_memory_level
-            if uvm_level and uvm_level > 0:
-                uvm_mempool = create_unified_mempool()
-
-            # Determine which context manager to use for model allocation
-            # Use torch_memory_saver if offloading is requested but UVM is not enabled
-            use_torch_saver_for_inference_model = (
-                args.rl_offload_inference_model_weights_when_idle
-                and uvm_level == 0
-                and HAVE_TORCH_MEMORY_SAVER
-            )
-            if use_torch_saver_for_inference_model:
-                # Use torch_memory_saver for offloading - allocate within a tagged region
-                model_alloc_ctx = torch_memory_saver.region(
-                    tag="rl_inference_model", enable_cpu_backup=True
-                )
-            elif uvm_mempool is not None:
-                model_alloc_ctx = torch.cuda.use_mem_pool(uvm_mempool)
-            else:
-                model_alloc_ctx = nullcontext()
-
-            with model_alloc_ctx:
-                inference_model = get_model(
-                    model_provider,
-                    model_type,
-                    wrap_with_ddp=False,
-                    pg_collection=inference_pg_collection,
-                    config=inference_config,
-                )
-            inference_model[0].eval()
-
-        # Validate: offloading flag requires a separate inference model
-        if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
-            raise ValueError(
-                "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
-                "This flag is only useful when doing refit since the weights are shared with the training model."
-            )
-
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for vp_stage in range(len(model)):
-            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
-            assert "vp_stage" in dataset_provider_parameters, \
-                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-            vp_stage_train_valid_test_dataset_provider = \
-                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
-            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
-                vp_stage_train_valid_test_dataset_provider.is_distributed = True
-            iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
+    if context.should_build_standard_dataloaders():
+        if args.virtual_pipeline_model_parallel_size is not None:
+            train_data_iterator = []
+            valid_data_iterator = []
+            test_data_iterator = []
+            for vp_stage in range(len(model)):
+                dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+                assert "vp_stage" in dataset_provider_parameters, \
+                    "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+                vp_stage_train_valid_test_dataset_provider = \
+                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                    vp_stage_train_valid_test_dataset_provider.is_distributed = True
+                iterators = build_train_valid_test_data_iterators(
+                    vp_stage_train_valid_test_dataset_provider
+                )
+                train_data_iterator.append(iterators[0])
+                valid_data_iterator.append(iterators[1])
+                test_data_iterator.append(iterators[2])
+        else:
+            train_data_iterator, valid_data_iterator, test_data_iterator = (
+                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
             )
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
     else:
-        train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
-        )
+        train_data_iterator = None
+        valid_data_iterator = None
+        test_data_iterator = None
+        args.do_train = (args.train_iters or 0) > 0
+        args.do_valid = args.full_validation or args.eval_iters > 0
+        args.do_test = args.full_validation or args.eval_iters > 0
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+
+    context.attach_training_state(
+        model=model,
+        optimizer=optimizer,
+        config=config,
+        train_data_iterator=train_data_iterator,
+        valid_data_iterator=valid_data_iterator,
+        checkpointing_context=checkpointing_context,
+        forward_step_func=forward_step_func,
+        process_non_loss_data_func=process_non_loss_data_func,
+        non_loss_data_func=non_loss_data_func,
+    )
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
@@ -1172,28 +1058,16 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
-    if not args.skip_train or args.perform_rl_step:
+    if context.should_run_train_loop():
         if args.skip_train:
-            print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
+            print_rank_0('RL inference-only mode (--skip-train); entering train loop ...')
         else:
             print_rank_0('training ...')
 
         iteration = 0
         args.curr_iteration = iteration
         if args.do_train and (args.train_iters or 0) > 0:
-            iteration, num_floating_point_operations_so_far = train(
-                forward_step_func,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                train_data_iterator,
-                valid_data_iterator,
-                process_non_loss_data_func,
-                config,
-                checkpointing_context,
-                non_loss_data_func,
-                inference_model,
-            )
+            iteration, num_floating_point_operations_so_far = train(context, opt_param_scheduler)
 
         print_datetime('after training is done')
 
@@ -1205,7 +1079,7 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
+                train_data_iterator=context.train_data_iterator,
                 preprocess_common_state_dict_fn=preprocess_common_state_dict,
             )
 
@@ -1220,33 +1094,12 @@ def pretrain(
 
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
-        if args.perform_rl_step:
-            rl_eval_model = model
-            rl_training_model = None
-            if inference_model is not None:
-                inf_core = unwrap_model(inference_model[0])
-                # If separate inference and training models, swap training weights
-                # back to the inference model for RL evaluation.
-                rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                swap_model_weights(model, inference_model, args.refit_method)
-                rl_eval_model = inference_model
-                rl_training_model = model
-            rl_utils.evaluate_and_print_results_rl(
-                valid_data_iterator,
-                rl_eval_model,
-                optimizer,
-                iteration,
-                write_to_tensorboard=not args.skip_train,
-                training_model=rl_training_model,
-            )
-        else:
-            evaluate_and_print_results(
-                prefix, forward_step_func,
-                valid_data_iterator, model,
-                iteration, process_non_loss_data_func, config,
-                verbose=True, write_to_tensorboard=not args.skip_train,
-                non_loss_data_func=non_loss_data_func
-            )
+        context.run_eval(
+            prefix=prefix,
+            iteration=iteration,
+            verbose=True,
+            write_to_tensorboard=not args.skip_train,
+        )
 
     if args.do_test:
         prefix = f'iteration {iteration} on test set'
@@ -1275,8 +1128,7 @@ def pretrain(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
 
-    if args.perform_rl_step:
-        rl_utils.rl_inference_interface_shutdown()
+    context.shutdown()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -1611,16 +1463,16 @@ def setup_model_and_optimizer(
     model_provider_func,
     model_type,
     checkpointing_context=None,
+    skip_optimizer=None,
 ):
     """Setup model and optimizer."""
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
 
-    # Skip optimizer when not training. In RL inference-only mode (skip_train + perform_rl_step),
-    # --no-load-optim controls whether the optimizer is skipped (saving memory) or created
-    # (required for --rl-offload-optimizer-during-inference).
-    skip_optimizer = args.skip_train and (not args.perform_rl_step or args.no_load_optim)
+    # Skip optimizer when not training, such as in RL inference-only mode.
+    if skip_optimizer is None:
+        skip_optimizer = args.skip_train
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -1628,9 +1480,7 @@ def setup_model_and_optimizer(
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:
         optimizer, opt_param_scheduler = None, None
-        # In RL inference-only mode, train_iters must still be set despite having no optimizer.
-        if args.perform_rl_step:
-            update_train_iters(args)
+        update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
@@ -1963,6 +1813,7 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    context: Optional[PretrainContext] = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2033,9 +1884,8 @@ def training_log(
             'backward-send-backward-recv',
             'forward-backward-send-forward-backward-recv',
         ])
-    # Add timers from RL loop if needed.
-    if getattr(args, 'perform_rl_step', False):
-        timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
+    if context is not None:
+        timers_to_log.extend(context.extra_log_timers())
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -2064,13 +1914,8 @@ def training_log(
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
-        # Log bins for packed mode
-        if has_rl_utils and args.rl_use_sequence_packing:
-            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
-            for metric_name, metric_value in packing_metrics.items():
-                writer.add_scalar(metric_name, metric_value, iteration)
-            if wandb_writer and packing_metrics:
-                wandb_writer.log(packing_metrics, iteration)
+        if context is not None:
+            context.log_tensorboard_metrics(writer, wandb_writer, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
@@ -2103,11 +1948,6 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if args.perform_rl_step:
-            grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
-            writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
-            if wandb_writer:
-                wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -2210,8 +2050,8 @@ def training_log(
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
-        if has_rl_utils and args.rl_use_sequence_packing:
-            log_string += rl_utils.get_sequence_packing_log_info(args)
+        if context is not None:
+            log_string += context.extra_log_string()
         if args.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -2604,94 +2444,26 @@ def checkpoint_and_decide_exit(
     return False
 
 
-def train(
-    forward_step_func,
-    model,
-    optimizer,
-    opt_param_scheduler,
-    train_data_iterator,
-    valid_data_iterator,
-    process_non_loss_data_func,
-    config,
-    checkpointing_context,
-    non_loss_data_func,
-    inference_model=None,
-):
+def train(context: PretrainContext, opt_param_scheduler):
     """Training function: run train_step desired number of times, run validation, checkpoint."""
-    args = get_args()
+    args = context.args
     timers = get_timers()
 
-    if args.perform_rl_step:
-        assert has_rl_utils, "RL cannot run without the megatron.rl package"
+    # Unpack everything the loop body needs.
+    # train_data_iterator is intentionally NOT unpacked: it may be modified (e.g. by RL).
+    model = context.model
+    optimizer = context.optimizer
+    valid_data_iterator = context.valid_data_iterator
+    config = context.config
+    checkpointing_context = context.checkpointing_context
+    forward_step_func = context.forward_step_func
+    process_non_loss_data_func = context.process_non_loss_data_func
+    non_loss_data_func = context.non_loss_data_func
 
-    # Additional variable initialization for RL training
-    if args.perform_rl_step:
-        if args.skip_train:
-            # In inference-only mode, use current weights as reference.
-            print_rank_0("> RL inference-only: using current weights as reference.")
-            ref_state_dict = {
-                k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()
-            }
-        else:
-            print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
-            load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
-            args.no_load_optim = True
-
-            # Load pretrained checkpoint
-            args.load = None
-            args.finetune = True
-            load_checkpoint(
-                    model,
-                    None,  # Don't load optimizer state
-                    None,  # Don't load scheduler state
-                    checkpointing_context=checkpointing_context,
-                    skip_load_to_model_and_opt=HAVE_FSDP2
-                    and getattr(args, "use_torch_fsdp2", False)
-                    and args.ckpt_format == "torch_dist",
-                )
-            ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
-
-            # Reload RL training checkpoint weights
-            args.load = load
-            args.finetune = finetune
-            print_rank_0("> Reloading RL training checkpoint...")
-            load_checkpoint(
-                    model,
-                    None,
-                    None,
-                    checkpointing_context=checkpointing_context,
-                    skip_load_to_model_and_opt=HAVE_FSDP2
-                    and getattr(args, "use_torch_fsdp2", False)
-                    and args.ckpt_format == "torch_dist",
-                )
-
-            args.no_load_optim = no_load_optim
-
-    # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
-    if args.perform_rl_step:
-        print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
-        from megatron.core.num_microbatches_calculator import (
-            destroy_num_microbatches_calculator,
-            init_num_microbatches_calculator
-        )
-        # First destroy the existing calculator
-        destroy_num_microbatches_calculator()
-        # Then initialize with the correct perform_rl_step=True context
-        init_num_microbatches_calculator(
-            args.rank,
-            args.rampup_batch_size,
-            args.global_batch_size,
-            args.micro_batch_size,
-            mpu.get_data_parallel_world_size(),
-            args.decrease_batch_size_if_needed
-        )
-        print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
+    context.before_train_loop()
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:
@@ -2891,7 +2663,6 @@ def train(
         )
 
     # Run training iterations till done.
-    buffered_rollouts = None
     while iteration < args.train_iters:
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
@@ -2920,17 +2691,14 @@ def train(
         # checkpoint should be saved. If the number of microbatches is different
         # from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
-        # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
-        # Skip automatic checkpoint on microbatch changes when sequence packing is active
-        # as it intentionally reconfigures microbatches
+        # Normally a microbatch change mid-loop is a monotonically increasing batch-size ramp-up.
+        # Training contexts that intentionally reconfigure microbatches every iteration
+        # (e.g. RL sequence packing) must be able to suppress this behavior.
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            if args.rl_use_sequence_packing:
-                print_rank_0(
-                    f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
-                    f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
-                )
-            else:
+            if context.on_microbatch_change(
+                iteration, num_microbatches, get_num_microbatches()
+            ):
                 assert get_num_microbatches() > num_microbatches, (
                     f"Number of microbatches should be increasing due to batch size rampup; "
                     f"instead going from {num_microbatches} to {get_num_microbatches()}"
@@ -2943,7 +2711,7 @@ def train(
                         opt_param_scheduler,
                         num_floating_point_operations_so_far,
                         checkpointing_context,
-                        train_data_iterator=train_data_iterator,
+                        train_data_iterator=context.train_data_iterator,
                     )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
@@ -2964,7 +2732,7 @@ def train(
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
             # Dummy train_step to fast forward train_data_iterator.
-            dummy_train_step(train_data_iterator)
+            dummy_train_step(context.train_data_iterator)
             if iteration == start_iteration:
                 start_iteration = iteration + 1
             iteration += 1
@@ -2976,27 +2744,7 @@ def train(
             continue
 
         args.curr_iteration = iteration
-        # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
-        # It is similar to a PPO epoch.
-
-        if args.perform_rl_step:
-            if optimizer is None:
-                # Release stale CUDA cached memory before inference.
-                torch.cuda.empty_cache()
-            with torch.no_grad():
-                train_data_iterator = rl_utils.get_grpo_data_iterator(
-                    model, inference_model, optimizer, iteration, ref_state_dict,
-                    grpo_iterations=args.grpo_iterations,
-                    grpo_prompts_per_step=args.grpo_prompts_per_step,
-                    grpo_group_size=args.grpo_group_size,
-                    global_batch_size=args.global_batch_size,
-                    sequence_packing=args.rl_use_sequence_packing,
-                    buffered_rollouts=buffered_rollouts,
-                    is_correction=args.rl_inference_logprobs_is_correction,
-                )
-                # Buffered rollouts are used as a state container for setups when
-                # we use previously-generated data for an update.
-                buffered_rollouts = train_data_iterator
+        context.begin_iteration(iteration)
 
         if args.skip_train:
             # RL inference-only mode: skip gradient updates, just collect rollouts.
@@ -3020,7 +2768,7 @@ def train(
                 num_zeros_in_grad,
                 max_attention_logit,
             ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
+                forward_step_func, context.train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
         if should_checkpoint:
@@ -3031,7 +2779,7 @@ def train(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
+                train_data_iterator=context.train_data_iterator,
             )
         if should_exit:
             break
@@ -3079,18 +2827,10 @@ def train(
                     if pad_buf is not None:
                         pad_buf.manual_buffer_registration()
 
-        if args.perform_rl_step and args.rl_use_sequence_packing:
-            iteration_sequences = rl_utils.get_iteration_sequence_count(args)
-            # Track bins separately for packed mode
-            bin_count = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
-            )
+        iteration_sequences = context.iteration_sequence_count()
+        bin_count = context.iteration_bin_count()
+        if bin_count is not None:
             args.consumed_train_bins += bin_count
-        else:
-            batch_size = (
-                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
-            )
-            iteration_sequences = batch_size
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
@@ -3137,6 +2877,7 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            context=context,
         )
         is_first_iteration = False
 
@@ -3153,33 +2894,12 @@ def train(
                 gc.collect()
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
-            if args.perform_rl_step:
-                rl_eval_model = model
-                rl_training_model = None
-                # If separate inference and training models, swap training weights
-                # back to the inference model for RL evaluation.
-                if inference_model is not None:
-                    inf_core = unwrap_model(inference_model[0])
-                    rl_utils._maybe_prefetch_separate_inference_model_weights(
-                        inf_core, to_cpu=False
-                    )
-                    swap_model_weights(model, inference_model, args.refit_method)
-                    rl_eval_model = inference_model
-                    rl_training_model = model
-                rl_utils.evaluate_and_print_results_rl(
-                    valid_data_iterator,
-                    rl_eval_model,
-                    optimizer,
-                    iteration,
-                    write_to_tensorboard=True,
-                    training_model=rl_training_model,
-                )
-            else:
-                evaluate_and_print_results(prefix, forward_step_func,
-                                       valid_data_iterator, model,
-                                       iteration, process_non_loss_data_func,
-                                       config, verbose=False, write_to_tensorboard=True,
-                                       non_loss_data_func=non_loss_data_func)
+            context.run_eval(
+                prefix=prefix,
+                iteration=iteration,
+                verbose=False,
+                write_to_tensorboard=True,
+            )
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -3219,7 +2939,7 @@ def train(
             iteration,
             num_floating_point_operations_so_far,
             checkpointing_context,
-            train_data_iterator,
+            context.train_data_iterator,
         )
         if should_exit:
             break
@@ -3262,8 +2982,7 @@ def train(
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
-        if args.perform_rl_step:
-            rl_utils.rl_inference_interface_shutdown()
+        context.shutdown()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
@@ -3612,40 +3331,29 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Construct the data pipeline
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
-        # Build datasets and dataloders.
-        if args.perform_rl_step:
-            # we don't need to build any dataloaders for RL training
+        # Build datasets and dataloaders.
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+        valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+        if args.skip_train:
             train_dataloader = None
-            valid_dataloaders = None
-            test_dataloader = None
-            do_train = (args.train_iters or 0) > 0
-            do_valid = (args.full_validation or args.eval_iters > 0)
-            do_test = (args.full_validation or args.eval_iters > 0)
-
         else:
-            # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
-            valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-            if args.skip_train:
-                train_dataloader = None
+            train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+        valid_dataloaders = []
+        for valid_d in valid_ds:
+            if args.skip_train or args.full_validation:
+                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
-            valid_dataloaders = []
-            for valid_d in valid_ds:
-                if args.skip_train or args.full_validation:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
-                else:
-                    if args.multiple_validation_sets:
-                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                        # correct and needs to be calculated/set per validation set
-                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-            if not args.multiple_validation_sets:
-                assert len(valid_dataloaders) == 1
-            test_dataloader = build_pretraining_data_loader(test_ds, 0)
-            do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
-            do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
-            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
+                if args.multiple_validation_sets:
+                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                    # correct and needs to be calculated/set per validation set
+                    raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+        if not args.multiple_validation_sets:
+            assert len(valid_dataloaders) == 1
+        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+        do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
+        do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
+        do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
