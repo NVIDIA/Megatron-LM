@@ -221,14 +221,18 @@ jobs:
                `/ok to test <SHA>`
             2. Find the CI run: use `gh run list` with `--json` and filter
                for `headBranch == "pull-request/<PR_NUMBER>"` (note: `gh run
-               list` does not support a `--branch` flag). Wait for the `CICD
-               Megatron-LM` workflow run to complete. Poll the GitHub API
-               every 2 minutes, checking for individual job failures as they
-               happen (don't wait for the entire run to finish). Use:
+               list` does not support a `--branch` flag).
+            3. **Poll for failures every 2 minutes — do NOT wait for the
+               full run to complete.** Use:
                `gh api repos/$REPO/actions/runs/<RUN_ID>/jobs?per_page=100`
                and check for jobs with `conclusion == "failure"`.
-            3. If the run **succeeded** → go to Phase 4.
-            4. If any job **failed** → investigate and fix immediately:
+               As soon as you see ANY failed job, immediately investigate it
+               (see step 5). Do not wait for remaining jobs — they will keep
+               running in CI while you diagnose and fix. The goal is to
+               overlap investigation with CI execution so you can push a fix
+               and re-trigger before the full run even finishes.
+            4. If all jobs **succeeded** → go to Phase 4.
+            5. If any job **failed** → investigate and fix immediately:
                - Fetch the failed job's logs via
                  `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs`.
                - Grep for `ImportError`, `ModuleNotFoundError`, `FAILED`,
@@ -248,7 +252,11 @@ jobs:
                    missing-docstring, edit the file directly.
                  - **Test assertion failures**: Read the test and the code under
                    test. Fix the code or the test as appropriate.
-               - Commit fixes, push, and re-trigger CI.
+               - If the failure is pre-existing (see below), note it and
+                 continue polling for other failures.
+               - If the failure is sync-caused, fix it, commit, push, and
+                 re-trigger CI immediately — do not wait for the rest of the
+                 run to finish.
                - Repeat until all fixable issues are resolved.
 
             **Handling pre-existing failures:**
