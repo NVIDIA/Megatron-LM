@@ -234,7 +234,12 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     if b_model_chunk_id:
         # The same as the backward_step_helper
         backward_step_helper_postprocess(b_virtual_microbatch_id)
-        if input_tensor is not None:
+        # Verify backward grad: if backward microbatch received activation from upstream
+        # (b_input_tensor is not None), input_tensor_grad must be produced.
+        # Note: the original assert used forward's input_tensor, which is incorrect when
+        # forward and backward are on different VP stages (backward has chunk reversal:
+        # model_chunk_id = num_chunks - id - 1), causing false failures in interleaved PP.
+        if b_input_tensor is not None:
             assert input_tensor_grad is not None
     return output_tensor, input_tensor_grad
 
