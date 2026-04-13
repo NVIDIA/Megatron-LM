@@ -41,6 +41,11 @@ from examples.multimodal_dev.models.qwen35_vl.factory import (
     post_language_config as _qwen35_vl_post_language_config,
     set_vision_flops_metadata as _qwen35_vl_vision_flops,
 )
+from examples.multimodal_dev.models.kimi_k25.factory import (
+    build_model as _build_kimi_k25_model,
+    get_kimi_k25_vision_config_stub as _kimi_k25_vision_config_stub,
+    post_language_config as _kimi_k25_post_language_config,
+)
 
 MODEL_REGISTRY = {
     "qwen35_vl": {
@@ -51,6 +56,17 @@ MODEL_REGISTRY = {
         "dataset_providers": {
             "mock": (
                 "examples.multimodal_dev.data.mock"
+                ".train_valid_test_datasets_provider"
+            ),
+        },
+    },
+    "kimi_k25": {
+        "model_factory_fn": _build_kimi_k25_model,
+        "vision_config_fn": _kimi_k25_vision_config_stub,
+        "post_language_config_fn": _kimi_k25_post_language_config,
+        "dataset_providers": {
+            "mock": (
+                "examples.multimodal_dev.data.kimi_k25_vlm_mock"
                 ".train_valid_test_datasets_provider"
             ),
         },
