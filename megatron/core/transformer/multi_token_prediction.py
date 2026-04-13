@@ -1022,7 +1022,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
-        inference_params=None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
     ) -> Tensor:
@@ -1053,7 +1052,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
-            inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )

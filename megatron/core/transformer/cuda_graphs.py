@@ -1426,8 +1426,13 @@ class CudaGraphManager(torch.nn.Module):
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
         """
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
+        # is_mtp implies inference mode: MTP is only cuda-graphed for inference
+        # (forward_single_position), not for training which uses the regular forward path.
+        self.is_mtp = isinstance(base_module, MultiTokenPredictionLayer)
 
         if function_name is not None:
             func = getattr(base_module, function_name)
@@ -1493,15 +1498,6 @@ class CudaGraphManager(torch.nn.Module):
                 # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
 
-    @staticmethod
-    def _is_mtp_inference(megatron_module, kwargs):
-        """Check if this call is an MTP layer running under inference mode."""
-        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-
-        return (
-            'inference_context' not in kwargs or not kwargs.get('inference_context')
-        ) and isinstance(megatron_module, MultiTokenPredictionLayer)
-
     def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs):
         '''Returns a valid cudagraph runner for the current forward call.
         The cudagraph corresponding to this call is the first element of 'self.cudagraph_runners'.
@@ -1511,7 +1507,7 @@ class CudaGraphManager(torch.nn.Module):
         over different microbatches by tracking their respective fwd and bwd passes.'''
         if reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
-            is_mtp_inference = self._is_mtp_inference(megatron_module, kwargs)
+            is_mtp_inference = self.is_mtp
             if is_inference_mode:
                 is_static_batching = kwargs['inference_context'].is_static_batching()
                 if is_static_batching:
@@ -1600,7 +1596,7 @@ class CudaGraphManager(torch.nn.Module):
         """
         is_inference_mode = (
             'inference_context' in kwargs.keys() and kwargs['inference_context']
-        ) or self._is_mtp_inference(megatron_module, kwargs)
+        ) or self.is_mtp
         is_in_checkpoint_fwd = is_checkpointing()
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
@@ -1619,9 +1615,7 @@ class CudaGraphManager(torch.nn.Module):
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
 
-                if not runner.fwd_graph_recorded and self._is_mtp_inference(
-                    megatron_module, kwargs
-                ):
+                if not runner.fwd_graph_recorded and self.is_mtp:
                     # No pre-warmed graph for this MTP batch size — run eagerly
                     # instead of attempting lazy capture. Lazy MTP graph capture
                     # would fail for models with MoE layers because the AlltoAll
