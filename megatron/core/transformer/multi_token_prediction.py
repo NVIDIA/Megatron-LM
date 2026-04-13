@@ -848,13 +848,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         self.offload_context = nullcontext()
 
-        # Create cuda graph manager wrapping forward_single_position so that
+        # Create cuda graph manager for forward_single_position so that
         # the full MTP forward (embedding, projection, transformer, layernorm)
         # is captured in a single graph.
         if config.cuda_graph_impl == "local" and not config.cuda_graph_scope:
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-            self.mtp_cudagraph_manager = CudaGraphManager(
+            self.cudagraph_manager = CudaGraphManager(
                 config,
                 base_module=self,
                 function_name="forward_single_position",
@@ -1011,6 +1011,14 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         return hidden_states
+
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """MTP cuda-graphs forward_single_position, not forward.
+
+        Disable the MegatronModule.__call__ interceptor so the training forward
+        path is not routed through the cuda graph manager.
+        """
+        return False
 
     def forward_single_position(
         self,
