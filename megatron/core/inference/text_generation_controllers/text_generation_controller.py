@@ -189,6 +189,25 @@ class TextGenerationController:
                 max_requests, dtype=torch.int64, device=device
             )
 
+            # Cache invariant values for serial MTP to avoid CPU overhead on
+            # the hot path (unwrap_model, is_pipeline_last_stage, get_pg_size,
+            # etc. are constant across inference steps).
+            self._serial_mtp_unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+            self._serial_mtp_is_last_pp_stage = is_pipeline_last_stage(self.pp_group)
+            tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+            self._serial_mtp_tp_size = tp_size
+            self._serial_mtp_sp_enabled = self.model_config.sequence_parallel and tp_size > 1
+            self._serial_mtp_num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+
+            # Pre-allocate padded buffers for per-depth token/position IDs so
+            # the depth loop avoids repeated unsqueeze + F.pad overhead.
+            self._mtp_token_ids_buf = torch.zeros(
+                [1, max_requests], dtype=torch.int64, device=device
+            )
+            self._mtp_position_ids_buf = torch.zeros(
+                [1, max_requests], dtype=torch.int64, device=device
+            )
+
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -850,10 +869,14 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
 
-        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        # Use cached values to avoid CPU overhead from unwrap_model,
+        # is_pipeline_last_stage, get_pg_size, etc. on every step.
+        unwrapped_model = self._serial_mtp_unwrapped_model
+        sp_enabled = self._serial_mtp_sp_enabled
+        num_depths = self._serial_mtp_num_depths
 
         # On non-last pipeline stages, the model won't have decoder hidden states.
-        has_mtp = is_pipeline_last_stage(self.pp_group) and hasattr(
+        has_mtp = self._serial_mtp_is_last_pp_stage and hasattr(
             unwrapped_model, '_decoder_hidden_states_cache'
         )
 
@@ -864,7 +887,7 @@ class TextGenerationController:
             # When SP is active the decoder output is in scattered format
             # [S/TP, B, H], but _last_accepted_seq_indices are indices into
             # the full (gathered) sequence.
-            if self.model_config.sequence_parallel:
+            if sp_enabled:
                 hidden_states = gather_from_sequence_parallel_region(
                     hidden_states, group=self.inference_wrapped_model.tp_group
                 )
@@ -886,11 +909,10 @@ class TextGenerationController:
         current_hidden = last_accepted_hidden if has_mtp else None
 
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
-        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
             padded_count = self._mtp_resolved_padded_count
         elif sp_enabled:
+            tp_size = self._serial_mtp_tp_size
             padded_count = (
                 active_request_count + (tp_size - active_request_count % tp_size) % tp_size
             )
@@ -907,25 +929,27 @@ class TextGenerationController:
                     current_hidden, group=self.inference_wrapped_model.tp_group
                 )
 
-        num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+        # Prepare pre-allocated padded buffers for the depth loop so each
+        # iteration avoids unsqueeze + F.pad tensor creation overhead.
+        token_ids_buf = self._mtp_token_ids_buf[:, :padded_count]
+        position_ids_buf = self._mtp_position_ids_buf[:, :padded_count]
+
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
         for depth in range(num_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
-            position_ids = (base_position + depth).unsqueeze(0)  # [1, active_request_count]
-            token_ids = next_token_ids.unsqueeze(0)  # [1, active_request_count]
+
+            # Write active region into pre-allocated buffers (padding region
+            # stays zero-filled from initialization / previous zero-fill).
+            token_ids_buf[0, :active_request_count] = next_token_ids
+            position_ids_buf[0, :active_request_count] = base_position + depth
 
             mtp_logits_2d = None
             if has_mtp:
-                # Pad token_ids and position_ids each iteration (they change per depth).
-                if pad_count > 0:
-                    token_ids = F.pad(token_ids, (0, pad_count))
-                    position_ids = F.pad(position_ids, (0, pad_count))
-
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
-                    next_token_ids=token_ids,
-                    position_ids=position_ids,
+                    next_token_ids=token_ids_buf,
+                    position_ids=position_ids_buf,
                     depth=depth,
                 )
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
@@ -1850,23 +1874,28 @@ class TextGenerationController:
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
-                # Release blocks back to the allocator (not compilable due to
-                # allocator state mutation). release_memory_blocks handles
-                # empty tensors.
-                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs
                 # are active (the graphs were captured with padding enabled).
                 if self.model_config.moe_pad_experts_for_cuda_graph_inference:
                     if not context.using_cuda_graph_this_step():
-                        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-                        set_decode_expert_padding(unwrapped_model, False)
+                        set_decode_expert_padding(self._serial_mtp_unwrapped_model, False)
 
                 # Phase 3: Compute MTP serially with correct (verified) inputs.
                 nvtx_range_push("mtp-spec-decoding/serial-mtp")
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
+
+                # Phase 4: Release freed blocks back to the allocator.
+                # Deferred from Phase 2 to avoid a GPU pipeline drain:
+                # blocks_to_release[remove_mask] is boolean-mask indexing whose
+                # output size is data-dependent, forcing a CUDA sync.  By
+                # deferring to after serial MTP, the sync overlaps with
+                # already-completed GPU work instead of stalling before it.
+                context.kv_block_allocator.release_memory_blocks(
+                    blocks_to_release[remove_mask]
+                )
             else:
                 self._dynamic_step_sample_logits(logits)
 
