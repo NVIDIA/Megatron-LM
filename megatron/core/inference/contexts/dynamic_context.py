@@ -1786,28 +1786,50 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-        if self.expert_model_parallel_group is not None and not self._nccl_ep_dispatcher:
-            self._update_nvls_dispatcher_metadata()
+        if self.expert_model_parallel_group is not None:
+            self._update_moe_dispatcher_metadata()
 
-    def _update_nvls_dispatcher_metadata(self) -> None:
-        """All-gather per-rank token counts over the EP group and update NVLS dispatcher metadata.
+    def _update_moe_dispatcher_metadata(self) -> None:
+        """Update step metadata for the active MoE inference dispatcher.
 
-        Each rank contributes its padded_active_token_count. The dispatcher then
-        computes valid_tokens, rank_token_offset, and ep_max_tokens from the result.
-        Only called when inference_moe_token_dispatcher_type='nvls'.
+        For NCCL: all ranks share the same token count (decode-only CUDA graphs), so
+        the [ep_size] tensor is filled trivially without a collective.
+        For NVLS: all-gathers per-rank token counts; a barrier is issued first to
+        ensure all ranks have completed initialize_attention_state before any rank
+        enters the forward and hits the AGV kernel barrier.
         """
         import torch.distributed as dist
         from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NVLSAllGatherVDispatcher,
+            InferenceAllGatherDispatcherBase,
         )
 
-        local_count = torch.tensor(
-            [self.padded_active_token_count], dtype=torch.int32, device="cuda"
-        )
-        ep_size = dist.get_world_size(group=self.expert_model_parallel_group)
-        gathered = torch.empty(ep_size, dtype=torch.int32, device="cuda")
-        dist.all_gather_into_tensor(gathered, local_count, group=self.expert_model_parallel_group)
-        NVLSAllGatherVDispatcher.set_step_metadata(gathered, self.expert_model_parallel_group)
+        ep_group = self.expert_model_parallel_group
+        ep_size = dist.get_world_size(group=ep_group)
+        ep_rank = dist.get_rank(group=ep_group)
+        local_tokens = self.padded_active_token_count
+
+        if self._nccl_ep_dispatcher:
+            logging.info(
+                "[NCCL-EP rank=%d] _update_moe_dispatcher_metadata: local_tokens=%d ep_size=%d (no collective)",
+                ep_rank, local_tokens, ep_size,
+            )
+            local_tokens_per_rank = torch.full(
+                (ep_size,), local_tokens, dtype=torch.int32, device="cuda"
+            )
+        else:
+            logging.info(
+                "[NVLS-EP rank=%d] _update_moe_dispatcher_metadata: entering all_gather local_tokens=%d",
+                ep_rank, local_tokens,
+            )
+            local_count = torch.tensor([local_tokens], dtype=torch.int32, device="cuda")
+            local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device="cuda")
+            dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
+            logging.info("[NVLS-EP rank=%d] _update_moe_dispatcher_metadata: all_gather done", ep_rank)
+
+        InferenceAllGatherDispatcherBase.set_step_metadata(local_tokens_per_rank, ep_group)
+        logging.info("[EP rank=%d] _update_moe_dispatcher_metadata: entering barrier", ep_rank)
+        dist.barrier(group=ep_group)
+        logging.info("[EP rank=%d] _update_moe_dispatcher_metadata: barrier done", ep_rank)
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""

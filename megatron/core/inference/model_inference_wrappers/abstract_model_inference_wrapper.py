@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import abc
+import logging
 from typing import Any, Dict, Iterable, Optional, Union
 
 import torch
@@ -137,6 +138,49 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # we use num_dummy_tokens equal to tensor model parallel size
         # so that the dummy forward pass will work with sequence parallel
         num_dummy_tokens = self.tp_size
+
+        # Populate MoE dispatcher step metadata before the eager dummy forward.
+        # For CUDA-graph steps this is handled by initialize_attention_state; here
+        # we cover the eager path (no CG list, or CG list but no match).
+        context = self.inference_context
+        ep_group = getattr(context, 'expert_model_parallel_group', None)
+        if ep_group is not None:
+            import torch.distributed as dist
+            from megatron.core.transformer.moe.token_dispatcher_inference import (
+                InferenceAllGatherDispatcherBase,
+            )
+            ep_size = dist.get_world_size(group=ep_group)
+            ep_rank = dist.get_rank(group=ep_group)
+            if getattr(context, '_nccl_ep_dispatcher', False):
+                # NCCL: all ranks always have the same count — no collective needed.
+                logging.info(
+                    "[NCCL-EP rank=%d] dummy_forward: setting metadata num_dummy_tokens=%d ep_size=%d",
+                    ep_rank, num_dummy_tokens, ep_size,
+                )
+                local_tokens_per_rank = torch.full(
+                    (ep_size,), num_dummy_tokens, dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                InferenceAllGatherDispatcherBase.set_step_metadata(local_tokens_per_rank, ep_group)
+                logging.info("[NCCL-EP rank=%d] dummy_forward: metadata set", ep_rank)
+            else:
+                # NVLS: all-gather actual per-rank counts, then barrier so all ranks
+                # have their metadata set before any enters the forward.
+                logging.info(
+                    "[NVLS-EP rank=%d] dummy_forward: entering all_gather num_dummy_tokens=%d",
+                    ep_rank, num_dummy_tokens,
+                )
+                local_count = torch.tensor(
+                    [num_dummy_tokens], dtype=torch.int32, device=torch.cuda.current_device()
+                )
+                local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32,
+                                                     device=torch.cuda.current_device())
+                dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
+                InferenceAllGatherDispatcherBase.set_step_metadata(local_tokens_per_rank, ep_group)
+                logging.info("[NVLS-EP rank=%d] dummy_forward: entering barrier", ep_rank)
+                dist.barrier(group=ep_group)
+                logging.info("[NVLS-EP rank=%d] dummy_forward: barrier done", ep_rank)
+
         tokens = torch.zeros(
             (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
         )
@@ -152,7 +196,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
         is_spec_decode = (
             self.inference_context.is_dynamic_batching() and self.config.mtp_num_layers is not None
         )
-        return self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
+        logging.info("[dummy_forward] entering model forward")
+        result = self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
+        logging.info("[dummy_forward] model forward done")
+        return result
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None

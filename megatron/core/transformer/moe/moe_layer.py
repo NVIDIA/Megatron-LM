@@ -359,10 +359,7 @@ class MoELayer(BaseMoELayer):
         eval mode → inference dispatcher, train mode → standard dispatcher.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
-        if dispatcher_type == 'nvls':
-            dispatcher_cls = NVLSAllGatherVDispatcher
-        else:
-            dispatcher_cls = NCCLAllGatherDispatcher
+        dispatcher_cls = NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
 
         self._training_token_dispatcher = self.token_dispatcher
         self._inference_token_dispatcher = dispatcher_cls(

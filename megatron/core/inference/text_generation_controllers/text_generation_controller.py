@@ -1666,6 +1666,29 @@ class TextGenerationController:
         # clear the context of any temporary state from the dummy forward
         context.reset()
 
+    def _agv_dummy_forward(self):
+        """Dummy forward for NVLSAllGatherVDispatcher.
+
+        Two cases:
+        1. No CUDA graphs configured: run an eager dummy forward. Dispatcher metadata
+           is set inside dummy_forward for both NCCL and NVLS dispatchers.
+        2. CUDA graphs configured: delegate to _dynamic_step_context_init which calls
+           initialize_attention_state and handles the NVLS metadata all-gather.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        if not context.cuda_graph_batch_dimensions_list:
+            # Metadata setup is handled inside dummy_forward for the eager path.
+            self.inference_wrapped_model.dummy_forward()
+            return
+
+        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+
+        assert context.using_cuda_graph_this_step()
+        self._dynamic_step_forward_logits(input_ids, position_ids)
+        
+        context.reset()
+
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
         """Run dummy MTP forward passes to participate in EP collectives.

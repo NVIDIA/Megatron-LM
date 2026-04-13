@@ -630,7 +630,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NVLSAllGatherVDispatcher,
+            InferenceAllGatherDispatcherBase,
         )
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
@@ -641,7 +641,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._mcore_activation_type,
             num_local_experts=self.num_local_experts,
             local_expert_start=local_expert_start,
-            valid_tokens=NVLSAllGatherVDispatcher._valid_tokens(),
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
         )
