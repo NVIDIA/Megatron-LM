@@ -49,8 +49,6 @@ logger = logging.getLogger(__name__)
      num_global_tokens: num_local_tokens*TP*EP
 """
 
-logger = logging.getLogger(__name__)
-
 
 class MoETokenDispatcher:
     """
@@ -78,11 +76,29 @@ class MoETokenDispatcher:
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
+        self.ep_rank = utils.get_pg_rank(self.ep_group)
 
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
         self.cudagraph_attrs = []
         self.valid_cudagraph_attrs = None
+
+    def get_cudagraph_attr(self, attr_name: str):
+        """Resolve a cudagraph attribute path, including nested attributes."""
+        attr = self
+        for name in attr_name.split('.'):
+            attr = getattr(attr, name, None)
+            if attr is None:
+                return None
+        return attr
+
+    def set_cudagraph_attr(self, attr_name: str, value) -> None:
+        """Assign to a cudagraph attribute path, including nested attributes."""
+        hier_attr_name = attr_name.split('.')
+        attr = self
+        for name in hier_attr_name[:-1]:
+            attr = getattr(attr, name)
+        setattr(attr, hier_attr_name[-1], value)
 
     @abstractmethod
     def dispatch_preprocess(
@@ -665,6 +681,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of tokens and probabilities after All-to-All.
         """
+
         # Perform expert parallel AlltoAll communication
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
@@ -1005,10 +1022,23 @@ class _HybridEPManager(_DispatchManager):
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
             )
 
+        self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+        self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
         self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
         self.token_probs = probs.reshape(num_tokens, self.num_experts)
+
+        if self.moe_expert_rank_capacity_factor is not None:
+            pad_multiple = get_align_size_for_quantization(self.config)
+            budget = int(
+                routing_map.shape[0]
+                * self.config.moe_router_topk
+                * self.moe_expert_rank_capacity_factor
+            )
+            budget += -budget % pad_multiple
+            self.num_permuted_tokens = budget
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = num_tokens * self.config.moe_router_topk
@@ -1056,12 +1086,16 @@ class _HybridEPManager(_DispatchManager):
                 fused=self.config.moe_permute_fusion_into_hybridep,
             )
         )
+        if self.moe_expert_rank_capacity_factor is not None:
+            over_budget = self.handle[8] != 0  # this is overflow_flag
+            self.over_budget |= over_budget
 
-        if not self.drop_and_pad:
-            self.tokens_per_expert = tokens_per_expert
+        if self.num_permuted_tokens is None:
+            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # self.num_permuted_tokens is necessary to allocate the output tensor for permute
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-
+        if self.moe_expert_rank_capacity_factor is not None:
+            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
     def combine(
@@ -1417,6 +1451,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             .expand(-1, -1, self.tp_size, -1)
             .reshape(num_local_tokens, world_size, self.num_local_experts)
         ).contiguous()
+
         return routing_map, probs
 
     @jit_fuser
@@ -1537,3 +1572,15 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             The final MoE layer output reshaped to its original dimensions.
         """
         return hidden_states.view(self.hidden_shape)
+
+    def check_over_budget(self):
+        """Check if the dispatcher has exceeded its budget."""
+        if hasattr(self._comm_manager, 'over_budget'):
+            return self._comm_manager.over_budget
+        else:
+            return None
+
+    def reset_over_budget(self):
+        """Reset the accumulated over-budget flag on the communication manager."""
+        if hasattr(self._comm_manager, 'over_budget'):
+            self._comm_manager.over_budget.fill_(0)

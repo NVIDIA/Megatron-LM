@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -97,17 +98,13 @@ except:
     flash_attn_varlen_func = None
     flash_attn_with_kvcache = None
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         SplitAlongDim,
         TELinear,
         set_save_original_input,
     )
-except ImportError:
-    HAVE_TE = False
+else:
     SplitAlongDim, TELinear, set_save_original_input = None, None, None
 
 try:
@@ -252,11 +249,13 @@ class Attention(MegatronModule, ABC):
         attention_type: str,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
+        self._pp_layer_offset = pp_layer_offset
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -433,7 +432,16 @@ class Attention(MegatronModule, ABC):
         )
 
     def _get_pp_layer_offset_for_inference(self):
-        """Return the pipeline parallel layer offset for inference."""
+        """Return the pipeline parallel layer offset for inference.
+
+        When pp_layer_offset was explicitly provided (e.g. by MambaBlock for
+        hybrid models using --hybrid-layer-pattern with fVPP), use that value
+        directly.  Otherwise fall back to the standard computation which assumes
+        uniform layer distribution across pipeline stages.
+        """
+        if self._pp_layer_offset is not None:
+            return self._pp_layer_offset
+
         assert (
             self.config.virtual_pipeline_model_parallel_size is None
         ), "Virtual pipeline parallelism is not supported for inference"
@@ -789,7 +797,7 @@ class Attention(MegatronModule, ABC):
         assert block_table is not None
 
         # Flash attn kernel.
-        if not is_decode_only:
+        if max_seqlen_q > 1:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
@@ -914,6 +922,13 @@ class Attention(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+
+        # here we need to set the right cp group for dynamic-cp
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -982,18 +997,16 @@ class Attention(MegatronModule, ABC):
         if output_gate:
             assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
 
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        with qkv_linear_manager as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 split_qkv=split_qkv,
                 output_gate=self.config.attention_output_gate,
             )
-        if self.offload_qkv_linear:
-            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-            qkv_output = off_interface.group_commit(
-                qkv_output, name="qkv_linear", forced_released_tensors=[]
-            )
+        # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+        qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -1043,6 +1056,7 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = self.linear_proj(context_layer)
+            self.pg_collection.cp = _orig_cp_group
             return output, bias
 
         if (
@@ -1136,6 +1150,9 @@ class Attention(MegatronModule, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, query, "core_attn"
+        )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -1149,9 +1166,7 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with off_interface(
-                    self.offload_core_attention and self.training, query, "core_attn"
-                ) as query:
+                with core_attn_manager as query:
                     core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
@@ -1187,10 +1202,9 @@ class Attention(MegatronModule, ABC):
                 if is_using_quantization_scales(self.config):
                     core_attn_out[inference_context.padding_slice] = 0.0
 
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[query, key, value]
+            )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -1210,14 +1224,13 @@ class Attention(MegatronModule, ABC):
         # Output. [sq, b, h]
         # =================
         nvtx_range_push(suffix="linear_proj")
-        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
-        if self.offload_attn_proj:
-            output = off_interface.group_commit(
-                output, name="attn_proj", forced_released_tensors=[core_attn_out]
-            )
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
+        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
     @jit_fuser
@@ -1256,6 +1269,7 @@ class SelfAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
     ):
         super().__init__(
             config=config,
@@ -1265,6 +1279,7 @@ class SelfAttention(Attention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -1412,8 +1427,10 @@ class SelfAttention(Attention):
             # 4. Further index into query to get only the q_heads that this rank is
             #    responsible for (e.g., q1).
             # The block of code below performs steps 1 and 2.
-            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
-            idx = get_tensor_model_parallel_rank() // (
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+                mixed_qkv, group=self.pg_collection.tp
+            )
+            idx = get_pg_rank(self.pg_collection.tp) // (
                 self.world_size // self.config.num_query_groups
             )
             size = mixed_qkv.size()[-1] // self.config.num_query_groups
@@ -1470,7 +1487,7 @@ class SelfAttention(Attention):
             # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
             # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
             # This is step 4 in the list of steps above.
-            idx = get_tensor_model_parallel_rank() % (
+            idx = get_pg_rank(self.pg_collection.tp) % (
                 self.world_size // self.config.num_query_groups
             )
             size = self.num_attention_heads_per_partition // (

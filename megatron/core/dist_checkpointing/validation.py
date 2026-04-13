@@ -1,16 +1,19 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import os
 from collections import Counter, defaultdict
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
+from megatron.core.dist_checkpointing.core import (
+    CheckpointingException,
+    check_is_distributed_checkpoint,
+)
 from megatron.core.dist_checkpointing.dict_utils import diff, extract_matching_values, nested_values
 from megatron.core.dist_checkpointing.mapping import (
     CommonStateDict,
@@ -19,15 +22,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     is_main_replica,
 )
-from megatron.core.dist_checkpointing.strategies.base import (
-    LoadCommonStrategy,
-    LoadShardedStrategy,
-    SaveCommonStrategy,
-    SaveShardedStrategy,
-    StrategyAction,
-    get_default_strategy,
-)
-from megatron.core.msc_utils import MultiStorageClientFeature
 
 if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
@@ -199,60 +193,17 @@ def validate_integrity_and_strict_load(
     return sharded_state_dict, missing_keys, unexpected_keys
 
 
-def verify_checkpoint_and_load_strategy(
-    checkpoint_dir: str,
-    sharded_strategy: Union[LoadShardedStrategy, Tuple[str, int], None] = None,
-    common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
-) -> Tuple[LoadShardedStrategy, LoadCommonStrategy]:
-    """Verifies if checkpoint metadata exists and matches given strategies.
-
-    If no strategies are passed, they are determined based on the checkpoint metadata.
+def verify_checkpoint(checkpoint_dir: str):
+    """Verifies if checkpoint exists.
 
     Args:
         checkpoint_dir (str): checkpoint directory
-        sharded_strategy (LoadShardedStrategy, Tuple[str, int], optional): sharded load strategy to be verified
-            if compatible with the checkpoint content. If None, the default sharded load strategy
-            for the checkpoint backend will be returned.
-        common_strategy (LoadCommonStrategy, Tuple[str, int], optional): common load strategy to be verified
-            if compatible with the checkpoint content. If None, the default common load strategy
-            for the checkpoint backend will be returned.
     """
-    isdir = True
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        isdir = msc.os.path.isdir(str(checkpoint_dir), strict=False)
-    else:
-        isdir = os.path.isdir(checkpoint_dir)
-    if not isdir:
-        raise CheckpointingException(f"Checkpoint directory {checkpoint_dir} does not exist")
+    if not Path(checkpoint_dir).exists():
+        raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
-    saved_config = maybe_load_config(checkpoint_dir)
-    if saved_config is None:
-        raise CheckpointingException(f"{checkpoint_dir} is not a distributed checkpoint")
-
-    if sharded_strategy is None:
-        sharded_strategy = get_default_strategy(
-            StrategyAction.LOAD_SHARDED,
-            saved_config.sharded_backend,
-            saved_config.sharded_backend_version,
-        )
-    elif isinstance(sharded_strategy, tuple):
-        sharded_strategy = get_default_strategy(StrategyAction.LOAD_SHARDED, *sharded_strategy)
-
-    if common_strategy is None:
-        common_strategy = get_default_strategy(
-            StrategyAction.LOAD_COMMON,
-            saved_config.common_backend,
-            saved_config.common_backend_version,
-        )
-    elif isinstance(common_strategy, tuple):
-        sharded_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, *common_strategy)
-
-    sharded_strategy.check_backend_compatibility(saved_config.sharded_backend)
-    sharded_strategy.check_version_compatibility(saved_config.sharded_backend_version)
-    common_strategy.check_backend_compatibility(saved_config.common_backend)
-    common_strategy.check_version_compatibility(saved_config.common_backend_version)
-    return sharded_strategy, common_strategy
+    if not check_is_distributed_checkpoint(checkpoint_dir):
+        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
 
 
 def adjust_non_strict_load(
@@ -532,29 +483,3 @@ def determine_global_metadata(
     global_metadata = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(global_metadata, local_metadata)
     return local_metadata, global_metadata  # type: ignore[return-value]
-
-
-def validate_sharded_objects_handling(
-    sharded_strategy: Union[SaveShardedStrategy, LoadShardedStrategy],
-    common_strategy: Union[SaveCommonStrategy, LoadCommonStrategy],
-) -> None:
-    """Checks if either of the passed strategies can handle sharded objects.
-
-    Args:
-        sharded_strategy (Union[SaveShardedStrategy, LoadShardedStrategy]): sharded strategy used for saving/loading
-        common_strategy (Union[SaveCommonStrategy, LoadCommonStrategy]): common strategy used for saving/loading
-
-    Returns:
-        None
-
-    Raises:
-        CheckpointingException: if both strategies can't handle ShardedObjects
-    """
-    if (
-        not sharded_strategy.can_handle_sharded_objects
-        and not common_strategy.can_handle_sharded_objects
-    ):
-        raise CheckpointingException(
-            f"Either sharded strategy or common strategy must implement ShardedObjects handling."
-            f" Both {sharded_strategy} and {common_strategy} specify can_handle_sharded_objects=False"
-        )

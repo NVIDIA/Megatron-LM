@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.mamba import MambaModel
@@ -21,23 +22,22 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
-    from megatron.core.utils import is_te_min_version
 
-    HAVE_TE = True
     try:
         import transformer_engine_torch as tex
 
         HAVE_TEX = True
-    except:
+    except ImportError:
+        tex = None
         HAVE_TEX = False
-except:
-    HAVE_TE = False
+else:
+    TEDotProductAttention = None
+    tex = None
+    HAVE_TEX = False
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
@@ -115,9 +115,7 @@ class LLaVAModel(MegatronModule):
         language_rotary_base: int = 10000,
         language_rope_scaling: bool = False,
         language_rope_scaling_factor: float = 8.0,
-        hybrid_attention_ratio: float = 1.0,
-        hybrid_mlp_ratio: float = 1.0,
-        hybrid_override_pattern: str = None,
+        hybrid_layer_pattern: str = None,
         fp16_lm_cross_entropy: bool = False,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
@@ -206,9 +204,7 @@ class LLaVAModel(MegatronModule):
                     parallel_output=parallel_output,
                     position_embedding_type=language_position_embedding_type,
                     pre_process=self.pre_process,
-                    hybrid_attention_ratio=hybrid_attention_ratio,
-                    hybrid_mlp_ratio=hybrid_mlp_ratio,
-                    hybrid_override_pattern=hybrid_override_pattern,
+                    hybrid_layer_pattern=hybrid_layer_pattern,
                     post_process=self.post_process,
                     rotary_percent=language_rotary_percent,
                     rotary_base=language_rotary_base,

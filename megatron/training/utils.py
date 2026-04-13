@@ -43,7 +43,8 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.legacy.model.module import param_is_not_shared
+
+from megatron.core.transformer.module import param_is_not_shared
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -433,6 +434,11 @@ def print_rank_last(message):
         print(message, flush=True)
 
 
+def is_hybrid_model(args):
+    """Returns True if the model is a hybrid Mamba-Transformer model."""
+    return args.hybrid_layer_pattern is not None
+
+
 def is_first_or_last_pipeline_stage(vp_stage):
     """Return True if on first or last pipeline stage, taking into account virtual
     pipeline parallelism."""
@@ -562,7 +568,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
-            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
+            n_tensor = torch.empty(1, dtype=torch.int64, device=dev).fill_(n)
             _broadcast(n_tensor)
 
             if n == 0:
@@ -574,7 +580,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
-        if args.hybrid_context_parallel:
+        if args.dynamic_context_parallel:
             seq_len = torch.tensor(batch['tokens'].shape[0], dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
             
@@ -604,7 +610,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['attention_mask'])
 
     else:
-        if args.hybrid_context_parallel:
+        if args.dynamic_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
             shape = (seq_len.item())
@@ -627,7 +633,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             device=torch.cuda.current_device(),
         )
         if args.create_attention_mask_in_dataloader:
-            shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
+            shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.dynamic_context_parallel else (1, 1, shape[0], shape[0])
             attention_mask = torch.empty(
                 shape_attention_mask,
                 dtype=torch.bool,
@@ -641,7 +647,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             device=torch.cuda.current_device(),
         )
         cu_seqlens = None
-        if args.hybrid_context_parallel or args.sft:
+        if args.dynamic_context_parallel or args.sft:
             max_seqlen = torch.empty(
                 1,
                 dtype=torch.int32,
@@ -654,7 +660,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             1,
             dtype=torch.int32,
             device=torch.cuda.current_device(),
-        ) if args.hybrid_context_parallel else None
+        ) if args.dynamic_context_parallel else None
 
         def _broadcast_cu_seqlens():
             dev = torch.cuda.current_device()
@@ -751,26 +757,36 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
 
 
 def get_nvtx_range():
-    """Create an NVTX range context manager."""
+    """Create an NVTX range context manager.
+
+    Returns a context manager that:
+    - Creates an NVTX range for profiling (nsight-systems compatible)
+    - Optionally tracks time via Megatron timers when time=True
+
+    Args (for returned context manager):
+        msg: Name of the range/timer
+        time: If True, also track with Megatron timers (default: False)
+        log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
+    """
     try:
         from torch.cuda import nvtx
 
         @contextmanager
-        def nvtx_range(msg, time=False):
+        def nvtx_range(msg, time=False, log_level=1):
             if time:
                 timers = get_timers()
-                timers(msg, log_level=0).start()
+                timers(msg, log_level=log_level).start()
             try:
                 nvtx.range_push(msg)
                 yield
             finally:
                 nvtx.range_pop()
                 if time:
-                    timers(msg, log_level=0).stop()
+                    timers(msg, log_level=log_level).stop()
 
         return nvtx_range
     except:
         @contextmanager
-        def dummy_range(msg):
+        def dummy_range(msg, time=False, log_level=1):
             yield
         return dummy_range

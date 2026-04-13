@@ -45,7 +45,11 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
+    from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+        FSDPDistributedIndex,
+        MegatronFSDP,
+        MixedPrecisionPolicy,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -76,22 +80,37 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        self.num_moe_experts = getattr(config, "num_moe_experts", None)
+
         self.ddp_config = ddp_config
         log_single_rank(
             logger,
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
+        self.mp_policy = MixedPrecisionPolicy(
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
+            # Grandfathered Argument: grad_reduce_in_fp32
+            main_grads_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_main_grads_dtype
+            ),
+            grad_comm_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Setting up Megatron-FSDP MixedPrecisionPolicy with config {self.mp_policy}',
+        )
 
         self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
 
         if config.gradient_accumulation_fusion:
-            assert (
-                self.megatron_fsdp_dist_index.get_dp_group(is_expert_parallel=True).size() == 1
-            ), (
-                "Megatron-FSDP with gradient_accumulation_fusion does not support "
-                "data parallelism when expert parallelism is enabled."
-            )
             assert is_te_min_version("2.10"), (
                 "Megatron-FSDP with gradient_accumulation_fusion requires "
                 "Transformer Engine version 2.10 or higher."
@@ -116,6 +135,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             config=config,
             module=MegatronFSDP(
                 ddp_config=ddp_config,
+                mixed_precision_policy=self.mp_policy,
                 module=module,
                 fsdp_unit_modules=self.fsdp_unit_modules,
                 disable_bucketing=disable_bucketing,
@@ -266,7 +286,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             expt_tp_group = single_rank_group
 
         if enable_hsdp:
-            if expt_dp_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_hsdp_tp_mesh(
                     outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size()
                 )
@@ -295,7 +315,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 expt_device_mesh=expt_device_mesh,
             )
         else:
-            if ep_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
                 expt_device_mesh = DeviceMesh.from_group(
                     [expt_dp_group, expt_tp_group],

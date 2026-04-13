@@ -427,7 +427,6 @@ def _load_checkpoint(queue, args):
         from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
-        from megatron.legacy import fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -517,7 +516,6 @@ def _load_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
-    fused_kernels.load(margs)
 
     # For backward compatibility during local parallel states refactoring
     fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)

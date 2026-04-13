@@ -3,7 +3,7 @@
 import weakref
 from contextlib import nullcontext
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from torch import Tensor
@@ -330,6 +330,8 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
         with torch.cuda.stream(self.stream):
             torch.cuda.nvtx.range_push(f"{self.name} wgrad")
             for module in self.bwd_dw_callables:
@@ -476,18 +478,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
+                mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
+                node.layer_state.mlp_norm_manager = mlp_norm_manager
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-                    with off_interface(
-                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
-                    ) as hidden_states:
+                    with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
                             apply_module(layer.pre_mlp_layernorm), hidden_states
                         )
                 else:
-                    with off_interface(
-                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
-                    ) as hidden_states:
+                    with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
                             hidden_states
                         )
@@ -589,10 +589,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
-        if layer.offload_mlp_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+        mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
+        if mlp_norm_manager is not None:
+            hidden_states = mlp_norm_manager.group_offload(
+                hidden_states, forced_released_tensors=[residual]
             )
+            node.layer_state.mlp_norm_manager = None
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )

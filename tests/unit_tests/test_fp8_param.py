@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 import gc
@@ -11,7 +11,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
-from megatron.core.fp8_utils import is_float8tensor
+from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -72,12 +72,12 @@ class TestFP8Param:
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-        destroy_global_vars()
-        destroy_num_microbatches_calculator()
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
         gc.collect()
 
     def model_provider(
@@ -245,6 +245,28 @@ class TestFP8Param:
         # Each layer has 4 GEMM weights: qkv, proj, fc1, fc2.
         if fp8_param_gather:
             assert num_fp8_params == 4 * fp8_layers
+
+        # Verify that bf16 params (embedding, LN, etc.) in the MXFP8 model are mapped
+        # to the param buffer (shared with grad buffer) rather than allocated separately.
+        if args.reuse_grad_buf_for_mxfp8_param_ag:
+            for buffer in gpt_model[0].buffers:
+                if buffer.param_data is None:
+                    continue
+                buf_start = buffer.param_data.data_ptr()
+                buf_end = buf_start + buffer.param_data.numel() * buffer.param_data.element_size()
+                for param in buffer.param_to_bucket:
+                    if is_mxfp8tensor(param):
+                        # MXFP8 params keep their own quantized storage.
+                        assert not (
+                            buf_start <= param.data.data_ptr() < buf_end
+                        ), "MXFP8 param should not be mapped to the param buffer"
+                    else:
+                        # BF16 params should be views into the param buffer
+                        # (no double allocation).
+                        assert buf_start <= param.data.data_ptr() < buf_end, (
+                            "BF16 param should be a view into the param buffer "
+                            "(no separate allocation)"
+                        )
 
         loss_list = []
 
