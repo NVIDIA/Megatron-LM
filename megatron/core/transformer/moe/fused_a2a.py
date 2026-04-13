@@ -412,7 +412,7 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
-            fuse_permute_dispatch=fused,
+            **({"fuse_permute_dispatch": fused} if fused else {}),
         )
 
         ctx.handle = handle
@@ -437,7 +437,7 @@ class HybridEPDispatch(torch.autograd.Function):
             probs=grad_probs,
             handle=handle,
             pad_multiple=ctx.pad_multiple,
-            fuse_unpermute_combine=ctx.fused,
+            **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
         return (
             combined_hidden,
@@ -467,7 +467,10 @@ class HybridEPCombine(torch.autograd.Function):
         Forward pass of fused combine of the HybridEP backend
         '''
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x, handle=handle, pad_multiple=pad_multiple, fuse_unpermute_combine=fused
+            hidden=x,
+            handle=handle,
+            pad_multiple=pad_multiple,
+            **({"fuse_unpermute_combine": fused} if fused else {}),
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
@@ -487,7 +490,7 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
-            fuse_permute_dispatch=ctx.fused,
+            **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
         return dispatched_hidden, None, None, None, None
 
