@@ -431,10 +431,9 @@ class RerunStateMachine:
             log_single_rank(
                 logger,
                 logging.WARNING,
-                "Exiting now. A checkpoint at the last iteration is being saved "
-                "if further examination is needed",
+                "Exiting now. The job can be resumed from a previous checkpoint",
             )
-            return True, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
+            return False, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
         elif self.state == RerunState.WILL_RERUN_FROM_CHECKPOINT:
             log_single_rank(
                 logger,
