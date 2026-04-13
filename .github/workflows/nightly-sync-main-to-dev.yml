@@ -94,12 +94,13 @@ jobs:
             create a PR, ensure all CI tests pass (fixing any failures), and mark
             the PR as ready for review.
 
-            **CRITICAL: You MUST complete ALL 4 phases before exiting.**
-            Creating the PR and triggering CI is only Phase 2. You MUST then
-            poll CI until every job finishes (Phase 3), fix any sync-caused
-            failures and re-trigger, and finally mark the PR ready (Phase 4).
-            If you exit after triggering CI without waiting for results, you
-            have FAILED your task. You have 1000 turns — use them.
+            **CRITICAL: Your exit condition is running `gh pr ready`.**
+            You are NOT done until you have run `gh pr ready <PR_NUMBER>`.
+            That command is in Phase 4. You cannot reach Phase 4 until CI
+            finishes. CI takes 1-2 hours. You must poll it with `sleep`
+            and `gh api` calls in a loop until every job completes. Do NOT
+            exit after creating the PR or triggering CI — that is only
+            Phase 2 out of 4. You have 1000 turns and 6 hours. Use them.
 
             REPO: ${{ github.repository }}
             BRANCH: ${{ steps.vars.outputs.branch }}
