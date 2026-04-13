@@ -71,6 +71,7 @@ class StaticBufferLoader:
 
         assert isinstance(inputs, dict)
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
+            self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
@@ -84,6 +85,7 @@ class StaticBufferLoader:
                     else:
                         StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
+            self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 clone_tensors_in_struct(
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs

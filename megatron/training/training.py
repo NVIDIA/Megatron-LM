@@ -156,6 +156,7 @@ from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import get_loaded_iteration
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -200,7 +201,8 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
-    update_pg_timeout
+    update_pg_timeout,
+    create_all_gather_groups,
 )
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
@@ -1351,6 +1353,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
+        if args.create_all_gather_group:
+            timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
+            dp_cp_ag, expt_dp_ag = create_all_gather_groups(
+                for_expert_parallelism=(args.expert_model_parallel_size > 1),
+                timeout=timeout,
+            )
+            pg_collection.dp_cp_ag = dp_cp_ag
+            pg_collection.expt_dp_ag = expt_dp_ag
+
+            print_rank_0("> created all-gather process groups for AG/RS overlap")
+            if expt_dp_ag is not None:
+                print_rank_0(">   including expert parallelism AG group")
+
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
         # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
@@ -1491,11 +1506,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
+            kwargs['param_name_patterns_for_fp32_local_accumulation'] = \
+                tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
             kwargs['average_in_collective'] = args.ddp_average_in_collective
             # Megatron-FSDP arguments.
             kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
             kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
             kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
+            kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
@@ -1520,6 +1538,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
+            # Megatron-FSDP reads dtypes from ddp_config; pass pg_collection for AG/RS overlap.
+            dp_init_kwargs = {}
+            if args.use_megatron_fsdp:
+                dp_init_kwargs["pg_collection"] = pg_collection
             model = [
                 DP(
                     config=config,
@@ -1528,6 +1550,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     # Turn off bucketing for model_chunk 2 onwards, since communication
                     # for these model chunks is overlapped with compute anyway.
                     disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+                    **dp_init_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
@@ -2864,20 +2887,9 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(
-            forward_backward_func,
-            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-        )
-    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
-    if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
-        forward_backward_func = PagedStashRunner(
-            config,
-            copy_main_params,
-            model,
-            optimizer,
-            forward_backward_func,
-        )
+        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+    if args.optimizer_cuda_graph:
+        optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3305,6 +3317,10 @@ def train(
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
+
+    # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
+    if args.optimizer_cuda_graph:
+        del optimizer.step
 
     one_logger_utils.track_e2e_metrics()
 
@@ -3854,6 +3870,6 @@ def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
     return (
         not args.use_megatron_fsdp
-        and (args.use_distributed_optimizer or 'dist' in args.optimizer)
+        and (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
         and args.overlap_param_gather
     )

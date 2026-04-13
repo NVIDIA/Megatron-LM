@@ -35,11 +35,17 @@ except ImportError:
         USING_PYTORCH_OPTIMIZER = True
 
 try:
-    from emerging_optimizers.scalar_optimizers import Lion
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
 
-    HAVE_LION = True
-except ImportError:
-    HAVE_LION = False
+    _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
+except (ImportError, PackageNotFoundError):
+    _eo_ver = (0, 0)
+
+HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
+
+if HAVE_EMERGING_OPTIMIZERS:
+    from emerging_optimizers.scalar_optimizers import Lion
 
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
@@ -542,6 +548,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 "weight_decay": config.weight_decay,
                 "betas": (config.adam_beta1, config.adam_beta2),
                 "eps": config.adam_eps,
+                "capturable": config.optimizer_cuda_graph,
             }
 
             # set Adam class and weight decay mode depending
@@ -589,12 +596,12 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.initialize_state(p)
 
         elif config.optimizer == 'lion':
-            if not HAVE_LION:
+            if not HAVE_EMERGING_OPTIMIZERS:
                 raise ImportError(
-                    "Lion optimizer requires the 'emerging_optimizers' package. "
-                    "Please install it to use --optimizer lion."
+                    "Lion optimizer requires emerging_optimizers >= 0.2. "
+                    "Please install or upgrade it to use --optimizer lion."
                 )
-            optimizer = Lion(
+            optimizer = Lion(  # pylint: disable=possibly-used-before-assignment
                 param_groups,
                 lr=config.lr,
                 betas=(config.lion_beta1, config.lion_beta2),
@@ -843,7 +850,8 @@ def _get_megatron_emerging_optimizer(
             config,
             pg_collection,
             init_state_fn_list=list(init_fns),
-            model_chunks=model_chunks,
+            model_chunks=model_chunks if config.overlap_param_gather else None,
+            overlap_param_gather=config.overlap_param_gather,
         )
 
     return ChainedOptimizer(results)
@@ -944,21 +952,32 @@ def get_megatron_optimizer(
                 buffer_name='buffers',
             )
 
-            optimizers.append(
-                _get_megatron_optimizer_based_on_param_groups(
-                    config=config,
-                    model_chunks=model_chunk,
-                    param_groups=param_groups,
-                    per_model_buffers=buffers,
-                    model_parallel_group=mp_group,
-                    data_parallel_group=dp_cp_group,
-                    data_parallel_group_gloo=intra_dp_cp_group_gloo,
-                    data_parallel_group_idx=model_parallel_rank,
-                    intra_dist_opt_group=intra_dist_opt_group,
-                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-                    pg_collection=pg_collection,
-                )
+            optimizer_part = _get_megatron_optimizer_based_on_param_groups(
+                config=config,
+                model_chunks=model_chunk,
+                param_groups=param_groups,
+                per_model_buffers=buffers,
+                model_parallel_group=mp_group,
+                data_parallel_group=dp_cp_group,
+                data_parallel_group_gloo=intra_dp_cp_group_gloo,
+                data_parallel_group_idx=model_parallel_rank,
+                intra_dist_opt_group=intra_dist_opt_group,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
             )
+            if (
+                not USING_PYTORCH_OPTIMIZER
+                and config.use_precision_aware_optimizer
+                and getattr(optimizer_part.optimizer, "master_weights", None) is not None
+            ):
+                # NOTE(@cspades): FusedAdam is provided Megatron-FSDP's main weights as
+                # non-quantized DTensor(s). Megatron-FSDP should NEVER use FusedAdam's
+                # main weights, complete waste of memory as the optimizer step is still
+                # applied to the Megatron-FSDP main weight and extended to FusedAdam
+                # main weights. Override this here.
+                setattr(optimizer_part.optimizer, "master_weights", False)
+
+            optimizers.append(optimizer_part)
             model_chunk_offset += 1
 
         if len(optimizers) == 1:
