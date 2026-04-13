@@ -4,6 +4,7 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+
 import torch
 
 from gpt_builders import gpt_builder
@@ -74,8 +75,7 @@ def get_model_for_inference() -> MegatronModule:
             quant_backend = "triton"
         elif backend == "te":
             raise ValueError(
-                "MXFP8 quantization is not supported with "
-                "inference_grouped_gemm_backend='te'."
+                "MXFP8 quantization is not supported with " "inference_grouped_gemm_backend='te'."
             )
         quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
@@ -354,10 +354,18 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
-        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
-        prefix_caching_routing_alpha=getattr(args, 'inference_dynamic_batching_prefix_caching_routing_alpha', 0.5),
-        prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(
+            args.inference_dynamic_batching_prefix_caching_eviction_policy
+        ),
+        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
+            args.inference_dynamic_batching_prefix_caching_coordinator_policy
+        ),
+        prefix_caching_routing_alpha=getattr(
+            args, 'inference_dynamic_batching_prefix_caching_routing_alpha', 0.5
+        ),
+        prefix_caching_mamba_gb=getattr(
+            args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None
+        ),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
         num_speculative_tokens=args.num_speculative_tokens,
