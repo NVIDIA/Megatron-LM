@@ -177,8 +177,9 @@ class SharedExpertMLP(MLP):
             # State machine to ensure correct calling order of overlapped forward methods
             self._overlap_state = SharedExpertState.IDLE
 
-            if SharedExpertMLP.stream is None:
-                SharedExpertMLP.stream = torch.cuda.Stream()
+            if self.__class__.stream is None:
+                self.__class__.stream = torch.cuda.Stream()
+            self.stream = self.__class__.stream
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
