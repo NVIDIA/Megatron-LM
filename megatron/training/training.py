@@ -202,7 +202,8 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
-    update_pg_timeout
+    update_pg_timeout,
+    create_all_gather_groups,
 )
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
@@ -1322,6 +1323,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
+        if args.create_all_gather_group:
+            timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
+            dp_cp_ag, expt_dp_ag = create_all_gather_groups(
+                for_expert_parallelism=(args.expert_model_parallel_size > 1),
+                timeout=timeout,
+            )
+            pg_collection.dp_cp_ag = dp_cp_ag
+            pg_collection.expt_dp_ag = expt_dp_ag
+
+            print_rank_0("> created all-gather process groups for AG/RS overlap")
+            if expt_dp_ag is not None:
+                print_rank_0(">   including expert parallelism AG group")
+
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
         # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
@@ -1494,6 +1508,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
+            # Megatron-FSDP reads dtypes from ddp_config; pass pg_collection for AG/RS overlap.
+            dp_init_kwargs = {}
+            if args.use_megatron_fsdp:
+                dp_init_kwargs["pg_collection"] = pg_collection
             model = [
                 DP(
                     config=config,
@@ -1502,6 +1520,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     # Turn off bucketing for model_chunk 2 onwards, since communication
                     # for these model chunks is overlapped with compute anyway.
                     disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+                    **dp_init_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
