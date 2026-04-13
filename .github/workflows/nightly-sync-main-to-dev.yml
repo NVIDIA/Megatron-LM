@@ -259,6 +259,13 @@ jobs:
 
             ## Rules
 
+            - **Do NOT exit until Phase 4 is complete.** You must stay alive
+              through the entire CI cycle: trigger CI, poll until every job
+              finishes, fix any sync-caused failures, re-trigger, and repeat.
+              Only exit after you have marked the PR as ready (or documented
+              all remaining failures as pre-existing). Triggering CI and
+              walking away is NOT acceptable — the whole point of this
+              workflow is automated end-to-end delivery.
             - **Prioritize main over dev** when there is a genuine conflict between
               the two. But preserve dev-only additions (new files, new classes, new
               tests) that do not conflict with main.
