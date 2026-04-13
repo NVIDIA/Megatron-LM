@@ -130,6 +130,7 @@ def main(
             "TRANSFORMERS_OFFLINE": "1",
             "NCCL_PROTO": "simple",
             "NCCL_ALGO": "Ring",
+            "NCCL_COLLNET_ENABLE": "0",
             "NCCL_NVLS_ENABLE": "0",
             "NCCL_TUNER_PLUGIN": "libnccl-tuner.so",
             "NCCL_BUFFSIZE": "8388608",
