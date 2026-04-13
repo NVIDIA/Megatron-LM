@@ -26,8 +26,7 @@ if HAVE_TE:
 # TEFusedMLP / TEFusedDenseMLP require TE >= 1.13.0
 _HAVE_TE_FUSED = HAVE_TE and is_te_min_version("1.13.0")
 _skip_no_te_fused = pytest.mark.skipif(
-    not _HAVE_TE_FUSED,
-    reason="Requires Transformer Engine >= 1.13.0",
+    not _HAVE_TE_FUSED, reason="Requires Transformer Engine >= 1.13.0"
 )
 
 
@@ -37,9 +36,7 @@ class TestGetMlpModuleSpecForBackend:
     def test_no_flags_selects_mlp(self):
         """With no special flags the local backend returns plain MLP."""
         spec = get_mlp_module_spec_for_backend(
-            backend=LocalSpecProvider(),
-            use_te_op_fuser=False,
-            use_grouped_gemm_for_dense=False,
+            backend=LocalSpecProvider(), use_te_op_fuser=False, use_grouped_gemm_for_dense=False
         )
         assert spec.module is MLP
 
@@ -47,9 +44,7 @@ class TestGetMlpModuleSpecForBackend:
     def test_te_op_fuser_only_selects_te_fused_mlp(self):
         """use_te_op_fuser=True without grouped-GEMM flag selects TEFusedMLP."""
         spec = get_mlp_module_spec_for_backend(
-            backend=TESpecProvider(),
-            use_te_op_fuser=True,
-            use_grouped_gemm_for_dense=False,
+            backend=TESpecProvider(), use_te_op_fuser=True, use_grouped_gemm_for_dense=False
         )
         assert spec.module is TEFusedMLP
 
@@ -57,9 +52,7 @@ class TestGetMlpModuleSpecForBackend:
     def test_grouped_gemm_for_dense_flag_selects_te_fused_dense_mlp(self):
         """use_grouped_gemm_for_dense=True + use_te_op_fuser=True selects TEFusedDenseMLP."""
         spec = get_mlp_module_spec_for_backend(
-            backend=TESpecProvider(),
-            use_te_op_fuser=True,
-            use_grouped_gemm_for_dense=True,
+            backend=TESpecProvider(), use_te_op_fuser=True, use_grouped_gemm_for_dense=True
         )
         assert spec.module is TEFusedDenseMLP
 
@@ -77,17 +70,12 @@ class TestGetMlpModuleSpecForBackend:
     def test_grouped_gemm_for_dense_without_te_op_fuser_selects_mlp(self):
         """use_grouped_gemm_for_dense=True without use_te_op_fuser has no effect; MLP is used."""
         spec = get_mlp_module_spec_for_backend(
-            backend=LocalSpecProvider(),
-            use_te_op_fuser=False,
-            use_grouped_gemm_for_dense=True,
+            backend=LocalSpecProvider(), use_te_op_fuser=False, use_grouped_gemm_for_dense=True
         )
         assert spec.module is MLP
 
     def test_env_var_without_te_op_fuser_has_no_effect(self, monkeypatch):
         """USE_GROUPED_GEMM_FOR_DENSE=1 without use_te_op_fuser does not change the module."""
         monkeypatch.setenv("USE_GROUPED_GEMM_FOR_DENSE", "1")
-        spec = get_mlp_module_spec_for_backend(
-            backend=LocalSpecProvider(),
-            use_te_op_fuser=False,
-        )
+        spec = get_mlp_module_spec_for_backend(backend=LocalSpecProvider(), use_te_op_fuser=False)
         assert spec.module is MLP

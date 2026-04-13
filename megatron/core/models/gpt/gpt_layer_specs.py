@@ -528,7 +528,9 @@ def get_mlp_module_spec_for_backend(
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        _use_grouped_gemm = use_grouped_gemm_for_dense or os.getenv("USE_GROUPED_GEMM_FOR_DENSE") == "1"
+        _use_grouped_gemm = (
+            use_grouped_gemm_for_dense or os.getenv("USE_GROUPED_GEMM_FOR_DENSE") == "1"
+        )
         if _use_grouped_gemm and use_te_op_fuser:
             module = TEFusedDenseMLP
         elif use_te_op_fuser:
