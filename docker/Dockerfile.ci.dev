@@ -16,7 +16,7 @@ ENV UV_LINK_MODE=copy
 
 RUN bash -ex <<"EOF"
     apt-get update
-    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime 
+    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime
     apt-get clean
     python -m venv /opt/jet
     ARCH=$(uname -m)
@@ -31,11 +31,6 @@ RUN bash -ex <<"EOF"
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
 
-RUN ln -sf /usr/local/cuda/targets/x86_64-linux/include/cuda \
-    /usr/local/include/cuda
-RUN find /usr/local/cuda -name "utility" 2>/dev/null | head -5 && \
-    ls /usr/local/cuda/targets/x86_64-linux/include/ | head -20
-
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
@@ -46,7 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     export NVTE_CUDA_ARCHS="80;90;100"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra ${IMAGE_TYPE} --extra mlm --group no_pypi_wheels --link-mode copy --locked \
+    uv sync --extra ${IMAGE_TYPE} --extra mlm --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
