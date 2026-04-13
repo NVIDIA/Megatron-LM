@@ -120,6 +120,29 @@ jobs:
               additions, which is correct. Only intervene where there is an actual
               conflict.
 
+            **Beware of squash-merge chains (favor dev when it has follow-ups):**
+            Dev often develops features as a chain of PRs (PR1 → PR2 → PR3)
+            where each builds on the last. When PR1 is squash-merged to main,
+            git sees main's squashed version and dev's original commits as
+            unrelated changes to the same lines. `-X theirs` will then pick
+            main's PR1 code and silently discard PR2/PR3's improvements on dev.
+
+            After the merge, check for this pattern:
+            1. For each file where `-X theirs` resolved a conflict, run
+               `git log --oneline origin/dev -- <file>` to see if dev has
+               commits that came AFTER the code main is bringing in.
+            2. If dev has follow-up commits (e.g. bug fixes, refactors, or
+               extensions to the feature), **favor dev's version** for those
+               specific sections — the follow-ups are more recent and
+               intentional.
+            3. If the conflict is just main bringing in a clean copy of what
+               dev already has (no follow-ups), main's version is fine.
+
+            In practice: after the merge completes, run
+            `git diff origin/dev -- <file>` on any file that had conflicts.
+            If the diff shows dev's code was removed or reverted, investigate
+            whether dev's version is the more evolved one.
+
             **After merging, take main's version ONLY for these specific files**
             that are known to have semantic conflicts (dev's versions reference
             args/APIs that main removed or renamed):
