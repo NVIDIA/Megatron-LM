@@ -488,6 +488,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_batch_sizes))
 
+        from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
+
+        _set_capture_start()
         for batch_size in sorted(mtp_batch_sizes):
             dummy_hidden = torch.zeros((batch_size, 1, hidden_size), device=device, dtype=dtype)
             if sp_enabled:
@@ -509,6 +512,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 position_ids=dummy_position_ids,
                 depth=0,
             )
+        _set_capture_end()
 
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(model)
