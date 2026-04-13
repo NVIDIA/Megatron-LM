@@ -1567,6 +1567,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         packed_seq_params.cp_group is not None
                     ), "cp_group is not set in packed_seq_params for dynamic CP"
                     self.cp_group = packed_seq_params.cp_group
+                    if TEDotProductAttention.cp_stream is None:
+                        TEDotProductAttention.cp_stream = torch.cuda.Stream()
                     super().set_context_parallel_group(
                         self.cp_group,
                         torch.distributed.get_process_group_ranks(self.cp_group),
@@ -1707,9 +1709,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             extra_kwargs = _get_extra_te_kwargs(config)
 
-            if self.config.delay_wgrad_compute:
+            self.delay_wgrad_compute = (
+                self.config.delay_wgrad_compute
+                or self.config.overlap_dispatch_backward_with_experts_wgrad
+            )
+            if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
-                    extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+                    extra_kwargs["delay_wgrad_compute"] = True
                 else:
                     raise RuntimeError(
                         "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
@@ -1750,6 +1756,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
+            if is_te_min_version("2.14.0"):
+                extra_kwargs["single_grouped_weight"] = getattr(
+                    config, "moe_single_grouped_weight", False
+                )
+                extra_kwargs["single_grouped_bias"] = getattr(
+                    config, "moe_single_grouped_bias", False
+                )
+
             super().__init__(
                 num_gemms=num_gemms,
                 in_features=input_size,
@@ -1783,7 +1797,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             ):
                 """Make grouped checkpoint keys compatible across parameter layouts."""
 
-                def maybe_remap_param(param_name: str) -> None:
+                def maybe_remap_param(param_name: str, single_grouped: bool) -> None:
                     grouped_key = f"{prefix}{param_name}"
                     indexed_keys = [
                         f"{prefix}{param_name}{gemm_idx}" for gemm_idx in range(self.num_gemms)
@@ -1792,7 +1806,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     has_any_indexed_key = any(key in state_dict for key in indexed_keys)
                     has_all_indexed_keys = all(key in state_dict for key in indexed_keys)
 
-                    if getattr(self, "single_grouped_parameter", False):
+                    if single_grouped:
                         if has_grouped_key or not has_all_indexed_keys:
                             return
                         state_dict[grouped_key] = torch.stack(
@@ -1807,9 +1821,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         for gemm_idx, tensor in enumerate(split_tensors):
                             state_dict[f"{prefix}{param_name}{gemm_idx}"] = tensor
 
-                maybe_remap_param("weight")
+                maybe_remap_param("weight", getattr(self, "single_grouped_weight", False))
                 if self.use_bias:
-                    maybe_remap_param("bias")
+                    maybe_remap_param("bias", getattr(self, "single_grouped_bias", False))
 
             self._register_load_state_dict_pre_hook(
                 normalize_grouped_parameter_keys, with_module=True
@@ -2123,7 +2137,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             Compute weight gradients during the backward pass
             if delay_wgrad_compute is enabled.
             """
-            if self.config.delay_wgrad_compute:
+            if self.delay_wgrad_compute:
                 super().backward_dw()
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):

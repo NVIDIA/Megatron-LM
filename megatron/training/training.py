@@ -159,6 +159,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
@@ -191,7 +192,6 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.core.datasets.data_schedule import DynamicCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -2740,9 +2740,6 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.dynamic_context_parallel:
-        train_data_iterator = iter(DynamicCPDataLoaderWrapper(train_data_iterator, config))
-
     if args.run_workload_inspector_server:
         try:
             from workload_inspector.utils.webserver import run_server
@@ -2867,7 +2864,20 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            config,
+            copy_main_params,
+            model,
+            optimizer,
+            forward_backward_func,
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3370,7 +3380,20 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            config,
+            copy_main_params,
+            model,
+            None,
+            forward_backward_func,
+        )
 
     if has_nvidia_modelopt:
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
@@ -3410,7 +3433,7 @@ def evaluate(
                 try:
                     (
                         packed_data_iterator,
-                        eval_num_microbatches,
+                        scheduled_eval_num_microbatches,
                         _,
                         _,
                     ) = wrap_data_iterator(data_iterator, config, eval_num_microbatches)
@@ -3419,11 +3442,12 @@ def evaluate(
                     break
             else:
                 packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=packed_data_iterator,
                 model=model,
-                num_microbatches=eval_num_microbatches,
+                num_microbatches=scheduled_eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,

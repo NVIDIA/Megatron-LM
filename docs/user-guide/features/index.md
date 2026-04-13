@@ -20,6 +20,7 @@ context_parallel
 custom_fsdp
 dist_optimizer
 optimizer_cpu_offload
+paged_stash
 pipeline_parallel_layout
 tokenizers
 megatron_energon

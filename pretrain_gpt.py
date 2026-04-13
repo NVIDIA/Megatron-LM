@@ -31,7 +31,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_dynamic_cp_rank, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, StragglerDetector
 from megatron.training import (
     get_args,
     get_timers,
@@ -124,6 +124,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
+            dynamic_cp=args.dynamic_context_parallel,
         )
 
     # TODO: this is pretty hacky, find a better way
@@ -141,9 +142,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
     max_seqlen = batch.pop('max_seqlen', None)
-    local_cp_size = batch.pop('local_cp_size', None)
-    if local_cp_size is not None:
-        local_cp_size = int(local_cp_size.item())
+    batch.pop('local_cp_size', None)
 
     if cu_seqlens is not None:
         assert (
@@ -163,14 +162,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             qkv_format='thd',
         )
 
-    if cu_seqlens is None and local_cp_size is None:
+    if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
-    elif local_cp_size is None:  # Packed THD format
+    else:  # Packed THD format
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
-    else: # Dynamic CP format
-        batch, packed_seq_params = get_batch_on_this_dynamic_cp_rank(batch, local_cp_size)
     
     return (*batch.values(), packed_seq_params)
 

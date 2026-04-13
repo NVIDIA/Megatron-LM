@@ -76,6 +76,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "deallocate_pipeline_outputs": True,
     "defer_embedding_wgrad_compute": False,
     "delay_wgrad_compute": False,
+    "overlap_dispatch_backward_with_experts_wgrad": False,
     "deterministic_mode": False,
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
@@ -162,6 +163,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_deepep_num_sms": 20,
     "moe_enable_deepep": False,
     "moe_expert_capacity_factor": None,
+    "moe_expert_rank_capacity_factor": None,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
     "moe_grouped_gemm": True,
@@ -172,6 +174,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_layer_recompute": False,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
+    "moe_paged_stash": False,
+    "moe_paged_stash_buffer_size_factor_cpu": 0.0,
+    "moe_paged_stash_buffer_size_factor_cuda": 1.1,
+    "moe_paged_stash_page_size": 64,
     "moe_per_layer_logging": False,
     "moe_permute_fusion": False,
     "moe_router_bias_update_rate": 0.001,
@@ -292,6 +298,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "delta_offload_bytes_across_pp_ranks": 0,
     "activation_offload_fraction": 1.0,
     "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "fallback_to_eager_attn": False,
@@ -303,6 +310,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_force_biased": None,
     "sequence_packing_scheduler": None,
     "use_transformer_engine_op_fuser": False,
+    "moe_single_grouped_weight": False,
+    "moe_single_grouped_bias": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

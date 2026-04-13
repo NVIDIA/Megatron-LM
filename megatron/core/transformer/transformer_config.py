@@ -708,8 +708,8 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
-    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+    moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+    """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
@@ -743,6 +743,16 @@ class TransformerConfig(ModelParallelConfig):
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
+
+    moe_single_grouped_weight: bool = False
+    """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``.
+    """
+
+    moe_single_grouped_bias: bool = False
+    """When using TE GroupedLinear for MoE experts, store expert biases as a single grouped
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
+    and ``add_bias_linear=True``."""
 
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
@@ -825,9 +835,13 @@ class TransformerConfig(ModelParallelConfig):
     block interleaved format. Instead of interpreting the input tensor
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
-
     This data format is experimental and primarily intended to enable
     advanced fused kernels."""
+
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
+    exceeding this budget will be dropped. None means no token will be dropped. 
+    The default is None."""
 
     ##################
     # Context Parallel
@@ -1090,6 +1104,24 @@ class TransformerConfig(ModelParallelConfig):
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
 
+    moe_paged_stash: bool = False
+    """If True, enable paged stash for all routed-expert activations needed for backward"""
+
+    moe_paged_stash_page_size: int = 64
+    """Number of tokens per page for paged stash memory management."""
+
+    moe_paged_stash_buffer_size_factor_cuda: float = 1.10
+    """Scale factor for paged stash CUDA buffer allocation.
+
+    Sign selects sizing: positive = avg-based, negative = actual-max. Magnitude is headroom
+    (e.g. 1.10 = 10%)."""
+
+    moe_paged_stash_buffer_size_factor_cpu: float = 0.0
+    """Scale factor for paged stash host buffer. 0 disables host buffer.
+
+    Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
+    negative = actual-max; scale = abs(factor)."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1309,6 +1341,20 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_ffn_hidden_size is None
             ), "moe_ffn_hidden_size must be None when num_experts is not set."
 
+        if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+            if not self.moe_grouped_gemm:
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias require "
+                    "moe_grouped_gemm=True."
+                )
+            if not is_te_min_version("2.14.0"):
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias require "
+                    f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
+                )
+        if self.moe_single_grouped_bias and not self.add_bias_linear:
+            raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
+
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
@@ -1381,6 +1427,18 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_expert_capacity_factor is None:
                 raise ValueError(
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
+                )
+
+        if self.moe_expert_rank_capacity_factor is not None:
+            if not self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires use_transformer_engine_op_fuser to "
+                    "be enabled."
+                )
+            if self.moe_flex_dispatcher_backend != "hybridep":
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
+                    "'hybridep'."
                 )
 
         if self.cpu_offloading and (
@@ -1535,13 +1593,25 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_layer_num must be a positive integer when "
                     "'mhc' is in recompute_modules."
                 )
-            if self.fine_grained_activation_offloading:
-                raise ValueError(
-                    "'mhc' in recompute_modules is incompatible with "
-                    "fine_grained_activation_offloading. The mHC recompute hook fires "
-                    "before the offloading backward chunk is initialized, causing "
-                    "tensor_pop on a None chunk. Disable one of them."
-                )
+            if self.fine_grained_activation_offloading and self.offload_modules:
+                # mHC checkpoints wrap input_layernorm (inside attn_norm offload context)
+                # and pre_mlp_layernorm (inside mlp_norm offload context). The unified
+                # recompute hook fires before GroupCommitFunction.backward() initializes
+                # the backward chunk, so tensor_pop hits a None chunk for these modules.
+                # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
+                # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
+                # checkpoints, so they are safe to use with mHC recompute.
+                _MHC_CONFLICTING_OFFLOAD_MODULES = {"attn_norm", "mlp_norm"}
+                conflicting = _MHC_CONFLICTING_OFFLOAD_MODULES & set(self.offload_modules)
+                if conflicting:
+                    raise ValueError(
+                        f"'mhc' in recompute_modules is incompatible with "
+                        f"offload_modules {conflicting}. The mHC recompute hook fires "
+                        f"before the offloading backward chunk is initialized for these "
+                        f"modules, causing tensor_pop on a None chunk. Remove "
+                        f"{conflicting} from offload_modules or remove 'mhc' from "
+                        f"recompute_modules."
+                    )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
@@ -1624,6 +1694,18 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
+        if self.moe_paged_stash:
+            assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
+            assert self.moe_expert_rank_capacity_factor is not None, (
+                "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
+                "there is no need to use paged stashing without it."
+            )
+            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            assert not moe_offload_conflict, (
+                "When moe_paged_stash is enabled, offload_modules must not include "
+                f"expert_fc1 or moe_act (paged stash covers those activations). "
+                f"Remove: {moe_offload_conflict}"
+            )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -1986,10 +2068,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
+            "sigmoid",
+            "sqrtsoftplus",
+        ):
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+                "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
+                "score functions. Please set --moe-router-score-function to 'sigmoid' or "
+                "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
 
         if self.num_moe_experts and self.fp8:
@@ -2307,14 +2393,15 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if self.cuda_graph_impl != "none":
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                    and CudaGraphScope.moe not in self.cuda_graph_scope
-                    and CudaGraphScope.mlp not in self.cuda_graph_scope
-                ), (
-                    'CUDA graph scope on moe and mlp is not '
-                    'supported with overlap_moe_expert_parallel_comm'
-                )
+                if self.cuda_graph_impl == "transformer_engine":
+                    assert (
+                        self.cuda_graph_impl == "transformer_engine"
+                        and CudaGraphScope.moe not in self.cuda_graph_scope
+                        and CudaGraphScope.mlp not in self.cuda_graph_scope
+                    ), (
+                        'CUDA graph scope on moe and mlp is not '
+                        'supported with overlap_moe_expert_parallel_comm'
+                    )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
@@ -2326,6 +2413,19 @@ class TransformerConfig(ModelParallelConfig):
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
                 )
+
+        if self.overlap_dispatch_backward_with_experts_wgrad:
+            assert not self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be disabled when enabling '
+                'overlap_dispatch_backward_with_experts_wgrad.'
+            )
+            assert is_te_min_version(
+                "2.3.0"
+            ), 'TE version >= 2.3.0 is required for overlap_dispatch_backward_with_experts_wgrad'
+            assert not self.delay_wgrad_compute, (
+                'delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad '
+                'are mutually exclusive; use only one'
+            )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
@@ -2455,7 +2555,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"got '{self.moe_token_dispatcher_type}'"
             )
 
-            supported_schedulers = ['dp_balanced']
+            supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
             if (
                 self.sequence_packing_scheduler is not None
                 and self.sequence_packing_scheduler not in supported_schedulers
