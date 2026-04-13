@@ -15,9 +15,6 @@
 name: Nightly Sync Main to Dev
 
 on:
-  push:
-    branches:
-      - add-nightly-sync-workflow
   workflow_dispatch:
 
 concurrency:
