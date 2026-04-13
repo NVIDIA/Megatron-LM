@@ -218,10 +218,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_world_range = gbuf_world_all_ranges[data_parallel_rank]
 
         # Get each param's ranges.
-        # Use get_grad_index_map() which returns full-numel indices for NVFP4 params
+        # Use get_unpacked_index_map() which returns full-numel indices for NVFP4 params
         # (from nvfp4_grad_index_map) and normal indices for other params.
         param_range_map = cls._build_model_gbuf_param_range_map(
-            param_and_grad_buffer.get_grad_index_map(), gbuf_world_range, bucket.offset
+            param_and_grad_buffer.get_unpacked_index_map(), gbuf_world_range, bucket.offset
         )
 
         # Group into dict.
@@ -2440,20 +2440,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     nvfp4_param_to_idx_map[param] = idx
                     idx += 1
 
-        def get_shard_fp32_from_nvfp4(shard_main_groups, model_groups):
+        def _get_shard_fp32_from_nvfp4(shard_main_groups, model_groups):
+            """Populate shard_fp32_from_nvfp4 and shard_offsets_in_nvfp4 for NVFP4 params."""
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
                     if is_nvfp4tensor(model_param):
                         param_range_map = self._get_model_param_range_map(model_param)
                         param_range = param_range_map["param"]
-                        # param_range is in full numel space (from get_grad_index_map)
                         assert param_range.size == shard_main_param.nelement()
                         idx = nvfp4_param_to_idx_map[model_param]
                         shard_fp32_from_nvfp4[idx] = shard_main_param
                         shard_offsets_in_nvfp4[idx] = param_range.start
 
-        get_shard_fp32_from_nvfp4(self.shard_fp32_from_float16_groups, self.model_float16_groups)
-        get_shard_fp32_from_nvfp4(self.shard_fp32_groups, self.model_fp32_groups)
+        _get_shard_fp32_from_nvfp4(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+        _get_shard_fp32_from_nvfp4(self.shard_fp32_groups, self.model_fp32_groups)
 
         return nvfp4_params, shard_fp32_from_nvfp4, shard_offsets_in_nvfp4
 

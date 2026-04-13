@@ -917,12 +917,12 @@ class _ParamAndGradBuffer:
         # packs two FP4 values into a single uint8 byte for storage/communication, but
         # gradients are computed and reduced in BF16 at full element count.
         #
-        #   Logical param (BF16 view):  [v0, v1, v2, v3, ...]   numel = N
+        #   Logical view:  [v0, v1, v2, v3, ...]   numel = N
         #
         #   Param buffer  (uint8):      [byte0, byte1, ...]      numel = N // 2
         #                                 ^^^^^ packs v0+v1
         #
-        #   Grad buffer   (BF16):       [g0, g1, g2, g3, ...]   numel = N
+        #   Grad buffer:  [g0, g1, g2, g3, ...]   numel = N
         #
         # We therefore maintain two index maps:
         #   - param_index_map:        offsets into the packed param buffer  (numel // 2)
@@ -932,6 +932,7 @@ class _ParamAndGradBuffer:
         self.nvfp4_grad_index_map = {}
         grad_start_index = 0 if self.has_nvfp4_params else None
         grad_bucket_start_index = 0 if self.has_nvfp4_params else None
+        grad_bucket_end_index = None
 
         for param, _ in params_with_names[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order.
@@ -940,6 +941,9 @@ class _ParamAndGradBuffer:
             # NVFP4 params are packed (2 values per byte), so the param buffer uses
             # half the logical numel. Non-NVFP4 params use the full numel for both.
             if self.has_nvfp4_params and is_nvfp4tensor(param):
+                assert full_numel % 2 == 0, (
+                    f"NVFP4 requires even numel for packing, got {full_numel}"
+                )
                 param_numel = full_numel // 2
             else:
                 param_numel = full_numel
@@ -1138,12 +1142,8 @@ class _ParamAndGradBuffer:
 
             if bucket_id != cur_bucket_id:
                 bucket_end_index = _pad_end_of_bucket_if_needed(param_start_index)
-                # For NVFP4, compute grad bucket boundaries separately
                 if self.has_nvfp4_params:
                     grad_bucket_end_index = _pad_end_of_bucket_if_needed(grad_start)
-                else:
-                    grad_bucket_start_index = None
-                    grad_bucket_end_index = None
                 self.buckets.append(
                     self._new_bucket(
                         bucket_params=bucket_params,
@@ -1174,9 +1174,6 @@ class _ParamAndGradBuffer:
             bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
             if self.has_nvfp4_params:
                 grad_bucket_end_index = self.grad_numel
-            else:
-                grad_bucket_start_index = None
-                grad_bucket_end_index = None
             self.buckets.append(
                 self._new_bucket(
                     bucket_params=bucket_params,
@@ -1219,16 +1216,17 @@ class _ParamAndGradBuffer:
         for grad in self.extra_main_grads:
             grad *= scaling_factor
 
-    def get_grad_index_map(self) -> Dict[torch.nn.Parameter, tuple[int, int, int]]:
+    def get_unpacked_index_map(self) -> Dict[torch.nn.Parameter, tuple[int, int, int]]:
         """
-        Return the index map for grad buffer operations.
+        Return the index map using unpacked (full) numel for each parameter.
 
-        For NVFP4 buffers, returns nvfp4_grad_index_map (full numel indices).
-        For other buffers, returns param_index_map (same as grad indices).
+        For NVFP4 buffers, param_index_map uses packed numel (half the logical size),
+        so this returns nvfp4_grad_index_map which has full-numel indices instead.
+        For other buffers, param and grad indices are identical, so param_index_map
+        is returned directly.
 
-        This is needed because NVFP4 has separate param buffer (packed) and grad buffer (full).
-        The distributed optimizer uses this to determine which rank owns which portion of
-        each param's gradient - this calculation must use grad buffer indices.
+        The distributed optimizer uses this to determine which rank owns which portion
+        of each parameter's data.
         """
         if self.has_nvfp4_params:
             return self.nvfp4_grad_index_map
