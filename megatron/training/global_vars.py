@@ -242,8 +242,15 @@ def _set_wandb_writer(args):
             if isinstance(obj, Namespace):
                 obj = vars(obj)
             if isinstance(obj, dict):
-                return {k: _clean(v) for k, v in obj.items()
-                        if not isinstance(v, (bytes, type, type(lambda: None)))}
+                result = {}
+                for k, v in obj.items():
+                    # Skip type objects and callables, but process other values recursively
+                    if isinstance(v, type) or callable(v):
+                        continue
+                    result[k] = _clean(v)
+                return result
+            if isinstance(obj, list):
+                return [_clean(v) for v in obj]
             if isinstance(obj, bytes):
                 return obj.decode('utf-8', errors='ignore')
             if hasattr(obj, 'tolist'):          # torch.Tensor / numpy.ndarray
