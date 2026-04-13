@@ -739,6 +739,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # For Mamba path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
         mamba_submodules: Optional[MambaStackSubmodules] = None,
+        name: str = None,
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
@@ -806,6 +807,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
             tp_group=pg_collection.tp if pg_collection is not None else None,
+            name=name + ".eh_proj",
         )
 
         # Build inner layers: two possible paths
@@ -825,6 +827,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
+                name=name + ".mtp_model_layer",
             )
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
@@ -838,6 +841,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
                 pg_collection=pg_collection,
+                name=name + ".mtp_model_layer",
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -1273,6 +1277,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
         mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        name: str = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
@@ -1282,6 +1287,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_num_depths = mtp_num_depths
         self.mamba_submodules = mamba_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
+        self.name = name
 
         vp_size = config.virtual_pipeline_model_parallel_size
         assert is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size), (
@@ -1324,6 +1330,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=self.mtp_layer_pattern,
+                    name=self.name + f".layers.{layer_number}",
                 )
             return module
 
@@ -1339,6 +1346,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     mamba_submodules=mamba_submodules,
+                    name=self.name + f".layers.{layer_number}",
                 )
             return module
 

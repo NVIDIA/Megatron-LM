@@ -236,6 +236,7 @@ class MambaModel(LanguageModule):
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
+            name="decoder",
         )
 
         # MTP block - uses mtp_block_spec from mamba_stack_spec.submodules
@@ -255,6 +256,7 @@ class MambaModel(LanguageModule):
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 mamba_submodules=mamba_submodules,
+                name="mtp",
             )
 
         # Output

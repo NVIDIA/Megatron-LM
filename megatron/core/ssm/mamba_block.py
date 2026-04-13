@@ -84,6 +84,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        name: str = None,
     ) -> None:
         super().__init__(config=config)
         self.pre_process = pre_process
@@ -124,6 +125,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        name=name + f".layers.{i}",
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
@@ -134,6 +136,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=name + f".layers.{i}",
                     )
                 elif layer_type == LayerSymbols.MLP:
                     layer = build_module(
@@ -142,6 +145,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=name + f".layers.{i}",
                     )
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
@@ -150,6 +154,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=name + f".layers.{i}",
                     )
                 elif layer_type == LayerSymbols.GDN:
                     layer = build_module(

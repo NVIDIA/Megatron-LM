@@ -49,6 +49,7 @@ class SharedExpertMLP(MLP):
         submodules: MLPSubmodules,
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str = None,
     ):
         config = copy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
@@ -56,7 +57,7 @@ class SharedExpertMLP(MLP):
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
+        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp, name=name)
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:

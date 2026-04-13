@@ -175,6 +175,7 @@ class MambaMixer(MegatronModule):
         layer_number=None,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
+        name: str = None,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(
@@ -256,6 +257,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            name=name + f".in_proj",
         )
         # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
         # component is independently TP-sharded but with different sizes.  When
@@ -382,6 +384,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            name=name + f".out_proj",
         )
 
         # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the
