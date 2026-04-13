@@ -2443,6 +2443,14 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            if self.activation_func != F.silu or not self.config.gated_linear_unit:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires SwiGLU activation "
+                    "(activation_func=F.silu, gated_linear_unit=True) "
+                    "for the CuTeGEMM fused kernel, but got "
+                    f"activation_func={self.activation_func}, "
+                    f"gated_linear_unit={self.config.gated_linear_unit}."
+                )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
