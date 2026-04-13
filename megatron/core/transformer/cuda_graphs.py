@@ -1619,6 +1619,18 @@ class CudaGraphManager(torch.nn.Module):
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
 
+                if not runner.fwd_graph_recorded and self._is_mtp_inference(
+                    megatron_module, kwargs
+                ):
+                    # No pre-warmed graph for this MTP batch size — run eagerly
+                    # instead of attempting lazy capture. Lazy MTP graph capture
+                    # would fail for models with MoE layers because the AlltoAll
+                    # token dispatcher performs host synchronization
+                    # (d2h_event.synchronize) that is illegal inside CUDA graph
+                    # capture, and the graph-safe inference dispatcher is only
+                    # enabled during explicit warmup.
+                    return self.func(*args, **kwargs)
+
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
                     local_args, local_kwargs = args, kwargs
