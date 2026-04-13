@@ -307,7 +307,7 @@ def permute(
     fused: bool = False,
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
-    align_size: int = -1,
+    align_size: int = 0,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -369,7 +369,11 @@ def permute(
                 "fused_permute_with_probs typically requires TE >= 2.1.0, and "
                 "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
+        if (
+            fused_permute_and_pad_with_probs is not None
+            and tokens_per_expert is not None
+            and align_size > 0
+        ):
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
@@ -1428,7 +1432,8 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
         return get_fp8_align_size(config.fp8_recipe)
     elif config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    return 16
+    # Only FP8 or FP4 requires padding. Defaults to 0.
+    return 0
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
