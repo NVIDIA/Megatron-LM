@@ -38,8 +38,8 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
-from .async_utils import is_empty_async_queue, schedule_async_save
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest, _disable_gc
+from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
+from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
@@ -64,6 +64,16 @@ try:
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
+
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import FileSystemWriterAsync
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import save_state_dict_async_plan
+
+    HAVE_NVRX = True
+except (ImportError, ModuleNotFoundError):
+
+    HAVE_NVRX = False
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
@@ -571,7 +581,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+    if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
         ensure_directory_exists(optim_checkpoint_name)
@@ -582,7 +592,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if args.async_save:
         if ckpt_type == CheckpointType.LEGACY:
             raise NotImplementedError('Async checkpoint save not implemented for legacy checkpoints')
-        elif ckpt_type == CheckpointType.GLOBAL and args.ckpt_format != 'torch_dist':
+        elif ckpt_type == CheckpointType.GLOBAL and args.ckpt_format not in ['torch_dist', 'torch_dcp', 'fsdp_dtensor']:
             raise NotImplementedError(f'Async checkpoint save not implemented for {args.ckpt_format} distributed checkpoint format')
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -668,11 +678,23 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if ckpt_format == "fsdp_dtensor":
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
-            fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
-            torch.distributed.checkpoint.save(
-                state_dict=state_dict,
-                storage_writer=fs_storage_writer,
-            )
+            if args.async_save:
+                planner = torch.distributed.checkpoint.DefaultSavePlanner()
+                coordinator_rank = 0
+                fs_storage_writer = FileSystemWriterAsync(
+                    checkpoint_name, thread_count=args.dist_ckpt_workers, use_msc=args.enable_msc
+                )
+
+                save_state_dict_ret = save_state_dict_async_plan(
+                    state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
+                )
+                async_save_request = get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
+            else:
+                fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
+                torch.distributed.checkpoint.save(
+                    state_dict=state_dict,
+                    storage_writer=fs_storage_writer,
+                )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
@@ -1870,7 +1892,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+            if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
                 dp_rank = mpu.get_data_parallel_rank()
                 optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
