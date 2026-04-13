@@ -219,7 +219,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Get each param's ranges.
         # Use get_unpacked_index_map() which returns full-numel indices for NVFP4 params
-        # (from nvfp4_grad_index_map) and normal indices for other params.
+        # (from nvfp4_unpacked_param_index_map) and normal indices for other params.
         param_range_map = cls._build_model_gbuf_param_range_map(
             param_and_grad_buffer.get_unpacked_index_map(), gbuf_world_range, bucket.offset
         )

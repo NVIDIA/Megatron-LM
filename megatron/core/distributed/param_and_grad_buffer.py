@@ -926,10 +926,10 @@ class _ParamAndGradBuffer:
         #
         # We therefore maintain two index maps:
         #   - param_index_map:        offsets into the packed param buffer  (numel // 2)
-        #   - nvfp4_grad_index_map:   offsets into the full-size grad buffer (numel)
+        #   - nvfp4_unpacked_param_index_map: offsets using full (unpacked) numel
         #
         self.has_nvfp4_params = any(is_nvfp4tensor(p) for p in self.params)
-        self.nvfp4_grad_index_map = {}
+        self.nvfp4_unpacked_param_index_map = {}
         grad_start_index = 0 if self.has_nvfp4_params else None
         grad_bucket_start_index = 0 if self.has_nvfp4_params else None
         grad_bucket_end_index = None
@@ -964,7 +964,7 @@ class _ParamAndGradBuffer:
             if self.has_nvfp4_params:
                 grad_start_index = _pad_start_of_param_if_needed(grad_start_index)
                 grad_end_index = grad_start_index + full_numel
-                self.nvfp4_grad_index_map[param] = (grad_start_index, grad_end_index, bucket_id)
+                self.nvfp4_unpacked_param_index_map[param] = (grad_start_index, grad_end_index, bucket_id)
                 grad_start_index = grad_end_index
 
             # If we have enough elements already or the current param is part of the shared
@@ -1109,7 +1109,7 @@ class _ParamAndGradBuffer:
 
             # For NVFP4, use grad_index_map for main_grad (full numel offsets)
             if self.has_nvfp4_params:
-                grad_start, grad_end, _ = self.nvfp4_grad_index_map[param]
+                grad_start, grad_end, _ = self.nvfp4_unpacked_param_index_map[param]
                 param.main_grad = self._get(
                     param.data.shape, grad_start, buffer_type=BufferType.GRAD
                 )
@@ -1221,15 +1221,15 @@ class _ParamAndGradBuffer:
         Return the index map using unpacked (full) numel for each parameter.
 
         For NVFP4 buffers, param_index_map uses packed numel (half the logical size),
-        so this returns nvfp4_unpacked_index_map which has full-numel indices instead.
-        For other buffers, param and grad indices are identical, so param_index_map
+        so this returns nvfp4_unpacked_param_index_map which has full-numel indices instead.
+        For other buffers, packed and unpacked indices are identical, so param_index_map
         is returned directly.
 
         The distributed optimizer uses this to determine which rank owns which portion
         of each parameter's data.
         """
         if self.has_nvfp4_params:
-            return self.nvfp4_unpacked_index_map
+            return self.nvfp4_unpacked_param_index_map
         return self.param_index_map
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
