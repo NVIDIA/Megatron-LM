@@ -275,6 +275,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()
             self.weight._need_weight_prefetch = False
+            # Mark as already initialized so the lazy chain linking in
+            # all_gather_and_prefetch skips this param entirely.
+            # Embedding is ungraphed and does sync AG — no chain participation needed.
+            self.weight.prefetch_initialized = True
 
     def forward(self, input_):
         """Forward.

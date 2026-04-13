@@ -199,6 +199,12 @@ class MambaModel(LanguageModule):
                 ps_group=self.pg_collection.ps,
             )
 
+        # Output layer is ungraphed — exclude from prefetch chain to avoid
+        # eager-to-graph ETP boundary that causes NCCL hangs at IB scale.
+        if self.output_layer.weight is not None and hasattr(self.output_layer.weight, '_need_weight_prefetch'):
+            self.output_layer.weight._need_weight_prefetch = False
+            self.output_layer.weight.prefetch_initialized = True
+
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
