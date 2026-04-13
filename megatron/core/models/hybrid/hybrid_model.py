@@ -240,8 +240,8 @@ class HybridModel(LanguageModule):
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
-            mamba_submodules = hybrid_stack_spec.submodules
-            mtp_block_spec = mamba_submodules.mtp_block_spec
+            hybrid_submodules = hybrid_stack_spec.submodules
+            mtp_block_spec = hybrid_submodules.mtp_block_spec
             assert mtp_block_spec is not None, (
                 "MTP pattern specified but mtp_block_spec is None in hybrid_stack_spec.submodules. "
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
@@ -254,7 +254,7 @@ class HybridModel(LanguageModule):
                 vp_stage=self.vp_stage,
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
-                mamba_submodules=mamba_submodules,
+                hybrid_submodules=hybrid_submodules,
             )
 
         # Output

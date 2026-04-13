@@ -61,7 +61,7 @@ _hybrid_mtp_block_spec = ModuleSpec(
                     enorm=TENorm,
                     hnorm=TENorm,
                     eh_proj=TEColumnParallelLinear,
-                    mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                    mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                     layer_norm=TENorm,
                 ),
             )
@@ -210,7 +210,7 @@ hybrid_inference_stack_spec = ModuleSpec(
                             enorm=TENorm,
                             hnorm=TENorm,
                             eh_proj=InferenceColumnParallelLinear,
-                            mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                            mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                             layer_norm=TENorm,
                         ),
                     )

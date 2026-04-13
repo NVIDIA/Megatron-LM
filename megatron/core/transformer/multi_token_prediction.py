@@ -738,7 +738,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         # For Mamba path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
-        mamba_submodules: Optional[HybridStackSubmodules] = None,
+        hybrid_submodules: Optional[HybridStackSubmodules] = None,
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
@@ -811,13 +811,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         # Build inner layers: two possible paths
         # 1. Hybrid path: use HybridStack for hybrid pattern support
         # 2. GPT path: single TransformerLayer
-        if mtp_layer_pattern is not None and mamba_submodules is not None:
+        if mtp_layer_pattern is not None and hybrid_submodules is not None:
             from megatron.core.models.hybrid.hybrid_block import HybridStack
             from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 
             self.mtp_model_layer = HybridStack(
                 config=self.config,
-                submodules=mamba_submodules,
+                submodules=hybrid_submodules,
                 layer_type_list=validate_segment_layers(mtp_layer_pattern),
                 pp_layer_offset=0,
                 pre_process=True,  # Always receives input from eh_proj
@@ -1272,7 +1272,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         # New: For Mamba path with unified pattern syntax
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
-        mamba_submodules: Optional["HybridStackSubmodules"] = None,
+        hybrid_submodules: Optional["HybridStackSubmodules"] = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
@@ -1280,7 +1280,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.vp_stage = vp_stage
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
-        self.mamba_submodules = mamba_submodules
+        self.hybrid_submodules = hybrid_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
 
         vp_size = config.virtual_pipeline_model_parallel_size
@@ -1327,7 +1327,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 )
             return module
 
-        def build_layer_with_pattern(layer_spec, layer_number, mtp_layer_pattern, mamba_submodules):
+        def build_layer_with_pattern(layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules):
             """Build layer using pattern-based approach (new Mamba path)."""
             fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
@@ -1338,12 +1338,12 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
-                    mamba_submodules=mamba_submodules,
+                    hybrid_submodules=hybrid_submodules,
                 )
             return module
 
-        # New Mamba path: use mtp_layer_pattern and mamba_submodules
-        if self.mtp_layer_pattern is not None and self.mamba_submodules is not None:
+        # New Mamba path: use mtp_layer_pattern and hybrid_submodules
+        if self.mtp_layer_pattern is not None and self.hybrid_submodules is not None:
             if self.mtp_use_repeated_layer:
                 # Shared/repeated layer: build one layer, use it for all depths
                 layer_spec = self.submodules.layer_specs[0]
@@ -1351,7 +1351,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_spec,
                     layer_number=1,
                     mtp_layer_pattern=self.mtp_layer_pattern,
-                    mamba_submodules=self.mamba_submodules,
+                    hybrid_submodules=self.hybrid_submodules,
                 )
                 self.layers = torch.nn.ModuleList([shared_layer])
             else:
@@ -1364,7 +1364,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                             ],
                             layer_number=i + 1,
                             mtp_layer_pattern=self.mtp_layer_pattern,
-                            mamba_submodules=self.mamba_submodules,
+                            hybrid_submodules=self.hybrid_submodules,
                         )
                         for i in range(num_depths)
                     ]
