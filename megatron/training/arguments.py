@@ -567,6 +567,15 @@ def validate_args(args, defaults={}):
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
+    # Eval batch size defaults and validation.
+    if args.eval_global_batch_size is None:
+        args.eval_global_batch_size = args.global_batch_size
+    if args.eval_micro_batch_size is None:
+        args.eval_micro_batch_size = args.micro_batch_size
+    assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
+        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
+        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
+
     if args.perform_rl_step:
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -950,9 +959,25 @@ def validate_args(args, defaults={}):
         #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
         args.use_custom_fsdp = True
 
-        if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
+        # Megatron-FSDP requires the DistributedOptimizer.
+        if not args.use_distributed_optimizer:
             warn_rank_0(
-                'Please make sure your TransformerEngine support FSDP + gradient accumulation fusion',
+                'Megatron-FSDP is only compatible with --use-distributed-optimizer. Using DistributedOptimizer...',
+                args.rank,
+            )
+        args.use_distributed_optimizer = True
+        # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
+        args.reuse_grad_buf_for_mxfp8_param_ag = False
+        # Optimizer compatibility check.
+        assert args.optimizer in ('sgd', 'adam'), \
+            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+
+        if (
+            args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
+            and args.gradient_accumulation_fusion
+        ):
+            warn_rank_0(
+                'Verify that fused gradient accumulation is supported by TransformerEngine for Megatron-FSDP.',
                 args.rank,
             )
 
@@ -961,17 +986,14 @@ def validate_args(args, defaults={}):
                 'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
 
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
-            'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+            'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
 
         assert args.ckpt_format == "fsdp_dtensor", \
-            "Megatron FSDP only supports fsdp_dtensor checkpoint format"
+            "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
         
     if args.fsdp_manual_registration:
-        assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP"
-        assert args.nccl_ub, "FSDP manual registration is only supported with nccl-ub option"
-
-        if args.use_megatron_fsdp:
-            args.reuse_grad_buf_for_mxfp8_param_ag = False
+        assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
+        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -2705,8 +2727,8 @@ def _add_distributed_args(parser):
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
     group.add_argument('--create-all-gather-group', action='store_true',
-                   help='Create a separate process group for all-gather operations '
-                   'to overlap reduce-scatter and all-gather operations.')
+                       help='Create a separate process group for all-gather operations '
+                       'to overlap reduce-scatter and all-gather operations.')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='optim_grads_params',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
