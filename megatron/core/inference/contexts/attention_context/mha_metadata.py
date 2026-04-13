@@ -234,14 +234,8 @@ class NonGraphedMHAMetadata(MHAMetadata):
             num_speculative_tokens,
         )
         if len(self.state_data["query_lengths"]) > 0:
-            # Direct .item() — one GPU→CPU sync per value. Cannot be avoided
-            # because flash-attention needs max_seqlen as a Python int for launch.
-            self.state_data["max_seqlen_q"] = torch.max(
-                self.state_data["query_lengths"]
-            ).item()
-            self.state_data["max_seqlen_k"] = torch.max(
-                self.state_data["kv_seq_lengths"]
-            ).item()
+            self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
+            self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"]).item()
         else:
             self.state_data["max_seqlen_q"] = num_speculative_tokens + 1
             self.state_data["max_seqlen_k"] = 1
