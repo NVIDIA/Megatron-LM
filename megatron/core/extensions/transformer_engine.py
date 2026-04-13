@@ -2499,13 +2499,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             self._norm_seq = te.pytorch.ops.Sequential()
             self._norm_seq.append(op)
 
-            # Helper: dequantize any QuantizedTensor -> BF16 for weight processing.
-            def _to_bf16(w):
-                from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
-                if isinstance(w, QuantizedTensor):
-                    return w.dequantize().to(torch.bfloat16)
-                return w.to(torch.bfloat16)
-
             # GLU interleave size must match ScaledSwiGLU and the CuTe kernel.
             _GLU_INTERLEAVE_SIZE = 32
 
@@ -2571,12 +2564,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             )
 
             # Build fused impl and cache recipe lazily on first forward pass.
-            # Recipe is created once and reused — avoids object creation every call.
-            import os as _os_recipe
-            if _os_recipe.getenv("FP4_RECIPE", "") == "nvfp4":
-                recipe = te.common.recipe.NVFP4BlockScaling()
-            else:
-                recipe = te.common.recipe.MXFP8BlockScaling()
+            # Both are created once and reused — avoids object creation every call.
+            if not hasattr(self, '_recipe'):
+                if os.getenv("FP4_RECIPE", "") == "nvfp4":
+                    self._recipe = te.common.recipe.NVFP4BlockScaling()
+                else:
+                    self._recipe = te.common.recipe.MXFP8BlockScaling()
+            recipe = self._recipe
 
             if self._fused_impl is None:
                 with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
