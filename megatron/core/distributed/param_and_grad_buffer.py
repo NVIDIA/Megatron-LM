@@ -1221,7 +1221,7 @@ class _ParamAndGradBuffer:
         Return the index map using unpacked (full) numel for each parameter.
 
         For NVFP4 buffers, param_index_map uses packed numel (half the logical size),
-        so this returns nvfp4_grad_index_map which has full-numel indices instead.
+        so this returns nvfp4_unpacked_index_map which has full-numel indices instead.
         For other buffers, param and grad indices are identical, so param_index_map
         is returned directly.
 
@@ -1229,7 +1229,7 @@ class _ParamAndGradBuffer:
         of each parameter's data.
         """
         if self.has_nvfp4_params:
-            return self.nvfp4_grad_index_map
+            return self.nvfp4_unpacked_index_map
         return self.param_index_map
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
