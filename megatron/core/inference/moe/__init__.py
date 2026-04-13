@@ -31,16 +31,15 @@ def resolve_inference_grouped_gemm_backend(
         An InferenceGroupedGemmBackend enum value.
     """
     if backend == 'auto':
+        if is_mxfp8:
+            assert hasattr(torch.nn.functional, 'scaled_grouped_mm'), (
+                "Auto backend selection for MXFP8 requires "
+                "torch.nn.functional.scaled_grouped_mm. "
+                "Please install PyTorch 2.10+."
+            )
+            return InferenceGroupedGemmBackend.TORCH
         if is_cuda_graphed:
-            if is_mxfp8:
-                assert hasattr(torch.nn.functional, 'scaled_grouped_mm'), (
-                    "Auto backend selection for MXFP8 requires "
-                    "torch.nn.functional.scaled_grouped_mm. "
-                    "Please install PyTorch 2.10+."
-                )
-                return InferenceGroupedGemmBackend.TORCH
-            else:
-                return InferenceGroupedGemmBackend.FLASHINFER
+            return InferenceGroupedGemmBackend.FLASHINFER
         else:
             if hasattr(torch.nn.functional, 'grouped_mm'):
                 return InferenceGroupedGemmBackend.TORCH

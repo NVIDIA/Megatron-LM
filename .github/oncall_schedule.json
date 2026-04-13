@@ -1,17 +1,5 @@
 [
     {
-        "user": "dimapihtar",
-        "date": "2026-03-18"
-    },
-    {
-        "user": "janEbert",
-        "date": "2026-03-25"
-    },
-    {
-        "user": "gautham-kollu",
-        "date": "2026-04-01"
-    },
-    {
         "user": "ilml",
         "date": "2026-04-08"
     },
@@ -24,27 +12,43 @@
         "date": "2026-04-22"
     },
     {
-        "user": "BoxiangW",
+        "user": "maanug-nv",
         "date": "2026-04-29"
     },
     {
-        "user": "maanug-nv",
+        "user": "dimapihtar",
         "date": "2026-05-06"
     },
     {
-        "user": "dimapihtar",
+        "user": "janEbert",
         "date": "2026-05-13"
     },
     {
-        "user": "gautham-kollu",
+        "user": "ilml",
         "date": "2026-05-20"
     },
     {
-        "user": "ilml",
+        "user": "wujingyue",
         "date": "2026-05-27"
     },
     {
-        "user": "janEbert",
+        "user": "Connor-XY",
         "date": "2026-06-03"
+    },
+    {
+        "user": "guihong-nv",
+        "date": "2026-06-10"
+    },
+    {
+        "user": "Phlip79",
+        "date": "2026-06-17"
+    },
+    {
+        "user": "asolergi-nv",
+        "date": "2026-06-24"
+    },
+    {
+        "user": "maanug-nv",
+        "date": "2026-07-01"
     }
 ]

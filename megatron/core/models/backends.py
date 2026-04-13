@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import warnings
 from abc import abstractmethod
-from typing import Optional, Protocol, Tuple, cast
+from functools import partial
+from typing import Optional, Protocol, cast
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
@@ -13,10 +14,11 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import (
+    GroupedMLPSubmodules,
     InferenceGroupedMLP,
     SequentialMLP,
-    TEGroupedMLPSubmodules,
 )
+from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
@@ -84,9 +86,7 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool
-    ) -> tuple[type, MLPSubmodules | TEGroupedMLPSubmodules | None]:
+    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         ...
 
@@ -130,12 +130,15 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which module to use for attention"""
         return DotProductAttention
 
-    def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool
-    ) -> tuple[type[SequentialMLP], MLPSubmodules]:
+    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
-        return SequentialMLP, MLPSubmodules(
-            linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
+        return partial(
+            SequentialMLP,
+            submodules=MLPSubmodules(
+                linear_fc1=ColumnParallelLinear,
+                linear_fc2=RowParallelLinear,
+                activation_func=self.activation_func(),
+            ),
         )
 
     def activation_func(self) -> TEActivationFunctionBuilder | None:
@@ -187,10 +190,13 @@ class InferenceSpecProvider(BackendSpecProvider):
         # design these classes always meet the interface.
         return cast(TEActivationFunctionBuilder, TEActivationOp)
 
-    def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
-        return InferenceGroupedMLP, MLPSubmodules(
-            linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+        return partial(
+            InferenceGroupedMLP,
+            submodules=GroupedMLPSubmodules(
+                linear_fc1=TEColumnParallelGroupedLinear,
+                linear_fc2=TERowParallelGroupedLinear,
+                activation_func=self.activation_func(),
+            ),
         )
