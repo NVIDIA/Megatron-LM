@@ -306,13 +306,13 @@ def init_hybrid_ep_buffer(
         num_local_experts (int):
             Number of local experts.
         num_sms_dispatch_api (Optional[int]):
-            Number of SMs used by the dispatch API. 
+            Number of SMs used by the dispatch API.
         num_sms_combine_api (Optional[int]):
-            Number of SMs used by the combine API. 
+            Number of SMs used by the combine API.
         num_blocks_permute (Optional[int]):
-            Number of blocks used by the permute part. 
+            Number of blocks used by the permute part.
         num_blocks_unpermute (Optional[int]):
-            Number of blocks used by the unpermute part. 
+            Number of blocks used by the unpermute part.
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
     '''
@@ -528,13 +528,13 @@ if HAVE_HYBRIDEP:
             num_local_experts (int):
                 Number of local experts.
             num_sms_dispatch_api (Optional[int]):
-                Number of SMs used by the dispatch API. 
+                Number of SMs used by the dispatch API.
             num_sms_combine_api (Optional[int]):
-                Number of SMs used by the combine API. 
+                Number of SMs used by the combine API.
             num_blocks_permute (Optional[int]):
-                Number of blocks used by the permute part. 
+                Number of blocks used by the permute part.
             num_blocks_unpermute (Optional[int]):
-                Number of blocks used by the unpermute part. 
+                Number of blocks used by the unpermute part.
             num_permuted_tokens (int):
                 Number of tokens after permute. HybridEP uses this to allocate buffers.
                 If not provided, HybridEP obtains the size from a GPU tensor,

@@ -761,10 +761,14 @@ class TransformerConfig(ModelParallelConfig):
     In pure NVL scenarios, 16 SMs can generally achieve good bandwidth."""
 
     moe_hybridep_num_blocks_permute: Optional[int] = None
-    """Number of cuda threads blocks to use for permute part in HybridEP. If permute_fusion_into_hybridep is True, this is the number of sms to use for the permute part."""
+    """Number of cuda threads blocks to use for permute part in HybridEP. 
+    If permute_fusion_into_hybridep is True, this is the number of sms 
+    to use for the permute part."""
 
     moe_hybridep_num_blocks_unpermute: Optional[int] = None
-    """Number of cuda threads blocks to use for unpermute part in HybridEP. If permute_fusion_into_hybridep is True, this is the number of sms to use for the unpermute part."""
+    """Number of cuda threads blocks to use for unpermute part in HybridEP. 
+    If permute_fusion_into_hybridep is True, this is the number of sms to 
+    use for the unpermute part."""
 
     ##################
     # Context Parallel
