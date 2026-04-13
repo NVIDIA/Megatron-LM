@@ -219,6 +219,13 @@ def custom_backward(output, grad_output):
     )
 
 
+def get_tensor_device(tensor: Union[torch.Tensor, Dict[str, torch.Tensor]]):
+    """Get the device of a tensor or a dictionary of tensors."""
+    if isinstance(tensor, dict):
+        return next(iter(tensor.values())).device
+    return tensor.device
+
+
 def forward_step_calc_loss(
     model,
     output_tensor,
@@ -284,10 +291,11 @@ def forward_step_calc_loss(
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        device = get_tensor_device(output_tensor)
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
@@ -299,10 +307,11 @@ def forward_step_calc_loss(
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        device = get_tensor_device(output_tensor)
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
