@@ -1,15 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import torch
 
-# HAVE_TRITON gates whether mha_metadata.py uses the optimized fused path
-# or falls back to the original tensor_copy_and_pad approach.
-try:
-    import triton  # noqa: F401
-
-    HAVE_TRITON = True
-except ImportError:
-    HAVE_TRITON = False
-
 
 def fused_mha_metadata_update(
     query_lengths: torch.Tensor,
@@ -22,7 +13,6 @@ def fused_mha_metadata_update(
     max_seqlen_k_buf: torch.Tensor,
     real_batch_size: int,
     padded_batch_size: int,
-    max_batch_size: int = 0,
     compute_max: bool = True,
 ) -> None:
     """Compute all MHA metadata buffers using pure PyTorch ops (fully async, no CPU-GPU syncs).
@@ -44,7 +34,6 @@ def fused_mha_metadata_update(
         max_seqlen_k_buf: ``[1]`` int32 - output: max kv length across real requests.
         real_batch_size: Number of real requests.
         padded_batch_size: Padded request count (≥ real_batch_size).
-        max_batch_size: Unused (kept for API compat).
         compute_max: If True, compute max_seqlen values into the output buffers.
             GraphedMHAMetadata overrides these values, so it passes False to skip.
     """

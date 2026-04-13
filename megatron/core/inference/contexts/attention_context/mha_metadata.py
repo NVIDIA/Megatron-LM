@@ -4,7 +4,7 @@ import torch
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
 from .metadata_base import MetadataBase
-from .triton.fused_mha_metadata_update import HAVE_TRITON, fused_mha_metadata_update
+from .triton.fused_mha_metadata_update import fused_mha_metadata_update
 
 
 class MHAMetadata(MetadataBase):
@@ -67,51 +67,19 @@ class MHAMetadata(MetadataBase):
         assert request_kv_length_offsets.shape[0] == real_batch_size
         assert request_to_kv_block_ids.shape[0] == real_batch_size
 
-        if HAVE_TRITON:
-            # Fused kernel: single launch for all 1D copy+pad+cumsum+add+max ops.
-            fused_mha_metadata_update(
-                query_lengths=request_query_lengths,
-                kv_length_offsets=request_kv_length_offsets,
-                query_lengths_buf=self._query_lengths_buf,
-                cu_query_seq_lengths_buf=self._cu_query_seq_lengths_buf,
-                kv_seq_lengths_buf=self._kv_seq_lengths_buf,
-                cu_kv_seq_lengths_buf=self._cu_kv_seq_lengths_buf,
-                max_seqlen_q_buf=self._max_seqlen_buf[:1],
-                max_seqlen_k_buf=self._max_seqlen_buf[1:],
-                real_batch_size=real_batch_size,
-                padded_batch_size=padded_active_request_count,
-                max_batch_size=self.max_bs,
-                compute_max=getattr(self, '_compute_max_in_fused', True),
-            )
-        else:
-            self.tensor_copy_and_pad(
-                self._query_lengths_buf,
-                request_query_lengths,
-                real_batch_size,
-                padded_active_request_count,
-            )
-            self._cu_query_seq_lengths_buf[0] = 0
-            self.tensor_copy_and_pad(
-                self._cu_query_seq_lengths_buf[1:],
-                torch.cumsum(request_query_lengths, dim=0),
-                real_batch_size,
-                padded_active_request_count,
-                is_cumulative_tensor=True,
-            )
-            self.tensor_copy_and_pad(
-                self._kv_seq_lengths_buf,
-                request_kv_length_offsets + request_query_lengths,
-                real_batch_size,
-                padded_active_request_count,
-            )
-            self._cu_kv_seq_lengths_buf[0] = 0
-            self.tensor_copy_and_pad(
-                self._cu_kv_seq_lengths_buf[1:],
-                torch.cumsum(self._kv_seq_lengths_buf, dim=0),
-                real_batch_size,
-                padded_active_request_count,
-                is_cumulative_tensor=True,
-            )
+        fused_mha_metadata_update(
+            query_lengths=request_query_lengths,
+            kv_length_offsets=request_kv_length_offsets,
+            query_lengths_buf=self._query_lengths_buf,
+            cu_query_seq_lengths_buf=self._cu_query_seq_lengths_buf,
+            kv_seq_lengths_buf=self._kv_seq_lengths_buf,
+            cu_kv_seq_lengths_buf=self._cu_kv_seq_lengths_buf,
+            max_seqlen_q_buf=self._max_seqlen_buf[:1],
+            max_seqlen_k_buf=self._max_seqlen_buf[1:],
+            real_batch_size=real_batch_size,
+            padded_batch_size=padded_active_request_count,
+            compute_max=getattr(self, '_compute_max_in_fused', True),
+        )
 
         # Block table is 2D — kept separate from the fused 1D kernel.
         self.tensor_copy_and_pad(

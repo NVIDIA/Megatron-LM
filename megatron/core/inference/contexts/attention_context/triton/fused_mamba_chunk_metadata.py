@@ -188,10 +188,7 @@ def fused_conv_metadata(
     MAX_TOKENS_PER_SEQ = triton.next_power_of_2(max(token_hint, 1))
 
     _scatter_conv_metadata_kernel[(real_prefill_count,)](
-        cu_seqlens_buf,
-        conv_seq_idx_buf,
-        conv_seq_start_buf,
-        MAX_TOKENS_PER_SEQ=MAX_TOKENS_PER_SEQ,
+        cu_seqlens_buf, conv_seq_idx_buf, conv_seq_start_buf, MAX_TOKENS_PER_SEQ=MAX_TOKENS_PER_SEQ
     )
 
 

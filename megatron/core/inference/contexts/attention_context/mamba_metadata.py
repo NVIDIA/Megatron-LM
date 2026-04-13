@@ -272,9 +272,7 @@ class MambaMetadata:
                     max_tokens=self.max_tokens,
                 )
             else:
-                self._build_chunk_metadata_cpu(
-                    padded_prefill_count, chunk_size, padded_max_chunks
-                )
+                self._build_chunk_metadata_cpu(padded_prefill_count, chunk_size, padded_max_chunks)
 
             n_cu = padded_max_chunks + 1
             self.cu_chunk_seqlens = self._cu_chunk_seqlens_buffer[:n_cu]
@@ -291,9 +289,7 @@ class MambaMetadata:
                     max_tokens=self.max_tokens,
                 )
             else:
-                self._build_conv_metadata_cpu(
-                    real_prefill_count, padded_token_count
-                )
+                self._build_conv_metadata_cpu(real_prefill_count, padded_token_count)
 
             self.conv_seq_idx = self._conv_seq_idx_buffer[:padded_token_count]
             self.conv_seq_start = self._conv_seq_start_buffer[:padded_token_count]
@@ -339,13 +335,9 @@ class MambaMetadata:
 
             # Compute cumulative chunk counts from cu_seqlens
             cu = self._cu_seqlens_buffer[: real_prefill_count + 1]
-            seq_lens = (cu[1 : real_prefill_count + 1] - cu[:real_prefill_count]).to(
-                torch.int64
-            )
+            seq_lens = (cu[1 : real_prefill_count + 1] - cu[:real_prefill_count]).to(torch.int64)
             num_chunks = torch.clamp((seq_lens + chunk_size - 1) // chunk_size, min=1)
-            cum_chunks = torch.zeros(
-                real_prefill_count + 1, dtype=torch.int64, device=self.device
-            )
+            cum_chunks = torch.zeros(real_prefill_count + 1, dtype=torch.int64, device=self.device)
             torch.cumsum(num_chunks, dim=0, out=cum_chunks[1:])
 
             seq_starts = cu[:real_prefill_count].to(torch.int64)
@@ -446,17 +438,13 @@ class MambaMetadata:
             torch.tensor(chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32)
         )
 
-    def _build_conv_metadata_cpu(
-        self, real_prefill_count: int, padded_token_count: int
-    ) -> None:
+    def _build_conv_metadata_cpu(self, real_prefill_count: int, padded_token_count: int) -> None:
         """Fallback: build conv1d per-token metadata via repeat_interleave."""
         real_tokens_gpu = self._cu_seqlens_buffer[real_prefill_count]
         if real_prefill_count > 0:
             cu = self._cu_seqlens_buffer[: real_prefill_count + 1]
             lengths = (cu[1:] - cu[:-1]).to(torch.int64)
-            seq_indices = torch.arange(
-                real_prefill_count, dtype=torch.int32, device=self.device
-            )
+            seq_indices = torch.arange(real_prefill_count, dtype=torch.int32, device=self.device)
             seq_starts = cu[:real_prefill_count].to(torch.int32)
             self._conv_seq_idx_buffer[:real_tokens_gpu] = torch.repeat_interleave(
                 seq_indices, lengths
