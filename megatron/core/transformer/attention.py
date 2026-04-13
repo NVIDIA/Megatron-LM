@@ -379,6 +379,80 @@ class Attention(MegatronModule, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+        # Per-layer RotaryEmbedding (used when rotary_base_per_layer is set in config).
+        self.rotary_pos_emb = None
+        if getattr(self.config, 'rotary_base_per_layer', None):
+            rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
+            self._build_per_layer_rotary_pos_emb(rotary_base)
+
+        # Per-head scalar output gate (e.g., Step-3.5-Flash g_proj).
+        # Separate ColumnParallelLinear so gate weights are independent of QKV.
+        if self.config.use_head_wise_attn_gate:
+            self.g_proj = submodules.linear_qkv(
+                self.config.hidden_size,
+                self.config.num_attention_heads,
+                config=self.config,
+                init_method=not_none(self.config.init_method),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='gate',
+                tp_group=self.pg_collection.tp,
+            )
+
+    def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
+        """Build self.rotary_pos_emb using a layer-specific rotary base."""
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+        seq_len_interpolation_factor = self.config.rotary_scaling_factor
+        if self.config.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = RotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                rope_scaling=self.config.rope_scaling,
+                rope_scaling_factor=self.config.rope_scaling_factor,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
+        elif self.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                original_max_position_embeddings=getattr(
+                    self.config, "yarn_original_max_position_embeddings"
+                ),
+                beta_fast=getattr(self.config, "yarn_beta_fast"),
+                beta_slow=getattr(self.config, "yarn_beta_slow"),
+                mscale=getattr(self.config, "yarn_mscale"),
+                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                correction_range_round_to_int=getattr(
+                    self.config, "yarn_correction_range_round_to_int"
+                ),
+                use_cpu_initialization=self.config.use_cpu_initialization,
+            )
+        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = MultimodalRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=self.config.rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+            )
+            self.mrope_section = self.config.mrope_section
+            assert (
+                self.mrope_section is not None
+            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+        else:
+            assert False, "Invalid position embedding type"
+
     def _checkpointed_attention_forward(
         self,
         query,
@@ -975,6 +1049,11 @@ class Attention(MegatronModule, ABC):
         if no_rope:
             rotary_pos_emb = None
 
+        # Per-layer theta: override the model-level RoPE with this layer's own embedding.
+        if self.rotary_pos_emb is not None and rotary_pos_emb is not None:
+            seq_len = rotary_pos_emb.shape[0]
+            rotary_pos_emb = self.rotary_pos_emb(seq_len)
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
@@ -1252,7 +1331,19 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        # Output gate
+        # Per-head scalar gate (attention_per_head_gate: separate per_head_gate module)
+        if self.config.use_head_wise_attn_gate:
+            nvtx_range_push(suffix="head_wise_attn_gate")
+            gate_states, _ = self.g_proj(hidden_states)  # [sq, b, np_per_rank]
+            gate_states = gate_states.view(*gate_states.shape[:2], -1, 1)  # [sq, b, np, 1]
+            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)     # [sq, b, np, hn]
+            core_attn_out = (
+                core_attn_out * torch.sigmoid(gate_states.float()).to(core_attn_out.dtype)
+            )
+            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)     # [sq, b, np*hn]
+            nvtx_range_pop(suffix="head_wise_attn_gate")
+
+        # Output gate (attention_output_gate: full head_dim gate fused into QKV)
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
