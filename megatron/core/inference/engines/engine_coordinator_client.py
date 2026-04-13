@@ -154,8 +154,9 @@ class _MPChannel(AsyncZmqEndpoint):
         while True:
             try:
                 _, header, batch = await self._irecv()
-                for header_int, data in batch:
-                    self._pending_messages.append((Headers(header_int), data))
+                if batch is not None:
+                    for header_int, data in batch:
+                        self._pending_messages.append((Headers(header_int), data))
                 self._messages_processing_event.set()
                 async with self._cond:
                     self._cond.notify_all()
@@ -596,12 +597,15 @@ class EngineCoordinatorClient:
         # MP coordinator: snapshot pending_messages and send as a single batch.
         # We always send, even when the snapshot is empty, because followers block on
         # messages_processing_event each iteration — skipping the send would leave them
-        # hanging. The empty batch is an intentional heartbeat that keeps followers in
-        # lockstep with the leader.
+        # hanging. Empty batches send a header-only frame (no msgpack payload) to avoid
+        # the serialization round-trip on the hot path.
         if self.is_mp_coordinator:
             messages = list(self.pending_messages)
             self.pending_messages.clear()
-            self._mp_channel._isend(Headers.MESSAGES, [(h.value, d) for h, d in messages])
+            if messages:
+                self._mp_channel._isend(Headers.MESSAGES, [(h.value, d) for h, d in messages])
+            else:
+                self._mp_channel._isend(Headers.MESSAGES)  # header-only heartbeat
         else:
             await self.messages_processing_event.wait()
             self.messages_processing_event.clear()
