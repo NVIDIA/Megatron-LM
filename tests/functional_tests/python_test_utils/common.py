@@ -226,7 +226,7 @@ def pipeline(
                 # Tolerance check
                 is_close = np.isclose(actual, golden, rtol=test.rtol, atol=test.atol)
 
-                if test.type_of_test_result == TypeOfTestResult.DETERMINISTIC:
+                if test.type_of_test_result == TypeOfTestResult.DETERMINISTIC or total_steps_evaluated == 1:
                     passing = bool(np.all(is_close))
                 else:
                     num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
