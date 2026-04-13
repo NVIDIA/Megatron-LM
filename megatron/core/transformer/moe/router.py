@@ -51,7 +51,6 @@ class Router(ABC, MegatronModule):
         self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
-        self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
 
         # Initialize the gate weights.
@@ -282,6 +281,14 @@ class TopKRouter(Router):
                 return True
         return False
 
+    def _get_tp_cp_reduce_groups(self):
+        """Return [tp_group, cp_group] for sequential all-reduce.
+
+        This replaces the static tp_cp_group to support dynamic context parallelism,
+        where cp_group may be swapped to a dynamic group per batch.
+        """
+        return [self.tp_group, self.cp_group]
+
     def _apply_aux_loss(
         self,
         probs: torch.Tensor,
@@ -294,12 +301,13 @@ class TopKRouter(Router):
         if aux_loss_coeff == 0:
             return probs
 
+        tp_cp_groups = self._get_tp_cp_reduce_groups()
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
+                reduce_groups=tp_cp_groups,
             )
         )
 
@@ -318,7 +326,6 @@ class TopKRouter(Router):
             aux_loss_coeff,
             aux_loss,
             "load_balancing_loss",
-            self.tp_cp_group,
             valid_token_count=local_num_tokens,
         )
         return probs
@@ -346,12 +353,13 @@ class TopKRouter(Router):
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
         routing_map = routing_map.reshape(seq_length, -1)
 
+        tp_cp_groups = self._get_tp_cp_reduce_groups()
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
                 routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
                 with_padding_mask=with_padding_mask,
                 topk=self.topk * bsz,
+                reduce_groups=tp_cp_groups,
             )
         )
 
@@ -373,7 +381,6 @@ class TopKRouter(Router):
             seq_aux_loss_coeff,
             aux_loss,
             "seq_load_balancing_loss",
-            self.tp_cp_group,
             valid_token_count=local_num_tokens,
         )
         return probs
@@ -418,7 +425,6 @@ class TopKRouter(Router):
             global_aux_loss_coeff,
             global_aux_loss,
             "global_load_balancing_loss",
-            self.tp_dp_cp_group,
             needs_dp_avg=False,
             valid_token_count=local_num_tokens,
         )
@@ -430,7 +436,6 @@ class TopKRouter(Router):
         aux_loss_coeff: float,
         aux_loss: torch.Tensor,
         aux_loss_name: str,
-        reduce_group: torch.distributed.ProcessGroup,
         needs_dp_avg: bool = True,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
     ):
@@ -441,7 +446,6 @@ class TopKRouter(Router):
             aux_loss_coeff (float): Coefficient for the aux loss.
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
-            reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
             needs_dp_avg (bool): Whether to average this metric across DP ranks after reduce_group.
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
@@ -470,13 +474,15 @@ class TopKRouter(Router):
         else:
             layer_number = self.layer_number
 
+        # Use tp_dp_cp_group for logging: it is static even under dynamic CP
+        # (DP×CP total size is constant), so it won't be invalidated across micro-batches.
         get_moe_metrics_tracker().record(
             aux_loss_name,
             aux_loss / aux_loss_coeff,
             layer_number,
             num_layers,
-            reduce_group=reduce_group,
-            needs_dp_avg=needs_dp_avg,
+            avg_group=self.tp_dp_cp_group,
+            needs_dp_avg=False,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
@@ -508,7 +514,9 @@ class TopKRouter(Router):
         """
         if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
             # Skip Z loss calculations when using torch.no_grad() or checkpointing.
-            moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
+            moe_z_loss_coeff = self.config.moe_z_loss_coeff / (
+                self.tp_group.size() * self.cp_group.size()
+            )
             z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
             if self.calculate_per_token_loss:
                 # The expected final scaling for z_loss gradients is
