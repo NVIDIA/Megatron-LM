@@ -92,6 +92,16 @@ class TextGenerationController:
         self.num_mtp_heads = self._get_mtp_num_heads()
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
+        if (
+            self.model_config.cuda_graph_impl == "local"
+            and self.model_config.expert_model_parallel_size > 1
+            and self.model_config.transformer_impl != "inference_optimized"
+        ):
+            assert self.model_config.moe_pad_experts_for_cuda_graph_inference, (
+                "--moe-pad-experts-for-cuda-graph-inference must be set when using "
+                "CUDA graphs with expert parallelism"
+            )
+
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
@@ -1747,12 +1757,11 @@ class TextGenerationController:
         active_request_ids = context.request_ids[active_request_slice].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
 
-        if self.num_speculative_tokens > 0:
-            active_sequence_lengths += (
-                self._accepted_token_counts_per_request[:active_request_count] + 1
-            )
-        else:
-            active_sequence_lengths += 1
+        # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
+        # returns kv_offsets + query_lengths which already includes all accepted
+        # speculative tokens (they were part of the query and survived the rewind).
+        # Only the newly sampled base token is not yet in the KV cache, so add 1.
+        active_sequence_lengths += 1
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
