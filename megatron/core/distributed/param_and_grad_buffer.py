@@ -941,9 +941,9 @@ class _ParamAndGradBuffer:
             # NVFP4 params are packed (2 values per byte), so the param buffer uses
             # half the logical numel. Non-NVFP4 params use the full numel for both.
             if self.has_nvfp4_params and is_nvfp4tensor(param):
-                assert full_numel % 2 == 0, (
-                    f"NVFP4 requires even numel for packing, got {full_numel}"
-                )
+                assert (
+                    full_numel % 2 == 0
+                ), f"NVFP4 requires even numel for packing, got {full_numel}"
                 param_numel = full_numel // 2
             else:
                 param_numel = full_numel
@@ -964,7 +964,11 @@ class _ParamAndGradBuffer:
             if self.has_nvfp4_params:
                 grad_start_index = _pad_start_of_param_if_needed(grad_start_index)
                 grad_end_index = grad_start_index + full_numel
-                self.nvfp4_unpacked_param_index_map[param] = (grad_start_index, grad_end_index, bucket_id)
+                self.nvfp4_unpacked_param_index_map[param] = (
+                    grad_start_index,
+                    grad_end_index,
+                    bucket_id,
+                )
                 grad_start_index = grad_end_index
 
             # If we have enough elements already or the current param is part of the shared
