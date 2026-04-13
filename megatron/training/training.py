@@ -2399,7 +2399,7 @@ def save_checkpoint_and_time(
     
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
-    save_checkpoint_duration = timers(timer_key).elapsed()
+    save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
     
     if should_report_memory:
         # Track memory after checkpoint save.
