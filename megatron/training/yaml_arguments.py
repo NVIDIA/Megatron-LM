@@ -7,39 +7,43 @@ import dataclasses
 import json
 import os
 import re
-import torch
 import types
-import yaml
-
 from itertools import chain, starmap
 from types import SimpleNamespace
 
+import torch
 import torch.nn.functional as F
+import yaml
 
-from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
 env_pattern = re.compile(r".*?\${(.*?)}.*?")
+
+
 def env_constructor(loader, node):
     value = loader.construct_scalar(node)
     for group in env_pattern.findall(value):
         assert os.environ.get(group) is not None, f"environment variable {group} in yaml not found"
         value = value.replace(f"${{{group}}}", os.environ.get(group))
     return value
+
+
 yaml.add_implicit_resolver("!pathex", env_pattern)
 yaml.add_constructor("!pathex", env_constructor)
 
 
 str_dtype_to_torch = {
-    "float32" : torch.float32,
-    "float16" : torch.float16,
-    "bfloat16" : torch.bfloat16
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
 }
 
+
 def validate_yaml(args, defaults={}):
-    
+
     # This is for legacy script env var setting
     if type(args.data_path) is str:
         # If no white space its a single path
@@ -49,42 +53,63 @@ def validate_yaml(args, defaults={}):
 
     # Tensor model parallel size.
     args.model_parallel.tensor_model_parallel_size = min(
-        args.model_parallel.tensor_model_parallel_size, args.world_size)
-    assert args.world_size % args.model_parallel.tensor_model_parallel_size == 0, 'world size'\
-        ' ({}) is not divisible by tensor model parallel size ({})'.format(
-            args.world_size, args.model_parallel.tensor_model_parallel_size)
+        args.model_parallel.tensor_model_parallel_size, args.world_size
+    )
+    assert (
+        args.world_size % args.model_parallel.tensor_model_parallel_size == 0
+    ), 'world size' ' ({}) is not divisible by tensor model parallel size ({})'.format(
+        args.world_size, args.model_parallel.tensor_model_parallel_size
+    )
     # Pipeline model parallel size.
     args.model_parallel.pipeline_model_parallel_size = min(
         args.model_parallel.pipeline_model_parallel_size,
-        (args.world_size // args.model_parallel.tensor_model_parallel_size))
+        (args.world_size // args.model_parallel.tensor_model_parallel_size),
+    )
     args.model_parallel.transformer_pipeline_model_parallel_size = (
         args.model_parallel.pipeline_model_parallel_size - 1
-        if args.account_for_embedding_in_pipeline_split else
-        args.model_parallel.pipeline_model_parallel_size
+        if args.account_for_embedding_in_pipeline_split
+        else args.model_parallel.pipeline_model_parallel_size
     )
     # Checks.
-    model_parallel_size = args.model_parallel.pipeline_model_parallel_size * \
-                          args.model_parallel.tensor_model_parallel_size
-    assert args.world_size % (model_parallel_size * args.model_parallel.context_parallel_size) == 0, \
-        'world size ({}) is not divisible by tensor parallel size ({}) times ' \
+    model_parallel_size = (
+        args.model_parallel.pipeline_model_parallel_size
+        * args.model_parallel.tensor_model_parallel_size
+    )
+    assert (
+        args.world_size % (model_parallel_size * args.model_parallel.context_parallel_size) == 0
+    ), (
+        'world size ({}) is not divisible by tensor parallel size ({}) times '
         'pipeline parallel size ({}) times context parallel size ({})'.format(
-        args.world_size, args.model_parallel.tensor_model_parallel_size,
-        args.model_parallel.pipeline_model_parallel_size, args.model_parallel.context_parallel_size)
-    
+            args.world_size,
+            args.model_parallel.tensor_model_parallel_size,
+            args.model_parallel.pipeline_model_parallel_size,
+            args.model_parallel.context_parallel_size,
+        )
+    )
+
     # data_parallel_size is not in model parallel config
-    args.data_parallel_size = args.world_size // (model_parallel_size * args.model_parallel.context_parallel_size)
+    args.data_parallel_size = args.world_size // (
+        model_parallel_size * args.model_parallel.context_parallel_size
+    )
     if args.rank == 0:
-        print('using world size: {}, data-parallel size: {}, '
-              'context-parallel size: {}, '
-              'tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {}'.format(
-                  args.world_size, args.data_parallel_size,
-                  args.model_parallel.context_parallel_size,
-                  args.model_parallel.tensor_model_parallel_size,
-                  args.model_parallel.pipeline_model_parallel_size), flush=True)
+        print(
+            'using world size: {}, data-parallel size: {}, '
+            'context-parallel size: {}, '
+            'tensor-model-parallel size: {}, '
+            'pipeline-model-parallel size: {}'.format(
+                args.world_size,
+                args.data_parallel_size,
+                args.model_parallel.context_parallel_size,
+                args.model_parallel.tensor_model_parallel_size,
+                args.model_parallel.pipeline_model_parallel_size,
+            ),
+            flush=True,
+        )
 
     if args.model_parallel.tp_comm_overlap:
-        assert args.model_parallel.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
+        assert (
+            args.model_parallel.sequence_parallel == True
+        ), 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     # Set input defaults.
     for key in defaults:
@@ -93,10 +118,13 @@ def validate_yaml(args, defaults={}):
         # ensuring the arg is set to None.
         if getattr(args, key, None) is not None:
             if args.rank == 0:
-                print('WARNING: overriding default arguments for {key}:{v} \
-                       with {key}:{v2}'.format(key=key, v=defaults[key],
-                                               v2=getattr(args, key)),
-                                               flush=True)
+                print(
+                    'WARNING: overriding default arguments for {key}:{v} \
+                       with {key}:{v2}'.format(
+                        key=key, v=defaults[key], v2=getattr(args, key)
+                    ),
+                    flush=True,
+                )
         else:
             setattr(args, key, defaults[key])
 
@@ -106,8 +134,7 @@ def validate_yaml(args, defaults={}):
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         if args.rank == 0:
-            print('setting global batch size to {}'.format(
-                args.global_batch_size), flush=True)
+            print('setting global batch size to {}'.format(args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
 
     # Eval batch size.
@@ -115,35 +142,50 @@ def validate_yaml(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if getattr(args, 'eval_micro_batch_size', None) is None:
         args.eval_micro_batch_size = args.micro_batch_size
-    assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
-        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
+    assert (
+        args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0
+    ), (
+        f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
         f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
+    )
 
     # num_layers_per_virtual_pipeline_stage is not insde model parallel for checkpointing
     if args.num_layers_per_virtual_pipeline_stage is not None:
-        assert args.model_parallel.pipeline_model_parallel_size > 2, \
-            'pipeline-model-parallel size should be greater than 2 with ' \
-            'interleaved schedule'
-        assert args.language_model.num_layers % args.model_parallel.transformer_pipeline_model_parallel_size == 0, \
-            'number of layers should be divisible by the pipeline parallel size'
-        num_layers_per_pipeline_stage = args.language_model.num_layers // args.model_parallel.transformer_pipeline_model_parallel_size
-        assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
-            'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
-        args.model_parallel.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
-            args.num_layers_per_virtual_pipeline_stage
+        assert args.model_parallel.pipeline_model_parallel_size > 2, (
+            'pipeline-model-parallel size should be greater than 2 with ' 'interleaved schedule'
+        )
+        assert (
+            args.language_model.num_layers
+            % args.model_parallel.transformer_pipeline_model_parallel_size
+            == 0
+        ), 'number of layers should be divisible by the pipeline parallel size'
+        num_layers_per_pipeline_stage = (
+            args.language_model.num_layers
+            // args.model_parallel.transformer_pipeline_model_parallel_size
+        )
+        assert (
+            num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0
+        ), 'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
+        args.model_parallel.virtual_pipeline_model_parallel_size = (
+            num_layers_per_pipeline_stage // args.num_layers_per_virtual_pipeline_stage
+        )
     else:
         args.model_parallel.virtual_pipeline_model_parallel_size = None
         # Overlap P2P communication is disabled if not using the interleaved schedule.
         args.model_parallel.overlap_p2p_comm = False
         if args.rank == 0:
-            print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
-                  'schedule does not support overlapping p2p communication')
+            print(
+                'WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
+                'schedule does not support overlapping p2p communication'
+            )
 
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--overlap-param-gather only supported with distributed optimizer'
-        assert args.overlap_grad_reduce, \
-            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
+        assert (
+            args.use_distributed_optimizer
+        ), '--overlap-param-gather only supported with distributed optimizer'
+        assert (
+            args.overlap_grad_reduce
+        ), '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
 
     # Parameters dtype.
     if args.model_parallel.fp16:
@@ -157,12 +199,13 @@ def validate_yaml(args, defaults={}):
         if not args.accumulate_allreduce_grads_in_fp32:
             args.accumulate_allreduce_grads_in_fp32 = True
             if args.rank == 0:
-                print('accumulate and all-reduce gradients in fp32 for '
-                      'bfloat16 data type.', flush=True)
+                print(
+                    'accumulate and all-reduce gradients in fp32 for ' 'bfloat16 data type.',
+                    flush=True,
+                )
 
     if args.rank == 0:
-        print('using {} for parameters ...'.format(args.model_parallel.params_dtype),
-              flush=True)
+        print('using {} for parameters ...'.format(args.model_parallel.params_dtype), flush=True)
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -182,41 +225,39 @@ def validate_yaml(args, defaults={}):
     if args.train_iters:
         # If we use iteration-based training, make sure the
         # sample-based options are off.
-        assert args.train_samples is None, \
-            'expected iteration-based training'
-        assert args.lr_decay_samples is None, \
-            'expected iteration-based learning rate decay'
-        assert args.lr_warmup_samples == 0, \
-            'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
+        assert args.train_samples is None, 'expected iteration-based training'
+        assert args.lr_decay_samples is None, 'expected iteration-based learning rate decay'
+        assert args.lr_warmup_samples == 0, 'expected iteration-based learning rate warmup'
+        assert (
+            args.rampup_batch_size is None
+        ), 'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_iters == 0, \
-                'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+            assert (
+                args.lr_warmup_iters == 0
+            ), 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
 
     # Sample-based training.
     if args.train_samples:
         # If we use sample-based training, make sure the
         # iteration-based options are off.
-        assert args.train_iters is None, \
-            'expected sample-based training'
-        assert args.lr_decay_iters is None, \
-            'expected sample-based learning rate decay'
-        assert args.lr_warmup_iters == 0, \
-            'expected sample-based learnig rate warmup'
+        assert args.train_iters is None, 'expected sample-based training'
+        assert args.lr_decay_iters is None, 'expected sample-based learning rate decay'
+        assert args.lr_warmup_iters == 0, 'expected sample-based learnig rate warmup'
         if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_samples == 0, \
-                'can only specify one of lr-warmup-fraction ' \
-                'and lr-warmup-samples'
+            assert args.lr_warmup_samples == 0, (
+                'can only specify one of lr-warmup-fraction ' 'and lr-warmup-samples'
+            )
 
     # How to handle this better
     if args.language_model.num_layers is not None:
-        assert args.encoder_num_layers is None, \
-            'cannot have both num-layers and encoder-num-layers specified'
+        assert (
+            args.encoder_num_layers is None
+        ), 'cannot have both num-layers and encoder-num-layers specified'
         args.encoder_num_layers = args.language_model.num_layers
     else:
-        assert args.encoder_num_layers is not None, \
-            'either num-layers or encoder-num-layers should be specified'
+        assert (
+            args.encoder_num_layers is not None
+        ), 'either num-layers or encoder-num-layers should be specified'
         args.language_model.num_layers = args.encoder_num_layers
 
     # Check required arguments.
@@ -233,15 +274,19 @@ def validate_yaml(args, defaults={}):
             # the same ballpark as the counterpart with 4*h size
             # we keep it a multiple of 64, which means the actual tensor size
             # will be a multiple of 64 / tp_size
-            args.language_model.ffn_hidden_size = int((4 * args.language_model.hidden_size * 2 / 3) / 64) * 64
+            args.language_model.ffn_hidden_size = (
+                int((4 * args.language_model.hidden_size * 2 / 3) / 64) * 64
+            )
         else:
             args.language_model.ffn_hidden_size = 4 * args.language_model.hidden_size
 
     if args.language_model.kv_channels is None:
         assert args.language_model.hidden_size % args.language_model.num_attention_heads == 0
-        args.language_model.kv_channels = args.language_model.hidden_size // args.language_model.num_attention_heads
+        args.language_model.kv_channels = (
+            args.language_model.hidden_size // args.language_model.num_attention_heads
+        )
 
-    #TODO: Implement arguments for encoder-decoder
+    # TODO: Implement arguments for encoder-decoder
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
@@ -261,8 +306,9 @@ def validate_yaml(args, defaults={}):
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
     if args.language_model.fp32_residual_connection:
-        assert args.model_parallel.fp16 or args.model_parallel.bf16, \
-            'residual connection in fp32 only supported when using fp16 or bf16.'
+        assert (
+            args.model_parallel.fp16 or args.model_parallel.bf16
+        ), 'residual connection in fp32 only supported when using fp16 or bf16.'
 
     if args.language_model.moe_grouped_gemm:
         assert args.model_parallel.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
@@ -282,30 +328,33 @@ def validate_yaml(args, defaults={}):
     if not is_torch_min_version("1.11.0a0"):
         args.language_model.persist_layer_norm = False
         if args.rank == 0:
-            print('Persistent fused layer norm kernel is supported from '
-                  'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
-                  'Defaulting to no_persist_layer_norm=True')
+            print(
+                'Persistent fused layer norm kernel is supported from '
+                'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
+                'Defaulting to no_persist_layer_norm=True'
+            )
 
     # Activation recomputing.
     if args.language_model.distribute_saved_activations:
-        assert args.model_parallel.tensor_model_parallel_size > 1, 'can distribute ' \
-            'recomputed activations only across tensor model ' \
-            'parallel groups'
-        assert args.language_model.recompute_granularity == 'full', \
-            'distributed recompute activations is only '\
-            'application to full recompute granularity'
-        assert args.language_model.recompute_method is not None, \
-            'for distributed recompute activations to work you '\
-            'need to use a recompute method '
-        assert is_torch_min_version("1.10.0a0"), \
-            'distributed recompute activations are supported for pytorch ' \
-            'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
+        assert args.model_parallel.tensor_model_parallel_size > 1, (
+            'can distribute ' 'recomputed activations only across tensor model ' 'parallel groups'
+        )
+        assert args.language_model.recompute_granularity == 'full', (
+            'distributed recompute activations is only ' 'application to full recompute granularity'
+        )
+        assert args.language_model.recompute_method is not None, (
+            'for distributed recompute activations to work you ' 'need to use a recompute method '
+        )
+        assert is_torch_min_version("1.10.0a0"), (
+            'distributed recompute activations are supported for pytorch '
+            'v1.10 and above (Nvidia Pytorch container >= 21.07). Current '
             f'pytorch version is v{get_torch_version()}.'
+        )
 
     if args.language_model.recompute_granularity == 'selective':
-        assert args.language_model.recompute_method is None, \
-            'recompute method is not yet supported for ' \
-            'selective recomputing granularity'
+        assert args.language_model.recompute_method is None, (
+            'recompute method is not yet supported for ' 'selective recomputing granularity'
+        )
 
     # disable sequence parallelism when tp=1
     # to avoid change in numerics when
@@ -317,27 +366,34 @@ def validate_yaml(args, defaults={}):
         if args.model_parallel.sequence_parallel:
             raise RuntimeError(
                 "Using sequence parallelism requires setting the environment variable "
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-    
+                "CUDA_DEVICE_MAX_CONNECTIONS to 1"
+            )
+
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
         assert args.spec is None, "Model Spec must be None when using MoEs"
         if args.model_parallel.tensor_model_parallel_size > 1:
-            assert args.model_parallel.sequence_parallel, \
-                "When using MoE and tensor parallelism, sequence parallelism must be used."
+            assert (
+                args.model_parallel.sequence_parallel
+            ), "When using MoE and tensor parallelism, sequence parallelism must be used."
 
     # Expert parallelism check
-    if args.model_parallel.expert_model_parallel_size  > 1:
-        assert args.language_model.num_moe_experts is not None, "num_experts must be non None to use expert model parallelism"
-        assert args.language_model.num_moe_experts % args.model_parallel.expert_model_parallel_size == 0, \
-            "Number of experts should be a multiple of expert model parallel_size."
-        assert not args.model_parallel.fp16, \
-            "Expert parallelism is not supported with fp16 training."
+    if args.model_parallel.expert_model_parallel_size > 1:
+        assert (
+            args.language_model.num_moe_experts is not None
+        ), "num_experts must be non None to use expert model parallelism"
+        assert (
+            args.language_model.num_moe_experts % args.model_parallel.expert_model_parallel_size
+            == 0
+        ), "Number of experts should be a multiple of expert model parallel_size."
+        assert (
+            not args.model_parallel.fp16
+        ), "Expert parallelism is not supported with fp16 training."
 
     # Print arguments.
     _print_args("arguments", args)
 
-    #TODO: Added as much of the global initialization requires the model parallel arguments
+    # TODO: Added as much of the global initialization requires the model parallel arguments
     args = SimpleNamespace(**args.__dict__, **args.model_parallel.__dict__)
     args = SimpleNamespace(**args.__dict__, **args.language_model.__dict__)
     # For GPT Layer spec in pretrain_gpt
@@ -345,19 +401,19 @@ def validate_yaml(args, defaults={}):
 
     return args
 
+
 def _print_args(title, args):
     """Print arguments."""
     if args.rank == 0:
-        print(f'------------------------ {title} ------------------------',
-              flush=True)
+        print(f'------------------------ {title} ------------------------', flush=True)
         str_list = []
         for arg in vars(args):
             dots = '.' * (48 - len(arg))
             str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
         for arg in sorted(str_list, key=lambda x: x.lower()):
             print(arg, flush=True)
-        print(f'-------------------- end of {title} ---------------------',
-              flush=True)
+        print(f'-------------------- end of {title} ---------------------', flush=True)
+
 
 def core_config_from_args(args, dataclass=TransformerConfig):
     """Builds core config object from namespace args from given dataclass
@@ -365,7 +421,7 @@ def core_config_from_args(args, dataclass=TransformerConfig):
     Raises exception if argument missing in args
 
     Args:
-        args(SimpleNamespace, optional): Namespace to pull argument values from 
+        args(SimpleNamespace, optional): Namespace to pull argument values from
         dataclass (dataclass, optional): Core dataclass config to pull argument names from
 
 
@@ -380,28 +436,36 @@ def core_config_from_args(args, dataclass=TransformerConfig):
             raise Exception(f"Missing argument {f.name} for {str(dataclass)} config")
     return kw_args
 
+
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
-def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):    
+
+def core_transformer_config_from_yaml(args, transfomer_key="language_model"):
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
     # Translate args to core transformer configuration
-    kw_args = core_config_from_args(args, TransformerConfig)    
-    
-    # Hardcoded 
+    kw_args = core_config_from_args(args, TransformerConfig)
+
+    # Hardcoded
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = kw_args['params_dtype']
-    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
-    
-    assert args.activation_func in ["swiglu","squaredrelu","gelu"], f"{args.activation_func} is not a supported activation function"
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+
+    assert args.activation_func in [
+        "swiglu",
+        "squaredrelu",
+        "gelu",
+    ], f"{args.activation_func} is not a supported activation function"
     if args.activation_func == "swiglu":
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     elif args.activation_func == "squaredrelu":
+
         def squared_relu(x):
             return torch.pow(F.relu(x), 2)
+
         kw_args['activation_func'] = squared_relu
     elif args.activation_func == "gelu":
         kw_args['activation_func'] = F.gelu
@@ -409,26 +473,28 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
             kw_args['bias_activation_fusion'] = False
         else:
             kw_args['bias_activation_fusion'] = args.bias_activation_fusion
-    
+
     if args.init_method == "xavier_uniform":
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
     if args.embedding_init_method == "xavier_uniform":
         kw_args['embedding_init_method'] = torch.nn.init.xavier_uniform_
-    
+
     # Return Transformer config.
     if getattr(args, "multi_latent_attention", False):
         return MLATransformerConfig(**kw_args)
     else:
         return TransformerConfig(**kw_args)
 
+
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
         # Convert to nested namespace
-        config_namespace = json.loads(json.dumps(config), object_hook=lambda item: SimpleNamespace(**item))
+        config_namespace = json.loads(
+            json.dumps(config), object_hook=lambda item: SimpleNamespace(**item)
+        )
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
         return config_namespace
-
