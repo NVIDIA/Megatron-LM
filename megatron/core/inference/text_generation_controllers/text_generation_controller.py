@@ -902,7 +902,9 @@ class TextGenerationController:
         # The next position to predict starts at that cache length.
         adjusted_offsets = context.request_kv_length_offsets[active_slice]
         processed_tokens = context.request_query_lengths[active_slice]
-        base_position = adjusted_offsets + processed_tokens
+        # Cast to int64: context tensors are int32 but position_ids should be
+        # int64 to match CUDA graph capture dtype expectations.
+        base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
         # Start with the freshly sampled base token.
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
