@@ -94,6 +94,13 @@ jobs:
             create a PR, ensure all CI tests pass (fixing any failures), and mark
             the PR as ready for review.
 
+            **CRITICAL: You MUST complete ALL 4 phases before exiting.**
+            Creating the PR and triggering CI is only Phase 2. You MUST then
+            poll CI until every job finishes (Phase 3), fix any sync-caused
+            failures and re-trigger, and finally mark the PR ready (Phase 4).
+            If you exit after triggering CI without waiting for results, you
+            have FAILED your task. You have 1000 turns — use them.
+
             REPO: ${{ github.repository }}
             BRANCH: ${{ steps.vars.outputs.branch }}
             DATE: ${{ steps.vars.outputs.date }}
@@ -308,5 +315,6 @@ jobs:
             - After editing imports, run `isort` on those files.
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
-            --model "claude-opus-4-6"
+            --model "claude-opus-4-6[1m]"
+            --effort max
             --max-turns 1000
