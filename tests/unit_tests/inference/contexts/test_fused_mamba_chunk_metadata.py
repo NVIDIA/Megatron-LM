@@ -86,9 +86,7 @@ class TestFusedMambaChunkMetadata:
 
         # --- Fused kernel ---
         cum_chunks_buf = torch.zeros(max_bs + 1, dtype=torch.int32, device=device)
-        cu_chunk_seqlens_buf = torch.zeros(
-            padded_max_chunks + 16, dtype=torch.int32, device=device
-        )
+        cu_chunk_seqlens_buf = torch.zeros(padded_max_chunks + 16, dtype=torch.int32, device=device)
         last_chunk_indices_buf = torch.zeros(max_bs, dtype=torch.int32, device=device)
         seq_idx_for_varlen_buf = torch.zeros(
             padded_max_chunks + 16, dtype=torch.int32, device=device
@@ -111,15 +109,15 @@ class TestFusedMambaChunkMetadata:
         fused_last_idx = last_chunk_indices_buf[:padded_prefill_count]
         fused_seq_idx = seq_idx_for_varlen_buf[:padded_max_chunks]
 
-        assert torch.equal(fused_cu_chunk, ref_cu_chunk), (
-            f"cu_chunk_seqlens mismatch\nfused: {fused_cu_chunk}\nref:   {ref_cu_chunk}"
-        )
-        assert torch.equal(fused_last_idx, ref_last_idx), (
-            f"last_chunk_indices mismatch\nfused: {fused_last_idx}\nref:   {ref_last_idx}"
-        )
-        assert torch.equal(fused_seq_idx, ref_seq_idx), (
-            f"seq_idx_for_varlen mismatch\nfused: {fused_seq_idx}\nref:   {ref_seq_idx}"
-        )
+        assert torch.equal(
+            fused_cu_chunk, ref_cu_chunk
+        ), f"cu_chunk_seqlens mismatch\nfused: {fused_cu_chunk}\nref:   {ref_cu_chunk}"
+        assert torch.equal(
+            fused_last_idx, ref_last_idx
+        ), f"last_chunk_indices mismatch\nfused: {fused_last_idx}\nref:   {ref_last_idx}"
+        assert torch.equal(
+            fused_seq_idx, ref_seq_idx
+        ), f"seq_idx_for_varlen mismatch\nfused: {fused_seq_idx}\nref:   {ref_seq_idx}"
 
     def test_single_seq_single_chunk(self):
         """One sequence shorter than chunk_size."""

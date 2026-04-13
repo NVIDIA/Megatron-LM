@@ -67,13 +67,9 @@ class TestFusedMhaMetadataUpdate:
 
     def _run_and_compare(self, real_bs, padded_bs, max_bs=None):
         """Run both fused and reference, assert identical outputs."""
-        from megatron.core.inference.contexts.attention_context.triton.fused_mha_metadata_update import (
-            HAVE_TRITON,
-            fused_mha_metadata_update,
+        from megatron.core.inference.contexts.attention_context.mha_metadata import (
+            update_mha_metadata,
         )
-
-        if not HAVE_TRITON:
-            pytest.skip("Triton not available")
 
         if max_bs is None:
             max_bs = padded_bs + 16  # some headroom
@@ -88,8 +84,8 @@ class TestFusedMhaMetadataUpdate:
         ql_buf_fused, cu_q_buf_fused, kvl_buf_fused, cu_kv_buf_fused, mq_fused, mk_fused = (
             _alloc_buffers(max_bs, device)
         )
-        ql_buf_ref, cu_q_buf_ref, kvl_buf_ref, cu_kv_buf_ref, mq_ref, mk_ref = (
-            _alloc_buffers(max_bs, device)
+        ql_buf_ref, cu_q_buf_ref, kvl_buf_ref, cu_kv_buf_ref, mq_ref, mk_ref = _alloc_buffers(
+            max_bs, device
         )
 
         # Sentinel fill to ensure kernel writes all expected positions
@@ -99,7 +95,7 @@ class TestFusedMhaMetadataUpdate:
             buf.fill_(-999)
 
         # Run fused kernel
-        fused_mha_metadata_update(
+        update_mha_metadata(
             query_lengths,
             kv_length_offsets,
             ql_buf_fused,
@@ -126,13 +122,15 @@ class TestFusedMhaMetadataUpdate:
 
         # Compare the meaningful region (up to padded_bs or padded_bs+1).
         # All ops are int32 (copy, add, cumsum) so results must be bit-exact.
-        assert torch.equal(ql_buf_fused[:padded_bs], ql_buf_ref[:padded_bs]), \
-            "query_lengths_buf mismatch"
+        assert torch.equal(
+            ql_buf_fused[:padded_bs], ql_buf_ref[:padded_bs]
+        ), "query_lengths_buf mismatch"
         assert torch.equal(
             cu_q_buf_fused[: padded_bs + 1], cu_q_buf_ref[: padded_bs + 1]
         ), "cu_query_seq_lengths_buf mismatch"
-        assert torch.equal(kvl_buf_fused[:padded_bs], kvl_buf_ref[:padded_bs]), \
-            "kv_seq_lengths_buf mismatch"
+        assert torch.equal(
+            kvl_buf_fused[:padded_bs], kvl_buf_ref[:padded_bs]
+        ), "kv_seq_lengths_buf mismatch"
         assert torch.equal(
             cu_kv_buf_fused[: padded_bs + 1], cu_kv_buf_ref[: padded_bs + 1]
         ), "cu_kv_seq_lengths_buf mismatch"
@@ -190,13 +188,9 @@ class TestFusedMhaMetadataUpdate:
     def test_large_values(self):
         """Large query lengths and KV offsets to check int32 overflow safety."""
         device = "cuda"
-        from megatron.core.inference.contexts.attention_context.triton.fused_mha_metadata_update import (
-            HAVE_TRITON,
-            fused_mha_metadata_update,
+        from megatron.core.inference.contexts.attention_context.mha_metadata import (
+            update_mha_metadata,
         )
-
-        if not HAVE_TRITON:
-            pytest.skip("Triton not available")
 
         real_bs = 8
         padded_bs = 16
@@ -208,13 +202,27 @@ class TestFusedMhaMetadataUpdate:
         ql_fused, cu_q_fused, kvl_fused, cu_kv_fused, mq_f, mk_f = _alloc_buffers(max_bs, device)
         ql_ref, cu_q_ref, kvl_ref, cu_kv_ref, mq_r, mk_r = _alloc_buffers(max_bs, device)
 
-        fused_mha_metadata_update(
-            query_lengths, kv_length_offsets, ql_fused, cu_q_fused, kvl_fused, cu_kv_fused,
-            mq_f, mk_f, real_bs, padded_bs,
+        update_mha_metadata(
+            query_lengths,
+            kv_length_offsets,
+            ql_fused,
+            cu_q_fused,
+            kvl_fused,
+            cu_kv_fused,
+            mq_f,
+            mk_f,
+            real_bs,
+            padded_bs,
         )
         _reference_mha_metadata_update(
-            query_lengths, kv_length_offsets, ql_ref, cu_q_ref, kvl_ref, cu_kv_ref,
-            real_bs, padded_bs,
+            query_lengths,
+            kv_length_offsets,
+            ql_ref,
+            cu_q_ref,
+            kvl_ref,
+            cu_kv_ref,
+            real_bs,
+            padded_bs,
         )
 
         assert torch.equal(ql_fused[:padded_bs], ql_ref[:padded_bs])
@@ -224,13 +232,9 @@ class TestFusedMhaMetadataUpdate:
 
     def test_monotonic_cumsum(self):
         """Verify cu_query and cu_kv are non-decreasing (sanity check)."""
-        from megatron.core.inference.contexts.attention_context.triton.fused_mha_metadata_update import (
-            HAVE_TRITON,
-            fused_mha_metadata_update,
+        from megatron.core.inference.contexts.attention_context.mha_metadata import (
+            update_mha_metadata,
         )
-
-        if not HAVE_TRITON:
-            pytest.skip("Triton not available")
 
         device = "cuda"
         real_bs, padded_bs, max_bs = 32, 64, 128
@@ -238,8 +242,8 @@ class TestFusedMhaMetadataUpdate:
         kv_length_offsets = torch.randint(0, 200, (real_bs,), dtype=torch.int32, device=device)
 
         ql, cu_q, kvl, cu_kv, mq, mk = _alloc_buffers(max_bs, device)
-        fused_mha_metadata_update(
-            query_lengths, kv_length_offsets, ql, cu_q, kvl, cu_kv, mq, mk, real_bs, padded_bs,
+        update_mha_metadata(
+            query_lengths, kv_length_offsets, ql, cu_q, kvl, cu_kv, mq, mk, real_bs, padded_bs
         )
 
         cu_q_vals = cu_q[: padded_bs + 1]

@@ -4,13 +4,85 @@ import torch
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
 from .metadata_base import MetadataBase
-from .triton.fused_mha_metadata_update import fused_mha_metadata_update
+
+
+def update_mha_metadata(
+    query_lengths: torch.Tensor,
+    kv_length_offsets: torch.Tensor,
+    query_lengths_buf: torch.Tensor,
+    cu_query_seq_lengths_buf: torch.Tensor,
+    kv_seq_lengths_buf: torch.Tensor,
+    cu_kv_seq_lengths_buf: torch.Tensor,
+    max_seqlen_q_buf: torch.Tensor,
+    max_seqlen_k_buf: torch.Tensor,
+    real_batch_size: int,
+    padded_batch_size: int,
+    compute_max: bool = True,
+) -> None:
+    """Compute all 1D MHA metadata buffers using pure PyTorch ops.
+
+    Fully async with no CPU-GPU syncs. Uses zero-padded cumsum trick: writing
+    real values into a zero buffer then calling cumsum naturally propagates the
+    last prefix-sum value through the padded positions — matching the
+    cumulative-pad semantics of ``tensor_copy_and_pad(..., is_cumulative_tensor=True)``
+    without the CPU-GPU sync that ``tensor_copy_and_pad`` requires to read the
+    last value.
+
+    Args:
+        query_lengths: ``[>=real_batch_size]`` int32 - per-request query lengths.
+        kv_length_offsets: ``[>=real_batch_size]`` int32 - per-request KV offsets.
+        query_lengths_buf: ``[>=padded_batch_size]`` int32 - output buffer.
+        cu_query_seq_lengths_buf: ``[>=padded_batch_size+1]`` int32 - output buffer.
+        kv_seq_lengths_buf: ``[>=padded_batch_size]`` int32 - output buffer.
+        cu_kv_seq_lengths_buf: ``[>=padded_batch_size+1]`` int32 - output buffer.
+        max_seqlen_q_buf: ``[1]`` int32 - output: max query length across real requests.
+        max_seqlen_k_buf: ``[1]`` int32 - output: max kv length across real requests.
+        real_batch_size: Number of real requests.
+        padded_batch_size: Padded request count (≥ real_batch_size).
+        compute_max: If True, compute max_seqlen values into the output buffers.
+            GraphedMHAMetadata overrides these values, so it passes False to skip.
+    """
+    rbs = real_batch_size
+    pbs = padded_batch_size
+
+    if pbs == 0:
+        cu_query_seq_lengths_buf[0] = 0
+        cu_kv_seq_lengths_buf[0] = 0
+        max_seqlen_q_buf[0] = 0
+        max_seqlen_k_buf[0] = 0
+        return
+
+    # query_lengths_buf: copy real, zero-pad rest
+    query_lengths_buf[:rbs] = query_lengths[:rbs]
+    if pbs > rbs:
+        query_lengths_buf[rbs:pbs] = 0
+
+    # kv_seq_lengths = kv_offsets + query_lengths, zero-padded
+    kv_seq_lengths_buf[:rbs] = kv_length_offsets[:rbs] + query_lengths[:rbs]
+    if pbs > rbs:
+        kv_seq_lengths_buf[rbs:pbs] = 0
+
+    # cumsum on the padded buffer: zeros propagate last real value
+    cu_query_seq_lengths_buf[0] = 0
+    torch.cumsum(query_lengths_buf[:pbs], dim=0, out=cu_query_seq_lengths_buf[1 : pbs + 1])
+
+    cu_kv_seq_lengths_buf[0] = 0
+    torch.cumsum(kv_seq_lengths_buf[:pbs], dim=0, out=cu_kv_seq_lengths_buf[1 : pbs + 1])
+
+    # max values (GPU-only, no .item() sync)
+    if compute_max:
+        max_seqlen_q_buf[0] = query_lengths_buf[:rbs].max()
+        max_seqlen_k_buf[0] = kv_seq_lengths_buf[:rbs].max()
 
 
 class MHAMetadata(MetadataBase):
     """
     Metadata for MHA layer using flash-attention.
     """
+
+    # Whether subclasses need max_seqlen computed during the 1D metadata update.
+    # GraphedMHAMetadata overrides these values, so it skips the computation.
+    _compute_max = True
 
     def __init__(
         self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
@@ -33,9 +105,7 @@ class MHAMetadata(MetadataBase):
         )
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
-        # Packed GPU buffer for fused kernel to write max_seqlen_q and max_seqlen_k.
-        # Using a contiguous 2-element buffer allows a single .tolist() call
-        # instead of two separate .item() syncs.
+        # Packed GPU buffer for update_mha_metadata to write max values.
         self._max_seqlen_buf = torch.zeros(2, dtype=torch.int32, device=device)
         self.state_data = {}
 
@@ -67,7 +137,7 @@ class MHAMetadata(MetadataBase):
         assert request_kv_length_offsets.shape[0] == real_batch_size
         assert request_to_kv_block_ids.shape[0] == real_batch_size
 
-        fused_mha_metadata_update(
+        update_mha_metadata(
             query_lengths=request_query_lengths,
             kv_length_offsets=request_kv_length_offsets,
             query_lengths_buf=self._query_lengths_buf,
@@ -78,10 +148,10 @@ class MHAMetadata(MetadataBase):
             max_seqlen_k_buf=self._max_seqlen_buf[1:],
             real_batch_size=real_batch_size,
             padded_batch_size=padded_active_request_count,
-            compute_max=getattr(self, '_compute_max_in_fused', True),
+            compute_max=self._compute_max,
         )
 
-        # Block table is 2D — kept separate from the fused 1D kernel.
+        # Block table is 2D — handled separately.
         self.tensor_copy_and_pad(
             self._block_table_buf,
             request_to_kv_block_ids,
@@ -128,7 +198,7 @@ class GraphedMHAMetadata(MHAMetadata):
     Metadata for MHA layer using flash-attention with CUDA graphs.
     """
 
-    _compute_max_in_fused = False  # Max seqlen values are overridden; skip in fused path.
+    _compute_max = False  # Max seqlen values are overridden; skip in fused path.
 
     def __init__(
         self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
@@ -173,7 +243,7 @@ class NonGraphedMHAMetadata(MHAMetadata):
     Metadata for MHA layer using flash-attention without CUDA graphs.
     """
 
-    _compute_max_in_fused = True  # Max seqlen values are read after update.
+    _compute_max = True  # Max seqlen values are read after update.
 
     def update(
         self,
