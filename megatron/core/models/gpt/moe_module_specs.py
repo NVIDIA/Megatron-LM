@@ -1,5 +1,4 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
 from functools import partial
 from typing import Optional
 
@@ -13,14 +12,14 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_layer import MlpBuilder
 
 
 def get_moe_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
-) -> ModuleSpec:
+) -> MlpBuilder:
     """Helper function to get module spec for MoE.
 
     Called by mamba_layer_specs.py for standard (non-inference) MoE specs.
@@ -46,7 +45,7 @@ def get_moe_module_spec_for_backend(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
-) -> ModuleSpec:
+) -> MlpBuilder:
     """Helper function to get module spec for MoE"""
     assert num_experts is not None
 
@@ -63,15 +62,12 @@ def get_moe_module_spec_for_backend(
     shared_experts = partial(SharedExpertMLP, submodules=mlp)
 
     # MoE module spec
-    moe_module_spec = ModuleSpec(
-        module=MoELayer,
-        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
-        metainfo={"fuse_pre_mlp_layernorm": False},
+    return partial(
+        MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
     )
-    return moe_module_spec
 
 
-def get_inference_optimized_moe_spec() -> ModuleSpec:
+def get_inference_optimized_moe_spec() -> MlpBuilder:
     """MoE module spec for inference-optimized transformer impl.
 
     Uses InferenceSpecProvider to select inference-optimized modules:
@@ -93,10 +89,9 @@ def get_inference_optimized_moe_spec() -> ModuleSpec:
         ),
     )
 
-    return ModuleSpec(
-        module=MoELayer,
+    return partial(
+        MoELayer,
         submodules=MoESubmodules(
             router=InferenceTopKRouter, experts=experts, shared_experts=shared_experts
         ),
-        metainfo={"fuse_pre_mlp_layernorm": False},
     )

@@ -20,7 +20,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from tests.unit_tests.test_utilities import Utils
 
 success_string = "hello,world"
@@ -315,12 +316,11 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
         add_bias_linear=False,
         bf16=True,
     )
-    model = MoELayer(
-        transformer_config,
-        get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=2, moe_grouped_gemm=True
-        ).mlp.submodules,
-    ).to(device='cuda')
+    submodules = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(num_experts=2, moe_grouped_gemm=True).mlp
+    )
+    assert isinstance(submodules, MoESubmodules)
+    model = MoELayer(transformer_config, submodules).to(device='cuda')
     model.requires_grad_(True)
     # Initialize the model with all 1.0 for weights.
     for param in model.parameters():

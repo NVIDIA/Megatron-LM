@@ -5,7 +5,8 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -41,10 +42,11 @@ class TestSharedExperts:
             add_bias_linear=False,
             moe_shared_expert_gate=shared_expert_gate,
         )
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=False
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
         )
-        self.moe_layer = MoELayer(transformer_config, submodules.mlp.submodules)
+        assert isinstance(submodules, MoESubmodules)
+        self.moe_layer = MoELayer(transformer_config, submodules)
 
         assert isinstance(self.moe_layer, MoELayer)
 
@@ -101,10 +103,11 @@ class TestSharedExpertsOverlap:
             moe_router_topk=1,
             add_bias_linear=False,
         )
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=False
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
         )
-        self.moe_layer = MoELayer(transformer_config, submodules.mlp.submodules)
+        assert isinstance(submodules, MoESubmodules)
+        self.moe_layer = MoELayer(transformer_config, submodules)
 
         assert isinstance(self.moe_layer, MoELayer)
 

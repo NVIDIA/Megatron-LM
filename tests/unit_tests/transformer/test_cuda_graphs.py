@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -35,11 +36,13 @@ from megatron.core.transformer.cuda_graphs import (
     _CudagraphGlobalRecord,
 )
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -327,10 +330,10 @@ class TestLLaVACudaGraph:
         )
 
         # Get layer specs
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-        assert isinstance(language_layer_spec.submodules, TransformerLayerSubmodules)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
+        assert isinstance(vision_projection_spec, MLPSubmodules)
 
         # Set vision model type
         vision_config.vision_model_type = "clip"
@@ -339,7 +342,9 @@ class TestLLaVACudaGraph:
         # Create LLaVA model with both encoder and decoder
         self.llava_model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,

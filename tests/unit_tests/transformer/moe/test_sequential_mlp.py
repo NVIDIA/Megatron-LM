@@ -1,6 +1,4 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-from importlib.metadata import version
-
 import pytest
 import torch
 
@@ -10,8 +8,9 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import SequentialMLP
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -37,10 +36,11 @@ class TestParallelSequentialMLP:
             moe_router_topk=1,
             add_bias_linear=False,
         )
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=False
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
         )
-        self.sequential_mlp = MoELayer(transformer_config, submodules.mlp.submodules)
+        assert isinstance(submodules, MoESubmodules)
+        self.sequential_mlp = MoELayer(transformer_config, submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
