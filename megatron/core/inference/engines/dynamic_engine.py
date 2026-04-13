@@ -94,10 +94,6 @@ DEPRECATED_ARGS = [
     "pg_collection",
 ]
 
-# Used to turn a synchronous CUDA event wait into an asynchronous yielding poll.
-# Should be set to <1% of the forward step time. A value of 0 is safe, but may be inefficient.
-CUDA_EVENT_POLL_INTERVAL_S = 1e-4
-
 
 class EngineState(Enum):
     """State machine for the inference engine."""
@@ -1590,7 +1586,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.record()
         # Poll the CUDA event instead of blocking the event loop on synchronize().
         while not self.step_end_event.query():
-            await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
+            await asyncio.sleep(0)
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
@@ -2046,7 +2042,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 self.step_end_event.record()
                                 # Poll the CUDA event instead of blocking the event loop.
                                 while not self.step_end_event.query():
-                                    await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
+                                    await asyncio.sleep(0)
                                 self.context.step_count += 1
                                 self.context.prefix_cache_lru_clock += 1
                         # else: no global work and not all pausing → idle this iteration.
