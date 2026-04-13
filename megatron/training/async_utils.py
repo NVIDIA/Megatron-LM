@@ -6,7 +6,6 @@ the async checkpoint save calls.
 """
 import logging
 import time
-
 from abc import ABC
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
@@ -17,10 +16,14 @@ from megatron.training.utils import print_rank_0
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import _results_queue
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import save_state_dict_async_finalize
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+        save_state_dict_async_finalize,
+    )
 except (ImportError, ModuleNotFoundError):
     from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
-    from megatron.core.dist_checkpointing.strategies.state_dict_saver import save_state_dict_async_finalize
+    from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
+        save_state_dict_async_finalize,
+    )
 
     NVRxAsyncRequest = ABC
 
@@ -71,7 +74,10 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     # initialize ckpt write results queue
     get_write_results_queue('fork')
     if rank == 0:
-        print(f"init_persistent_async_worker: rank {rank}, Async Caller Started in {time.time() - time_start} seconds", flush=True)
+        print(
+            f"init_persistent_async_worker: rank {rank}, Async Caller Started in {time.time() - time_start} seconds",
+            flush=True,
+        )
 
 
 def schedule_async_save(async_request: AsyncRequest | NVRxAsyncRequest):
@@ -107,6 +113,7 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
     # Clean up finished deletion processes to prevent zombies
     # Import here to avoid circular dependency
     from .checkpointing import finalize_deletion_processes
+
     finalize_deletion_processes(blocking=blocking or terminate)
 
     if terminate and async_calls_queue is not None:
@@ -124,7 +131,7 @@ def is_empty_async_queue() -> bool:
 
 def reset_persistent_async_worker(async_strategy):
     global _async_calls_queue, _results_queue
-    
+
     if _async_calls_queue is not None:
         _async_calls_queue.close(abort=True)
         del _async_calls_queue
