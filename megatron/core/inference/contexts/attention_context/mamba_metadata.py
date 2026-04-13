@@ -268,6 +268,8 @@ class MambaMetadata:
                     chunk_size=chunk_size,
                     padded_max_chunks=padded_max_chunks,
                     padded_token_count=padded_token_count,
+                    max_requests=self.max_requests,
+                    max_tokens=self.max_tokens,
                 )
             else:
                 self._build_chunk_metadata_cpu(
@@ -286,6 +288,7 @@ class MambaMetadata:
                     conv_seq_start_buf=self._conv_seq_start_buffer,
                     real_prefill_count=real_prefill_count,
                     padded_token_count=padded_token_count,
+                    max_tokens=self.max_tokens,
                 )
             else:
                 self._build_conv_metadata_cpu(

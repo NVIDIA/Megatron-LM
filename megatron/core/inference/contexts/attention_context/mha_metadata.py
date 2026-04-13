@@ -80,6 +80,8 @@ class MHAMetadata(MetadataBase):
                 max_seqlen_k_buf=self._max_seqlen_buf[1:],
                 real_batch_size=real_batch_size,
                 padded_batch_size=padded_active_request_count,
+                max_batch_size=self.max_bs,
+                compute_max=getattr(self, '_compute_max_in_fused', True),
             )
         else:
             self.tensor_copy_and_pad(
@@ -158,6 +160,8 @@ class GraphedMHAMetadata(MHAMetadata):
     Metadata for MHA layer using flash-attention with CUDA graphs.
     """
 
+    _compute_max_in_fused = False  # Max seqlen values are overridden; skip in fused path.
+
     def __init__(
         self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
     ):
@@ -201,6 +205,8 @@ class NonGraphedMHAMetadata(MHAMetadata):
     Metadata for MHA layer using flash-attention without CUDA graphs.
     """
 
+    _compute_max_in_fused = True  # Max seqlen values are read after update.
+
     def update(
         self,
         request_query_lengths: torch.Tensor,
@@ -228,19 +234,14 @@ class NonGraphedMHAMetadata(MHAMetadata):
             num_speculative_tokens,
         )
         if len(self.state_data["query_lengths"]) > 0:
-            if HAVE_TRITON:
-                # Max was already computed by the fused kernel into a packed
-                # 2-element buffer — one .tolist() sync instead of two .item() syncs.
-                max_vals = self._max_seqlen_buf.tolist()
-                self.state_data["max_seqlen_q"] = max_vals[0]
-                self.state_data["max_seqlen_k"] = max_vals[1]
-            else:
-                self.state_data["max_seqlen_q"] = torch.max(
-                    self.state_data["query_lengths"]
-                ).item()
-                self.state_data["max_seqlen_k"] = torch.max(
-                    self.state_data["kv_seq_lengths"]
-                ).item()
+            # Direct .item() — one GPU→CPU sync per value. Cannot be avoided
+            # because flash-attention needs max_seqlen as a Python int for launch.
+            self.state_data["max_seqlen_q"] = torch.max(
+                self.state_data["query_lengths"]
+            ).item()
+            self.state_data["max_seqlen_k"] = torch.max(
+                self.state_data["kv_seq_lengths"]
+            ).item()
         else:
             self.state_data["max_seqlen_q"] = num_speculative_tokens + 1
             self.state_data["max_seqlen_k"] = 1

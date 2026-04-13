@@ -1,85 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import torch
 
+# HAVE_TRITON gates whether mha_metadata.py uses the optimized fused path
+# or falls back to the original tensor_copy_and_pad approach.
 try:
-    import triton
-    import triton.language as tl
+    import triton  # noqa: F401
 
     HAVE_TRITON = True
 except ImportError:
-    from unittest.mock import MagicMock
-
-    from megatron.core.utils import null_decorator
-
-    triton = MagicMock()
-    triton.jit = null_decorator
-    tl = MagicMock()
     HAVE_TRITON = False
-
-
-@triton.jit
-def _fused_mha_metadata_update_kernel(
-    # Inputs (1D, int32)
-    QUERY_LENGTHS_PTR,
-    KV_LENGTH_OFFSETS_PTR,
-    # Outputs (1D, int32)
-    QUERY_LENGTHS_BUF_PTR,
-    CU_QUERY_SEQ_LENGTHS_BUF_PTR,
-    KV_SEQ_LENGTHS_BUF_PTR,
-    CU_KV_SEQ_LENGTHS_BUF_PTR,
-    # Scalar outputs (max values, written as single-element tensors)
-    MAX_SEQLEN_Q_PTR,
-    MAX_SEQLEN_K_PTR,
-    # Runtime dimensions
-    real_bs,
-    padded_bs,
-    # Compile-time block size (next power of 2 of padded_bs)
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Fused kernel computing copy+pad, add, cumsum, and max for MHA metadata buffers.
-
-    Runs as a single program (grid=(1,)). The entire batch fits in one block
-    since inference batch sizes are typically ≤ a few thousand.
-
-    The zero-padding trick: loading beyond ``real_bs`` with ``other=0`` means
-    ``tl.cumsum`` naturally propagates the last real prefix-sum value through
-    the padded positions — exactly matching the cumulative-pad semantics of
-    ``tensor_copy_and_pad(..., is_cumulative_tensor=True)``.
-    """
-    offsets = tl.arange(0, BLOCK_SIZE)
-    real_mask = offsets < real_bs
-    padded_mask = offsets < padded_bs
-
-    # --- Load inputs (zero-padded beyond real_bs) ---
-    query_lengths = tl.load(QUERY_LENGTHS_PTR + offsets, mask=real_mask, other=0)
-    kv_offsets = tl.load(KV_LENGTH_OFFSETS_PTR + offsets, mask=real_mask, other=0)
-
-    # --- Derived values ---
-    kv_seq_lengths = kv_offsets + query_lengths
-
-    # --- Prefix sums (zeros beyond real_bs propagate last value) ---
-    cu_query = tl.cumsum(query_lengths, axis=0)
-    cu_kv = tl.cumsum(kv_seq_lengths, axis=0)
-
-    # --- Max values over real entries (for NonGraphedMHAMetadata) ---
-    max_q = tl.max(query_lengths, axis=0)
-    max_k = tl.max(kv_seq_lengths, axis=0)
-    tl.store(MAX_SEQLEN_Q_PTR, max_q)
-    tl.store(MAX_SEQLEN_K_PTR, max_k)
-
-    # --- Write query_lengths_buf  [0:padded_bs], pad=0 ---
-    tl.store(QUERY_LENGTHS_BUF_PTR + offsets, query_lengths, mask=padded_mask)
-
-    # --- Write kv_seq_lengths_buf [0:padded_bs], pad=0 ---
-    tl.store(KV_SEQ_LENGTHS_BUF_PTR + offsets, kv_seq_lengths, mask=padded_mask)
-
-    # --- Write cu_query_seq_lengths_buf [0]=0, [1:padded_bs+1]=cumsum ---
-    tl.store(CU_QUERY_SEQ_LENGTHS_BUF_PTR, 0)
-    tl.store(CU_QUERY_SEQ_LENGTHS_BUF_PTR + offsets + 1, cu_query, mask=padded_mask)
-
-    # --- Write cu_kv_seq_lengths_buf [0]=0, [1:padded_bs+1]=cumsum ---
-    tl.store(CU_KV_SEQ_LENGTHS_BUF_PTR, 0)
-    tl.store(CU_KV_SEQ_LENGTHS_BUF_PTR + offsets + 1, cu_kv, mask=padded_mask)
 
 
 def fused_mha_metadata_update(
@@ -93,8 +22,16 @@ def fused_mha_metadata_update(
     max_seqlen_k_buf: torch.Tensor,
     real_batch_size: int,
     padded_batch_size: int,
+    max_batch_size: int = 0,
+    compute_max: bool = True,
 ) -> None:
-    """Launch the fused MHA metadata update kernel.
+    """Compute all MHA metadata buffers using pure PyTorch ops (fully async, no CPU-GPU syncs).
+
+    Uses zero-padded cumsum trick: writing real values into a zero buffer then
+    calling cumsum naturally propagates the last prefix-sum value through
+    the padded positions — matching the cumulative-pad semantics of
+    ``tensor_copy_and_pad(..., is_cumulative_tensor=True)`` without the
+    CPU-GPU sync that ``tensor_copy_and_pad`` requires to read the last value.
 
     Args:
         query_lengths: ``[>=real_batch_size]`` int32 - per-request query lengths.
@@ -107,6 +44,9 @@ def fused_mha_metadata_update(
         max_seqlen_k_buf: ``[1]`` int32 - output: max kv length across real requests.
         real_batch_size: Number of real requests.
         padded_batch_size: Padded request count (≥ real_batch_size).
+        max_batch_size: Unused (kept for API compat).
+        compute_max: If True, compute max_seqlen values into the output buffers.
+            GraphedMHAMetadata overrides these values, so it passes False to skip.
     """
     if padded_batch_size == 0:
         cu_query_seq_lengths_buf[0] = 0
@@ -115,18 +55,28 @@ def fused_mha_metadata_update(
         max_seqlen_k_buf[0] = 0
         return
 
-    BLOCK_SIZE = triton.next_power_of_2(padded_batch_size)
+    rbs = real_batch_size
+    pbs = padded_batch_size
 
-    _fused_mha_metadata_update_kernel[(1,)](
-        query_lengths,
-        kv_length_offsets,
-        query_lengths_buf,
-        cu_query_seq_lengths_buf,
-        kv_seq_lengths_buf,
-        cu_kv_seq_lengths_buf,
-        max_seqlen_q_buf,
-        max_seqlen_k_buf,
-        real_batch_size,
-        padded_batch_size,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    # --- query_lengths_buf: copy real, zero-pad rest ---
+    query_lengths_buf[:rbs] = query_lengths[:rbs]
+    if pbs > rbs:
+        query_lengths_buf[rbs:pbs] = 0
+
+    # --- kv_seq_lengths = kv_offsets + query_lengths, zero-padded ---
+    kv_seq_lengths_buf[:rbs] = kv_length_offsets[:rbs] + query_lengths[:rbs]
+    if pbs > rbs:
+        kv_seq_lengths_buf[rbs:pbs] = 0
+
+    # --- cumsum on the padded buffer: zeros propagate last real value ---
+    cu_query_seq_lengths_buf[0] = 0
+    torch.cumsum(query_lengths_buf[:pbs], dim=0, out=cu_query_seq_lengths_buf[1 : pbs + 1])
+
+    cu_kv_seq_lengths_buf[0] = 0
+    torch.cumsum(kv_seq_lengths_buf[:pbs], dim=0, out=cu_kv_seq_lengths_buf[1 : pbs + 1])
+
+    # --- max values (GPU-only, no .item() sync) ---
+    # Only needed for NonGraphedMHAMetadata; GraphedMHAMetadata overrides these.
+    if compute_max:
+        max_seqlen_q_buf[0] = query_lengths_buf[:rbs].max()
+        max_seqlen_k_buf[0] = kv_seq_lengths_buf[:rbs].max()

@@ -1182,26 +1182,32 @@ class TextGenerationController:
             required_token_logits = context.last_token_logits(logits)
 
         if self._sampling_backend == "torch":
-            # Concatenate the outputs once to prevent repeated small writes.
-            token_list = []
-            indices_list = []
+            n_buckets = len(self._torch_sampling_buckets)
 
-            # e.g torch sample buckets will be
-            # i.e (for all unique comibnation of t, topk, topk what are the associated
-            # requests indices (based on the active slices)
-            # [ [req at index 0, req at index 2], t1, topk1, topp1 ]]
-            # [ [req at index 1, req at index 3, req at index 4] , t2, topk2, topp2]
-            for indices, temp, top_k, top_p in self._torch_sampling_buckets:
-                token_list.append(
-                    self._torch_sampling_func(required_token_logits[indices, :], temp, top_k, top_p)
+            if n_buckets == 1:
+                # Fast path: all requests share the same sampling params.
+                # Avoids fancy indexing, torch.tensor() CPU→GPU, torch.cat, and scatter.
+                indices, temp, top_k, top_p = self._torch_sampling_buckets[0]
+                n = len(indices)
+                sampled = self._torch_sampling_func(
+                    required_token_logits[:n, :], temp, top_k, top_p
                 )
-                indices_list.append(torch.tensor(indices))
+                self._sampled_tokens_cuda[:n] = sampled
+            else:
+                # General path: multiple sampling param buckets.
+                token_list = []
+                indices_list = []
+                for indices, temp, top_k, top_p in self._torch_sampling_buckets:
+                    token_list.append(
+                        self._torch_sampling_func(
+                            required_token_logits[indices, :], temp, top_k, top_p
+                        )
+                    )
+                    indices_list.append(torch.tensor(indices))
 
-            # Single write to the output tensor.
-            sampled_tokens = torch.cat(token_list, dim=0)
-            sampled_indices = torch.cat(indices_list, dim=0)
-
-            self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
+                sampled_tokens = torch.cat(token_list, dim=0)
+                sampled_indices = torch.cat(indices_list, dim=0)
+                self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.

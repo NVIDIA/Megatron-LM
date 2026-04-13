@@ -48,13 +48,6 @@ except ImportError:
     triton_append_key_value_cache = None
 
 try:
-    from .attention_context.triton.tensor_ops import fused_fill_3
-
-    HAVE_FUSED_FILL = True
-except ImportError:
-    HAVE_FUSED_FILL = False
-
-try:
     import flashinfer  # type: ignore # pylint: disable=unused-import
 
     HAVE_FLASHINFER = True
@@ -1704,27 +1697,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
         # Update token position indexes (pad region with sentinel/zero values).
-        if HAVE_FUSED_FILL:
-            fused_fill_3(
-                self.token_to_block_idx,
-                self.token_to_local_position_within_kv_block,
-                self.token_to_position_in_request,
-                self.kv_block_allocator.dummy_block_idx,
-                0,
-                0,
-                self.active_token_count,
-                self.padded_active_token_count,
-            )
-        else:
-            self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
-                self.kv_block_allocator.dummy_block_idx
-            )
-            self.token_to_local_position_within_kv_block[
-                self.active_token_count : self.padded_active_token_count
-            ] = 0
-            self.token_to_position_in_request[
-                self.active_token_count : self.padded_active_token_count
-            ] = 0
+        # Direct slice assignment is fully async and avoids Triton dispatch overhead.
+        self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
+            self.kv_block_allocator.dummy_block_idx
+        )
+        self.token_to_local_position_within_kv_block[
+            self.active_token_count : self.padded_active_token_count
+        ] = 0
+        self.token_to_position_in_request[
+            self.active_token_count : self.padded_active_token_count
+        ] = 0
 
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]

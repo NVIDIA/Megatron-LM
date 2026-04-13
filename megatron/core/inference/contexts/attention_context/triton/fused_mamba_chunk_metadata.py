@@ -163,6 +163,7 @@ def fused_conv_metadata(
     conv_seq_start_buf: torch.Tensor,
     real_prefill_count: int,
     padded_token_count: int,
+    max_tokens: int = 0,
 ) -> None:
     """Compute conv1d per-token metadata on GPU, replacing repeat_interleave.
 
@@ -172,6 +173,8 @@ def fused_conv_metadata(
         conv_seq_start_buf: ``[>=padded_token_count]`` int32 — output: per-token sequence start.
         real_prefill_count: Number of real prefill sequences.
         padded_token_count: Total padded token count.
+        max_tokens: Maximum possible token count. Used as fixed constexpr to
+            avoid Triton JIT recompilation. Falls back to padded_token_count if 0.
     """
     # Pre-fill with padding value (0) — kernel overwrites real positions.
     conv_seq_idx_buf[:padded_token_count] = 0
@@ -180,9 +183,9 @@ def fused_conv_metadata(
     if real_prefill_count == 0:
         return
 
-    # Conservative upper bound on tokens per sequence.
-    max_tokens_per_seq = padded_token_count
-    MAX_TOKENS_PER_SEQ = triton.next_power_of_2(max(max_tokens_per_seq, 1))
+    # Use max_tokens for a fixed constexpr to avoid JIT recompilation.
+    token_hint = max_tokens if max_tokens > 0 else padded_token_count
+    MAX_TOKENS_PER_SEQ = triton.next_power_of_2(max(token_hint, 1))
 
     _scatter_conv_metadata_kernel[(real_prefill_count,)](
         cu_seqlens_buf,
@@ -202,6 +205,8 @@ def fused_mamba_chunk_metadata(
     chunk_size: int,
     padded_max_chunks: int,
     padded_token_count: int,
+    max_requests: int = 0,
+    max_tokens: int = 0,
 ) -> None:
     """Compute mamba chunk metadata entirely on GPU.
 
@@ -219,20 +224,22 @@ def fused_mamba_chunk_metadata(
         chunk_size: Mamba chunk size (e.g. 128).
         padded_max_chunks: Total padded chunk count for CUDA graph compatibility.
         padded_token_count: Total padded token count.
+        max_requests: Maximum possible request count. Used as fixed BLOCK_SIZE to
+            avoid Triton JIT recompilation. Falls back to padded_prefill_count if 0.
+        max_tokens: Maximum possible token count. Used as fixed MAX_CHUNKS_PER_SEQ
+            to avoid Triton JIT recompilation. Falls back to padded_token_count if 0.
     """
     if padded_prefill_count == 0:
         cu_chunk_seqlens_buf[0] = 0
         return
 
     # Pre-fill output buffers with padding values.
-    # Kernel 2 overwrites real positions; remaining positions keep these defaults.
-    # cu_chunk_seqlens padding = last boundary = cu_seqlens[padded_prefill_count]
-    # Use slice assignment (not .fill_/.item()) to avoid a CPU-GPU sync.
     cu_chunk_seqlens_buf[1 : padded_max_chunks + 1] = cu_seqlens_buf[padded_prefill_count]
     seq_idx_for_varlen_buf[:padded_max_chunks] = 0
 
     # Kernel 1: compute cumulative chunk offsets and last_chunk_indices
-    BLOCK_SEQ = triton.next_power_of_2(padded_prefill_count)
+    block_seq_hint = max_requests if max_requests > 0 else padded_prefill_count
+    BLOCK_SEQ = triton.next_power_of_2(block_seq_hint)
     _compute_chunk_offsets_kernel[(1,)](
         cu_seqlens_buf,
         cum_chunks_buf,
@@ -244,7 +251,8 @@ def fused_mamba_chunk_metadata(
     )
 
     # Kernel 2: scatter chunk boundaries and seq_idx per sequence
-    max_chunks_per_seq = padded_token_count // chunk_size + 1
+    token_hint = max_tokens if max_tokens > 0 else padded_token_count
+    max_chunks_per_seq = token_hint // chunk_size + 1
     MAX_CHUNKS_PER_SEQ = triton.next_power_of_2(max(max_chunks_per_seq, 1))
     _scatter_chunk_boundaries_kernel[(padded_prefill_count,)](
         cu_seqlens_buf,
