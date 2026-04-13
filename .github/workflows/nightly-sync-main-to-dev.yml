@@ -309,4 +309,4 @@ jobs:
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
             --model "claude-opus-4-6"
-            --max-turns 200
+            --max-turns 1000
