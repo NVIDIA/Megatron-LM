@@ -499,7 +499,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     dummy_hidden, group=controller.inference_wrapped_model.tp_group
                 )
             dummy_token_ids = torch.zeros((1, batch_size), device=device, dtype=torch.long)
-            dummy_position_ids = torch.zeros((1, batch_size), device=device, dtype=torch.int32)
+            dummy_position_ids = torch.zeros((1, batch_size), device=device, dtype=torch.int64)
 
             # One call per batch size; depth=0 warms the shared layer (repeated
             # mode) or the first unique layer (non-repeated mode).
