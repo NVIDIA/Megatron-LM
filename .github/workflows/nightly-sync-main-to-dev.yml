@@ -314,6 +314,7 @@ jobs:
             - CI runs appear on the `pull-request/<PR_NUMBER>` branch.
             - The git committer identity is `svcnvidia-nemo-ci`.
             - After editing imports, run `isort` on those files.
+          show_full_output: true
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
             --model "claude-opus-4-6[1m]"
