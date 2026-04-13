@@ -8,6 +8,8 @@ and event lifecycle.
 """
 
 import logging
+import os
+from importlib import metadata
 from typing import Dict, Optional
 
 from ..compat import ensure_nvshmem_compat, get_cuda_core_device_class
@@ -45,10 +47,10 @@ class GPUResourceManager:
         self.copy_stream = None
 
         # PyTorch stream wrappers
-        self.torch_pack_stream = None
-        self.torch_unpack_stream = None
-        self.torch_send_stream = None
-        self.torch_copy_stream = None
+        self.torch_pack_stream_wrapper = None
+        self.torch_unpack_stream_wrapper = None
+        self.torch_send_stream_wrapper = None
+        self.torch_copy_stream_wrapper = None
 
         # Stream name to PyTorch stream mapping
         self._torch_streams: Dict[str, torch.cuda.ExternalStream] = {}
@@ -69,6 +71,49 @@ class GPUResourceManager:
         if not HAVE_NVSHMEM:
             raise RuntimeError(
                 "nvshmem.core is not available. Please install nvshmem to use GPUResourceManager."
+            )
+
+        # Guard against older NVSHMEM releases. We observed that previous
+        # versions (notably 3.4.5) could crash in nvshmemi_team_init /
+        # nvshmemx_hostlib_init_attr on split NVLink-domain PE layouts.
+        #
+        # If you intentionally want to try an older version while debugging,
+        # you can remove this guard or set
+        # MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION=1.
+        min_nvshmem_version = (3, 6, 5)
+        allow_unsupported_nvshmem = (
+            os.environ.get("MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION", "0") == "1"
+        )
+        try:
+            nvshmem_pkg_version = metadata.version("nvidia-nvshmem-cu12")
+            version_parts = tuple(int(part) for part in nvshmem_pkg_version.split(".")[:3])
+            if version_parts < min_nvshmem_version:
+                version_msg = (
+                    f"Installed nvidia-nvshmem-cu12=={nvshmem_pkg_version} is older than "
+                    "the recommended minimum 3.6.5. Previous NVSHMEM versions had "
+                    "known bugs with split NVLink-domain PE layouts and could crash "
+                    "in nvshmemi_team_init / nvshmemx_hostlib_init_attr."
+                )
+                if allow_unsupported_nvshmem:
+                    logger.warning(version_msg)
+                else:
+                    raise RuntimeError(
+                        version_msg
+                        + (
+                            " Set MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION=1 "
+                            "if you intentionally want to try an older version."
+                        )
+                    )
+        except metadata.PackageNotFoundError:
+            logger.warning(
+                "Could not determine nvidia-nvshmem-cu12 package version for NVSHMEM safety check."
+            )
+
+        # Recommend a conservative CTA limit for stability when team counts grow.
+        max_ctas = os.environ.get("NVSHMEM_MAX_CTAS")
+        if max_ctas != "2":
+            logger.warning(
+                "Recommended NVSHMEM_MAX_CTAS=2 for this path. Current value is %r.", max_ctas
             )
 
         # torch.distributed must be initialized before calling this
@@ -131,17 +176,17 @@ class GPUResourceManager:
         _, send_stream_ptr = self.send_stream.__cuda_stream__()
         _, copy_stream_ptr = self.copy_stream.__cuda_stream__()
 
-        self.torch_pack_stream = torch.cuda.ExternalStream(pack_stream_ptr)
-        self.torch_unpack_stream = torch.cuda.ExternalStream(unpack_stream_ptr)
-        self.torch_send_stream = torch.cuda.ExternalStream(send_stream_ptr)
-        self.torch_copy_stream = torch.cuda.ExternalStream(copy_stream_ptr)
+        self.torch_pack_stream_wrapper = torch.cuda.ExternalStream(pack_stream_ptr)
+        self.torch_unpack_stream_wrapper = torch.cuda.ExternalStream(unpack_stream_ptr)
+        self.torch_send_stream_wrapper = torch.cuda.ExternalStream(send_stream_ptr)
+        self.torch_copy_stream_wrapper = torch.cuda.ExternalStream(copy_stream_ptr)
 
         # Build stream mapping
         self._torch_streams = {
-            "pack": self.torch_pack_stream,
-            "unpack": self.torch_unpack_stream,
-            "send": self.torch_send_stream,
-            "copy": self.torch_copy_stream,
+            "pack": self.torch_pack_stream_wrapper,
+            "unpack": self.torch_unpack_stream_wrapper,
+            "send": self.torch_send_stream_wrapper,
+            "copy": self.torch_copy_stream_wrapper,
         }
 
         logger.info("Stream mapping built")

@@ -446,6 +446,9 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    fused_residual_rmsnorm: bool = False
+    """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
+
     ####################
     # activation recomputation
     ####################
@@ -715,6 +718,13 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_biased: Optional[float] = None
+    """Apply random expert bias in normal distribution with specified std
+    to router logits. Shared seed across all ranks ensures identical bias.
+    If positive, generates new random bias each forward pass.
+    If negative, generates bias once per layer and reuses it (abs value is std).
+    This is an experimental feature for benchmarking purposes."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -913,9 +923,23 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_disable_torch_grouped_mm: bool = False
-    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, 
-    falling back to TE GroupedGEMM. """
+    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
+    """Specifies the backend to use for grouped GEMM operations during inference.
+    Options:
+    - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
+      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
+      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
+      in future releases.
+    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
+      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
+    - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
+    """
+
+    inference_moe_disable_fused_quant_kernels: bool = False
+    """When False (default), use fused kernels that combine permute/activation with
+    MXFP8 quantization + swizzle into a single kernel launch. Only applies when
+    fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
+    launches (useful for debugging)."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1157,16 +1181,39 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_router_dtype != "fp32":
                 raise ValueError(
-                    "Inference-optimized MoE requires --moe-router-dtype=fp32 "
+                    "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
                     "to avoid costly dtype conversions during decode."
                 )
-            if self.gated_linear_unit and self.cuda_graph_impl != "none":
+
+            if self.gated_linear_unit and self.cuda_graph_impl == "local":
                 raise ValueError(
-                    "Inference-optimized MoE does not yet support CUDA graphs with gated "
-                    "linear units (SwiGLU/GeGLU) due to differences in weight layouts "
-                    "between the FlashInfer kernel and mcore. Either disable CUDA graphs "
-                    "(--cuda-graph-impl=none) or use a non-gated activation (e.g. squared_relu)."
+                    "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
+                    "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
+                    "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
+                    "graphs (--cuda-graph-impl=none) or use a non-gated activation "
+                    "(e.g. squared_relu)."
                 )
+
+            if self.fp8 == "mxfp8":
+                if not self.fp8_param:
+                    raise ValueError(
+                        "fp8_param must be enabled when using "
+                        "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
+                        "Please set --fp8-param-gather."
+                    )
+
+            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
+                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
+                f"got '{self.inference_grouped_gemm_backend}'"
+            )
+
+            if self.cuda_graph_impl == "local":
+                if self.inference_grouped_gemm_backend == "te":
+                    raise ValueError(
+                        "TE GroupedGEMM is not supported with CUDA graphs. Please set "
+                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
+                        "CUDA graphs (--cuda-graph-impl=none)."
+                    )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
@@ -1175,10 +1222,23 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
 
-        if self.num_moe_experts is None:
-            assert (
-                self.moe_ffn_hidden_size is None
-            ), "moe_ffn_hidden_size must be None when num_experts is not set."
+        if self.num_moe_experts is None and self.moe_ffn_hidden_size is not None:
+            is_mixed_model = (
+                isinstance(self.moe_layer_freq, list) and 0 in self.moe_layer_freq
+            ) or (isinstance(self.moe_layer_freq, int) and self.moe_layer_freq > 1)
+            if is_mixed_model:
+                warnings.warn(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "This is expected for dense layers in a mixed dense/MoE model "
+                    "(moe_layer_freq indicates some layers remain dense). "
+                    "moe_ffn_hidden_size will be ignored for this layer."
+                )
+                self.moe_ffn_hidden_size = None
+            else:
+                raise ValueError(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "Please set num_moe_experts or remove moe_ffn_hidden_size."
+                )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
@@ -1635,6 +1695,12 @@ class TransformerConfig(ModelParallelConfig):
                     "to True and use_te_activation_func to False."
                 )
 
+        if self.fused_residual_rmsnorm:
+            if self.normalization != "RMSNorm":
+                raise ValueError(
+                    "fused_residual_rmsnorm is only supported when normalization is RMSNorm."
+                )
+
         if self.use_te_activation_func:
             if self.activation_func not in (F.gelu, F.silu, F.relu):
                 raise ValueError(
@@ -1895,7 +1961,7 @@ class TransformerConfig(ModelParallelConfig):
                 "local",
             ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
-            if self.cpu_offloading:
+            if self.cpu_offloading and self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
             if self.cuda_graph_impl == "local":
@@ -2053,6 +2119,9 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.recompute_num_layers is None
             ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                "moe" not in self.recompute_modules
+            ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
 
             # Check if bf16 or fp16 is used
             assert (
@@ -2091,6 +2160,19 @@ class TransformerConfig(ModelParallelConfig):
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
                 )
+
+        if self.overlap_dispatch_backward_with_experts_wgrad:
+            assert not self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be disabled when enabling '
+                'overlap_dispatch_backward_with_experts_wgrad.'
+            )
+            assert is_te_min_version(
+                "2.3.0"
+            ), 'TE version >= 2.3.0 is required for overlap_dispatch_backward_with_experts_wgrad'
+            assert not self.delay_wgrad_compute, (
+                'delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad '
+                'are mutually exclusive; use only one'
+            )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
@@ -2178,12 +2260,6 @@ class TransformerConfig(ModelParallelConfig):
                 "for inference_optimized transformer implementation."
             )
 
-        if self.inference_disable_torch_grouped_mm:
-            assert self.transformer_impl == "inference_optimized", (
-                "inference_disable_torch_grouped_mm is only supported "
-                "for inference_optimized transformer implementation."
-            )
-
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash
@@ -2250,6 +2326,11 @@ class MLATransformerConfig(TransformerConfig):
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
+
+    mla_down_proj_fusion: bool = False
+    """Enable fused q/kv down-projection and fused input layernorm when backend supports.
+       Otherwise fall back to the unfused MLA.
+    """
 
     def __post_init__(self):
         super().__post_init__()
