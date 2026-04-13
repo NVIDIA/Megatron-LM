@@ -132,9 +132,12 @@ def main(
             "NCCL_ALGO": "Ring",
             "NCCL_COLLNET_ENABLE": "0",
             "NCCL_NVLS_ENABLE": "0",
-            "NCCL_TUNER_PLUGIN": "libnccl-tuner.so",
-            "NCCL_BUFFSIZE": "8388608",
-            "NCCL_P2P_NET_CHUNKSIZE": "524288",
+            # Disable the EFA tuner plugin so NCCL_ALGO/NCCL_PROTO are
+            # actually respected instead of being overridden at runtime.
+            "NCCL_TUNER_PLUGIN": "",
+            # Match the NCCL default (4 MB) so buffer-chunking behaviour
+            # is the same as on Slurm nodes.
+            "NCCL_BUFFSIZE": "4194304",
             "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
         },
         packager=run.Packager(),
