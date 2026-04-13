@@ -129,6 +129,7 @@ def main(
             "HF_HOME": "/mnt/hf_home",
             "TRANSFORMERS_OFFLINE": "1",
             "NCCL_PROTO": "simple",
+            "NCCL_ALGO": "Ring",
             "NCCL_NVLS_ENABLE": "0",
             "NCCL_TUNER_PLUGIN": "libnccl-tuner.so",
             "NCCL_BUFFSIZE": "8388608",
