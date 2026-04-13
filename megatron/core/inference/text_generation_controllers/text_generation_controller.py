@@ -618,7 +618,13 @@ class TextGenerationController:
         # Precompute MTP CUDA graph padded batch size from the already EP-synced
         # padded_batch_dimensions. This avoids an extra EP all-reduce on the MTP
         # hot path — all ranks derive the same value from the matched graph.
-        if getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None:
+        # When the main model falls back to eager mode, padded_batch_dimensions
+        # is computed from local values without EP sync, so we cannot use it;
+        # MTP will also run eagerly with a locally SP-aligned batch size.
+        if (
+            getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None
+            and context.using_cuda_graph_this_step()
+        ):
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
             tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
             sp_enabled = self.model_config.sequence_parallel and tp_size > 1
@@ -628,6 +634,16 @@ class TextGenerationController:
                 ) % tp_size
         else:
             self._mtp_resolved_padded_count = None
+
+        # Tell MTP layers whether to use CUDA graphs this step.  When the main
+        # model falls back to eager mode, MTP must also run eagerly across all
+        # EP ranks — otherwise some ranks may replay a captured graph while
+        # others run eagerly, causing EP collectives to hang.
+        if getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None:
+            use_mtp_graphs = context.using_cuda_graph_this_step()
+            if hasattr(unwrapped_model, 'mtp'):
+                for layer in unwrapped_model.mtp.layers:
+                    layer.use_mtp_cuda_graphs = use_mtp_graphs
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -910,10 +926,19 @@ class TextGenerationController:
 
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
+            # CUDA-graph path: use the EP-synced padded count derived from the
+            # matched graph dimensions.
             padded_count = self._mtp_resolved_padded_count
             assert not sp_enabled or padded_count % self._serial_mtp_tp_size == 0
+        elif has_mtp:
+            # Eager path (no CUDA graphs this step): pad only for SP alignment
+            # using the local request count.
+            padded_count = active_request_count
+            if sp_enabled:
+                tp_size = self._serial_mtp_tp_size
+                padded_count += (tp_size - padded_count % tp_size) % tp_size
         else:
-            assert not has_mtp
+            padded_count = active_request_count
         pad_count = padded_count - active_request_count
 
         # Pad hidden states and scatter for sequence parallelism.

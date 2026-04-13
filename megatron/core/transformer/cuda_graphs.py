@@ -1612,6 +1612,11 @@ class CudaGraphManager(torch.nn.Module):
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
+                # When the main model is in eager mode, MTP must also run
+                # eagerly so that all EP ranks take the same code path.
+                if self.is_mtp and not getattr(megatron_module, 'use_mtp_cuda_graphs', False):
+                    return self.func(*args, **kwargs)
+
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
 
