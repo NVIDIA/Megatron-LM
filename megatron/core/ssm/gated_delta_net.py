@@ -52,7 +52,6 @@ except ImportError:
 
     HAVE_FLA = False
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -337,41 +336,20 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
-            outputs = []
-            for qkvzba_i in unpacked_qkvzba:
-                qkvzba_i = tensor_a2a_cp2hp(
-                    qkvzba_i,
-                    seq_dim=0,
-                    head_dim=-1,
-                    cp_group=self.pg_collection.cp,
-                    split_sections=[
-                        self.qk_dim_local_tp,
-                        self.qk_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.num_value_heads // self.tp_size,
-                        self.num_value_heads // self.tp_size,
-                    ],
-                )
-                outputs.append(qkvzba_i)
-            qkvzba = torch.cat(outputs, dim=0)
-        else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=self.pg_collection.cp,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
-            )
+        qkvzba = tensor_a2a_cp2hp(
+            qkvzba,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.pg_collection.cp,
+            split_sections=[
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.v_dim_local_tp,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+            ],
+        )
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
@@ -438,7 +416,6 @@ class GatedDeltaNet(MegatronModule):
                 activation=self.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
             )
         nvtx_range_pop(suffix="conv1d")
 
@@ -468,7 +445,6 @@ class GatedDeltaNet(MegatronModule):
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -483,19 +459,9 @@ class GatedDeltaNet(MegatronModule):
         norm_out = norm_out.transpose(0, 1).contiguous()
 
         # CP all to all: HP to CP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
-            outputs = []
-            for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(
-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                )
-                outputs.append(norm_out_i)
-            norm_out = torch.cat(outputs, dim=0)
-        else:
-            norm_out = tensor_a2a_hp2cp(
-                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-            )
+        norm_out = tensor_a2a_hp2cp(
+            norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+        )
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -566,23 +532,6 @@ class GatedDeltaNet(MegatronModule):
         g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
         beta = beta.sigmoid()
         return g, beta
-
-    def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name):
-        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
-        if cu_seqlens_padded is not None:
-            cu_seqlens = cu_seqlens_padded
-        else:
-            cu_seqlens = cu_seqlens_actual
-
-        total_cu = cu_seqlens[-1].item()
-        if total_cu != total_seq_len:
-            raise ValueError(
-                f"GDN: {name}[-1]={total_cu} does not match "
-                f"total_sequence_length={total_seq_len}. "
-                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
-            )
-
-        return cu_seqlens
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
@@ -680,17 +629,6 @@ class GatedDeltaNet(MegatronModule):
     def _backward_out_proj(self):
         """Computes weight gradients of output projection layer."""
         self.out_proj.backward_dw()
-
-
-def _unpack_sequence(x, cu_seqlens, dim=1):
-    unpacked_x = []
-    num_seqs = cu_seqlens.shape[0] - 1
-    for i in range(num_seqs):
-        idx_start = cu_seqlens[i].item()
-        idx_end = cu_seqlens[i + 1].item()
-        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
-        unpacked_x.append(x[tuple(chunked_index)])
-    return unpacked_x
 
 
 ####################
@@ -899,13 +837,13 @@ def tensor_a2a_hp2cp(
         return tensor
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
-    assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
+    assert seq_dim == 0, f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
     assert (
         head_dim == -1 or head_dim == 2
-    ), f"tensor_a2a_cp2hp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
+    ), f"tensor_a2a_hp2cp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
     assert (
         tensor.dim() == 3
-    ), f"tensor_a2a_cp2hp only supports 3-d input tensor for now, but got {tensor.dim()=}"
+    ), f"tensor_a2a_hp2cp only supports 3-d input tensor for now, but got {tensor.dim()=}"
 
     # Redo attention load balancing first if needed.
     if redo_attention_load_balancing:

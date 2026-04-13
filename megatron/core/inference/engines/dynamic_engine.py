@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import multiprocessing
 import socket
 import struct
@@ -22,6 +23,7 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
@@ -212,12 +214,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.num_speculative_tokens > 0:
             assert (
-                self.num_speculative_tokens <= self.controller.num_mtp_heads
+                model_config.mtp_use_repeated_layer
+                or self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
-            assert (
-                not self.materialize_only_last_token_logits
-            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
-
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -426,6 +425,7 @@ class DynamicInferenceEngine(AbstractEngine):
         inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
+        hostname: str | None = None,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
@@ -463,6 +463,9 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+            hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
+                If None, defaults to `socket.gethostname()`. Should be set to a routable
+                address in multi-node settings where gethostname() may return 127.0.0.1.
 
         Returns:
             inference_coordinator_addresss (str): The network address of the central
@@ -495,7 +498,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
-        local_ip = socket.gethostname()
+        local_ip = hostname or socket.gethostname()
 
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
@@ -505,18 +508,21 @@ class DynamicInferenceEngine(AbstractEngine):
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
-                args=(
-                    dp_process_pipe,
-                    coordinator_ready_event,
-                    get_pg_size(self.pg_collection.dp),
-                    self.controller.tokenizer,
-                    inference_coordinator_port,
-                    deterministic_mode,
-                    self.context.block_size_tokens,
-                    self.context.enable_prefix_caching,
-                    self.context.prefix_caching_coordinator_policy,
-                    coordinator_schedule_output_path,
-                ),
+                kwargs={
+                    "pipe_connection": dp_process_pipe,
+                    "ready_event": coordinator_ready_event,
+                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    "tokenizer": self.controller.tokenizer,
+                    "max_requests": self.context.max_requests,
+                    "inference_coordinator_port": inference_coordinator_port,
+                    "deterministic_mode": deterministic_mode,
+                    "block_size_tokens": self.context.block_size_tokens,
+                    "enable_prefix_caching": self.context.enable_prefix_caching,
+                    "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
+                    "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "schedule_output_path": coordinator_schedule_output_path,
+                    "hostname": hostname,
+                },
             )
             self.inference_coordinator_process.start()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
@@ -601,13 +607,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.ep
+                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
         if total_world_size > 1:
-            self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+            self.world_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=None, hostname=hostname
+            )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
@@ -932,6 +940,16 @@ class DynamicInferenceEngine(AbstractEngine):
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
+        # Check that the KV cache has enough blocks for this request's max sequence length.
+        max_request_tokens = (
+            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
+        )
+        request_block_count = math.ceil(max_request_tokens / self.context.block_size_tokens)
+        total_blocks = self.context.kv_block_allocator.total_count - 1  # -1 for dummy block
+        if request_block_count > total_blocks:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(BlockOverflowError(request_id))
+
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
             stop_word_ids = [
@@ -1096,10 +1114,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     len(request.generated_tokens) + len(tokens)
                     >= request.sampling_params.num_tokens_to_generate
                 ):
-                    tokens = tokens[
-                        : request.sampling_params.num_tokens_to_generate
-                        - len(request.generated_tokens)
-                    ]
+                    keep = request.sampling_params.num_tokens_to_generate - len(
+                        request.generated_tokens
+                    )
+                    tokens = tokens[:keep]
+                    # Trim log probs / top-n to match so the counts stay in sync.
+                    if request_log_probs is not None:
+                        request_log_probs = request_log_probs[:keep]
+                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1190,7 +1213,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
-            if request_log_probs is not None:
+            # Skip for requests being finished due to stop words — tokens are not
+            # appended for these requests, so log probs must also be skipped to keep
+            # the two lists in sync.
+            if (
+                request_log_probs is not None
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []
@@ -1223,7 +1252,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
-            if top_n_logprobs is not None and req_idx in top_n_logprobs:
+            # Same stop-word guard as log probs above.
+            if (
+                top_n_logprobs is not None
+                and req_idx in top_n_logprobs
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if request.prompt_top_n_logprobs is None:
                     request.prompt_top_n_logprobs = []

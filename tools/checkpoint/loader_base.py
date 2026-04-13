@@ -468,7 +468,6 @@ class MegatronCheckpointLoaderBase:
             '--no-masked-softmax-fusion',
             '--no-bias-gelu-fusion',
             '--no-bias-dropout-fusion',
-            '--no-async-tensor-model-parallel-allreduce',
             '--use-cpu-initialization',
             '--micro-batch-size', '1',
             '--no-load-optim',
