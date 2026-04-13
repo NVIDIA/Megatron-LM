@@ -563,3 +563,165 @@ def test_router_gating_linear_bias(router_dtype):
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
     assert torch.allclose(bias.grad, ref_bias.grad, **tols)
+
+
+# ---------------------------------------------------------------------------
+# Rollout Routing Replay (R3) integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestRouterReplayIntegration:
+    """Integration tests for R3 using a real MoELayer with CUDA.
+
+    These tests verify the full replay workflow end-to-end:
+      1. RECORD mode captures routing indices from a forward pass.
+      2. REPLAY_FORWARD mode forces the same indices on a subsequent forward pass.
+      3. Router weight gradients still exist after a replayed forward+backward.
+      4. The ``moe_enable_routing_replay`` flag gates RouterReplay instantiation.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        self.num_experts = 4
+        self.topk = 2
+        self.hidden_size = 16
+        self.seq_len = 8
+        self.batch_size = 2
+        self.config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=True,
+            moe_token_dispatcher_type="allgather",
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=self.topk,
+            moe_aux_loss_coeff=0.01,
+            moe_grouped_gemm=False,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_enable_routing_replay=True,
+        )
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=self.num_experts, moe_grouped_gemm=False
+        )
+        self.moe_layer = MoELayer(self.config, submodules.mlp.submodules)
+
+    def teardown_method(self, method):
+        from megatron.core.transformer.moe.router_replay import RouterReplay
+
+        RouterReplay.clear_global_router_replay_instances()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_routing_replay_instances_created(self):
+        """moe_enable_routing_replay=True must create RouterReplay instances for each MoE layer."""
+        from megatron.core.transformer.moe.router_replay import RouterReplay
+
+        assert (
+            len(RouterReplay.global_router_replay_instances) == 1
+        ), "Expected one RouterReplay instance per MoE layer"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_record_and_replay_forward(self):
+        """RECORD then REPLAY_FORWARD must produce the same expert selection."""
+        from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+
+        self.moe_layer = self.moe_layer.cuda()
+        hidden = torch.randn(
+            self.seq_len, self.batch_size, self.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+
+        # --- Phase 1: RECORD ---
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        with torch.no_grad():
+            out_record, _ = self.moe_layer(hidden)
+        recorded = RouterReplay.get_recorded_data()
+        assert len(recorded) == 1 and recorded[0] is not None, "Indices were not recorded"
+        RouterReplay.clear_global_router_replay_action()
+
+        # --- Phase 2: REPLAY_FORWARD with recorded indices ---
+        RouterReplay.set_rollout_routing_data(recorded, activate_replay=True)
+        with torch.no_grad():
+            router_probs_replay, routing_map_replay = self.moe_layer.router(hidden)
+
+        # Expert selection (routing_map) must exactly match what was recorded
+        num_tokens = self.seq_len * self.batch_size
+        # recorded[0] shape: [num_tokens, topk]
+        replay_chosen = routing_map_replay.nonzero(as_tuple=False)[:, 1].view(num_tokens, self.topk)
+        assert torch.equal(
+            replay_chosen.sort(dim=1).values, recorded[0].sort(dim=1).values
+        ), "Replayed routing map does not match recorded indices"
+
+        RouterReplay.clear_global_indices()
+        RouterReplay.clear_global_router_replay_action()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_replay_router_grad_exists(self):
+        """Router weight gradients must be non-zero after a replayed forward+backward."""
+        from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+
+        self.moe_layer = self.moe_layer.cuda()
+        hidden = torch.randn(
+            self.seq_len, self.batch_size, self.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+
+        # Record routing decisions first
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        with torch.no_grad():
+            self.moe_layer(hidden)
+        recorded = RouterReplay.get_recorded_data()
+        RouterReplay.clear_global_router_replay_action()
+
+        # Inject and run forward+backward with replay
+        RouterReplay.set_rollout_routing_data(recorded, activate_replay=True)
+        out, _ = self.moe_layer(hidden)
+        out.sum().backward()
+
+        router_weight_grad = self.moe_layer.router.weight.grad
+        assert router_weight_grad is not None, "Router weight grad is None after replay backward"
+        assert (
+            router_weight_grad.abs().sum() > 0
+        ), "Router weight grad is all-zero after replay backward"
+
+        RouterReplay.clear_global_indices()
+        RouterReplay.clear_global_router_replay_action()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flag_false_no_replay_instance(self):
+        """moe_enable_routing_replay=False must NOT create RouterReplay instances."""
+        from megatron.core.transformer.moe.router_replay import RouterReplay
+
+        # Clear instances from setup_method (which used True)
+        RouterReplay.clear_global_router_replay_instances()
+
+        config_no_replay = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=True,
+            moe_token_dispatcher_type="allgather",
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=self.topk,
+            moe_aux_loss_coeff=0.01,
+            moe_grouped_gemm=False,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_enable_routing_replay=False,  # disabled
+        )
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=self.num_experts, moe_grouped_gemm=False
+        )
+        _ = MoELayer(config_no_replay, submodules.mlp.submodules)
+
+        assert (
+            len(RouterReplay.global_router_replay_instances) == 0
+        ), "RouterReplay instances should NOT be created when flag is False"
