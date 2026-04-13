@@ -1623,6 +1623,7 @@ class CudaGraphManager(torch.nn.Module):
                     # (d2h_event.synchronize) that is illegal inside CUDA graph
                     # capture, and the graph-safe inference dispatcher is only
                     # enabled during explicit warmup.
+                    print(f"MTP cuda graph: eager fallback (shape={kwargs['hidden_states'].shape})")
                     return self.func(*args, **kwargs)
 
                 if not runner.fwd_graph_recorded:
@@ -1662,6 +1663,8 @@ class CudaGraphManager(torch.nn.Module):
                     )
 
                 # Now replay the graph
+                if self.is_mtp:
+                    print(f"MTP cuda graph: replaying (shape={kwargs['hidden_states'].shape})")
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
             elif self.training or is_in_checkpoint_fwd:
                 runner = self.get_cudagraph_runner(

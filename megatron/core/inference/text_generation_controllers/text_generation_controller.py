@@ -201,10 +201,10 @@ class TextGenerationController:
 
             # Pre-allocate padded buffers for per-depth token/position IDs so
             # the depth loop avoids repeated unsqueeze + F.pad overhead.
-            self._mtp_token_ids_buf = torch.zeros(
+            self._mtp_token_ids_buf = torch.empty(
                 [1, max_requests], dtype=torch.int64, device=device
             )
-            self._mtp_position_ids_buf = torch.zeros(
+            self._mtp_position_ids_buf = torch.empty(
                 [1, max_requests], dtype=torch.int64, device=device
             )
 
@@ -614,13 +614,11 @@ class TextGenerationController:
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
 
+        
         # Precompute MTP CUDA graph padded batch size from the already EP-synced
-        # padded_batch_dimensions.  This avoids an extra EP all-reduce on the MTP
+        # padded_batch_dimensions. This avoids an extra EP all-reduce on the MTP
         # hot path — all ranks derive the same value from the matched graph.
-        if (
-            getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None
-            and context.using_cuda_graph_this_step()
-        ):
+        if getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None:
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
             tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
             sp_enabled = self.model_config.sequence_parallel and tp_size > 1
@@ -913,13 +911,9 @@ class TextGenerationController:
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
             padded_count = self._mtp_resolved_padded_count
-        elif sp_enabled:
-            tp_size = self._serial_mtp_tp_size
-            padded_count = (
-                active_request_count + (tp_size - active_request_count % tp_size) % tp_size
-            )
+            assert not sp_enabled or padded_count % self._serial_mtp_tp_size == 0
         else:
-            padded_count = active_request_count
+            assert not has_mtp
         pad_count = padded_count - active_request_count
 
         # Pad hidden states and scatter for sequence parallelism.
@@ -948,6 +942,7 @@ class TextGenerationController:
             mtp_logits_2d = None
             if has_mtp:
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
+                print(f"Rank {torch.distributed.get_rank()} Running real MTP depth {depth} with hidden_states={current_hidden.shape}, next_token_ids={token_ids_buf.shape}, position_ids={position_ids_buf.shape} (padded_count={padded_count})")
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids_buf,
@@ -1693,8 +1688,9 @@ class TextGenerationController:
         sp_enabled = self.model_config.sequence_parallel and tp_size > 1
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
             padded_count = self._mtp_resolved_padded_count
+            assert not sp_enabled or padded_count % tp_size == 0
         else:
-            padded_count = tp_size if sp_enabled else 1
+            assert not has_mtp
 
         dummy_hidden = None
         if has_mtp:
@@ -1713,6 +1709,7 @@ class TextGenerationController:
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
+                print(f"Rank {torch.distributed.get_rank()} Running dummy MTP depth {depth} with hidden_states={dummy_hidden.shape}, next_token_ids={dummy_token_ids.shape}, position_ids={dummy_position_ids.shape} (padded_count={padded_count})")
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,
