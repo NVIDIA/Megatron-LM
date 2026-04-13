@@ -417,7 +417,7 @@ class TestGDNCuSeqlensResolve:
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
+def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -458,4 +458,5 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         seed=123,
         sequence_length=256,
         micro_batch_size=4,
+        sequence_packing=sequence_packing,
     )
