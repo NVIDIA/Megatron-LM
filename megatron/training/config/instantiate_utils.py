@@ -199,14 +199,14 @@ def instantiate_node(
     elif OmegaConf.is_dict(node):
         exclude_keys = set(item.value for item in _Keys if item != _Keys.ARGS)
         if _is_target(node):
-            should_call_target = node.get("_call_", True)
+            should_call_target = node.get(_Keys.CALL, True)
             _target_ = _resolve_target(node.get(_Keys.TARGET), full_key, check_callable=should_call_target)
             kwargs = {}
-            is_partial = node.get("_partial_", False) or partial
+            is_partial = node.get(_Keys.PARTIAL, False) or partial
 
             if not should_call_target:
-                if len(set(node.keys()) - {"_target_", "_call_"}) != 0:
-                    extra_keys = set(node.keys()) - {"_target_", "_call_"}
+                if len(set(node.keys()) - {_Keys.TARGET, _Keys.CALL}) != 0:
+                    extra_keys = set(node.keys()) - {_Keys.TARGET, _Keys.CALL}
                     raise InstantiationException(
                         f"_call_ was set to False for target {_convert_target_to_string(_target_)},"
                         f" but extra keys were found: {extra_keys}"
@@ -289,9 +289,9 @@ def _locate(path: str) -> Any:
 
 def _is_target(x: Any) -> bool:
     if isinstance(x, dict):
-        return "_target_" in x
+        return _Keys.TARGET in x
     if OmegaConf.is_dict(x):
-        return "_target_" in x
+        return _Keys.TARGET in x
     return False
 
 
@@ -387,8 +387,8 @@ def _prepare_input_dict_or_list(d: dict[Any, Any] | list[Any]) -> Any:
     if isinstance(d, dict):
         res = {}
         for k, v in d.items():
-            if k == "_target_":
-                v = _convert_target_to_string(d["_target_"])
+            if k == _Keys.TARGET:
+                v = _convert_target_to_string(d[_Keys.TARGET])
             elif isinstance(v, (dict, list)):
                 v = _prepare_input_dict_or_list(v)
             res[k] = v
