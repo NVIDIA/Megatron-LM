@@ -18,6 +18,36 @@ import torch
 _buffer = None
 
 
+def _drain_etp_side_streams(chain_id: str = None):
+    """Drain ETP ag/rs side streams before an eager NCCL collective.
+
+    Eager NCCL ops on main_stream (dispatch all-to-all, combine, etc.) can deadlock
+    at scale over IB if concurrent NCCL ops are still running on ag/rs side streams.
+
+    Args:
+        chain_id: 'dense', 'expert', or None (drain all chains).
+    """
+    try:
+        if chain_id is not None:
+            from transformer_engine.pytorch.module.extended_tensor_parallelism import (
+                get_ag_stream,
+                get_rs_stream,
+            )
+            torch.cuda.current_stream().wait_stream(get_ag_stream(chain_id))
+            torch.cuda.current_stream().wait_stream(get_rs_stream(chain_id))
+        else:
+            from transformer_engine.pytorch.module.extended_tensor_parallelism import (
+                get_all_ag_streams,
+                get_all_rs_streams,
+            )
+            for s in get_all_ag_streams():
+                torch.cuda.current_stream().wait_stream(s)
+            for s in get_all_rs_streams():
+                torch.cuda.current_stream().wait_stream(s)
+    except ImportError:
+        pass
+
+
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for a tensor.
 

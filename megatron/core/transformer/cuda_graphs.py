@@ -75,8 +75,6 @@ _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
-_EXTERNAL_STREAMS = []
-
 # Freeze GC during capture.
 # TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
 FREEZE_GC = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
@@ -531,22 +529,6 @@ def delete_cuda_graphs():
     CudaGraphManager.global_mempool = None
 
 
-def drain_etp_rs_stream() -> None:
-    """Gate the current CUDA stream behind every ETP backward graph's full completion.
-
-    Must be called in finalize_model_grads before finish_grad_sync when ETP
-    (parameter_sharding or expert_parameter_sharding) is active with CUDA graphs.
-    Ensures all layers' RS and add_(wgrad_rs, main_grad) are done before
-    finish_grad_sync reads any main_grad.
-
-    No-op when no parameter_sharding backward graph has been replayed.
-    """
-    events = list(_CudagraphReplayNode._bwd_completion_events.values())
-    _CudagraphReplayNode._bwd_completion_events.clear()
-    for event in events:
-        torch.cuda.current_stream().wait_event(event)
-
-
 class _GraphStatus(Enum):
     """An Enum to track if a cudagraph is ready to perform a forward or backward pass."""
 
@@ -599,17 +581,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
     # main_stream only unblocks after ag/rs streams are fully drained, so eager ops that
     # follow (e.g. expert GEMMs reading the weight buffer) are guaranteed to see completed data.
     #
-    # Pros: simple, race-free — no extra fences needed between graph replays and eager ops.
-    # Cons: cannot overlap AG(grouped-fc1) with EP all-to-all in dispatch_with_permute.
-    #       A 2-event scheme (early unblock after GEMM, late event after AG drain) could
-    #       recover that overlap, but requires explicit fences in both fwd and bwd eager
-    #       expert compute paths to prevent use-before-ready on the weight buffer.
-
-    # bwd_completion_events for all active parameter_sharding runners, keyed by id(event).
-    # Accumulated during the backward pass; drained by drain_etp_rs_stream() before
-    # finalize_model_grads reads main_grad. Keyed by id to deduplicate across microbatches
-    # (same Event object re-recorded each time; the latest recording is what matters).
-    _bwd_completion_events: "dict" = {}
+    # wait_async_comms() is called INSIDE the captured graph (not before replay) so that
+    # ag_event.record() is embedded in the graph and fires at the right moment on ag_stream.
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
@@ -660,9 +633,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
-        if runner.parameter_sharding:
-            wait_async_comms()
-
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
@@ -703,19 +673,11 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
-        if runner.parameter_sharding:
-            wait_async_comms()
-
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
             torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
-            if runner.parameter_sharding:
-                # Accumulate for drain_etp_rs_stream() in finalize_model_grads.
-                _CudagraphReplayNode._bwd_completion_events[id(runner.bwd_completion_event)] = (
-                    runner.bwd_completion_event
-                )
         else:
             runner.bwd_graph.replay()
 
@@ -894,26 +856,6 @@ class _CudaGraphRunner(torch.nn.Module):
         # Return module params that were found in the graph, preserving original order
         return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
 
-    def _drain_etp_async_comms_before_capture(self):
-        """Drain all in-flight ETP async comms (all-gathers / reduce-scatters) and
-        synchronize the device BEFORE entering a torch.cuda.graph() capture context.
-
-        wait_async_comms() is also called INSIDE the capture context so that any
-        prefetch-comms launched by the captured module itself are waited before the
-        graph ends.  However, if comms belonging to *other* (non-captured) parameters
-        are in flight at capture time, their ag_event.record() CUDA ops get embedded
-        into this graph.  On subsequent replays the event fires at the wrong moment,
-        letting the forward GEMM race ahead of the actual in-flight all-gather and
-        corrupting partially-written quantized buffers (e.g. mxfp8 scale_inv → NaN).
-
-        Calling this method outside the capture context settles Python-side state
-        (_prefetch_handle, _inflight_comm_params) so the inner wait_async_comms()
-        becomes a no-op and captures no external ag_event.record() ops.
-        """
-        if self.parameter_sharding:
-            wait_async_comms()
-        torch.cuda.synchronize()
-
     def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
@@ -1059,10 +1001,15 @@ class _CudaGraphRunner(torch.nn.Module):
                         only_inputs=True,
                         allow_unused=True,
                     )
+
+                if self.parameter_sharding:
+                    wait_async_comms()
+                    self._sync_against_side_streams(self.bwd_side_streams)
+
             _set_warmup_end()
 
             with self.get_quantization_context():
-                self._drain_etp_async_comms_before_capture()
+                torch.cuda.synchronize()
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
                 # before capture begins, to avoid inference-tensor state issues during capture.
                 with torch.inference_mode(mode=False):
@@ -1200,7 +1147,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 out_grad.requires_grad = True
             self.static_grad_outputs.append(out_grad)
 
-        self._drain_etp_async_comms_before_capture()
+        torch.cuda.synchronize()
 
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:

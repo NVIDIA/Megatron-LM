@@ -1337,6 +1337,15 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
+        # Drain dense ETP ag_stream before the MoE dispatch AllToAll.
+        # The preceding shared_expert GEMM's all_gather_and_prefetch may have launched
+        # AG(next_mamba_fc1) on ag_stream (IB). Running that concurrently with the dispatch
+        # AllToAll (also IB) causes NCCL deadlock at 64+ GPU scale. Drain here ensures
+        # the dispatch and combine AllToAlls have exclusive IB access.
+        if self.config.parameter_sharding_size > 1:
+            from megatron.core.transformer.moe.fused_a2a import _drain_etp_side_streams
+            _drain_etp_side_streams('dense')
+
         # Restore token dispatcher attributes that were captured during CUDA graph recording.
         # After router graph replay, Python code does not re-run, so any attribute that was
         # mutated by eager expert_compute (e.g. tokens_per_expert set to None by

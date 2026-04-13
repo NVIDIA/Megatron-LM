@@ -13,7 +13,6 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
-from megatron.core.transformer.cuda_graphs import drain_etp_rs_stream
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,
@@ -441,13 +440,25 @@ def finalize_model_grads(
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
-    # Ensure all in-flight ETP reduce-scatter ops complete before DDP reads the sharded
-    # gradients.  With CUDA graphs + parameter_sharding, the per-graph backward replay
-    # intentionally leaves the last graph's RS running on the RS side-stream to overlap
-    # with subsequent graph backward computation.  That RS must be complete here before
-    # finish_grad_sync checks and allreduces the ETP gradient buckets.
+    # Drain any in-flight ETP reduce-scatters on rs_stream before the DP gradient sync.
+    # Expert backward runs eagerly (not in CUDA graphs), so its ETP RS operations on
+    # rs_stream may still be writing to main_grad when finish_grad_sync starts the DP
+    # allreduce on main_stream.
     if config.parameter_sharding_size > 1 or config.expert_parameter_sharding_size > 1:
-        drain_etp_rs_stream()
+        try:
+            from transformer_engine.pytorch.module.extended_tensor_parallelism import (
+                get_all_ag_streams,
+                get_all_rs_streams,
+                wait_async_comms,
+            )
+
+            wait_async_comms()
+            for s in get_all_ag_streams():
+                torch.cuda.current_stream().wait_stream(s)
+            for s in get_all_rs_streams():
+                torch.cuda.current_stream().wait_stream(s)
+        except ImportError:
+            pass
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
