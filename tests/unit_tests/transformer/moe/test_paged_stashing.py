@@ -5,9 +5,9 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import config
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
@@ -16,6 +16,7 @@ from megatron.core.transformer.moe.paged_stash import (
     paged_stash_reset,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -182,6 +183,27 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
+def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
+    """Cheap gate matching the start of ``TEGroupedMLP._is_fused_impl_supported`` (experts.py)."""
+    if not HAVE_TE:
+        return False
+    try:
+        from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
+    except ImportError:
+        return False
+    return is_te_min_version("2.14.0")
+
+
+_TE_GROUPED_MLP_OP_FUSER_SKIP_REASON = (
+    "TEGroupedMLP op fuser (tests use use_transformer_engine_op_fuser=True) requires TE>=2.14 "
+    "with GroupedLinear/ScaledSwiGLU ops"
+)
+
+
+@pytest.mark.skipif(
+    not _te_grouped_mlp_op_fuser_environment_supported(),
+    reason=_TE_GROUPED_MLP_OP_FUSER_SKIP_REASON,
+)
 @pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
 class TestPagedStashing:
     def setup_method(self, method):
@@ -222,11 +244,6 @@ class TestPagedStashing:
             gated_linear_unit=True,
             activation_func=F.silu,
         )
-        experts = container.moe_layer.experts
-        fused_ok = isinstance(experts, TEGroupedMLP) and experts._is_fused_impl_supported()
-        if not fused_ok:
-            container.destroy()
-            pytest.skip("TEGroupedMLP fused impl not supported")
 
         seq_length = 1024
         batch_size = 1
@@ -272,6 +289,10 @@ class TestPagedStashing:
             ), f"tokens_per_expert != ref: max diff = {(tpe_f - ref_f).abs().max().item()}"
 
 
+@pytest.mark.skipif(
+    not _te_grouped_mlp_op_fuser_environment_supported(),
+    reason=_TE_GROUPED_MLP_OP_FUSER_SKIP_REASON,
+)
 @pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
 class TestPagedStashingOverBudget:
     def setup_method(self, method):
@@ -313,11 +334,6 @@ class TestPagedStashingOverBudget:
             activation_func=F.silu,
             moe_router_force_biased=1,
         )
-        experts = container.moe_layer.experts
-        fused_ok = isinstance(experts, TEGroupedMLP) and experts._is_fused_impl_supported()
-        if not fused_ok:
-            container.destroy()
-            pytest.skip("TEGroupedMLP fused impl not supported")
 
         seq_length = 1024
         batch_size = 1
