@@ -194,6 +194,10 @@ class TestFullyShardedDataParallel:
         """Test that FSDP works correctly with different process group configurations."""
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if dp_size > torch.cuda.device_count():
+            pytest.skip(
+                f"Test requires {dp_size} GPUs, but only {torch.cuda.device_count()} are available"
+            )
 
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():
@@ -338,6 +342,10 @@ class TestFullyShardedDataParallel:
         """
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if dp_size > torch.cuda.device_count():
+            pytest.skip(
+                f"Test requires {dp_size} GPUs, but only {torch.cuda.device_count()} are available"
+            )
 
         # Skip nccl_ub=True cases if PyTorch version is less than 2.7.0
         if nccl_ub and version.parse(torch.__version__) < version.parse('2.7.0'):

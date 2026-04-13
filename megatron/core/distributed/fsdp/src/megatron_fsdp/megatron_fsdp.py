@@ -28,6 +28,7 @@ from .mixed_precision import (
     fp8_create_transpose_cache,
     fp8_discard_transpose_cache,
     is_float8tensor,
+    is_nvfp4tensor,
 )
 from .param_and_grad_buffer import (
     AllGatherPipeline,
@@ -486,7 +487,7 @@ class MegatronFSDP(torch.nn.Module):
             for param in params:
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
                 ag_pipeline.wait_bucket_ready(bucket_id, bwd)
-                if bwd and is_float8tensor(param):
+                if bwd and not is_nvfp4tensor(param) and is_float8tensor(param):
                     fp8_create_transpose_cache(param)
 
         for param in params:
@@ -943,6 +944,7 @@ class MegatronFSDP(torch.nn.Module):
 
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
+            module._training_state = TrainingState.IDLE
 
             return output
 
