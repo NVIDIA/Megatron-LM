@@ -1940,8 +1940,6 @@ def _add_inference_args(parser):
     group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
                        choices=['bf16', 'fp16', 'fp32'], default='bf16',
                        help='Dtype for the Mamba inference SSM states tensor')
-    group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
-                       required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
     return parser
 
 
