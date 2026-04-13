@@ -15,7 +15,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
-from megatron.rl.pretrain_context import rl_pretrain_context_factory
+from megatron.rl.pretrain_context import RLPretrainContext
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
     get_logprobs,
@@ -418,5 +418,5 @@ if __name__ == "__main__":
         forward_step,
         args_defaults={},
         extra_args_provider=add_inference_args,
-        pretrain_context_factory=rl_pretrain_context_factory,
+        pretrain_context_class=RLPretrainContext,
     )

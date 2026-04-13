@@ -385,6 +385,3 @@ class RLPretrainContext(PretrainContext):
         rl_utils.rl_inference_interface_shutdown()
 
 
-def rl_pretrain_context_factory(**kwargs: Any) -> RLPretrainContext:
-    """RL-specific factory: construct an RLPretrainContext."""
-    return RLPretrainContext(**kwargs)

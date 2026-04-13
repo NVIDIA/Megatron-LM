@@ -16,7 +16,7 @@ The context has a two-phase lifecycle:
    the model, optimizer, config, and data iterators.
 """
 
-from typing import Any, Callable, List, Optional
+from typing import List, Optional
 
 from megatron.core import mpu
 from megatron.core.num_microbatches_calculator import get_num_microbatches
@@ -157,11 +157,3 @@ class PretrainContext:
     def shutdown(self) -> None:
         """Called once when training terminates (clean shutdown)."""
         pass
-
-
-PretrainContextFactory = Callable[..., PretrainContext]
-
-
-def default_pretrain_context_factory(**kwargs: Any) -> PretrainContext:
-    """Default factory: construct a plain PretrainContext class."""
-    return PretrainContext(**kwargs)

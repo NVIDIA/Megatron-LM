@@ -187,11 +187,7 @@ from .global_vars import (
 )
 from . import one_logger_utils
 from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
-from .pretrain_context import (
-    PretrainContext,
-    PretrainContextFactory,
-    default_pretrain_context_factory,
-)
+from .pretrain_context import PretrainContext
 
 from . import ft_integration
 
@@ -773,7 +769,7 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[CallWrapper] = None,
-    pretrain_context_factory: PretrainContextFactory = default_pretrain_context_factory,
+    pretrain_context_class: type[PretrainContext] = PretrainContext,
 ):
     """Main training program.
 
@@ -968,7 +964,7 @@ def pretrain(
 
     # Construct the pretrain context so that the setup-policy hooks are in-place for
     # (should_build_optimizer, should_build_standard_dataloaders).
-    context = pretrain_context_factory(
+    context = pretrain_context_class(
         args=args,
         model_provider=model_provider,
         model_type=model_type,
