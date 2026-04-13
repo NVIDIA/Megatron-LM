@@ -762,9 +762,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
-            self.coordinator_client.send_engine_reply(
-                [request_entry.record.merge().serialize()]
-            )
+            self.coordinator_client.send_engine_reply([request_entry.record.merge().serialize()])
         elif not self.use_coordinator:
             if request.prompt is None:
                 request.prompt = self.controller.tokenizer.detokenize(
@@ -1989,11 +1987,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 return True
             if cc and cc.pending_messages:
                 return True
-            if self.state not in (
-                EngineState.RUNNING,
-                EngineState.PAUSED,
-                EngineState.SUSPENDED,
-            ):
+            if self.state not in (EngineState.RUNNING, EngineState.PAUSED, EngineState.SUSPENDED):
                 return True
             return self.state == EngineState.RUNNING and (
                 self.has_unfinished_requests() or (cc and cc.ep_peer_has_work)
@@ -2018,8 +2012,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 self.waiting_request_ids
                             )
                             global_work, all_pausing = await cc.ep_establish_consensus(
-                                local_pending,
-                                signal_consensus=(self.state == EngineState.PAUSING),
+                                local_pending, signal_consensus=(self.state == EngineState.PAUSING)
                             )
                     else:
                         global_work, all_pausing = await pending_schedule_and_consensus

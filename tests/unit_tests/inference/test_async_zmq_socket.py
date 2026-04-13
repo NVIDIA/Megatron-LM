@@ -44,9 +44,7 @@ from megatron.core.inference.headers import Headers
 
 if HAVE_TORCH:
     from megatron.core.inference.engines.dynamic_engine import EngineState
-    from megatron.core.inference.engines.engine_coordinator_client import (
-        EngineCoordinatorClient,
-    )
+    from megatron.core.inference.engines.engine_coordinator_client import EngineCoordinatorClient
 
 
 class _DummyTokenizer:
@@ -228,9 +226,7 @@ async def test_coordinator_lifecycle():
         # ── Clean shutdown ──
         client.send_multipart([Headers.SHUTDOWN.value.to_bytes()])
         proc.join(timeout=2.0)
-        assert not proc.is_alive(), (
-            "Coordinator did not exit within 2 s of SHUTDOWN"
-        )
+        assert not proc.is_alive(), "Coordinator did not exit within 2 s of SHUTDOWN"
 
         engine_a.close(linger=0)
         engine_b.close(linger=0)
@@ -272,8 +268,7 @@ async def test_coordinator_lifecycle():
     ],
 )
 async def test_deferred_application(
-    is_leader, requests, epoch, signals,
-    expect_state, expect_n_added, expect_epoch, expect_putback,
+    is_leader, requests, epoch, signals, expect_state, expect_n_added, expect_epoch, expect_putback
 ):
     """Verify apply_deferred commits all deferred state to the engine correctly.
 
@@ -296,8 +291,11 @@ async def test_deferred_application(
             self._state_events = {
                 s: asyncio.Event()
                 for s in (
-                    EngineState.RUNNING, EngineState.PAUSED, EngineState.SUSPENDED,
-                    EngineState.RESUMED, EngineState.STOPPED,
+                    EngineState.RUNNING,
+                    EngineState.PAUSED,
+                    EngineState.SUSPENDED,
+                    EngineState.RESUMED,
+                    EngineState.STOPPED,
                 )
             }
             self._state_events[EngineState.RUNNING].set()

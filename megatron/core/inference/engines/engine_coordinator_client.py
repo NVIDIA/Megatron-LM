@@ -601,9 +601,7 @@ class EngineCoordinatorClient:
         if self.is_mp_coordinator:
             messages = list(self.pending_messages)
             self.pending_messages.clear()
-            self._mp_channel._isend(
-                Headers.MESSAGES, [(h.value, d) for h, d in messages]
-            )
+            self._mp_channel._isend(Headers.MESSAGES, [(h.value, d) for h, d in messages])
         else:
             await self.messages_processing_event.wait()
             self.messages_processing_event.clear()

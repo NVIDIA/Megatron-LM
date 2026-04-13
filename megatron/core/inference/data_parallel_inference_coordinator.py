@@ -114,10 +114,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
         self.ready_event = ready_event
 
         super().__init__(
-            "ROUTER",
-            bind=True,
-            bind_host=hostname,
-            bind_port=inference_coordinator_port,
+            "ROUTER", bind=True, bind_host=hostname, bind_port=inference_coordinator_port
         )
 
         # Send the address to the parent process.
@@ -239,11 +236,7 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                     remapped[h] = new_info
             self._hash_table = remapped
 
-        logging.warning(
-            "Coordinator: removed engine %s (now %d engines)",
-            identity,
-            n,
-        )
+        logging.warning("Coordinator: removed engine %s (now %d engines)", identity, n)
 
     def _handle_unreachable_identity(self, identity):
         """Override: prune the dead engine instead of just logging.
@@ -468,14 +461,18 @@ class DataParallelInferenceCoordinator(AsyncZmqEndpoint):
                 )
 
                 self.request_id_to_rank[request_id] = next_data_parallel_rank_identity
-                self._pending_counts[self.identity_to_rank_index[next_data_parallel_rank_identity]] += 1
+                self._pending_counts[
+                    self.identity_to_rank_index[next_data_parallel_rank_identity]
+                ] += 1
                 if request_hashes:
                     self._update_rank_hashes(next_data_parallel_rank_identity, request_hashes)
                 if self.schedule_records is not None:
                     self.schedule_records.append(
                         {
                             "request_id": request_id,
-                            "rank_index": self.identity_to_rank_index[next_data_parallel_rank_identity],
+                            "rank_index": self.identity_to_rank_index[
+                                next_data_parallel_rank_identity
+                            ],
                             "num_hashes": len(request_hashes),
                         }
                     )
