@@ -243,7 +243,13 @@ class MoELayer(BaseMoELayer):
         # Initialize latent projections.
         if self.config.moe_latent_size:
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
-            self.fc1_latent_proj = TELinear(
+            if self.config.transformer_impl == "inference_optimized":
+                from megatron.core.tensor_parallel.inference_layers import InferenceLinear
+
+                linear_cls = InferenceLinear
+            else:
+                linear_cls = TELinear
+            self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
                 parallel_mode="duplicated",
@@ -254,7 +260,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
             )
-            self.fc2_latent_proj = TELinear(
+            self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
                 parallel_mode="duplicated",
@@ -342,16 +348,6 @@ class MoELayer(BaseMoELayer):
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
 
-    def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
-        """Initializes CUDA events and streams for overlapping expert
-        weight gradient computation with dispatch backward.
-        """
-        self._delayed_wgrad_event: Optional[torch.cuda.Event] = None
-        self._delayed_wgrad_stream: Optional[torch.cuda.Stream] = None
-        if self.config.overlap_dispatch_backward_with_experts_wgrad:
-            self._delayed_wgrad_event = torch.cuda.Event()
-            self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
-
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher and state.
 
@@ -371,6 +367,16 @@ class MoELayer(BaseMoELayer):
             config=self.config,
             pg_collection=pg_collection,
         )
+
+    def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
+        """Initializes CUDA events and streams for overlapping expert
+        weight gradient computation with dispatch backward.
+        """
+        self._delayed_wgrad_event: Optional[torch.cuda.Event] = None
+        self._delayed_wgrad_stream: Optional[torch.cuda.Stream] = None
+        if self.config.overlap_dispatch_backward_with_experts_wgrad:
+            self._delayed_wgrad_event = torch.cuda.Event()
+            self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     def set_inference_cuda_graphed_iteration(self):
         """Enable CUDA-graphed iteration mode on this layer, its router, and its experts.
