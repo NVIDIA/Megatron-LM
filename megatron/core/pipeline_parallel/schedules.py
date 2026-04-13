@@ -738,7 +738,8 @@ def forward_backward_no_pipelining(
     if forward_only:
         for model_chunk in [model]:
             if (
-                model_chunk.ddp_config.use_megatron_fsdp
+                getattr(model_chunk, 'ddp_config')
+                and model_chunk.ddp_config.use_megatron_fsdp
                 and model_chunk.ddp_config.overlap_param_gather
             ):
                 model_chunk.synchronize_param_gather()
