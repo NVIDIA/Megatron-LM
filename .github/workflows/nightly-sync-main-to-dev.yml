@@ -89,7 +89,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.PAT }}
-          direct_prompt: |
+          prompt: |
             You are an automated sync bot. Your job is to merge `main` into `dev`,
             create a PR, ensure all CI tests pass (fixing any failures), and mark
             the PR as ready for review.
