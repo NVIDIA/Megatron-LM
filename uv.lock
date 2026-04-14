@@ -1303,6 +1303,16 @@ wheels = [
 ]
 
 [[package]]
+name = "fast-hadamard-transform"
+version = "1.0.4.post1"
+source = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca#f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
+dependencies = [
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "torch", marker = "sys_platform == 'never' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+]
+
+[[package]]
 name = "fastapi"
 version = "0.135.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2624,6 +2634,7 @@ dev = [
     { name = "datasets", version = "4.8.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "einops" },
     { name = "emerging-optimizers" },
+    { name = "fast-hadamard-transform" },
     { name = "fastapi" },
     { name = "flash-linear-attention" },
     { name = "flashinfer-python" },
@@ -2653,6 +2664,7 @@ lts = [
     { name = "datasets", version = "4.8.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "einops" },
     { name = "emerging-optimizers" },
+    { name = "fast-hadamard-transform" },
     { name = "fastapi" },
     { name = "flashinfer-python" },
     { name = "mamba-ssm" },
@@ -2716,6 +2728,7 @@ linting = [
 ]
 no-pypi-wheels = [
     { name = "emerging-optimizers" },
+    { name = "fast-hadamard-transform" },
     { name = "flash-mla" },
 ]
 test = [
@@ -2749,6 +2762,7 @@ requires-dist = [
     { name = "einops", marker = "extra == 'lts'", specifier = "~=0.8" },
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.2.0" },
     { name = "emerging-optimizers", marker = "extra == 'lts'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.2.0" },
+    { name = "fast-hadamard-transform", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "fastapi", marker = "extra == 'lts'", specifier = "~=0.50" },
     { name = "flash-linear-attention", marker = "extra == 'dev'", specifier = "~=0.4.0" },
