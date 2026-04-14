@@ -451,7 +451,27 @@ if telemetry is not None and telemetry.is_exporting:
 
 ---
 
-## 12. Installation
+## 12. Alternative Backends
+
+Since nemo-lens exports via standard OTLP, you can point traces at any
+OTLP-compatible backend by setting standard OTel SDK environment variables.
+No code changes required.
+
+### W&B Weave
+
+```bash
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://trace.wandb.ai/otel/v1/traces
+export OTEL_EXPORTER_OTLP_TRACES_HEADERS="wandb-api-key=<your-key>"
+export WANDB_ENTITY=my-team
+export WANDB_PROJECT=megatron-training
+```
+
+Any OTLP-compatible backend (Datadog, Grafana Cloud, Honeycomb, etc.) can be
+used the same way — set the endpoint and auth headers via standard OTel env vars.
+
+---
+
+## 13. Installation
 
 ```bash
 # nemo-lens (already in dev/lts extras — provides opentelemetry-api)
