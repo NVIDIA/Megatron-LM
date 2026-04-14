@@ -258,11 +258,7 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     if not hasattr(base_module, "layer_number"):
         return True, True
 
-    # MTP layers have their own numbering separate from the decoder stack.
-    # Treat each one as self-contained so the buffer-reuse logic does not
-    # try to chain them with decoder layers.  Uses getattr rather than
-    # isinstance so it covers both the inner TransformerLayer (is_mtp_layer=True)
-    # and the outer MultiTokenPredictionLayer (is_mtp_layer=True).
+    # MTP layers are self-contained; don't chain them with decoder layers.
     if getattr(base_module, 'is_mtp_layer', False):
         return True, True
 
@@ -1426,8 +1422,12 @@ class CudaGraphManager(torch.nn.Module):
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
         """
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
+        # MTP is only cuda-graphed for inference (forward_single_position).
+        self.is_mtp = isinstance(base_module, MultiTokenPredictionLayer)
 
         if function_name is not None:
             func = getattr(base_module, function_name)
@@ -1493,15 +1493,6 @@ class CudaGraphManager(torch.nn.Module):
                 # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
 
-    @staticmethod
-    def _is_mtp_inference(megatron_module, kwargs):
-        """Check if this call is an MTP layer running under inference mode."""
-        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-
-        return (
-            'inference_context' not in kwargs or not kwargs.get('inference_context')
-        ) and isinstance(megatron_module, MultiTokenPredictionLayer)
-
     def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs):
         '''Returns a valid cudagraph runner for the current forward call.
         The cudagraph corresponding to this call is the first element of 'self.cudagraph_runners'.
@@ -1511,7 +1502,7 @@ class CudaGraphManager(torch.nn.Module):
         over different microbatches by tracking their respective fwd and bwd passes.'''
         if reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
-            is_mtp_inference = self._is_mtp_inference(megatron_module, kwargs)
+            is_mtp_inference = self.is_mtp
             if is_inference_mode:
                 is_static_batching = kwargs['inference_context'].is_static_batching()
                 if is_static_batching:
@@ -1600,7 +1591,7 @@ class CudaGraphManager(torch.nn.Module):
         """
         is_inference_mode = (
             'inference_context' in kwargs.keys() and kwargs['inference_context']
-        ) or self._is_mtp_inference(megatron_module, kwargs)
+        ) or self.is_mtp
         is_in_checkpoint_fwd = is_checkpointing()
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
@@ -1616,8 +1607,21 @@ class CudaGraphManager(torch.nn.Module):
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
+                # MTP must match the main model's eager/graph mode so all EP
+                # ranks take the same code path. Skip during graph capture.
+                if (
+                    self.is_mtp
+                    and not getattr(megatron_module, 'use_mtp_cuda_graphs', False)
+                    and not is_graph_capturing()
+                ):
+                    return self.func(*args, **kwargs)
+
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
+
+                if not runner.fwd_graph_recorded and self.is_mtp and not is_graph_capturing():
+                    # No pre-warmed graph for this batch size — run eagerly.
+                    return self.func(*args, **kwargs)
 
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference

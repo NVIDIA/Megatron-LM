@@ -53,6 +53,12 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.text_generation_controllers.triton_kernels import (
+    mamba_state_selective_copy,
+    prepare_next_forward_pass,
+    rewind_kv_cache,
+    verify_speculative_tokens,
+)
 
 
 # pylint: disable=line-too-long
@@ -175,6 +181,27 @@ class TextGenerationController:
                     [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
                 )
                 * -1
+            )
+            self._accepted_token_counts_per_request = torch.zeros(
+                max_requests, dtype=torch.int64, device=device
+            )
+            self._last_accepted_seq_indices_buf = torch.empty(
+                max_requests, dtype=torch.int64, device=device
+            )
+
+            # Cache values that are constant across inference steps.
+            self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+            self._is_last_pp_stage = is_pipeline_last_stage(self.pp_group)
+            self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+            self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
+            self._num_mtp_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+
+            # Pre-allocate padded buffers for per-depth token/position IDs.
+            self._mtp_token_ids_buf = torch.empty(
+                [1, max_requests], dtype=torch.int64, device=device
+            )
+            self._mtp_position_ids_buf = torch.empty(
+                [1, max_requests], dtype=torch.int64, device=device
             )
 
     @staticmethod
@@ -583,22 +610,30 @@ class TextGenerationController:
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
 
-        # Precompute MTP CUDA graph padded batch size from the already EP-synced
-        # padded_batch_dimensions.  This avoids an extra EP all-reduce on the MTP
-        # hot path — all ranks derive the same value from the matched graph.
+
+        # Derive the MTP padded batch size from the EP-synced graph dimensions.
+        # In eager mode MTP uses locally SP-aligned batch size instead.
         if (
             getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None
             and context.using_cuda_graph_this_step()
         ):
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
-            tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-            sp_enabled = self.model_config.sequence_parallel and tp_size > 1
-            if sp_enabled:
+            if self._sp_enabled:
                 self._mtp_resolved_padded_count += (
-                    tp_size - self._mtp_resolved_padded_count % tp_size
-                ) % tp_size
+                    self._tp_size - self._mtp_resolved_padded_count % self._tp_size
+                ) % self._tp_size
         else:
             self._mtp_resolved_padded_count = None
+
+        # Tell MTP layers whether to use CUDA graphs this step. When the main
+        # model falls back to eager mode, MTP must also run eagerly across all
+        # EP ranks — otherwise some ranks may replay a captured graph while
+        # others run eagerly, causing EP collectives to hang.
+        if getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None:
+            use_mtp_graphs = context.using_cuda_graph_this_step()
+            if hasattr(unwrapped_model, 'mtp'):
+                for layer in unwrapped_model.mtp.layers:
+                    layer.use_mtp_cuda_graphs = use_mtp_graphs
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -719,21 +754,19 @@ class TextGenerationController:
             self._torch_sampling_buckets = [
                 (indices, *sampling_params) for sampling_params, indices in bucket_map.items()
             ]
-            # Pre-compute index tensors on GPU so that _sample_from_logits_2d
-            # (called once per MTP depth) avoids repeated H2D copies.
+            # Pre-compute index tensors on GPU to avoid per-step H2D copies.
             self._torch_sampling_bucket_index_tensors = [
                 torch.tensor(indices, device=device, dtype=torch.long)
                 for indices, *_ in self._torch_sampling_buckets
             ]
 
-    @torch.compile()
     def _rewind_kv_cache(self) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
 
         After forward pass with speculative tokens, some tokens may be rejected.
         This function "rewinds" the KV cache bookkeeping to reflect only the accepted
-        tokens. All operations use fixed-shape tensors (no data-dependent branches,
-        no boolean indexing, no torch.nonzero) so the entire function is torch-compilable.
+        tokens. The core bookkeeping is handled by a Triton kernel (one thread per
+        request). Mamba hybrid-model state updates remain in PyTorch.
 
         Returns (blocks_to_release, remove_mask) for the caller to release blocks
         back to the allocator outside the compiled graph.
@@ -750,72 +783,40 @@ class TextGenerationController:
         request_kv_block_counts = context.request_kv_block_counts[active_request_slice]
         request_last_kv_block_id = context.request_last_kv_block_id[active_request_slice]
         request_to_kv_block_ids = context.request_to_kv_block_ids[active_request_slice]
-        block_size_tokens = context.block_size_tokens
 
-        num_tokens_to_rewind = self.num_speculative_tokens - accepted_tokens_per_request
-
-        # Zero out rewind for prefill requests (no data-dependent branch)
-        num_tokens_to_rewind = torch.where(request_in_prefill_status == 1, 0, num_tokens_to_rewind)
-
-        original_offset = request_last_kv_block_offset.clone()
-        remove_mask = (original_offset - num_tokens_to_rewind) < 0
-
-        # Update offsets
-        request_last_kv_block_offset.copy_(
-            (original_offset - num_tokens_to_rewind) % block_size_tokens
-        )
-        request_kv_length_offsets -= num_tokens_to_rewind
-
-        # Save current last block IDs before modifications (blocks to potentially release)
-        blocks_to_release = request_last_kv_block_id.clone()
-
-        # Conditionally decrement block counts where block boundary is crossed
-        request_kv_block_counts -= remove_mask.to(request_kv_block_counts.dtype)
-
-        # Get previous block IDs using gather (for requests crossing block boundary).
-        # For requests not crossing, the gathered value is unused (discarded by torch.where).
-        prev_block_idx = torch.clamp(request_kv_block_counts - 1, min=0)
-        prev_block_ids = request_to_kv_block_ids.gather(1, prev_block_idx.unsqueeze(1)).squeeze(1)
-
-        # Conditionally update last block ID to point to previous block
-        request_last_kv_block_id.copy_(
-            torch.where(remove_mask, prev_block_ids, request_last_kv_block_id)
+        # --- Triton kernel: core KV-cache rewind ---
+        blocks_to_release, remove_mask = rewind_kv_cache(
+            accepted_counts=accepted_tokens_per_request,
+            prefill_status=request_in_prefill_status,
+            last_kv_block_offset=request_last_kv_block_offset,
+            kv_length_offsets=request_kv_length_offsets,
+            kv_block_counts=request_kv_block_counts,
+            last_kv_block_id=request_last_kv_block_id,
+            kv_block_ids=request_to_kv_block_ids,
+            num_speculative_tokens=self.num_speculative_tokens,
+            block_size_tokens=context.block_size_tokens,
         )
 
-        # Clear released block entries using scatter.
-        # For requests crossing boundary: write -1 at index new_block_count.
-        # For others: write back the existing value (no-op).
-        scatter_idx = torch.clamp(request_kv_block_counts, max=request_to_kv_block_ids.shape[1] - 1)
-        current_vals = request_to_kv_block_ids.gather(1, scatter_idx.unsqueeze(1)).squeeze(1)
-        clear_vals = torch.where(remove_mask, -1, current_vals)
-        request_to_kv_block_ids.scatter_(1, scatter_idx.unsqueeze(1), clear_vals.unsqueeze(1))
-
-        # Mamba speculative rewind state update.
+        # Mamba speculative rewind: copy accepted intermediate states in-place.
         if context.is_hybrid_model:
             mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
             ]
-            is_decode_mask = request_in_prefill_status == 0  # [N]
-
-            # Gather intermediate states for ALL active requests using fixed-shape
-            # advanced indexing (no boolean indexing / dynamic shapes).
-            # For prefill requests the gathered values are discarded by torch.where.
-            intermediate_conv = context.mamba_intermediate_conv_states[
-                :, mamba_state_idx, accepted_tokens_per_request
-            ]  # [L, N, *conv_shape]
-            current_conv = context.mamba_conv_states[:, mamba_state_idx]  # [L, N, *conv_shape]
-            conv_mask = is_decode_mask.reshape(1, -1, *([1] * (intermediate_conv.ndim - 2)))
-            context.mamba_conv_states[:, mamba_state_idx] = torch.where(
-                conv_mask, intermediate_conv, current_conv
+            mamba_state_selective_copy(
+                intermediate_states=context.mamba_intermediate_conv_states,
+                current_states=context.mamba_conv_states,
+                prefill_status=request_in_prefill_status,
+                state_idx=mamba_state_idx,
+                accepted_counts=accepted_tokens_per_request,
+                num_layers=context.num_mamba_layers,
             )
-
-            intermediate_ssm = context.mamba_intermediate_ssm_states[
-                :, mamba_state_idx, accepted_tokens_per_request
-            ]  # [L, N, *ssm_shape]
-            current_ssm = context.mamba_ssm_states[:, mamba_state_idx]  # [L, N, *ssm_shape]
-            ssm_mask = is_decode_mask.reshape(1, -1, *([1] * (intermediate_ssm.ndim - 2)))
-            context.mamba_ssm_states[:, mamba_state_idx] = torch.where(
-                ssm_mask, intermediate_ssm, current_ssm
+            mamba_state_selective_copy(
+                intermediate_states=context.mamba_intermediate_ssm_states,
+                current_states=context.mamba_ssm_states,
+                prefill_status=request_in_prefill_status,
+                state_idx=mamba_state_idx,
+                accepted_counts=accepted_tokens_per_request,
+                num_layers=context.num_mamba_layers,
             )
 
         return blocks_to_release, remove_mask
@@ -859,10 +860,10 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
 
-        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        unwrapped_model = self._unwrapped_model
 
         # On non-last pipeline stages, the model won't have decoder hidden states.
-        has_mtp = is_pipeline_last_stage(self.pp_group) and hasattr(
+        has_mtp = self._is_last_pp_stage and hasattr(
             unwrapped_model, '_decoder_hidden_states_cache'
         )
 
@@ -873,7 +874,7 @@ class TextGenerationController:
             # When SP is active the decoder output is in scattered format
             # [S/TP, B, H], but _last_accepted_seq_indices are indices into
             # the full (gathered) sequence.
-            if self.model_config.sequence_parallel:
+            if self._sp_enabled:
                 hidden_states = gather_from_sequence_parallel_region(
                     hidden_states, group=self.inference_wrapped_model.tp_group
                 )
@@ -888,21 +889,23 @@ class TextGenerationController:
         # The next position to predict starts at that cache length.
         adjusted_offsets = context.request_kv_length_offsets[active_slice]
         processed_tokens = context.request_query_lengths[active_slice]
-        base_position = adjusted_offsets + processed_tokens
+        # Cast to int64 to match CUDA graph capture dtype expectations.
+        base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
         # Start with the freshly sampled base token.
         next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
         current_hidden = last_accepted_hidden if has_mtp else None
 
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
-        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
+            # CUDA-graph path: use the EP-synced padded count.
             padded_count = self._mtp_resolved_padded_count
-        elif sp_enabled:
-            padded_count = (
-                active_request_count + (tp_size - active_request_count % tp_size) % tp_size
-            )
+            assert not self._sp_enabled or padded_count % self._tp_size == 0
+        elif has_mtp:
+            # Eager path: pad only for SP alignment.
+            padded_count = active_request_count
+            if self._sp_enabled:
+                padded_count += (self._tp_size - padded_count % self._tp_size) % self._tp_size
         else:
             padded_count = active_request_count
         pad_count = padded_count - active_request_count
@@ -911,35 +914,33 @@ class TextGenerationController:
         if has_mtp:
             if pad_count > 0:
                 current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
-            if sp_enabled:
+            if self._sp_enabled:
                 current_hidden = scatter_to_sequence_parallel_region(
                     current_hidden, group=self.inference_wrapped_model.tp_group
                 )
 
-        num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+        token_ids_buf = self._mtp_token_ids_buf[:, :padded_count]
+        position_ids_buf = self._mtp_position_ids_buf[:, :padded_count]
+
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
-        for depth in range(num_depths):
+        for depth in range(self._num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
-            position_ids = (base_position + depth).unsqueeze(0)  # [1, active_request_count]
-            token_ids = next_token_ids.unsqueeze(0)  # [1, active_request_count]
+
+            token_ids_buf[0, :active_request_count] = next_token_ids
+            position_ids_buf[0, :active_request_count] = base_position + depth
 
             mtp_logits_2d = None
             if has_mtp:
-                # Pad token_ids and position_ids each iteration (they change per depth).
-                if pad_count > 0:
-                    token_ids = F.pad(token_ids, (0, pad_count))
-                    position_ids = F.pad(position_ids, (0, pad_count))
-
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
-                    next_token_ids=token_ids,
-                    position_ids=position_ids,
+                    next_token_ids=token_ids_buf,
+                    position_ids=position_ids_buf,
                     depth=depth,
                 )
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
-                # Strip padding from logits only.  Hidden states stay padded+SP
+                # Strip padding from logits only. Hidden states stay padded+SP
                 # between depths to avoid redundant gather/scatter round-trips.
                 if pad_count > 0:
                     mtp_logits = mtp_logits[:active_request_count]
@@ -1026,7 +1027,6 @@ class TextGenerationController:
 
         return output_tokens, repeats
 
-    @torch.compile()
     def _verify_speculative_tokens(
         self,
         output_tokens: Tensor,
@@ -1035,51 +1035,14 @@ class TextGenerationController:
         num_prefill_requests: int,
         active_request_count: int,
     ) -> tuple:
-        """Verify speculative tokens against input tokens without data-dependent graph breaks."""
-        if input_tokens_required.ndim == 2:
-            input_tokens_required = input_tokens_required.squeeze(0)
-
-        device = input_tokens_required.device
-
-        # Initialize mask functionally
-        accepted_tokens_mask = torch.zeros_like(input_tokens_required, dtype=torch.bool)
-
-        decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
-        last_one_indices = torch.full((active_request_count,), -1, device=device, dtype=torch.long)
-
-        # Vectorized decode token verification
-        decode_inputs = input_tokens_required[:decode_len].view(
-            num_decode_requests, self.num_speculative_tokens + 1
+        """Verify speculative tokens against input tokens (Triton kernel)."""
+        return verify_speculative_tokens(
+            input_tokens=input_tokens_required,
+            output_tokens=output_tokens,
+            num_decode_requests=num_decode_requests,
+            num_prefill_requests=num_prefill_requests,
+            num_speculative_tokens=self.num_speculative_tokens,
         )
-        decode_outputs = output_tokens[:decode_len].view(
-            num_decode_requests, self.num_speculative_tokens + 1
-        )
-        decode_outputs_shifted = decode_outputs.roll(1, dims=1)
-
-        # Functionally build the mask: The first token (base token) is always accepted
-        first_col_true = torch.ones_like(decode_inputs[:, :1], dtype=torch.bool)
-        rest_cols = decode_inputs[:, 1:] == decode_outputs_shifted[:, 1:]
-        decode_mask_2d = torch.cat([first_col_true, rest_cols], dim=1)
-
-        # Enforce consecutive acceptance: cummin propagates False to the right
-        decode_mask_2d = decode_mask_2d.cummin(dim=1).values
-        accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
-
-        # All prefill tokens are accepted
-        accepted_tokens_mask[decode_len:] = True
-
-        # Compute last accepted indices for decode requests
-        local_last_indices = decode_mask_2d.sum(dim=1) - 1
-        row_offsets = torch.arange(num_decode_requests, device=device) * (
-            self.num_speculative_tokens + 1
-        )
-        last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
-
-        # Compute last accepted indices for prefill requests mathematically instead of using torch.nonzero
-        prefill_valid = decode_len + torch.arange(num_prefill_requests, device=device)
-        last_one_indices[num_decode_requests:] = prefill_valid
-
-        return last_one_indices, accepted_tokens_mask, input_tokens_required
 
     def _dynamic_step_sample_logits_and_verify_tokens(self, logits: Tensor, input_ids: Tensor):
         """
@@ -1142,7 +1105,6 @@ class TextGenerationController:
         )
         nvtx_range_pop("mtp-spec-decoding/verify/prepare-next")
 
-    @torch.compile()
     def _prepare_speculative_tokens_for_next_forward_pass(
         self,
         num_decode_requests: int,
@@ -1152,37 +1114,32 @@ class TextGenerationController:
         accepted_tokens_mask: torch.Tensor,
         input_tokens_required: torch.Tensor,
     ):
-        # Store the final sampled tokens for the next forward pass.
-        final_sampled_tokens = output_tokens[last_one_indices]
-        self._sampled_tokens_cuda[: len(final_sampled_tokens)] = final_sampled_tokens
+        """Prepare accepted speculative tokens for the next forward pass (Triton kernel).
 
-        # Store the last accepted positions in the packed sequence for serial
-        # MTP computation after verification.
-        self._last_accepted_seq_indices = required_logit_indices[last_one_indices]
-
-        # Extract accepted tokens and counts for decode requests.
-        # For prefill it is always set to 1. For decode, the first token is always accepted,
-        # then we compare with input tokens and accept the next tokens if its a match.
-        #
-        # Example (continuing from above):
-        #   input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]
-        #   Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
-        #   Accepted tokens                     [   [a6s  -1]  |     [b4s  b5s]    |     [-1  -1]      ]  # Only decode requests (prefill defaults to -1)
-        #   Accepted token counts               [      1       |         2         |         0         ]  # Prefill defaults to 0
-        input_tokens_required[accepted_tokens_mask == 0] = -1  # Mask out non-accepted tokens
-        input_tokens_decode_mode = input_tokens_required[
-            : num_decode_requests * (self.num_speculative_tokens + 1)
-        ]
-        input_tokens_reshaped = input_tokens_decode_mode.reshape(
-            -1, self.num_speculative_tokens + 1
-        )  # shape: [num_decode_requests, num_speculative_tokens + 1]
-
-        # Skip the first token of every decode request (i.e a5, b3, c6)
-        accepted_tokens = input_tokens_reshaped[:, 1:]
-        self._accepted_tokens_per_request[: accepted_tokens.shape[0], :] = accepted_tokens
-        self._accepted_token_counts_per_request = (self._accepted_tokens_per_request != -1).sum(
-            dim=1
+        Example:
+          input_tokens_required:  [ a5  a6s  a7s |  b3   b4s  b5s  |  c6  c7s  c8s  |  d2  |  e4  ]
+          Accepted tokens mask    [  1   1    0  |  1     1    1   |   1   0    0   |   1  |   1  ]
+          Accepted tokens         [ [a6s  -1] | [b4s  b5s] | [-1  -1] ]  (decode only; prefill → -1)
+          Accepted token counts   [     1     |      2     |     0    ]  (prefill defaults to 0)
+        """
+        active_request_count = last_one_indices.shape[0]
+        prepare_next_forward_pass(
+            num_decode_requests=num_decode_requests,
+            output_tokens=output_tokens,
+            required_logit_indices=required_logit_indices,
+            last_one_indices=last_one_indices,
+            accepted_tokens_mask=accepted_tokens_mask,
+            input_tokens=input_tokens_required,
+            sampled_tokens_buf=self._sampled_tokens_cuda,
+            last_accepted_seq_buf=self._last_accepted_seq_indices_buf,
+            accepted_tokens_per_request=self._accepted_tokens_per_request,
+            accepted_token_counts=self._accepted_token_counts_per_request,
+            num_speculative_tokens=self.num_speculative_tokens,
         )
+        # Expose the active slice so downstream code sees the right length.
+        self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[
+            :active_request_count
+        ]
 
     def _dynamic_step_sample_logits(self, logits: Tensor):
         """Sample tokens from logits for dynamic batching.
@@ -1701,10 +1658,9 @@ class TextGenerationController:
         if self.model_config.expert_model_parallel_size <= 1:
             return
 
-        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        unwrapped_model = self._unwrapped_model
 
-        is_last_stage = is_pipeline_last_stage(self.pp_group)
-        has_mtp = is_last_stage and hasattr(unwrapped_model, '_decoder_hidden_states_cache')
+        has_mtp = self._is_last_pp_stage and hasattr(unwrapped_model, '_decoder_hidden_states_cache')
         if not has_mtp and not self.model_is_pipeline_parallel:
             # No MTP on this rank and no PP broadcast to participate in.
             return
@@ -1712,31 +1668,28 @@ class TextGenerationController:
         device = torch.cuda.current_device()
         dtype = self.model_config.params_dtype
         hidden_size = self.model_config.hidden_size
-        num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
 
         # Use precomputed MTP CUDA graph batch size when available;
         # otherwise use minimal SP-compatible size.
-        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
             padded_count = self._mtp_resolved_padded_count
+            assert not self._sp_enabled or padded_count % self._tp_size == 0
         else:
-            padded_count = tp_size if sp_enabled else 1
+            assert not has_mtp
 
         dummy_hidden = None
         if has_mtp:
-            # Minimal dummy tensors — just enough to drive the MTP layer forward
+            # Minimal dummy tensors to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
-            # Depth 0 uses full-format hidden; subsequent depths use SP format.
             dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
-            if sp_enabled:
+            if self._sp_enabled:
                 dummy_hidden = scatter_to_sequence_parallel_region(
                     dummy_hidden, group=self.inference_wrapped_model.tp_group
                 )
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
-        for depth in range(num_depths):
+        for depth in range(self._num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
@@ -1903,23 +1856,24 @@ class TextGenerationController:
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
-                # Release blocks back to the allocator (not compilable due to
-                # allocator state mutation). release_memory_blocks handles
-                # empty tensors.
-                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs
                 # are active (the graphs were captured with padding enabled).
                 if self.model_config.moe_pad_experts_for_cuda_graph_inference:
                     if not context.using_cuda_graph_this_step():
-                        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-                        set_decode_expert_padding(unwrapped_model, False)
+                        set_decode_expert_padding(self._unwrapped_model, False)
 
                 # Phase 3: Compute MTP serially with correct (verified) inputs.
                 nvtx_range_push("mtp-spec-decoding/serial-mtp")
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
+
+                # Phase 4: Release freed blocks. Deferred from Phase 2 so the
+                # data-dependent boolean-mask sync overlaps with MTP GPU work.
+                context.kv_block_allocator.release_memory_blocks(
+                    blocks_to_release[remove_mask]
+                )
             else:
                 self._dynamic_step_sample_logits(logits)
 

@@ -429,17 +429,10 @@ class DynamicInferenceEngine(AbstractEngine):
     def _create_mtp_cuda_graphs(self, controller, context):
         """Capture CUDA graphs for MTP layers used in speculative decoding.
 
-        Derives the set of MTP batch sizes from the decoder CUDA graph batch dimensions
-        (decode-only entries), then runs a single ``compute_mtp_single_step`` per
-        batch size to trigger graph capture.  Each ``MultiTokenPredictionLayer``
-        already has a ``CudaGraphManager`` wrapping ``forward_single_position``
-        (created in ``__init__``), so the full MTP forward (embedding lookup,
-        projection, transformer layer, and final layernorm) is captured in a
-        single graph.
-
-        With ``mtp_use_repeated_layer`` (the common case) one call covers every
-        depth; with unique layers the remaining depths will capture lazily on
-        first real inference call.
+        Derives the set of MTP batch sizes from the decoder CUDA graph batch
+        dimensions, then runs ``compute_mtp_single_step`` per batch size to
+        trigger graph capture. With ``mtp_use_repeated_layer`` one call covers
+        every depth; with unique layers the remaining depths capture lazily.
         """
         num_mtp_heads = controller.num_mtp_heads
         num_spec_tokens = controller.num_speculative_tokens or 0
@@ -457,7 +450,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if model_config.cuda_graph_impl != "local":
             return
 
-        # Collect batch sizes from all graph dimensions.  MTP serial forward
+        # Collect batch sizes from all graph dimensions. MTP serial forward
         # runs on all active requests (decode + prefill), so we need graphs
         # for total request counts, not just decode-only counts.
         tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
@@ -489,6 +482,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_batch_sizes))
 
+        from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
+
+        _set_capture_start()
         for batch_size in sorted(mtp_batch_sizes):
             dummy_hidden = torch.zeros((batch_size, 1, hidden_size), device=device, dtype=dtype)
             if sp_enabled:
@@ -500,7 +496,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     dummy_hidden, group=controller.inference_wrapped_model.tp_group
                 )
             dummy_token_ids = torch.zeros((1, batch_size), device=device, dtype=torch.long)
-            dummy_position_ids = torch.zeros((1, batch_size), device=device, dtype=torch.int32)
+            dummy_position_ids = torch.zeros((1, batch_size), device=device, dtype=torch.int64)
 
             # One call per batch size; depth=0 warms the shared layer (repeated
             # mode) or the first unique layer (non-repeated mode).
@@ -510,6 +506,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 position_ids=dummy_position_ids,
                 depth=0,
             )
+        _set_capture_end()
 
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(model)
