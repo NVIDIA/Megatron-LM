@@ -202,7 +202,6 @@ class TestGatedDeltaNet:
         assert g.shape == alpha.shape
         assert beta_sig.shape == beta.shape
 
-
         gdn = self.gdn
         batch = 2
         seq_len = 16

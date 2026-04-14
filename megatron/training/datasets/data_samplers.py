@@ -11,7 +11,6 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
@@ -37,8 +36,16 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
-    micro_batch_size = getattr(args, 'eval_micro_batch_size', args.micro_batch_size) if is_eval else args.micro_batch_size
-    global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
+    micro_batch_size = (
+        getattr(args, 'eval_micro_batch_size', args.micro_batch_size)
+        if is_eval
+        else args.micro_batch_size
+    )
+    global_batch_size = (
+        getattr(args, 'eval_global_batch_size', args.global_batch_size)
+        if is_eval
+        else args.global_batch_size
+    )
 
     if split == Split.valid and args.full_validation:
         batch_sampler = MegatronPretrainingSampler(
@@ -56,7 +63,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 micro_batch_size=micro_batch_size,
                 global_batch_size=global_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+            )
         else:
             # Megatron sampler
             batch_sampler = MegatronPretrainingSampler(
@@ -64,7 +72,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 consumed_samples=consumed_samples,
                 micro_batch_size=micro_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+            )
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
@@ -97,12 +106,10 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         if args.exit_signal_handler:
             DistributedSignalHandler(args.exit_signal).__enter__()
 
-    maybe_worker_init_fn = (
-        worker_init_fn if args.num_workers > 0 else None
-    )
+    maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
     # Torch dataloader.
     if args.dynamic_context_parallel:
-        extra_kwargs = {"collate_fn": lambda x: x,}
+        extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
     return torch.utils.data.DataLoader(
@@ -114,6 +121,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         worker_init_fn=maybe_worker_init_fn,
         **extra_kwargs,
     )
+
 
 class MegatronPretrainingSampler:
     """
@@ -183,6 +191,7 @@ class MegatronPretrainingSampler:
         if len(batch) > 0 and not self.drop_last:
             start_idx, end_idx = self.get_start_end_idx()
             yield batch[start_idx:end_idx]
+
 
 class RandomSeedDataset(Dataset):
     """

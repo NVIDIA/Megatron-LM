@@ -210,6 +210,7 @@ def _compile_dependencies():
 
     torch.distributed.barrier()
 
+
 def _initialize_tp_communicators():
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
     communication overlap"""
