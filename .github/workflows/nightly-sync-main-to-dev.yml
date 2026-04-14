@@ -97,10 +97,12 @@ jobs:
             **CRITICAL: Your exit condition is running `gh pr ready`.**
             You are NOT done until you have run `gh pr ready <PR_NUMBER>`.
             That command is in Phase 4. You cannot reach Phase 4 until CI
-            finishes. CI takes 1-2 hours. You must poll it with `sleep`
-            and `gh api` calls in a loop until every job completes. Do NOT
-            exit after creating the PR or triggering CI — that is only
-            Phase 2 out of 4. You have 1000 turns and 6 hours. Use them.
+            finishes. CI takes 1-2 hours. You must poll it using a Bash
+            `while` loop with `sleep 120` between iterations — do NOT use
+            ScheduleWakeup or any deferred/async mechanism. ScheduleWakeup
+            will silently end your session. Stay in a synchronous loop.
+            Do NOT exit after creating the PR or triggering CI — that is
+            only Phase 2 out of 4. You have 1000 turns and 6 hours.
 
             REPO: ${{ github.repository }}
             BRANCH: ${{ steps.vars.outputs.branch }}
@@ -230,9 +232,17 @@ jobs:
             2. Find the CI run: use `gh run list` with `--json` and filter
                for `headBranch == "pull-request/<PR_NUMBER>"` (note: `gh run
                list` does not support a `--branch` flag).
-            3. **Poll for failures every 2 minutes — do NOT wait for the
-               full run to complete.** Use:
-               `gh api repos/$REPO/actions/runs/<RUN_ID>/jobs?per_page=100`
+            3. **Poll for failures every 2 minutes using a Bash while-loop
+               with `sleep 120`.** Do NOT use ScheduleWakeup — it will end
+               your session. Write a synchronous polling loop like:
+               ```
+               while true; do
+                 JOBS=$(gh api repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100)
+                 # check for failures and completion
+                 sleep 120
+               done
+               ```
+               Use `gh api repos/$REPO/actions/runs/<RUN_ID>/jobs?per_page=100`
                and check for jobs with `conclusion == "failure"`.
                As soon as you see ANY failed job, immediately investigate it
                (see step 5). Do not wait for remaining jobs — they will keep
