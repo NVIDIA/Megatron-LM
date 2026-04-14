@@ -66,5 +66,5 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --log-overload-factor: true
+  --log-moe-overload-factor: true
 TEST_TYPE: ckpt-resume
