@@ -1614,7 +1614,13 @@ class CudaGraphManager(torch.nn.Module):
             if is_inference_mode:
                 # When the main model is in eager mode, MTP must also run
                 # eagerly so that all EP ranks take the same code path.
-                if self.is_mtp and not getattr(megatron_module, 'use_mtp_cuda_graphs', False):
+                # Skip this guard during graph capturing (warmup) since the
+                # attribute is only set at runtime by the controller.
+                if (
+                    self.is_mtp
+                    and not getattr(megatron_module, 'use_mtp_cuda_graphs', False)
+                    and not is_graph_capturing()
+                ):
                     return self.func(*args, **kwargs)
 
                 # Inference generation mode creates graphs immediately
