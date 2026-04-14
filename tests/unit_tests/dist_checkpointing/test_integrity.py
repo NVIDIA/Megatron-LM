@@ -6,13 +6,12 @@ import pytest
 import torch
 from pathlib import Path
 
-from megatron.core.dist_checkpointing import (
-    ShardedTensor,
-    load,
-    save,
-)
+from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.core import CheckpointingException
-from megatron.core.dist_checkpointing.validation import save_integrity_manifest, verify_integrity_manifest
+from megatron.core.dist_checkpointing.validation import (
+    save_integrity_manifest,
+    verify_integrity_manifest,
+)
 
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -33,7 +32,7 @@ class TestIntegrity:
         load_state_dict = {
             'sd_keyA': ShardedTensor.from_rank_offsets(
                 'keyA', torch.empty(1, 1), replica_id=Utils.rank
-            ),
+            )
         }
 
         with TempNamedDir(
@@ -52,7 +51,7 @@ class TestIntegrity:
                 assert len(data["files"]["common.pt"]) == 64
 
             loaded_state_dict = load(load_state_dict, ckpt_dir, verify_integrity=True)
-    
+
     def test_save_verify_integrity_manifest_directly(self, tmp_path_dist_ckpt):
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_directly', sync=True
@@ -74,7 +73,7 @@ class TestIntegrity:
                 assert len(data["files"]["metadata.json"]) == 64
 
             verify_integrity_manifest(ckpt_dir)
-    
+
     def test_save_verify_integrity_manifest_error(self, tmp_path_dist_ckpt):
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_error', sync=True
@@ -102,7 +101,7 @@ class TestIntegrity:
             with open(metadata_file, "w") as f:
                 data = {"test_metadata": 11}
                 json.dump(data, f)
-            
+
             # CheckpointingException, no integrity.json file
             os.remove(Path(ckpt_dir / "integrity.json"))
             with pytest.raises(CheckpointingException):

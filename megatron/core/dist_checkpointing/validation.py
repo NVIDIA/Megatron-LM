@@ -546,9 +546,7 @@ def save_integrity_manifest(checkpoint_dir: str) -> None:
         with open(integrity_path, 'w') as f:
             json.dump(payload, f, indent=2)
 
-    logger.debug(
-        "Saved integrity manifest with %d file(s) to %s", len(manifest), integrity_path
-    )
+    logger.info("Saved integrity manifest with %d file(s) to %s", len(manifest), integrity_path)
 
 
 def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
@@ -613,9 +611,7 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
             f'file(s) in {checkpoint_dir}:\n' + '\n'.join(mismatches)
         )
 
-    logger.info(
-        "Checkpoint integrity verified: %d file(s) OK in %s", len(manifest), checkpoint_dir
-    )
+    logger.info("Checkpoint integrity verified: %d file(s) OK in %s", len(manifest), checkpoint_dir)
 
 
 def verify_integrity_manifest(checkpoint_dir: str) -> None:
