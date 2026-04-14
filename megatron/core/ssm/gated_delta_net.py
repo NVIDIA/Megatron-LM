@@ -178,8 +178,10 @@ class GatedDeltaNet(MegatronModule):
             dtype=config.params_dtype,
         )
         setattr(self.conv1d.weight, "tensor_model_parallel", True)
+        setattr(self.conv1d.weight, "partition_dim", 0)
         if conv_bias:
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
+            setattr(self.conv1d.bias, "partition_dim", 0)
 
         # Time step projection (discretization)
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
@@ -192,6 +194,7 @@ class GatedDeltaNet(MegatronModule):
             )
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
+        setattr(self.dt_bias, "partition_dim", 0)
         # A_log parameter
         self.A_log = nn.Parameter(
             torch.empty(
@@ -201,6 +204,7 @@ class GatedDeltaNet(MegatronModule):
             )
         )
         setattr(self.A_log, "tensor_model_parallel", True)
+        setattr(self.A_log, "partition_dim", 0)
 
         if self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
@@ -930,9 +934,9 @@ def torch_chunk_gated_delta_rule(
     Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
     '''
 
-    assert cu_seqlens is None, (
-        "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
-    )
+    assert (
+        cu_seqlens is None
+    ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
 
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
