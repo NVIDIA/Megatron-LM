@@ -98,6 +98,7 @@ keywords, individual group names, or a mix.
 | `forward_backward` | `megatron.forward_backward` | every iteration |
 | `optimizer` | `megatron.optimizer_step` | every iteration |
 | `microbatch` | `megatron.microbatch.forward`, `megatron.microbatch.backward` | every microbatch |
+| `layer` | `megatron.layer.forward`, `megatron.layer.self_attention`, `megatron.layer.mlp` | every layer per microbatch |
 | `communication` | `megatron.p2p.{recv,send}_{forward,backward}`, `megatron.grad_sync.{start,finish}` | every iteration |
 | `activation_offload` | `megatron.activation.offload`, `megatron.activation.reload` | every microbatch |
 | `data_loading` | (reserved for future use) | every iteration |
@@ -133,6 +134,9 @@ megatron.pretrain                                    # job
         ├── megatron.train_step                      # step
         │     ├── megatron.forward_backward          # forward_backward
         │     │     ├── megatron.microbatch.forward   # microbatch (×N)
+        │     │     │     └── megatron.layer.forward  # layer (×L per microbatch)
+        │     │     │           ├── megatron.layer.self_attention
+        │     │     │           └── megatron.layer.mlp
         │     │     ├── megatron.microbatch.backward  # microbatch (×N)
         │     │     ├── megatron.p2p.recv_forward     # communication
         │     │     ├── megatron.p2p.send_forward     # communication
