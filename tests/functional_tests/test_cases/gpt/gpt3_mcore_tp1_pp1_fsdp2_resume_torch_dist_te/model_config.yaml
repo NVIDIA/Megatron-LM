@@ -21,9 +21,9 @@ MODEL_ARGS:
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.00015
@@ -42,7 +42,6 @@ MODEL_ARGS:
   --use-torch-fsdp2: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
-  --no-async-tensor-model-parallel-allreduce: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
@@ -52,4 +51,6 @@ MODEL_ARGS:
   --fp16: true
   --apply-query-key-layer-scaling: true
   --log-memory-to-tensorboard: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: ckpt-resume

@@ -2,6 +2,7 @@
 import warnings
 from typing import Optional, Union
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import (
     BackendSpecProvider,
@@ -14,6 +15,7 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
+    FusedMLASelfAttention,
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
@@ -39,15 +41,11 @@ from megatron.core.transformer.transformer_layer import (
 from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import is_te_min_version
 
-try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TEFusedMLP, TENorm, TESpecProvider = None, None, None
 
 try:
     from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
@@ -184,6 +182,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_te_activation_func: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    mla_down_proj_fusion: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -198,6 +197,9 @@ def get_gpt_layer_with_transformer_engine_submodules(
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
+        mla_down_proj_fusion (bool, optional): Enable fused q/kv down-projection and fused input
+                                               layernorm when backend supports. Otherwise fall back
+                                               to the unfused MLA.
 
     Returns:
         TransformerLayerSubmodules: TE modules to construct a TransformerLayer
@@ -243,6 +245,45 @@ def get_gpt_layer_with_transformer_engine_submodules(
             if qk_layernorm
             else backend.column_parallel_linear()
         )
+
+        if mla_down_proj_fusion:
+            fuse_input_layernorm = backend.column_parallel_layer_norm_linear() is not None
+            input_layernorm = IdentityOp if fuse_input_layernorm else backend.layer_norm()
+            down_proj_linear = (
+                backend.column_parallel_layer_norm_linear()
+                if fuse_input_layernorm
+                else backend.linear()
+            )
+            return TransformerLayerSubmodules(
+                input_layernorm=input_layernorm,
+                self_attention=ModuleSpec(
+                    module=FusedMLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=backend.column_parallel_linear(),
+                        linear_qkv_down_proj=down_proj_linear,
+                        linear_q_up_proj=linear_q_up_proj,
+                        linear_kv_up_proj=linear_kv_up_proj,
+                        core_attention=backend.core_attention(),
+                        linear_proj=backend.row_parallel_linear(),
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map=(
+                    {
+                        "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+                        "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+                        "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+                    }
+                    if fuse_input_layernorm
+                    else {}
+                ),
+            )
         return TransformerLayerSubmodules(
             input_layernorm=backend.layer_norm(has_residual=True),
             self_attention=ModuleSpec(
@@ -526,6 +567,7 @@ def get_gpt_decoder_layer_specs(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -537,6 +579,7 @@ def get_gpt_decoder_layer_specs(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
