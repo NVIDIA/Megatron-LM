@@ -300,7 +300,7 @@ class TestMTPCudaGraphInference:
 
         # Warmup MTP CUDA graphs for the padded count.
         self._warmup_mtp_graphs(model, [padded_count], sp_enabled=True)
-        ctrl._mtp_cuda_graph_batch_sizes = [padded_count]
+        ctrl._has_mtp_cuda_graphs = True
 
         # Set up context state.
         ctx.total_request_count = active_request_count
@@ -390,7 +390,7 @@ class TestMTPCudaGraphInference:
 
             if use_cuda_graph:
                 self._warmup_mtp_graphs(model, [padded_count], sp_enabled=True)
-                ctrl._mtp_cuda_graph_batch_sizes = [padded_count]
+                ctrl._has_mtp_cuda_graphs = True
                 ctrl._mtp_resolved_padded_count = padded_count
                 self._set_mtp_cuda_graph_flag(model, True)
             else:

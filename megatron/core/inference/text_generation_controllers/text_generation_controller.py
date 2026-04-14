@@ -613,7 +613,7 @@ class TextGenerationController:
         # Derive the MTP padded batch size from the EP-synced graph dimensions.
         # In eager mode MTP uses locally SP-aligned batch size instead.
         if (
-            getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None
+            getattr(self, '_has_mtp_cuda_graphs', False)
             and context.using_cuda_graph_this_step()
         ):
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
@@ -628,7 +628,7 @@ class TextGenerationController:
         # model falls back to eager mode, MTP must also run eagerly across all
         # EP ranks — otherwise some ranks may replay a captured graph while
         # others run eagerly, causing EP collectives to hang.
-        if getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None:
+        if getattr(self, '_has_mtp_cuda_graphs', False):
             use_mtp_graphs = context.using_cuda_graph_this_step()
             if hasattr(unwrapped_model, 'mtp'):
                 for layer in unwrapped_model.mtp.layers:
@@ -1675,8 +1675,9 @@ class TextGenerationController:
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
             padded_count = self._mtp_resolved_padded_count
             assert not self._sp_enabled or padded_count % self._tp_size == 0
-        else:
-            assert not has_mtp
+        elif has_mtp:
+            # Eager path: use TP-aligned minimum size for dummy tensors.
+            padded_count = self._tp_size if self._sp_enabled else 1
 
         dummy_hidden = None
         if has_mtp:

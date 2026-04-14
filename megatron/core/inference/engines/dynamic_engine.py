@@ -465,8 +465,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if not mtp_batch_sizes:
             return
 
-        # Store sorted batch sizes on the controller for runtime padding lookup.
-        controller._mtp_cuda_graph_batch_sizes = sorted(mtp_batch_sizes)
+        # Flag that MTP CUDA graphs are available. The actual padded count is
+        # re-derived at runtime from padded_batch_dimensions.req_count.
+        controller._has_mtp_cuda_graphs = True
 
         device = torch.cuda.current_device()
         dtype = model_config.params_dtype
