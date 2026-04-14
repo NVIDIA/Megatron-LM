@@ -285,9 +285,7 @@ class MoEOverloadFactorTracker:
         return tp_ep_overload, device
 
     def _expt_dp_reduce_overload(
-        self,
-        tp_ep_overload: torch.Tensor,
-        expt_dp_group: Optional[torch.distributed.ProcessGroup],
+        self, tp_ep_overload: torch.Tensor, expt_dp_group: Optional[torch.distributed.ProcessGroup]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Average and worst-case overload across expert-DP replicas (per entry)."""
         if expt_dp_group is not None:
@@ -386,15 +384,11 @@ class MoEOverloadFactorTracker:
         num_layers = len(self._layer_fwd_tokens)
         self._validate_overload_tensor_lists(num_entries, num_layers, len(balanced_tensors))
 
-        max_cum_overload_factor = self._max_cum_overload_if_timeline(
-            tp_ep_group, expt_dp_group
-        )
+        max_cum_overload_factor = self._max_cum_overload_if_timeline(tp_ep_group, expt_dp_group)
         tp_ep_overload, device = self._tp_ep_overload_from_lists(
             fwd_tensors, balanced_tensors, tp_ep_group
         )
-        overload_avg, overload_max = self._expt_dp_reduce_overload(
-            tp_ep_overload, expt_dp_group
-        )
+        overload_avg, overload_max = self._expt_dp_reduce_overload(tp_ep_overload, expt_dp_group)
 
         avg_overload_factor = overload_avg.mean().item()
         max_overload_factor = overload_max.max().item()
