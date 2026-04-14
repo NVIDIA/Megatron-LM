@@ -95,22 +95,41 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
     @classmethod
     def set_step_metadata(
         cls,
-        local_tokens_per_rank: torch.Tensor,
+        local_tokens: int,
         ep_group: torch.distributed.ProcessGroup,
         use_allgather_v: bool = False,
     ) -> None:
-        """Set per-step metadata.
+        """Gather per-rank token counts and set per-step metadata.
+
+        On CG steps (use_allgather_v=False), all EP ranks share the same padded token
+        count by construction — no collective needed, the tensor is filled trivially.
+        On non-CG steps (use_allgather_v=True), ranks may have different token counts
+        so a real AllGather is performed.
+
+        A barrier is issued at the end to ensure all ranks are ready before the forward.
 
         Args:
-            local_tokens_per_rank: [ep_size] int32 tensor of token counts per rank.
+            local_tokens: Number of tokens on this rank this step.
             ep_group: Expert parallel process group.
-            use_allgather_v: True on non-CG steps where ranks have variable token counts.
+            use_allgather_v: True on non-CG (prefill) steps with variable token counts.
         """
         cls._use_allgather_v = use_allgather_v
+        ep_size = dist.get_world_size(group=ep_group)
+        device = torch.cuda.current_device()
+
+        if use_allgather_v:
+            local_count = torch.tensor([local_tokens], dtype=torch.int32, device=device)
+            local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
+            dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
+        else:
+            local_tokens_per_rank = torch.full(
+                (ep_size,), local_tokens, dtype=torch.int32, device=device
+            )
+
         cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
         if InferenceAllGatherDispatcherBase._valid_tokens_tensor is None:
             InferenceAllGatherDispatcherBase._valid_tokens_tensor = torch.zeros(
-                1, dtype=torch.int32, device=local_tokens_per_rank.device
+                1, dtype=torch.int32, device=device
             )
         InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(local_tokens_per_rank.sum())
 
@@ -274,30 +293,41 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     @classmethod
     def set_step_metadata(
         cls,
-        local_tokens_per_rank: torch.Tensor,
+        local_tokens: int,
         ep_group: torch.distributed.ProcessGroup,
     ) -> None:
-        """Set all three NVLS metadata fields from per-rank token counts.
+        """All-gather per-rank token counts and set all three NVLS metadata fields.
 
         Allocates _step_metadata on the first call and wires the base class's
         _valid_tokens_tensor to _step_metadata[0:1] so experts.py can always
         call InferenceAllGatherDispatcherBase._valid_tokens() regardless of
         which dispatcher is active. Subsequent calls copy in-place.
+
+        A barrier is issued at the end to ensure all ranks are ready before the forward.
+
+        Args:
+            local_tokens: Number of tokens on this rank this step.
+            ep_group: Expert parallel process group.
         """
+        ep_size = dist.get_world_size(group=ep_group)
+        device = torch.cuda.current_device()
+        local_count = torch.tensor([local_tokens], dtype=torch.int32, device=device)
+        local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
+        dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
+
         if cls._step_metadata is None:
-            cls._step_metadata = torch.zeros(
-                3, dtype=torch.int32, device=local_tokens_per_rank.device
-            )
+            cls._step_metadata = torch.zeros(3, dtype=torch.int32, device=device)
             InferenceAllGatherDispatcherBase._valid_tokens_tensor = cls._step_metadata[0:1]
             cls._ep_rank = dist.get_rank(group=ep_group)
         ep_rank = cls._ep_rank
         cls._step_metadata.copy_(
             torch.stack([
-                local_tokens_per_rank.sum(),
-                local_tokens_per_rank[:ep_rank].sum(),
-                local_tokens_per_rank.max(),
+                local_tokens_per_rank.sum(), # valid tokens
+                local_tokens_per_rank[:ep_rank].sum(), # prefix sum (for allgather-v/reduce-scatterv offsets)
+                local_tokens_per_rank.max(), # max tokens to determine the number of CTAs needed for barriers within AGv/RSv
             ])
         )
+        dist.barrier(group=ep_group)
 
     def __init__(
         self,

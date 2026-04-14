@@ -34,6 +34,10 @@ from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NCCLAllGatherDispatcher,
+            NVLSAllGatherVDispatcher,
+)
 
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -1648,12 +1652,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
-            smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
             strict=self.is_hybrid_model,
-            decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
             nvls_dispatcher=not self._nccl_ep_dispatcher,
-            num_speculative_tokens=self.num_speculative_tokens,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
@@ -1792,44 +1793,18 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _update_moe_dispatcher_metadata(self) -> None:
         """Update step metadata for the active MoE inference dispatcher.
 
-        For NCCL on CG steps: all ranks share the same padded token count, so the
-        [ep_size] tensor is filled trivially without a collective.
-        For NCCL on non-CG steps (prefill): ranks may have different token counts,
-        so an all-gather is performed and use_allgather_v=True is set.
-        For NVLS: always all-gathers per-rank token counts.
+        Delegates the all-gather and barrier to the dispatcher's set_step_metadata.
         """
-        import torch.distributed as dist
-        from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NCCLAllGatherDispatcher,
-            NVLSAllGatherVDispatcher,
-        )
-
         ep_group = self.expert_model_parallel_group
-        ep_size = dist.get_world_size(group=ep_group)
         local_tokens = self.padded_active_token_count
 
         if self._nccl_ep_dispatcher:
             using_cuda_graph = self.using_cuda_graph_this_step()
-            if using_cuda_graph:
-                # CG path: all ranks have the same padded token count by construction.
-                local_tokens_per_rank = torch.full(
-                    (ep_size,), local_tokens, dtype=torch.int32, device="cuda"
-                )
-            else:
-                # Non-CG path (prefill): ranks may have different token counts.
-                local_count = torch.tensor([local_tokens], dtype=torch.int32, device="cuda")
-                local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device="cuda")
-                dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
             NCCLAllGatherDispatcher.set_step_metadata(
-                local_tokens_per_rank, ep_group, use_allgather_v=not using_cuda_graph
+                local_tokens, ep_group, use_allgather_v=not using_cuda_graph
             )
         else:
-            local_count = torch.tensor([local_tokens], dtype=torch.int32, device="cuda")
-            local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device="cuda")
-            dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
-            NVLSAllGatherVDispatcher.set_step_metadata(local_tokens_per_rank, ep_group)
-
-        dist.barrier(group=ep_group)
+            NVLSAllGatherVDispatcher.set_step_metadata(local_tokens, ep_group)
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""

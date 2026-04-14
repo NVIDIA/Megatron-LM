@@ -138,94 +138,43 @@ class InferenceBatchDimensions:
     @staticmethod
     def adjust_batch_dims_for_expert_parallelism(
         local_batch_dims,
-        strict: bool,
-        decode_only_cuda_graphs: bool,
-        smallest_non_decode_cuda_graph_size: int,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
-        num_speculative_tokens: int = 0,
     ) -> Optional["InferenceBatchDimensions"]:
-        """Adjusted cuda graph batch dimensions for expert parallelism.
-            We take the max token count across expert model parallel group.
+        """Adjust CUDA graph batch dimensions for expert parallelism.
+
+        All-reduce-max the token count and non-decode flag across the EP group.
+        If any rank has a prefill (non-decode) step, all ranks fall back to eager
+        mode (return None) — the non-CG path handles variable token counts via
+        use_allgather_v. Otherwise return adjusted dims with the max token count.
 
         Args:
             local_batch_dims: The local batch dimensions to adjust.
-            strict: Whether to use strict matching for batch dimensions.
-            decode_only_cuda_graphs: Whether CUDA graphs are only used for decode steps.
-            ep_group: Optional expert parallel process group. If None, uses global parallel state.
-                      When using different EP sizes for inference vs training, pass the
-                      inference EP group explicitly.
+            ep_group: Expert parallel process group.
 
-        Return:
-            (InferenceBatchDimensions) A new InferenceBatchDimensions object with
-            adjusted dimensions, or None if eager mode should be used.
+        Returns:
+            InferenceBatchDimensions with max token count, or None for eager mode.
         """
         ep_size = get_pg_size(ep_group)
         if ep_size <= 1:
             return local_batch_dims
-        # all reduce local work across expert model parallel group
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
-
         sync_tensor = torch.tensor(
-            [
-                local_batch_dims.token_count,
-                int(is_non_decode),
-                local_batch_dims.prefill_req_count,
-                local_batch_dims.decode_req_count,
-            ],
+            [local_batch_dims.token_count, int(is_non_decode)],
             dtype=torch.int32,
             device=torch.cuda.current_device(),
         )
-
         torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group)
-
         sync_tensor = sync_tensor.cpu()
-        is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
 
-        # We force eager mode for scenarios where some ranks will run with CUDA graphs
-        # while others will not. Without this check, communication in the
-        # expert routing layer would pad up to the maximum capacity only for the ranks that
-        # are using CUDA graphs in this step, leading to a hang.
-        # This can happen if we only allow decode CUDA graphs but some ranks are running
-        # non-decode batches.
-        if is_any_ep_rank_in_non_decode and decode_only_cuda_graphs:
-            return None  # indicate no match, run in eager mode
+        if sync_tensor[1].item() == 1:
+            return None  # any rank has prefill → eager mode
 
-        adjusted_token_count = int(sync_tensor[0].item())
-
-        # Sync request counts across EP ranks when strict matching is enabled
-        # or when speculative tokens are used.  With speculative tokens,
-        # decode-only graphs have token counts of decode_req_count * (spec+1)
-        # which creates a different granularity than mixed graphs (raw sizes).
-        # Without syncing, decode-only ranks and prefill ranks search different
-        # graph pools and may pick graphs with different token counts.
-        sync_request_counts = strict or (
-            is_any_ep_rank_in_non_decode and num_speculative_tokens > 0
+        return InferenceBatchDimensions(
+            token_count=int(sync_tensor[0].item()),
+            prefill_req_count=local_batch_dims.prefill_req_count,
+            decode_req_count=local_batch_dims.decode_req_count,
         )
-        adjusted_prefill_req_count = (
-            int(sync_tensor[2].item())
-            if sync_request_counts
-            else local_batch_dims.prefill_req_count
-        )
-        adjusted_decode_req_count = (
-            int(sync_tensor[3].item()) if sync_request_counts else local_batch_dims.decode_req_count
-        )
-
-        # When any EP rank has prefill requests (non-strict mode), elevate
-        # the token count to be >= the smallest prefill/mixed cuda graph.
-        # This ensures decode-only ranks don't match a fine-grained decode
-        # graph while prefill ranks match a coarser mixed graph, which would
-        # produce inconsistent token counts across EP ranks.
-        if is_any_ep_rank_in_non_decode and not strict:
-            adjusted_token_count = max(adjusted_token_count, smallest_non_decode_cuda_graph_size)
-
-        adjusted_batch_dim = InferenceBatchDimensions(
-            token_count=adjusted_token_count,
-            prefill_req_count=adjusted_prefill_req_count,
-            decode_req_count=adjusted_decode_req_count,
-        )
-
-        return adjusted_batch_dim
 
 
 class CUDAGraphBatchDimensionBuilder:
@@ -506,12 +455,9 @@ class CUDAGraphBatchDimensionBuilder:
     def match_graph_config(
         real_batch_dim: InferenceBatchDimensions,
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
-        smallest_non_decode_cuda_graph_size: int,
         strict: bool = False,
-        decode_only_cuda_graphs: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         nvls_dispatcher: bool = False,
-        num_speculative_tokens: int = 0,
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -521,9 +467,6 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_batch_dimensions_list: List of available CUDA graph batch dimensions
             strict: If False, prefill slots can be used for prefill or decode requests.
                    If True, prefill slots can only be used for prefill requests.
-            decode_only_cuda_graphs: Used by expert parallel matching. If this is true,
-            and one of the EP ranks is running a non-decode step, we elect to run in
-            eager mode instead of matching a decode-only cuda graph.
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
@@ -541,15 +484,10 @@ class CUDAGraphBatchDimensionBuilder:
 
         if not nvls_dispatcher and ep_group is not None:
             # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
-            # across the EP group so graph selection is consistent. If any rank has a prefill
-            # step and decode_only_cuda_graphs is True, all ranks fall back to eager mode.
+            # across the EP group so graph selection is consistent.
             adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
                 real_batch_dim,
-                strict=strict,
-                decode_only_cuda_graphs=decode_only_cuda_graphs,
                 ep_group=ep_group,
-                smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
-                num_speculative_tokens=num_speculative_tokens,
             )
             if adjusted_batch_dim is None:
                 return None

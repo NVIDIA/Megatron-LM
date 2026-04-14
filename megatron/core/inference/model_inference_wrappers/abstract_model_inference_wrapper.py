@@ -17,6 +17,10 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NCCLAllGatherDispatcher,
+            NVLSAllGatherVDispatcher,
+        )
 
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
 
@@ -144,26 +148,13 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # we cover the eager path (no CG list, or CG list but no match).
         context = self.inference_context
         ep_group = context.expert_model_parallel_group
-        import torch.distributed as dist
-        from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NCCLAllGatherDispatcher,
-            NVLSAllGatherVDispatcher,
-        )
-        ep_size = dist.get_world_size(group=ep_group)
-        local_count = torch.tensor(
-            [num_dummy_tokens], dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        local_tokens_per_rank = torch.empty(
-            ep_size, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
         if getattr(context, '_nccl_ep_dispatcher', False):
+            # Always non-CG (eager), so use_allgather_v=True.
             NCCLAllGatherDispatcher.set_step_metadata(
-                local_tokens_per_rank, ep_group, use_allgather_v=True
+                num_dummy_tokens, ep_group, use_allgather_v=True
             )
         else:
-            NVLSAllGatherVDispatcher.set_step_metadata(local_tokens_per_rank, ep_group)
-        dist.barrier(group=ep_group)
+            NVLSAllGatherVDispatcher.set_step_metadata(num_dummy_tokens, ep_group)
 
         tokens = torch.zeros(
             (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
