@@ -772,45 +772,70 @@ class TEGroupedMLP(MegatronModule):
         )
 
     def _is_fused_impl_supported(self) -> bool:
-        """Check if the TE op fuser supports implementing this module."""
+        """Check if the TE op fuser supports implementing this module.
+
+        Logs a warning for each unsatisfied condition to aid debugging
+        (e.g. when CUDA graph fails because the CuTe DSL fused kernel
+        was not activated and GroupedLinear falls back to tolist()).
+        """
+
+        def _unsupported(reason):
+            logger.warning("TE fused GroupedMLP not available: %s", reason)
+            return False
 
         # Check Transformer Engine installation
         if not HAVE_TE:
-            return False  # Transformer Engine is not available
+            return _unsupported("Transformer Engine is not installed")
         try:
             from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
         except ImportError:
-            return False  # Transformer Engine version is too old
+            return _unsupported("TE too old (missing pytorch.ops.GroupedLinear)")
 
         if not is_te_min_version("2.14.0"):
-            return False
+            return _unsupported("TE version < 2.14.0")
 
         # Check for unsupported features
         if self.tp_group.size() > 1:
-            return False  # Tensor parallelism is not supported
+            return _unsupported(f"expert TP > 1 (tp_size={self.tp_group.size()})")
         if self.offload_expert_fc1 or self.offload_moe_act:
-            return False  # Fine-grained activation offloading is not supported
+            return _unsupported("fine-grained activation offloading enabled")
         if self.config.moe_apply_probs_on_input:
-            return False  # Pre-multiplying probs is not supported
+            return _unsupported("moe_apply_probs_on_input enabled")
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
-            return False
+            return _unsupported(f"linear_fc1 is {type(self.linear_fc1).__name__}")
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
-            return False
+            return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU (ScaledSwiGLU) or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
-        if self.config.gated_linear_unit:
-            if self.activation_func == F.silu:
-                return True
-            if self.activation_func == quick_gelu:
-                try:
-                    from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-                except ImportError:
-                    return False
-                return True
+        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
+        if not self.config.gated_linear_unit:
+            return _unsupported("gated_linear_unit not enabled")
+        if self.activation_func == F.silu:
+            pass  # SwiGLU — supported
+        elif self.activation_func == quick_gelu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
+            except ImportError:
+                return _unsupported("quick_gelu needs TE >= 2.15")
+        else:
+            return _unsupported(f"unsupported activation: {self.activation_func}")
 
-        return False
+        # Check TE CuTe DSL fused kernel conditions (must match TE's
+        # fuse_grouped_mlp_ops matching logic)
+        import os
+
+        if os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0") == "0":
+            return _unsupported(
+                "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set — CuTe DSL fused kernel disabled"
+            )
+        if self.config.moe_mlp_glu_interleave_size != 32:
+            return _unsupported(
+                f"moe_mlp_glu_interleave_size={self.config.moe_mlp_glu_interleave_size} "
+                f"(CuTe DSL requires 32)"
+            )
+
+        return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
