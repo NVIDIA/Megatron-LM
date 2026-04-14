@@ -29,25 +29,24 @@ die() { log "FATAL: $*"; exit 1; }
 
 cd "${REPO_ROOT}"
 
-# 1. Stash any local changes
-#log "Stashing local changes..."
-#git stash
+#1. Stash any local changes
+log "Stashing local changes..."
+git stash
 
-# 2. Fetch and checkout the target commit
-#log "Fetching and checking out ${COMMIT}..."
-#git fetch origin "${COMMIT}"
-#git checkout "${COMMIT}"
+#2. Fetch and checkout the target commit
+log "Fetching and checking out ${COMMIT}..."
+git fetch origin "${COMMIT}"
+git checkout "${COMMIT}"
 
-# 3. Cherry-pick each patch commit onto the tested commit, in order
-#log "Cherry-picking ${#CHERRYPICK_SHAS[@]} commit(s)..."
-#for sha in "${CHERRYPICK_SHAS[@]}"; do
-#    log "  cherry-pick ${sha}..."
-#    git fetch origin "${sha}"
-#    git cherry-pick "${sha}"
-#done
+#3. Cherry-pick each patch commit onto the tested commit, in order
+log "Cherry-picking ${#CHERRYPICK_SHAS[@]} commit(s)..."
+for sha in "${CHERRYPICK_SHAS[@]}"; do
+   log "  cherry-pick ${sha}..."
+   git fetch origin "${sha}"
+   git cherry-pick "${sha}"
+done
 
 python -m tests.test_utils.python_scripts.generate_local_jobs --environment dev --scope mr
-
 
 # 4. Run the test and tee output to log.txt
 log "Running ${TEST_SCRIPT} (output → ${LOG_FILE})..."
@@ -67,7 +66,7 @@ log "OUTPUT_PATH=${OUTPUT_PATH}"
 log "Copying golden values from ${OUTPUT_PATH} → ${GOLDEN_DIR}..."
 mkdir -p "${GOLDEN_DIR}"
 cp "${OUTPUT_PATH}"/golden_values*.json "${GOLDEN_DIR}/"
-log "Copied: $(ls "${GOLDEN_DIR}"/golden_values*.json)"
+log "Copied: $(ls "${that sGOLDEN_DIR}"/golden_values*.json)"
 
 # 7. Run the test again to validate against the new golden values
 log "Re-running ${TEST_SCRIPT} to validate..."
