@@ -1786,6 +1786,17 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
+        # Save block IDs for finished requests before update_requests releases them.
+        # Needed for per-block routing reconstruction in the engine.
+        finished_routing_block_ids = {}
+        if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
+            for fidx in finished_idxs.tolist():
+                req_id = int(context.request_ids[fidx].item())
+                blocks = context.request_to_kv_block_ids[fidx]
+                valid = blocks[blocks >= 0].tolist()
+                if valid:
+                    finished_routing_block_ids[req_id] = valid
+
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused _sampled_tokens_cuda buffer.
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
@@ -1803,6 +1814,7 @@ class TextGenerationController:
         return {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
+            "finished_routing_block_ids": finished_routing_block_ids,
             **(update_result or {}),
         }
 
@@ -1857,6 +1869,12 @@ class TextGenerationController:
 
             # Collect routing indices per request (must be done before context transitions)
             routing_indices_per_request = self._router_record_bookkeeping()
+
+            # Store routing per-block for MoE routing replay reconstruction.
+            # Must be done while token-to-block mappings are still valid (before update_requests).
+            context.kv_block_allocator.store_routing_per_block(routing_indices_per_request)
+            # Per-step routing is no longer needed; reconstruction happens from blocks at completion.
+            routing_indices_per_request = None
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
