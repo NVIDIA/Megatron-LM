@@ -70,16 +70,21 @@ class StaticBufferLoader:
 
         assert isinstance(inputs, dict)
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
+            self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
 
             for k in inputs.keys():
                 if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
-                    StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
-                        inputs[k]
-                    ).cuda()
+                    if isinstance(inputs[k], torch.Tensor):
+                        StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
+                            inputs[k], device="cuda"
+                        )
+                    else:
+                        StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
+            self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 clone_tensors_in_struct(
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
@@ -176,7 +181,7 @@ class FullCudaGraphWrapper:
                 )
             torch.cuda.synchronize()
             torch.distributed.barrier()
-            logger.info(f'CUDA graph capture done!!!')
+            logger.info(f'CUDA graph capture done for {training_str}!!!')
 
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)

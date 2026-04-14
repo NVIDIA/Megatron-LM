@@ -1,5 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import functools
+import pathlib
+from collections.abc import Callable
+from typing import Optional
+
 import pytest
 import torch
 
@@ -10,7 +15,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
     common_test_simple_sharded_state_dict_save_load,
@@ -18,6 +25,13 @@ from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_vocab_size_padding_change,
 )
 from tests.unit_tests.test_utilities import Utils
+
+# List of model spec functions
+_spec_fn_list: list[Callable[[], ModuleSpec]] = [gpt_te_spec, gpt_local_spec]
+_gpt_te_spec_op_fuser: Optional[Callable] = None
+if is_te_min_version("1.13.0"):
+    _gpt_te_spec_op_fuser = functools.partial(gpt_te_spec, use_te_op_fuser=True)
+    _spec_fn_list.append(_gpt_te_spec_op_fuser)
 
 
 def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, vocab_size=128, **config_kwargs):
@@ -51,10 +65,13 @@ def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, vocab_size=128, **conf
 
 
 class TestGPTModel:
-    @pytest.mark.parametrize('src_layer_spec_fn', [gpt_te_spec, gpt_local_spec])
-    @pytest.mark.parametrize('dst_layer_spec_fn', [gpt_te_spec, gpt_local_spec])
+    @pytest.mark.parametrize('src_layer_spec_fn', _spec_fn_list)
+    @pytest.mark.parametrize('dst_layer_spec_fn', _spec_fn_list)
     def test_sharded_state_dict_save_load(
-        self, tmp_path_dist_ckpt, src_layer_spec_fn, dst_layer_spec_fn
+        self,
+        tmp_path_dist_ckpt: pathlib.Path,
+        src_layer_spec_fn: Callable[[], ModuleSpec],
+        dst_layer_spec_fn: Callable[[], ModuleSpec],
     ):
         common_test_simple_sharded_state_dict_save_load(
             initialize_gpt_model, tmp_path_dist_ckpt, src_layer_spec_fn, dst_layer_spec_fn
@@ -89,21 +106,43 @@ class TestGPTModelReconfiguration:
             (True, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), True, gpt_local_spec, gpt_te_spec),
             (False, 'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), False, gpt_te_spec, gpt_local_spec),
             (False, 'tp-dp-pp', 'tp-pp-dp', (2, 4), (2, 4), True, gpt_local_spec, gpt_local_spec),
+            (
+                False,
+                'tp-dp-pp',
+                'tp-dp-pp',
+                (2, 4),
+                (4, 2),
+                False,
+                gpt_te_spec,
+                _gpt_te_spec_op_fuser,
+            ),
+            (
+                False,
+                'tp-dp-pp',
+                'tp-dp-pp',
+                (2, 4),
+                (4, 2),
+                False,
+                _gpt_te_spec_op_fuser,
+                gpt_te_spec,
+            ),
         ],
     )
     def test_parallel_reconfiguration_e2e(
         self,
-        tmp_path_dist_ckpt,
-        src_tp_pp,
-        dest_tp_pp,
-        src_layer_spec_fn,
-        dst_layer_spec_fn,
-        use_fpsl,
-        load_order,
-        store_order,
-        singleton_local_shards,
+        tmp_path_dist_ckpt: pathlib.Path,
+        src_tp_pp: tuple[int, int],
+        dest_tp_pp: tuple[int, int],
+        src_layer_spec_fn: Optional[Callable[[], ModuleSpec]],
+        dst_layer_spec_fn: Optional[Callable[[], ModuleSpec]],
+        use_fpsl: bool,
+        load_order: str,
+        store_order: str,
+        singleton_local_shards: bool,
     ):
         """Test model saving and loading with different TP/PP"""
+        if src_layer_spec_fn is None or dst_layer_spec_fn is None:
+            pytest.skip("Spec function is not supported")
         Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
         common_test_parallel_reconfiguration_e2e(
             initialize_gpt_model,
@@ -132,10 +171,46 @@ class TestGPTModelReconfiguration:
         ],
     )
     def test_vocab_size_padding_change(
-        self, tmp_path_dist_ckpt, vocab_size_base, src_tp_pp, dest_tp_pp
-    ):
+        self,
+        tmp_path_dist_ckpt: pathlib.Path,
+        vocab_size_base: int,
+        src_tp_pp: tuple[int, int],
+        dest_tp_pp: tuple[int, int],
+    ) -> None:
         """Test model loading with different vocab size (caused by TP padding)."""
         Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
         common_test_vocab_size_padding_change(
             initialize_gpt_model, tmp_path_dist_ckpt, vocab_size_base, src_tp_pp, dest_tp_pp
+        )
+
+    @pytest.mark.parametrize(
+        ('src_tp_pp', 'dest_tp_pp', 'src_layer_spec_fn', 'dst_layer_spec_fn'),
+        [
+            ((2, 4), (4, 2), gpt_te_spec, gpt_te_spec),
+            ((2, 4), (4, 2), gpt_te_spec, gpt_local_spec),
+            ((2, 4), (4, 2), gpt_local_spec, gpt_te_spec),
+            ((2, 4), (4, 2), gpt_te_spec, _gpt_te_spec_op_fuser),
+            ((2, 4), (4, 2), _gpt_te_spec_op_fuser, gpt_te_spec),
+        ],
+    )
+    def test_mlp_with_glu(
+        self,
+        tmp_path_dist_ckpt: pathlib.Path,
+        src_tp_pp: tuple[int, int],
+        dest_tp_pp: tuple[int, int],
+        src_layer_spec_fn: Optional[Callable[[], ModuleSpec]],
+        dst_layer_spec_fn: Optional[Callable[[], ModuleSpec]],
+    ) -> None:
+        """Test model loading when MLP activation is gated linear unit."""
+        if src_layer_spec_fn is None or dst_layer_spec_fn is None:
+            pytest.skip("Spec function is not supported")
+        Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
+        common_test_parallel_reconfiguration_e2e(
+            functools.partial(initialize_gpt_model, gated_linear_unit=True),
+            tmp_path_dist_ckpt,
+            src_tp_pp,
+            dest_tp_pp,
+            src_layer_spec_fn,
+            dst_layer_spec_fn,
+            False,  # use_fpsl
         )

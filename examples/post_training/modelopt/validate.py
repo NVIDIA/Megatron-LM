@@ -2,29 +2,24 @@
 
 """Sample Generate GPT."""
 import functools
+import json
 import os
 import sys
 import warnings
-import json
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
-import modelopt
-from modelopt.torch.speculative.plugins.megatron import MegatronARValidation
 import torch
-from datasets import load_dataset
-from tqdm import tqdm
+from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidation
 
-from megatron.core import mpu
-from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
-from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_provider import model_provider
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
-from megatron.training.checkpointing import save_checkpoint
-from megatron.training.utils import get_ltor_masks_and_position_ids, print_rank_0, unwrap_model
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.utils import get_mtbench_chat_data
+from megatron.training import get_args, get_model, initialize_megatron
+from utils import get_hf_tokenizer
+from megatron.training.utils import print_rank_0, unwrap_model
+from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
@@ -39,8 +34,8 @@ def add_ar_validation_args(parser):
     parser.add_argument(
         "--prompts-path",
         type=str,
-        required=True,
-        help="Path to the prompts json file",
+        default=None,
+        help="Path to the prompts json file. If not provided, MTBench will be used.",
     )
     parser.add_argument(
         "--ground-truth-path",
@@ -107,8 +102,12 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    with open(args.prompts_path, "r") as f:
-        prompts = [json.loads(line) for line in f]
+    if not args.prompts_path:
+        dataset = get_mtbench_chat_data()
+        prompts = [[sample["conversations"][0]] for sample in dataset]
+    else:
+        with open(args.prompts_path, "r") as f:
+            prompts = [json.loads(line) for line in f]
 
     if args.ground_truth_path is not None:
         ground_truth = torch.load(args.ground_truth_path)
@@ -116,8 +115,8 @@ if __name__ == "__main__":
     else:
         ground_truth = [None for _ in range(len(prompts))]
 
-    tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    tokenizer = get_hf_tokenizer()
+    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
 
     report_current_memory_info()
 

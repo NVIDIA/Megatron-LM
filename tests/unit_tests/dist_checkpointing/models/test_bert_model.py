@@ -24,12 +24,10 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def initialize_bert_model(
-    seed, layer_spec_fn=bert_layer_with_transformer_engine_spec, vocab_size=128, **config_kwargs
+    seed, layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=128, **config_kwargs
 ):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
-
-    layer_spec = layer_spec_fn() if callable(layer_spec_fn) else layer_spec_fn
 
     default_config_kwargs = dict(
         num_layers=8,

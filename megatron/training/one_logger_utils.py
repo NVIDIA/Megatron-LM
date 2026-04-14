@@ -297,8 +297,7 @@ def on_pretrain_start():
                 'one_logger_utils_version': _one_logger_utils_version,
             })
 
-def track_config_flags(train_iters, skip_train, do_train, do_valid, do_test,
-                           dataloader_type, retro_project_dir, retro_cyclic_train_iters):
+def track_config_flags(train_iters, skip_train, do_train, do_valid, do_test, dataloader_type):
     """Track flags about train/validation/test enablement
 
     Args:
@@ -308,16 +307,10 @@ def track_config_flags(train_iters, skip_train, do_train, do_valid, do_test,
         do_valid (bool): flags to do validation
         do_test (bool): flags to do test
         dataloader_type (str): dataloader type
-        retro_project_dir (str): Retro project directory
-        retro_cyclic_train_iters (int): iteration number for cyclic retro training
     """
     one_logger = get_one_logger()
     if one_logger:
         with one_logger.get_context_manager():
-            # Update train_iters for cyclic loader
-            if dataloader_type == 'cyclic' and retro_project_dir:
-                assert retro_cyclic_train_iters is not None
-                train_iters = retro_cyclic_train_iters
             # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
             train_enabled = train_iters and (not skip_train) and do_train and train_iters > 0
             one_logger.log_metrics({

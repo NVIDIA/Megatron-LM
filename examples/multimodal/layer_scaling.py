@@ -4,6 +4,8 @@ from functools import partial
 import torch
 
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.typed_torch import copy_signature
+
 
 def _bias_dropout_add_func_layer_scaling(ls, x_with_bias, residual, prob, training):
     x, bias = x_with_bias  # unpack
@@ -36,6 +38,7 @@ def get_bias_dropout_add_layer_scaling(ls, training, fused):
 
 # Add LayerScaling to our default TransformerLayer.
 class LayerScalingTransformerLayer(TransformerLayer):
+    @copy_signature(TransformerLayer.__init__)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ls1 = torch.nn.Parameter(torch.ones(self.config.hidden_size))

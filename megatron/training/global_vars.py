@@ -3,15 +3,19 @@
 """Megatron global variables."""
 
 import os
+import signal
 import sys
 import torch
+
+from datetime import timedelta
 
 from megatron.core import Timers
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
+from megatron.core.jit import disable_jit_fuser
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
-from megatron.training import dist_signal_handler
-from megatron.training.tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 _GLOBAL_ARGS = None
 _GLOBAL_TOKENIZER = None
@@ -73,11 +77,40 @@ def get_signal_handler():
     return _GLOBAL_SIGNAL_HANDLER
 
 
-def _set_signal_handler():
+def _set_signal_handler(exit_signal):
+
     global _GLOBAL_SIGNAL_HANDLER
     _ensure_var_is_not_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
-    _GLOBAL_SIGNAL_HANDLER = dist_signal_handler.DistributedSignalHandler().__enter__()
+    _GLOBAL_SIGNAL_HANDLER = DistributedSignalHandler(exit_signal).__enter__()
 
+
+def _graceful_shutdown(signum, frame):
+    """
+    Signal handler for user-initiated termination (SIGINT / SIGTERM).
+
+    This handler attempts a best-effort graceful shutdown:
+      - Logs a single termination message from rank 0
+      - Synchronizes all ranks (barrier)
+      - Destroys the distributed process group
+      - Exits the process cleanly
+    """
+    from megatron.training.utils import print_rank_0
+    print_rank_0("\nTermination requested. Performing orderly shutdown.")
+
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # synchronize all ranks before exiting
+            try:
+                # avoid deadlock if ranks don't all reach here
+                torch.distributed.barrier(timeout=timedelta(seconds=5))
+            except Exception:
+                pass
+
+            torch.distributed.destroy_process_group()
+    except Exception:
+        pass
+
+    sys.exit(0)
 
 
 def set_global_variables(args, build_tokenizer=True):
@@ -109,7 +142,14 @@ def set_global_variables(args, build_tokenizer=True):
         set_experimental_flag(True)
 
     if args.exit_signal_handler:
-        _set_signal_handler()
+        _set_signal_handler(args.exit_signal)
+
+    if args.exit_signal_handler_for_training:
+        signal.signal(signal.SIGINT, _graceful_shutdown)
+        signal.signal(signal.SIGTERM, _graceful_shutdown)
+
+    if args.disable_jit_fuser:
+        disable_jit_fuser()
 
 
 def unset_global_variables():
@@ -207,6 +247,8 @@ def _set_wandb_writer(args):
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
             'config': wandb_config}
+        if args.wandb_entity:
+            wandb_kwargs['entity'] = args.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
@@ -242,13 +284,13 @@ def _set_adlr_autoresume(args):
     _ensure_var_is_not_initialized(_GLOBAL_ADLR_AUTORESUME, 'adlr autoresume')
 
     if args.adlr_autoresume:
-        if args.rank == 0:
-            print('enabling autoresume ...', flush=True)
+        from megatron.training.utils import print_rank_0
+        print_rank_0('enabling autoresume ...')
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
             from userlib.auto_resume import AutoResume
         except ImportError:
-            print('ADLR autoresume is not available, exiting ...')
+            print_rank_0('ADLR autoresume is not available, exiting ...')
             sys.exit()
 
         _GLOBAL_ADLR_AUTORESUME = AutoResume

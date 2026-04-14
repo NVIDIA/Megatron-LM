@@ -3,6 +3,7 @@
 /* Helper methods for fast index mapping builds */
 
 #include <algorithm>
+#include <cassert>
 #include <iostream>
 #include <limits>
 #include <math.h>
@@ -46,7 +47,7 @@ void build_exhaustive_blending_indices(py::array_t<int16_t> &dataset_index, py::
   while (dataset_unspent_indices.size() > 0) {
     double index_sample_double = std::max(static_cast<double>(index_sample), 1.0);
 
-    int64_t error_argmax;
+    int64_t error_argmax = -1;
     double error_max = std::numeric_limits<double>::lowest();
 
     for (int32_t index_dataset : dataset_unspent_indices) {
@@ -56,6 +57,7 @@ void build_exhaustive_blending_indices(py::array_t<int16_t> &dataset_index, py::
         error_max = error;
       }
     }
+    assert(error_argmax >= 0);
 
     // Populate the indices.
     dataset_index_ptr[index_sample] = static_cast<int16_t>(error_argmax);
@@ -164,7 +166,8 @@ py::array_t<T> build_sample_idx(
   // Remove bound checks.
   auto sizes = sizes_.unchecked<1>();
   auto document_idx = document_idx_.unchecked<1>();
-
+  
+  // NOTE(asolergi-nv): This is the logic used to compute the number of samples in the GPTDataset when leveraging defer_npy_index_mmap
   // Build the sample idx as a contiguous 1-D array of type T.
   int64_t num_samples = 0;
   if (drop_last_partial_sequence == true) {

@@ -3,6 +3,7 @@
 """Megatron optimizer."""
 
 import copy
+import logging
 import math
 import warnings
 from abc import ABC, abstractmethod
@@ -11,6 +12,7 @@ from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+from typing_extensions import override
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
@@ -45,6 +47,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
+from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
@@ -98,10 +101,13 @@ class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
 
+    Provides a consistent interface for gradient management, parameter
+    access, and state-dict handling across different optimization types.
+
     Args:
-        optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
-        config (OptimizerConfig): configuration object for optimizer.
-        init_state_fn (Callable, optional): function to initialize state in the optimizer.
+        optimizer (torch.optim.Optimizer): The base PyTorch optimizer.
+        config (OptimizerConfig): The optimizer configuration.
+        init_state_fn (Callable, optional): Function to initialize optimizer state.
     """
 
     def __init__(
@@ -132,24 +138,41 @@ class MegatronOptimizer(ABC):
         return params
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        """
-        Get main_grads that should be taken into account to compute the grad norm.
-        Filter parameters based on:
-          - grad should not be None.
-          - parameter should not be shared (i.e., grads shouldn't be double counted while
-            computing norms).
-          - should not be a replica due to tensor model parallelism.
+        """Collects gradients for norm calculation, filtering duplicates.
+
+        This method filters parameters based on whether the gradient is not None,
+        the parameter is not shared (to avoid double-counting gradients), and
+        the parameter is not a replica due to tensor model parallelism.
+
+        Returns:
+            List[torch.Tensor]: A list of gradient tensors filtered for norm calculation.
         """
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
+                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                self.config.use_precision_aware_optimizer
+                and getattr(param, "__fsdp_param__", False)
+            ):
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+                if (
+                    getattr(param, "__fsdp_param__", False)
+                    and grad is not None
+                    and hasattr(grad, "_local_tensor")
+                ):
+                    # Megatron-FSDP gradients are DTensors.
+                    grad = grad._local_tensor
+            elif getattr(param, "__fsdp_param__", False):
+                # Megatron-FSDP gradients are DTensors.
+                grad = param.grad._local_tensor if param.grad is not None else None
             else:
                 grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                param, getattr(self, 'tp_group', None)
+            )
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
 
@@ -210,7 +233,13 @@ class MegatronOptimizer(ABC):
                 params,
                 clip_grad,
                 grad_norm,
-                self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                # Decoupled Grad
+                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                or (
+                    # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                    self.config.use_precision_aware_optimizer
+                    and getattr(params[0], "__fsdp_param__", False)
+                ),
             )
         return grad_norm
 
@@ -220,7 +249,13 @@ class MegatronOptimizer(ABC):
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+            or (
+                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                self.config.use_precision_aware_optimizer
+                and getattr(params[0], "__fsdp_param__", False)
+            ),
+            tp_group=getattr(self, 'tp_group', None),
         )
 
     @abstractmethod
@@ -333,6 +368,44 @@ class MegatronOptimizer(ABC):
     def _restore_common_per_param_step(state_dict: Dict, step: Union[int, torch.Tensor]):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
+
+    def offload_to_cpu(self):
+        """Function used for RL training.
+        Move optimizer state tensors to CPU to free GPU memory during inference."""
+        if getattr(self, 'optimizer', None) is not None and not getattr(
+            self, 'is_stub_optimizer', False
+        ):
+            log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
+            # Move all optimizer tensors to CPU while keeping the optimizer instance
+            for param_group in self.optimizer.param_groups:
+                for p in param_group['params']:
+                    if isinstance(p, torch.Tensor) and p.is_cuda:
+                        p.data = p.data.cpu()
+
+            for state_dict in self.optimizer.state.values():
+                for k, v in state_dict.items():
+                    if isinstance(v, torch.Tensor) and v.is_cuda:
+                        state_dict[k] = v.cpu()
+
+            torch.cuda.empty_cache()
+
+    def restore_from_cpu(self):
+        """Function used for RL training.
+        Restore optimizer state tensors from CPU back to GPU for training."""
+        if getattr(self, 'optimizer', None) is not None and not getattr(
+            self, 'is_stub_optimizer', False
+        ):
+            log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
+            # Move all optimizer tensors back to GPU
+            for param_group in self.optimizer.param_groups:
+                for p in param_group['params']:
+                    if isinstance(p, torch.Tensor) and not p.is_cuda:
+                        p.data = p.data.cuda()
+
+            for state_dict in self.optimizer.state.values():
+                for k, v in state_dict.items():
+                    if isinstance(v, torch.Tensor) and not v.is_cuda:
+                        state_dict[k] = v.cuda()
 
     @staticmethod
     def _filter_and_reorder_param_groups(
@@ -1077,6 +1150,14 @@ class ChainedOptimizer(MegatronOptimizer):
             param_groups += optimizer.param_groups
         return param_groups
 
+    @override
+    def get_parameters(self) -> List[torch.nn.Parameter]:
+        """Get list of parameters wrapped in all chained optimizers."""
+        params = []
+        for optimizer in self.chained_optimizers:
+            params.extend(optimizer.get_parameters())
+        return params
+
     @property
     def state(self) -> ProxyDict:
         """
@@ -1107,20 +1188,26 @@ class ChainedOptimizer(MegatronOptimizer):
         state_dicts = [None] * len(self.chained_optimizers)
         if state_dict is not None:
             if len(self.model_chunks) == 1:
-                state_dicts[0] = state_dict
+                # When there is only one global model chunk, all sub-optimizers
+                # (e.g., dense and MoE parts) use the same model state dict.
+                state_dicts = [state_dict] * len(self.chained_optimizers)
             else:
-                # Split state_dict if needed
+                # Split state_dict by model chunk object.
                 prefix = "model" if "model0" in state_dict.keys() else "model_"
-                offset = 0
+                chunk_to_global_idx = {chunk: idx for idx, chunk in enumerate(self.model_chunks)}
                 for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
                     if hasattr(optimizer, "model_chunks"):
                         d = {}
-                        for chunk_idx in range(len(optimizer.model_chunks)):
+                        for chunk_idx, model_chunk in enumerate(optimizer.model_chunks):
+                            assert model_chunk in chunk_to_global_idx, (
+                                "Sub-optimizer model chunk was not found in "
+                                "chained optimizer model chunks"
+                            )
+                            global_idx = chunk_to_global_idx[model_chunk]
                             assert (
-                                f"{prefix}{offset}" in state_dict
-                            ), f"Wrong state_dict format, cannot find '{prefix}{offset}'"
-                            d[f"{prefix}{chunk_idx}"] = state_dict[f"{prefix}{offset}"]
-                            offset += 1
+                                f"{prefix}{global_idx}" in state_dict
+                            ), f"Wrong state_dict format, cannot find '{prefix}{global_idx}'"
+                            d[f"{prefix}{chunk_idx}"] = state_dict[f"{prefix}{global_idx}"]
                         if len(d) > 0:
                             state_dicts[optimizer_idx] = d
         return state_dicts
@@ -1140,13 +1227,17 @@ class ChainedOptimizer(MegatronOptimizer):
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
         metadata = kwargs.get('metadata') or {}
-        should_add_prefix = True  # Backward-compatibility
-        if (
-            metadata.get('chained_optim_avoid_prefix', False)
-            # This condition should be True if a distributed optimizer isn't used
-            and metadata.get('distrib_optim_sharding_type') != 'dp_zero_gather_scatter'
-        ):
-            should_add_prefix = False
+        # ChainedOptimizer should add its prefix to the tensor state keys only if
+        # DistributedOptimizer is used (non-empty 'distrib_optim_sharding_type') and uses
+        # a non fully-reshardable format. For backward compatibility we also add it
+        # if `chained_optim_avoid_prefix` is False.
+        from .distrib_optimizer import DistributedOptimizer
+
+        should_add_prefix = (
+            "distrib_optim_sharding_type" in metadata
+            and metadata["distrib_optim_sharding_type"]
+            not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+        ) or not metadata.get('chained_optim_avoid_prefix', False)
 
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].sharded_state_dict(
@@ -1245,7 +1336,12 @@ class ChainedOptimizer(MegatronOptimizer):
             return count_zeros_fp32(
                 params,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                or (
+                    # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                    self.config.use_precision_aware_optimizer
+                    and getattr(params[0], "__fsdp_param__", False)
+                ),
             )
         else:
             num_zeros_in_grad = 0
@@ -1278,6 +1374,11 @@ class ChainedOptimizer(MegatronOptimizer):
                     total_norm=grad_norm,
                     use_decoupled_grad=(
                         optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                        or (
+                            # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                            self.config.use_precision_aware_optimizer
+                            and getattr(parameters[0], "__fsdp_param__", False)
+                        )
                     ),
                 )
 
@@ -1309,9 +1410,8 @@ class ChainedOptimizer(MegatronOptimizer):
                     states.append(state_dict)
                     save_states = True
                 else:
+                    assert state_dict is None
                     states.append(None)
-            else:
-                states.append(None)
 
         if save_states:
             torch.save(states, filename)
@@ -1358,6 +1458,17 @@ class ChainedOptimizer(MegatronOptimizer):
         step = steps[0] if len(steps) == 1 else None
         for optimizer in self.chained_optimizers:
             for param_group in optimizer.optimizer.param_groups:
-                param_group['step'] = step
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    param_group['step'] = step
 
         return step
+
+    def offload_to_cpu(self):
+        """Move optimizer state to CPU to free GPU memory during inference."""
+        for optimizer in self.chained_optimizers:
+            optimizer.offload_to_cpu()
+
+    def restore_from_cpu(self):
+        """Restore optimizer state from CPU back to GPU for training."""
+        for optimizer in self.chained_optimizers:
+            optimizer.restore_from_cpu()

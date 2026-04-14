@@ -1,21 +1,20 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 import logging
-import os
 from collections import Counter, defaultdict
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
-from megatron.core.dist_checkpointing.dict_utils import (
-    diff,
-    extract_matching_values,
-    map_reduce,
-    nested_values,
+from megatron.core.dist_checkpointing.core import (
+    CheckpointingException,
+    check_is_distributed_checkpoint,
 )
+from megatron.core.dist_checkpointing.dict_utils import diff, extract_matching_values, nested_values
 from megatron.core.dist_checkpointing.mapping import (
     CommonStateDict,
     ShardedBase,
@@ -23,15 +22,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     is_main_replica,
 )
-from megatron.core.dist_checkpointing.strategies.base import (
-    LoadCommonStrategy,
-    LoadShardedStrategy,
-    SaveCommonStrategy,
-    SaveShardedStrategy,
-    StrategyAction,
-    get_default_strategy,
-)
-from megatron.core.msc_utils import MultiStorageClientFeature
 
 if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
@@ -203,60 +193,17 @@ def validate_integrity_and_strict_load(
     return sharded_state_dict, missing_keys, unexpected_keys
 
 
-def verify_checkpoint_and_load_strategy(
-    checkpoint_dir: str,
-    sharded_strategy: Union[LoadShardedStrategy, Tuple[str, int], None] = None,
-    common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
-) -> Tuple[LoadShardedStrategy, LoadCommonStrategy]:
-    """Verifies if checkpoint metadata exists and matches given strategies.
-
-    If no strategies are passed, they are determined based on the checkpoint metadata.
+def verify_checkpoint(checkpoint_dir: str):
+    """Verifies if checkpoint exists.
 
     Args:
         checkpoint_dir (str): checkpoint directory
-        sharded_strategy (LoadShardedStrategy, Tuple[str, int], optional): sharded load strategy to be verified
-            if compatible with the checkpoint content. If None, the default sharded load strategy
-            for the checkpoint backend will be returned.
-        common_strategy (LoadCommonStrategy, Tuple[str, int], optional): common load strategy to be verified
-            if compatible with the checkpoint content. If None, the default common load strategy
-            for the checkpoint backend will be returned.
     """
-    isdir = True
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        isdir = msc.os.path.isdir(str(checkpoint_dir), strict=False)
-    else:
-        isdir = os.path.isdir(checkpoint_dir)
-    if not isdir:
-        raise CheckpointingException(f"Checkpoint directory {checkpoint_dir} does not exist")
+    if not Path(checkpoint_dir).exists():
+        raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
-    saved_config = maybe_load_config(checkpoint_dir)
-    if saved_config is None:
-        raise CheckpointingException(f"{checkpoint_dir} is not a distributed checkpoint")
-
-    if sharded_strategy is None:
-        sharded_strategy = get_default_strategy(
-            StrategyAction.LOAD_SHARDED,
-            saved_config.sharded_backend,
-            saved_config.sharded_backend_version,
-        )
-    elif isinstance(sharded_strategy, tuple):
-        sharded_strategy = get_default_strategy(StrategyAction.LOAD_SHARDED, *sharded_strategy)
-
-    if common_strategy is None:
-        common_strategy = get_default_strategy(
-            StrategyAction.LOAD_COMMON,
-            saved_config.common_backend,
-            saved_config.common_backend_version,
-        )
-    elif isinstance(common_strategy, tuple):
-        sharded_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, *common_strategy)
-
-    sharded_strategy.check_backend_compatibility(saved_config.sharded_backend)
-    sharded_strategy.check_version_compatibility(saved_config.sharded_backend_version)
-    common_strategy.check_backend_compatibility(saved_config.common_backend)
-    common_strategy.check_version_compatibility(saved_config.common_backend_version)
-    return sharded_strategy, common_strategy
+    if not check_is_distributed_checkpoint(checkpoint_dir):
+        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
 
 
 def adjust_non_strict_load(
@@ -437,19 +384,26 @@ def validate_sharding_integrity(
     for rank, rank_shardings in enumerate(global_metadata):
         for sharding in rank_shardings:
             key_shardings[sharding.key].append((rank, sharding))
+    errors = []
     for key, shardings in key_shardings.items():
         if isinstance(shardings[0][1], ShardedObject):
-            _validate_objects_for_key(shardings)
+            errors.extend(_validate_objects_for_key(shardings))
         else:
-            _validate_sharding_for_key(shardings)
+            errors.extend(_validate_sharding_for_key(shardings))
+
+    if errors:
+        errors = '\n'.join(str(e) for e in errors)
+        raise CheckpointingException(f'Invalid sharding pattern validation. Errors: {errors}')
 
 
-def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
+def _validate_sharding_for_key(
+    rank_sharding: List[Tuple[int, ShardedTensor]]
+) -> List[CheckpointingException]:
     some_rank_shard = rank_sharding[0][1]
     global_shape = some_rank_shard.global_shape
     local_shape = some_rank_shard.local_shape
     dtype = some_rank_shard.dtype
-    has_flattened_range = some_rank_shard.flattened_range is not None
+    has_regular_sharding_grid = some_rank_shard.has_regular_grid
     for rank, sharding in rank_sharding:
         assert sharding.dtype == dtype, (sharding.dtype, dtype, some_rank_shard)
         assert sharding.global_shape == global_shape, (
@@ -457,34 +411,31 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
             global_shape,
             some_rank_shard,
         )
-        assert sharding.local_shape == local_shape, (
-            sharding.local_shape,
-            local_shape,
+        assert sharding.has_regular_grid == has_regular_sharding_grid, (
+            has_regular_sharding_grid,
             some_rank_shard,
         )
-        assert (sharding.flattened_range is not None) == has_flattened_range, (
-            (sharding.flattened_range is not None),
-            has_flattened_range,
-            some_rank_shard,
-        )
+        if has_regular_sharding_grid:
+            assert sharding.local_shape == local_shape, (
+                sharding.local_shape,
+                local_shape,
+                some_rank_shard,
+            )
+
+    errors = []
+    if not has_regular_sharding_grid:
+        # In case of uneven sharding we defer the validation to DCP
+        return errors
 
     shard_access_cnt = _compute_shards_access(rank_sharding)
-    if has_flattened_range:
-        map_reduce(
-            rank_sharding,
-            lambda x: x[1].global_offset,
-            lambda x: x[1],
-            _validate_sharding_for_key_flattened,
-        )
-        # For each shard with at least 1 flattened tensor in it, the above
-        # `_validate_sharding_for_key_flattened` ensure a correct consistent pattern
-        # The only thing that can go wrong at this point is that some shard don't have
-        # *any* representatives which will be checked later by comparing `shard_access_cnt == 1`
-        shard_access_cnt = torch.minimum(shard_access_cnt, torch.tensor([1]))
     if not torch.all(shard_access_cnt == 1):
-        raise CheckpointingException(
-            f"Invalid access pattern for {rank_sharding[0][1]}: {shard_access_cnt}"
+        errors.append(
+            CheckpointingException(
+                f'Invalid access pattern for {rank_sharding[0][1]}: {shard_access_cnt}'
+            )
         )
+
+    return errors
 
 
 def _compute_shards_access(rank_sharding):
@@ -497,39 +448,24 @@ def _compute_shards_access(rank_sharding):
     return shard_access_cnt
 
 
-def _validate_sharding_for_key_flattened(tensors_by_shard):
-    all_slices = []
-    local_shape = tensors_by_shard[0].local_shape
-    for sharding in tensors_by_shard:
-        assert sharding.local_shape == local_shape
-        sharding: ShardedTensor
-        if not is_main_replica(sharding.replica_id):
-            continue
-
-        all_slices.append((sharding.flattened_range.start, sharding.flattened_range.stop))
-
-    starts, stops = map(np.asarray, zip(*sorted(all_slices)))
-    expected_size = np.product(local_shape)
-    if starts[0] != 0 or stops[-1] != expected_size or not np.all(starts[1:] == stops[:-1]):
-        raise CheckpointingException(
-            f"Flattened ranges dont cover the whole shard {tensors_by_shard[0]} of size {expected_size}. Ranges: {(starts, stops)}"
-        )
-
-
-def _validate_objects_for_key(sharded_objects: List[ShardedObject]):
+def _validate_objects_for_key(sharded_objects: List[ShardedObject]) -> List[CheckpointingException]:
     """Ensure uniqueness of saved objects."""
     unique_keys = [
         sh_obj.unique_key for _, sh_obj in sharded_objects if is_main_replica(sh_obj.replica_id)
     ]
+    errors = []
     if len(unique_keys) != len(set(unique_keys)):
         duplicates = {k: cnt for k, cnt in Counter(unique_keys).items() if cnt > 1}
         logger.error(f"Duplicate ShardedObject keys and counts: {duplicates}")
-        raise CheckpointingException(f"Duplicate ShardedObject keys: {list(duplicates.keys())}")
+        errors.append(
+            CheckpointingException(f'Duplicate ShardedObject keys: {list(duplicates.keys())}')
+        )
     expected_shard_num = np.prod(sharded_objects[0][1].global_shape)
     if len(unique_keys) != expected_shard_num:
         err_msg = f"Invalid access pattern: {expected_shard_num - len(unique_keys)} ShardedObject are missing."
         logger.error(f"{err_msg} Existing shards: {unique_keys}")
-        raise CheckpointingException(err_msg)
+        errors.append(CheckpointingException(err_msg))
+    return errors
 
 
 def determine_global_metadata(
@@ -547,29 +483,3 @@ def determine_global_metadata(
     global_metadata = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(global_metadata, local_metadata)
     return local_metadata, global_metadata  # type: ignore[return-value]
-
-
-def validate_sharded_objects_handling(
-    sharded_strategy: Union[SaveShardedStrategy, LoadShardedStrategy],
-    common_strategy: Union[SaveCommonStrategy, LoadCommonStrategy],
-) -> None:
-    """Checks if either of the passed strategies can handle sharded objects.
-
-    Args:
-        sharded_strategy (Union[SaveShardedStrategy, LoadShardedStrategy]): sharded strategy used for saving/loading
-        common_strategy (Union[SaveCommonStrategy, LoadCommonStrategy]): common strategy used for saving/loading
-
-    Returns:
-        None
-
-    Raises:
-        CheckpointingException: if both strategies can't handle ShardedObjects
-    """
-    if (
-        not sharded_strategy.can_handle_sharded_objects
-        and not common_strategy.can_handle_sharded_objects
-    ):
-        raise CheckpointingException(
-            f"Either sharded strategy or common strategy must implement ShardedObjects handling."
-            f" Both {sharded_strategy} and {common_strategy} specify can_handle_sharded_objects=False"
-        )

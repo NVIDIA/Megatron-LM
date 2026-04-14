@@ -6,19 +6,19 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
+)
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
 )
 from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -47,13 +47,13 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     submodules = MambaMixerSubmodules(
         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
     )
-    model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
     model = MambaMixer(
         transformer_config,
         submodules,
         transformer_config.hidden_size,
         rmsnorm=True,
-        model_comm_pgs=model_comm_pgs,
+        pg_collection=pg_collection,
     )
     return model
 
@@ -121,7 +121,7 @@ class TestMambaReconfiguration:
             )
             sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
-            save_strategy = get_default_save_sharded_strategy()
+            save_strategy = TorchDistSaveShardedStrategy()
             if use_fpsl:
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
@@ -130,6 +130,8 @@ class TestMambaReconfiguration:
                 )
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
+            if metadata is not None:
+                metadata.pop("dp_cp_group")
 
             # Load checkpoint A with different TP/PP/expert/CP and save as checkpoint B
             # No FPS this time, only FPL
@@ -147,7 +149,7 @@ class TestMambaReconfiguration:
                 sequence_parallel=(dest_exp > 1 and dest_pp > 1),
             )
             if use_fpsl:
-                load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+                load_strategy = TorchDistLoadShardedStrategy()
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy,
                     parallel_state.get_data_parallel_group(with_context_parallel=True),

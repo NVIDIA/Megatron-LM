@@ -4,9 +4,10 @@ import pytest
 import torch
 
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_block import MambaStack
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -23,15 +24,16 @@ class TestMambaBlock:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
 
-    def get_model_comm_pgs(self):
-        return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+    def get_pg_collection(self):
+        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-    def get_mamba_block(self, hybrid_override_pattern):
+    def get_mamba_block(self, layer_pattern):
+        layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
             # will generate errors.
-            num_layers=len(hybrid_override_pattern),
+            num_layers=len(layer_type_list),
             num_attention_heads=4,
             use_cpu_initialization=True,
         )
@@ -39,8 +41,9 @@ class TestMambaBlock:
         return MambaStack(
             transformer_config,
             modules,
-            hybrid_override_pattern=hybrid_override_pattern,
-            model_comm_pgs=self.get_model_comm_pgs(),
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
         )
 
     def teardown_method(self, method):
@@ -48,8 +51,8 @@ class TestMambaBlock:
 
     def test_gpu_forward(self):
         """Test GPU forward pass."""
-        hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
-        block = self.get_mamba_block(hybrid_override_pattern)
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(layer_pattern)
         block.cuda()
         micro_batch_size = 2
         sequence_length = 32
@@ -67,13 +70,13 @@ class TestMambaBlock:
 
     def test_layer_types(self):
         """
-        Make sure that the layer types specified with hybrid_override_pattern
+        Make sure that the layer types specified with layer_pattern
         were honored.
         """
-        hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
-        block = self.get_mamba_block(hybrid_override_pattern)
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(layer_pattern)
         layers = block.layers
-        # Note that this matches the order specified by hybrid_override_pattern in setup_method
+        # Note that this matches the order specified by layer_pattern above
         assert isinstance(layers[0], MambaLayer)
         assert isinstance(layers[1], TransformerLayer)
         assert isinstance(layers[1].self_attention, SelfAttention)
@@ -82,8 +85,56 @@ class TestMambaBlock:
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = '+'
-        assert invalid_symbol not in Symbols.VALID  # sanity check.
-        hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
-        # _allocate_override() in mamba_hybrid_layer_allocation.py throws a ValueError.
+        assert invalid_symbol not in Symbols.VALID_LAYERS  # sanity check.
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
+        # validate_segment_layers() in mamba_hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):
-            block = self.get_mamba_block(hybrid_override_pattern)
+            block = self.get_mamba_block(layer_pattern)
+
+    def test_gdn_layer_types(self):
+        """
+        Make sure that G creates a TransformerLayer wrapping GatedDeltaNet,
+        while * creates a TransformerLayer wrapping SelfAttention.
+        """
+        layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
+        block = self.get_mamba_block(layer_pattern)
+        layers = block.layers
+        assert isinstance(layers[0], TransformerLayer)
+        assert isinstance(layers[0].self_attention, GatedDeltaNet)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, SelfAttention)
+        assert isinstance(layers[2], MambaLayer)
+
+    def test_gdn_gpu_forward(self):
+        """Test GPU forward pass with GDN, attention, and Mamba layers."""
+        layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
+        layer_type_list = validate_segment_layers(layer_pattern)
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            activation_func=torch.nn.functional.silu,
+        )
+        modules = mamba_stack_spec.submodules
+        block = MambaStack(
+            transformer_config,
+            modules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        )
+        block.cuda()
+        micro_batch_size = 2
+        sequence_length = 32
+        hidden_states = torch.ones((sequence_length, micro_batch_size, block.config.hidden_size))
+        hidden_states = hidden_states.cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        )
+        attention_mask = attention_mask.cuda()
+        output = block(hidden_states, attention_mask=attention_mask)
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == block.config.hidden_size
+        assert output.dtype == torch.float32

@@ -5,6 +5,8 @@ import os
 import sys
 import types
 
+from functools import partial
+
 import torch
 
 from tools.checkpoint.utils import _ConverterFakeProcessGroup
@@ -45,7 +47,6 @@ def _load_checkpoint(queue, args):
         from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
-        from megatron.legacy import fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -56,7 +57,6 @@ def _load_checkpoint(queue, args):
                 '--no-masked-softmax-fusion',
                 '--no-bias-gelu-fusion',
                 '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
                 '--use-cpu-initialization',
                 '--micro-batch-size', '1',
                 '--no-load-optim',
@@ -116,7 +116,9 @@ def _load_checkpoint(queue, args):
 
     # Determine how to make our models
     if args.model_type == 'GPT':
-        from pretrain_gpt import model_provider
+        from model_provider import model_provider as common_model_provider
+        from gpt_builders import gpt_builder
+        model_provider = partial(common_model_provider, gpt_builder)
         margs.model_type = ModelType.encoder_or_decoder
     elif args.model_type == 'BERT':
         from pretrain_bert import model_provider
@@ -184,7 +186,6 @@ def _load_checkpoint(queue, args):
     # For backward compatibility during local parallel states refactoring
     fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
     mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-    fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size
     if args.true_vocab_size is not None:

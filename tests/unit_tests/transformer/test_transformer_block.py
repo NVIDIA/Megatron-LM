@@ -12,7 +12,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
@@ -144,6 +144,220 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
 
+    def test_feature_extraction_without_checkpoint(self):
+        """Test feature extraction in normal forward mode (no checkpointing)."""
+        parallel_transformer_block = self.parallel_transformer_block
+        config = parallel_transformer_block.config
+
+        sequence_length = 32
+        micro_batch_size = 2
+        parallel_transformer_block.cuda()
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
+        hidden_states = hidden_states.cuda()
+
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        # Test with None (should return just hidden_states)
+        output = parallel_transformer_block(
+            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=None
+        )
+        assert isinstance(output, torch.Tensor)
+        assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
+        # Test with single layer extraction
+        extract_indices = {0}
+        result = parallel_transformer_block(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            extract_layer_indices=extract_indices,
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        output_hidden_states, intermediate_hidden_states = result
+        assert output_hidden_states.shape == (sequence_length, micro_batch_size, config.hidden_size)
+        assert len(intermediate_hidden_states) == 1
+        assert intermediate_hidden_states[0].shape == (
+            sequence_length,
+            micro_batch_size,
+            config.hidden_size,
+        )
+
+        # Test with multiple layer extraction (config has 2 layers: indices 0, 1)
+        extract_indices = {0, 1}
+        result = parallel_transformer_block(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            extract_layer_indices=extract_indices,
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        output_hidden_states, intermediate_hidden_states = result
+        assert output_hidden_states.shape == (sequence_length, micro_batch_size, config.hidden_size)
+        assert len(intermediate_hidden_states) == 2
+        for intermediate in intermediate_hidden_states:
+            assert intermediate.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
+    def test_feature_extraction_full_checkpoint_block(self):
+        """Test feature extraction with full checkpoint using block method."""
+        transformer_config = self.transformer_config
+        config = transformer_config
+        config.recompute_granularity = 'full'
+        config.recompute_method = 'block'
+        config.recompute_num_layers = config.num_layers  # checkpoint all layers
+        block_transformer_block = TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec()
+        )
+        block_transformer_block.cuda()
+
+        sequence_length = 32
+        micro_batch_size = 2
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
+        hidden_states = hidden_states.cuda()
+        hidden_states.requires_grad = True
+
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        # Test with None (should return just hidden_states)
+        output = block_transformer_block(
+            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=None
+        )
+        assert isinstance(output, torch.Tensor)
+        assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
+        # Test with single layer extraction
+        extract_indices = {0}
+        result = block_transformer_block(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            extract_layer_indices=extract_indices,
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        output_hidden_states, intermediate_hidden_states = result
+        assert output_hidden_states.shape == (sequence_length, micro_batch_size, config.hidden_size)
+        assert len(intermediate_hidden_states) == 1
+        assert intermediate_hidden_states[0].shape == (
+            sequence_length,
+            micro_batch_size,
+            config.hidden_size,
+        )
+
+        # Test with multiple layer extraction (config has 2 layers: indices 0, 1)
+        # Unlike uniform, block method supports extraction at every layer
+        extract_indices = {0, 1}
+        result = block_transformer_block(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            extract_layer_indices=extract_indices,
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        output_hidden_states, intermediate_hidden_states = result
+        assert output_hidden_states.shape == (sequence_length, micro_batch_size, config.hidden_size)
+        assert len(intermediate_hidden_states) == 2
+        for intermediate in intermediate_hidden_states:
+            assert intermediate.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
+    def test_feature_extraction_full_checkpoint_uniform(self):
+        """Test feature extraction with full checkpoint using uniform method.
+
+        With recompute_num_layers=2 (chunk size 2) and num_layers=2, all layers
+        fall into a single chunk [0, 1]. The uniform method can only extract
+        features at chunk boundaries (the last layer of each chunk), so
+        requesting {0, 1} returns only 1 embedding (layer 1's output).
+        Layer 0's activation is discarded during the forward pass.
+        """
+        transformer_config = self.transformer_config
+        config = transformer_config
+        config.recompute_granularity = 'full'
+        config.recompute_method = 'uniform'
+        config.recompute_num_layers = 2  # chunk size 2: single chunk [0, 1]
+        uniform_transformer_block = TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec()
+        )
+        uniform_transformer_block.cuda()
+
+        sequence_length = 32
+        micro_batch_size = 2
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
+        hidden_states = hidden_states.cuda()
+        hidden_states.requires_grad = True
+
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        # Test with None (should return just hidden_states)
+        output = uniform_transformer_block(
+            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=None
+        )
+        assert isinstance(output, torch.Tensor)
+        assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
+        # With chunk size 2, layers [0, 1] form one chunk.
+        # Only the chunk boundary (layer 1) can be extracted; layer 0 is inside the chunk.
+        extract_indices = {0, 1}
+        result = uniform_transformer_block(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            extract_layer_indices=extract_indices,
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        output_hidden_states, intermediate_hidden_states = result
+        assert output_hidden_states.shape == (sequence_length, micro_batch_size, config.hidden_size)
+        # Only 1 embedding returned: layer 1 (the chunk boundary). Layer 0 is skipped.
+        assert len(intermediate_hidden_states) == 1
+        assert intermediate_hidden_states[0].shape == (
+            sequence_length,
+            micro_batch_size,
+            config.hidden_size,
+        )
+
+    def test_gpu_forward_uniform_checkpoint_non_divisible_layers(self):
+        """Test that uniform recompute works when num_layers is not evenly
+        divisible by recompute_num_layers.
+
+        With num_layers=5 and recompute_num_layers=3 the chunks should be
+        [0, 1, 2] and [3, 4].  Before the fix the last chunk would attempt
+        to access layers 3, 4, **5** which is out of bounds.
+
+        Regression test for https://github.com/NVIDIA/Megatron-LM/issues/2294
+        """
+        transformer_config = TransformerConfig(
+            num_layers=5,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=3,
+        )
+        uniform_block = TransformerBlock(
+            transformer_config, get_gpt_layer_with_transformer_engine_spec()
+        )
+        uniform_block.cuda()
+
+        sequence_length = 32
+        micro_batch_size = 2
+
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, transformer_config.hidden_size), device='cuda'
+        )
+        hidden_states.requires_grad = True
+
+        attention_mask = torch.ones(
+            (1, 1, sequence_length, sequence_length), dtype=bool, device='cuda'
+        )
+
+        # This should not raise an IndexError
+        output = uniform_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert output.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size)
+
 
 class TestPipelineParallelTransformerBlock:
     @pytest.mark.parametrize(
@@ -222,20 +436,21 @@ class TestPipelineParallelTransformerBlock:
             )
             total_build_layers = 0
             for i in range(pipeline_model_parallel_size):
-                parallel_state.set_pipeline_model_parallel_rank(i)
                 if virtual_pipeline_model_parallel_size is not None:
                     for j in range(virtual_pipeline_model_parallel_size):
-                        num_layers_to_build = get_num_layers_to_build(transformer_config, j)
+                        num_layers_to_build = get_num_layers_to_build(
+                            transformer_config, vp_stage=j, pp_rank=i
+                        )
+
                         total_build_layers += num_layers_to_build
                 else:
-                    num_layers_to_build = get_num_layers_to_build(transformer_config)
+                    num_layers_to_build = get_num_layers_to_build(transformer_config, pp_rank=i)
                     total_build_layers += num_layers_to_build
         if not should_assert_error:
             assert (
                 total_build_layers == num_layers
             ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
-        parallel_state.set_pipeline_model_parallel_world_size(None)
-        parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
+        Utils.destroy_model_parallel()
 
 
 class TestProcessGroupTransformerBlock:
@@ -267,17 +482,18 @@ class TestProcessGroupTransformerBlock:
                 torch.distributed.init_process_group(backend='nccl')
 
             # Create HyperCommGrid with dimensions cp, tp, dp (reversed from device mesh order)
-            grid = HyperCommGrid([cp_size, tp_size, dp_size], ["cp", "tp", "dp"])
+            grid = HyperCommGrid([cp_size, tp_size, dp_size, 1], ["cp", "tp", "dp", "pp"])
 
             # Get process groups from HyperCommGrid
             tp_group = grid.create_pg("tp")
             cp_group = grid.create_pg("cp")
+            pp_group = grid.create_pg("pp")
 
-            # Create ModelCommProcessGroups with custom process groups
-            model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+            # Create ProcessGroupCollection with custom process groups
+            pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, pp=pp_group)
         else:
             # Rely on TransformerBlock to create default process groups
-            model_comm_pgs = None
+            pg_collection = None
 
         self.transformer_config = TransformerConfig(
             num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
@@ -285,7 +501,7 @@ class TestProcessGroupTransformerBlock:
         self.transformer_block = TransformerBlock(
             self.transformer_config,
             get_gpt_layer_with_transformer_engine_spec(),
-            model_comm_pgs=model_comm_pgs,
+            pg_collection=pg_collection,
         )
         self.transformer_block.cuda()
 
@@ -332,22 +548,22 @@ class TestMixedProcessGroups:
                 fp8_init_context = get_fp8_context(self.config, layer_number - 1, is_init=True)
                 if layer_number % 4 == 0:
                     config = self.local_attn_config
-                    model_comm_pgs = self.local_pgs
+                    pg_collection = self.local_pgs
                 else:
                     config = self.config
-                    model_comm_pgs = self.model_comm_pgs
+                    pg_collection = self.pg_collection
                 with fp8_init_context:
                     module = build_module(
                         layer_spec,
                         config=config,
                         layer_number=layer_number,
-                        model_comm_pgs=model_comm_pgs,
+                        pg_collection=pg_collection,
                     )
                 return module
 
-            # Modify TransformerConfig and ModelCommProcessGroups for local attention
+            # Modify TransformerConfig and ProcessGroupCollection for local attention
             self.local_attn_config = copy.deepcopy(self.config)
-            self.local_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+            self.local_pgs = ProcessGroupCollection.use_mpu_process_groups()
             self.local_attn_config.context_parallel_size = 1
             self.local_pgs.cp = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
 
@@ -611,3 +827,38 @@ class TestPipelineParallelLayoutTransformerBlock:
             parsed_layout_from_str.virtual_pipeline_model_parallel_size
             == parsed_layout_baseline.virtual_pipeline_model_parallel_size
         )
+
+    @pytest.mark.parametrize(
+        "pp_size, input_layout",
+        [
+            (2, "Et|t*4|t|tL"),
+            (2, [["embedding", "decoder"], ["decoder"] * 4, ["decoder"], ["decoder", "loss"]]),
+            (8, [["embedding"] + ["decoder"] * 3] + [["decoder"] * 2] * 29 + [["mtp"], ["loss"]]),
+        ],
+    )
+    def test_repr_returns_string(self, pp_size, input_layout):
+        """Test that __repr__ always returns a string for both str and list inputs."""
+        layout = PipelineParallelLayerLayout(input_layout, pp_size)
+        repr_result = repr(layout)
+
+        # Assert that repr returns a string
+        assert isinstance(
+            repr_result, str
+        ), f"__repr__ must return a string, but got {type(repr_result).__name__}"
+
+        # Assert that the returned string matches the expected value
+        if isinstance(input_layout, str):
+            # For string input, repr should return the exact same string
+            assert repr_result == input_layout, (
+                f"For string input, repr should return the original string.\n"
+                f"Expected: {input_layout!r}\n"
+                f"Got: {repr_result!r}"
+            )
+        else:
+            # For list input, repr should return str(input_layout)
+            expected_repr = str(input_layout)
+            assert repr_result == expected_repr, (
+                f"For list input, repr should return str(input_layout).\n"
+                f"Expected: {expected_repr!r}\n"
+                f"Got: {repr_result!r}"
+            )

@@ -21,7 +21,7 @@ class SiglipHuggingFaceModel(HuggingFaceModule):
     Wrapper for Siglip HuggingFace models.
     """
 
-    # Currently applies to FSDP2 only, not the custom FSDP implementation.
+    # Currently applies to FSDP2 only, not the Megatron FSDP implementation.
     _fsdp_modules = [SiglipEncoderLayer]
 
     def __init__(self, config):

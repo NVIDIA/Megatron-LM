@@ -1,15 +1,21 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from functools import partial
 from typing import Any, Callable, Tuple, Union
 from unittest import mock
 
 import torch
 
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
@@ -24,6 +30,11 @@ NUM_ATTENTION_HEADS = 8
 def initialize_gpt_model(
     pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -32,6 +43,7 @@ def initialize_gpt_model(
         hidden_size=HIDDEN_SIZE,
         num_attention_heads=NUM_ATTENTION_HEADS,
         use_cpu_initialization=True,
+        bf16=True,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs, gated_linear_unit=use_glu)
@@ -44,7 +56,6 @@ def initialize_gpt_model(
         post_process=post_process,
     )
 
-    model.bfloat16()
     with torch.no_grad():
         for p in model.parameters():
             p.random_()
@@ -61,6 +72,11 @@ def initialize_moe_model(
     use_grouped_mlp=False,
     **config_kwargs,
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     expert_num = 8
@@ -141,7 +157,6 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.consumed_train_samples = 0
     args.skipped_train_samples = 0
     args.consumed_valid_samples = 0
-    args.retro_add_retriever = False
     args.no_load_optim = False
     args.no_load_rng = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
@@ -151,17 +166,17 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.hidden_size = HIDDEN_SIZE
     args.num_attention_heads = NUM_ATTENTION_HEADS
     args.ckpt_step = None
+    args.use_megatron_fsdp = False
+    args.dist_ckpt_optim_fully_reshardable = False
+    args.distrib_optim_fully_reshardable_mem_efficient = False
+    args.phase_transition_iterations = None
+    # Clear the metadata cache to avoid contamination between tests
+
+    CachedMetadataFileSystemReader.clear_metadata_cache()
 
 
 def setup_model_and_optimizer(
-    seed,
-    tp,
-    pp,
-    initialize_fn=initialize_gpt_model,
-    bf16=True,
-    dist_opt=True,
-    use_custom_fsdp=False,
-    data_parallel_sharding_strategy="optim_grads_params",
+    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True, optimizer='adam'
 ):
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
@@ -177,24 +192,45 @@ def setup_model_and_optimizer(
             )
         )
 
+    optimizer_type = optimizer
+    use_layer_wise = False
+    if optimizer_type == 'dist_muon':
+        optimizer = 'muon'
+        use_layer_wise = True
+    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
+        use_layer_wise = True
+        dist_opt = False
+
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=dist_opt,
+        use_layer_wise_distributed_optimizer=use_layer_wise,
+        optimizer=optimizer,
     )
+
+    if optimizer_type in ('muon', 'dist_muon'):
+        config.lr = 0.0
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    for group in optimizer.optimizer.param_groups:
-        for p in group['params']:
-            if len(optimizer.optimizer.state[p]) == 0:
-                optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    if isinstance(optimizer, ChainedOptimizer):
+        for opt in optimizer.chained_optimizers:
+            if not hasattr(opt, 'optimizer'):
+                opt.init_state_fn(opt)
+            else:
+                opt.init_state_fn(opt.optimizer)
+    else:
+        for group in optimizer.optimizer.param_groups:
+            for p in group['params']:
+                if len(optimizer.optimizer.state[p]) == 0:
+                    optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
+                    optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
 
 
@@ -234,6 +270,7 @@ def setup_moe_model_and_optimizer(
     use_te=False,
     use_grouped_mlp=False,
     use_glu=False,
+    optimizer='adam',
 ):
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
@@ -254,23 +291,44 @@ def setup_moe_model_and_optimizer(
             )
         )
 
+    optimizer_type = optimizer
+    use_layer_wise = False
+    if optimizer_type == 'dist_muon':
+        optimizer = 'muon'
+        use_layer_wise = True
+    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
+        use_layer_wise = True
+        dist_opt = False
+
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=dist_opt,
+        use_layer_wise_distributed_optimizer=use_layer_wise,
+        optimizer=optimizer,
     )
+
+    if optimizer_type in ('muon', 'dist_muon'):
+        config.lr = 0.0
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    for opt in optimizer.chained_optimizers:
-        for group in opt.param_groups:
-            for p in group['params']:
-                if len(opt.state[p]) == 0:
-                    opt.state[p]['exp_avg'] = torch.rand_like(p.data)
-                    opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    if optimizer_type in ('muon', 'dist_muon'):
+        for opt in optimizer.chained_optimizers:
+            if not hasattr(opt, 'optimizer'):
+                opt.init_state_fn(opt)
+            else:
+                opt.init_state_fn(opt.optimizer)
+    else:
+        for opt in optimizer.chained_optimizers:
+            for group in opt.param_groups:
+                for p in group['params']:
+                    if len(opt.state[p]) == 0:
+                        opt.state[p]['exp_avg'] = torch.rand_like(p.data)
+                        opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer

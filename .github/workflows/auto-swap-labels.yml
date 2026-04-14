@@ -1,0 +1,75 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Auto Swap Labels
+on:
+  pull_request_target:
+    types: [ready_for_review, synchronize]
+    branches:
+      - main
+  workflow_run:
+    workflows: ["Review Trigger"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  contents: read
+  actions: read
+
+jobs:
+  check-approval:
+    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'NVIDIA/Megatron-LM' && (
+        (github.event_name == 'pull_request_target' &&
+         github.event.pull_request.base.ref == 'main' &&
+         !github.event.pull_request.draft) ||
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success')
+      )
+
+    steps:
+      - name: Get PR number from workflow_run
+        id: get-pr
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-number
+          path: pr-number
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Set PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            if [ "${{ steps.get-pr.outcome }}" != "success" ]; then
+              echo "No approval artifact found — review was not an approval. Skipping."
+              exit 0
+            fi
+            echo "number=$(cat pr-number/number)" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check out repository code
+        if: steps.pr.outputs.number
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.pr.outputs.number
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        if: steps.pr.outputs.number
+        run: |
+          pip install --no-cache-dir PyGithub slack-sdk
+
+      - name: Run Auto Swap Labels
+        if: steps.pr.outputs.number
+        run: |
+          export GH_TOKEN=${{ secrets.PAT }}
+          export PR_NUMBER=${{ steps.pr.outputs.number }}
+          python tests/test_utils/python_scripts/swap_pr_labels.py

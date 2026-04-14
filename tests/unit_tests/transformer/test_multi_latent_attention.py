@@ -1,27 +1,32 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from functools import partial
-from importlib.metadata import version
 from inspect import signature
 from unittest import mock
 
 import pytest
 import torch
-import transformer_engine as te
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.multi_latent_attention import MLASelfAttention, MultiLatentAttention
+from megatron.core.transformer.multi_latent_attention import (
+    FusedMLASelfAttention,
+    MLASelfAttention,
+    MLASelfAttentionSubmodules,
+    MultiLatentAttention,
+)
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.arguments import parse_args
@@ -92,12 +97,23 @@ def make_test_packed_seq_params_with_padding(
 
 
 def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
-    submodules = get_gpt_layer_with_transformer_engine_spec(
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
         multi_latent_attention=True
-    ).submodules.self_attention.submodules
+    ).self_attention.submodules
+    assert isinstance(submodules, MLASelfAttentionSubmodules)
     if linear_qkv_down_proj is not None:
         submodules.linear_q_down_proj = linear_qkv_down_proj
         submodules.linear_kv_down_proj = linear_qkv_down_proj
+    return submodules
+
+
+def get_fused_mla_submodules():
+    """Get submodules for FusedMLASelfAttention via the mla_down_proj_fusion spec path."""
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
+        multi_latent_attention=True, mla_down_proj_fusion=True
+    ).self_attention.submodules
+    assert isinstance(submodules, MLASelfAttentionSubmodules)
+    assert submodules.linear_qkv_down_proj is not None
     return submodules
 
 
@@ -293,16 +309,83 @@ class TestParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
             # Test that the get_query_key_value_tensors function properly handles padded cu_seqlens
-            query, key, value = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states, None, None, packed_seq_params, None
+            query, key, value, q_compressed, kv_compressed = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states, None, None, packed_seq_params, None
+                )
             )
 
             assert query is not None
             assert key is not None
             assert value is not None
+            assert q_compressed is not None
+            assert kv_compressed is not None
             assert query.is_contiguous()
             assert key.is_contiguous()
             assert value.is_contiguous()
+
+    def test_gpu_forward_thd_qv_head_dim_mismatch(self):
+        """Test THD MLA path when q and v head dimensions differ."""
+        if is_te_min_version("1.10.0"):
+            transformer_config = MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=64,
+                qk_pos_emb_head_dim=64,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=self.transformer_config.rotary_base,
+                original_max_position_embeddings=self.transformer_config.original_max_position_embeddings,
+            )
+            mismatch_attention = MLASelfAttention(
+                transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+            sequence_length = 32
+            micro_batch_size = 1
+
+            mismatch_attention.cuda().bfloat16()
+
+            # [sequence length, batch size, hidden size]
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, transformer_config.hidden_size)
+            )
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            attention_mask = None
+            with mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ):
+                packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+
+                query, key, value, q_compressed, kv_compressed = (
+                    mismatch_attention.get_query_key_value_tensors(
+                        hidden_states, None, None, packed_seq_params, None
+                    )
+                )
+
+                assert query is not None
+                assert key is not None
+                assert value is not None
+                assert q_compressed is not None
+                assert kv_compressed is not None
+                assert query.shape[-1] != value.shape[-1]
+
+                output, bias = mismatch_attention(
+                    hidden_states, attention_mask, packed_seq_params=packed_seq_params
+                )
+
+                assert output.shape[0] == sequence_length
+                assert output.shape[1] == micro_batch_size
+                assert output.shape[2] == transformer_config.hidden_size
+                assert bias.shape[0] == transformer_config.hidden_size
 
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
@@ -370,7 +453,9 @@ class TestParallelMLAAttention:
             )
             hidden_states = hidden_states.cuda()
 
-            q, k, v = checkpointed_parallel_attention.get_query_key_value_tensors(hidden_states)
+            q, k, v, q_compressed, kv_compressed = (
+                checkpointed_parallel_attention.get_query_key_value_tensors(hidden_states)
+            )
             assert q.is_contiguous()
             assert k.is_contiguous()
             assert v.is_contiguous()
@@ -529,7 +614,7 @@ class TestContextParallelMLAAttention:
             v_head_dim=128,
             qk_pos_emb_head_dim=64,
             rotary_base=10000,
-            max_position_embeddings=64,
+            original_max_position_embeddings=64,
             context_parallel_size=self.context_parallel_size,
             bf16=True,
             rope_type=rope_type,
@@ -675,37 +760,43 @@ class TestParallelMLAAttentionPrecision:
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
-            query_sbhd, key_sbhd, value_sbhd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_sbhd, None, None, None, None
+            query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states_sbhd, None, None, None, None
+                )
             )
-            query_thd, key_thd, value_thd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_thd, None, None, packed_seq_params, None
+            query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states_thd, None, None, packed_seq_params, None
+                )
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
             _key_sbhd = key_sbhd.transpose(0, 1).contiguous().view(*key_thd.shape)
             _value_sbhd = value_sbhd.transpose(0, 1).contiguous().view(*value_thd.shape)
+            _q_compressed_sbhd = (
+                q_compressed_sbhd.transpose(0, 1).contiguous().view(*q_compressed_thd.shape)
+            )
+            _kv_compressed_sbhd = (
+                kv_compressed_sbhd.transpose(0, 1).contiguous().view(*kv_compressed_thd.shape)
+            )
             assert torch.equal(_query_sbhd, query_thd)
             assert torch.equal(_key_sbhd, key_thd)
             assert torch.equal(_value_sbhd, value_thd)
+            assert torch.equal(_q_compressed_sbhd, q_compressed_thd)
+            assert torch.equal(_kv_compressed_sbhd, kv_compressed_thd)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -774,7 +865,7 @@ class TestContextParallelMLAAttentionPrecision:
             v_head_dim=128,
             qk_pos_emb_head_dim=64,
             rotary_base=10000,
-            max_position_embeddings=64,
+            original_max_position_embeddings=64,
             context_parallel_size=self.context_parallel_size,
             bf16=True,
             rope_type=rope_type,
@@ -828,37 +919,43 @@ class TestContextParallelMLAAttentionPrecision:
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
-            query_sbhd, key_sbhd, value_sbhd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_sbhd, None, None, None, None
+            query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states_sbhd, None, None, None, None
+                )
             )
-            query_thd, key_thd, value_thd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_thd, None, None, packed_seq_params, None
+            query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states_thd, None, None, packed_seq_params, None
+                )
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
             _key_sbhd = key_sbhd.transpose(0, 1).contiguous().view(*key_thd.shape)
             _value_sbhd = value_sbhd.transpose(0, 1).contiguous().view(*value_thd.shape)
+            _q_compressed_sbhd = (
+                q_compressed_sbhd.transpose(0, 1).contiguous().view(*q_compressed_thd.shape)
+            )
+            _kv_compressed_sbhd = (
+                kv_compressed_sbhd.transpose(0, 1).contiguous().view(*kv_compressed_thd.shape)
+            )
             torch.testing.assert_close(_query_sbhd, query_thd, atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(_key_sbhd, key_thd, atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(_value_sbhd, value_thd, atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(_q_compressed_sbhd, q_compressed_thd, atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(_kv_compressed_sbhd, kv_compressed_thd, atol=1e-6, rtol=1e-6)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -917,7 +1014,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             qk_pos_emb_head_dim=64,
             rope_type="yarn",
             rotary_base=10000,
-            max_position_embeddings=32,
+            original_max_position_embeddings=32,
             deterministic_mode=True,
             hidden_dropout=0.0,
             attention_dropout=0.0,
@@ -967,37 +1064,43 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
-            query_sbhd, key_sbhd, value_sbhd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_sbhd, None, None, None, None
+            query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states_sbhd, None, None, None, None
+                )
             )
-            query_thd, key_thd, value_thd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_thd, None, None, packed_seq_params, None
+            query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states_thd, None, None, packed_seq_params, None
+                )
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
             _key_sbhd = key_sbhd.transpose(0, 1).contiguous().view(*key_thd.shape)
             _value_sbhd = value_sbhd.transpose(0, 1).contiguous().view(*value_thd.shape)
+            _q_compressed_sbhd = (
+                q_compressed_sbhd.transpose(0, 1).contiguous().view(*q_compressed_thd.shape)
+            )
+            _kv_compressed_sbhd = (
+                kv_compressed_sbhd.transpose(0, 1).contiguous().view(*kv_compressed_thd.shape)
+            )
             assert torch.equal(_query_sbhd, query_thd)
             assert torch.equal(_key_sbhd, key_thd)
             assert torch.equal(_value_sbhd, value_thd)
+            assert torch.equal(_q_compressed_sbhd, q_compressed_thd)
+            assert torch.equal(_kv_compressed_sbhd, kv_compressed_thd)
 
-            core_attn_out_sbhd = self.parallel_attention.core_attention(
-                query_sbhd,
-                key_sbhd,
-                value_sbhd,
-                attention_mask_sbhd,
-                packed_seq_params=None,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
+            core_attn_out_sbhd = self.parallel_attention._run_core_attention(
+                query_sbhd, key_sbhd, value_sbhd, attention_mask_sbhd, packed_seq_params=None
             )
             query_thd = query_thd.squeeze(1)
             key_thd = key_thd.squeeze(1)
             value_thd = value_thd.squeeze(1)
-            core_attn_out_thd = self.parallel_attention.core_attention(
+            core_attn_out_thd = self.parallel_attention._run_core_attention(
                 query_thd,
                 key_thd,
                 value_thd,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
-                attn_mask_type=self.parallel_attention.attn_mask_type,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -1032,6 +1135,234 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
 
             os.environ.clear()
             os.environ.update(_environ)
+
+
+@pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="QK clipping requires TE >= 2.9.0")
+@pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
+class TestMLAClipQK:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self, rope_type):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type=rope_type,
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_clip_qk_disabled_raises_error(self):
+        """Test that clip_qk raises ValueError when qk_clip is not enabled."""
+        if is_te_min_version("1.10.0"):
+            # Create config without qk_clip
+            config = MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=128,
+                qk_pos_emb_head_dim=64,
+                rotary_base=10000,
+                original_max_position_embeddings=32,
+                qk_clip=False,
+            )
+            attention = MLASelfAttention(
+                config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+            with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
+                attention.clip_qk()
+
+    def test_clip_qk_none_logits_raises_error(self):
+        """Test that clip_qk raises ValueError when current_max_attn_logits is None."""
+        if is_te_min_version("1.10.0"):
+            attention = MLASelfAttention(
+                self.transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+            with pytest.raises(ValueError, match="current_max_attn_logits is None"):
+                attention.clip_qk()
+
+    def test_clip_qk_below_threshold_no_update(self):
+        """Test that weights are not updated when max logits are below threshold."""
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+
+        attention = MLASelfAttention(
+            self.transformer_config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        attention.cuda()
+
+        # Save original weights
+        if self.transformer_config.q_lora_rank is None:
+            original_q_weight = attention.linear_q_proj.weight.data.clone()
+        else:
+            original_q_weight = attention.linear_q_up_proj.weight.data.clone()
+        original_kv_weight = attention.linear_kv_up_proj.weight.data.clone()
+
+        # Set current_max_attn_logits below threshold
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [50.0, 60.0, 70.0, 80.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should not be updated
+        if self.transformer_config.q_lora_rank is None:
+            assert torch.equal(attention.linear_q_proj.weight.data, original_q_weight)
+        else:
+            assert torch.equal(attention.linear_q_up_proj.weight.data, original_q_weight)
+        assert torch.equal(attention.linear_kv_up_proj.weight.data, original_kv_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_above_threshold_updates_weights(self):
+        """Test that weights are updated when max logits exceed threshold."""
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+
+        attention = MLASelfAttention(
+            self.transformer_config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        attention.cuda()
+
+        # Save original weights
+        if self.transformer_config.q_lora_rank is None:
+            original_q_weight = attention.linear_q_proj.weight.data.clone()
+        else:
+            original_q_weight = attention.linear_q_up_proj.weight.data.clone()
+        original_kv_weight = attention.linear_kv_up_proj.weight.data.clone()
+
+        # Set current_max_attn_logits above threshold
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [150.0, 160.0, 170.0, 180.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should be updated
+        if self.transformer_config.q_lora_rank is None:
+            assert not torch.equal(attention.linear_q_proj.weight.data, original_q_weight)
+        else:
+            assert not torch.equal(attention.linear_q_up_proj.weight.data, original_q_weight)
+        assert not torch.equal(attention.linear_kv_up_proj.weight.data, original_kv_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_mixed_logits(self):
+        """Test clip_qk with mixed logits (some above, some below threshold)."""
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+
+        attention = MLASelfAttention(
+            self.transformer_config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        attention.cuda()
+
+        # Save original weights
+        if self.transformer_config.q_lora_rank is None:
+            original_q_weight = attention.linear_q_proj.weight.data.clone()
+        else:
+            original_q_weight = attention.linear_q_up_proj.weight.data.clone()
+        original_kv_weight = attention.linear_kv_up_proj.weight.data.clone()
+
+        # Set mixed current_max_attn_logits (some above, some below threshold)
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [80.0, 150.0, 90.0, 200.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should be updated since at least one head exceeds threshold
+        if self.transformer_config.q_lora_rank is None:
+            assert not torch.equal(attention.linear_q_proj.weight.data, original_q_weight)
+        else:
+            assert not torch.equal(attention.linear_q_up_proj.weight.data, original_q_weight)
+        assert not torch.equal(attention.linear_kv_up_proj.weight.data, original_kv_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_with_absorption_raises_error(self):
+        """Test that clip_qk raises ValueError when in absorption mode."""
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+
+        # Create config with cache_mla_latents enabled
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = MLASelfAttention(
+            config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        attention.cuda()
+
+        # Simulate absorption mode by setting cache_mla_latents and deleting linear_kv_up_proj
+        attention.cache_mla_latents = True
+        if hasattr(attention, 'linear_kv_up_proj'):
+            delattr(attention, 'linear_kv_up_proj')
+
+        # Set current_max_attn_logits
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [150.0, 160.0, 170.0, 180.0], device='cuda'
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="qk_clip is not supported when cache_mla_latents is enabled and absorption is active",
+        ):
+            attention.clip_qk()
 
 
 @pytest.mark.experimental
@@ -1082,7 +1413,9 @@ def test_parallel_multi_latent_attention_correctness(
     hidden_size = 128
 
     # Model initialization function
-    def initialize_gpt_model(config, pre_process=True, post_process=True, vp_stage=None):
+    def initialize_gpt_model(
+        pre_process=True, post_process=True, vp_stage=None, pg_collection=None, config=None
+    ):
         layer_spec = get_gpt_layer_with_transformer_engine_spec(multi_latent_attention=True)
         gpt_model = GPTModel(
             config=config,
@@ -1121,7 +1454,7 @@ def test_parallel_multi_latent_attention_correctness(
         v_head_dim=128,
         qk_pos_emb_head_dim=64,
         rotary_base=10000,
-        max_position_embeddings=64,
+        original_max_position_embeddings=64,
         context_parallel_size=1,
         tensor_model_parallel_size=1,
         sequence_parallel=False,
@@ -1141,9 +1474,7 @@ def test_parallel_multi_latent_attention_correctness(
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(
-            get_model(partial(initialize_gpt_model, config=transformer_config))
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
 
         # Initialize args and save checkpoint
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -1178,9 +1509,7 @@ def test_parallel_multi_latent_attention_correctness(
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
-        gpt_model = unwrap_model(
-            get_model(partial(initialize_gpt_model, config=transformer_config))
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
                 load_checkpoint(gpt_model, None, None)
@@ -1270,3 +1599,274 @@ def test_parallel_multi_latent_attention_correctness(
 
     os.environ.clear()
     os.environ.update(_environ)
+
+
+@pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
+class TestFusedMLASelfAttention:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self, rope_type):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type=rope_type,
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+        )
+        self.fused_attention = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_constructor(self):
+        assert isinstance(self.fused_attention, FusedMLASelfAttention)
+        assert isinstance(self.fused_attention, MLASelfAttention)
+        assert self.fused_attention.layer_number == 1
+        assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
+
+    def test_fused_weight_shape(self):
+        config = self.transformer_config
+        expected_out = config.q_lora_rank + config.kv_lora_rank + config.qk_pos_emb_head_dim
+        weight = self.fused_attention.linear_qkv_down_proj.weight
+        assert weight.shape[0] == expected_out
+        assert weight.shape[1] == config.hidden_size
+
+    def test_qkv_down_projection_split(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+        config = self.transformer_config
+        self.fused_attention.cuda()
+
+        seq_len, batch = 16, 2
+        hidden = torch.randn(seq_len, batch, config.hidden_size).cuda()
+        q_compressed, kv_combined = self.fused_attention._qkv_down_projection(hidden)
+
+        assert q_compressed.shape == (seq_len, batch, config.q_lora_rank)
+        assert kv_combined.shape == (
+            seq_len,
+            batch,
+            config.kv_lora_rank + config.qk_pos_emb_head_dim,
+        )
+
+    def test_gpu_forward(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        config = self.fused_attention.config
+        sequence_length = 32
+        micro_batch_size = 2
+
+        self.fused_attention.cuda()
+
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size)).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        output, bias = self.fused_attention(hidden_states, attention_mask)
+
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == config.hidden_size
+        assert bias.shape[0] == config.hidden_size
+
+    def test_gpu_forward_bf16(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        config = self.fused_attention.config
+        sequence_length = 32
+        micro_batch_size = 2
+
+        self.fused_attention.cuda().bfloat16()
+
+        hidden_states = (
+            torch.ones((sequence_length, micro_batch_size, config.hidden_size)).cuda().bfloat16()
+        )
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        output, bias = self.fused_attention(hidden_states, attention_mask)
+
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == config.hidden_size
+        assert output.dtype == torch.bfloat16
+
+
+class TestFusedMLAGradientFlow:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_backward_pass(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        config = self.transformer_config
+        fused = FusedMLASelfAttention(
+            config, get_fused_mla_submodules(), layer_number=1, attn_mask_type=AttnMaskType.causal
+        )
+        fused.cuda()
+
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(
+            seq_len, batch, config.hidden_size, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        output, bias = fused(hidden_states, attention_mask)
+        loss = output.sum()
+        loss.backward()
+
+        assert fused.linear_qkv_down_proj.weight.grad is not None
+        assert (
+            fused.linear_qkv_down_proj.weight.grad.shape == fused.linear_qkv_down_proj.weight.shape
+        )
+        assert hidden_states.grad is not None
+
+
+class TestFusedMLALoadFromStateDict:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_load_unfused_state_dict(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        unfused = MLASelfAttention(
+            self.transformer_config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        unfused_sd = unfused.state_dict()
+
+        q_down_keys = [k for k in unfused_sd if 'linear_q_down_proj' in k]
+        kv_down_keys = [k for k in unfused_sd if 'linear_kv_down_proj' in k]
+        assert len(q_down_keys) > 0, "Expected q_down_proj keys in unfused state dict"
+        assert len(kv_down_keys) > 0, "Expected kv_down_proj keys in unfused state dict"
+
+        fused.load_state_dict(unfused_sd, strict=False)
+
+        config = self.transformer_config
+        expected_out = config.q_lora_rank + config.kv_lora_rank + config.qk_pos_emb_head_dim
+        assert fused.linear_qkv_down_proj.weight.shape[0] == expected_out
+
+        q_w = unfused_sd['linear_q_down_proj.weight']
+        kv_w = unfused_sd['linear_kv_down_proj.weight']
+        expected_fused = torch.cat([q_w, kv_w], dim=0)
+        torch.testing.assert_close(fused.linear_qkv_down_proj.weight.data, expected_fused)
+
+    def test_sharded_state_dict_splits_back(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        sharded_sd = fused.sharded_state_dict(prefix="")
+        assert any(
+            'linear_q_down_proj.weight' in k for k in sharded_sd
+        ), f"Expected linear_q_down_proj.weight in sharded state dict, got keys: {list(sharded_sd.keys())}"
+        assert any(
+            'linear_kv_down_proj.weight' in k for k in sharded_sd
+        ), f"Expected linear_kv_down_proj.weight in sharded state dict, got keys: {list(sharded_sd.keys())}"
+        assert not any(
+            'linear_qkv_down_proj.weight' in k for k in sharded_sd
+        ), f"Unexpected linear_qkv_down_proj.weight in sharded state dict"
+
+
+class TestFusedMLARequiresQLora:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_raises_without_q_lora_rank(self):
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=None,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+        )
+        with pytest.raises(AssertionError, match="q_lora_rank"):
+            FusedMLASelfAttention(
+                config,
+                get_fused_mla_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )

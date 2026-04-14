@@ -27,10 +27,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
     is_main_replica,
 )
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
     SaveShardedStrategy,
@@ -68,7 +64,7 @@ class MockLoadStrategy(LoadShardedStrategy):
         self.device = device
         self.load_keys = set()
 
-    def load(self, sharded_state_dict, ckpt_dir):
+    def load(self, sharded_state_dict, ckpt_dir, async_strategy="nvrx"):
         for sh_ten in nested_values(sharded_state_dict):
             if is_main_replica(sh_ten.replica_id):
                 self.load_keys.add(sh_ten.key)
@@ -363,10 +359,13 @@ class TestFullyParallelSaveAndLoad:
 
         mem_alloc_start = torch.cuda.memory_allocated()
 
-        with mock.patch(
-            'megatron.core.dist_checkpointing.exchange_utils._get_empty_tensor_for_exchange',
-            new=mock_get_empty_tensor_for_exchange,
-        ), TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+        with (
+            mock.patch(
+                'megatron.core.dist_checkpointing.exchange_utils._get_empty_tensor_for_exchange',
+                new=mock_get_empty_tensor_for_exchange,
+            ),
+            TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A,
+        ):
             _ = load_strategy.load(sharded_state_dict, ckpt_dir_A)
 
         # Each rank is expected to do 9 allocations for all shards loaded by some other rank.
@@ -588,7 +587,7 @@ class TestCrossRanksReads:
         state_dict = self.get_sharded_state_dict(ranks_placement)
         with TempNamedDir(tmp_path_dist_ckpt / 'determine_cross_rank_reads') as ckpt_dir:
             save_strategy = FullyParallelSaveStrategyWrapper(
-                get_default_save_sharded_strategy(), parallelization_group
+                TorchDistSaveShardedStrategy(), parallelization_group
             )
             save_strategy.save(state_dict, ckpt_dir)
 
