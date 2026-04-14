@@ -37,7 +37,7 @@ MODEL_ARGS:
   --manual-gc-interval: 10
   --no-create-attention-mask-in-dataloader: true
   --num-workers: 1
-  --exit-interval: 51000
+  --exit-interval: 1000
   --override-opt_param-scheduler: true
 
   # Network size args
@@ -137,7 +137,7 @@ MODEL_ARGS:
   --eval-iters: 14
 
   # Logging args
-  --log-interval: 100
+  --log-interval: 1
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-timers-to-tensorboard: true
@@ -145,10 +145,10 @@ MODEL_ARGS:
   --log-throughput: true
   --log-progress: true
   --log-energy: true
-  --log-memory-interval: 500
+  --log-memory-interval: 50
   --logging-level: 20
   --timing-log-option: minmax
-  --check-weight-hash-across-dp-replicas-interval: 20000
+  --check-weight-hash-across-dp-replicas-interval: 2000
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-entity: adlr
