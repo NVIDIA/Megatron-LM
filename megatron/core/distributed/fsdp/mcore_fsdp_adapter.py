@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import logging
-from typing import List, Optional
+import random
+from typing import Dict, List, Optional
 
 try:
     import einops
@@ -22,8 +23,10 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
+import numpy as np
 import torch
 import torch.distributed as dist
+from torch import nn
 
 try:
     from torch.distributed import DeviceMesh
@@ -32,17 +35,21 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
+    from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+        FSDPDistributedIndex,
+        MegatronFSDP,
+        MixedPrecisionPolicy,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -56,6 +63,32 @@ class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
     """
+
+    # Module type registry (forked from Megatron-Bridge param_mapping utilities).
+    _MODULE_TYPE_REGISTRY: Dict[str, set] = {
+        "column": {
+            "ColumnParallelLinear",
+            "TEColumnParallelLinear",
+            "TELayerNormColumnParallelLinear",
+            "TEColumnParallelGroupedLinear",
+            "VocabParallelEmbedding",
+            "DotProductAttention",  # for attention sink only
+            "TEDotProductAttention",  # for attention sink only
+        },
+        "row": {"RowParallelLinear", "TERowParallelLinear", "TERowParallelGroupedLinear"},
+        "replicated": {
+            # Normalization layers
+            "TENorm",
+            "FusedLayerNorm",
+            "WrappedTorchNorm",
+            "LayerNorm",
+            "RMSNorm",
+            "L2Norm",
+            # Other non-parallel modules
+            "IdentityOp",
+            "TopKRouter",
+        },
+    }
 
     def __init__(
         self,
@@ -73,14 +106,41 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        self.num_moe_experts = getattr(config, "num_moe_experts", None)
+
         self.ddp_config = ddp_config
         log_single_rank(
             logger,
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
+        self.mp_policy = MixedPrecisionPolicy(
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
+            # Grandfathered Argument: grad_reduce_in_fp32
+            main_grads_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_main_grads_dtype
+            ),
+            grad_comm_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Setting up Megatron-FSDP MixedPrecisionPolicy with config {self.mp_policy}',
+        )
 
         self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
+
+        if config.gradient_accumulation_fusion:
+            assert is_te_min_version("2.10"), (
+                "Megatron-FSDP with gradient_accumulation_fusion requires "
+                "Transformer Engine version 2.10 or higher."
+            )
 
         self.bucket_size = self.ddp_config.bucket_size
         if disable_bucketing:
@@ -95,10 +155,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
             else:
                 self.fsdp_unit_modules = []
 
+        self._annotate_tensor_parallelism(module)
+
         super().__init__(
             config=config,
             module=MegatronFSDP(
                 ddp_config=ddp_config,
+                mixed_precision_policy=self.mp_policy,
                 module=module,
                 fsdp_unit_modules=self.fsdp_unit_modules,
                 disable_bucketing=disable_bucketing,
@@ -106,6 +169,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
+                enable_fine_grained_param_gather_hook=(
+                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
+                ),
             ),
         )
         self.param_and_grad_buffer = self.module.param_and_grad_buffer
@@ -116,8 +182,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.scale_gradients = self.module.scale_gradients
         self.zero_grad_buffer = self.module.zero_grad_buffer
         self.broadcast_params = self.module.broadcast_params
+        self.synchronize_param_gather = self.module.synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
+        self.module.config = config
+
+        self.sync_rng_states_across_tp_group()
 
     def load_state_dict(self, state_dict, strict=True):
         """
@@ -141,6 +211,76 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module.load_state_dict(custom_state_dict, strict=strict)
 
+    def _detect_parallelism_type(self, param_name: str, module: nn.Module) -> Optional[str]:
+        """
+        Infer tensor-parallelism type for a parameter under a given module
+        (forked from Megatron-Bridge).
+
+        Returns:
+            "column", "row", or "replicated" if a type can be inferred, else None.
+        """
+        module_type = type(module).__name__
+
+        # Handle fused modules like TELayerNormColumnParallelLinear
+        # These modules have both column-parallel weights (weight, bias)
+        # and replicated layer norm weights (layer_norm_weight, layer_norm_bias)
+        if module_type == "TELayerNormColumnParallelLinear":
+            # Check the actual parameter name to determine the correct parallelism type
+            if param_name.endswith("layer_norm_weight") or param_name.endswith("layer_norm_bias"):
+                return "replicated"
+            # All other parameters (weight, bias) are column-parallel
+            return "column"
+
+        # Check registry first
+        for parallelism, types in self._MODULE_TYPE_REGISTRY.items():
+            if module_type in types:
+                if parallelism == "row" and "bias" in param_name:
+                    return "replicated"
+                return parallelism
+
+        # Fallback to inspecting module attributes
+        if hasattr(module, "tensor_model_parallel"):
+            if not module.tensor_model_parallel:
+                return "replicated"
+
+            # Check partition dimension
+            partition_dim = getattr(module, "partition_dim", None)
+            if partition_dim == 0:
+                return "column"
+            elif partition_dim == 1:
+                if "bias" in param_name:
+                    return "replicated"
+                return "row"
+
+        # Fallback for normalization layers
+        if any(norm in module_type for norm in ["Norm", "Normalization"]):
+            return "replicated"
+
+        # Check parallel_mode for TELinear
+        if module_type == "TELinear":
+            if module.parallel_mode == "column":
+                return "column"
+            elif module.parallel_mode == "row":
+                if "bias" in param_name:
+                    return "replicated"
+                return "row"
+            else:
+                return "replicated"
+
+        return None
+
+    def _annotate_tensor_parallelism(self, root_module: nn.Module) -> None:
+        """Annotate parameters under root_module with inferred tensor-parallel metadata.
+
+        Each parameter that can be classified will get a `_tensor_parallel_mode` attribute
+        set to one of: "column", "row", or "replicated".
+        """
+        for submodule in root_module.modules():
+            for name, param in submodule.named_parameters(recurse=False):
+                detected_type = self._detect_parallelism_type(name, submodule)
+                if detected_type is not None:
+                    setattr(param, "_tensor_parallel_mode", detected_type)
+
     def _init_dist_index(self, pg_collection):
         """
         Initialize the distributed index for the module.
@@ -154,6 +294,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         enable_hsdp = self.ddp_config.num_distributed_optimizer_instances > 1
         if pg_collection is None:
             tp_group = parallel_state.get_tensor_model_parallel_group()
+            expt_tp_group = parallel_state.get_expert_tensor_parallel_group()
             if enable_hsdp:
                 dp_cp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=True
@@ -162,28 +303,66 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 hybrid_fsdp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
                 )
+                expt_dp_group = parallel_state.get_expert_data_parallel_group(
+                    partial_expert_data_parallel=True
+                )
+                hybrid_fsdp_expt_group = parallel_state.get_expert_data_parallel_group(
+                    partial_expert_data_parallel=False
+                )
+                ep_group = parallel_state.get_expert_model_parallel_group()
             else:
                 dp_cp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
                 )
                 outer_fsdp_group = None
                 hybrid_fsdp_group = None
+                expt_dp_group = parallel_state.get_expert_data_parallel_group()
+                ep_group = parallel_state.get_expert_model_parallel_group()
         else:
             tp_group = getattr(pg_collection, 'tp', None)
+            expt_tp_group = getattr(pg_collection, 'expt_tp', None)
             if enable_hsdp:
                 dp_cp_group = pg_collection.intra_dp_cp
                 outer_fsdp_group = pg_collection.inter_dist_opt
                 hybrid_fsdp_group = pg_collection.dp_cp
+                # This has not been tested yet.
+                expt_dp_group = getattr(pg_collection, 'intra_expt_dp', None)
+                hybrid_fsdp_expt_group = getattr(pg_collection, 'expt_dp', None)
+                ep_group = getattr(pg_collection, 'ep', None)
             else:
                 dp_cp_group = pg_collection.dp_cp
                 outer_fsdp_group = None
                 hybrid_fsdp_group = None
+                expt_dp_group = getattr(pg_collection, 'expt_dp', None)
+                ep_group = getattr(pg_collection, 'ep', None)
 
         if tp_group is None:
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
             tp_group = single_rank_group
 
+        if expt_tp_group is None:
+            single_rank_group = dist.new_group(ranks=[dist.get_rank()])
+            expt_tp_group = single_rank_group
+
+        # Extract AG groups from pg_collection for explicit passing
+        dp_cp_ag = getattr(pg_collection, 'dp_cp_ag', None) if pg_collection is not None else None
+        expt_dp_ag = (
+            getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
+        )
+
         if enable_hsdp:
+            if self.num_moe_experts is not None:
+                expt_mesh = _get_hsdp_tp_mesh(
+                    outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size()
+                )
+                expt_device_mesh = DeviceMesh.from_group(
+                    [outer_fsdp_group, expt_dp_group, expt_tp_group],
+                    device_type="cuda",
+                    mesh=expt_mesh.tolist(),
+                    mesh_dim_names=["outer_fsdp_dp", "dp_cp", "tp"],
+                )
+            else:
+                expt_device_mesh = None
             mesh = _get_hsdp_tp_mesh(outer_fsdp_group, dp_cp_group, tp_group)
             dist_index = FSDPDistributedIndex(
                 hsdp_outer_dp_shard=self.ddp_config.outer_dp_sharding_strategy != "no_shard",
@@ -197,8 +376,23 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
                 hybrid_fsdp_group=hybrid_fsdp_group,
+                hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
+                expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
         else:
+            if self.num_moe_experts is not None:
+                expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
+                expt_device_mesh = DeviceMesh.from_group(
+                    [expt_dp_group, expt_tp_group],
+                    device_type="cuda",
+                    mesh=expt_mesh.tolist(),
+                    mesh_dim_names=["dp_cp", "tp"],
+                )
+            else:
+                expt_device_mesh = None
+
             mesh = _get_dp_tp_mesh(dp_cp_group, tp_group)
             dist_index = FSDPDistributedIndex(
                 device_mesh=DeviceMesh.from_group(
@@ -209,7 +403,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 ),
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
+                expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
+
+        self.tp_group = tp_group
 
         return dist_index
 
@@ -220,23 +419,39 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.synchronize_gradient_reduce()
         self.module.synchronize_param_gather()
 
+    def sync_rng_states_across_tp_group(self):
+        """
+        Synchronize the tensor parallel random number generator states.
+        """
+        if self.tp_group.size() <= 1:
+            return
 
-def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
+        if self.tp_group.rank() == 0:
+            broadcast_list = [_get_rng_state_dict()]
+        else:
+            broadcast_list = [None]
+        torch.distributed.broadcast_object_list(broadcast_list, group=self.tp_group, group_src=0)
+        _load_rng_state_dict(broadcast_list[0])
+
+
+def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()
 
     mesh = einops.rearrange(
         torch.arange(world_size),
-        "(outer_fsdp_dp fsdp tp) -> outer_fsdp_dp fsdp tp",
+        "(outer_fsdp_dp fsdp ep tp) -> ep outer_fsdp_dp fsdp tp",
         outer_fsdp_dp=outer_fsdp_dp_group.size(),
         tp=tp_group.size(),
+        ep=ep_size,
     )
 
     mesh_fsdp_ranks = einops.rearrange(
         mesh,
-        'outer_fsdp_dp fsdp tp -> (outer_fsdp_dp tp) fsdp',
+        'ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp ep tp) fsdp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
+        ep=ep_size,
     )
     fsdp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_fsdp_ranks, fsdp_group_ranks), (
@@ -246,7 +461,7 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
 
     mesh_tp_ranks = einops.rearrange(
         mesh,
-        'outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp) tp',
+        'ep outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp ep) tp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
     )
@@ -258,9 +473,10 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
 
     mesh_outer_fsdp_dp_ranks = einops.rearrange(
         mesh,
-        'outer_fsdp_dp fsdp tp -> (fsdp tp) outer_fsdp_dp',
+        'ep outer_fsdp_dp fsdp tp -> (fsdp ep tp) outer_fsdp_dp',
         tp=tp_group.size(),
         fsdp=dp_cp_group.size(),
+        ep=ep_size,
     )
     outer_fsdp_dp_group_ranks = dist.get_process_group_ranks(outer_fsdp_dp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(
@@ -270,32 +486,63 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
         f"do not match the ranks in the Outer FSDP DP group {outer_fsdp_dp_group_ranks}."
     )
 
-    return mesh
+    # Exclude the expert parallel dimension
+    rank = dist.get_rank()
+    dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
+    assert (
+        len(dp_tp_meshes) == 1
+    ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
+    assert (
+        len(dp_tp_meshes[0].reshape(-1).tolist())
+        == outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()
+    ), (
+        f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
+        f"does not match the expected size"
+        f"{outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()}."
+    )
+    return dp_tp_meshes[0]
 
 
-def _get_dp_tp_mesh(dp_cp_group, tp_group):
+def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()
 
     tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
-    # TODO: Supports configurable (dp, cp, tp) order.
-    mesh = einops.rearrange(torch.arange(world_size), "(dp_cp tp) -> dp_cp tp", tp=tp_size)
+    # TODO: Supports configurable (dp, cp, ep, tp) order.
+    mesh = einops.rearrange(
+        torch.arange(world_size),
+        "(dp_cp ep tp) -> ep dp_cp tp",
+        dp_cp=dp_cp_group.size(),
+        tp=tp_size,
+        ep=ep_size,
+    )
 
-    mesh_dp_ranks = einops.rearrange(mesh, 'dp_cp tp -> tp dp_cp', tp=tp_size)
+    mesh_dp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (ep tp) dp_cp', dp_cp=dp_cp_group.size())
     dp_cp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_dp_ranks, dp_cp_group_ranks), (
         f"[Megatron-FSDP] Data Parallel ranks in the mesh {mesh_dp_ranks} "
         f"do not match the ranks in the DP group {dp_cp_group_ranks}."
     )
 
-    mesh_tp_ranks = einops.rearrange(mesh, 'dp_cp tp -> (dp_cp) tp', tp=tp_size)
+    mesh_tp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (dp_cp ep) tp', tp=tp_size)
     tp_group_ranks = dist.get_process_group_ranks(tp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_tp_ranks, tp_group_ranks), (
         f"[Megatron-FSDP] Tensor Parallel ranks in the mesh {mesh_tp_ranks} "
         f"do not match the ranks in the TP group {tp_group_ranks}."
     )
 
-    return mesh
+    # Exclude the expert parallel dimension
+    rank = dist.get_rank()
+    dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
+    assert (
+        len(dp_tp_meshes) == 1
+    ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
+    assert len(dp_tp_meshes[0].reshape(-1).tolist()) == dp_cp_group.size() * tp_group.size(), (
+        f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
+        f"does not match expected size {dp_cp_group.size() * tp_group.size()}."
+    )
+
+    return dp_tp_meshes[0]
 
 
 def _check_mesh_ranks_and_group_ranks_are_consistent(mesh_ranks, group_ranks):
@@ -310,3 +557,22 @@ def _check_mesh_ranks_and_group_ranks_are_consistent(mesh_ranks, group_ranks):
         f"{mesh_ranks.tolist()} does not match the group ranks {group_ranks}."
     )
     return sorted(current_ranks[0]) == sorted(group_ranks)
+
+
+def _get_rng_state_dict():
+    rng_state_dict = {
+        'random_rng_state': random.getstate(),
+        'np_rng_state': np.random.get_state(),
+        'torch_rng_state': torch.get_rng_state(),
+        'cuda_rng_state': torch.cuda.get_rng_state(),
+        'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states(),
+    }
+    return rng_state_dict
+
+
+def _load_rng_state_dict(rng_state_dict):
+    random.setstate(rng_state_dict['random_rng_state'])
+    np.random.set_state(rng_state_dict['np_rng_state'])
+    torch.set_rng_state(rng_state_dict['torch_rng_state'])
+    torch.cuda.set_rng_state(rng_state_dict['cuda_rng_state'])
+    tensor_parallel.get_cuda_rng_tracker().set_states(rng_state_dict['rng_tracker_states'])

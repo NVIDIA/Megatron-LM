@@ -1,8 +1,45 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import torch
-from datasets import load_dataset
+import inspect
+import os
 
+import modelopt
+import modelopt.torch.quantization as mtq
+import torch
+from modelopt.torch.quantization.utils import is_quantized
+from packaging.version import Version
+
+from megatron.core import parallel_state
+from megatron.training.utils import unwrap_model
+
+
+def modelopt_version_higher_than(target_version: str):
+    """Check if Model-Optimizer is greater than this version."""
+    info = "rank {:3}/{:3} checking if nvidia-modelopt-{} is higher than {}".format(
+        torch.distributed.get_rank(),
+        torch.distributed.get_world_size(),
+        str(modelopt.__version__),
+        target_version,
+    )
+    print(info)
+    return Version(modelopt.__version__) > Version(target_version)
+
+def modelopt_version_at_least(target_version: str):
+    """Check if Model-Optimizer is greater or equal than this version."""
+    info = "rank {:3}/{:3} checking if nvidia-modelopt-{} is at least {}".format(
+        torch.distributed.get_rank(),
+        torch.distributed.get_world_size(),
+        str(modelopt.__version__),
+        target_version,
+    )
+    print(info)
+    return Version(modelopt.__version__) >= Version(target_version)
+
+
+def function_has_parameter(function, argument_name: str) -> bool:
+    """Check if a function has a specific argument."""
+    sig = inspect.signature(function)
+    return argument_name in sig.parameters
 
 def get_current_memory_info():
     """Get current memory usage."""
@@ -25,6 +62,7 @@ def report_current_memory_info():
 
 def get_mtbench_chat_data():
     """Return a MTBench dataset."""
+    from datasets import load_dataset
 
     def mtbench_to_oai_chat(example):
         """Convert MTBench data to OpenAI chat completion format."""
@@ -34,12 +72,15 @@ def get_mtbench_chat_data():
         example["conversations"] = conversations
         return example
 
-    dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
+    dataset = load_dataset(
+        "HuggingFaceH4/mt_bench_prompts", split="train", token=os.environ.get("HF_TOKEN", None)
+    )
     return dataset.map(mtbench_to_oai_chat)
+
 
 def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=True):
     """Move tensors to device if not meta device; otherwise materialize with empty_like().
-   
+
     Args:
         module: The target module to apply this transformation.
         device: The desired device of the parameters
@@ -54,6 +95,34 @@ def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=T
         else:
             return tensor.to(device)
 
-    module._apply(
-        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
-    )
+    module._apply(lambda t: _empty_like_if_meta(t, device=device), recurse=recurse)
+
+
+def print_distributed_quant_summary(model, msg=""):
+    from megatron.core import parallel_state
+    from megatron.training import print_rank_0
+    from megatron.training.utils import unwrap_model
+
+    unwrapped_model = unwrap_model(model)
+    if isinstance(unwrapped_model, list):
+        unwrapped_model = unwrapped_model[0]
+
+    if not is_quantized(unwrapped_model):
+        return
+
+    print_rank_0(f"{msg}\nQuantization summary of unwrapped model: {unwrapped_model}\n{'_'*80}")
+
+    if not torch.distributed.is_initialized():
+        mtq.print_quant_summary(unwrapped_model)
+        return
+
+    # Only print from unique TP ranks of [0, 1]
+    if parallel_state.get_data_parallel_rank(
+        with_context_parallel=True
+    ) == 0 and parallel_state.get_tensor_model_parallel_rank() in [0, 1]:
+        TP_rank = parallel_state.get_tensor_model_parallel_rank()
+        EP_rank = parallel_state.get_expert_model_parallel_rank()
+        PP_rank = parallel_state.get_pipeline_model_parallel_rank()
+        print(f"\nTP rank {TP_rank}, EP rank {EP_rank}, PP rank {PP_rank}")
+        print("_" * 80)
+        mtq.print_quant_summary(unwrapped_model)

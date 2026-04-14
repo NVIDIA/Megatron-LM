@@ -1,9 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
+
 import gc
 import logging
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Protocol, cast
 
 import numpy as np
 import torch
@@ -23,8 +26,8 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     nvtx_range_pop,
@@ -42,7 +45,91 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# pylint: disable=missing-class-docstring
+class LinearFc1Interface(Protocol):
+    """Interface for linear_fc1 module in MLP."""
+
+    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward method for linear_fc1 module."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward method for linear_fc1 module."""
+        ...
+
+
+class LinearFc1Builder(Protocol):
+    """Protocol describing how to build a linear_fc1 layer in MLP."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str | None,
+        tp_group: torch.distributed.ProcessGroup | None,
+        stride: int = 1,
+    ) -> LinearFc1Interface:
+        """Builds a linear_fc1 layer for MLP."""
+        ...
+
+
+class TEActivationFunctionInterface(Protocol):
+    """Interface for activation_function module in MLP."""
+
+    def forward(self, input_: torch.Tensor, /) -> torch.Tensor:
+        """Forward method for activation_function module."""
+        ...
+
+
+class TEActivationFunctionBuilder(Protocol):
+    """Protocol for activation_function module in MLP."""
+
+    def __call__(self, *, config: TransformerConfig) -> TEActivationFunctionInterface:
+        """Builds an activation function module for MLP."""
+        ...
+
+
+class LinearFc2Interface(Protocol):
+    """Interface for linear_fc2 module in MLP."""
+
+    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward method for linear_fc2 module."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward method for linear_fc2 module."""
+        ...
+
+
+class LinearFc2Builder(Protocol):
+    """Protocol describing how to build a linear_fc2 layer in MLP."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str | None,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> LinearFc2Interface:
+        """Builds a linear_fc2 layer for MLP."""
+        ...
+
+
 @dataclass
 class MLPSubmodules:
     """
@@ -50,9 +137,14 @@ class MLPSubmodules:
     including  linear fc1, activation function, linear fc2.
     """
 
-    linear_fc1: Union[ModuleSpec, type] = None
-    activation_func: Union[ModuleSpec, type] = None
-    linear_fc2: Union[ModuleSpec, type] = None
+    linear_fc1: LinearFc1Builder
+
+    linear_fc2: LinearFc2Builder
+
+    activation_func: TEActivationFunctionBuilder | None = None
+    """
+    Builder for an activation function module; only used if config.use_te_activation_func is True.
+    """
 
 
 class MLP(MegatronModule):
@@ -78,7 +170,7 @@ class MLP(MegatronModule):
         submodules: MLPSubmodules,
         is_expert: bool = False,
         input_size: Optional[int] = None,
-        ffn_hidden_size: int = None,
+        ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
@@ -87,7 +179,7 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
-        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         if ffn_hidden_size is None:
             if is_expert:
                 raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
@@ -97,38 +189,52 @@ class MLP(MegatronModule):
                 DeprecationWarning,
                 stacklevel=2,
             )
-            ffn_hidden_size = self.config.ffn_hidden_size
+            ffn_hidden_size = not_none(self.config.ffn_hidden_size)
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
+        # For GLU/SwiGLU, use stride=2 because each TP rank stores interleaved [gate, up] portions.
+        # This is critical for correct weight resharding across different TP sizes.
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
+            fc1_stride = 2
+            if self.config.use_kitchen:
+                # Kitchen Linear doesn't support stride != 1.
+                # Weight resharding across TP sizes will have aforementioned problems.
+                fc1_stride = 1
+        else:
+            fc1_stride = 1
 
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
-            self.input_size,
+        # Use moe_latent_size only for routed experts. 'is_expert' is false for
+        # shared_experts.
+        use_latent_size = (self.config.moe_latent_size is not None) and is_expert
+
+        self.linear_fc1 = submodules.linear_fc1(
+            self.input_size if not use_latent_size else not_none(self.config.moe_latent_size),
             ffn_hidden_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            stride=fc1_stride,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
+            self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.config.ffn_hidden_size,
-            self.config.hidden_size,
+        self.linear_fc2 = submodules.linear_fc2(
+            not_none(self.config.ffn_hidden_size),
+            not_none(
+                self.config.hidden_size if not use_latent_size else self.config.moe_latent_size
+            ),
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -137,11 +243,13 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-    def forward(self, hidden_states, per_token_scale=None):
+    def forward(
+        self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
+    ):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
-        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
@@ -222,7 +330,10 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
-        output, output_bias = self.linear_fc2(intermediate_parallel)
+
+        output, output_bias = apply_module(self.linear_fc2)(
+            cast(torch.Tensor, intermediate_parallel)
+        )
         nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None and output_bias is not None:
@@ -295,89 +406,26 @@ def apply_swiglu_sharded_factory(
             )
             w_key = key
             v_key = key
-        if flattened_range is None:
-            tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
-            return [
-                ShardedTensor.from_rank_offsets(
-                    w_key,
-                    tensor_w,
-                    *sharded_offsets,
-                    offset_w,
-                    replica_id=replica_id,
-                    prepend_axis_num=prepend_axis_num,
-                ),
-                ShardedTensor.from_rank_offsets(
-                    v_key,
-                    tensor_v,
-                    *sharded_offsets,
-                    offset_v,
-                    replica_id=replica_id,
-                    prepend_axis_num=prepend_axis_num,
-                ),
-            ]
-        else:
-            if singleton_local_shards:
-                raise NotImplementedError(
-                    'singleton_local_shards not implemented for SwiGLU MLP flattened tensors'
-                )
-            # Here we need to map a slice `t` (`flattened_range` specifies slice start and stop)
-            # of the *original* flattened tensor into slices `w` and `v` of chunked
-            # and flattened tensor.
-            # Example:
-            # If original tensor has (16, 5) shape and flattened_range is `slice(8, 64)`,
-            # then `t` has shape `(56,)` and we need to create 2 tensors:
-            # w: first 32 elements of `t` with flattened_range slice(8, 40)
-            # v: last 24 elements of `t` with flattened_range slice(0, 24)
-            # Global offsets are the same as in the non-flattened case
-            assert t.ndim == 1, (key, t.shape)
-            non_flat_local_shape = (original_shape[0] // 2, *original_shape[1:])
-            chunk_numel = original_numel // 2
-            result = []
-            if flattened_range.start < chunk_numel:
-                # Non-empty `w` chunk
-                tensor_w = t[: chunk_numel - flattened_range.start]
-                flattened_range_w = slice(
-                    flattened_range.start, min(chunk_numel, flattened_range.stop)
-                )
-                assert len(tensor_w) == flattened_range_w.stop - flattened_range_w.start
-                result.append(
-                    ShardedTensor.from_rank_offsets_flat(
-                        key,
-                        tensor_w,
-                        non_flat_local_shape,
-                        *sharded_offsets,
-                        offset_w,
-                        replica_id=replica_id,
-                        prepend_axis_num=prepend_axis_num,
-                        flattened_range=flattened_range_w,
-                    )
-                )
-            if flattened_range.stop > chunk_numel:
-                # Non-empty `v` chunk
-                tensor_v = t[-(flattened_range.stop - chunk_numel) :]
-                flattened_range_v = slice(
-                    max(chunk_numel, flattened_range.start) - chunk_numel,
-                    flattened_range.stop - chunk_numel,
-                )
-                assert len(tensor_v) == flattened_range_v.stop - flattened_range_v.start, (
-                    len(tensor_v),
-                    flattened_range_v,
-                )
 
-                result.append(
-                    ShardedTensor.from_rank_offsets_flat(
-                        key,
-                        tensor_v,
-                        non_flat_local_shape,
-                        *sharded_offsets,
-                        offset_v,
-                        replica_id=replica_id,
-                        prepend_axis_num=prepend_axis_num,
-                        flattened_range=flattened_range_v,
-                    )
-                )
-            assert sum(sh_ten.data.numel() for sh_ten in result) == t.numel(), (result, t.shape)
-            return result
+        tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+        return [
+            ShardedTensor.from_rank_offsets(
+                w_key,
+                tensor_w,
+                *sharded_offsets,
+                offset_w,
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            ),
+            ShardedTensor.from_rank_offsets(
+                v_key,
+                tensor_v,
+                *sharded_offsets,
+                offset_v,
+                replica_id=replica_id,
+                prepend_axis_num=prepend_axis_num,
+            ),
+        ]
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():

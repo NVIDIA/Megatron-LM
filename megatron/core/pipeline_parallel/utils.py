@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Callable, Optional
@@ -7,7 +8,16 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -80,14 +90,37 @@ def make_viewless(e):
     return e
 
 
-@contextmanager
-def stream_acquire_context(stream, event):
-    """Stream acquire context"""
-    event.wait(stream)
+def set_ideal_affinity_for_current_gpu():
+    """Set CPU affinity for the current GPU to optimize host-device transfers."""
+    import uuid
+
     try:
-        yield
-    finally:
-        event.record(stream)
+        import cuda.bindings.driver as cuda_driver
+        import cuda.bindings.runtime as cuda_runtime
+    except:
+        try:
+            import cuda.cuda as cuda_driver
+            import cuda.cudart as cuda_runtime
+        except:
+            raise RuntimeError("Please install cuda-python to enable GPU affinity setting")
+    import pynvml
+
+    # Get current CUDA device ID
+    err, device_id = cuda_runtime.cudaGetDevice()
+    assert err == cuda_runtime.cudaError_t.cudaSuccess
+    # Get device UUID
+    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
+    assert err == cuda_driver.CUresult.CUDA_SUCCESS
+    # Set CPU affinity based on GPU's NUMA node
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
+    pynvml.nvmlDeviceSetCpuAffinity(handle)
+
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        f"Set CPU affinity for all GPUs for optimal host-device transfer performance",
+    )
 
 
 class NoopScheduleNode:
@@ -128,7 +161,7 @@ class ScheduleNode:
 
         Args:
             forward_func (callable): Function to execute during the forward pass.
-            stream (torch.cuda.Stream): The CUDA stream for this node's computation.
+            stream (Callable): Func that returns CUDA stream for computation.
                 This can be either a 'compute' stream or a 'communicate' stream.
                 - 'compute' stream: Used for computational nodes like attention and experts.
                 - 'communicate' stream: Used for nodes that handle token communication,
@@ -149,6 +182,8 @@ class ScheduleNode:
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
+        self.delay_grads_release = False
+        self.manual_release_grads = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -170,26 +205,24 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
-        with stream_acquire_context(self.stream, self.event):
-            torch.cuda.nvtx.range_push(f"{self.name} forward")
-            with torch.cuda.stream(self.stream):
-                self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
-                for i, input in enumerate(self.inputs):
-                    if input is not None:
-                        input.requires_grad = inputs[i].requires_grad
+        # Lazy initialization of stream
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
+        with self.stream_acquire_context(f"{self.name} forward"):
+            self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
+            for i, input in enumerate(self.inputs):
+                if input is not None:
+                    input.requires_grad = inputs[i].requires_grad
 
-                data = tuple(self.inputs)
-                data = self.forward_func(*data)
+            data = tuple(self.inputs)
+            data = self.forward_func(*data)
 
-                if not isinstance(data, tuple):
-                    data = make_viewless(data)
-                else:
-                    data = tuple(
-                        [make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data]
-                    )
+            if not isinstance(data, tuple):
+                data = make_viewless(data)
+            else:
+                data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
 
-                self.output = data
-            torch.cuda.nvtx.range_pop()
+            self.output = data
 
         # Immediately frees input tensors after they are used for nodes
         # where inputs are no longer needed after computation.
@@ -212,24 +245,30 @@ class ScheduleNode:
         return self._backward(*output_grad)
 
     def _backward(self, *output_grad):
-        with stream_acquire_context(self.stream, self.event):
-            torch.cuda.nvtx.range_push(f"{self.name} backward")
-            with torch.cuda.stream(self.stream):
-                outputs = self.output
-                if not isinstance(outputs, tuple):
-                    outputs = (outputs,)
-                assert len(outputs) == len(output_grad), (
-                    f"{len(outputs)} of {type(outputs[0])} is not equal to "
-                    f"{len(output_grad)} of {type(output_grad[0])}"
-                )
-                output_grad = self.backward_func(outputs, output_grad)
-            torch.cuda.nvtx.range_pop()
+        # Lazy initialization of stream
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
+        with self.stream_acquire_context(f"{self.name} backward"):
+            outputs = self.output
+            if not isinstance(outputs, tuple):
+                outputs = (outputs,)
+            assert len(outputs) == len(output_grad), (
+                f"{len(outputs)} of {type(outputs[0])} is not equal to "
+                f"{len(output_grad)} of {type(output_grad[0])}"
+            )
+            output_grad = self.backward_func(outputs, output_grad)
 
         # output_grad maybe from another stream
         if output_grad:
             for g in output_grad:
                 if g is not None:
                     g.record_stream(self.stream)
+                    # Manually trigger the memory release of dgrad tensor
+                    # to avoid delayed garbage collection. If
+                    # delay_grads_release is True, dgrad is last used in
+                    # wgrad compute and skip the release here.
+                    if self.manual_release_grads and not self.delay_grads_release:
+                        g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()
@@ -243,6 +282,30 @@ class ScheduleNode:
         if len(grad) == 1:
             grad = grad[0]
         return grad
+
+    @contextmanager
+    def stream_acquire_context(self, name=None):
+        """Stream acquire context that handles event synchronization,
+            NVTX profiling, and stream context.
+
+        This context manager consolidates:
+        1. Event wait/record for synchronization between streams
+        2. NVTX range for profiling (if name is provided)
+        3. torch.cuda.stream context for execution on the specified stream
+
+        Args:
+            name: Optional name for NVTX range profiling
+        """
+        self.event.wait(self.stream)
+        if name:
+            nvtx_range_push(name)
+        try:
+            with torch.cuda.stream(self.stream):
+                yield
+        finally:
+            if name:
+                nvtx_range_pop(name)
+            self.event.record(self.stream)
 
     def _release_state(self):
         """Clear the state of the node"""
@@ -273,32 +336,25 @@ class AbstractSchedulePlan(ABC):
         ...
 
 
+_USE_DYNAMIC_COMP_STREAM = None
 _COMP_STREAM = None
 _COMM_STREAM = None
 
 
-def set_streams(comp_stream=None, comm_stream=None):
-    """Set the streams for communication and computation"""
-    global _COMP_STREAM
+def set_streams(comm_stream=None):
+    """Set the stream for communication operations."""
     global _COMM_STREAM
-    if _COMP_STREAM is not None and _COMM_STREAM is not None:
-        return
 
-    if comp_stream is None:
-        comp_stream = torch.cuda.current_stream()
-    if comm_stream is None:
-        comm_stream = torch.cuda.Stream(device="cuda")
-
-    assert _COMP_STREAM is None
-    assert _COMM_STREAM is None
-    _COMP_STREAM = comp_stream
-    _COMM_STREAM = comm_stream
+    # Set communication stream
+    if _COMM_STREAM is None:
+        if comm_stream is None:
+            comm_stream = torch.cuda.Stream(device="cuda")
+        _COMM_STREAM = comm_stream
 
 
 def get_comp_stream():
     """Get the stream for computation"""
-    global _COMP_STREAM
-    return _COMP_STREAM
+    return torch.cuda.current_stream()
 
 
 def get_comm_stream():

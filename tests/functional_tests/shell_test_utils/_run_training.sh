@@ -8,7 +8,7 @@
 
 set -euxo pipefail
 
-echo "------ARGUMENTS LIST --------"
+set +x
 for ARGUMENT in "$@"; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
@@ -18,7 +18,7 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
-echo "---------------------------------"
+set -x
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(
@@ -39,9 +39,11 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+set +x
 # Envsubst model_params
 cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
 TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
+set -x
 
 # Pull env vars to export
 ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
@@ -122,8 +124,8 @@ else
                 value=$(echo "$value" | sed 's/^\[//;s/\]$//')
                 TRAINING_PARAMS_FROM_CONFIG+="$key $value "
 
-            # Case: contains spaces
-            elif [[ "$value" == *" "* ]]; then
+            # Case: contains spaces or shell metacharacters
+            elif [[ "$value" == *" "* || "$value" == *"|"* || "$value" == *"("* || "$value" == *")"* ]]; then
                 TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
             # Case: default
             else
@@ -157,7 +159,7 @@ MASTER_PORT=${MASTER_PORT:-6000}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
-LAST_RANK=7
+LAST_RANK=$((GPUS_PER_NODE - 1)) 
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
 
@@ -168,7 +170,7 @@ DISTRIBUTED_ARGS=(
     --master_port $MASTER_PORT
     --node_rank $NODE_RANK
     --log-dir $LOG_DIR
-    --tee "0:3,7:3"
+    --tee "0:3,$LAST_RANK:3"
     --redirects "3"
 )
 

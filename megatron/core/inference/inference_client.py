@@ -1,12 +1,13 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-import os
+import logging
 import time
-from typing import List, Union
+from typing import List, Optional, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
 
@@ -23,8 +24,6 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
-
-from .headers import Headers
 
 
 class InferenceClient:
@@ -52,13 +51,16 @@ class InferenceClient:
             completed requests.
     """
 
-    def __init__(self, inference_coordinator_port: int):
+    def __init__(self, inference_coordinator_address: str, deserialize: bool = False):
         """
         Initializes the InferenceClient.
 
         Args:
-            inference_coordinator_port (int): The port number on which the
+            inference_coordinator_address (str): The address on which the
                 inference coordinator is listening.
+            deserialize (bool): If True, deserialize completed requests
+                into DynamicInferenceRequest objects. If False (default), return
+                the raw serialized dict for lower overhead.
         """
         assert (
             HAVE_ZMQ
@@ -68,10 +70,16 @@ class InferenceClient:
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
-        inference_coordinator_address = os.getenv('MASTER_ADDR', '127.0.0.1')
-        socket.connect(f"tcp://{inference_coordinator_address}:{inference_coordinator_port}")
 
+        # Prevent socket.send() from thread-blocking at >1000 concurrent requests
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.RCVHWM, 0)
+
+        socket.connect(inference_coordinator_address)
+
+        self._loop = None
         self.socket = socket
+        self.deserialize = deserialize
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
@@ -90,40 +98,53 @@ class InferenceClient:
             prompt (str): The input prompt to send to the language model.
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
-                `serializable()` method.
+                `serialize()` method.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
-            `DynamicInferenceRequest` object containing the completed result.
+            `DynamicInferenceRequest` object (if deserialize=True) or a raw
+            serialized dict (if deserialize=False) containing the completed result.
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serializable()]
+        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_event_loop().create_future()
+        self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
-    async def _listen_for_completed_requests(self):
+    @trace_async_exceptions
+    async def _recv_task(self):
         """
         Listens for completed inference requests from the coordinator.
 
         This coroutine runs in an infinite loop, continuously polling the socket
-        for replies. When a reply is received, it unpacks the message, finds the
+        for data.
+        When a request reply is received, it unpacks the message, finds the
         corresponding Future using the request ID, and sets the result.
+        Other control packets are handled appropriately.
 
         This method is started as a background task by the `start()` method.
         """
         while True:
             try:
-                request_id, reply = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
-                reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
-                    request_id
-                )
-                completion_future = self.completion_futures.pop(request_id)
-                completion_future.set_result(DynamicInferenceRequest(**reply))
+                data = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
+                header = Headers(data[0])
+                if header == Headers.ENGINE_REPLY:
+                    request_id, reply = data[1:]
+                    reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
+                        request_id
+                    )
+                    completion_future = self.completion_futures.pop(request_id)
+                    if completion_future.done():
+                        logging.warning(f"Client: The future for {request_id} has been cancelled!")
+                        continue
+                    completed_request = (
+                        DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
+                    )
+                    completion_future.set_result(completed_request)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -134,48 +155,88 @@ class InferenceClient:
         """
         Performs the initial handshake with the inference coordinator.
 
-        Sends a CONNECT signal and waits for an ACK reply to ensure the
+        Sends a CONNECT signal and waits for a CONNECT_ACK reply to ensure the
         connection is established and acknowledged by the coordinator.
         """
         payload = [Headers.CONNECT.value]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
-        assert Headers(reply) == Headers.ACK
+        assert Headers(reply) == Headers.CONNECT_ACK
 
-    async def start(self):
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
         """
         Connects to the coordinator and starts the background listener task.
 
-        This method must be awaited before submitting any requests. It handles
+        This must be called before submitting any requests. It handles
         the initial handshake and spawns the `listen_for_completed_requests`
         coroutine.
         """
-        print("Client: Connecting to InferenceCoordinator...")
+        logging.info("Client: Connecting to InferenceCoordinator...")
+        self._loop = get_asyncio_loop(loop)
         self._connect_with_inference_coordinator()
-        self.listener_task = asyncio.create_task(self._listen_for_completed_requests())
+        self.listener_task = self._loop.create_task(self._recv_task())
 
-    def _send_signal_to_engines(self, signal):
+    def _send_signal_to_engines(self, signal, *args):
         """
         Sends a generic control signal to the inference coordinator.
 
         Args:
             signal: The signal to send, typically a value from the `Headers` enum.
+            *args: Optional extra values to include in the payload.
         """
-        payload = [signal.value]
+        payload = [signal.value, *args]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
     def pause_engines(self):
-        """Sends a signal to pause all inference engines."""
+        """Sends PAUSE to all engines via coordinator.
+
+        The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
+        then synchronizes via a world-wide barrier before transitioning to
+        PAUSED. Callers should await engine.paused for confirmation.
+        """
         self._send_signal_to_engines(Headers.PAUSE)
 
-    def unpause_engines(self):
-        """Sends a signal to unpause all inference engines."""
+    def unpause_engines(self) -> None:
+        """Sends UNPAUSE to all engines. No synchronization needed."""
         self._send_signal_to_engines(Headers.UNPAUSE)
 
+    def set_generation_epoch(self, generation_epoch: int):
+        """Sends a signal to stamp all in-flight requests with the given generation epoch.
+
+        Args:
+            generation_epoch: The current generation epoch number.
+        """
+        self._send_signal_to_engines(Headers.SET_GENERATION_EPOCH, generation_epoch)
+
+    def suspend_engines(self):
+        """Sends SUSPEND to all engines via coordinator. Requires PAUSED.
+
+        Callers should await engine.suspended for confirmation.
+        """
+        self._send_signal_to_engines(Headers.SUSPEND)
+
+    def resume_engines(self):
+        """Sends RESUME to all engines via coordinator. Requires SUSPENDED.
+
+        Callers should await engine.paused (or engine.running after UNPAUSE) for confirmation.
+        """
+        self._send_signal_to_engines(Headers.RESUME)
+
     def stop_engines(self):
-        """Sends a signal to gracefully stop all inference engines."""
+        """Sends STOP to all engines via coordinator. Requires PAUSED or SUSPENDED.
+
+        Callers should await engine.stopped for confirmation.
+        Does not affect the coordinator.
+        """
         self._send_signal_to_engines(Headers.STOP)
+
+    def shutdown_coordinator(self):
+        """Tells the coordinator process to exit its main loop.
+
+        Does not affect the engines.
+        """
+        self._send_signal_to_engines(Headers.SHUTDOWN)
 
     def stop(self):
         """
@@ -185,6 +246,12 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
-        self.listener_task.cancel()
-        self.socket.close()
+        if hasattr(self, 'listener_task') and not self.listener_task.done():
+            self.listener_task.cancel()
+        # Wake up any listeners.
+        for future in self.completion_futures.values():
+            if not future.done():
+                future.cancel()
+        self.completion_futures.clear()
+        self.socket.close(linger=0)
         self.context.term()

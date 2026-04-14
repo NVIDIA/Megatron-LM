@@ -46,6 +46,17 @@ class BridgeCommunicator:
       send_backward_recv_forward to be used by the pipeline schedule.
     """
 
+    # Cache broadcast PGs to avoid creating duplicate NCCL communicators for identical rank sets.
+    _broadcast_pg_cache: Dict[str, "torch.distributed.ProcessGroup"] = {}
+
+    @classmethod
+    def destroy_broadcast_pgs(cls):
+        """Destroy all cached broadcast process groups."""
+        for pg in cls._broadcast_pg_cache.values():
+            if pg is not None:
+                dist.destroy_process_group(pg)
+        cls._broadcast_pg_cache.clear()
+
     def __init__(
         self,
         src_grid: HyperCommGrid,
@@ -54,6 +65,7 @@ class BridgeCommunicator:
         comm_dtype: Optional[torch.dtype] = None,
         src_module_name: Optional[str] = None,
         dest_module_name: Optional[str] = None,
+        tensor_ndim: int = 3,
     ):
         """Initialize the bridge communicator between source and destination grids.
 
@@ -65,12 +77,20 @@ class BridgeCommunicator:
             dim_mapping: Dictionary mapping logical dimensions to tensor axes.
                         Expected keys: 's' (sequence), 'b' (batch), 'h' (hidden).
                         Defaults to {'s': 1, 'b': 0, 'h': 2} if None.
+            tensor_ndim: Number of dimensions in tensors communicated through this
+                        bridge. For 3D tensors (e.g. [S, B, H]), fan-in/fan-out
+                        operates on dim_mapping['b']. For 2D tensors (e.g. [B*S, H]
+                        where batch is folded into dim 0), fan-in/fan-out operates
+                        on dim 0. Default: 3.
         """
         self.src_grid = src_grid
         self.dest_grid = dest_grid
         self.src_module_name = src_module_name
         self.dest_module_name = dest_module_name
         self.comm_dtype = comm_dtype
+
+        assert tensor_ndim in (2, 3), f"tensor_ndim must be 2 or 3, got {tensor_ndim}"
+        self.tensor_ndim = tensor_ndim
 
         # TODO (ykarnati, pthombre) - CP support will be added in follow up PR.
         if 'cp' in self.src_grid.dim_names:
@@ -110,8 +130,8 @@ class BridgeCommunicator:
 
         self.src_grid_broadcast_ranks = []
         if src_grid_broadcast_ranks_list:
-            self.src_grid_broadcast_pg, _ = dist.new_subgroups_by_enumeration(
-                src_grid_broadcast_ranks_list, backend='nccl'
+            self.src_grid_broadcast_pg = self._get_or_create_broadcast_pg(
+                src_grid_broadcast_ranks_list
             )
             self.src_grid_broadcast_ranks = next(
                 (ranks for ranks in src_grid_broadcast_ranks_list if self.current_rank in ranks), []
@@ -119,8 +139,8 @@ class BridgeCommunicator:
 
         self.dest_grid_broadcast_ranks = []
         if dest_grid_broadcast_ranks_list:
-            self.dest_grid_broadcast_pg, _ = dist.new_subgroups_by_enumeration(
-                dest_grid_broadcast_ranks_list, backend='nccl'
+            self.dest_grid_broadcast_pg = self._get_or_create_broadcast_pg(
+                dest_grid_broadcast_ranks_list
             )
             self.dest_grid_broadcast_ranks = next(
                 (ranks for ranks in dest_grid_broadcast_ranks_list if self.current_rank in ranks),
@@ -145,6 +165,27 @@ class BridgeCommunicator:
 
         self.build_comm_map(self.src_tp_leaders, self.dest_tp_leaders)
         dist.barrier()
+
+    @property
+    def _batch_dim(self) -> int:
+        """Get the tensor dimension used for fan-in/fan-out (cat/split).
+
+        For 3D tensors (e.g. [S, B, H]), this is dim_mapping['b'].
+        For 2D tensors (e.g. [B*S, H] where batch is folded into the first
+        dimension), this is 0.
+        """
+        if self.tensor_ndim == 2:
+            return 0
+        return self.dim_mapping['b']
+
+    @classmethod
+    def _get_or_create_broadcast_pg(cls, ranks_list: List[List[int]]):
+        """Get or create a broadcast PG, caching to avoid duplicate NCCL communicators."""
+        cache_key = str(sorted([tuple(r) for r in ranks_list]))
+        if cache_key not in cls._broadcast_pg_cache:
+            pg, _ = dist.new_subgroups_by_enumeration(ranks_list, backend='nccl')
+            cls._broadcast_pg_cache[cache_key] = pg
+        return cls._broadcast_pg_cache[cache_key]
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
         """Get the leader rank for a given grid and direction.
@@ -365,7 +406,7 @@ class BridgeCommunicator:
                     f"shape {tensor_to_recv.shape} sum {tensor_to_recv.sum()}"
                 )
                 received_tensors_list.append(tensor_to_recv)
-            aggregated_tensor = torch.cat(received_tensors_list, dim=self.dim_mapping['b'])
+            aggregated_tensor = torch.cat(received_tensors_list, dim=self._batch_dim)
             logging.debug(
                 f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
                 f"broadcasting tensor {aggregated_tensor.shape} sum {aggregated_tensor.sum()}"
@@ -389,7 +430,9 @@ class BridgeCommunicator:
             and self.current_rank in self.dest_grid_broadcast_ranks
         ):
             # Non-leader rank - participate in broadcast
-            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            shape_tensor = torch.empty(
+                (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
+            )
             dist.broadcast(
                 shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
             )
@@ -494,7 +537,7 @@ class BridgeCommunicator:
                 received_gradients_list.append(grad_tensor)
 
             # Concatenate received gradients
-            aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+            aggregated_gradient = torch.cat(received_gradients_list, dim=self._batch_dim)
             logging.debug(
                 f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
                 f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
@@ -516,7 +559,9 @@ class BridgeCommunicator:
         ):
             # Non-leader rank - participate in gather for gradients
             # Receive broadcasted tensor shape from leader rank
-            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            shape_tensor = torch.empty(
+                (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
+            )
             dist.broadcast(
                 shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
             )
@@ -615,7 +660,7 @@ class BridgeCommunicator:
                     req.wait()
 
                 # Concatenate received gradients
-                aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+                aggregated_gradient = torch.cat(received_gradients_list, dim=self._batch_dim)
                 logging.debug(
                     f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
                     f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
@@ -624,9 +669,6 @@ class BridgeCommunicator:
                 tensor_shape_to_broadcast = aggregated_gradient.shape
                 shape_tensor = torch.tensor(
                     tensor_shape_to_broadcast, device=torch.cuda.current_device(), dtype=torch.int64
-                )
-                dist.broadcast(
-                    shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
                 )
                 dist.broadcast(
                     shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
@@ -644,7 +686,9 @@ class BridgeCommunicator:
         ):
             # participate in both gather for gradients
             # Receive gradient from leader using broadcast
-            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            shape_tensor = torch.empty(
+                (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
+            )
             dist.broadcast(
                 shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
             )
@@ -740,9 +784,9 @@ class BridgeCommunicator:
                     req.wait()
 
                 # Concatenate received activations
-                aggregated_activation = torch.cat(received_activations_list, dim=0)
+                aggregated_activation = torch.cat(received_activations_list, dim=self._batch_dim)
                 logging.debug(
-                    f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
+                    f"[Bridge Communicator] [send_backward_recv_forward] Rank {self.current_rank} "
                     f"agg act shape {aggregated_activation.shape} sum {aggregated_activation.sum()}"
                 )
 
@@ -765,7 +809,9 @@ class BridgeCommunicator:
             rank_info.role == CommRole.MEMBER
             and self.current_rank in self.dest_grid_broadcast_ranks
         ):
-            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            shape_tensor = torch.empty(
+                (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
+            )
             dist.broadcast(
                 shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
             )
@@ -846,7 +892,7 @@ class BridgeCommunicator:
             if recv_next:
                 for dest_rank in rank_info.send_to_ranks:
                     grad_shape_tensor = torch.empty(
-                        (3), device=torch.cuda.current_device(), dtype=torch.int64
+                        (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
                     )
                     recv_grad_shape_tensors.append(grad_shape_tensor)
                     ops.append(
@@ -860,7 +906,7 @@ class BridgeCommunicator:
             if recv_prev:
                 for src_rank in rank_info.recv_from_ranks:
                     forward_shape_tensor = torch.empty(
-                        (3), device=torch.cuda.current_device(), dtype=torch.int64
+                        (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
                     )
                     recv_forward_shape_tensors.append(forward_shape_tensor)
                     ops.append(
@@ -916,7 +962,6 @@ class BridgeCommunicator:
         if num_splits <= 0:
             raise ValueError(f"num_splits must be positive, got {num_splits}")
 
-        batch_dim = self.dim_mapping['b']
-        splits = torch.tensor_split(aggregated_tensor, num_splits, dim=batch_dim)
+        splits = torch.tensor_split(aggregated_tensor, num_splits, dim=self._batch_dim)
         # PyTorch p2p requires the tensors to be contiguous
         return [split.contiguous() for split in splits]

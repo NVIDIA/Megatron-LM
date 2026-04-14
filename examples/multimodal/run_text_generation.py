@@ -202,7 +202,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed
+            controller, max_batch_size=1, random_seed=args.seed, legacy=True
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -227,7 +227,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 inference_request = VLMInferenceRequest(
                    request_id=inference_engine.get_new_request_id(),
                    prompt=conv,
-                   prompt_tokens=controller.tokenize_prompt(conv),
+                   prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
                    sampling_params=sampling_params,
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
@@ -344,7 +344,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 inference_request = VLMInferenceRequest(
                    request_id=inference_engine.get_new_request_id(),
                    prompt=conv,
-                   prompt_tokens=controller.tokenize_prompt(conv),
+                   prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
                    sampling_params=sampling_params,
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,

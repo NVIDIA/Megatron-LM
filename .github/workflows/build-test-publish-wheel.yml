@@ -20,6 +20,8 @@ on:
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
 
 defaults:
   run:
@@ -31,51 +33,47 @@ permissions:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
+    if: github.repository == 'NVIDIA/Megatron-LM'
 
-  build-test-publish-wheel:
+  build-test-publish-wheels:
     needs: [pre-flight]
-    if: |
-      !(needs.pre-flight.outputs.docs_only == 'true'
-      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_test_publish_wheel.yml@v0.63.1
+    uses: ./.github/workflows/_build_test_publish_wheel.yml
     with:
-      dry-run: true
-      python-package: megatron.core
-      python-version: "3.10"
-      packaging: uv
-      no-publish: ${{ !(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) }}
-      custom-container: nvcr.io/nvidia/pytorch:25.05-py3
-      no-build-isolation: true
-      runner: linux-amd64-cpu16
+      no-publish: true
     secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      GH_TOKEN: ${{ secrets.PAT }}
+      TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
 
   build-test-publish-wheel-summary:
-    needs: [pre-flight, build-test-publish-wheel]
+    needs: [pre-flight, build-test-publish-wheels]
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
         || always()
       )
+      && github.repository == 'NVIDIA/Megatron-LM'
       && !cancelled()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
       - name: Result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          SKIPPING_IS_ALLOWED: false
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | test("build-and-test-wheels")))] | length') || echo 0
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]; then
-              echo "✅ All previous jobs completed successfully"
+              echo "✅ All build-and-test-wheels jobs completed successfully"
               exit 0
           else
-              echo "❌ Found $FAILED_JOBS failed job(s)"
+              echo "❌ Found $FAILED_JOBS failed build-and-test-wheels job(s)"
               # Show which jobs failed
-              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success") | .name'
+              gh run view $GITHUB_RUN_ID --json jobs --jq '.jobs[] | select(.status == "completed" and .conclusion != "success" and (.name | test("build-and-test-wheels"))) | .name'
               exit 1
           fi

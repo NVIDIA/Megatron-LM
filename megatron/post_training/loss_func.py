@@ -2,14 +2,12 @@
 
 """Pretrain GPT loss function(s)."""
 
-import os
-
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.training import get_args
-from megatron.training.utils import average_losses_across_data_parallel_group, unwrap_model
+from megatron.training.utils import unwrap_model
 
 
 def _mask_loss(output_tensor, loss_mask):
@@ -38,24 +36,6 @@ def _mask_loss(output_tensor, loss_mask):
     return loss
 
 
-def _allreduce_losses(losses):
-    """Reduce losses across all GPUs."""
-    args = get_args()
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        for loss in losses:
-            assert not loss.isnan(), (
-                f'Rank {global_rank}: found NaN in local forward loss calculation. '
-                f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
-            )
-
-    # Reduce loss for logging.
-    # TODO(aanoosheh): This should ideally be done with num_tokens separately reduced and averaged.
-    return average_losses_across_data_parallel_group(losses)
-
-
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTModel):
     """Loss function (with KD Loss support).
 
@@ -75,16 +55,18 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     report = {'lm loss': torch.cat([loss_lm.clone().detach().view(1), num_tokens.view(1)])}
 
-    if model.training and args.export_kd_teacher_load:
+    if args.export_kd_teacher_load:
         # [ModelOpt]: Handle knowledge distillation
         losses = model.compute_kd_loss(
             student_loss=loss_lm,
             loss_reduction_fn=lambda x: _mask_loss(x, loss_mask),
         )
-        loss = losses["kd_loss"]
 
         report["total loss"] = torch.cat([losses["kd_loss"].clone().detach().view(1), num_tokens.view(1)])
         report["logits distillation loss"] = torch.cat([losses["logits_loss"].clone().detach().view(1), num_tokens.view(1)])
         report["intermediate distillation loss"] = torch.cat([losses["intermediate_loss"].clone().detach().view(1), num_tokens.view(1)])
+
+        if model.training:
+            loss = losses["kd_loss"]
 
     return loss, num_tokens, report

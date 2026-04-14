@@ -1,0 +1,42 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Trigger MBridge Tests
+on:
+  workflow_dispatch:
+    inputs:
+      mbridge_ref:
+        description: "MBridge branch/ref to trigger"
+        required: false
+        type: string
+        default: "main"
+      test_suite:
+        description: "Test suite to run"
+        required: false
+        type: choice
+        options:
+          - "all"
+          - "unit-only"
+          - "functional-only"
+        default: "all"
+
+jobs:
+  trigger-mbridge-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger MBridge tests
+        uses: convictional/trigger-workflow-and-wait@v1.6.5
+        with:
+          owner: NVIDIA-NeMo
+          repo: Megatron-Bridge
+          workflow_file_name: cicd-main.yml
+          github_token: ${{ secrets.PAT }}
+          ref: ${{ inputs.mbridge_ref }}
+          wait_interval: 60
+          propagate_failure: true
+          client_payload: |
+            {
+              "mcore_ref": "${{ github.sha }}",
+              "test_suite": "${{ inputs.test_suite }}",
+              "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }

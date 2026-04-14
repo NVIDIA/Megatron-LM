@@ -1,7 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
+
+import torch
 
 
 @dataclass
@@ -33,7 +35,10 @@ class DistributedDataParallelConfig:
     """
 
     check_for_nan_in_grad: bool = False
-    """If true, check for NaNs and Infs in gradients _before_ communication collective."""
+    """
+    If true, check for NaNs and Infs in gradients _before_ communication collective.
+    Invoked by `start_grad_sync` such as in the Megatron-LM DDP training API.
+    """
 
     check_for_large_grads: bool = False
     """If true, check for unexpectedly large gradients _before_ communication collective."""
@@ -48,6 +53,16 @@ class DistributedDataParallelConfig:
        ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL
        message size (which for ring algorithms is bucket_size / dp_size) apparently needs
        to be divisible by a power of 2 for high busbw."""
+
+    reduce_scatter_with_fp32_accumulation: bool = False
+    """If true, use a reduce-scatter implementation which sends lower-precision values
+       over the wire (using an all-to-all to keep total communication overhead in line
+       with the standard ring implementation) but performs accumulation locally in FP32."""
+
+    param_name_patterns_for_fp32_local_accumulation: Tuple[str, ...] = ()
+    """List of param_name patterns (in Python's fnmatch format) to match against to do
+       local gradient accumulation in FP32. The special pattern 'all' matches every
+       parameter. Do not specify when grad_reduce_in_fp32 is already True."""
 
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
@@ -73,7 +88,7 @@ class DistributedDataParallelConfig:
 
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
-        'optim_grads', 'optim_grads_params'."""
+      'optim_grads', 'optim_grads_params'."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -86,9 +101,6 @@ class DistributedDataParallelConfig:
       disables prefetching and may degrade performance. Adjust this value
       based on your system's memory and performance requirements."""
 
-    preserve_fp32_weights: bool = True
-    """If true, preserve fp32 weights in the Megatron FSDP ParamAndGradBuffer."""
-
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
@@ -100,7 +112,6 @@ class DistributedDataParallelConfig:
       The follwoing will be the expected number of SM usage for various cases.
       (Note that this is just a reference number and the number of SM usage could vary 
       on message size, communication domain size and nccl version.)
-      ----------------------------------------------------------
       | Communication domain | use_sharp | SM usage of "AG/RS" |
       |----------------------|-----------|---------------------|
       | NVL                  | N/A       | 4 / 5               |
@@ -108,7 +119,6 @@ class DistributedDataParallelConfig:
       | NVL+IB               | True      | 6 / 6               |
       | IB                   | False     | 1 / 4               |
       | IB                   | True      | 1 / 1               |
-      ----------------------------------------------------------
     """
 
     fsdp_double_buffer: bool = False
@@ -117,13 +127,29 @@ class DistributedDataParallelConfig:
       This option will cause additional memory overhead, however, it is necessary for
       to register user buffer (nccl_ub=True) for the Megatron FSDP. 
       This option will be automatically set to True when nccl_ub=True.
-   """
+    """
+
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False
+    """Whether to fall back to persistent buffer when a bucket does not
+       fit FSDP double buffer size. If true, FSDP will use the persistently 
+       allocated buffer for the bucket that does not fit, it will enable NCCL 
+       user buffer with the cost of more memory usage. If false, FSDP will use
+       Dynamic memory allocator, NCCL user buffer won't not enabled, which 
+       usually leads to low performance.
+    """
+
+    fsdp_all_gather_in_start_param_sync: bool = True
+    """
+    If True, use all-gather during the initial Megatron-FSDP parameter
+    synchronization step. This can increase overlap between the first
+    parameter all-gather and computation, helping to better hide the
+    initial communication cost.
+    """
 
     outer_dp_sharding_strategy: str = 'no_shard'
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
-    Valid values are 'no_shard', 'optim', 'optim_grads', 'optim_grads_params'.
-    This option is only effective when Hybrid FSDP is enabled.
+    Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
     """
 
     disable_symmetric_registration: bool = False
@@ -132,8 +158,49 @@ class DistributedDataParallelConfig:
       when nccl_ub is set.
     """
 
+    fsdp_manual_registration: bool = False
+    """If true, manually register the FSDP communication buffers to NCCL user buffer.
+      This option is only effective when use_megatron_fsdp and nccl_ub is set.
+      For symmetric registration with large models, the registration itself can take 
+      a significant amount of time. This option minimizes the number of registration calls
+      to minimize the registration time.
+    """
+
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
+    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
+      buffer will take the role of the main weights, or when no sharding is applied,
+      the native model weights become the main weights. Defaults to torch.float32.
+    """
+
+    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to None.
+    """
+
+    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
+    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and copy operations.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support
+      `FP32` reduction even though we have `BF16` input and output communication buffers.
+      If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
+      or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
+      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
+      communication buffers (per FSDP group) adds memory overhead. Defaults to None.
+      No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
+    """
+
+    megatron_fsdp_use_decoupled_grad: bool = False
+    """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
+      gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
+      main gradients to parameter dtype for `.grad`.
+    """
 
     def __post_init__(self):
         import os
@@ -148,3 +215,9 @@ class DistributedDataParallelConfig:
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+        if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
+            assert not self.grad_reduce_in_fp32, (
+                "Only need to explicitly specify param_name patterns for FP32 local accumulation "
+                "if .main_grads aren't already in FP32"
+            )

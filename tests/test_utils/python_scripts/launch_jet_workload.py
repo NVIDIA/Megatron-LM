@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 import logging
 import os
@@ -6,6 +8,7 @@ import re
 import signal
 import sys
 import time
+import uuid
 import zipfile
 from typing import Dict, List, Optional
 
@@ -17,7 +20,7 @@ import yaml
 from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
@@ -70,7 +73,7 @@ def launch_and_wait_for_completion(
             ).workloads.submit(
                 workloads=[
                     jetclient.JETWorkloadManifest(**workload)
-                    for workload in common.load_workloads(
+                    for workload in recipe_parser.load_workloads(
                         test_case=test_case,
                         n_repeat=n_repeat,
                         time_limit=(1200 if enable_lightweight_mode else time_limit),
@@ -83,7 +86,7 @@ def launch_and_wait_for_completion(
                         record_checkpoints=record_checkpoints,
                     )
                 ],
-                config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
+                config_id=f"mcore/{recipe_parser.resolve_cluster_config(cluster)}",
                 custom_config={
                     "launchers": {cluster: cluster_config},
                     "executors": {
@@ -109,14 +112,11 @@ def launch_and_wait_for_completion(
                                         "HF_HUB_CACHE": "/lustre/fsw/coreai_dlalgo_mcore/hf_hub",
                                         "TRANSFORMERS_OFFLINE": "1",
                                         "CLUSTER": cluster,
+                                        "RUN_ID": str(uuid.uuid4()),
                                     }
                                 }
                             }
                         }
-                    },
-                    "outputs": {
-                        "enabled": True,
-                        "artifacts_storages": [common.resolve_artifact_config(cluster)],
                     },
                 },
                 wait_for_validation=True,
@@ -288,6 +288,8 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "Unpack failed: incomplete input" in concat_allranks_logs
         or "unspecified launch failure" in concat_allranks_logs
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
+        or "Segfault encountered" in concat_allranks_logs
+        or "Fatal glibc error" in concat_allranks_logs
     )
 
 
@@ -496,6 +498,7 @@ def main(
 
             if (
                 "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
+                or "Throughput is slower than expected!" in concat_mainrank_log
             ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 n_nondeterminism_attemps += 1
                 if n_nondeterminism_attemps < 3:

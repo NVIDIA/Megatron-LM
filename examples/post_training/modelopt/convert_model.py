@@ -2,6 +2,7 @@
 
 """Convert a GPTModel."""
 import functools
+import inspect
 import json
 import os
 import sys
@@ -18,15 +19,18 @@ from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_provider import model_provider
-from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
-from megatron.training import get_args, get_tokenizer
+from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.utils import (
+    report_current_memory_info,
+    to_empty_if_meta,
+)
+from megatron.training import get_args
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
+from model_provider import model_provider
 
 ALGO_TO_CONFIG = {
-    "eagle1": mtsp.config.EAGLE1_DEFAULT_CFG,
     "eagle3": mtsp.config.EAGLE3_DEFAULT_CFG,
     "eagle-mtp": mtsp.config.EAGLE_MTP_DEFAULT_CFG,
 }
@@ -44,19 +48,22 @@ def add_convert_args(parser):
     group.add_argument(
         '--algorithm',
         type=str,
-        choices=["medusa", "eagle1", "eagle3", "None"],
+        choices=["eagle3", "None"],
         default="None",
         help='Chosing between different speculative decoding algorithms. Default is None.',
     )
     group.add_argument(
-        '--export-num-medusa-heads',
-        type=int,
-        default=0,
-        help='Number of Medusa heads for speculative decoding.',
+        "--eagle-config",
+        type=str,
+        default=None,
+        help="EAGLE architecture config. If not given, "
+        "a default config will be use. If provided, it will overwrite the default config.",
     )
     group.add_argument(
-        "--eagle-config", type=str, default=None, help="EAGLE architecture config. If not given, " \
-        "a default config will be use. If provided, it will overwrite the default config."
+        "--mix-hidden-states",
+        type=bool,
+        default=False,
+        help="Whether to mix hidden states from previous TTT step.",
     )
 
     add_modelopt_args(parser)
@@ -89,8 +96,9 @@ def check_arguments():
         exit()
 
     if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
-        print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
-        args.moe_grouped_gemm = False
+        if not getattr(args, 'export_default_te_spec', False):
+            print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
+            args.moe_grouped_gemm = False
 
 
 if __name__ == "__main__":
@@ -120,39 +128,43 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+    )
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
 
     if args.pretrained_model_path is not None:
-        import_dtype = torch.float16 if args.fp16 else torch.bfloat16 
+        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        print_rank_0("Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype)))
+        print_rank_0(
+            "Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype))
+        )
+        import_kwargs = {
+            "dtype": import_dtype,
+            "moe_router_dtype": args.moe_router_dtype,
+        }
+        if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
+            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
-            unwrapped_model,
-            args.pretrained_model_path,
-            workspace_dir,
-            dtype = import_dtype,
+            unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)
 
-    if args.algorithm in ("eagle1", "eagle3"):
+    if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]
         if args.eagle_config:
-            with open(args.eagle_config)as f:
+            with open(args.eagle_config) as f:
                 eagle_config = json.load(f)
             mtsp_config["config"]["eagle_architecture_config"].update(eagle_config)
-        # Update eagle hidden_size and vocab_size according to the base model
-        mtsp_config["config"]["eagle_architecture_config"]["hidden_size"] = unwrapped_model.config.hidden_size
-        mtsp_config["config"]["eagle_architecture_config"]["vocab_size"] = unwrapped_model.vocab_size
-        if not args.eagle_config or "draft_vocab_size" not in eagle_config:
-            # If draft_vocab_size is not provided, set it to vocab_size
-            mtsp_config["config"]["eagle_architecture_config"]["draft_vocab_size"] = unwrapped_model.vocab_size
+
         if args.export_offline_model:
             mtsp_config["config"]["eagle_offline"] = True
+        if args.mix_hidden_states:
+            mtsp_config["config"]["eagle_mix_hidden_states"] = True
 
         unwrapped_model = mtsp.convert(unwrapped_model, mtsp_config)
 
@@ -161,21 +173,6 @@ if __name__ == "__main__":
             if eagle_module is not None:
                 mcore_eagle_state_dict = torch.load(args.extra_model_path)
                 eagle_module.load_state_dict(mcore_eagle_state_dict, strict=False)
-
-        # Add mask tokens for parallel draft
-        if unwrapped_model.eagle_config.parallel_draft_step > 1:
-            assert unwrapped_model.eagle_config.parallel_draft_step <= 4, "Parallel draft only supports steps less than or equal to 4."
-            tokenizer = get_tokenizer()
-            for i in range(unwrapped_model.eagle_config.parallel_draft_step - 1):
-                mask_token = "[MASK_{}]".format(i)
-                tokenizer._tokenizer.add_tokens([mask_token], special_tokens=True) 
-                token_id = tokenizer._tokenizer.convert_tokens_to_ids(mask_token)
-                setattr(unwrapped_model, "mask_token_{}".format(i), torch.tensor(token_id))
-                
-    elif args.algorithm == "medusa":
-        config = {"medusa_num_heads": args.export_num_medusa_heads, "medusa_num_layers": 1}
-        unwrapped_model = mtsp.convert(unwrapped_model, [("medusa", config)])
-
 
     print_rank_0(f"Converted Model:\n {model}")
     torch.distributed.barrier()

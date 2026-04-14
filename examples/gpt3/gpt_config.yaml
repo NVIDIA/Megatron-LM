@@ -92,7 +92,6 @@ model_parallel:
 
   # Optimizations
   gradient_accumulation_fusion: True
-  async_tensor_model_parallel_allreduce: True
   tp_comm_overlap: False
 
   # Debug Options
@@ -219,7 +218,6 @@ overlap_grad_reduce: False
 align_grad_reduce: True
 overlap_param_gather: False
 align_param_gather: False
-scatter_gather_tensors_in_pipeline: True
 local_rank: null
 lazy_mpu_init: null
 empty_unused_memory_level: 0
@@ -257,7 +255,6 @@ vocab_extra_ids: 0
 seq_length: 4096
 encoder_seq_length: null
 decoder_seq_length: null
-retriever_seq_length: 256
 sample_rate: 1.0
 mask_prob: 0.15
 short_seq_prob: 0.1

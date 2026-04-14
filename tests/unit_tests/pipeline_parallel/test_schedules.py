@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 import os
 
 import pytest
@@ -13,6 +15,10 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import (
+    convert_schedule_table_to_order,
+    get_overlap_moe_expert_parallel_comm_order,
+)
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -106,7 +112,7 @@ def test_get_pipeline_parallel_order(
     schedule_table = schedule.get_schedule_table(
         num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage
     )
-    order = schedule.convert_schedule_table_to_order(
+    order = convert_schedule_table_to_order(
         num_warmup_microbatches, num_model_chunks, schedule_table
     )
 
@@ -126,6 +132,52 @@ def test_get_pipeline_parallel_order(
     assert 0 not in order_cnt
     for k, v in order_cnt.items():
         assert -k in order_cnt and order_cnt[-k] == v
+
+    layers_per_chunk = 2
+    num_layers_per_chunk = [layers_per_chunk] * num_model_chunks
+    # disable wgrad compute
+    overlapped_order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
+        order, num_layers_per_chunk, False
+    )
+    assert max(overlapped_order) == num_model_chunks * layers_per_chunk
+    assert len(overlapped_order) == len(order) * layers_per_chunk
+    assert len(chunk_id_list) == len(overlapped_order)
+    order_cnt = {}
+    accumulated_order = 0
+    for o in overlapped_order:
+        order_cnt[o] = order_cnt.get(o, 0) + 1
+        if o < 0:
+            assert -o in order_cnt and order_cnt[-o] >= order_cnt[o]
+        elif -o in order_cnt:
+            assert order_cnt[-o] < order_cnt[o]
+        accumulated_order += o
+        assert accumulated_order >= 0
+    assert accumulated_order == 0
+
+    # enable wgrad compute
+    overlapped_order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
+        order, num_layers_per_chunk, True
+    )
+    assert max(overlapped_order) == num_model_chunks * layers_per_chunk
+    assert len(overlapped_order) == len(order) * layers_per_chunk * 3 // 2
+    assert len(chunk_id_list) == len(overlapped_order)
+    from math import ceil
+
+    order_cnt = {}
+    accumulated_order = 0
+    prev_o = 0
+    for o in overlapped_order:
+        if ceil(o) != o:
+            assert prev_o - 0.5 == o
+        else:
+            order_cnt[o] = order_cnt.get(o, 0) + 1
+            if o < 0:
+                assert -o in order_cnt and order_cnt[-o] >= order_cnt[o]
+            elif -o in order_cnt:
+                assert order_cnt[-o] < order_cnt[o]
+        accumulated_order += o
+        prev_o = o
+    assert accumulated_order < 0
 
     Utils.destroy_model_parallel()
 

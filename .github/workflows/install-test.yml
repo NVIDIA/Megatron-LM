@@ -20,31 +20,36 @@ name: Installation Test
 on:
   push:
     branches:
+      - dev
       - main
       - "pull-request/[0-9]+"
       - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.64.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
+    if: github.repository == 'NVIDIA/Megatron-LM'
 
   pip-test-pytorch:
     needs: [pre-flight]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: linux-amd64-cpu16
     name: Pip - Python${{ matrix.python-version }} - AMD64/Linux - NGC PyTorch
     container:
       image: nvcr.io/nvidia/pytorch:25.05-py3
-    environment: nemo-ci
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set PATH
         run: |
@@ -60,7 +65,7 @@ jobs:
         run: bash docker/common/install.sh --environment dev --base-image pytorch --python-version ${{ matrix.python-version }}
 
       - name: Checkout check-imports
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.63.2
@@ -76,19 +81,20 @@ jobs:
     needs: [pre-flight]
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      && github.repository == 'NVIDIA/Megatron-LM'
     runs-on: linux-amd64-cpu16
     name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC PyTorch
     container:
       image: nvcr.io/nvidia/pytorch:25.05-py3
-    environment: nemo-ci
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set PATH
         run: |
@@ -107,7 +113,7 @@ jobs:
 
       # NGC PyTorch 25.05 has a version of triton that is broken on CPU only machines.
       # - name: Checkout check-imports
-      #   uses: actions/checkout@v4
+      #   uses: actions/checkout@v6
       #   with:
       #     repository: NVIDIA-NeMo/FW-CI-templates
       #     ref: v0.63.2
@@ -130,14 +136,18 @@ jobs:
         || always()
       )
       && !cancelled()
+      && github.repository == 'NVIDIA/Megatron-LM'
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Get workflow result
         id: result
         shell: bash -x -e -u -o pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.run_id }}
-          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' }}
+          SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
         run: |
           FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion != "success")] | length') || echo 0
 

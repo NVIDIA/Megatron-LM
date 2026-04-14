@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
-from functools import lru_cache
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -11,6 +10,8 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import (
+    get_pg_rank,
+    get_tensor_model_parallel_group_if_none,
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
@@ -29,13 +30,11 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
     return layer
 
 
-@lru_cache(maxsize=32)
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
     return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
 
 
-@lru_cache(maxsize=32)
 def get_sliding_window_causal_mask(sq, skv, window_size):
     """Create the equivalent attention mask for SWA in [sq, skv] shape"""
     m = torch.ones(sq, skv, dtype=torch.bool, device="cuda")
@@ -79,6 +78,8 @@ def make_sharded_tensors_for_checkpoint(
     tensor_parallel_layers_axis_map: Optional[Dict[str, int]] = None,
     sharded_offsets: Iterable[Tuple[int, int, int]] = (),
     extra_state_suffix: str = '_extra_state',
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Wraps tensors from transformer layers with ShardedTensor or ShardedObject.
 
@@ -96,11 +97,20 @@ def make_sharded_tensors_for_checkpoint(
             applied (e.g. PP related), passed along to ShardedTensor
         extra_state_suffix (str, default = '_extra_state'): layers with this
             suffix will be wrapped with ShardedObject instead of ShardedTensor.
+        tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
+            If None, defaults to parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
+            with context parallel. If None, defaults to
+            parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     """
 
     if tensor_parallel_layers_axis_map is None:
         tensor_parallel_layers_axis_map = {}
+
+    if tp_group is None and dp_cp_group is None:
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
@@ -108,19 +118,31 @@ def make_sharded_tensors_for_checkpoint(
         layer_key = f'{prefix}{layer_name}'
 
         if layer_name.endswith(extra_state_suffix):
+            # Compute replica_id when groups are provided
+            replica_id = (0, get_pg_rank(tp_group), get_pg_rank(dp_cp_group))
+
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
-                tensor, layer_key, sharded_offsets
+                tensor, layer_key, sharded_offsets, replica_id=replica_id
             )
 
         elif layer_name in tensor_parallel_layers_axis_map:
             tp_axis = tensor_parallel_layers_axis_map[layer_name]
             sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
-                tensor, layer_key, tp_axis, prepend_offsets=sharded_offsets
+                tensor,
+                layer_key,
+                tp_axis,
+                prepend_offsets=sharded_offsets,
+                tp_group=tp_group,
+                dp_cp_group=dp_cp_group,
             )
 
         else:
             sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
-                tensor, layer_key, prepend_offsets=sharded_offsets
+                tensor,
+                layer_key,
+                prepend_offsets=sharded_offsets,
+                tp_group=tp_group,
+                dp_cp_group=dp_cp_group,
             )
 
     return sharded_state_dict
@@ -169,11 +191,27 @@ def _get_extra_state_offsets(
     return extra_state_shape, extra_state_offset
 
 
+def ensure_metadata_has_dp_cp_group(metadata: Optional[dict]) -> dict:
+    """Ensure `metadata` is a dict containing `dp_cp_group` entry.
+
+    If `metadata` is None, a new dict is returned with `dp_cp_group` set.
+    If `metadata` is a dict and missing `dp_cp_group`, it is updated in-place.
+    Otherwise, asserts that `dp_cp_group` exists.
+    """
+    if metadata is None:
+        return {'dp_cp_group': parallel_state.get_data_parallel_group(with_context_parallel=True)}
+    assert isinstance(metadata, dict), "metadata must be a dict with dp_cp_group as key"
+    if 'dp_cp_group' not in metadata:
+        metadata['dp_cp_group'] = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    return metadata
+
+
 def sharded_state_dict_default(
     module: torch.nn.Module,
     prefix: str = '',
     sharded_offsets: Tuple[Tuple[int, int, int]] = (),
     metadata: Optional[dict] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> ShardedStateDict:
     """Provides implementation for sharded_state_dict method for non-MegatronModules.
 
@@ -189,10 +227,15 @@ def sharded_state_dict_default(
         sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
             applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
         metadata (dict, optional): metadata passed to module sharded_state_dict method
+        tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
+            If None, defaults to parallel_state.get_tensor_model_parallel_group()
 
     Returns:
         dict: dictionary of state dict keys mapped to ShardedTensors
     """
+
+    # Guard for cases metadata is not provided
+    metadata = ensure_metadata_has_dp_cp_group(metadata)
 
     if hasattr(module, 'sharded_state_dict'):
         module_sharded_sd = module.sharded_state_dict(
@@ -201,7 +244,12 @@ def sharded_state_dict_default(
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)
         module_sharded_sd = make_sharded_tensors_for_checkpoint(
-            module_sd, prefix, {}, sharded_offsets
+            module_sd,
+            prefix,
+            {},
+            sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
     return module_sharded_sd
 
@@ -343,14 +391,12 @@ def init_cuda_graph_cache(model):
     find_modules_with_attrs(model_modules)
 
 
-def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
+def toggle_cuda_graphs(model, set_to="none"):
     """
     Toggle CUDA graph-related attributes for the model and its modules.
 
     Args:
         set_to (str): Value to set for CUDA graph-related attributes.
-        reset_cuda_graphs (bool): If True, remake the CUDA graph;
-            if False, use cached CUDA graph managers.
     """
     global cuda_graph_attr_cache
     model_id = id(model)
@@ -379,25 +425,29 @@ def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
         elif attribute == "cudagraph_manager":
             for module in modules:
                 if set_to == "local":
-                    if reset_cuda_graphs:
-                        from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-                        # If we are resetting cuda graphs we create a new cuda graph manager
-                        setattr(module[0], attribute, CudaGraphManager(model.config))
-                    else:
-                        # If we are not resetting cuda graphs we set it to its cached cuda graph
-                        setattr(module[0], attribute, module[1])
+                    # If we are not resetting cuda graphs we set it to its cached cuda graph
+                    setattr(module[0], attribute, module[1])
                 else:
                     for module in modules:
                         # If we are deleting the cuda graph, we delete its attribute
                         if hasattr(module[0], "cudagraph_manager"):
                             delattr(module[0], "cudagraph_manager")
 
-    from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 
-    # if we are resetting cuda graphs we need to reset all the state
-    if reset_cuda_graphs and set_to == "none":
-        delete_cuda_graphs()
+def transition_moe_cudagraphs(model, scope: str):
+    """
+    Switch MoE layers to the given cudagraph scope. Flips between 'partial' and 'full'.
+
+    Args:
+        model: The model with MoE layers which will be transitioned.
+        scope: 'partial' for training (router + postprocess captured, expert dispatch eager)
+               or 'full' for inference (full-layer graph capture).
+    """
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    for module in model.modules():
+        if isinstance(module, MoETransformerLayer):
+            module.transition_cudagraph_scope(scope)
 
 
 def is_layer_window_attention(

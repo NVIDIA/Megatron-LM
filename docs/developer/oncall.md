@@ -1,0 +1,58 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+-->
+
+# Oncall Overview
+
+During your oncall week, you will be assigned to all PRs marked “Ready for 
+Review”. From a high-level, your responsibilities include:
+
+- Review all new PRs
+- Accelerate the review process
+- Ensure issues and discussion questions are answered
+
+## PR Responsibilities
+
+Below is the checklist that the oncall needs to go through for each PR.
+
+- Should the PR remain a single PR?
+  - Each PR should have at most 1 expert reviewer, although there will be some outlier cases
+- Label PR as “complexity: low”, “complexity: medium”, or “complexity: high” depending on complexity
+  - Expert reviewers have final say, oncall just sets the initial complexity level
+  - Initial complexity level guideline
+    - Low: <100 lines changed
+    - Medium: 100 < lines changed < 500
+    - High: > 500 lines changed
+- Does this PR have proper testing coverage?
+  - If new logic is added, is the new logic tested?
+- Should the PR add documentation for any new features?
+- Does the PR conform to our style guidelines?
+  - Code structure
+  - Cleanliness
+  - Comments
+  - File structure
+- Do all tests pass?
+  - Oncall will need to kick off testing suite for external reviewers
+  - Comment “/ok to test commid_id” to kick off testing suite
+- Expert reviewers are notified after the PR is marked “Ready for Review”
+  - **Expert reviewers should review within 1 business day.** Message the assigned reviewer if it is taking longer. The reviewer either needs to review the PR or suggest an alternate reviewer.
+  - If the reviewer is not responding after 2 business days, escalate to the reviewer’s manager.
+- For `megatron/core` PRs, the “Final Review” label is applied automatically once all expert reviewers approve
+  - Final reviewers should review within 1 business day. Message the assigned reviewer if it is taking longer.
+  - If the reviewer is not responding after 2 business days, escalate to the reviewer’s manager.
+- The “Approved” label is applied automatically once all required reviewers have approved
+
+## Issues and Discussion Questions
+
+If you do not know the answer to an issue or discussion question: that's ok! **Delegate to someone who does.**
+
+On a daily basis, track the following:
+
+- [new issues](https://github.com/NVIDIA/Megatron-LM/issues): check to see if there are any new issues before they become out of SLA!
+- [out of SLA issues](https://github.com/orgs/NVIDIA-NeMo/projects/20/views/4?sliceBy%5Bvalue%5D=NVIDIA%2FMegatron-LM): useful dashboard that tracks all out of SLA issues

@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 from typing import Dict
 
@@ -20,9 +22,7 @@ def test_resume_checkpoint_pipeline(
         model_config = yaml.safe_load(f)
 
     checks_types = (
-        model_config["METRICS"]
-        if "METRICS" in model_config
-        else ["iteration-time", "lm loss", "num-zeros"]
+        model_config["METRICS"] if "METRICS" in model_config else ["lm loss", "num-zeros"]
     )
     checks = {
         metric: test_pretraining_regular_pipeline.CHECK_THRESHOLDS[metric]
