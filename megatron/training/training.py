@@ -1419,6 +1419,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
 
+        # Register DDP module for draining async param gathers at CG/eager boundary.
+        # With --overlap-param-gather + CUDA graphs, the DDP forward pre-hook
+        # (finish_param_sync) is skipped during graph capture/replay, leaving async
+        # param AGs in-flight. Expert compute needs to drain them before EETP RS.
+        if ddp_config.overlap_param_gather and DP is DDP:
+            from megatron.core.transformer.moe.fused_a2a import register_ddp_for_expert_drain
+            register_ddp_for_expert_drain(model[0])
+
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
             for model_module in model:
