@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import copy
 import gc
 import random
 
@@ -12,6 +13,7 @@ from torch.testing import assert_close
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
@@ -198,6 +200,11 @@ class TestFullyShardedDataParallel:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend='nccl')
 
+        # Skip test if we don't have enough GPUs
+        world_size = torch.distributed.get_world_size()
+        if world_size != dp_size:
+            pytest.skip(f"This test requires {dp_size} GPUs, but only {world_size} are available")
+
         # Create HyperCommGrid with dp dimension
         grid = HyperCommGrid([dp_size], ["dp"])
 
@@ -206,11 +213,6 @@ class TestFullyShardedDataParallel:
 
         pg_collection.dp = grid.create_pg("dp")
         pg_collection.dp_cp = pg_collection.dp
-
-        # Skip test if we don't have enough GPUs
-        world_size = torch.distributed.get_world_size()
-        if world_size != dp_size:
-            pytest.skip(f"This test requires {dp_size} GPUs, but only {world_size} are available")
 
         # Simple model config
         input_dim = 13
@@ -350,6 +352,11 @@ class TestFullyShardedDataParallel:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend='nccl')
 
+        # Skip test if we don't have enough GPUs
+        world_size = torch.distributed.get_world_size()
+        if world_size != dp_size:
+            pytest.skip(f"This test requires {dp_size} GPUs, but only {world_size} are available")
+
         # Create HyperCommGrid with dp dimension
         grid = HyperCommGrid([dp_size], ["dp"])
 
@@ -357,11 +364,6 @@ class TestFullyShardedDataParallel:
         pg_collection = ProcessGroupCollection()
 
         pg_collection.dp = grid.create_pg("dp")
-
-        # Skip test if we don't have enough GPUs
-        world_size = torch.distributed.get_world_size()
-        if world_size != dp_size:
-            pytest.skip(f"This test requires {dp_size} GPUs, but only {world_size} are available")
 
         # Model config
         hidden_dim = 16
@@ -697,6 +699,12 @@ class TestMegatronFSDPE2E:
             train_iters=NUM_TRAINING_STEPS,
             **kwargs,
         )
+        if kwargs.get("use_megatron_fsdp", False) and kwargs.get(
+            "use_precision_aware_optimizer", False
+        ):
+            assert (
+                not optim.optimizer.master_weights
+            ), "Megatron-FSDP should not use FusedAdam master weights."
 
         # Prepare data iterator
         data_iterator = make_gpt_mock_data_iterator(
@@ -741,34 +749,85 @@ class TestMegatronFSDPE2E:
         ],
     )
     @pytest.mark.parametrize(
-        ("fsdp_sharding_strategy", "use_double_buffer"),
+        "spec_configs",
         [
-            ("optim_grads_params", False),
-            ("optim_grads_params", True),
-            ("optim_grads", False),
-            ("optim", True),
-            ("no_shard", False),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fsdp_double_buffer=True,
+                    fp8_recipe="mxfp8",
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    bf16=True,
+                    num_distributed_optimizer_instances=2,
+                    outer_dp_sharding_strategy="optim",
+                ),
+                id="optim_grads_params_mxfp8_double_buffer",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fsdp_double_buffer=True,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
+                ),
+                id="optim_grads_params_double_buffer",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    megatron_fsdp_main_params_dtype=torch.float32,
+                    use_precision_aware_optimizer=True,
+                    fp8_recipe="delayed",
+                    fp8_param_gather=True,
+                    bf16=True,
+                ),
+                id="optim_grads_params_fused_adam_e2e",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params", fsdp_double_buffer=False
+                ),
+                id="optim_grads_params_no_double_buffer",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim_grads", fsdp_double_buffer=True),
+                id="optim_grads_no_double_buffer",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim", fsdp_double_buffer=False),
+                id="optim_double_buffer",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="no_shard", fsdp_double_buffer=False),
+                id="no_shard_no_double_buffer",
+            ),
         ],
     )
-    def test_compatible_with_nd_parallel(
-        self, ref_cache, nd_topology, fsdp_sharding_strategy, use_double_buffer
-    ):
+    def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
+        if spec_configs.get("fp8_recipe") == "mxfp8" and (
+            torch.cuda.get_device_capability()[0] < 10 or not HAVE_TE_MXFP8TENSOR
+        ):
+            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
+            distopt_spec_configs = copy.deepcopy(spec_configs)
+            distopt_spec_configs["fp8_param_gather"] = False
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True
+                use_distributed_optimizer=True, **distopt_spec_configs
             )
 
         # no_shard is incompatible with meta device initialization. See fully_shard.py:326.
-        init_model_with_meta_device = True if fsdp_sharding_strategy != "no_shard" else False
+        init_model_with_meta_device = True if spec_configs['data_parallel_sharding_strategy'] != "no_shard" else False
 
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
-            data_parallel_sharding_strategy=fsdp_sharding_strategy,
             init_model_with_meta_device=init_model_with_meta_device,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
-            fsdp_double_buffer=use_double_buffer,
+            **spec_configs,
         )
         reference_outputs = ref_cache[nd_topology_str]
 
