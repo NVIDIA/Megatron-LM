@@ -116,8 +116,9 @@ class SharedExpertMLP(MLP):
             self.cached_output = None
             self.gate_score = None
 
-            if self.stream is None:
-                self.stream = torch.cuda.Stream()
+            if self.__class__.stream is None:
+                self.__class__.stream = torch.cuda.Stream()
+            self.stream = self.__class__.stream
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""

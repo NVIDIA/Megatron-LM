@@ -705,10 +705,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        # Condition embeddings for diffusion models (e.g. timestep or text embeddings),
-        # shape [batch_size, embeddings_dim]. Consumed here so it is not forwarded to
-        # _forward_attention. Subclasses that override forward() can use this directly.
-        conditions_embeddings = kwargs.pop("conditions_embeddings", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
