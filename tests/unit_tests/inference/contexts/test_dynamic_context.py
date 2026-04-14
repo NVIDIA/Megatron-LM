@@ -577,6 +577,10 @@ class TestDynamicContext:
 
         mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0].item()
         assert mamba_idx >= 0
+
+        # Mamba state zeroing is deferred until transfer_bookkeeping_to_gpu().
+        dynamic_context.initialize_attention_state()
+        dynamic_context.transfer_bookkeeping_to_gpu()
         assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx] == 0)
         assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx] == 0)
 

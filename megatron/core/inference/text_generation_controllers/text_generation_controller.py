@@ -1746,6 +1746,28 @@ class TextGenerationController:
                     pp_group=self.pp_group,
                 )
 
+    def _transfer_samples_to_cpu(
+        self, active_request_count: int
+    ) -> tuple:
+        """Batch GPU-to-CPU transfer of sampled tokens.
+
+        Called at the boundary between GPU sampling and CPU bookkeeping.
+        After this returns, all sampled data is on CPU and the remainder
+        of the step is 100% CPU.
+
+        Returns:
+            tuple: (sampled_tokens_cpu, sampled_mtp_tokens_cpu) where
+                sampled_mtp_tokens_cpu is None when speculative decoding is off.
+        """
+        sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
+        if self.num_speculative_tokens > 0:
+            sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[
+                :, :active_request_count
+            ].cpu()
+        else:
+            sampled_mtp_tokens_cpu = None
+        return sampled_tokens_cpu, sampled_mtp_tokens_cpu
+
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -1765,13 +1787,15 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # GPU-to-CPU transfer of sampled tokens (single batch D2H).
+        # Batch GPU-to-CPU transfer of all sampled tokens.
         range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
+        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+            active_request_count,
+        )
         range_pop()
 
         range_push("active_request_mask")
-        # Active sequence lengths (CPU, from context bookkeeping).
+        # Everything below is 100% CPU.
         active_request_ids = context.request_ids[active_request_slice].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
 
@@ -1783,14 +1807,11 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
-        # Note: termination_id tensor has per-request termination IDs from mixed sampling.
-        # All comparisons are on CPU (sampled_tokens_cpu, _request_metadata, context tensors).
         active_request_mask = (
             sampled_tokens_cpu
             != self._request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
-        # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
@@ -1810,12 +1831,6 @@ class TextGenerationController:
         range_pop()
 
         range_push("update_requests")
-        # Update requests (100% CPU).
-        # _sampled_mtp_tokens_cuda has shape [num_speculative_tokens, max_requests]
-        if self.num_speculative_tokens > 0:
-            sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[:, :active_request_count].cpu()
-        else:
-            sampled_mtp_tokens_cpu = None
         update_result = context.update_requests(
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
         )

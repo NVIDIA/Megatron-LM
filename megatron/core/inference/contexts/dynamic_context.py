@@ -888,6 +888,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
+        # Deferred Mamba GPU operations.  Populated by add_request() /
+        # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
+        self._pending_mamba_zeros: list = []
+        self._pending_mamba_restores: list = []
+
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
@@ -1480,8 +1485,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     raise ContextOverflowError(
                         requests[logical_idx].request_id, "No Mamba slots available"
                     )
-                self.mamba_conv_states[:, mamba_idx] = 0.0
-                self.mamba_ssm_states[:, mamba_idx] = 0.0
+                self._pending_mamba_zeros.append(mamba_idx)
                 self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
 
         self.active_token_count = token_end
@@ -1857,6 +1861,32 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
+    def _execute_pending_mamba_ops(self) -> None:
+        """Execute Mamba GPU operations deferred from add_request() / update_requests().
+
+        This runs at the start of transfer_bookkeeping_to_gpu() so that all GPU
+        Mamba state is correct before the forward pass.
+        """
+        if not (self._pending_mamba_restores or self._pending_mamba_zeros):
+            return
+
+        # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
+        for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
+            restored = self.mamba_slot_allocator.restore_to_live(request_idx, block_id)
+            if not restored:
+                self._pending_mamba_zeros.append(mamba_idx)
+        self._pending_mamba_restores.clear()
+
+        # Batch-zero newly allocated Mamba slots.
+        if self._pending_mamba_zeros:
+            device = self.mamba_conv_states.device
+            indices = torch.tensor(
+                self._pending_mamba_zeros, dtype=torch.long, device=device,
+            )
+            self.mamba_conv_states[:, indices] = 0.0
+            self.mamba_ssm_states[:, indices] = 0.0
+            self._pending_mamba_zeros.clear()
+
     def transfer_bookkeeping_to_gpu(self) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
@@ -1864,6 +1894,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         All copies use non_blocking=True with pinned CPU memory. CUDA stream
         ordering guarantees the forward pass sees completed transfers.
         """
+        # Execute deferred Mamba GPU operations first (state zeroing, restore, offsets).
+        self._execute_pending_mamba_ops()
+
         n_tok = self.padded_active_token_count
 
         # Token-level transfers.
@@ -2439,17 +2472,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Restore Mamba state from the block corresponding to prefix_skip_tokens
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
-            restored = False
             if restore_block_count > 0 and self.mamba_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
-                restored = self.mamba_slot_allocator.restore_to_live(
-                    self.total_request_count, restore_block_id
+                self._pending_mamba_restores.append(
+                    (self.total_request_count, restore_block_id, mamba_idx)
                 )
-            if not restored:
-                self.mamba_conv_states[:, mamba_idx] = 0.0
-                self.mamba_ssm_states[:, mamba_idx] = 0.0
+            else:
+                self._pending_mamba_zeros.append(mamba_idx)
 
-            # Compute intermediate offsets for state extraction during forward pass
+            # compute_and_store_offsets sets both CPU state (hash_to_block_id,
+            # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
+            # because commit_intermediate_states() reads the CPU state after the
+            # forward pass.
             if self.mamba_slot_allocator is not None:
                 self.mamba_slot_allocator.compute_and_store_offsets(
                     req,
