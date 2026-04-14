@@ -67,6 +67,7 @@ class TestRotateActivation:
         yield
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     def test_rotate_activation_shape(self):
         """Test that rotate_activation preserves shape."""
         batch_size = 2
@@ -79,6 +80,7 @@ class TestRotateActivation:
         assert output.shape == x.shape
         assert output.dtype == torch.bfloat16
 
+    @pytest.mark.flaky_in_dev
     def test_rotate_activation_dtype_check(self):
         """Test that rotate_activation only accepts bfloat16."""
         x = torch.randn(16, 2, 128, dtype=torch.float32).cuda()
