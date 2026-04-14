@@ -295,8 +295,14 @@ jobs:
 
             ## Phase 4: Mark PR as ready for review
 
-            Once all sync-related CI issues are fixed (pre-existing failures
-            are acceptable):
+            **Do NOT run `gh pr ready` until the FINAL CI run has completed
+            and you have verified the results.** "Fixed" means the fix has
+            been pushed AND the subsequent CI run has finished AND the
+            previously-failing jobs now pass. Pushing a fix is not enough —
+            you must wait for CI to confirm it works.
+
+            Once the final CI run completes and the only remaining failures
+            are pre-existing (not sync-caused):
             ```
             gh pr ready <PR_NUMBER> --repo $REPO
             ```
