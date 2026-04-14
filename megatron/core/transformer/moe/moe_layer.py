@@ -30,7 +30,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import internal_api, nvtx_range_push, nvtx_range_pop
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 try:
     import flashinfer  # pylint: disable=unused-import
