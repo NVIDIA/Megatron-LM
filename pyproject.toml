@@ -185,7 +185,6 @@ no-build-isolation-package = [
     "mamba-ssm",
     "transformer-engine",
     "transformer-engine-torch",
-    "fast-hadamard-transform",
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
