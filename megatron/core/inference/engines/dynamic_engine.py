@@ -19,7 +19,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
-from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
@@ -62,6 +61,8 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    nvtx_range_pop,
+    nvtx_range_push,
     trace_async_exceptions,
 )
 
@@ -650,14 +651,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
-            range_push(f"{key}-inference-context")
+            nvtx_range_push(f"{key}-inference-context")
             torch.cuda.synchronize()
 
             yield
 
         finally:
 
-            range_pop()
+            nvtx_range_pop(f"{key}-inference-context")
             end_time = time.time()
 
             end_mem = torch.cuda.memory_stats()
@@ -1656,7 +1657,7 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
         # Generate tokens.
-        range_push("Prefill" if not is_decode_only else "Decode")
+        nvtx_range_push("Prefill" if not is_decode_only else "Decode")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
@@ -1668,7 +1669,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
-        range_pop()
+        nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
         if (
             self.logging_step_interval > 0
@@ -1715,7 +1716,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
         # Increment finished_request_count.
-        range_push("bookkeeping")
+        nvtx_range_push("bookkeeping")
         cuda_graph_request_count = None
 
         if step_result is not None:
@@ -1764,13 +1765,13 @@ class DynamicInferenceEngine(AbstractEngine):
             ), f"Failed request {failed_request_id} future has not been properly resolved."
         self.failed_request_ids.clear()
 
-        range_pop()
+        nvtx_range_pop("bookkeeping")
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will
         # overlap detokenization with the engine.
         if not self.use_coordinator:
-            range_push("detokenization")
+            nvtx_range_push("detokenization")
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
@@ -1784,7 +1785,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_tokens,
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
-            range_pop()
+            nvtx_range_pop("detokenization")
 
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,
@@ -1794,13 +1795,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
             if records_to_send:
-                range_push("coordinator_communication")
+                nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
                     [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
                     use_bin_type=True,
                 )
                 self.socket_for_receiving_requests.send(payload)
-                range_pop()
+                nvtx_range_pop("coordinator_communication")
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
@@ -2040,7 +2041,7 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
-        range_push("drain_zmq_socket")
+        nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
             while True:
@@ -2073,7 +2074,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 all_messages = []
 
-        range_pop()
+        nvtx_range_pop("drain_zmq_socket")
 
         # First pass: add requests.
         # Control signals are queued for the second pass.
@@ -2084,9 +2085,9 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                range_push("add_request")
+                nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
-                range_pop()
+                nvtx_range_pop("add_request")
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:
@@ -2230,7 +2231,7 @@ class DynamicInferenceEngine(AbstractEngine):
             (global_work, all_pausing): max work across EP, and whether
             all peers signaled consensus.
         """
-        range_push("_ep_establish_consensus")
+        nvtx_range_push("_ep_establish_consensus")
 
         consensus_val = -1 if signal_consensus else 0
 
@@ -2255,7 +2256,7 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             global_work, global_consensus = local_work, consensus_val
 
-        range_pop()
+        nvtx_range_pop("_ep_establish_consensus")
         return global_work, global_consensus == -1
 
     async def _world_barrier(self):
@@ -2267,12 +2268,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         No-op when world_size == 1 (communicator is not created).
         """
-        range_push("world_barrier")
+        nvtx_range_push("world_barrier")
         if hasattr(self, 'world_zmq_communicator'):
             await self.world_zmq_communicator.all_reduce_max(
                 1, async_op=(not self.use_synchronous_zmq_collectives)
             )
-        range_pop()
+        nvtx_range_pop("world_barrier")
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
