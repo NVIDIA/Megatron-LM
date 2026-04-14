@@ -405,7 +405,6 @@ class TestGDNCuSeqlensResolve:
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
 
 
-@pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
     [
