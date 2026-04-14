@@ -90,266 +90,41 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.PAT }}
           prompt: |
-            You are an automated sync bot. Your job is to merge `main` into `dev`,
-            create a PR, ensure all CI tests pass (fixing any failures), and mark
-            the PR as ready for review.
-
-            **CRITICAL: Your exit condition is running `gh pr ready`.**
-            You are NOT done until you have run `gh pr ready <PR_NUMBER>`.
-            That command is in Phase 4. You cannot reach Phase 4 until CI
-            finishes. CI takes 1-2 hours. You must poll it using a Bash
-            `while` loop with `sleep 120` between iterations.
-
-            **Banned patterns that will break the workflow:**
-            - Do NOT use `ScheduleWakeup` — it silently ends your session.
-            - Do NOT use `run_in_background: true` for polling — background
-              processes become orphans that hang the GH Actions job forever.
-            - Do NOT use `tail` on a background task output file in a loop
-              — this burns turns rapidly for no benefit.
-            Instead, run a SINGLE foreground `Bash` command with a
-            `while true; do ...; sleep 120; done` loop that checks the
-            GitHub API directly. This is one tool call that blocks until
-            CI completes.
-
-            Do NOT exit after creating the PR or triggering CI — that is
-            only Phase 2 out of 4. You have 1000 turns and 6 hours.
+            You are an automated sync bot. Merge `main` into `dev`, create a
+            PR, ensure CI passes (fixing failures), and mark the PR ready.
+            There are 4 phases. You are NOT done until Phase 4 completes.
 
             REPO: ${{ github.repository }}
             BRANCH: ${{ steps.vars.outputs.branch }}
             DATE: ${{ steps.vars.outputs.date }}
 
-            Read `.claude/skills/build-and-test/SKILL.md` and `CLAUDE.md` first to
-            understand the project's CI pipeline, testing infrastructure, and
-            contribution guidelines.
+            Read `.claude/skills/nightly-sync/SKILL.md` for the detailed
+            merge strategy, CI architecture, failure investigation procedures,
+            and known issues. Also read `.claude/skills/build-and-test/SKILL.md`
+            and `CLAUDE.md` for general CI and contribution guidelines.
 
-            ---
+            ## Hard Constraints
 
-            ## Phase 1: Create the sync branch and merge
+            **Exit condition:** You MUST run `gh pr ready <PR_NUMBER>` before
+            exiting. That command is Phase 4. Do NOT exit after Phase 2 or 3.
 
-            Create a branch named `$BRANCH` from `origin/dev` and merge
-            `origin/main` into it.
+            **CI polling:** Use a SINGLE foreground Bash `while true` loop
+            with `sleep 120` that calls `gh api` to check job status. One
+            tool call that blocks until CI completes or a failure is found.
 
-            **Merge strategy:**
-            - Use `git merge origin/main -X theirs --no-edit` so that main wins on
-              textual conflicts.
-            - If any conflicts remain unresolved (e.g. add/add), read each
-              conflicted file, understand both sides, and resolve by favoring main.
-            - **Do NOT blanket-override all shared files with main's version.**
-              Dev has features that are not yet in main (new classes, new modules,
-              new tests). The git merge preserves both sides' non-conflicting
-              additions, which is correct. Only intervene where there is an actual
-              conflict.
+            **Banned patterns (will break the workflow):**
+            - `ScheduleWakeup` — silently ends your session
+            - `run_in_background: true` for polling — orphans hang the job
+            - `tail` on background task output in a loop — burns turns
 
-            **Beware of squash-merge chains (favor dev when it has follow-ups):**
-            Dev often develops features as a chain of PRs (PR1 → PR2 → PR3)
-            where each builds on the last. When PR1 is squash-merged to main,
-            git sees main's squashed version and dev's original commits as
-            unrelated changes to the same lines. `-X theirs` will then pick
-            main's PR1 code and silently discard PR2/PR3's improvements on dev.
+            **Pre-existing failures:** MUST verify against recent dev CI
+            before classifying any failure as pre-existing. Run
+            `gh pr checks` on a recently merged dev PR. If the test passes
+            on dev, the failure is sync-caused and you must fix it.
 
-            After the merge, check for this pattern:
-            1. For each file where `-X theirs` resolved a conflict, run
-               `git log --oneline origin/dev -- <file>` to see if dev has
-               commits that came AFTER the code main is bringing in.
-            2. If dev has follow-up commits (e.g. bug fixes, refactors, or
-               extensions to the feature), **favor dev's version** for those
-               specific sections — the follow-ups are more recent and
-               intentional.
-            3. If the conflict is just main bringing in a clean copy of what
-               dev already has (no follow-ups), main's version is fine.
-
-            In practice: after the merge completes, run
-            `git diff origin/dev -- <file>` on any file that had conflicts.
-            If the diff shows dev's code was removed or reverted, investigate
-            whether dev's version is the more evolved one.
-
-            **After merging, take main's version ONLY for these specific files**
-            that are known to have semantic conflicts (dev's versions reference
-            args/APIs that main removed or renamed):
-            - `pyproject.toml` and `uv.lock` (lock-file consistency for container build)
-            - `docker/Dockerfile.ci.dev` (build compatibility)
-            - `megatron/training/training.py` (references dev-only args)
-            - `megatron/training/initialize.py` (references dev-only args)
-            - `megatron/training/utils.py` (references dev-only args)
-            - `megatron/training/datasets/data_samplers.py` (references dev-only args)
-            - `megatron/core/optimizer/layer_wise_optimizer.py` (constructor signature)
-
-            Use: `git checkout origin/main -- <file>` for each.
-
-            **Special handling for `megatron/core/datasets/data_schedule.py`:**
-            Main and dev have completely different classes in this file. Main has
-            `HybridCPDataLoaderWrapper` (imported by main's `training.py`). Dev
-            has `BasePackingScheduler`, `DpBalancedScheduler`,
-            `DefaultDynamicCPScheduler`, `wrap_data_iterator`, and
-            `get_batch_on_this_rank_for_sequence_packing` (imported by
-            `pretrain_gpt.py` and `tests/unit_tests/test_sequence_packing.py`).
-            **Do NOT take either version wholesale.** Instead, keep dev's file
-            and append main's `HybridCPDataLoaderWrapper` class (plus any
-            missing imports like `BalancedCPScheduler`, `Any`, `List`) at the
-            end. Then run `black` and `isort` on the result.
-
-            **Restore files that exist in main but were deleted/renamed in dev:**
-            Compare `git ls-tree` between `origin/main` and HEAD, and restore any
-            files from main that are missing (e.g. `hybrid_cp_schedule.py`).
-
-            Run `black` (version 24, with `--config pyproject.toml`) on **all**
-            changed Python files (relative to `origin/dev`) to fix formatting.
-            Then run `isort` on the same set of files. Order matters: black
-            first, then isort — running them in the wrong order can undo
-            isort's work.
-
-            **After formatting, run pylint on all changed `megatron/core/` files**
-            to catch missing-docstring and line-too-long violations before
-            pushing. Fix any violations found — e.g. the merge often introduces
-            pylint issues in `megatron/core/optimizer/grad_scaler.py` (missing
-            docstrings on abstract methods, long lines in docstrings).
-
-            Commit everything and push the branch.
-
-            ---
-
-            ## Phase 2: Create the PR
-
-            Create a **draft** PR targeting `dev`:
-            - Title: `chore: nightly sync main into dev ($DATE)`
-            - Body: describe what was synced, how conflicts were resolved, and
-              that CI will be iterated on automatically.
-
-            Save the PR number.
-
-            ---
-
-            ## Phase 3: Trigger CI and iterate until all tests pass
-
-            **Important CI architecture notes:**
-            - `Nemo_CICD_Test` is a downstream **gate job** that aggregates
-              results from unit tests, integration tests, and other jobs. If
-              it fails, investigate the upstream jobs it depends on — do NOT
-              debug `Nemo_CICD_Test` itself.
-            - Integration tests (H100, GB200) may be skipped for non-maintainer
-              PRs. This is expected; the `Nemo_CICD_Test` gate will fail as a
-              result, but that is not a sync issue.
-            - `tests/unit_tests/conftest.py` imports from
-              `megatron.training.training`, so a single broken import in
-              `training.py` (or anything it transitively imports) will cascade
-              and fail **ALL** test suites. If you see every test job failing
-              with an `ImportError`, check the import chain from `training.py`
-              first.
-
-            Loop:
-            1. Get the HEAD commit SHA and comment on the PR:
-               `/ok to test <SHA>`
-            2. Find the CI run: use `gh run list` with `--json` and filter
-               for `headBranch == "pull-request/<PR_NUMBER>"` (note: `gh run
-               list` does not support a `--branch` flag).
-            3. **Poll for failures every 2 minutes using a Bash while-loop
-               with `sleep 120`.** Do NOT use ScheduleWakeup — it will end
-               your session. Write a synchronous polling loop like:
-               ```
-               while true; do
-                 JOBS=$(gh api repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100)
-                 # check for failures and completion
-                 sleep 120
-               done
-               ```
-               Use `gh api repos/$REPO/actions/runs/<RUN_ID>/jobs?per_page=100`
-               and check for jobs with `conclusion == "failure"`.
-               As soon as you see ANY failed job, immediately investigate it
-               (see step 5). Do not wait for remaining jobs — they will keep
-               running in CI while you diagnose and fix. The goal is to
-               overlap investigation with CI execution so you can push a fix
-               and re-trigger before the full run even finishes.
-            4. If all jobs **succeeded** → go to Phase 4.
-            5. If any job **failed** → investigate and fix immediately:
-               - Fetch the failed job's logs via
-                 `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs`.
-               - Grep for `ImportError`, `ModuleNotFoundError`, `FAILED`,
-                 `would reformat`, `line-too-long`, `Traceback`, etc.
-               - Read the error, understand the root cause, and fix the code.
-               - Common issues from this sync:
-                 - **ImportError for a class/module**: A dev-only test imports a
-                   class from a shared file where we took main's version. Fix by
-                   checking whether the class was moved, renamed, or needs to be
-                   kept from dev's version of that file. Be surgical — restore only
-                   the missing class/function, not the entire file. If a file's
-                   classes are completely different between main and dev (like
-                   `data_schedule.py`), take main's version entirely and note it
-                   as a new override candidate for Phase 1.
-                 - **black / pylint formatting**: Run `black --config pyproject.toml`
-                   on the offending files. For pylint long-line or
-                   missing-docstring, edit the file directly.
-                 - **Test assertion failures**: Read the test and the code under
-                   test. Fix the code or the test as appropriate.
-               - If the failure is pre-existing (see below), note it and
-                 continue polling for other failures.
-               - If the failure is sync-caused, fix it, commit, push, and
-                 re-trigger CI immediately — do not wait for the rest of the
-                 run to finish.
-               - Repeat until all fixable issues are resolved.
-
-            **Handling pre-existing failures — VERIFY, do not assume:**
-            Do NOT lazily label a failure as "pre-existing." You MUST prove
-            it by checking actual CI results from recent dev PRs:
-            1. Run: `gh pr list --repo $REPO --base dev --state merged --limit 3`
-               to find recently merged dev PRs.
-            2. Run: `gh pr checks <PR_NUMBER> --repo $REPO` on one of them
-               and check if the SAME test bucket that failed on your sync
-               also failed on the recent dev PR.
-            3. If the test **passes on recent dev CI**, the failure is
-               sync-caused — you must fix it. Common cause: taking main's
-               `pyproject.toml`/`uv.lock` changes the container's dependency
-               versions (e.g. TransformerEngine), breaking dev-only code.
-               In this case, the fix may require keeping dev's dependency
-               versions or adjusting the code.
-            4. Only if the test **also fails on recent dev CI** can you
-               classify it as pre-existing. Document it with the dev PR
-               number and CI run as evidence.
-            5. After the CI run completes, update the PR description with a
-               section titled "Pre-existing test failures (NOT caused by this
-               sync)" documenting each such failure: the test name, the error
-               message, the dev PR number checked, and whether it also failed
-               there.
-            6. Also comment on the PR summarizing these findings.
-
-            ---
-
-            ## Phase 4: Mark PR as ready for review
-
-            **Do NOT run `gh pr ready` until the FINAL CI run has completed
-            and you have verified the results.** "Fixed" means the fix has
-            been pushed AND the subsequent CI run has finished AND the
-            previously-failing jobs now pass. Pushing a fix is not enough —
-            you must wait for CI to confirm it works.
-
-            Once the final CI run completes and the only remaining failures
-            are pre-existing (not sync-caused):
-            ```
-            gh pr ready <PR_NUMBER> --repo $REPO
-            ```
-            Comment on the PR confirming which checks passed, listing any
-            pre-existing failures that remain, and stating it is ready for
-            human review.
-
-            ---
-
-            ## Rules
-
-            - **Do NOT exit until Phase 4 is complete.** You must stay alive
-              through the entire CI cycle: trigger CI, poll until every job
-              finishes, fix any sync-caused failures, re-trigger, and repeat.
-              Only exit after you have marked the PR as ready (or documented
-              all remaining failures as pre-existing). Triggering CI and
-              walking away is NOT acceptable — the whole point of this
-              workflow is automated end-to-end delivery.
-            - **Prioritize main over dev** when there is a genuine conflict between
-              the two. But preserve dev-only additions (new files, new classes, new
-              tests) that do not conflict with main.
-            - Keep fixing and retrying sync-related issues until they pass.
-              For pre-existing failures, document them and move on (see Phase 3).
-            - The CI pipeline triggers when you comment "/ok to test <sha>".
-            - CI runs appear on the `pull-request/<PR_NUMBER>` branch.
-            - The git committer identity is `svcnvidia-nemo-ci`.
-            - After editing imports, run `isort` on those files.
+            **Phase 4 gate:** Do NOT run `gh pr ready` until the FINAL CI
+            run has completed AND previously-failing jobs now pass. Pushing
+            a fix is not enough — wait for CI to confirm.
           show_full_output: true
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
