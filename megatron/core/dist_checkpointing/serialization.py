@@ -93,10 +93,9 @@ def load(
             are: `False` (StrictHandling.LOG_UNEXPECTED) which logs only unexpected keys
             or `StrictHandling.RETURN_ALL` which returns all mismatch keys.
         verify_integrity (bool, optional): if True, re-hashes every checkpoint file
-            and compares against the SHA-256 manifest written by ``save(...,
-            save_integrity=True)``.  Raises :class:`CheckpointingException` on any
-            mismatch.  Requires that the checkpoint was previously saved with
-            ``save_integrity=True``.  Defaults to False.
+            and compares against the SHA-256 manifest. Raises `CheckpointingException` on any
+            mismatch. Requires that the checkpoint was previously saved with
+            `verify_integrity=True`.
 
     Returns:
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
@@ -351,12 +350,11 @@ def save(
             modify the original state dict
         content_metadata (dict, optional): metadata to identify the checkpoint content.
             Useful for framework specific versioning.
-        save_integrity (bool, optional): if True, compute SHA-256 hashes for every
-            file in the checkpoint directory after all data has been written and
-            persist them to ``{checkpoint_dir}/integrity.json``.  This manifest can
-            later be verified on load with ``load(..., verify_integrity=True)``.
+        verify_integrity (bool, optional): if True, compute SHA-256 hashes for every
+            file in the checkpoint directory after all data has been written. This manifest can
+            later be verified on load with `load(..., verify_integrity=True)`.
             Adds I/O overhead proportional to the total checkpoint size (one extra
-            read pass over all files on rank 0).  Defaults to False.
+            read pass over all files on rank 0).
 
     Returns:
         AsyncRequest (optional): if `async_sharded_save` is True, returns
