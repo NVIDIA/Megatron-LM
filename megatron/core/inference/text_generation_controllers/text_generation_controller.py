@@ -610,7 +610,6 @@ class TextGenerationController:
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
 
-
         # Derive the MTP padded batch size from the EP-synced graph dimensions.
         # In eager mode MTP uses locally SP-aligned batch size instead.
         if (
@@ -1137,9 +1136,7 @@ class TextGenerationController:
             num_speculative_tokens=self.num_speculative_tokens,
         )
         # Expose the active slice so downstream code sees the right length.
-        self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[
-            :active_request_count
-        ]
+        self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
     def _dynamic_step_sample_logits(self, logits: Tensor):
         """Sample tokens from logits for dynamic batching.
@@ -1660,7 +1657,9 @@ class TextGenerationController:
 
         unwrapped_model = self._unwrapped_model
 
-        has_mtp = self._is_last_pp_stage and hasattr(unwrapped_model, '_decoder_hidden_states_cache')
+        has_mtp = self._is_last_pp_stage and hasattr(
+            unwrapped_model, '_decoder_hidden_states_cache'
+        )
         if not has_mtp and not self.model_is_pipeline_parallel:
             # No MTP on this rank and no PP broadcast to participate in.
             return
@@ -1871,9 +1870,7 @@ class TextGenerationController:
 
                 # Phase 4: Release freed blocks. Deferred from Phase 2 so the
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.
-                context.kv_block_allocator.release_memory_blocks(
-                    blocks_to_release[remove_mask]
-                )
+                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits(logits)
 

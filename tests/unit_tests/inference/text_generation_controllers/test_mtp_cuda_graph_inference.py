@@ -44,7 +44,6 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
-
 # --------------------------------------------------------------------------- #
 #  TestMTPCudaGraphInference (TP = 2)
 # --------------------------------------------------------------------------- #
@@ -67,8 +66,7 @@ class TestMTPCudaGraphInference:
         if Utils.world_size < self.TP_SIZE:
             pytest.skip(f"Need at least {self.TP_SIZE} GPUs")
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=self.TP_SIZE,
-            pipeline_model_parallel_size=1,
+            tensor_model_parallel_size=self.TP_SIZE, pipeline_model_parallel_size=1
         )
 
     def teardown_method(self, method):
@@ -96,9 +94,7 @@ class TestMTPCudaGraphInference:
         )
         layer_spec = get_gpt_layer_local_spec()
         mtp_block_spec = get_gpt_mtp_block_spec(
-            config=config,
-            spec=layer_spec,
-            use_transformer_engine=False,
+            config=config, spec=layer_spec, use_transformer_engine=False
         )
         model = GPTModel(
             config=config,
@@ -123,8 +119,7 @@ class TestMTPCudaGraphInference:
     ):
         """Build a model, DynamicInferenceContext, and TextGenerationController."""
         model = self._build_model(
-            sequence_parallel=sequence_parallel,
-            mtp_num_layers=mtp_num_layers,
+            sequence_parallel=sequence_parallel, mtp_num_layers=mtp_num_layers
         )
         config = model.config
         if max_requests is None:
@@ -145,10 +140,7 @@ class TestMTPCudaGraphInference:
         wrapped = GPTInferenceWrapper(model, context)
         wrapped.model_is_pipeline_parallel = False
         mock_tokenizer = mock.Mock()
-        ctrl = TextGenerationController(
-            inference_wrapped_model=wrapped,
-            tokenizer=mock_tokenizer,
-        )
+        ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
         return model, context, ctrl
 
     def _warmup_mtp_graphs(self, model, batch_sizes, *, sp_enabled=False):
@@ -166,9 +158,7 @@ class TestMTPCudaGraphInference:
         for bs in sorted(batch_sizes):
             dummy_hidden = torch.zeros((bs, 1, hidden_size), device=device, dtype=dtype)
             if sp_enabled:
-                dummy_hidden = scatter_to_sequence_parallel_region(
-                    dummy_hidden, group=tp_group
-                )
+                dummy_hidden = scatter_to_sequence_parallel_region(dummy_hidden, group=tp_group)
             dummy_token_ids = torch.zeros((1, bs), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, bs), device=device, dtype=torch.int64)
             unwrapped.compute_mtp_single_step(
@@ -316,17 +306,17 @@ class TestMTPCudaGraphInference:
         ctx.total_request_count = active_request_count
         ctx.paused_request_count = 0
         ctx.request_kv_length_offsets[:active_request_count] = torch.arange(
-            active_request_count, dtype=torch.int32, device='cuda',
+            active_request_count, dtype=torch.int32, device='cuda'
         )
         ctx.request_query_lengths[:active_request_count] = torch.ones(
-            active_request_count, dtype=torch.int32, device='cuda',
+            active_request_count, dtype=torch.int32, device='cuda'
         )
 
         ctrl.num_speculative_tokens = num_spec
         ctrl.num_mtp_heads = num_spec
         ctrl._init_mtp_sampling_tensor()
         ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
-            torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE,
+            torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE
         )
 
         # Build decoder hidden states cache in SP format.
@@ -336,9 +326,7 @@ class TestMTPCudaGraphInference:
         s_total = active_request_count + pad
 
         torch.manual_seed(42)
-        full_hidden = torch.randn(
-            s_total, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.float32
-        )
+        full_hidden = torch.randn(s_total, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.float32)
         dist.broadcast(full_hidden, src=0)
         local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
         unwrapped._decoder_hidden_states_cache = local_hidden
@@ -350,11 +338,9 @@ class TestMTPCudaGraphInference:
         self._set_mtp_cuda_graph_flag(model, True)
 
         # Greedy sampling: top_k=1 selects argmax deterministically.
-        ctrl._torch_sampling_buckets = [
-            (list(range(active_request_count)), 1.0, 1, 0.0),
-        ]
+        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
         ctrl._torch_sampling_bucket_index_tensors = [
-            torch.arange(active_request_count, device='cuda', dtype=torch.long),
+            torch.arange(active_request_count, device='cuda', dtype=torch.long)
         ]
 
         # Run MTP forward pass.
@@ -410,17 +396,17 @@ class TestMTPCudaGraphInference:
             ctx.total_request_count = active_request_count
             ctx.paused_request_count = 0
             ctx.request_kv_length_offsets[:active_request_count] = torch.arange(
-                active_request_count, dtype=torch.int32, device='cuda',
+                active_request_count, dtype=torch.int32, device='cuda'
             )
             ctx.request_query_lengths[:active_request_count] = torch.ones(
-                active_request_count, dtype=torch.int32, device='cuda',
+                active_request_count, dtype=torch.int32, device='cuda'
             )
 
             ctrl.num_speculative_tokens = num_spec
             ctrl.num_mtp_heads = num_spec
             ctrl._init_mtp_sampling_tensor()
             ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
-                torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE,
+                torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE
             )
 
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -430,20 +416,16 @@ class TestMTPCudaGraphInference:
 
             torch.manual_seed(42)
             full_hidden = torch.randn(
-                s_total, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.float32,
+                s_total, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.float32
             )
             dist.broadcast(full_hidden, src=0)
             local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
             unwrapped._decoder_hidden_states_cache = local_hidden
 
-            ctrl._last_accepted_seq_indices = torch.arange(
-                active_request_count, device='cuda',
-            )
-            ctrl._torch_sampling_buckets = [
-                (list(range(active_request_count)), 1.0, 1, 0.0),
-            ]
+            ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+            ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
             ctrl._torch_sampling_bucket_index_tensors = [
-                torch.arange(active_request_count, device='cuda', dtype=torch.long),
+                torch.arange(active_request_count, device='cuda', dtype=torch.long)
             ]
 
             ctrl._compute_serial_mtp_and_sample()
@@ -504,9 +486,9 @@ class TestMTPCudaGraphInference:
                 f"Depth {depth}: expected logits shape ({batch_size}, 1, {self.VOCAB_SIZE}), "
                 f"got {logits.shape}"
             )
-            assert torch.all(torch.isfinite(logits)), (
-                f"Depth {depth}: logits contain non-finite values"
-            )
+            assert torch.all(
+                torch.isfinite(logits)
+            ), f"Depth {depth}: logits contain non-finite values"
 
     # ---- Test 6: eager fallback when no matching graph exists ------------- #
 
@@ -639,9 +621,7 @@ class TestMTPCudaGraphExpertParallel:
         )
         layer_spec = get_gpt_layer_local_spec(num_experts=self.NUM_MOE_EXPERTS)
         mtp_block_spec = get_gpt_mtp_block_spec(
-            config=config,
-            spec=layer_spec,
-            use_transformer_engine=False,
+            config=config, spec=layer_spec, use_transformer_engine=False
         )
         model = GPTModel(
             config=config,
@@ -767,10 +747,7 @@ class TestMTPCudaGraphExpertParallel:
 
         # All ranks must complete without hanging.
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=hidden,
-            next_token_ids=token_ids,
-            position_ids=position_ids,
-            depth=0,
+            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids, depth=0
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -778,11 +755,7 @@ class TestMTPCudaGraphExpertParallel:
 
     # ---- Test 3: EP state cross product with DynamicInferenceContext ------- #
 
-    @pytest.mark.parametrize(
-        "rank_states",
-        _STATE_COMBOS,
-        ids=[",".join(s) for s in _STATE_COMBOS],
-    )
+    @pytest.mark.parametrize("rank_states", _STATE_COMBOS, ids=[",".join(s) for s in _STATE_COMBOS])
     @pytest.mark.internal
     @torch.inference_mode()
     def test_ep_state_cross_product(self, rank_states):
@@ -854,10 +827,7 @@ class TestMTPCudaGraphExpertParallel:
         position_ids = torch.arange(mtp_padded, device='cuda', dtype=torch.int64).unsqueeze(0)
 
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=hidden,
-            next_token_ids=token_ids,
-            position_ids=position_ids,
-            depth=0,
+            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids, depth=0
         )
 
         assert h_out.shape == (mtp_padded, 1, self.HIDDEN_SIZE), (
@@ -872,9 +842,7 @@ class TestMTPCudaGraphExpertParallel:
     # ---- Test 4: dummy EP rank bail-out with decode-only CUDA graphs ------ #
 
     @pytest.mark.parametrize(
-        "peer_state",
-        [PREFILL, MIXED],
-        ids=[f"peer={s}" for s in [PREFILL, MIXED]],
+        "peer_state", [PREFILL, MIXED], ids=[f"peer={s}" for s in [PREFILL, MIXED]]
     )
     @pytest.mark.internal
     @torch.inference_mode()

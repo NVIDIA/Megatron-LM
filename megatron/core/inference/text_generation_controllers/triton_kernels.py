@@ -198,11 +198,7 @@ def _verify_speculative_tokens_kernel(
 
 
 def verify_speculative_tokens(
-    input_tokens,
-    output_tokens,
-    num_decode_requests,
-    num_prefill_requests,
-    num_speculative_tokens,
+    input_tokens, output_tokens, num_decode_requests, num_prefill_requests, num_speculative_tokens
 ):
     """Launch the speculative-token verification Triton kernel.
 
@@ -219,9 +215,7 @@ def verify_speculative_tokens(
     decode_len = num_decode_requests * stride
 
     accepted_tokens_mask = torch.zeros_like(input_tokens, dtype=torch.bool)
-    last_one_indices = torch.full(
-        (active_request_count,), -1, device=device, dtype=torch.long
-    )
+    last_one_indices = torch.full((active_request_count,), -1, device=device, dtype=torch.long)
 
     if active_request_count > 0:
         block_size = triton.next_power_of_2(stride)
@@ -398,12 +392,7 @@ def _mamba_state_selective_copy_kernel(
 
 
 def mamba_state_selective_copy(
-    intermediate_states,
-    current_states,
-    prefill_status,
-    state_idx,
-    accepted_counts,
-    num_layers,
+    intermediate_states, current_states, prefill_status, state_idx, accepted_counts, num_layers
 ):
     """Copy accepted intermediate Mamba states to current states in-place.
 
