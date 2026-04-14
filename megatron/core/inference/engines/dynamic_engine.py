@@ -43,7 +43,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, GPUFuture, await_process_call
+from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
@@ -1724,9 +1724,7 @@ class DynamicInferenceEngine(AbstractEngine):
         result = await self.controller.async_generate_output_tokens_dynamic_batch(loop=self._loop)
         if will_log_this_step:
             self.step_end_event.record()
-            step_done = GPUFuture(self._loop)
-            step_done.record()
-            await step_done
+            self.step_end_event.synchronize()
             step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         else:
             step_time = 0.0
@@ -2378,9 +2376,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_start_event.record()
                             self.controller.dummy_forward()
                             self.step_end_event.record()
-                            step_done = GPUFuture(self._loop)
-                            step_done.record()
-                            await step_done
+                            self.step_end_event.synchronize()
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
                     else:
