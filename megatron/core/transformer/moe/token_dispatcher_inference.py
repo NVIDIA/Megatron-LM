@@ -269,13 +269,23 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _ep_rank: int = 0
     _engine_max_tokens: int = 2048
 
-    # RSV symmetric buffer — written here by _alloc_rsv_buffer so mcore_fused_moe
-    # can write unpermute output directly into it, avoiding a copy before RSV.
-    _rsv_symm_tensor: Optional[torch.Tensor] = None
+    # ── Class-level symmetric buffer handles (allocated once at model init) ───────
+    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=bf16.
+    _symm_agv_hidden: Optional[dict] = None   # {"tensor": ..., "handle": ...}
+    _symm_agv_routing: Optional[dict] = None
+    _symm_agv_probs: Optional[dict] = None
+    _symm_rsv: Optional[dict] = None
+
+    # When True, set_step_metadata fills the routing buffer with -1 before each
+    # step so stale rows beyond valid_tokens are pre-masked. Required by FlashInfer,
+    # which does not tolerate garbage expert IDs in unused rows.
+    _mask_routing_map: bool = False
 
     @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
-        return cls._rsv_symm_tensor
+        """Return the RSV symmetric buffer tensor so mcore_fused_moe can write
+        unpermute output directly into it, avoiding a copy before RSV."""
+        return cls._symm_rsv["tensor"] if cls._symm_rsv is not None else None
 
     @classmethod
     def _rank_token_offset(cls) -> torch.Tensor:
@@ -286,9 +296,75 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         return cls._step_metadata[2:3]
 
     @classmethod
-    def set_engine_max_tokens(cls, n: int) -> None:
-        """Set at model init. Determines AGV/RSV CTA grid size (fixed for CG)."""
-        cls._engine_max_tokens = n
+    def allocate_symmetric_buffers(
+        cls,
+        engine_max_tokens: int,
+        topk: int,
+        hidden_size: int,
+        ep_group: torch.distributed.ProcessGroup,
+        mask_routing_map: bool = False,
+    ) -> None:
+        """Allocate all symmetric buffers and initialize class-level metadata.
+
+        Called once at model init. Allocates fixed-size AGV and RSV symmetric
+        memory buffers so dispatch/combine can proceed without any allocation on
+        the hot path.
+
+        Args:
+            engine_max_tokens: Maximum tokens per EP rank (engine-level cap).
+            topk: MoE router top-k value.
+            hidden_size: Model hidden dimension.
+            ep_group: Expert parallel process group.
+            mask_routing_map: If True, set_step_metadata fills the routing buffer
+                with -1 each step so stale rows beyond valid_tokens are pre-masked.
+                Required when using the FlashInfer backend.
+        """
+        cls._mask_routing_map = mask_routing_map
+        cls._engine_max_tokens = engine_max_tokens
+        ep_size = dist.get_world_size(group=ep_group)
+        global_max = engine_max_tokens * ep_size
+        device = torch.cuda.current_device()
+
+        cls._symm_agv_hidden = SymmetricMemoryManager.get_buffer(
+            "ep_agv_h", process_group=ep_group
+        ).maybe_get_tensor([global_max, hidden_size], dtype=torch.bfloat16)
+
+        cls._symm_agv_routing = SymmetricMemoryManager.get_buffer(
+            "ep_agv_r", process_group=ep_group
+        ).maybe_get_tensor([global_max, topk], dtype=torch.int64)
+
+        cls._symm_agv_probs = SymmetricMemoryManager.get_buffer(
+            "ep_agv_p", process_group=ep_group
+        ).maybe_get_tensor([global_max, topk], dtype=torch.float32)
+
+        cls._symm_rsv = SymmetricMemoryManager.get_buffer(
+            "ep_rsv", process_group=ep_group
+        ).maybe_get_tensor([global_max, hidden_size], dtype=torch.bfloat16)
+
+        failed = [
+            name
+            for name, buf in (
+                ("ep_agv_h", cls._symm_agv_hidden),
+                ("ep_agv_r", cls._symm_agv_routing),
+                ("ep_agv_p", cls._symm_agv_probs),
+                ("ep_rsv",   cls._symm_rsv),
+            )
+            if buf["handle"] is None
+        ]
+        if failed:
+            raise RuntimeError(
+                f"NVLSAllGatherVDispatcher: symmetric memory allocation failed for "
+                f"{failed}. This dispatcher requires Hopper+ GPUs with NVLink. "
+                f"Use inference_moe_token_dispatcher_type='nccl' on non-NVLS systems."
+            )
+
+        if mask_routing_map:
+            cls._symm_agv_routing["tensor"].fill_(-1)
+
+        # Initialise step-metadata tensor and wire base class valid_tokens pointer.
+        cls._step_metadata = torch.zeros(3, dtype=torch.int32, device=device)
+        InferenceAllGatherDispatcherBase._valid_tokens_tensor = cls._step_metadata[0:1]
+        cls._ep_rank = dist.get_rank(group=ep_group)
 
     @classmethod
     def set_step_metadata(
@@ -296,12 +372,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         local_tokens: int,
         ep_group: torch.distributed.ProcessGroup,
     ) -> None:
-        """All-gather per-rank token counts and set all three NVLS metadata fields.
+        """All-gather per-rank token counts, update NVLS metadata, and mask routing buffer.
 
-        Allocates _step_metadata on the first call and wires the base class's
-        _valid_tokens_tensor to _step_metadata[0:1] so experts.py can always
-        call InferenceAllGatherDispatcherBase._valid_tokens() regardless of
-        which dispatcher is active. Subsequent calls copy in-place.
+        Fills routing_map symmetric buffer with -1 so rows in [valid_tokens, global_max)
+        are pre-masked for FlashInfer — the AGV then overwrites only [0, valid_tokens).
 
         A barrier is issued at the end to ensure all ranks are ready before the forward.
 
@@ -315,18 +389,19 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
         dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
 
-        if cls._step_metadata is None:
-            cls._step_metadata = torch.zeros(3, dtype=torch.int32, device=device)
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor = cls._step_metadata[0:1]
-            cls._ep_rank = dist.get_rank(group=ep_group)
         ep_rank = cls._ep_rank
         cls._step_metadata.copy_(
             torch.stack([
-                local_tokens_per_rank.sum(), # valid tokens
-                local_tokens_per_rank[:ep_rank].sum(), # prefix sum (for allgather-v/reduce-scatterv offsets)
-                local_tokens_per_rank.max(), # max tokens to determine the number of CTAs needed for barriers within AGv/RSv
+                local_tokens_per_rank.sum(),           # valid_tokens
+                local_tokens_per_rank[:ep_rank].sum(), # rank_token_offset
+                local_tokens_per_rank.max(),           # ep_max_tokens
             ])
         )
+
+        # Mask stale rows so FlashInfer ignores them; AGV overwrites [0, valid_tokens).
+        if cls._mask_routing_map:
+            cls._symm_agv_routing["tensor"].fill_(-1)
+
         dist.barrier(group=ep_group)
 
     def __init__(
@@ -345,48 +420,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         self.topk = config.moe_router_topk
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
-        self.routing_map_dtype = None
-
-    # ── Buffer allocation helpers ─────────────────────────────────────────────────
-
-    def _alloc_agv_buffers(self, hidden_states: torch.Tensor, probs: torch.Tensor) -> tuple:
-        """Allocate separate symmetric buffers for the three AGV outputs.
-
-        Buffers are sized at engine_max_tokens * ep_size (fixed across steps)
-        so the same allocations can be reused every CUDA graph replay.
-        """
-        global_max = self._engine_max_tokens * self.ep_size
-        topk = probs.shape[1]
-        hidden_dim = hidden_states.shape[1]
-
-        hidden_r = SymmetricMemoryManager.get_buffer(
-            "ep_agv_h", process_group=self.ep_group
-        ).maybe_get_tensor([global_max, hidden_dim], dtype=hidden_states.dtype)
-
-        routing_r = SymmetricMemoryManager.get_buffer(
-            "ep_agv_r", process_group=self.ep_group
-        ).maybe_get_tensor([global_max, topk], dtype=self.routing_map.dtype)
-
-        probs_r = SymmetricMemoryManager.get_buffer(
-            "ep_agv_p", process_group=self.ep_group
-        ).maybe_get_tensor([global_max, topk], dtype=probs.dtype)
-
-        return hidden_r, routing_r, probs_r
-
-    def _alloc_rsv_buffer(self, hidden_states: torch.Tensor) -> dict:
-        """Allocate a symmetric buffer for the RSV input (expert outputs).
-
-        Sized at [engine_max_tokens * ep_size, hidden_dim] — fixed for CG.
-        Caches the tensor so mcore_fused_moe can write into it directly,
-        avoiding a copy before multimem_reduce_scatter_v.
-        """
-        global_max = self._engine_max_tokens * self.ep_size
-        hidden_dim = hidden_states.shape[1]
-        buf = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=self.ep_group
-        ).maybe_get_tensor([global_max, hidden_dim], dtype=hidden_states.dtype)
-        NVLSAllGatherVDispatcher._rsv_symm_tensor = buf["tensor"]
-        return buf
 
     # ── Dispatch path ─────────────────────────────────────────────────────────────
 
@@ -397,60 +430,55 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self._local_tokens = hidden_states.shape[0]
         self.routing_map = routing_map
-        self.routing_map_dtype = routing_map.dtype
         return hidden_states, probs
 
     def token_dispatch(self, hidden_states, probs):
         """AllGather-V: gather hidden_states, probs, and routing_map from all EP ranks.
 
         Args:
-            hidden_states: [local_tokens, hidden_dim] local input.
-            probs: [local_tokens, topk] local routing probabilities.
+            hidden_states: [local_tokens, hidden_size] bf16 local input.
+            probs: [local_tokens, topk] fp32 local routing probabilities.
 
         Returns:
             (hidden_states, probs) gathered to [global_max, *] shape.
-            Also updates self.routing_map to [global_max, topk].
+            Also updates self.routing_map to [global_max, topk] int64.
         """
         if self.ep_size == 1:
             return hidden_states, probs
 
-        hidden_r, routing_r, probs_r = self._alloc_agv_buffers(hidden_states, probs)
-        assert all(r["handle"] is not None for r in (hidden_r, routing_r, probs_r)), (
-            "NVLSAllGatherVDispatcher requires NVLS symmetric memory for AGV. "
-            "Ensure the device is Hopper+ with NVLink and symmetric memory is available."
-        )
+        agv_h = self.__class__._symm_agv_hidden
+        agv_r = self.__class__._symm_agv_routing
+        agv_p = self.__class__._symm_agv_probs
 
         engine_max = self._engine_max_tokens
         global_max = engine_max * self.ep_size
-        topk = probs.shape[1]
-        hidden_dim = hidden_states.shape[1]
-
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
+
         multimem_all_gather_v(
-            hidden_r["tensor"], hidden_states, hidden_r["handle"],
+            agv_h["tensor"], hidden_states, agv_h["handle"],
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             engine_max_tokens=engine_max,
         )
         multimem_all_gather_v(
-            routing_r["tensor"], self.routing_map, routing_r["handle"],
+            agv_r["tensor"], self.routing_map, agv_r["handle"],
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             engine_max_tokens=engine_max,
         )
         multimem_all_gather_v(
-            probs_r["tensor"], probs, probs_r["handle"],
+            agv_p["tensor"], probs, agv_p["handle"],
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             engine_max_tokens=engine_max,
         )
 
-        self.routing_map = (
-            routing_r["tensor"].view(self.routing_map_dtype).view(global_max, topk)
-        )
-        probs = probs_r["tensor"].view(global_max, topk)
-        hidden_states = hidden_r["tensor"].view(global_max, hidden_dim)
+        topk = probs.shape[1]
+        hidden_dim = hidden_states.shape[1]
+        self.routing_map = agv_r["tensor"].view(global_max, topk)
+        probs = agv_p["tensor"].view(global_max, topk)
+        hidden_states = agv_h["tensor"].view(global_max, hidden_dim)
         return hidden_states, probs
 
     def dispatch_postprocess(self, hidden_states, probs):
@@ -467,28 +495,24 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
         Args:
-            hidden_states: [global_max, hidden_dim] fp32 expert outputs.
+            hidden_states: [global_max, hidden_size] bf16 expert outputs.
 
         Returns:
-            [local_tokens, hidden_dim] bf16 local token outputs.
+            [local_tokens, hidden_size] bf16 local token outputs.
         """
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
-        rs_buffer = self._alloc_rsv_buffer(hidden_states)
-        assert rs_buffer["handle"] is not None, (
-            "NVLSAllGatherVDispatcher requires NVLS symmetric memory for RSV. "
-            "Ensure the device is Hopper+ with NVLink and symmetric memory is available."
-        )
+        rsv = self.__class__._symm_rsv
 
-        if hidden_states is not rs_buffer["tensor"]:
-            rs_buffer["tensor"].copy_(hidden_states)
+        if hidden_states is not rsv["tensor"]:
+            rsv["tensor"].copy_(hidden_states)
         output = torch.empty(
             self._local_tokens, hidden_states.shape[1],
             dtype=hidden_states.dtype, device=hidden_states.device,
         )
         multimem_reduce_scatter_v(
-            output, rs_buffer["tensor"], rs_buffer["handle"],
+            output, rsv["tensor"], rsv["handle"],
             rank_token_offset=self._rank_token_offset(),
             ep_max_tokens=self._ep_max_tokens(),
             engine_max_tokens=self._engine_max_tokens,

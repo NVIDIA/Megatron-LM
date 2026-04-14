@@ -616,12 +616,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             inference_config.cuda_graph_mixed_prefill_count, self.max_requests
         )
 
-        # Set engine max tokens on the NVLS dispatcher (used to size symmetric buffers).
+        # Allocate NVLS symmetric buffers upfront (sized once at model init).
         if self.expert_model_parallel_group is not None and not self._nccl_ep_dispatcher:
             from megatron.core.transformer.moe.token_dispatcher_inference import (
                 NVLSAllGatherVDispatcher,
             )
-            NVLSAllGatherVDispatcher.set_engine_max_tokens(self.max_tokens)
+            from megatron.core.inference.moe import InferenceGroupedGemmBackend
+            # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            NVLSAllGatherVDispatcher.allocate_symmetric_buffers(
+                engine_max_tokens=self.max_tokens,
+                topk=model_config.moe_router_topk,
+                hidden_size=moe_hidden_size,
+                ep_group=self.expert_model_parallel_group,
+                mask_routing_map=(
+                    model_config.inference_grouped_gemm_backend
+                    == InferenceGroupedGemmBackend.FLASHINFER
+                ),
+            )
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill

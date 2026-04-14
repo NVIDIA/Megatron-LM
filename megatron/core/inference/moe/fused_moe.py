@@ -88,6 +88,7 @@ def mcore_fused_moe(
     valid_tokens: torch.Tensor,
     routing_map: torch.Tensor,
     disable_fused_quant_kernels: bool = False,
+    out: torch.Tensor = None,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -111,6 +112,9 @@ def mcore_fused_moe(
         disable_fused_quant_kernels: if True, disable fused permute+quantize and
             activation+quantize kernels for MXFP8, using separate launches instead.
             Useful for debugging. Ignored when weights are BF16.
+        out: optional pre-allocated output buffer. If provided, unpermute writes
+            directly into this tensor (e.g. the RSV symmetric buffer), avoiding a
+            separate copy before reduce-scatter.
 
     Returns:
         [max_tokens, hidden_size] BF16 output. Only the first valid_tokens rows are
@@ -184,13 +188,7 @@ def mcore_fused_moe(
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
 
     # --- Post-processing: unpermute ---
-    # Write output directly into the RSV symmetric buffer to avoid a separate copy
-    # in token_combine before multimem_reduce_scatter_v.
-    from megatron.core.transformer.moe.token_dispatcher_inference import (
-        NVLSAllGatherVDispatcher,
-    )
-    rsv_out = NVLSAllGatherVDispatcher._get_rsv_tensor()
     return unpermute_tokens(
         fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens,
-        out=rsv_out,
+        out=out,
     )

@@ -923,16 +923,12 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'torch'] = "flashinfer"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
-      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
-      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
-      in future releases.
-    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
-      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
-    - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
+    - 'flashinfer': Uses FlashInfer cutlass_fused_moe. Not compatible with MXFP8.
+    - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
+      Supports both BF16 and MXFP8.
     """
 
     inference_moe_disable_fused_quant_kernels: bool = False
@@ -1210,18 +1206,26 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
-                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
-                f"got '{self.inference_grouped_gemm_backend}'"
-            )
+            from megatron.core.inference.moe import InferenceGroupedGemmBackend
+            try:
+                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
+                    self.inference_grouped_gemm_backend
+                )
+            except ValueError:
+                raise ValueError(
+                    f"inference_grouped_gemm_backend must be 'flashinfer', 'torch', or 'te', "
+                    f"got '{self.inference_grouped_gemm_backend}'"
+                )
 
-            if self.cuda_graph_impl == "local":
-                if self.inference_grouped_gemm_backend == "te":
-                    raise ValueError(
-                        "TE GroupedGEMM is not supported with CUDA graphs. Please set "
-                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
-                        "CUDA graphs (--cuda-graph-impl=none)."
-                    )
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and self.fp8 == "mxfp8"
+            ):
+                raise ValueError(
+                    "FlashInfer is not compatible with MXFP8 quantization. "
+                    "Set inference_grouped_gemm_backend to 'torch'."
+                )
+
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")

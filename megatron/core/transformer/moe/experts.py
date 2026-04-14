@@ -40,6 +40,10 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NVLSAllGatherVDispatcher,
+        )
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
@@ -58,7 +62,6 @@ from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import (
     InferenceGroupedGemmBackend,
     mcore_fused_moe,
-    resolve_inference_grouped_gemm_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -491,6 +494,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
+        self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
+    
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -624,14 +629,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._flashinfer_activation_type,
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
+            output=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )[0]
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
-        from megatron.core.transformer.moe.token_dispatcher_inference import (
-            InferenceAllGatherDispatcherBase,
-        )
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
             hidden_states,
@@ -644,6 +647,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )
         return output, None
 
@@ -688,13 +692,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
-        resolved_backend = resolve_inference_grouped_gemm_backend(
-            self.inference_grouped_gemm_backend,
-            not self.training,
-            is_mxfp8=self.config.fp8_recipe == "mxfp8",
-        )
-
-        if resolved_backend == InferenceGroupedGemmBackend.FLASHINFER:
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
             assert (
                 not self.training
@@ -702,14 +700,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-        elif resolved_backend == InferenceGroupedGemmBackend.TORCH:
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
             return self._mcore_fused_moe_forward(
                 permuted_local_hidden_states,
                 permuted_probs,
                 routing_map=routing_map,
             )
-        elif resolved_backend == InferenceGroupedGemmBackend.TE:
-            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
 
 class SequentialMLP(MegatronModule):
