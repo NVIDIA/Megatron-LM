@@ -83,9 +83,12 @@ Main and dev have completely different classes in this file:
 
 Compare `git ls-tree` between `origin/main` and HEAD to find files in main
 that are missing from the merged tree. For each:
-- **Restore** if main's code imports/references it (check with `grep -r`)
+- **Restore** if main's code imports/references it and would break without it
+  (e.g. `hybrid_cp_schedule.py` if `data_schedule.py` imports from it)
 - **Do NOT restore** if dev intentionally deleted it — check
-  `git log origin/dev -- <file>` for the deletion commit
+  `git log origin/dev -- <file>` for the deletion commit to understand intent
+- When in doubt, check whether any file in the merged tree imports from the
+  missing file. If nothing imports it, skip it.
 
 ### Formatting
 
@@ -106,9 +109,16 @@ Commit everything and push the branch.
 ## Phase 2: Create the Draft PR
 
 - Title: `chore: nightly sync main into dev ($DATE)`
-- Body: describe what was synced, how conflicts were resolved, that CI will
-  be iterated on automatically
 - Create as **draft**: `gh pr create --draft`
+- Body should include:
+  1. Summary of what was synced (number of commits from main)
+  2. List of files where main's version was taken over the merge
+  3. List of files that were deleted in dev but restored (and why)
+  4. The remerge-diff output (`git show --remerge-diff HEAD` on the merge
+     commit) so reviewers can inspect ONLY the conflict resolutions. If the
+     output is very long, summarize conflicts by file and put the full diff
+     in a collapsed `<details>` block. If git is too old for `--remerge-diff`,
+     note the git version and describe the merge strategy used instead.
 - Save the PR number for later phases
 
 ---
@@ -206,3 +216,6 @@ for human review.
 - CI runs appear on branch `pull-request/<PR_NUMBER>`
 - Git committer identity: `svcnvidia-nemo-ci`
 - After editing imports, run `isort` on those files
+- **Push directly to NVIDIA/Megatron-LM** (not a fork). The bot uses a PAT
+  with write access. CLAUDE.md says "never push directly" but that rule is
+  for human contributors — the sync bot is an exception.
