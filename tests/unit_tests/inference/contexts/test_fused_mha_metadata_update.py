@@ -190,14 +190,24 @@ class TestMhaMetadataUpdate:
         ql_ref, cu_q_ref, kvl_ref, cu_kv_ref = _alloc_buffers(max_bs, device)
 
         update_mha_metadata(
-            query_lengths, kv_length_offsets,
-            ql_fused, cu_q_fused, kvl_fused, cu_kv_fused,
-            real_bs, padded_bs,
+            query_lengths,
+            kv_length_offsets,
+            ql_fused,
+            cu_q_fused,
+            kvl_fused,
+            cu_kv_fused,
+            real_bs,
+            padded_bs,
         )
         _reference_mha_metadata_update(
-            query_lengths, kv_length_offsets,
-            ql_ref, cu_q_ref, kvl_ref, cu_kv_ref,
-            real_bs, padded_bs,
+            query_lengths,
+            kv_length_offsets,
+            ql_ref,
+            cu_q_ref,
+            kvl_ref,
+            cu_kv_ref,
+            real_bs,
+            padded_bs,
         )
 
         assert torch.equal(ql_fused[:padded_bs], ql_ref[:padded_bs])
