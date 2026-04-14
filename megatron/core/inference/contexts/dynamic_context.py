@@ -1809,7 +1809,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         local_tokens = self.padded_active_token_count
 
         if self._nccl_ep_dispatcher:
-            using_cuda_graph = self.using_cuda_graph_this_step
+            using_cuda_graph = self.using_cuda_graph_this_step()
             if using_cuda_graph:
                 # CG path: all ranks have the same padded token count by construction.
                 local_tokens_per_rank = torch.full(

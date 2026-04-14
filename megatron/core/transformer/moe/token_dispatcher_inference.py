@@ -108,11 +108,11 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         """
         cls._use_allgather_v = use_allgather_v
         cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
-        if cls._valid_tokens_tensor is None:
-            cls._valid_tokens_tensor = torch.zeros(
+        if InferenceAllGatherDispatcherBase._valid_tokens_tensor is None:
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor = torch.zeros(
                 1, dtype=torch.int32, device=local_tokens_per_rank.device
             )
-        cls._valid_tokens_tensor.copy_(local_tokens_per_rank.sum())
+        InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(local_tokens_per_rank.sum())
 
     def token_dispatch(self, hidden_states, probs):
         """Gather hidden_states, probs, and routing_map from all EP ranks.
