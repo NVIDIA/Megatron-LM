@@ -74,6 +74,12 @@ def _resolve_target_class(target: str) -> type | None:
     Returns:
         The resolved class, or None if resolution fails.
     """
+    from megatron.training.config.instantiate_utils import target_allowlist
+
+    if not target_allowlist.is_allowed(target):
+        logger.warning(f"Target '{target}' is not in the allowlist. Skipping resolution.")
+        return None
+
     try:
         module_path, class_name = target.rsplit(".", 1)
         module = importlib.import_module(module_path)

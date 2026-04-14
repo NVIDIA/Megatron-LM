@@ -3,6 +3,7 @@ import copy
 import functools
 import inspect
 import logging
+import os
 from enum import Enum
 from textwrap import dedent
 from typing import Any, Callable, Sequence
@@ -32,6 +33,96 @@ class _Keys(str, Enum):
     CALL = "_call_"
     ARGS = "_args_"
     NAME = "_name_"
+
+
+_DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (
+    "megatron.training.",
+    "megatron.core.",
+    "torch.",
+    "transformers.",
+    "signal.",
+)
+
+_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset({
+    "functools.partial",
+})
+
+
+class TargetAllowlist:
+    """Controls which ``_target_`` strings are permitted for instantiation.
+
+    Security: prevents arbitrary code execution from untrusted YAML configs
+    by gating which module paths can be imported and called.
+    """
+
+    def __init__(self) -> None:
+        self._allowed_prefixes: list[str] = list(_DEFAULT_ALLOWED_PREFIXES)
+        self._allowed_exact: set[str] = set(_DEFAULT_ALLOWED_EXACT)
+        self._enabled: bool = True
+        self._check_env_override()
+
+    def _check_env_override(self) -> None:
+        if os.environ.get("MEGATRON_ALLOW_ALL_TARGETS", "").strip() == "1":
+            logging.warning(
+                "MEGATRON_ALLOW_ALL_TARGETS=1 is set. Target allowlist is DISABLED. "
+                "This allows arbitrary code execution from YAML configs. "
+                "Do NOT use this in production."
+            )
+            self._enabled = False
+
+    def is_allowed(self, target: str) -> bool:
+        """Check whether *target* is permitted by the allowlist."""
+        if not self._enabled:
+            return True
+        if target in self._allowed_exact:
+            return True
+        return any(target.startswith(prefix) for prefix in self._allowed_prefixes)
+
+    def add_prefix(self, prefix: str) -> None:
+        """Add an allowed module prefix (must end with ``'.'``)."""
+        if not prefix.endswith("."):
+            raise ValueError(f"Prefix must end with '.': got '{prefix}'")
+        if prefix not in self._allowed_prefixes:
+            self._allowed_prefixes.append(prefix)
+
+    def remove_prefix(self, prefix: str) -> None:
+        """Remove an allowed module prefix."""
+        self._allowed_prefixes.remove(prefix)
+
+    def add_exact(self, target: str) -> None:
+        """Add an exact target string to the allowlist."""
+        self._allowed_exact.add(target)
+
+    def remove_exact(self, target: str) -> None:
+        """Remove an exact target string from the allowlist."""
+        self._allowed_exact.discard(target)
+
+    def disable(self) -> None:
+        """Disable the allowlist check (allows all targets)."""
+        logging.warning(
+            "Target allowlist has been disabled. "
+            "Arbitrary _target_ values will be permitted."
+        )
+        self._enabled = False
+
+    def enable(self) -> None:
+        """Re-enable the allowlist check."""
+        self._enabled = True
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def allowed_prefixes(self) -> tuple[str, ...]:
+        return tuple(self._allowed_prefixes)
+
+    @property
+    def allowed_exact(self) -> frozenset[str]:
+        return frozenset(self._allowed_exact)
+
+
+target_allowlist = TargetAllowlist()
 
 
 def instantiate(
@@ -410,6 +501,20 @@ def _resolve_target(
 ) -> type | Callable[..., Any] | object:
     """Resolve target string, type or callable into type or callable."""
     if isinstance(target, str):
+        # Security: check allowlist BEFORE importing to prevent
+        # arbitrary code execution from untrusted _target_ strings.
+        if not target_allowlist.is_allowed(target):
+            msg = (
+                f"Target '{target}' is not in the allowlist for _target_ instantiation.\n"
+                f"Allowed module prefixes: {', '.join(target_allowlist.allowed_prefixes)}\n"
+                f"Allowed exact targets: {', '.join(sorted(target_allowlist.allowed_exact))}\n"
+                f"To allow this target, call:\n"
+                f"  target_allowlist.add_prefix('{target.rsplit('.', 1)[0] + '.'}')\n"
+                f"  or: target_allowlist.add_exact('{target}')"
+            )
+            if full_key:
+                msg += f"\nfull_key: {full_key}"
+            raise InstantiationException(msg)
         try:
             target = _locate(target)
         except Exception as e:
