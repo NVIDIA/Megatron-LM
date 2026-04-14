@@ -102,6 +102,8 @@ def load(
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
             the loaded state dict is returned. If `strict` flag was set to
     """
+    # fix for QPs
+    validate_access_integrity = False
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
         checkpoint_dir, sharded_strategy, common_strategy
     )
