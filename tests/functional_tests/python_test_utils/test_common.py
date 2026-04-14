@@ -14,17 +14,13 @@ from tests.functional_tests.python_test_utils.common import (
     pipeline,
 )
 
-
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
 def make_metric(values: dict, step_interval: int = 1) -> GoldenValueMetric:
     steps = sorted(values)
     return GoldenValueMetric(
-        start_step=steps[0],
-        end_step=steps[-1],
-        step_interval=step_interval,
-        values=values,
+        start_step=steps[0], end_step=steps[-1], step_interval=step_interval, values=values
     )
 
 
@@ -250,10 +246,7 @@ class TestPipelineMultipleMetrics:
             run(
                 {"loss": good, "num-zeros": bad_golden},
                 {"loss": good, "num-zeros": bad_actual},
-                {
-                    "loss": [DeterministicTest()],
-                    "num-zeros": [DeterministicTest()],
-                },
+                {"loss": [DeterministicTest()], "num-zeros": [DeterministicTest()]},
             )
 
     def test_failure_message_lists_all_failed_metrics(self):
@@ -263,9 +256,6 @@ class TestPipelineMultipleMetrics:
             run(
                 {"loss": bad_golden, "num-zeros": bad_golden},
                 {"loss": bad_actual, "num-zeros": bad_actual},
-                {
-                    "loss": [DeterministicTest()],
-                    "num-zeros": [DeterministicTest()],
-                },
+                {"loss": [DeterministicTest()], "num-zeros": [DeterministicTest()]},
             )
         assert "num-zeros" in str(exc_info.value)
