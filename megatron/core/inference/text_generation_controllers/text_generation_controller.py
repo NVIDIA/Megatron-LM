@@ -911,8 +911,7 @@ class TextGenerationController:
 
         # Pad hidden states and scatter for sequence parallelism.
         if has_mtp:
-            if pad_count > 0:
-                current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
+            current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
             if self._sp_enabled:
                 current_hidden = scatter_to_sequence_parallel_region(
                     current_hidden, group=self.inference_wrapped_model.tp_group
@@ -920,6 +919,10 @@ class TextGenerationController:
 
         token_ids_buf = self._mtp_token_ids_buf[:, :padded_count]
         position_ids_buf = self._mtp_position_ids_buf[:, :padded_count]
+
+        # Zero-fill padding slots so the embedding layer never sees out-of-range IDs.
+        token_ids_buf[0, active_request_count:] = 0
+        position_ids_buf[0, active_request_count:] = 0
 
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
         for depth in range(self._num_mtp_depths):
@@ -941,8 +944,7 @@ class TextGenerationController:
 
                 # Strip padding from logits only. Hidden states stay padded+SP
                 # between depths to avoid redundant gather/scatter round-trips.
-                if pad_count > 0:
-                    mtp_logits = mtp_logits[:active_request_count]
+                mtp_logits = mtp_logits[:active_request_count]
 
                 # mtp_logits: [active_request_count, 1, vocab_size]
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [active_request_count, vocab_size]
