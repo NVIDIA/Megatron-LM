@@ -315,6 +315,10 @@ class TestMTPCudaGraphInference:
         ctrl.num_speculative_tokens = num_spec
         ctrl.num_mtp_heads = num_spec
         ctrl._init_mtp_sampling_tensor()
+        # Zero out buffers allocated with torch.empty to avoid garbage values
+        # in padding positions causing out-of-bounds embedding lookups.
+        ctrl._mtp_token_ids_buf.zero_()
+        ctrl._mtp_position_ids_buf.zero_()
         ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
             torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE
         )
@@ -405,6 +409,10 @@ class TestMTPCudaGraphInference:
             ctrl.num_speculative_tokens = num_spec
             ctrl.num_mtp_heads = num_spec
             ctrl._init_mtp_sampling_tensor()
+            # Zero out buffers allocated with torch.empty to avoid garbage values
+            # in padding positions causing out-of-bounds embedding lookups.
+            ctrl._mtp_token_ids_buf.zero_()
+            ctrl._mtp_position_ids_buf.zero_()
             ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
                 torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE
             )
