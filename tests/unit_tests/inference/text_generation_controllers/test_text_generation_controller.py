@@ -1181,6 +1181,7 @@ class TestTextGenerationController:
 
         if is_hybrid_model:
             ctx.is_hybrid_model = True
+            ctx.num_mamba_layers = 1
             ctx.mamba_metadata = mock.MagicMock()
             ctx.mamba_metadata.request_to_mamba_state_idx = torch.tensor([0, 1], device='cuda')
             ctx.mamba_ssm_states = torch.zeros((1, 2, 16), device='cuda')
