@@ -654,6 +654,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             tokens_per_expert=tokens_per_expert,
             skip_permute=skip_permute,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
+            load_balance=self.config.inference_moe_load_balancing,
+            num_experts=self.ep_group.size() * self.num_local_experts,
         )
         return output, None
 

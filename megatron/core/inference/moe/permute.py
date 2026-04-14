@@ -8,6 +8,7 @@ Includes:
 - Unpermute expert outputs back to original token order
 """
 
+import logging
 from unittest.mock import MagicMock
 
 import torch
@@ -28,8 +29,63 @@ if not HAVE_TRITON:
     tl = MagicMock()
 
 
+logger = logging.getLogger(__name__)
+_load_balance_logged = False
+
+
 def _ceil_div(a, b):
     return (a + b - 1) // b
+
+
+@triton.jit
+def _balance_routing_map_kernel(
+    routing_map_ptr,  # [num_tokens * topk] flattened int64 expert assignments, modified in-place
+    total_pairs,  # num_tokens * topk
+    num_experts: tl.constexpr,  # total number of experts across all EP ranks
+    BLOCK_SIZE: tl.constexpr,  # number of entries processed per program
+):
+    """Overwrite every routing map entry with a round-robin expert assignment.
+
+    Entry at flat index i (= token * topk + k) is assigned to expert (i % num_experts).
+    All EP ranks hold the same all-gathered routing_map and apply the same rewrite
+    independently, so each rank naturally processes the entries that fall in its
+    local expert range [local_expert_start, local_expert_start + num_local_experts).
+
+    Grid: (ceil(total_pairs / BLOCK_SIZE),) — each program handles BLOCK_SIZE entries.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < total_pairs
+    new_ids = (offsets % num_experts).to(tl.int64)
+    tl.store(routing_map_ptr + offsets, new_ids, mask=mask)
+
+
+def balance_routing_map(routing_map: torch.Tensor, num_experts: int) -> None:
+    """Rewrite routing_map in-place with round-robin expert assignments.
+
+    Each entry at flat index i (= token * topk + k) is replaced with i % num_experts.
+    Since all EP ranks share the same all-gathered routing_map, this transformation
+    is applied identically on every rank. Each rank's count and permute kernels then
+    operate only on the entries whose new expert ID falls in their local range.
+
+    Args:
+        routing_map: [num_tokens, topk] int64 tensor of global expert IDs.
+        num_experts: total number of experts across all EP ranks.
+    """
+    global _load_balance_logged
+    if not _load_balance_logged:
+        logger.info(
+            "MoE load balancing enabled: routing map will be overwritten with round-robin assignments"
+        )
+        _load_balance_logged = True
+    total_pairs = routing_map.numel()
+    BLOCK = 256
+    _balance_routing_map_kernel[(_ceil_div(total_pairs, BLOCK),)](
+        routing_map,
+        total_pairs,
+        num_experts,
+        BLOCK_SIZE=BLOCK,
+    )
 
 
 @triton.jit
@@ -174,6 +230,8 @@ def permute_tokens(
     local_expert_start: int,
     num_local_experts: int,
     alignment: int = 1,
+    load_balance: bool = False,
+    num_experts: int = None,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
 
@@ -187,6 +245,8 @@ def permute_tokens(
         local_expert_start: first global expert index on this rank.
         num_local_experts: number of experts on this rank.
         alignment: per-expert token alignment (default 1).
+        num_experts: total number of experts across all EP ranks. Required when
+            MEGATRON_INFERENCE_MOE_LOAD_BALANCE=1.
 
     Returns:
         (permuted_hidden, permuted_probs, permutation_map, inclusive_offsets)
@@ -199,6 +259,10 @@ def permute_tokens(
     """
     num_tokens, hidden_dim = hidden_states.shape
     topk = probs.shape[1]
+
+    if load_balance:
+        assert num_experts is not None, "num_experts must be provided when load_balance=True"
+        balance_routing_map(routing_map, num_experts)
 
     # Count how many (token, topk) pairs are routed to each local expert.
     # Non-local experts are ignored. Result is [num_local_experts] int32.
@@ -379,6 +443,8 @@ def permute_and_quantize_mxfp8(
     local_expert_start: int,
     num_local_experts: int,
     alignment: int = 128,
+    load_balance: bool = False,
+    num_experts: int = None,
 ) -> tuple:
     """Fused permute + MXFP8 quantize + swizzle.
 
@@ -406,6 +472,10 @@ def permute_and_quantize_mxfp8(
     num_tokens, K = hidden_states.shape
     topk = probs.shape[1]
     assert K % 32 == 0
+
+    if load_balance:
+        assert num_experts is not None, "num_experts must be provided when load_balance=True"
+        balance_routing_map(routing_map, num_experts)
 
     # Count how many (token, topk) pairs are routed to each local expert.
     tokens_per_expert = compute_local_tokens_per_expert(

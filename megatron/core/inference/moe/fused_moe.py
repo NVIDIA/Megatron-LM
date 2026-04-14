@@ -90,6 +90,8 @@ def mcore_fused_moe(
     tokens_per_expert: Optional[torch.Tensor] = None,
     skip_permute: bool = False,
     disable_fused_quant_kernels: bool = False,
+    load_balance: bool = False,
+    num_experts: Optional[int] = None,
 ) -> torch.Tensor:
     """Fused MoE: [permute ->] pad -> FC1 -> activation -> FC2 -> unpad [-> unpermute].
 
@@ -172,6 +174,8 @@ def mcore_fused_moe(
                 local_expert_start,
                 num_local_experts,
                 alignment=expert_alignment,
+                load_balance=load_balance,
+                num_experts=num_experts,
             )
         else:
             hidden_states, permuted_probs, permutation_map, offs = permute_tokens(
@@ -181,6 +185,8 @@ def mcore_fused_moe(
                 local_expert_start,
                 num_local_experts,
                 alignment=expert_alignment,
+                load_balance=load_balance,
+                num_experts=num_experts,
             )
 
     # --- FC1 -> activation -> FC2 ---

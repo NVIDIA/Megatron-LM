@@ -941,6 +941,12 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
+    inference_moe_load_balancing: bool = False
+    """When True, overwrite the all-gathered routing map with a round-robin assignment
+    (flat_index % num_experts) before token counting and permutation. This distributes
+    tokens evenly across experts regardless of router decisions, reducing expert load
+    imbalance at the cost of routing quality."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
