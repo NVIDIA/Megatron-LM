@@ -871,9 +871,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
-        # Manually release the metadata to avoid memory leak.
-        self.probs = None
-        self.routing_map = None
 
         # Add shared experts output
         if self.shared_experts is not None:
