@@ -31,7 +31,6 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.gpu_event_loop_synchronization import GPUFuture
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -44,7 +43,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, await_process_call
+from megatron.core.inference.utils import Counter, GPUFuture, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
@@ -1722,9 +1721,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(
-            loop=self._loop,
-        )
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(loop=self._loop)
         if will_log_this_step:
             self.step_end_event.record()
             step_done = GPUFuture(self._loop)

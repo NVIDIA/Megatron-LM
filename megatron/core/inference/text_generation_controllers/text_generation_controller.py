@@ -21,13 +21,13 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
-from megatron.core.inference.gpu_event_loop_synchronization import GPUFuture
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import (
+    GPUFuture,
     get_attention_mask,
     set_decode_expert_padding,
     set_moe_metadata_sync,
