@@ -612,10 +612,7 @@ class TextGenerationController:
 
         # Derive the MTP padded batch size from the EP-synced graph dimensions.
         # In eager mode MTP uses locally SP-aligned batch size instead.
-        if (
-            getattr(self, '_has_mtp_cuda_graphs', False)
-            and context.using_cuda_graph_this_step()
-        ):
+        if getattr(self, '_has_mtp_cuda_graphs', False) and context.using_cuda_graph_this_step():
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
             if self._sp_enabled:
                 self._mtp_resolved_padded_count += (

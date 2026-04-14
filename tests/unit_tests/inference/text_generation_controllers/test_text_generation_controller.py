@@ -102,12 +102,7 @@ class TestTextGenerationController:
             num_moe_experts=num_moe_experts,
             add_bias_linear=num_moe_experts is None,
             **(
-                dict(
-                    is_hybrid_model=True,
-                    mamba_num_heads=2,
-                    mamba_head_dim=16,
-                    mamba_num_groups=2,
-                )
+                dict(is_hybrid_model=True, mamba_num_heads=2, mamba_head_dim=16, mamba_num_groups=2)
                 if hybrid_layer_pattern
                 else {}
             ),
