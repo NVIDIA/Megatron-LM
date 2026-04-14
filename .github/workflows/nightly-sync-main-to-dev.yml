@@ -98,9 +98,19 @@ jobs:
             You are NOT done until you have run `gh pr ready <PR_NUMBER>`.
             That command is in Phase 4. You cannot reach Phase 4 until CI
             finishes. CI takes 1-2 hours. You must poll it using a Bash
-            `while` loop with `sleep 120` between iterations — do NOT use
-            ScheduleWakeup or any deferred/async mechanism. ScheduleWakeup
-            will silently end your session. Stay in a synchronous loop.
+            `while` loop with `sleep 120` between iterations.
+
+            **Banned patterns that will break the workflow:**
+            - Do NOT use `ScheduleWakeup` — it silently ends your session.
+            - Do NOT use `run_in_background: true` for polling — background
+              processes become orphans that hang the GH Actions job forever.
+            - Do NOT use `tail` on a background task output file in a loop
+              — this burns turns rapidly for no benefit.
+            Instead, run a SINGLE foreground `Bash` command with a
+            `while true; do ...; sleep 120; done` loop that checks the
+            GitHub API directly. This is one tool call that blocks until
+            CI completes.
+
             Do NOT exit after creating the PR or triggering CI — that is
             only Phase 2 out of 4. You have 1000 turns and 6 hours.
 
