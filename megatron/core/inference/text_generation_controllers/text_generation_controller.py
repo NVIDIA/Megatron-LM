@@ -19,7 +19,7 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
-from megatron.core.inference.gpu_event_loop_synchronization import GpuFuture
+from megatron.core.inference.gpu_event_loop_synchronization import GPUFuture
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -1834,7 +1834,7 @@ class TextGenerationController:
             return None
 
         loop = get_asyncio_loop(loop)
-        gpu_done = GpuFuture(loop)
+        gpu_done = GPUFuture(loop)
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
@@ -1865,8 +1865,8 @@ class TextGenerationController:
             routing_indices_per_request = self._router_record_bookkeeping()
 
         # Record after forward pass kernels are enqueued.  Awaiting this
-        # yields exclusivity (if active) so other tasks can run while the
-        # GPU is busy, then re-acquires once the forward pass completes.
+        # lets other asyncio tasks run while the GPU is busy, and resumes
+        # as soon as the forward pass completes.
         gpu_done.record()
         await gpu_done
 

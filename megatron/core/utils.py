@@ -2290,11 +2290,7 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
             if _ASYNC_IO_LOOP is not None:
                 return _ASYNC_IO_LOOP
             else:
-                from megatron.core.inference.gpu_event_loop_synchronization import (
-                    ExclusiveTaskEventLoop,
-                )
-
-                _ASYNC_IO_LOOP = loop = ExclusiveTaskEventLoop()
+                _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
     return loop
 
