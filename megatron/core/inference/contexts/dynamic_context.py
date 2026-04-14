@@ -3179,11 +3179,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_indices: Tensor,
         selected_log_probs: Tensor,
         log_prob_request_count: int,
+        active_request_count: int,
         selected_logits: Optional[Tensor] = None,
         top_n_max: int = 0,
     ) -> Tuple[List[Optional[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
         """Extract decode log-prob kernel outputs into a per-request list."""
-        active_request_count = self.total_request_count - self.paused_request_count
 
         req_idx_list = request_indices[:log_prob_request_count].tolist()
         lp_list = selected_log_probs[:log_prob_request_count].tolist()
@@ -3276,12 +3276,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         cu_masked_lengths: Tensor,
         token_log_probs: Tensor,
         log_prob_request_count: int,
+        active_request_count: int,
         top_n_max: int = 0,
         logits: Optional[Tensor] = None,
         logit_indices: Optional[Tensor] = None,
     ) -> Tuple[List[Optional[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
         """Extract prefill log-prob kernel outputs into a per-request list."""
-        active_request_count = self.total_request_count - self.paused_request_count
 
         ri = request_indices[:log_prob_request_count]
         selected_token_count = cu_masked_lengths[log_prob_request_count - 1].item()
@@ -3403,11 +3403,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                 top_n_max,
             )
 
+        active_request_count = self.total_request_count - self.paused_request_count
+
         if only_last_token_logits or self.is_decode_only():
             ri, padded_arange = self.log_probs_decode_indexing_kernel()
             slp, sl = self.log_probs_decode_softmax_kernel(logits, new_tokens, ri, padded_arange)
             return self.log_probs_decode_extract(
-                ri, slp, log_prob_request_count, selected_logits=sl, top_n_max=top_n_max
+                ri,
+                slp,
+                log_prob_request_count,
+                active_request_count,
+                selected_logits=sl,
+                top_n_max=top_n_max,
             )
         else:
             ri, cu_ml, li, li_range, mt = self.log_probs_prefill_indexing_kernel()
@@ -3419,6 +3426,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 cu_ml,
                 slp,
                 log_prob_request_count,
+                active_request_count,
                 top_n_max=top_n_max,
                 logits=logits,
                 logit_indices=li,
@@ -3640,6 +3648,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 cu_ml,
                 slp,
                 count_gpu.item(),
+                active_request_count,
                 top_n_max=top_n_max,
                 logits=logits,
                 logit_indices=li,

@@ -1789,8 +1789,12 @@ class DynamicInferenceEngine(AbstractEngine):
             evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
             accepted_tokens = step_result["accepted_tokens"]
-            log_probs = step_result["log_probs"]
-            top_n_logprobs = step_result.get("top_n_logprobs", None)
+            # The controller returned a callable to allow for deferred extraction of GPU log probs.
+            log_probs_extract = step_result.get("log_probs_extract")
+            if log_probs_extract is not None:
+                log_probs, top_n_logprobs = log_probs_extract()
+            else:
+                log_probs, top_n_logprobs = None, None
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
