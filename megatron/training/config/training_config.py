@@ -544,3 +544,7 @@ class CheckpointConfig:
                 "nvidia-resiliency-ext is not installed. "
                 "Please, install nvidia-resiliency-ext to enable async save."
             )
+
+        if self.verify_integrity:
+            assert self.ckpt_format == "torch_dist", \
+                f"`verify_integrity` is only supported with torch_dist checkpooint foramt."
