@@ -1523,6 +1523,7 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer, "offload_optimizer_states is only supported with distributed optimizer"
         assert args.optimizer == 'adam', "offload_optimizer_states is only supported with adam optimizer"
         assert not args.use_megatron_fsdp, "offload_optimizer_states does not support Megatron-FSDP for now."
+        assert not args.optimizer_cpu_offload, "offload_optimizer_states can not be used with optimizer_cpu_offload."
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
