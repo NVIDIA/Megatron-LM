@@ -1662,7 +1662,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        async with self._loop.exclusive():
+            result = await self.controller.async_generate_output_tokens_dynamic_batch(
+                loop=self._loop
+            )
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
