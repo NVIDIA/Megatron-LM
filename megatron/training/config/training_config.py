@@ -530,6 +530,9 @@ class CheckpointConfig:
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
 
+    verify_integrity: bool = False
+    """Whether to hash checkpointing files during save and validate their integrity during load."""
+
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_installed
 

@@ -27,7 +27,6 @@ from .mapping import (
     StateDict,
     apply_factory_merges,
 )
-from .integrity import save_integrity_manifest, verify_integrity_manifest
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
 from .strategies.common import load_common, save_common
@@ -37,8 +36,10 @@ from .validation import (
     StrictHandling,
     determine_global_metadata,
     parse_strict_flag,
+    save_integrity_manifest,
     validate_integrity_and_strict_load,
     verify_checkpoint,
+    verify_integrity_manifest,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,7 @@ def load(
     common_strategy: None = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
-    verify_integrity: bool = False,
+    verify_integrity: bool = True,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -304,7 +305,7 @@ def save(
     ] = None,
     content_metadata: Optional[dict] = None,
     async_strategy: Optional[str] = "nvrx",
-    save_integrity: bool = False,
+    verify_integrity: bool = True,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -410,13 +411,13 @@ def save(
     if not async_sharded_save:
         sharded_strategy.save(sharded_state_dict, checkpoint_dir)
         metadata_finalize_fn()
-        if save_integrity:
+        if verify_integrity:
             integrity_finalize_fn()
         return None
 
     async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
     async_request.finalize_fns.append(metadata_finalize_fn)
-    if save_integrity:
+    if verify_integrity:
         async_request.finalize_fns.append(integrity_finalize_fn)
     return async_request
 
