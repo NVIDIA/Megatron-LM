@@ -24,6 +24,7 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -673,6 +674,13 @@ class TestMTPCudaGraphExpertParallel:
         dtype = model.config.params_dtype
         hidden_size = model.config.hidden_size
 
+        # Enable drop-and-pad for MoE during graph capture so the all-to-all
+        # dispatcher is replaced by CUDA graph-safe local operations.
+        has_ep = model.config.expert_model_parallel_size > 1
+        if has_ep:
+            capacity_factor = model.config.num_moe_experts / model.config.moe_router_topk
+            set_decode_expert_padding(unwrapped, True, capacity_factor=capacity_factor)
+
         _set_capture_start()
         for bs in sorted(batch_sizes):
             dummy_hidden = torch.zeros((bs, 1, hidden_size), device=device, dtype=dtype)
@@ -685,6 +693,9 @@ class TestMTPCudaGraphExpertParallel:
                 depth=0,
             )
         _set_capture_end()
+
+        if has_ep:
+            set_decode_expert_padding(unwrapped, False)
 
     @staticmethod
     def _set_mtp_cuda_graph_flag(model, enabled):
