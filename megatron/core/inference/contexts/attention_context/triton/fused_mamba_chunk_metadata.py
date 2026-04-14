@@ -4,15 +4,6 @@
 
 Replaces the CPU-synchronizing ``.tolist()`` + Python loop + ``torch.tensor().copy_()``
 pattern in ``MambaMetadata.update()`` with GPU-only kernels.
-
-The original code (lines 258-299 of mamba_metadata.py) does:
-  1. ``.tolist()`` on cu_seqlens — forces GPU→CPU sync
-  2. Python loop computing chunk boundaries, seq_idx, last_chunk_indices
-  3. ``torch.tensor(list).copy_()`` — CPU→GPU copies
-
-This module provides two Triton kernels that do the same work entirely on GPU:
-  - Kernel 1: Compute per-sequence n_chunks, cumulative offsets, last_chunk_indices
-  - Kernel 2: Scatter-write cu_chunk_seqlens and seq_idx_for_varlen per sequence
 """
 
 import torch

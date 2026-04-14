@@ -92,6 +92,16 @@ class TextGenerationController:
         self.num_mtp_heads = self._get_mtp_num_heads()
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
+        if (
+            self.model_config.cuda_graph_impl == "local"
+            and self.model_config.expert_model_parallel_size > 1
+            and self.model_config.transformer_impl != "inference_optimized"
+        ):
+            assert self.model_config.moe_pad_experts_for_cuda_graph_inference, (
+                "--moe-pad-experts-for-cuda-graph-inference must be set when using "
+                "CUDA graphs with expert parallelism"
+            )
+
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
@@ -1182,32 +1192,26 @@ class TextGenerationController:
             required_token_logits = context.last_token_logits(logits)
 
         if self._sampling_backend == "torch":
-            n_buckets = len(self._torch_sampling_buckets)
+            # Concatenate the outputs once to prevent repeated small writes.
+            token_list = []
+            indices_list = []
 
-            if n_buckets == 1:
-                # Fast path: all requests share the same sampling params.
-                # Avoids fancy indexing, torch.tensor() CPU→GPU, torch.cat, and scatter.
-                indices, temp, top_k, top_p = self._torch_sampling_buckets[0]
-                n = len(indices)
-                sampled = self._torch_sampling_func(
-                    required_token_logits[:n, :], temp, top_k, top_p
+            # e.g torch sample buckets will be
+            # i.e (for all unique comibnation of t, topk, topk what are the associated
+            # requests indices (based on the active slices)
+            # [ [req at index 0, req at index 2], t1, topk1, topp1 ]]
+            # [ [req at index 1, req at index 3, req at index 4] , t2, topk2, topp2]
+            for indices, temp, top_k, top_p in self._torch_sampling_buckets:
+                token_list.append(
+                    self._torch_sampling_func(required_token_logits[indices, :], temp, top_k, top_p)
                 )
-                self._sampled_tokens_cuda[:n] = sampled
-            else:
-                # General path: multiple sampling param buckets.
-                token_list = []
-                indices_list = []
-                for indices, temp, top_k, top_p in self._torch_sampling_buckets:
-                    token_list.append(
-                        self._torch_sampling_func(
-                            required_token_logits[indices, :], temp, top_k, top_p
-                        )
-                    )
-                    indices_list.append(torch.tensor(indices))
+                indices_list.append(torch.tensor(indices))
 
-                sampled_tokens = torch.cat(token_list, dim=0)
-                sampled_indices = torch.cat(indices_list, dim=0)
-                self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
+            # Single write to the output tensor.
+            sampled_tokens = torch.cat(token_list, dim=0)
+            sampled_indices = torch.cat(indices_list, dim=0)
+
+            self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.

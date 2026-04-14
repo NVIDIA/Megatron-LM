@@ -18,13 +18,6 @@ def update_mha_metadata(
 ) -> None:
     """Compute all 1D MHA metadata buffers using pure PyTorch ops.
 
-    Fully async with no CPU-GPU syncs. Uses zero-padded cumsum trick: writing
-    real values into a zero buffer then calling cumsum naturally propagates the
-    last prefix-sum value through the padded positions — matching the
-    cumulative-pad semantics of ``tensor_copy_and_pad(..., is_cumulative_tensor=True)``
-    without the CPU-GPU sync that ``tensor_copy_and_pad`` requires to read the
-    last value.
-
     Args:
         query_lengths: ``[>=real_batch_size]`` int32 - per-request query lengths.
         kv_length_offsets: ``[>=real_batch_size]`` int32 - per-request KV offsets.
