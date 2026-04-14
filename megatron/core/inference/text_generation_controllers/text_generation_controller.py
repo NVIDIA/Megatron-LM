@@ -189,18 +189,14 @@ class TextGenerationController:
                 max_requests, dtype=torch.int64, device=device
             )
 
-            # Cache invariant values for serial MTP to avoid CPU overhead on
-            # the hot path (unwrap_model, is_pipeline_last_stage, get_pg_size,
-            # etc. are constant across inference steps).
-            self._serial_mtp_unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-            self._serial_mtp_is_last_pp_stage = is_pipeline_last_stage(self.pp_group)
-            tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-            self._serial_mtp_tp_size = tp_size
-            self._serial_mtp_sp_enabled = self.model_config.sequence_parallel and tp_size > 1
-            self._serial_mtp_num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+            # Cache values that are constant across inference steps.
+            self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+            self._is_last_pp_stage = is_pipeline_last_stage(self.pp_group)
+            self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+            self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
+            self._num_mtp_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
 
-            # Pre-allocate padded buffers for per-depth token/position IDs so
-            # the depth loop avoids repeated unsqueeze + F.pad overhead.
+            # Pre-allocate padded buffers for per-depth token/position IDs.
             self._mtp_token_ids_buf = torch.empty(
                 [1, max_requests], dtype=torch.int64, device=device
             )
@@ -614,28 +610,22 @@ class TextGenerationController:
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
 
-        
-        # Precompute MTP CUDA graph padded batch size from the already EP-synced
-        # padded_batch_dimensions. This avoids an extra EP all-reduce on the MTP
-        # hot path — all ranks derive the same value from the matched graph.
-        # When the main model falls back to eager mode, padded_batch_dimensions
-        # is computed from local values without EP sync, so we cannot use it;
-        # MTP will also run eagerly with a locally SP-aligned batch size.
+
+        # Derive the MTP padded batch size from the EP-synced graph dimensions.
+        # In eager mode MTP uses locally SP-aligned batch size instead.
         if (
             getattr(self, '_mtp_cuda_graph_batch_sizes', None) is not None
             and context.using_cuda_graph_this_step()
         ):
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
-            tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-            sp_enabled = self.model_config.sequence_parallel and tp_size > 1
-            if sp_enabled:
+            if self._sp_enabled:
                 self._mtp_resolved_padded_count += (
-                    tp_size - self._mtp_resolved_padded_count % tp_size
-                ) % tp_size
+                    self._tp_size - self._mtp_resolved_padded_count % self._tp_size
+                ) % self._tp_size
         else:
             self._mtp_resolved_padded_count = None
 
-        # Tell MTP layers whether to use CUDA graphs this step.  When the main
+        # Tell MTP layers whether to use CUDA graphs this step. When the main
         # model falls back to eager mode, MTP must also run eagerly across all
         # EP ranks — otherwise some ranks may replay a captured graph while
         # others run eagerly, causing EP collectives to hang.
@@ -764,8 +754,7 @@ class TextGenerationController:
             self._torch_sampling_buckets = [
                 (indices, *sampling_params) for sampling_params, indices in bucket_map.items()
             ]
-            # Pre-compute index tensors on GPU so that _sample_from_logits_2d
-            # (called once per MTP depth) avoids repeated H2D copies.
+            # Pre-compute index tensors on GPU to avoid per-step H2D copies.
             self._torch_sampling_bucket_index_tensors = [
                 torch.tensor(indices, device=device, dtype=torch.long)
                 for indices, *_ in self._torch_sampling_buckets
@@ -776,8 +765,8 @@ class TextGenerationController:
 
         After forward pass with speculative tokens, some tokens may be rejected.
         This function "rewinds" the KV cache bookkeeping to reflect only the accepted
-        tokens.  The core bookkeeping is handled by a Triton kernel (one thread per
-        request).  Mamba hybrid-model state updates remain in PyTorch.
+        tokens. The core bookkeeping is handled by a Triton kernel (one thread per
+        request). Mamba hybrid-model state updates remain in PyTorch.
 
         Returns (blocks_to_release, remove_mask) for the caller to release blocks
         back to the allocator outside the compiled graph.
@@ -808,19 +797,7 @@ class TextGenerationController:
             block_size_tokens=context.block_size_tokens,
         )
 
-        # --- Mamba speculative rewind state update (Triton, zero-alloc) ---
-        #
-        # The original code gathered full (L, N, *state_shape) temporaries via
-        # advanced indexing (always a copy), then used torch.where to select
-        # between intermediate and current, creating 3 large temps per state
-        # type (conv + SSM = 6 total).  For large models this was hundreds of
-        # MB of transient GPU memory and a frequent OOM trigger.
-        #
-        # The Triton kernel below writes directly from
-        #   intermediate[layer, slot, accepted, ...]
-        # into
-        #   current[layer, slot, ...]
-        # for decode requests only, with zero temporary allocations.
+        # Mamba speculative rewind: copy accepted intermediate states in-place.
         if context.is_hybrid_model:
             mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
@@ -883,14 +860,10 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Use cached values to avoid CPU overhead from unwrap_model,
-        # is_pipeline_last_stage, get_pg_size, etc. on every step.
-        unwrapped_model = self._serial_mtp_unwrapped_model
-        sp_enabled = self._serial_mtp_sp_enabled
-        num_depths = self._serial_mtp_num_depths
+        unwrapped_model = self._unwrapped_model
 
         # On non-last pipeline stages, the model won't have decoder hidden states.
-        has_mtp = self._serial_mtp_is_last_pp_stage and hasattr(
+        has_mtp = self._is_last_pp_stage and hasattr(
             unwrapped_model, '_decoder_hidden_states_cache'
         )
 
@@ -901,7 +874,7 @@ class TextGenerationController:
             # When SP is active the decoder output is in scattered format
             # [S/TP, B, H], but _last_accepted_seq_indices are indices into
             # the full (gathered) sequence.
-            if sp_enabled:
+            if self._sp_enabled:
                 hidden_states = gather_from_sequence_parallel_region(
                     hidden_states, group=self.inference_wrapped_model.tp_group
                 )
@@ -916,8 +889,7 @@ class TextGenerationController:
         # The next position to predict starts at that cache length.
         adjusted_offsets = context.request_kv_length_offsets[active_slice]
         processed_tokens = context.request_query_lengths[active_slice]
-        # Cast to int64: context tensors are int32 but position_ids should be
-        # int64 to match CUDA graph capture dtype expectations.
+        # Cast to int64 to match CUDA graph capture dtype expectations.
         base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
         # Start with the freshly sampled base token.
@@ -926,17 +898,14 @@ class TextGenerationController:
 
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
-            # CUDA-graph path: use the EP-synced padded count derived from the
-            # matched graph dimensions.
+            # CUDA-graph path: use the EP-synced padded count.
             padded_count = self._mtp_resolved_padded_count
-            assert not sp_enabled or padded_count % self._serial_mtp_tp_size == 0
+            assert not self._sp_enabled or padded_count % self._tp_size == 0
         elif has_mtp:
-            # Eager path (no CUDA graphs this step): pad only for SP alignment
-            # using the local request count.
+            # Eager path: pad only for SP alignment.
             padded_count = active_request_count
-            if sp_enabled:
-                tp_size = self._serial_mtp_tp_size
-                padded_count += (tp_size - padded_count % tp_size) % tp_size
+            if self._sp_enabled:
+                padded_count += (self._tp_size - padded_count % self._tp_size) % self._tp_size
         else:
             padded_count = active_request_count
         pad_count = padded_count - active_request_count
@@ -945,22 +914,18 @@ class TextGenerationController:
         if has_mtp:
             if pad_count > 0:
                 current_hidden = F.pad(current_hidden, (0, 0, 0, 0, 0, pad_count))
-            if sp_enabled:
+            if self._sp_enabled:
                 current_hidden = scatter_to_sequence_parallel_region(
                     current_hidden, group=self.inference_wrapped_model.tp_group
                 )
 
-        # Prepare pre-allocated padded buffers for the depth loop so each
-        # iteration avoids unsqueeze + F.pad tensor creation overhead.
         token_ids_buf = self._mtp_token_ids_buf[:, :padded_count]
         position_ids_buf = self._mtp_position_ids_buf[:, :padded_count]
 
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
-        for depth in range(num_depths):
+        for depth in range(self._num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 
-            # Write active region into pre-allocated buffers (padding region
-            # stays zero-filled from initialization / previous zero-fill).
             token_ids_buf[0, :active_request_count] = next_token_ids
             position_ids_buf[0, :active_request_count] = base_position + depth
 
@@ -975,7 +940,7 @@ class TextGenerationController:
                 )
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
-                # Strip padding from logits only.  Hidden states stay padded+SP
+                # Strip padding from logits only. Hidden states stay padded+SP
                 # between depths to avoid redundant gather/scatter round-trips.
                 if pad_count > 0:
                     mtp_logits = mtp_logits[:active_request_count]
@@ -1693,10 +1658,9 @@ class TextGenerationController:
         if self.model_config.expert_model_parallel_size <= 1:
             return
 
-        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        unwrapped_model = self._unwrapped_model
 
-        is_last_stage = is_pipeline_last_stage(self.pp_group)
-        has_mtp = is_last_stage and hasattr(unwrapped_model, '_decoder_hidden_states_cache')
+        has_mtp = self._is_last_pp_stage and hasattr(unwrapped_model, '_decoder_hidden_states_cache')
         if not has_mtp and not self.model_is_pipeline_parallel:
             # No MTP on this rank and no PP broadcast to participate in.
             return
@@ -1704,32 +1668,28 @@ class TextGenerationController:
         device = torch.cuda.current_device()
         dtype = self.model_config.params_dtype
         hidden_size = self.model_config.hidden_size
-        num_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
 
         # Use precomputed MTP CUDA graph batch size when available;
         # otherwise use minimal SP-compatible size.
-        tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-        sp_enabled = self.model_config.sequence_parallel and tp_size > 1
         if getattr(self, '_mtp_resolved_padded_count', None) is not None:
             padded_count = self._mtp_resolved_padded_count
-            assert not sp_enabled or padded_count % tp_size == 0
+            assert not self._sp_enabled or padded_count % self._tp_size == 0
         else:
             assert not has_mtp
 
         dummy_hidden = None
         if has_mtp:
-            # Minimal dummy tensors — just enough to drive the MTP layer forward
+            # Minimal dummy tensors to drive the MTP layer forward
             # so that the MoE all-to-all collectives are issued.
-            # Depth 0 uses full-format hidden; subsequent depths use SP format.
             dummy_hidden = torch.zeros((padded_count, 1, hidden_size), device=device, dtype=dtype)
-            if sp_enabled:
+            if self._sp_enabled:
                 dummy_hidden = scatter_to_sequence_parallel_region(
                     dummy_hidden, group=self.inference_wrapped_model.tp_group
                 )
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
-        for depth in range(num_depths):
+        for depth in range(self._num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
@@ -1902,19 +1862,15 @@ class TextGenerationController:
                 # are active (the graphs were captured with padding enabled).
                 if self.model_config.moe_pad_experts_for_cuda_graph_inference:
                     if not context.using_cuda_graph_this_step():
-                        set_decode_expert_padding(self._serial_mtp_unwrapped_model, False)
+                        set_decode_expert_padding(self._unwrapped_model, False)
 
                 # Phase 3: Compute MTP serially with correct (verified) inputs.
                 nvtx_range_push("mtp-spec-decoding/serial-mtp")
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
-                # Phase 4: Release freed blocks back to the allocator.
-                # Deferred from Phase 2 to avoid a GPU pipeline drain:
-                # blocks_to_release[remove_mask] is boolean-mask indexing whose
-                # output size is data-dependent, forcing a CUDA sync.  By
-                # deferring to after serial MTP, the sync overlaps with
-                # already-completed GPU work instead of stalling before it.
+                # Phase 4: Release freed blocks. Deferred from Phase 2 so the
+                # data-dependent boolean-mask sync overlaps with MTP GPU work.
                 context.kv_block_allocator.release_memory_blocks(
                     blocks_to_release[remove_mask]
                 )

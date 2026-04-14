@@ -367,10 +367,7 @@ def _mamba_state_selective_copy_kernel(
       - dim 1: mamba layer index
       - dim 2: chunk of the flattened state vector
 
-    For prefill requests the program is a no-op.  For decode requests it
-    copies ``intermediate[layer, slot, accepted, :]`` →
-    ``current[layer, slot, :]``, performing a direct in-place update with
-    **zero temporary allocations**.
+    No-op for prefill requests.
     """
     pid_req = tl.program_id(0)
     pid_layer = tl.program_id(1)
@@ -410,19 +407,9 @@ def mamba_state_selective_copy(
 ):
     """Copy accepted intermediate Mamba states to current states in-place.
 
-    For each **decode** request, copies
+    For each decode request, copies
     ``intermediate[layer, slot, accepted_count, ...]`` →
     ``current[layer, slot, ...]`` for every Mamba layer.
-
-    This replaces the original pattern of::
-
-        gathered = intermediate[:, idx, accepted]   # large temporary COPY
-        current_val = current[:, idx]                # large temporary COPY
-        result = torch.where(mask, gathered, current_val)  # another allocation
-        current[:, idx] = result                     # scatter back
-
-    …which allocated **three** full-sized temporaries per state type.
-    The Triton kernel writes directly in-place with zero temporaries.
 
     Args:
         intermediate_states: ``(L, M, S+1, *state_shape)`` — intermediate buffer.

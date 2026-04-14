@@ -258,11 +258,7 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     if not hasattr(base_module, "layer_number"):
         return True, True
 
-    # MTP layers have their own numbering separate from the decoder stack.
-    # Treat each one as self-contained so the buffer-reuse logic does not
-    # try to chain them with decoder layers.  Uses getattr rather than
-    # isinstance so it covers both the inner TransformerLayer (is_mtp_layer=True)
-    # and the outer MultiTokenPredictionLayer (is_mtp_layer=True).
+    # MTP layers are self-contained; don't chain them with decoder layers.
     if getattr(base_module, 'is_mtp_layer', False):
         return True, True
 
@@ -1430,8 +1426,7 @@ class CudaGraphManager(torch.nn.Module):
 
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
-        # is_mtp implies inference mode: MTP is only cuda-graphed for inference
-        # (forward_single_position), not for training which uses the regular forward path.
+        # MTP is only cuda-graphed for inference (forward_single_position).
         self.is_mtp = isinstance(base_module, MultiTokenPredictionLayer)
 
         if function_name is not None:
@@ -1612,10 +1607,8 @@ class CudaGraphManager(torch.nn.Module):
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
-                # When the main model is in eager mode, MTP must also run
-                # eagerly so that all EP ranks take the same code path.
-                # Skip this guard during graph capturing (warmup) since the
-                # attribute is only set at runtime by the controller.
+                # MTP must match the main model's eager/graph mode so all EP
+                # ranks take the same code path. Skip during graph capture.
                 if (
                     self.is_mtp
                     and not getattr(megatron_module, 'use_mtp_cuda_graphs', False)
@@ -1627,13 +1620,7 @@ class CudaGraphManager(torch.nn.Module):
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
 
                 if not runner.fwd_graph_recorded and self.is_mtp and not is_graph_capturing():
-                    # No pre-warmed graph for this MTP batch size — run eagerly
-                    # instead of attempting lazy capture. Lazy MTP graph capture
-                    # would fail for models with MoE layers because the AlltoAll
-                    # token dispatcher performs host synchronization
-                    # (d2h_event.synchronize) that is illegal inside CUDA graph
-                    # capture, and the graph-safe inference dispatcher is only
-                    # enabled during explicit warmup.
+                    # No pre-warmed graph for this batch size — run eagerly.
                     return self.func(*args, **kwargs)
 
                 if not runner.fwd_graph_recorded:
