@@ -314,24 +314,6 @@ class OptimizerConfig:
     """Second beta coefficient for Lion optimizer (used in momentum EMA update).
     Defaults to 0.98."""
 
-    soap_shampoo_beta: float = 0.95
-    """The beta parameter for the Shampoo preconditioner."""
-
-    soap_precondition_frequency: int = 1
-    """The frequency of the Shampoo preconditioner."""
-
-    soap_use_kl_shampoo: bool = True
-    """Whether to use the KL-Shampoo preconditioner."""
-
-    adaptive_muon_moment2_method: str = "adamuon"
-    """The method to use for the moment2 update in Adaptive Muon optimizer."""
-
-    adaptive_muon_beta2: float = 0.95
-    """The beta2 parameter for the Adaptive Muon optimizer."""
-
-    adaptive_muon_eps: float = 1e-8
-    """The eps parameter for the Adaptive Muon optimizer."""
-
     #######################
     # Distributed optimizer
     #######################
