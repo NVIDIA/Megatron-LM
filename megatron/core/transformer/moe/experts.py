@@ -40,6 +40,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
@@ -267,6 +268,202 @@ class TEGroupedMLP(MegatronModule):
             .to(intermediate_parallel.dtype)
         )
 
+    def _is_fused_impl_supported(self) -> bool:
+        """Check if the TE op fuser supports implementing this module."""
+
+        # Check Transformer Engine installation
+        if not HAVE_TE:
+            return False  # Transformer Engine is not available
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
+        except ImportError:
+            return False  # Transformer Engine version is too old
+
+        if not is_te_min_version("2.14.0"):
+            return False
+
+        # Check for unsupported features
+        if self.tp_group.size() > 1:
+            return False  # Tensor parallelism is not supported
+        if self.offload_expert_fc1 or self.offload_moe_act:
+            return False  # Fine-grained activation offloading is not supported
+        if self.config.moe_apply_probs_on_input:
+            return False  # Pre-multiplying probs is not supported
+
+        # Check grouped linear modules
+        if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
+            return False
+        if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
+            return False
+
+        # Check activation
+        if self.activation_func != F.silu or not self.config.gated_linear_unit:
+            return False  # Expected SwiGLU activation
+
+        return True
+
+    def _make_fused_ops(self) -> torch.nn.Module:
+        """Construct fused module for FC1, activation, and FC2."""
+
+        # Container for fusible ops
+        ops = te.pytorch.ops.Sequential()
+
+        # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
+        fc1_single_grouped_weight = self.linear_fc1.single_grouped_weight
+        fc1_weight_dtype = (
+            self.linear_fc1.weight.dtype
+            if fc1_single_grouped_weight
+            else self.linear_fc1.weight0.dtype
+        )
+        fc2_single_grouped_weight = self.linear_fc2.single_grouped_weight
+        fc2_weight_dtype = (
+            self.linear_fc2.weight.dtype
+            if fc2_single_grouped_weight
+            else self.linear_fc2.weight0.dtype
+        )
+        fc1_single_grouped_bias = self.linear_fc1.single_grouped_bias
+        fc2_single_grouped_bias = self.linear_fc2.single_grouped_bias
+
+        # TODO:ksivamani: Why meta device?
+        op = te.pytorch.ops.GroupedLinear(
+            self.linear_fc1.num_gemms,
+            self.linear_fc1.in_features,
+            self.linear_fc1.out_features,
+            bias=self.linear_fc1.use_bias,
+            device=torch.cuda.current_device(),
+            dtype=fc1_weight_dtype,
+            accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+            single_grouped_weight=fc1_single_grouped_weight,
+            single_grouped_bias=fc1_single_grouped_bias,
+            delay_wgrad_compute=self.config.delay_wgrad_compute,
+        )
+
+        # Copy the weights from GroupedLinear module to GroupedLinear op.
+        if fc1_single_grouped_weight:
+            setattr(op, "weight", getattr(self.linear_fc1, "weight"))
+
+        for idx in range(self.linear_fc1.num_gemms):
+            if not fc1_single_grouped_weight:
+                setattr(op, f"weight{idx}", getattr(self.linear_fc1, f"weight{idx}"))
+            if self.linear_fc1.use_bias and not fc1_single_grouped_bias:
+                setattr(op, f"bias{idx}", getattr(self.linear_fc1, f"bias{idx}"))
+        if self.linear_fc1.use_bias and fc1_single_grouped_bias:
+            setattr(op, "bias", getattr(self.linear_fc1, "bias"))
+        ops.append(op)
+
+        # Activation and post-multiply probs
+        op = te.pytorch.ops.ScaledSwiGLU(
+            glu_interleave_size=self.config.moe_mlp_glu_interleave_size
+        )
+        ops.append(op)
+
+        # FC2
+        op = te.pytorch.ops.GroupedLinear(
+            self.linear_fc2.num_gemms,
+            self.linear_fc2.in_features,
+            self.linear_fc2.out_features,
+            bias=self.linear_fc2.use_bias,
+            device=torch.cuda.current_device(),
+            dtype=fc2_weight_dtype,
+            accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+            single_grouped_weight=fc2_single_grouped_weight,
+            single_grouped_bias=fc2_single_grouped_bias,
+            delay_wgrad_compute=self.config.delay_wgrad_compute,
+        )
+
+        # Copy the weights from GroupedLinear module to GroupedLinear op.
+        if fc2_single_grouped_weight:
+            setattr(op, "weight", getattr(self.linear_fc2, "weight"))
+
+        for idx in range(self.linear_fc2.num_gemms):
+            if not fc2_single_grouped_weight:
+                setattr(op, f"weight{idx}", getattr(self.linear_fc2, f"weight{idx}"))
+            if self.linear_fc2.use_bias and not fc2_single_grouped_bias:
+                setattr(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
+        if self.linear_fc2.use_bias and fc2_single_grouped_bias:
+            setattr(op, "bias", getattr(self.linear_fc2, "bias"))
+        ops.append(op)
+
+        # Emulate submodule pre-forward hooks
+        ops.register_forward_pre_hook(self._make_fused_impl_pre_forward_hook())
+
+        return ops
+
+    def _make_fused_impl_pre_forward_hook(self) -> Callable:
+        """Make function that calls submodule pre-forward callback hooks.
+
+        This is intended for compatibility with
+        DistributedDataParallel hooks that trigger parameter
+        all-gathers. It does not support general pre-forward hooks
+        since they may manipulate intermediate tensors that are never
+        instantiated by the fused implementation.
+
+        """
+
+        def forward_pre_hook(module, *_) -> None:
+            for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
+                for hook in submodule._forward_pre_hooks.values():
+                    # Assume that hook does not interact with input
+                    ret = hook(submodule, None)
+                    if ret is not None:
+                        raise RuntimeError(
+                            f"Applying a fused implementation for {self.__class__.__name__}, "
+                            f"but a {submodule.__class__.__name__} submodule "
+                            "has a pre-forward hook that modifies the input tensor."
+                        )
+
+        return forward_pre_hook
+
+    def _fused_forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass using Transformer Engine operation fuser API."""
+
+        # Construct fused impl if needed
+        # Note: We initialize during the first forward pass in case
+        # the params are modified after the constructor.
+        # Note: The fused impl is stored in a tuple to avoid
+        # registering submodules.
+        if self._fused_ops is None:
+            self._fused_ops = (self._make_fused_ops(),)
+        (ops,) = self._fused_ops
+
+        # Apply padding if needed
+        unpadded_tokens_per_expert = None
+        if self.config.moe_router_padding_for_quantization:
+            # Padding has already been applied in router
+            pass
+        elif self.config.fp8 or self.config.fp4:
+            tokens_per_expert = tokens_per_expert.tolist()
+            unpadded_tokens_per_expert = tokens_per_expert
+            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+            permuted_probs, _ = self.quantization_padding(
+                permuted_probs.unsqueeze(-1), unpadded_tokens_per_expert
+            )
+            permuted_probs = permuted_probs.squeeze(-1)
+            tokens_per_expert = torch.tensor(
+                tokens_per_expert, dtype=torch.int, device=permuted_probs.device
+            )
+
+        # Call fused impl
+        output = ops(
+            permuted_local_hidden_states,
+            tokens_per_expert,  # FC1
+            permuted_probs,  # Scaled SwiGLU
+            tokens_per_expert,  # FC2
+        )
+
+        # Remove padding if needed
+        if unpadded_tokens_per_expert is not None:
+            output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
+
+        return output
+
     def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
         """
         Applies bias and activation function to the output of linear_fc1.
@@ -453,6 +650,14 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
+        if self._with_fused_impl and self.config.delay_wgrad_compute:
+            if self._fused_ops is not None:
+                (seq,) = self._fused_ops
+                fused_children = list(seq.children())
+                assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
+                fused_children[2].backward_dw()
+                fused_children[0].backward_dw()
+            return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
 
