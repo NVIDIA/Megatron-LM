@@ -53,19 +53,20 @@ These files have known semantic conflicts where dev's versions reference args
 or APIs that main removed or renamed. Take main's version with
 `git checkout origin/main -- <file>`:
 
-- `docker/Dockerfile.ci.dev` — build compatibility
 - `megatron/training/training.py` — references dev-only args
 - `megatron/training/initialize.py` — references dev-only args
 - `megatron/training/utils.py` — references dev-only args
 - `megatron/training/datasets/data_samplers.py` — references dev-only args
 - `megatron/core/optimizer/layer_wise_optimizer.py` — constructor signature
 
-**IMPORTANT: Do NOT take main's `pyproject.toml` or `uv.lock`.** These two
-files must stay consistent with each other and with dev's codebase. Main's
-versions are missing dev-only dependencies (e.g. `fast-hadamard-transform`,
-correct TransformerEngine revision, `nv-grouped-gemm`). `uv.lock` cannot
-be regenerated without a CUDA environment, and manually editing it is
-fragile. Keep dev's versions of both files.
+**IMPORTANT: Do NOT take main's `pyproject.toml`, `uv.lock`, or
+`docker/Dockerfile.ci.dev`.** These three files are a tightly coupled
+triple — the Dockerfile's `uv sync` command must match the dependency
+groups in `pyproject.toml`, and `uv.lock` must be consistent with both.
+Main's versions are missing dev-only dependencies (e.g.
+`fast-hadamard-transform`, correct TransformerEngine revision) and the
+`--group no_pypi_wheels` flag needed to install them. Keep dev's versions
+of all three files.
 
 **NEVER manually edit `uv.lock`.** It is a machine-generated lockfile. If
 it needs to change, it must be regenerated with `uv lock` inside a CUDA
