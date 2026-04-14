@@ -2,9 +2,10 @@
 
 import json
 import os
+from pathlib import Path
+
 import pytest
 import torch
-from pathlib import Path
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.core import CheckpointingException
@@ -12,9 +13,8 @@ from megatron.core.dist_checkpointing.validation import (
     save_integrity_manifest,
     verify_integrity_manifest,
 )
-
-from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestIntegrity:
