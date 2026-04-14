@@ -967,7 +967,6 @@ class TextGenerationController:
             mtp_logits_2d = None
             if has_mtp:
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
-                print(f"Rank {torch.distributed.get_rank()} Running real MTP depth {depth} with hidden_states={current_hidden.shape}, next_token_ids={token_ids_buf.shape}, position_ids={position_ids_buf.shape} (padded_count={padded_count})")
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids_buf,
@@ -1734,7 +1733,6 @@ class TextGenerationController:
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
-                print(f"Rank {torch.distributed.get_rank()} Running dummy MTP depth {depth} with hidden_states={dummy_hidden.shape}, next_token_ids={dummy_token_ids.shape}, position_ids={dummy_position_ids.shape} (padded_count={padded_count})")
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,
