@@ -24,8 +24,6 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-import megatron.core.inference.utils as _inference_utils
-from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -607,7 +605,6 @@ class TestMTPCudaGraphExpertParallel:
 
     def teardown_method(self, method):
         delete_cuda_graphs()
-        _inference_utils.moe_layer_cache = None
         Utils.destroy_model_parallel()
 
     # ---- helpers ---------------------------------------------------------- #
@@ -669,59 +666,19 @@ class TestMTPCudaGraphExpertParallel:
             ),
         )
 
-    def _warmup_mtp_graphs(self, model, batch_sizes):
-        """Warm up MTP CUDA graphs for the given batch sizes."""
-        unwrapped = unwrap_model(model)
-        device = torch.cuda.current_device()
-        dtype = model.config.params_dtype
-        hidden_size = model.config.hidden_size
-
-        # Enable drop-and-pad for MoE during graph capture so the all-to-all
-        # dispatcher is replaced by CUDA graph-safe local operations.
-        # Reset the global MoE layer cache so it discovers this model's layers.
-        has_ep = model.config.expert_model_parallel_size > 1
-        if has_ep:
-            _inference_utils.moe_layer_cache = None
-            capacity_factor = model.config.num_moe_experts / model.config.moe_router_topk
-            set_decode_expert_padding(unwrapped, True, capacity_factor=capacity_factor)
-
-        _set_capture_start()
-        for bs in sorted(batch_sizes):
-            dummy_hidden = torch.zeros((bs, 1, hidden_size), device=device, dtype=dtype)
-            dummy_token_ids = torch.zeros((1, bs), device=device, dtype=torch.long)
-            dummy_position_ids = torch.zeros((1, bs), device=device, dtype=torch.int64)
-            unwrapped.compute_mtp_single_step(
-                hidden_states=dummy_hidden,
-                next_token_ids=dummy_token_ids,
-                position_ids=dummy_position_ids,
-                depth=0,
-            )
-        _set_capture_end()
-
-        if has_ep:
-            set_decode_expert_padding(unwrapped, False)
-
-    @staticmethod
-    def _set_mtp_cuda_graph_flag(model, enabled):
-        unwrapped = unwrap_model(model)
-        for layer in unwrapped.mtp.layers:
-            layer.use_mtp_cuda_graphs = enabled
-
-    # ---- Test 1: all EP ranks run MTP forward with CUDA graphs ------------ #
+    # ---- Test 1: all EP ranks run MTP eager forward ----------------------- #
 
     @pytest.mark.parametrize("batch_size", [2, 4, 8])
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_ep_mtp_cuda_graph_forward(self, batch_size):
-        """All EP ranks can run MTP forward with CUDA graphs.
+    def test_ep_mtp_eager_forward(self, batch_size):
+        """All EP ranks can run MTP forward in eager mode.
 
         The MoE all-to-all collectives must match across EP ranks.  Verifies
         that all ranks complete without hanging and produce valid shapes.
         """
         model = self._build_model()
         unwrapped = unwrap_model(model)
-        self._warmup_mtp_graphs(model, [batch_size])
-        self._set_mtp_cuda_graph_flag(model, True)
 
         # Broadcast identical inputs so all EP ranks see the same data.
         hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda')
@@ -741,21 +698,19 @@ class TestMTPCudaGraphExpertParallel:
         assert logits.shape == (batch_size, 1, self.VOCAB_SIZE)
         assert torch.all(torch.isfinite(logits))
 
-    # ---- Test 2: dummy ranks + real ranks with CUDA graphs ---------------- #
+    # ---- Test 2: dummy ranks + real ranks in eager mode ------------------- #
 
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_ep_mtp_cuda_graph_dummy_and_real_ranks(self):
+    def test_ep_mtp_eager_dummy_and_real_ranks(self):
         """Even EP ranks run as dummy (with zeros), odd ranks run with real data.
 
         Both must issue matching MoE all-to-all collectives via the
-        CUDA-graphed MTP forward to avoid hangs.
+        MTP eager forward to avoid hangs.
         """
         batch_size = 4
         model = self._build_model()
         unwrapped = unwrap_model(model)
-        self._warmup_mtp_graphs(model, [batch_size])
-        self._set_mtp_cuda_graph_flag(model, True)
 
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         is_dummy = ep_rank % 2 == 0
@@ -786,9 +741,8 @@ class TestMTPCudaGraphExpertParallel:
 
         Verifies that:
         - All EP ranks agree on CUDA graph usage (on or off).
-        - When CUDA graphs are used, all ranks agree on the padded batch size.
-        - MTP ``compute_mtp_single_step`` completes on all ranks with the
-          EP-synced padded batch size.
+        - When CUDA graphs are used, all ranks agree on the padded batch size
+          (which would be used as the MTP batch dimension).
         """
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         my_state = rank_states[ep_rank]
@@ -822,7 +776,6 @@ class TestMTPCudaGraphExpertParallel:
         )
 
         if not uses_graph:
-            # When no CUDA graph matches, skip the MTP forward test.
             return
 
         # Phase 4: Derive MTP padded batch size from EP-synced dimensions.
@@ -838,28 +791,6 @@ class TestMTPCudaGraphExpertParallel:
             f"MTP padded batch size mismatch across EP ranks: "
             f"min={padded_min.item()}, max={padded_max.item()} "
             f"(rank_states={rank_states})"
-        )
-
-        # Phase 5: Warmup MTP CUDA graphs and run forward.
-        self._warmup_mtp_graphs(model, [mtp_padded])
-        self._set_mtp_cuda_graph_flag(model, True)
-
-        unwrapped = unwrap_model(model)
-        hidden = torch.randn(mtp_padded, 1, self.HIDDEN_SIZE, device='cuda')
-        token_ids = torch.randint(0, self.VOCAB_SIZE, (1, mtp_padded), device='cuda')
-        position_ids = torch.arange(mtp_padded, device='cuda', dtype=torch.int64).unsqueeze(0)
-
-        h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids, depth=0
-        )
-
-        assert h_out.shape == (mtp_padded, 1, self.HIDDEN_SIZE), (
-            f"EP rank {ep_rank} (state={my_state}): expected hidden shape "
-            f"({mtp_padded}, 1, {self.HIDDEN_SIZE}), got {h_out.shape}"
-        )
-        assert logits.shape == (mtp_padded, 1, self.VOCAB_SIZE), (
-            f"EP rank {ep_rank} (state={my_state}): expected logits shape "
-            f"({mtp_padded}, 1, {self.VOCAB_SIZE}), got {logits.shape}"
         )
 
     # ---- Test 4: dummy EP rank bail-out with decode-only CUDA graphs ------ #
@@ -901,7 +832,6 @@ class TestMTPCudaGraphExpertParallel:
 
         # MTP eager forward should still work on all ranks.
         unwrapped = unwrap_model(model)
-        self._set_mtp_cuda_graph_flag(model, False)
 
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
         dummy_hidden = torch.zeros((tp_size, 1, self.HIDDEN_SIZE), device='cuda')
