@@ -1026,14 +1026,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Return if this iteration we run decode only implementation.
 
-        When CUDA graphs are active, uses padded_batch_dimensions because it
-        reflects the post-expert-parallel sync state.  Otherwise falls back to
-        num_prefill_requests which is always up-to-date regardless of where we
-        are in the step lifecycle.
+        Uses padded_batch_dimensions because it reflects the
+        post-expert-parallel sync state (including phantom prefill
+        requests injected for EP+Mamba token-count alignment).
+
+        Must only be called after initialize_attention_state has set
+        padded_batch_dimensions for this step. Callers that run before
+        that point (engine logging, padding computation) should check
+        num_prefill_requests directly.
         """
-        if self._using_cuda_graph_this_step:
-            return self.padded_batch_dimensions.prefill_req_count == 0
-        return self.num_prefill_requests == 0
+        return self.padded_batch_dimensions.prefill_req_count == 0
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
@@ -1683,7 +1685,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:
-            if self.is_decode_only():
+            if self.num_prefill_requests == 0:
                 if self.num_speculative_tokens > 0:
                     padded_decode_req_count = min(
                         self.max_schedulable_requests,
