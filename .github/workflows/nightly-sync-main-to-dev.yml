@@ -287,19 +287,29 @@ jobs:
                  run to finish.
                - Repeat until all fixable issues are resolved.
 
-            **Handling pre-existing failures:**
-            If a test failure is NOT caused by the sync (i.e. the same test code
-            and function signatures exist identically on `dev` or `main` and the
-            failure would reproduce there too), do NOT attempt to fix it. Instead:
-            1. Verify it is pre-existing by comparing the test file and the code
-               it calls between `origin/main`, `origin/dev`, and your branch.
-            2. Note the failure as pre-existing and move on.
-            3. After the CI run completes, update the PR description with a
+            **Handling pre-existing failures — VERIFY, do not assume:**
+            Do NOT lazily label a failure as "pre-existing." You MUST prove
+            it by checking actual CI results from recent dev PRs:
+            1. Run: `gh pr list --repo $REPO --base dev --state merged --limit 3`
+               to find recently merged dev PRs.
+            2. Run: `gh pr checks <PR_NUMBER> --repo $REPO` on one of them
+               and check if the SAME test bucket that failed on your sync
+               also failed on the recent dev PR.
+            3. If the test **passes on recent dev CI**, the failure is
+               sync-caused — you must fix it. Common cause: taking main's
+               `pyproject.toml`/`uv.lock` changes the container's dependency
+               versions (e.g. TransformerEngine), breaking dev-only code.
+               In this case, the fix may require keeping dev's dependency
+               versions or adjusting the code.
+            4. Only if the test **also fails on recent dev CI** can you
+               classify it as pre-existing. Document it with the dev PR
+               number and CI run as evidence.
+            5. After the CI run completes, update the PR description with a
                section titled "Pre-existing test failures (NOT caused by this
                sync)" documenting each such failure: the test name, the error
-               message, and the evidence that it is pre-existing.
-            4. Also comment on the PR summarizing these pre-existing failures so
-               reviewers are aware.
+               message, the dev PR number checked, and whether it also failed
+               there.
+            6. Also comment on the PR summarizing these findings.
 
             ---
 
