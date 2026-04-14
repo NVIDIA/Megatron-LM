@@ -95,6 +95,9 @@ def destroy_moe_overload_factor_tracker() -> None:
 class MoEOverloadFactorTracker:
     """Tracker for MoE overload-factor metrics.
 
+    Reductions are over tp_ep then expt_dp (expert data parallel), not dense dp,
+    so overload stats stay within the same expert partition across replicas.
+
     Lifecycle: MoELayer records counts when log_overload_factor is set → report()
     at step end (sync, aggregate, log, deferred clear) → repeat.
 
@@ -112,19 +115,19 @@ class MoEOverloadFactorTracker:
         # +actual tokens on forward, - on backward (mirrors balanced timeline).
         self._cumulative_balanced_timeline: List[torch.Tensor] = []
         self._tp_ep_group: Optional[torch.distributed.ProcessGroup] = None
-        self._dp_group: Optional[torch.distributed.ProcessGroup] = None
+        self._expt_dp_group: Optional[torch.distributed.ProcessGroup] = None
         self._pending_clear: bool = False
 
     def set_process_groups(
         self,
         tp_ep_group: Optional[torch.distributed.ProcessGroup] = None,
-        dp_group: Optional[torch.distributed.ProcessGroup] = None,
+        expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         """Set process groups for reduction (MoELayer.__init__ when log_overload_factor)."""
         if tp_ep_group is not None:
             self._tp_ep_group = tp_ep_group
-        if dp_group is not None:
-            self._dp_group = dp_group
+        if expt_dp_group is not None:
+            self._expt_dp_group = expt_dp_group
 
     def _clear_storage(self) -> None:
         self._layer_fwd_tokens.clear()
@@ -216,7 +219,7 @@ class MoEOverloadFactorTracker:
     def _max_cum_overload_if_timeline(
         self,
         tp_ep_group: Optional[torch.distributed.ProcessGroup],
-        dp_group: Optional[torch.distributed.ProcessGroup],
+        expt_dp_group: Optional[torch.distributed.ProcessGroup],
     ) -> Optional[float]:
         """Cumulative actual vs balanced token count; ratio of peaks across ranks."""
         if not self._cumulative_tokens_timeline:
@@ -247,9 +250,9 @@ class MoEOverloadFactorTracker:
             torch.distributed.all_reduce(
                 cum_overload_ratio, group=tp_ep_group, op=torch.distributed.ReduceOp.MAX
             )
-        if dp_group is not None:
+        if expt_dp_group is not None:
             torch.distributed.all_reduce(
-                cum_overload_ratio, group=dp_group, op=torch.distributed.ReduceOp.MAX
+                cum_overload_ratio, group=expt_dp_group, op=torch.distributed.ReduceOp.MAX
             )
         return cum_overload_ratio.item()
 
@@ -281,18 +284,20 @@ class MoEOverloadFactorTracker:
         tp_ep_overload = max_actual / (balanced_per_rank + 1e-8)
         return tp_ep_overload, device
 
-    def _dp_reduce_overload(
-        self, tp_ep_overload: torch.Tensor, dp_group: Optional[torch.distributed.ProcessGroup]
+    def _expt_dp_reduce_overload(
+        self,
+        tp_ep_overload: torch.Tensor,
+        expt_dp_group: Optional[torch.distributed.ProcessGroup],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Average and worst-case overload across DP replicas (per entry)."""
-        if dp_group is not None:
+        """Average and worst-case overload across expert-DP replicas (per entry)."""
+        if expt_dp_group is not None:
             overload_avg = tp_ep_overload.clone()
             torch.distributed.all_reduce(
-                overload_avg, group=dp_group, op=torch.distributed.ReduceOp.AVG
+                overload_avg, group=expt_dp_group, op=torch.distributed.ReduceOp.AVG
             )
             overload_max = tp_ep_overload.clone()
             torch.distributed.all_reduce(
-                overload_max, group=dp_group, op=torch.distributed.ReduceOp.MAX
+                overload_max, group=expt_dp_group, op=torch.distributed.ReduceOp.MAX
             )
         else:
             overload_avg = tp_ep_overload
@@ -366,7 +371,7 @@ class MoEOverloadFactorTracker:
         """Reduce data, overload factors, log to TB/W&B, defer clear, return log string."""
         pp_group, use_pp_reduce = self._pipeline_group_and_use_reduce()
         tp_ep_group = self._tp_ep_group
-        dp_group = self._dp_group
+        expt_dp_group = self._expt_dp_group
 
         fwd_tensors, balanced_tensors = self._flatten_recorded_tokens()
 
@@ -381,11 +386,15 @@ class MoEOverloadFactorTracker:
         num_layers = len(self._layer_fwd_tokens)
         self._validate_overload_tensor_lists(num_entries, num_layers, len(balanced_tensors))
 
-        max_cum_overload_factor = self._max_cum_overload_if_timeline(tp_ep_group, dp_group)
+        max_cum_overload_factor = self._max_cum_overload_if_timeline(
+            tp_ep_group, expt_dp_group
+        )
         tp_ep_overload, device = self._tp_ep_overload_from_lists(
             fwd_tensors, balanced_tensors, tp_ep_group
         )
-        overload_avg, overload_max = self._dp_reduce_overload(tp_ep_overload, dp_group)
+        overload_avg, overload_max = self._expt_dp_reduce_overload(
+            tp_ep_overload, expt_dp_group
+        )
 
         avg_overload_factor = overload_avg.mean().item()
         max_overload_factor = overload_max.max().item()

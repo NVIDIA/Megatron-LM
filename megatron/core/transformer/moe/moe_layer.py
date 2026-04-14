@@ -237,7 +237,6 @@ class MoELayer(BaseMoELayer):
 
         self.tp_group = pg_collection.tp
         self.tp_ep_group = pg_collection.tp_ep
-        self.dp_group = pg_collection.dp
 
         # Initialize router.
         self.router = self.submodules.router(
@@ -352,7 +351,7 @@ class MoELayer(BaseMoELayer):
 
         if self.config.log_overload_factor:
             get_moe_overload_factor_tracker().set_process_groups(
-                tp_ep_group=self.tp_ep_group, dp_group=self.dp_group
+                tp_ep_group=self.tp_ep_group, expt_dp_group=pg_collection.expt_dp
             )
 
         # Setup events and streams for delayed wgrad computation.
