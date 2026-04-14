@@ -98,7 +98,7 @@ class MoEOverloadFactorTracker:
     Reductions are over tp_ep then expt_dp (expert data parallel), not dense dp,
     so overload stats stay within the same expert partition across replicas.
 
-    Lifecycle: MoELayer records counts when log_overload_factor is set → report()
+    Lifecycle: MoELayer records counts when log_moe_overload_factor is set → report()
     at step end (sync, aggregate, log, deferred clear) → repeat.
 
     Example:
@@ -123,7 +123,7 @@ class MoEOverloadFactorTracker:
         tp_ep_group: Optional[torch.distributed.ProcessGroup] = None,
         expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
-        """Set process groups for reduction (MoELayer.__init__ when log_overload_factor)."""
+        """Set process groups for reduction (MoELayer.__init__ when log_moe_overload_factor)."""
         if tp_ep_group is not None:
             self._tp_ep_group = tp_ep_group
         if expt_dp_group is not None:

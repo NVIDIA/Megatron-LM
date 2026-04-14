@@ -349,7 +349,7 @@ class MoELayer(BaseMoELayer):
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
-        if self.config.log_overload_factor:
+        if self.config.log_moe_overload_factor:
             get_moe_overload_factor_tracker().set_process_groups(
                 tp_ep_group=self.tp_ep_group, expt_dp_group=pg_collection.expt_dp
             )
@@ -502,13 +502,13 @@ class MoELayer(BaseMoELayer):
     def _maybe_record_overload_factor(
         self, dispatched_input: torch.Tensor, tokens_per_expert: torch.Tensor
     ) -> torch.Tensor:
-        """Wrap dispatched_input with overload logging when log_overload_factor is set.
+        """Wrap dispatched_input with overload logging when log_moe_overload_factor is set.
 
         Uses _overload_log_num_local_tokens captured from forward hidden_states and
         applies AllGather fair-share scaling so report()'s SUM over TP×EP matches one
         global balanced count when the map is replicated on every rank.
         """
-        if not self.config.log_overload_factor:
+        if not self.config.log_moe_overload_factor:
             return dispatched_input
         num_local_tokens = getattr(self, "_overload_log_num_local_tokens", None)
         if num_local_tokens is None:
@@ -627,7 +627,7 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    if self.config.log_overload_factor:
+                    if self.config.log_moe_overload_factor:
                         self._overload_log_num_local_tokens = (
                             self._num_token_rows_from_moe_hidden_states(hidden_states)
                         )

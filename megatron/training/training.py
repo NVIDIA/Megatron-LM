@@ -2443,7 +2443,7 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
-        if getattr(args, 'log_overload_factor', False):
+        if getattr(args, 'log_moe_overload_factor', False):
             overload_log_string = get_moe_overload_factor_tracker().report(
                 iteration=iteration,
                 writer=writer,
@@ -3563,7 +3563,7 @@ def train(
                 energy_monitor.resume()
             if args.num_experts is not None:
                 get_moe_metrics_tracker().clear()
-                if getattr(args, 'log_overload_factor', False):
+                if getattr(args, 'log_moe_overload_factor', False):
                     get_moe_overload_factor_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).

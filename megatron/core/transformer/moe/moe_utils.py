@@ -1066,7 +1066,7 @@ def record_dispatch_token_counts(
     Records tokens_per_expert.sum() on this rank and the balanced token count scalar.
     Overload factors are computed later in MoEOverloadFactorTracker.report(). Process groups
     must already be registered on the global tracker (MoELayer does this in __init__
-    when log_overload_factor is enabled).
+    when log_moe_overload_factor is enabled).
 
     Args:
         tensor: Tensor in the autograd graph (typically dispatched_input).

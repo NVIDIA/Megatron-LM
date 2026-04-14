@@ -744,6 +744,7 @@ class TransformerConfig(ModelParallelConfig):
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
     """
     log_overload_factor: bool = False
+    log_moe_overload_factor: bool = False
     """When True, log MoE overload metrics (avg/max vs balanced token count per step; max cum
     overload = peak cumulative actual tokens / peak cumulative balanced count over interleaved
     fwd/bwd) to TensorBoard/W&B and console. Records tokens_per_expert.sum() after dispatch;
