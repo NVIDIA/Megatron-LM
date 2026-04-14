@@ -30,6 +30,26 @@ metrics follow the [OTel GenAI semantic conventions](https://opentelemetry.io/do
 | `MEGATRON_OTEL_METRICS_ENABLED` | `1` | Enable metrics instruments |
 | `MEGATRON_OTEL_SPAN_GROUPS` | `default` | Span granularity spec (see §3) |
 | `MEGATRON_OTEL_EXPORTER` | `otlp` | Exporter backend: `otlp` or `console` |
+| `NEMO_LENS_RUN_ID` | (auto) | Unique run identifier. Auto-detected from SLURM_JOB_ID or generated UUID. |
+| `NEMO_LENS_USER` | (empty) | Optional user/team label for filtering. |
+
+### Run Identification
+
+Each training run is automatically assigned a unique `nemo.run.id` resource attribute that
+flows to all backends (Jaeger, Prometheus/Grafana, Elasticsearch/Kibana).
+
+**Priority order:**
+1. `NEMO_LENS_RUN_ID` env var (explicit, highest priority)
+2. `SLURM_JOB_ID` env var (auto-detected on SLURM clusters)
+3. Auto-generated 12-character UUID (fallback)
+
+All ranks in a distributed job share the same `run_id`. Each rank gets a unique
+`service.instance.id` of `{run_id}-rank{rank}`.
+
+**Filtering:**
+- **Jaeger**: Search by tag `nemo.run.id=<value>`
+- **Grafana**: Use the "Run ID" dropdown variable
+- **Kibana**: Filter by `nemo.run.id` field in Discover
 
 ---
 
@@ -97,6 +117,9 @@ MEGATRON_OTEL_SPAN_GROUPS=default,microbatch
 
 # Everything
 MEGATRON_OTEL_SPAN_GROUPS=all
+
+# Tag a run for easy filtering
+NEMO_LENS_RUN_ID=gpt3-lr-sweep-42 MEGATRON_OTEL_ENABLED=1 torchrun ...
 ```
 
 ### Span hierarchy
