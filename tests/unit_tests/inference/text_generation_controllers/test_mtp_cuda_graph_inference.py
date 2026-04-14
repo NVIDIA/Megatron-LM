@@ -24,6 +24,7 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+import megatron.core.inference.utils as _inference_utils
 from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -606,6 +607,7 @@ class TestMTPCudaGraphExpertParallel:
 
     def teardown_method(self, method):
         delete_cuda_graphs()
+        _inference_utils.moe_layer_cache = None
         Utils.destroy_model_parallel()
 
     # ---- helpers ---------------------------------------------------------- #
@@ -676,8 +678,10 @@ class TestMTPCudaGraphExpertParallel:
 
         # Enable drop-and-pad for MoE during graph capture so the all-to-all
         # dispatcher is replaced by CUDA graph-safe local operations.
+        # Reset the global MoE layer cache so it discovers this model's layers.
         has_ep = model.config.expert_model_parallel_size > 1
         if has_ep:
+            _inference_utils.moe_layer_cache = None
             capacity_factor = model.config.num_moe_experts / model.config.moe_router_topk
             set_decode_expert_padding(unwrapped, True, capacity_factor=capacity_factor)
 
