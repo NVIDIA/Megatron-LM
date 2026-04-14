@@ -31,6 +31,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.gpu_event_loop_synchronization import GPUFuture
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -1662,12 +1663,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        async with self._loop.exclusive():
-            result = await self.controller.async_generate_output_tokens_dynamic_batch(
-                loop=self._loop
-            )
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(
+            loop=self._loop,
+        )
         self.step_end_event.record()
-        self.step_end_event.synchronize()
+        step_done = GPUFuture(self._loop)
+        step_done.record()
+        await step_done
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
@@ -2320,7 +2322,9 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_start_event.record()
                             self.controller.dummy_forward()
                             self.step_end_event.record()
-                            self.step_end_event.synchronize()
+                            step_done = GPUFuture(self._loop)
+                            step_done.record()
+                            await step_done
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
                     else:
