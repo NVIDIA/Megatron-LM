@@ -31,7 +31,6 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.gpu_event_loop_synchronization import GPUFuture
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -46,6 +45,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import (
     Counter,
+    GPUFuture,
     await_process_call,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
@@ -1663,9 +1663,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(
-            loop=self._loop,
-        )
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(loop=self._loop)
         self.step_end_event.record()
         step_done = GPUFuture(self._loop)
         step_done.record()
