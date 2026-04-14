@@ -9,7 +9,7 @@
 
 # Data Loading at Scale
 
-This guide covers how Megatron's data pipeline works and how to configure it for efficient training at 256 nodes and beyond. At this scale, the primary bottlenecks are **index building**, **filesystem metadata operations**, and **barrier synchronization** -- not raw data bandwidth.
+This guide covers how Megatron's data pipeline works and how to configure it for efficient training at 256 nodes and beyond. At this scale, the primary bottlenecks are **index building** and **barrier synchronization** -- not raw data bandwidth.
 
 ## How Data Loading Works
 
@@ -28,8 +28,7 @@ After initialization, data access is **read-only and lock-free**. Each data-para
 Three things break down at large node counts:
 
 1. **Barrier synchronization**: All ranks block while rank 0 builds indices. On a 512-node job, this means 4,095 GPUs sit idle.
-2. **Filesystem metadata storms**: When blending many datasets, thousands of simultaneous `open()` and `stat()` calls from all ranks can overwhelm NFS/Lustre metadata servers.
-3. **Simultaneous memory-mapping**: All ranks `mmap` three large `.npy` files at once after the barrier, causing a burst of page faults and I/O.
+2. **Simultaneous memory-mapping**: All ranks `mmap` three large `.npy` files at once after the barrier, causing a burst of page faults and I/O.
 
 ## Baseline: Establish Maximum Achievable Performance
 
@@ -131,10 +130,6 @@ When data lives on S3 or MSC rather than a POSIX filesystem:
 **Symptom: Training hangs at startup for minutes**
 - Likely cause: Rank 0 is building indices while all other ranks wait at the barrier.
 - Fix: Pre-build the cache with `tools/prepare_cache.py` and enable `--dataloader-fast-cache-load`.
-
-**Symptom: Metadata server errors or slow `open()` calls**
-- Likely cause: Thousands of ranks simultaneously opening per-dataset files for metadata.
-- Fix: Use `--per-dataset-sequences-path` to consolidate metadata into a single JSON file.
 
 **Symptom: Spike in I/O at training start, then normal**
 - Likely cause: All ranks simultaneously memory-mapping index files after the barrier.
