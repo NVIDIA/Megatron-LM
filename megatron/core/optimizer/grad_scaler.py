@@ -22,23 +22,25 @@ class MegatronGradScaler(ABC):
 
     @property
     def scale(self):
+        """Return the current loss scale."""
         return self._scale
 
     @property
     def inv_scale(self):
+        """Return the reciprocal of the current loss scale."""
         return self._scale.double().reciprocal().float()
 
     @abstractmethod
     def update(self, found_inf: bool):
-        pass
+        """Update the loss scale based on whether inf/NaN was found."""
 
     @abstractmethod
     def state_dict(self):
-        pass
+        """Return the state dictionary for checkpointing."""
 
     @abstractmethod
     def load_state_dict(self, state_dict: Dict):
-        pass
+        """Load state from a checkpoint dictionary."""
 
 
 class ConstantGradScaler(MegatronGradScaler):
