@@ -147,39 +147,26 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if ep_group is not None:
             import torch.distributed as dist
             from megatron.core.transformer.moe.token_dispatcher_inference import (
-                InferenceAllGatherDispatcherBase,
+                NCCLAllGatherDispatcher,
+                NVLSAllGatherVDispatcher,
             )
             ep_size = dist.get_world_size(group=ep_group)
-            ep_rank = dist.get_rank(group=ep_group)
             if getattr(context, '_nccl_ep_dispatcher', False):
-                # NCCL: all ranks always have the same count — no collective needed.
-                logging.info(
-                    "[NCCL-EP rank=%d] dummy_forward: setting metadata num_dummy_tokens=%d ep_size=%d",
-                    ep_rank, num_dummy_tokens, ep_size,
-                )
                 local_tokens_per_rank = torch.full(
                     (ep_size,), num_dummy_tokens, dtype=torch.int32,
                     device=torch.cuda.current_device(),
                 )
-                InferenceAllGatherDispatcherBase.set_step_metadata(local_tokens_per_rank, ep_group)
-                logging.info("[NCCL-EP rank=%d] dummy_forward: metadata set", ep_rank)
+                NCCLAllGatherDispatcher.set_step_metadata(local_tokens_per_rank, ep_group)
             else:
-                # NVLS: all-gather actual per-rank counts, then barrier so all ranks
-                # have their metadata set before any enters the forward.
-                logging.info(
-                    "[NVLS-EP rank=%d] dummy_forward: entering all_gather num_dummy_tokens=%d",
-                    ep_rank, num_dummy_tokens,
-                )
                 local_count = torch.tensor(
                     [num_dummy_tokens], dtype=torch.int32, device=torch.cuda.current_device()
                 )
-                local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32,
-                                                     device=torch.cuda.current_device())
+                local_tokens_per_rank = torch.empty(
+                    ep_size, dtype=torch.int32, device=torch.cuda.current_device()
+                )
                 dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
-                InferenceAllGatherDispatcherBase.set_step_metadata(local_tokens_per_rank, ep_group)
-                logging.info("[NVLS-EP rank=%d] dummy_forward: entering barrier", ep_rank)
+                NVLSAllGatherVDispatcher.set_step_metadata(local_tokens_per_rank, ep_group)
                 dist.barrier(group=ep_group)
-                logging.info("[NVLS-EP rank=%d] dummy_forward: barrier done", ep_rank)
 
         tokens = torch.zeros(
             (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()

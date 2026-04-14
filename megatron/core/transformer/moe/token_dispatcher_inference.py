@@ -14,8 +14,11 @@ Two dispatchers are provided, selected via config.inference_moe_token_dispatcher
     different token counts per rank per step. Requires Hopper+ GPUs with NVLink and
     symmetric memory. Opt-in.
 
-Both dispatchers inherit from InferenceAllGatherDispatcherBase, which owns the
-class-level step metadata (_step_metadata) used by mcore_fused_moe kernels.
+InferenceAllGatherDispatcherBase is a minimal base used solely for isinstance checks
+and to hold _valid_tokens_tensor — the shared interface that mcore_fused_moe reads to
+gate kernel work to the valid token prefix. Each dispatcher defines its own
+set_step_metadata; the inference context calls the right one based on its dispatcher
+type flag.
 """
 
 from typing import List, Optional
@@ -38,93 +41,41 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
-    """Base class for inference AllGather token dispatchers.
+    """Minimal base for inference AllGather token dispatchers.
 
-    Owns the class-level step metadata shared across all MoE layers and provides
-    two static methods to populate it:
-      - set_step_metadata_nccl: trivial fill from local token count, no collective.
-      - set_step_metadata: all-gather path for NVLS variable token counts.
-
-    The _valid_tokens() classmethod is the primary interface consumed by
-    mcore_fused_moe to gate kernel work to the valid token prefix.
+    Exists for isinstance checks and to expose _valid_tokens_tensor — the single
+    class-level value that mcore_fused_moe reads (via experts.py) to gate kernel
+    work to the valid token prefix. Each concrete subclass owns its own metadata
+    and defines set_step_metadata independently.
     """
 
-    # ── Class-level step metadata (shared across all layers) ─────────────────────
-    # [3] int32 tensor: [valid_tokens, rank_token_offset, ep_max_tokens].
-    # Written in-place each step so CUDA graph replay sees stable addresses.
-    _step_metadata: Optional[torch.Tensor] = None  # [3] int32
-    _ep_rank: int = 0
-    _engine_max_tokens: int = 2048
-
-    # RSV symmetric buffer — set by NVLSAllGatherVDispatcher._alloc_rsv_buffer.
-    # Exposed here so mcore_fused_moe can write unpermute output directly into it.
-    _rsv_symm_tensor: Optional[torch.Tensor] = None
-
-    @classmethod
-    def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
-        return cls._rsv_symm_tensor
+    # [1] int32: total valid tokens across all EP ranks this step.
+    # Written in-place each step so CUDA graph replay sees a stable address.
+    # NVLSAllGatherVDispatcher points this at _step_metadata[0:1] on first init
+    # so that experts.py can always call _valid_tokens() on this base class.
+    _valid_tokens_tensor: Optional[torch.Tensor] = None
 
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
-        return cls._step_metadata[0:1]
-
-    @classmethod
-    def _rank_token_offset(cls) -> torch.Tensor:
-        return cls._step_metadata[1:2]
-
-    @classmethod
-    def _ep_max_tokens(cls) -> torch.Tensor:
-        return cls._step_metadata[2:3]
-
-    @staticmethod
-    def set_engine_max_tokens(n: int) -> None:
-        """Set at model init. Determines AGV/RSV CTA grid size (fixed for CG)."""
-        InferenceAllGatherDispatcherBase._engine_max_tokens = n
-
-    @staticmethod
-    def allocate_step_metadata(device: torch.device, ep_rank: int) -> None:
-        """Allocate a [3] int32 CUDA tensor for per-step metadata at model init."""
-        InferenceAllGatherDispatcherBase._ep_rank = ep_rank
-        InferenceAllGatherDispatcherBase._step_metadata = torch.zeros(
-            3, dtype=torch.int32, device=device
-        )
-
-    @staticmethod
-    def set_step_metadata(
-        local_tokens_per_rank: torch.Tensor,
-        ep_group: torch.distributed.ProcessGroup,
-    ) -> None:
-        """Populate step metadata from per-rank token counts.
-
-        Called each step by the inference context after building local_tokens_per_rank
-        (either via an all-gather for NVLS or a trivial fill for NCCL).
-
-        Args:
-            local_tokens_per_rank: [ep_size] int32 tensor of padded token counts per
-                EP rank.
-            ep_group: Expert parallel process group.
-        """
-        if InferenceAllGatherDispatcherBase._step_metadata is None:
-            InferenceAllGatherDispatcherBase.allocate_step_metadata(
-                device=local_tokens_per_rank.device,
-                ep_rank=dist.get_rank(group=ep_group),
-            )
-        ep_rank = InferenceAllGatherDispatcherBase._ep_rank
-        valid_tokens = local_tokens_per_rank.sum()
-        rank_token_offset = local_tokens_per_rank[:ep_rank].sum()
-        ep_max_tokens = local_tokens_per_rank.max()
-        InferenceAllGatherDispatcherBase._step_metadata.copy_(
-            torch.stack([valid_tokens, rank_token_offset, ep_max_tokens])
-        )
+        return cls._valid_tokens_tensor
 
 
 class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
-    """CUDA-graph-compatible AllGather token dispatcher for inference using NCCL.
+    """AllGather token dispatcher for inference using NCCL.
 
-    Uses standard NCCL AllGather/ReduceScatter collectives. All EP ranks must
-    contribute the same token count each step, which is guaranteed by decode-only
-    CUDA graphs (forced automatically when this dispatcher is selected).
+    Two modes selected per-step via set_step_metadata:
+
+    CG path (use_allgather_v=False): all EP ranks contribute the same token count,
+    guaranteed by decode-only CUDA graphs. Standard AllGather/ReduceScatter.
+
+    Non-CG path (use_allgather_v=True): ranks may have different token counts
+    (prefill). Each rank pads its tensors to max_tokens, runs a standard AllGather,
+    then compacts by stripping per-rank padding. Combine is the reverse: expand
+    compact output to padded layout, ReduceScatter, truncate to local token count.
     """
+
+    _use_allgather_v: bool = False
+    _local_tokens_per_rank: Optional[List[int]] = None
 
     def __init__(
         self,
@@ -141,28 +92,91 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         )
         self.topk = config.moe_router_topk
 
+    @classmethod
+    def set_step_metadata(
+        cls,
+        local_tokens_per_rank: torch.Tensor,
+        ep_group: torch.distributed.ProcessGroup,
+        use_allgather_v: bool = False,
+    ) -> None:
+        """Set per-step metadata.
+
+        Args:
+            local_tokens_per_rank: [ep_size] int32 tensor of token counts per rank.
+            ep_group: Expert parallel process group.
+            use_allgather_v: True on non-CG steps where ranks have variable token counts.
+        """
+        cls._use_allgather_v = use_allgather_v
+        cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
+        if cls._valid_tokens_tensor is None:
+            cls._valid_tokens_tensor = torch.zeros(
+                1, dtype=torch.int32, device=local_tokens_per_rank.device
+            )
+        cls._valid_tokens_tensor.copy_(local_tokens_per_rank.sum())
+
     def token_dispatch(self, hidden_states, probs):
-        """AllGather hidden_states, probs, and routing_map from all EP ranks via NCCL.
+        """Gather hidden_states, probs, and routing_map from all EP ranks.
+
+        CG path: standard AllGather (equal token counts guaranteed).
+        Non-CG path: pad to max_tokens, AllGather, compact (strip per-rank padding).
 
         Args:
             hidden_states: [local_tokens, hidden_dim] local input.
             probs: [local_tokens, topk] local routing probabilities.
 
         Returns:
-            (hidden_states, probs) gathered to [global_tokens, *] shape.
-            Also updates self.routing_map to [global_tokens, topk].
+            (hidden_states, probs) gathered to [total_tokens, *] shape.
+            Also updates self.routing_map to [total_tokens, topk].
         """
         if self.ep_size == 1:
             return hidden_states, probs
 
-        with torch.no_grad():
-            self.routing_map = gather_from_sequence_parallel_region(
-                self.routing_map, group=self.tp_ep_group
+        if not self.__class__._use_allgather_v:
+            # CG path: equal token counts, standard gather.
+            with torch.no_grad():
+                self.routing_map = gather_from_sequence_parallel_region(
+                    self.routing_map, group=self.tp_ep_group
+                )
+            probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, group=self.tp_ep_group
             )
-        probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
-        hidden_states = gather_from_sequence_parallel_region(
-            hidden_states, group=self.tp_ep_group
-        )
+            return hidden_states, probs
+
+        # Non-CG path: pad → AllGather → compact.
+        tokens_per_rank = self.__class__._local_tokens_per_rank
+        max_tokens = max(tokens_per_rank)
+
+        def pad_to_max(tensor):
+            deficit = max_tokens - tensor.shape[0]
+            if deficit == 0:
+                return tensor
+            return torch.cat([tensor, tensor.new_empty((deficit,) + tensor.shape[1:])], dim=0)
+
+        def allgather(padded_tensor):
+            gathered = padded_tensor.new_empty(
+                (self.ep_size * max_tokens,) + padded_tensor.shape[1:]
+            )
+            dist.all_gather_into_tensor(gathered, padded_tensor, group=self.ep_group)
+            return gathered
+
+        hidden_gathered = allgather(pad_to_max(hidden_states))
+        probs_gathered = allgather(pad_to_max(probs))
+        with torch.no_grad():
+            routing_gathered = allgather(pad_to_max(self.routing_map))
+
+        def compact(gathered_tensor):
+            return torch.cat(
+                [
+                    gathered_tensor[src_rank * max_tokens : src_rank * max_tokens + n_tokens]
+                    for src_rank, n_tokens in enumerate(tokens_per_rank)
+                ],
+                dim=0,
+            )
+
+        hidden_states = compact(hidden_gathered)
+        probs = compact(probs_gathered)
+        self.routing_map = compact(routing_gathered)
         return hidden_states, probs
 
     def dispatch_postprocess(self, hidden_states, probs):
@@ -174,10 +188,13 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         return expert_output
 
     def token_combine(self, hidden_states):
-        """ReduceScatter expert outputs across EP ranks via NCCL.
+        """Scatter-reduce expert outputs back to each EP rank.
+
+        CG path: standard ReduceScatter (equal token counts guaranteed).
+        Non-CG path: expand compact output to padded layout, ReduceScatter, truncate.
 
         Args:
-            hidden_states: [global_tokens, hidden_dim] expert outputs.
+            hidden_states: [total_tokens, hidden_dim] expert outputs.
 
         Returns:
             [local_tokens, hidden_dim] bf16 local token outputs.
@@ -185,10 +202,33 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
 
-        hidden_states = reduce_scatter_to_sequence_parallel_region(
-            hidden_states, group=self.tp_ep_group
-        )
-        return hidden_states.to(torch.bfloat16)
+        if not self.__class__._use_allgather_v:
+            # CG path: equal token counts, standard reduce-scatter.
+            hidden_states = reduce_scatter_to_sequence_parallel_region(
+                hidden_states, group=self.tp_ep_group
+            )
+            return hidden_states.to(torch.bfloat16)
+
+        # Non-CG path: expand compact → padded, ReduceScatter, truncate.
+        tokens_per_rank = self.__class__._local_tokens_per_rank
+        max_tokens = max(tokens_per_rank)
+        ep_rank = self.ep_group.rank()
+
+        # Expand [total_tokens, H] → [ep_size * max_tokens, H], zeros in padding slots.
+        padded_output = hidden_states.new_zeros(self.ep_size * max_tokens, hidden_states.shape[1])
+        offset = 0
+        for dst_rank, n_tokens in enumerate(tokens_per_rank):
+            padded_output[dst_rank * max_tokens : dst_rank * max_tokens + n_tokens] = (
+                hidden_states[offset : offset + n_tokens]
+            )
+            offset += n_tokens
+
+        # ReduceScatter: [ep_size * max_tokens, H] → [max_tokens, H].
+        scattered = padded_output.new_empty(max_tokens, hidden_states.shape[1])
+        dist.reduce_scatter_tensor(scattered, padded_output, group=self.ep_group)
+
+        # Truncate padding and cast.
+        return scattered[: tokens_per_rank[ep_rank]].to(torch.bfloat16)
 
 
 class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
@@ -200,6 +240,64 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
     Requires Hopper+ GPUs with NVLink and symmetric memory.
     """
+
+    # ── Class-level NVLS step metadata ───────────────────────────────────────────
+    # Packed [3] int32: [valid_tokens, rank_token_offset, ep_max_tokens].
+    # Written in-place each step for stable CUDA graph addresses.
+    # _valid_tokens_tensor on the base is pointed at _step_metadata[0:1] on first
+    # init, so experts.py can read valid_tokens via the base class interface.
+    _step_metadata: Optional[torch.Tensor] = None  # [3] int32
+    _ep_rank: int = 0
+    _engine_max_tokens: int = 2048
+
+    # RSV symmetric buffer — written here by _alloc_rsv_buffer so mcore_fused_moe
+    # can write unpermute output directly into it, avoiding a copy before RSV.
+    _rsv_symm_tensor: Optional[torch.Tensor] = None
+
+    @classmethod
+    def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
+        return cls._rsv_symm_tensor
+
+    @classmethod
+    def _rank_token_offset(cls) -> torch.Tensor:
+        return cls._step_metadata[1:2]
+
+    @classmethod
+    def _ep_max_tokens(cls) -> torch.Tensor:
+        return cls._step_metadata[2:3]
+
+    @classmethod
+    def set_engine_max_tokens(cls, n: int) -> None:
+        """Set at model init. Determines AGV/RSV CTA grid size (fixed for CG)."""
+        cls._engine_max_tokens = n
+
+    @classmethod
+    def set_step_metadata(
+        cls,
+        local_tokens_per_rank: torch.Tensor,
+        ep_group: torch.distributed.ProcessGroup,
+    ) -> None:
+        """Set all three NVLS metadata fields from per-rank token counts.
+
+        Allocates _step_metadata on the first call and wires the base class's
+        _valid_tokens_tensor to _step_metadata[0:1] so experts.py can always
+        call InferenceAllGatherDispatcherBase._valid_tokens() regardless of
+        which dispatcher is active. Subsequent calls copy in-place.
+        """
+        if cls._step_metadata is None:
+            cls._step_metadata = torch.zeros(
+                3, dtype=torch.int32, device=local_tokens_per_rank.device
+            )
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor = cls._step_metadata[0:1]
+            cls._ep_rank = dist.get_rank(group=ep_group)
+        ep_rank = cls._ep_rank
+        cls._step_metadata.copy_(
+            torch.stack([
+                local_tokens_per_rank.sum(),
+                local_tokens_per_rank[:ep_rank].sum(),
+                local_tokens_per_rank.max(),
+            ])
+        )
 
     def __init__(
         self,
@@ -249,15 +347,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """Allocate a symmetric buffer for the RSV input (expert outputs).
 
         Sized at [engine_max_tokens * ep_size, hidden_dim] — fixed for CG.
-        Caches the tensor in the base class so mcore_fused_moe can write into it
-        directly, avoiding a copy before multimem_reduce_scatter_v.
+        Caches the tensor so mcore_fused_moe can write into it directly,
+        avoiding a copy before multimem_reduce_scatter_v.
         """
         global_max = self._engine_max_tokens * self.ep_size
         hidden_dim = hidden_states.shape[1]
         buf = SymmetricMemoryManager.get_buffer(
             "ep_rsv", process_group=self.ep_group
         ).maybe_get_tensor([global_max, hidden_dim], dtype=hidden_states.dtype)
-        InferenceAllGatherDispatcherBase._rsv_symm_tensor = buf["tensor"]
+        NVLSAllGatherVDispatcher._rsv_symm_tensor = buf["tensor"]
         return buf
 
     # ── Dispatch path ─────────────────────────────────────────────────────────────

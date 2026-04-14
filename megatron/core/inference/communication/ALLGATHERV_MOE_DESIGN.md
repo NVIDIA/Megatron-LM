@@ -217,15 +217,13 @@ Consistent with existing patterns (`moe_disable_fuse_quant`, etc.).
 
 Old dispatcher remains untouched. Flag selects which dispatcher is instantiated in `experts.py` or the MoE layer init.
 
-### 7.4 CUDA graph considerations (deferred)
+### 7.4 CUDA graph considerations (resolved)
 
-The existing `MoEAlltoAllTokenDispatcher` has convoluted EP sync points in the inference dynamic context that are incompatible with CUDA graphing. The new dispatcher should be designed from scratch to avoid these:
+The new dispatcher is CG-safe by construction:
 
-- All metadata reads are from fixed-address GPU tensors (no host-device sync in the graph)
-- NCCL collectives are either captured or placed outside the graph boundary
-- Signal pad barriers (`symm_mem_sync`) are self-resetting and graph-safe
-
-*Detailed CUDA graph capture strategy to be discussed separately.*
+- All metadata (`valid_tokens`, `rank_token_offset`, `prefix_sum`) lives in **fixed-address GPU tensors**; `set_step_metadata()` updates them *before* graph replay — no host-device sync inside the graph.
+- The `local_tokens_per_rank` NCCL all-gather and `dist.barrier(ep_group)` are called from the preprocessing path (context + dummy forward), fully **outside** the graph boundary.
+- `symm_mem_sync` signal-pad barriers inside AGV/RSV kernels are self-resetting → safe to replay without re-initialization.
 
 ---
 
@@ -239,7 +237,7 @@ The existing `MoEAlltoAllTokenDispatcher` has convoluted EP sync points in the i
 | 4 | Metadata propagation mechanism? | **Resolved: `classmethod set_metadata` on dispatcher** |
 | 5 | `multimem_reduce_scatter_v` kernel design? | **Resolved: implemented, 10/10 tests passing.** |
 | 6 | What does the new dispatcher inherit from? | TBD. |
-| 7 | CUDA graph capture strategy (ep sync points)? | Deferred. |
+| 7 | CUDA graph capture strategy (ep sync points)? | **Resolved: fixed-address tensors + preprocessing outside graph + self-resetting symm_mem_sync.** |
 | 8 | 64-bit multicast store (`multimem.st v2.f32`) verified on Blackwell? | **Resolved: verified, all tests pass.** |
 | 9 | Fuse AGV for all 3 tensors (activations + probs + indices) into one kernel? | TBD — check signal pad reuse. |
 
@@ -254,5 +252,5 @@ The existing `MoEAlltoAllTokenDispatcher` has convoluted EP sync points in the i
 5. **`MoEAllGatherVTokenDispatcher` skeleton** — `init_metadata_buffers`, `set_metadata`, dispatch (AGV for all 3 tensors)
 6. **Grouped GEMM `valid_tokens` plumbing** — pass fixed-address scalar through `mcore_fused_moe` → permute/unpermute
 7. **Combine path** — `multimem_reduce_scatter_v` + unpermute with `valid_tokens`
-8. **CUDA graph capture hardening** — ep sync removal, graph capture test
+8. ✅ **CUDA graph capture hardening** — fixed-address metadata tensors, preprocessing outside graph, self-resetting symm_mem_sync
 9. **End-to-end integration test** — nanov3 config (EP=4, topk=8, hidden=2688)
