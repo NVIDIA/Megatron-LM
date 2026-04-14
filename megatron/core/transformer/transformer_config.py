@@ -687,6 +687,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_group_topk: Optional[int] = None
     """Number of selected groups for group-limited routing."""
 
+    moe_router_group_scoring_topk: int | None = None
+    """Number of top expert scores per group used to rank groups in group-limited routing.
+    If None, defaults to `moe_router_topk // moe_router_group_topk`.
+    """
+
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the
     top-k selection.
