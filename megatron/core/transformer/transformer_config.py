@@ -13,6 +13,7 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -1191,11 +1192,8 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.gated_linear_unit and self.cuda_graph_impl == "local":
                 raise ValueError(
-                    "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
-                    "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
-                    "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
-                    "graphs (--cuda-graph-impl=none) or use a non-gated activation "
-                    "(e.g. squared_relu)."
+                    "--transformer-impl='inference_optimized' does not yet support "
+                    "gated linear units (SwiGLU/GeGLU)."
                 )
 
             if self.fp8 == "mxfp8":
@@ -1206,14 +1204,13 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            from megatron.core.inference.moe import InferenceGroupedGemmBackend
             try:
                 self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
                     self.inference_grouped_gemm_backend
                 )
             except ValueError:
                 raise ValueError(
-                    f"inference_grouped_gemm_backend must be 'flashinfer', 'torch', or 'te', "
+                    f"inference_grouped_gemm_backend must be 'flashinfer' or 'torch' "
                     f"got '{self.inference_grouped_gemm_backend}'"
                 )
 
