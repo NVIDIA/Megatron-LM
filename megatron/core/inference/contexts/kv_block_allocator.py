@@ -47,15 +47,15 @@ class KVBlockAllocator:
         assert self.active_count >= 1  # ensures paused_count < total_count - 1
         self.dummy_block_idx = self.total_count - 1
 
-        # Initialize block pool as a "stack" data structure
+        # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
         self.block_bag = torch.arange(
-            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+            self.total_count, dtype=torch.int32, device='cpu',
         )
 
         if self.enable_prefix_caching:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
             self.block_hashes = torch.full(
-                (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
+                (self.total_count,), -1, dtype=torch.int64, device='cpu',
             )
 
             # Hash-to-block mapping for O(1) prefix lookup
@@ -63,14 +63,14 @@ class KVBlockAllocator:
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
-                (self.total_count,), dtype=torch.int32, device=torch.cuda.current_device()
+                (self.total_count,), dtype=torch.int32, device='cpu',
             )
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps = torch.zeros(
-                    (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
+                    (self.total_count,), dtype=torch.int64, device='cpu',
                 )
 
     def __str__(self):
@@ -240,7 +240,7 @@ class KVBlockAllocator:
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
         self.block_bag = torch.arange(
-            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+            self.total_count, dtype=torch.int32, device='cpu',
         )
 
         self.total_avail = self.total_count - 1

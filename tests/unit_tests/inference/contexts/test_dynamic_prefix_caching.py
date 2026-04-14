@@ -901,6 +901,7 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 
         # last_token_logits
         ctx.initialize_attention_state()
+        ctx.transfer_bookkeeping_to_gpu()
         logits = torch.randn(
             1, ctx.padded_active_token_count, vocab_size, device=torch.cuda.current_device()
         )

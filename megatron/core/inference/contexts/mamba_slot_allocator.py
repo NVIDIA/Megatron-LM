@@ -47,59 +47,62 @@ class MambaSlotAllocator:
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
 
-        device = torch.cuda.current_device()
+        gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.total_count
 
-        # Block <-> slot mappings
-        self.block_to_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
-        self.slot_to_block = torch.full((max_slots,), -1, dtype=torch.int32, device=device)
+        # Block <-> slot mappings (CPU for bookkeeping).
+        self.block_to_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device='cpu')
+        self.slot_to_block = torch.full((max_slots,), -1, dtype=torch.int32, device='cpu')
 
-        # Free slot pool (stack)
-        self.free_slots = torch.arange(max_slots, dtype=torch.int32, device=device)
+        # Free slot pool (stack, CPU).
+        self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # State tensors
+        # State tensors (GPU - accessed by Mamba CUDA kernels).
         self.conv_states = torch.zeros(
             (num_mamba_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
-            device=device,
+            device=gpu_device,
         )
         self.ssm_states = torch.zeros(
-            (num_mamba_layers, max_slots) + ssm_states_shape, dtype=ssm_states_dtype, device=device
+            (num_mamba_layers, max_slots) + ssm_states_shape,
+            dtype=ssm_states_dtype,
+            device=gpu_device,
         )
 
         # Hash-to-block mapping: only blocks with cached Mamba state
         self.hash_to_block_id: Dict[int, int] = {}
 
-        # Per-request intermediate state storage (GPU tensors, fixed-size per request)
+        # Per-request intermediate state storage (GPU tensors, fixed-size per request).
+        # These are consumed by Triton kernels during the forward pass.
         # 0 = no offset, -1 = no block
         k = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
         self._intermediate_offsets_gpu = torch.zeros(
-            (context.max_requests, k), dtype=torch.int32, device=device
+            (context.max_requests, k), dtype=torch.int32, device=gpu_device,
         )
         self._intermediate_block_ids_gpu = torch.full(
-            (context.max_requests, k), -1, dtype=torch.int32, device=device
+            (context.max_requests, k), -1, dtype=torch.int32, device=gpu_device,
         )
         self._intermediate_counts_gpu = torch.zeros(
-            context.max_requests, dtype=torch.int32, device=device
+            context.max_requests, dtype=torch.int32, device=gpu_device,
         )
         self._eos_cache_block_id_gpu = torch.full(
-            (context.max_requests,), -1, dtype=torch.int32, device=device
+            (context.max_requests,), -1, dtype=torch.int32, device=gpu_device,
         )
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
 
-        # Pre-allocated output buffers for CUDA graph compatible extraction
+        # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
         self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
-            device=device,
+            device=gpu_device,
         )
         self.intermediate_conv_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
             dtype=conv_states_dtype,
-            device=device,
+            device=gpu_device,
         )
 
     # =========================================================================
@@ -320,9 +323,11 @@ class MambaSlotAllocator:
             return
         device = self.conv_states.device
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
-        req_tensor = torch.tensor(request_indices, dtype=torch.int64, device=device)
-        # Batch lookup mamba state indices (1 GPU sync)
-        mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[req_tensor].tolist()
+        # Lookup mamba indices from CPU bookkeeping, then move to GPU for state copy.
+        req_tensor_cpu = torch.tensor(request_indices, dtype=torch.int64)
+        mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[
+            req_tensor_cpu
+        ].tolist()
         mamba_idx_tensor = torch.tensor(mamba_indices, dtype=torch.int64, device=device)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
         self.conv_states[:, slot_tensor] = self.context.mamba_conv_states[:, mamba_idx_tensor]
@@ -420,7 +425,7 @@ class MambaSlotAllocator:
                 [skip_tokens + o for o in offsets], dtype=torch.int64, device=device
             )
             block_indices = abs_tokens // ctx.block_size_tokens - 1
-            bids = ctx.request_to_kv_block_ids[current_id][block_indices]
+            bids = ctx.request_to_kv_block_ids[current_id][block_indices.cpu()].to(device)
 
             self._intermediate_offsets_gpu[current_id, :count] = torch.tensor(
                 offsets, dtype=torch.int32, device=device
@@ -601,7 +606,7 @@ class MambaSlotAllocator:
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
         self.free_slots = torch.arange(
-            self.max_slots, dtype=torch.int32, device=torch.cuda.current_device()
+            self.max_slots, dtype=torch.int32, device='cpu',
         )
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()

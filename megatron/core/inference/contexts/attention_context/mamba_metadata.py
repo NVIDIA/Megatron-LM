@@ -35,9 +35,9 @@ class MambaMetadata:
         # Maximum possible chunks across all batch configurations
         self.max_chunks = max_tokens // mamba_chunk_size + max_requests
 
-        # Map from requests to slots in the static Mamba state buffer
+        # Map from requests to slots in the static Mamba state buffer (CPU for bookkeeping).
         self.request_to_mamba_state_idx = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), -1, dtype=torch.int32, device='cpu',
         )
 
         # Map from requests to slots in the static Mamba state buffer for active decode requests
@@ -84,9 +84,9 @@ class MambaMetadata:
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
         self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
 
-        # Allocator for Mamba state slots
+        # Allocator for Mamba state slots (CPU for bookkeeping).
         self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+            self.max_requests, dtype=torch.int32, device='cpu',
         )
         self.mamba_state_free_slot_count = self.max_requests
 
@@ -119,7 +119,7 @@ class MambaMetadata:
 
         # Re-initialize the free slot pool
         self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+            self.max_requests, dtype=torch.int32, device='cpu',
         )
         self.mamba_state_free_slot_count = self.max_requests
 
