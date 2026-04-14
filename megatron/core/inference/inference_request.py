@@ -8,6 +8,7 @@ from enum import Enum, auto
 from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
@@ -44,6 +45,16 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     """
     tensor = torch.tensor(tensor_as_list)
     return tensor
+
+
+def serialize_ndarray(arr: np.ndarray) -> dict:
+    """Serialize numpy array to a JSON-compatible dict."""
+    return {"data": arr.tolist(), "dtype": str(arr.dtype)}
+
+
+def deserialize_ndarray(obj: dict) -> np.ndarray:
+    """Deserialize numpy array from dict."""
+    return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
 
 
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
@@ -180,9 +191,13 @@ class InferenceRequest:
             self.inference_parameters.serialize() if self.inference_parameters else None
         )
 
-        # Serialize tensors.
+        # Serialize tensors and numpy arrays.
         obj = {
-            k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
+            k: (
+                ("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor)
+                else ("ndarray", serialize_ndarray(v)) if isinstance(v, np.ndarray)
+                else v
+            )
             for k, v in obj.items()
         }
         return obj
@@ -221,10 +236,12 @@ class InferenceRequest:
             else SamplingParams.deserialize(obj["inference_parameters"])
         )
 
-        # Deserialize tensors and sampling params.
+        # Deserialize tensors, numpy arrays, and sampling params.
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
+            elif isinstance(v, list) and len(v) == 2 and v[0] == "ndarray":
+                setattr(self, k, deserialize_ndarray(v[1]))
 
 
 class DynamicInferenceEventType(Enum):
@@ -361,11 +378,11 @@ class DynamicInferenceRequest(InferenceRequest):
     policy_epoch: Optional[list[tuple[int, int]]] = None
     kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
-    # routing_indices stores MoE routing decisions for all tokens generated so far.
-    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
-    routing_indices: Optional[torch.Tensor] = None
+    # routing_indices is the concatenated result, set on finished requests only.
+    routing_indices: Optional[np.ndarray] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    _routing_indices_chunks: Optional[List[np.ndarray]] = field(default=None, repr=False)
 
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
@@ -387,6 +404,22 @@ class DynamicInferenceRequest(InferenceRequest):
             and not self.precomputed_block_hashes
         ):
             self._compute_block_hashes()
+
+    def add_routing_indices(self, chunk: np.ndarray):
+        """Append a routing indices chunk to the staging list (O(1) in the critical path).
+
+        Args:
+            chunk (np.ndarray): Routing indices for this step, shape [num_tokens, num_layers, topk].
+        """
+        if self._routing_indices_chunks is None:
+            self._routing_indices_chunks = []
+        self._routing_indices_chunks.append(chunk)
+
+    def finalize_routing_chunks(self):
+        """Concatenate all staged routing chunks into routing_indices and delete the staging list."""
+        if self._routing_indices_chunks:
+            self.routing_indices = np.concatenate(self._routing_indices_chunks, axis=0)
+        self._routing_indices_chunks = None
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.
@@ -430,11 +463,16 @@ class DynamicInferenceRequest(InferenceRequest):
                 serialization.
         """
         nvtx_range_push("DynamicInferenceRequest.serialize")
+        assert self._routing_indices_chunks is None, (
+            "Pending routing chunks during serialization. "
+            "Call finalize_routing_chunks() before serialize()."
+        )
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj.pop("_routing_indices_chunks", None)
 
-        # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
+        # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
             total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
             # the last generated token does not undergo a forward pass
@@ -695,8 +733,9 @@ class DynamicInferenceRequestRecord:
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
-        if self.requests[0].routing_indices is not None:
-            routing_indices = torch.cat([r.routing_indices for r in self.requests])
+        routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        if routing_parts:
+            routing_indices = np.concatenate(routing_parts)
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)

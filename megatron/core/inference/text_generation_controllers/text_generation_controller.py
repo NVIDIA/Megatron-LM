@@ -7,6 +7,7 @@ import functools
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -1272,20 +1273,20 @@ class TextGenerationController:
             # [local_token_count, num_layers, topk] -> [global_token_count, num_layers, topk]
             stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
 
-        # Slice to real tokens (remove CUDA padding)
-        stacked_routing = stacked_routing[:active_token_count]
+        # Slice to real tokens (remove CUDA padding), move to CPU as numpy with target dtype
+        _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
+        stacked_routing = stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
         # Split by request along token dimension
         # stacked_routing has shape [active_token_count, num_layers, topk]
-        routing_splits = stacked_routing.split(active_query_lengths, dim=0)
+        routing_splits = np.split(
+            stacked_routing,
+            np.cumsum(active_query_lengths[:-1]),
+            axis=0,
+        )
 
         # Map to request IDs
-        routing_indices_per_request = {}
-        for req_id, routing_split in zip(active_request_ids, routing_splits):
-            # routing_split has shape [num_tokens_for_request, num_layers, topk]
-            routing_indices_per_request[req_id] = routing_split
-
-        return routing_indices_per_request
+        return dict(zip(active_request_ids, routing_splits))
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""

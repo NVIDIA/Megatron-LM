@@ -17,6 +17,7 @@ from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -259,6 +260,13 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Routing replay config.
+        self._routing_replay_enabled = model_config.moe_enable_routing_replay
+
+        # Routing indices dtype for numpy storage.
+        _num_experts = model_config.num_moe_experts or 0
+        self._routing_indices_dtype = np.int16 if _num_experts <= 32768 else np.int32
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -1293,8 +1301,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_top_n_logprobs.append(logit_dict)
 
             # Process routing indices if available (keyed by request_id)
-            # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
-            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
+            # Each step's routing is a numpy array of shape [num_tokens_this_step, num_layers, topk]
+            # Stored as numpy on CPU to avoid GPU memory pressure at long sequences.
             if (
                 routing_indices_per_request is not None
                 and request_id in routing_indices_per_request
@@ -1302,12 +1310,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_routing = routing_indices_per_request[
                     request_id
                 ]  # [num_tokens, num_layers, topk]
-                if request.routing_indices is None:
-                    request.routing_indices = step_routing.clone()
-                else:
-                    request.routing_indices = torch.cat(
-                        [request.routing_indices, step_routing], dim=0
-                    )
+                request.add_routing_indices(step_routing)
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1786,6 +1789,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
             nvtx_range_pop("detokenization")
+
+        # Finalize routing chunks on all sub-requests before merge/serialize.
+        if self._routing_replay_enabled and finished_request_records:
+            for record in finished_request_records:
+                for req in record.requests:
+                    req.finalize_routing_chunks()
 
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,
