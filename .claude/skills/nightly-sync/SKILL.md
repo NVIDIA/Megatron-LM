@@ -53,7 +53,7 @@ These files have known semantic conflicts where dev's versions reference args
 or APIs that main removed or renamed. Take main's version with
 `git checkout origin/main -- <file>`:
 
-- `pyproject.toml` and `uv.lock` — lock-file consistency for container build
+- `pyproject.toml` — dependency declarations for container build
 - `docker/Dockerfile.ci.dev` — build compatibility
 - `megatron/training/training.py` — references dev-only args
 - `megatron/training/initialize.py` — references dev-only args
@@ -61,10 +61,11 @@ or APIs that main removed or renamed. Take main's version with
 - `megatron/training/datasets/data_samplers.py` — references dev-only args
 - `megatron/core/optimizer/layer_wise_optimizer.py` — constructor signature
 
-**Important:** Taking main's `pyproject.toml`/`uv.lock` changes the container's
-dependency versions. This can break dev-only code that depends on newer library
-versions (e.g. TransformerEngine features). If CI failures trace back to version
-mismatches, you may need to keep dev's dependency versions for specific packages.
+**IMPORTANT: Do NOT take main's `uv.lock`.** Keep dev's `uv.lock`. Main's
+lockfile is missing dev-only dependencies (e.g. `fast-hadamard-transform`,
+correct TransformerEngine revision) and manually splicing entries is fragile
+and error-prone. Dev's lockfile is the only one that works with dev's code.
+`uv.lock` cannot be regenerated without a CUDA environment.
 
 ### Special Handling: data_schedule.py
 
