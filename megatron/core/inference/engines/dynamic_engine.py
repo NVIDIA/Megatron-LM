@@ -48,6 +48,7 @@ from megatron.core.inference.utils import (
     await_process_call,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
+    warmup_flex_dispatcher_buffers,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -363,6 +364,12 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         if is_inference_optimized_ep:
             unwrapped_model = controller.inference_wrapped_model.model
+
+            # Warmup flex dispatcher buffers before CUDA graph capture to allocate communication
+            # memory before GPU fragmentation.
+            if model_config.moe_token_dispatcher_type == "flex":
+                warmup_flex_dispatcher_buffers(unwrapped_model, context.max_tokens)
+
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)

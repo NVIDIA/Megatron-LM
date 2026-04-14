@@ -229,6 +229,65 @@ def unset_inference_cuda_graphed_iteration_for_ep_inference(model):
         moe_layer.unset_inference_cuda_graphed_iteration()
 
 
+def warmup_flex_dispatcher_buffers(model, max_tokens_per_rank: int):
+    """Warmup DeepEP/HybridEP communication buffers for flex dispatcher.
+
+    Allocates fused all-to-all communication buffers before CUDA graph warmup
+    so that buffer memory is reserved while GPU memory is still unfragmented.
+    Without this, the first prefill after graph capture triggers lazy buffer
+    allocation into fragmented memory.
+
+    Should be called before CUDA graph warmup when using flex dispatcher.
+
+    Args:
+        model: Module containing MoE layers.
+        max_tokens_per_rank: Upper bound on tokens per rank (used for HybridEP buffer sizing).
+        Maps to `context.max_tokens`.
+    """
+    global moe_layer_cache
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+
+    config = get_model_config(model)
+    if config.moe_token_dispatcher_type != "flex":
+        return
+
+    from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
+
+    for moe_layer in moe_layer_cache:
+        dispatcher = moe_layer.token_dispatcher
+        if not isinstance(dispatcher, MoEFlexTokenDispatcher):
+            continue
+
+        group = dispatcher._comm_manager.group
+
+        if config.moe_flex_dispatcher_backend == "deepep":
+            from megatron.core.transformer.moe.fused_a2a import get_buffer
+
+            dtype_size = torch.tensor([], dtype=config.params_dtype).element_size()
+            hidden_bytes = config.hidden_size * max(dtype_size, 2)
+            get_buffer(group, hidden_bytes)
+        elif config.moe_flex_dispatcher_backend == "hybridep":
+            from megatron.core.transformer.moe.fused_a2a import (
+                _hybrid_ep_buffer,
+                init_hybrid_ep_buffer,
+            )
+
+            if _hybrid_ep_buffer is None:
+                init_hybrid_ep_buffer(
+                    group=group,
+                    hidden_dim=config.hidden_size,
+                    seq_len=max_tokens_per_rank,
+                    num_local_experts=dispatcher.num_local_experts,
+                    num_sms_dispatch_api=config.moe_hybridep_num_sms,
+                    num_sms_combine_api=config.moe_hybridep_num_sms,
+                    fp8_dispatch=False,
+                )
+
+        # Buffer is a global singleton — only need to initialize once.
+        break
+
+
 def tensor_swap(x, src_idxs, dst_idxs):
     """
     Swap x[src_idxs] and x[dst_idxs]
