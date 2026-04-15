@@ -19,6 +19,7 @@ from megatron.core.fp8_utils import is_float8tensor
 from .. import parallel_state, tensor_parallel
 from ..models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from ..models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from ..ssm.mamba_layer import MambaLayer
 from ..transformer.transformer_config import TransformerConfig
 from ..transformer.transformer_layer import TransformerLayer
 from .data_parallel_base import _BaseDataParallel
@@ -59,6 +60,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         module: torch.nn.Module,
         sub_modules_to_wrap: Set[torch.nn.Module] = {
             TransformerLayer,
+            MambaLayer,
             LanguageModelEmbedding,
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,

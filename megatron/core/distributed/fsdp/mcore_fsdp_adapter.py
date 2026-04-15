@@ -40,6 +40,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -151,7 +152,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer]
+                self.fsdp_unit_modules = [TransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
 
@@ -211,7 +212,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module.load_state_dict(custom_state_dict, strict=strict)
 
-    def _detect_parallelism_type(self, param_name: str, module: nn.Module) -> Optional[str]:
+    def _detect_parallelism_type(
+        self, param_name: str, module: nn.Module, param: nn.Parameter = None
+    ) -> Optional[str]:
         """
         Infer tensor-parallelism type for a parameter under a given module
         (forked from Megatron-Bridge).
@@ -252,6 +255,18 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     return "replicated"
                 return "row"
 
+        # Fallback to inspecting parameter-level TP attributes.
+        # Some modules (e.g. MambaMixer) set tensor_model_parallel and partition_dim
+        # directly on parameters rather than on the owning module.
+        if param is not None and getattr(param, "tensor_model_parallel", False):
+            partition_dim = getattr(param, "partition_dim", None)
+            if partition_dim == 0:
+                return "column"
+            elif partition_dim == 1:
+                if "bias" in param_name:
+                    return "replicated"
+                return "row"
+
         # Fallback for normalization layers
         if any(norm in module_type for norm in ["Norm", "Normalization"]):
             return "replicated"
@@ -277,7 +292,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         for submodule in root_module.modules():
             for name, param in submodule.named_parameters(recurse=False):
-                detected_type = self._detect_parallelism_type(name, submodule)
+                detected_type = self._detect_parallelism_type(name, submodule, param)
                 if detected_type is not None:
                     setattr(param, "_tensor_parallel_mode", detected_type)
 
