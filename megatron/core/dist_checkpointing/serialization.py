@@ -56,6 +56,7 @@ def load(
     common_strategy: None = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
+    use_dtensor_format: Optional[bool] = False,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -140,7 +141,7 @@ def load(
     )
 
     async_strategy = getattr(common_state_dict.get("args"), "async_strategy", "nvrx")
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format)
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -295,6 +296,7 @@ def save(
     ] = None,
     content_metadata: Optional[dict] = None,
     async_strategy: Optional[str] = "nvrx",
+    use_dtensor_format: Optional[bool] = False,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -387,7 +389,7 @@ def save(
         torch.distributed.barrier()
 
     if not async_sharded_save:
-        sharded_strategy.save(sharded_state_dict, checkpoint_dir)
+        sharded_strategy.save(sharded_state_dict, checkpoint_dir, use_dtensor_format)
         metadata_finalize_fn()
         return None
 

@@ -682,7 +682,6 @@ class TorchDistSaveShardedStrategy:
         thread_count: int = 1,
         cached_metadata: bool = False,
         separation_hint: Optional[str] = None,
-        dtensor_format: Optional[bool] = True,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -702,7 +701,6 @@ class TorchDistSaveShardedStrategy:
         self.version = version
         self.keep_only_main_replica = keep_only_main_replica
         self.thread_count = thread_count
-        self.dtensor_format = dtensor_format
 
         # Cached SavePlans to skip plan in `save_state_dict_async_plan`
         # cached outcome of `SavePlan.prepare_global_plan`,
@@ -727,9 +725,14 @@ class TorchDistSaveShardedStrategy:
 
         self.validated_loaded_metadata_reuse = False
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+        use_dtensor_format: bool = False,
+    ):
         """Each async strategy can be trivially used as a sync strategy."""
-        if self.dtensor_format:
+        if use_dtensor_format:
             values_to_save = inject_placeholders(sharded_state_dict)
             values_to_save = translate_state_dict_to_dcp_compatible(values_to_save)
             fill_placeholders(sharded_state_dict, values_to_save)
@@ -909,16 +912,16 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False, dtensor_format: bool = True):
+    def __init__(self, cache_metadata: bool = False):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
-        self.dtensor_format = dtensor_format
 
     def load(
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
         async_strategy: str = "nvrx",
+        use_dtensor_format: bool = False,
     ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
@@ -929,7 +932,7 @@ class TorchDistLoadShardedStrategy:
 
         Returns: loaded state dict
         """
-        if self.dtensor_format:
+        if use_dtensor_format:
             values_to_load = inject_placeholders(sharded_state_dict)
             values_to_load = translate_state_dict_to_dcp_compatible(values_to_load)
             fill_placeholders(sharded_state_dict, values_to_load)

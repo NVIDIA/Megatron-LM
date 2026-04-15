@@ -169,7 +169,7 @@ class Linear(torch.nn.Linear):
             sharded_offsets=sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
-            dtensor_format=metadata.get("dtensor_format", False),
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
         return sharded_state_dict
 

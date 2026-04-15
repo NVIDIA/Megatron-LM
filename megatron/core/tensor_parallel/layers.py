@@ -328,7 +328,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 prepend_offsets=sharded_offsets,
                 tp_group=self.tp_group,
                 dp_cp_group=metadata["dp_cp_group"],
-                dtensor_format=metadata.get("dtensor_format", False),
+                use_dtensor_format=metadata.get("use_dtensor_format", False),
             )
         }
 
@@ -1080,7 +1080,7 @@ class ColumnParallelLinear(torch.nn.Module):
             sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
-            dtensor_format=metadata.get("dtensor_format", False),
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
 
     def set_extra_state(self, state: Any):
@@ -1343,7 +1343,7 @@ class RowParallelLinear(torch.nn.Module):
             sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
-            dtensor_format=metadata.get("dtensor_format", False),
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
 
     def set_extra_state(self, state: Any):

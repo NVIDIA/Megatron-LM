@@ -80,7 +80,7 @@ def make_sharded_tensors_for_checkpoint(
     extra_state_suffix: str = '_extra_state',
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    dtensor_format: Optional[bool] = False,
+    use_dtensor_format: Optional[bool] = False,
 ):
     """Wraps tensors from transformer layers with ShardedTensor or ShardedObject.
 
@@ -134,7 +134,7 @@ def make_sharded_tensors_for_checkpoint(
                 prepend_offsets=sharded_offsets,
                 tp_group=tp_group,
                 dp_cp_group=dp_cp_group,
-                dtensor_format=dtensor_format,
+                use_dtensor_format=use_dtensor_format,
             )
 
         else:
@@ -144,7 +144,7 @@ def make_sharded_tensors_for_checkpoint(
                 prepend_offsets=sharded_offsets,
                 tp_group=tp_group,
                 dp_cp_group=dp_cp_group,
-                dtensor_format=dtensor_format,
+                use_dtensor_format=use_dtensor_format,
             )
 
     return sharded_state_dict
@@ -251,7 +251,7 @@ def sharded_state_dict_default(
             sharded_offsets,
             tp_group=tp_group,
             dp_cp_group=metadata['dp_cp_group'],
-            dtensor_format=metadata.get("dtensor_format", False),
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
     return module_sharded_sd
 

@@ -107,7 +107,7 @@ class ExtendedRMSNorm(RMSNormGated):
             sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata["dp_cp_group"],
-            dtensor_format=metadata.get("dtensor_format", False),
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
 
 
@@ -1256,7 +1256,7 @@ class MambaMixer(MegatronModule):
                 "D": 0,
             },  # parameters sharded across TP
             sharded_offsets=sharded_offsets,
-            dtensor_format=metadata.get("dtensor_format", False),
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
         # Submodules
         for name, module in self.named_children():
@@ -1270,7 +1270,7 @@ class MambaMixer(MegatronModule):
                     sharded_offsets,
                     tp_group=self.tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
-                    dtensor_format=metadata.get("dtensor_format", False),
+                    use_dtensor_format=metadata.get("use_dtensor_format", False),
                 )
 
             else:
