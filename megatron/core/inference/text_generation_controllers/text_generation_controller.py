@@ -787,9 +787,7 @@ class TextGenerationController:
 
         # Mamba speculative rewind: copy accepted intermediate states in-place.
         if context.is_hybrid_model:
-            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
-                active_request_slice
-            ]
+            mamba_state_idx = context.active_mamba_indices[:active_request_count]
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
@@ -1714,15 +1712,8 @@ class TextGenerationController:
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
-        Args:
-            new_sample (Tensor): The newly sampled tokens.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
-
         Return:
             Dict [str, Tensor]: A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
                 newly_paused_request_ids (Tensor): Newly paused request IDs.
                 finished_request_ids (Tensor): Finished request IDs.
         """
@@ -1730,8 +1721,6 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         # Active sequence lengths.
-        # Use the snapshot taken during build_active_slices.
-        active_request_ids = context.active_request_ids[:active_request_count]
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -1751,7 +1740,7 @@ class TextGenerationController:
         # Mark requests as finished if they hit stop words
         # (detected in previous step's post_process_requests)
         if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = active_request_ids.tolist()
+            request_ids_list = context.active_request_ids[:active_request_count].tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
             if stop_word_finished_ids:
                 for idx, request_id in enumerate(request_ids_list):
@@ -1787,7 +1776,6 @@ class TextGenerationController:
         )
 
         return {
-            "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
             "finished_routing_block_ids": finished_routing_block_ids,
             **(update_result or {}),
@@ -1912,6 +1900,7 @@ class TextGenerationController:
                 request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
             ret = {
+                "active_request_ids": context.active_request_ids[:active_request_count],
                 # Clone needed: _sampled_tokens_cuda is a reused buffer overwritten each step.
                 "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
                 "accepted_tokens": (

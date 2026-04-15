@@ -515,9 +515,14 @@ class MambaSlotAllocator:
         decode_count = ctx.batch_dimensions.decode_req_count
         prefill_start = decode_count
 
+        # Resolve deferred intermediate counts (GPU -> CPU).
+        if metadata._pending_intermediate_counts_gpu is not None:
+            per_request_counts = metadata._pending_intermediate_counts_gpu.tolist()
+            metadata._pending_intermediate_counts_gpu = None
+        else:
+            per_request_counts = []
+
         # Batch-transfer block IDs and EOS block IDs from GPU (2 GPU syncs)
-        intermediate_count = metadata.intermediate_count
-        per_request_counts = metadata.per_request_intermediate_counts
 
         all_block_ids_cpu = self._intermediate_block_ids_gpu[
             prefill_start : prefill_start + prefill_count
@@ -526,16 +531,15 @@ class MambaSlotAllocator:
             prefill_start : prefill_start + prefill_count
         ].tolist()
 
-        # Flatten intermediate block IDs and source offsets
+        # Flatten intermediate block IDs and source offsets.
+        # Entries are at stride-3 positions in the buffer (fixed layout, no compaction),
+        # matching `_update_intermediate_metadata`.
         intermediate_bids = []
         src_offsets = []
-        if intermediate_count > 0:
-            ssm_offset = 0
-            for req_idx, count in enumerate(per_request_counts):
-                for j in range(count):
-                    intermediate_bids.append(all_block_ids_cpu[req_idx][j])
-                    src_offsets.append(ssm_offset + j)
-                ssm_offset += count
+        for req_idx, count in enumerate(per_request_counts):
+            for j in range(count):
+                intermediate_bids.append(all_block_ids_cpu[req_idx][j])
+                src_offsets.append(req_idx * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST + j)
 
         # Collect EOS block IDs and their context indices
         eos_bids = []

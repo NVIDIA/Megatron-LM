@@ -41,35 +41,14 @@ class MHAMetadata(MetadataBase):
         padded_batch_dimensions: InferenceBatchDimensions,
         num_speculative_tokens: int = 0,
     ):
-        """Pad shared buffers.
+        """Assemble state_data.
 
         Args:
             batch_dimensions: Configuration object with real batch settings.
             padded_batch_dimensions: Configuration object with padded batch settings.
             num_speculative_tokens: Number of speculative tokens.
         """
-        real_batch_size = batch_dimensions.req_count
         padded_active_request_count = padded_batch_dimensions.req_count
-
-        assert real_batch_size <= padded_active_request_count <= self.max_bs
-
-        self.tensor_pad(self._query_lengths_buf, real_batch_size, padded_active_request_count)
-        self.tensor_pad(
-            self._cu_query_seq_lengths_buf,
-            real_batch_size,
-            padded_active_request_count,
-            is_cumulative_tensor=True,
-        )
-        self.tensor_pad(self._kv_seq_lengths_buf, real_batch_size, padded_active_request_count)
-        self.tensor_pad(
-            self._block_table_buf, real_batch_size, padded_active_request_count, pad_value=-1
-        )
-        self.tensor_pad(
-            self._cu_kv_seq_lengths_buf,
-            real_batch_size,
-            padded_active_request_count,
-            is_cumulative_tensor=True,
-        )
 
         if padded_batch_dimensions.prefill_req_count == 0:
             self._max_seqlen_q = num_speculative_tokens + 1
@@ -103,16 +82,14 @@ class NonGraphedMHAMetadata(MHAMetadata):
         padded_batch_dimensions: InferenceBatchDimensions,
         num_speculative_tokens: int = 0,
     ):
-        """
-        Args:
-            batch_dimensions: Configuration object containing real batch settings
-            padded_batch_dimensions: Configuration object containing padded batch settings
-            num_speculative_tokens: Number of speculative tokens
-        """
-        super().update(batch_dimensions, padded_batch_dimensions, num_speculative_tokens)
+        super().update(
+            batch_dimensions,
+            padded_batch_dimensions,
+            num_speculative_tokens,
+        )
         if len(self.state_data["query_lengths"]) > 0:
-            self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
-            self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"]).item()
+            self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"])
+            self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"])
         else:
             self.state_data["max_seqlen_q"] = num_speculative_tokens + 1
             self.state_data["max_seqlen_k"] = 1
