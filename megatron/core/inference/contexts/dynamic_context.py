@@ -593,7 +593,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # NCCLAllGatherDispatcher requires all EP ranks to contribute the same token count,
         # so force decode-only CUDA graphs (no prefill graphs) when it is selected.
         self._nccl_ep_dispatcher = (
-            self.expert_model_parallel_group is not None
+            self.expert_model_parallel_group.size() > 1
             and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
         )
         self.use_cuda_graphs_for_non_decode_steps = (
@@ -619,7 +619,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Allocate NVLS symmetric buffers upfront (sized once at model init).
-        if self.expert_model_parallel_group is not None and not self._nccl_ep_dispatcher:
+        if self.expert_model_parallel_group.size() > 1 and not self._nccl_ep_dispatcher:
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_symmetric_buffers(
