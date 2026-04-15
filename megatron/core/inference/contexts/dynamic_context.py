@@ -1844,6 +1844,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_counts_gpu=intermediate_counts_gpu,
             )
 
+        # Clean up phantom data from request-level buffers now that the metadata is built.
+        if phantom_count > 0 and phantom_tokens > 0:
+            end = self.total_request_count
+            phantom_slice = slice(end, end + phantom_count)
+            self.request_to_kv_block_ids[phantom_slice] = -1
+            self.request_query_lengths[phantom_slice] = 0
+            self.request_kv_length_offsets[phantom_slice] = 0
+
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
                 self.moe_routing_metadata.enable_static_buffer_recording()
