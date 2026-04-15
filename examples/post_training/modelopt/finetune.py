@@ -484,12 +484,16 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 if __name__ == "__main__":
+    from megatron.training.arguments import parse_and_validate_args
+
+    parse_and_validate_args(
+        extra_args_provider=add_finetune_args,
+        args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
+    )
     pretrain(
         train_valid_test_sft_datasets_provider,
         partial(model_provider, modelopt_gpt_mamba_builder),
         ModelType.encoder_or_decoder,
         forward_step,
-        extra_args_provider=add_finetune_args,
-        args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
         non_loss_data_func=non_loss_data_func,
     )
