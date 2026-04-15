@@ -1782,6 +1782,38 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                 )
 
+        # When padded_batch_dimensions has more prefill requests than the local batch,
+        # inject phantom request data into the attention metadata.
+        mamba_dimensions = attn_dimensions
+        padded_prefill_count = self.padded_batch_dimensions.prefill_req_count
+        real_prefill_count = batch_dimensions.prefill_req_count
+        phantom_count = self.padded_batch_dimensions.req_count - attn_dimensions.req_count
+        if padded_prefill_count > real_prefill_count and phantom_count > 0:
+            real_token_count = attn_dimensions.token_count
+            phantom_tokens = self.padded_batch_dimensions.token_count - real_token_count
+            per_phantom = phantom_tokens // phantom_count
+            rem_phantom = phantom_tokens % phantom_count
+            end = self.total_request_count
+            phantom_slice = slice(end, end + phantom_count)
+            self.request_query_lengths[phantom_slice] = per_phantom
+            if rem_phantom > 0:
+                self.request_query_lengths[end : end + rem_phantom] += 1
+            self.request_kv_length_offsets[phantom_slice] = 0
+            self.request_to_kv_block_ids[phantom_slice] = (
+                self.kv_block_allocator.dummy_block_idx
+            )
+            # Expand views to include phantoms so mha_metadata.update()
+            # sees all requests and computes cu_query_seq_lengths correctly.
+            expanded_slice = slice(self.paused_request_count, end + phantom_count)
+            query_lengths_view = self.request_query_lengths[expanded_slice]
+            request_kv_length_offsets_view = self.request_kv_length_offsets[expanded_slice]
+            request_to_kv_block_ids_view = self.request_to_kv_block_ids[expanded_slice]
+            attn_dimensions = InferenceBatchDimensions(
+                token_count=self.padded_batch_dimensions.token_count,
+                prefill_req_count=attn_dimensions.prefill_req_count + phantom_count,
+                decode_req_count=attn_dimensions.decode_req_count,
+            )
+
         assert self.active_attn_metadata is not None
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=query_lengths_view,
@@ -1804,11 +1836,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
                     self.mamba_slot_allocator.get_intermediate_gpu_data()
                 )
+            # Mamba metadata must avoid phantom prefills.
             self.mamba_metadata.update(
                 active_mamba_indices_view,
                 token_to_request_idx_view,
                 cu_seqlens,
-                batch_dimensions=attn_dimensions,
+                batch_dimensions=mamba_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
                 intermediate_offsets_gpu=intermediate_offsets_gpu,
