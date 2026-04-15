@@ -8,14 +8,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.optimizer import OptimizerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
     pretrain_container_from_args,
 )
 from megatron.training.config import PretrainConfigContainer
-from megatron.core.optimizer import OptimizerConfig
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
 
 @dataclass
