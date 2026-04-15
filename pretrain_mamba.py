@@ -3,8 +3,6 @@
 
 # Capture the true program start time BEFORE any heavy imports.
 import time
-
-from megatron.training.argument_utils import pretrain_container_from_args
 _PROGRAM_START_TIME = time.time()
 
 import json
@@ -45,6 +43,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.argument_utils import pretrain_container_from_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,

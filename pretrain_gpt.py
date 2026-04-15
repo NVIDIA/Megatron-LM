@@ -4,8 +4,6 @@
 
 # Capture the true program start time BEFORE any heavy imports.
 import time
-
-from megatron.training.argument_utils import pretrain_container_from_args
 _PROGRAM_START_TIME = time.time()
 
 import json
@@ -44,6 +42,7 @@ from megatron.training import (
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_container_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
