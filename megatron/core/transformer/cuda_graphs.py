@@ -59,7 +59,6 @@ try:
         reallocate_etp_cache_to_mempool,
         wait_async_comms,
     )
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE_GRAPHS = True
 except:
@@ -704,7 +703,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
             for param in runner.groundtruth_grad_added_to_main_grad:
                 hook = getattr(param, '_grad_accum_hook', None)
                 if hook is not None and param.grad_added_to_main_grad:
-                    param.grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
                     hook()
 
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
@@ -749,7 +747,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
         self.cudagraph_created = False
-        self._eager_warmup_pass_count = 0
         self.status = _GraphStatus.FWD_READY
 
         self.fuse_wgrad_accumulation = False
@@ -786,6 +783,11 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
             self.parameter_sharding = self.base_module.config.parameter_sharding_size > 1
+
+            # Ensure internal warmup (inside create_fwd_graph) has >= 2 steps
+            # for ETP: 1st builds chain + tickets, 2nd exercises prefetch path.
+            if self.parameter_sharding:
+                self.num_warmup_steps = max(self.num_warmup_steps, 2)
 
             if self.parameter_sharding:
                 self.use_stream = True
@@ -1299,18 +1301,6 @@ class _CudaGraphRunner(torch.nn.Module):
         if type(out) != tuple:
             out = (out,)
 
-        if not self.fwd_graph_recorded:
-            # For ETP (parameter_sharding), the ETP prefetch link table is built on the 1st
-            # eager pass but async AG tickets (_ag_ticket_fwd) are only set on the 2nd pass.
-            # Delay recording until num_warmup_steps eager passes have run so that tickets
-            # are always initialized before graph capture.
-            # Must check BEFORE applying _CudagraphRecordNode to avoid premature bwd recording.
-            if self._eager_warmup_pass_count < self.num_warmup_steps:
-                self._eager_warmup_pass_count += 1
-                if len(out) == 1:
-                    return out[0]
-                return tuple(out)
-
         # Register a noop autograd node that toggles `self.graph_status` in the bwd pass, which
         # tracks when the runner completes its bwd pass.
         # If it's the first bwd encountered by this runner, record it to _CudagraphGlobalRecord
@@ -1741,9 +1731,6 @@ class CudaGraphManager(torch.nn.Module):
 
         self.is_first_microbatch = False
         # If forward only, next replay should be a forward pass as well.
-        # During warmup passes (fwd_graph_recorded is False), no _CudagraphRecordNode is inserted
-        # so no backward hook will reset the status. Keep FWD_READY so the same runner is reused
-        # across microbatches and _eager_warmup_pass_count accumulates correctly.
         if is_inference_mode or not torch.is_grad_enabled() or not runner.fwd_graph_recorded:
             runner.status = _GraphStatus.FWD_READY
         else:
