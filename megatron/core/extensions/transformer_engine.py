@@ -1925,6 +1925,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def _decode_extra_state(self, state):
             from megatron.core.safe_globals import SafeUnpickler
+
             if isinstance(state, torch.Tensor):
                 # No FP8 is indicated by an empty tensor we don't need to unpickle.
                 if state.numel() == 0:
