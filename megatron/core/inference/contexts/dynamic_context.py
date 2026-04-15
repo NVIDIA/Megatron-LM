@@ -1782,15 +1782,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                 )
 
-        # When padded_batch_dimensions has more prefill requests than the local batch,
-        # inject phantom request data into the attention metadata.
+        # Handle phantom tokens and requests added for Mamba + MoE.
         mamba_dimensions = attn_dimensions
-        padded_prefill_count = self.padded_batch_dimensions.prefill_req_count
-        real_prefill_count = batch_dimensions.prefill_req_count
         phantom_count = self.padded_batch_dimensions.req_count - attn_dimensions.req_count
-        if padded_prefill_count > real_prefill_count and phantom_count > 0:
-            real_token_count = attn_dimensions.token_count
-            phantom_tokens = self.padded_batch_dimensions.token_count - real_token_count
+        phantom_tokens = self.padded_batch_dimensions.token_count - attn_dimensions.token_count
+        if phantom_count > 0 and phantom_tokens > 0:
             per_phantom = phantom_tokens // phantom_count
             rem_phantom = phantom_tokens % phantom_count
             end = self.total_request_count
