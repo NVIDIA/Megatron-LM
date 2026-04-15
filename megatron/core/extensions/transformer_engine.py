@@ -31,6 +31,7 @@ from megatron.core.parallel_state import (
     model_parallel_is_initialized,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatrom.core.safe_globals import SafeUnpickler
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -60,51 +61,6 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-
-class _FP8SafeUnpickler(pickle.Unpickler):
-    """Restricted unpickler for FP8 extra-state checkpoints.
-
-    Only allows the narrow set of types that ``_encode_extra_state`` can
-    produce: plain Python containers, numeric scalars, and the PyTorch
-    tensor/storage primitives used by ``pickle.dumps(tensor)``.  Any attempt
-    to instantiate a class outside this allowlist raises
-    ``pickle.UnpicklingError``, preventing arbitrary code execution via a
-    crafted checkpoint.
-    """
-
-    # (module, qualname) pairs that are always permitted.
-    _SAFE_CLASSES: frozenset = frozenset(
-        {
-            ("builtins", "dict"),
-            ("builtins", "list"),
-            ("builtins", "tuple"),
-            ("builtins", "int"),
-            ("builtins", "float"),
-            ("builtins", "bool"),
-            ("builtins", "bytes"),
-            ("builtins", "str"),
-            ("collections", "OrderedDict"),
-            ("torch", "Size"),
-            # Tensor reconstruction helpers used by pickle.dumps(tensor).
-            ("torch._utils", "_rebuild_tensor_v2"),
-            ("torch._tensor", "_rebuild_from_type_v2"),
-            # Storage types (TE only serialises float / half / bfloat16 tensors).
-            ("torch.storage", "UntypedStorage"),
-            ("torch.storage", "_load_from_bytes"),
-        }
-    )
-
-    def find_class(self, module: str, name: str):
-        # Allow legacy typed storage names such as ``torch.FloatStorage``,
-        # ``torch.HalfStorage``, ``torch.BFloat16Storage``, etc.
-        if module == "torch" and name.endswith("Storage"):
-            return super().find_class(module, name)
-        if (module, name) not in self._SAFE_CLASSES:
-            raise pickle.UnpicklingError(
-                f"Refusing to unpickle disallowed class '{module}.{name}' "
-                "in FP8 extra-state checkpoint."
-            )
-        return super().find_class(module, name)
 
 
 try:
@@ -1974,7 +1930,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 # No FP8 is indicated by an empty tensor we don't need to unpickle.
                 if state.numel() == 0:
                     return
-                return _FP8SafeUnpickler(
+                return SafeUnpickler(
                     io.BytesIO(state.detach().cpu().numpy().tobytes())
                 ).load()
             elif isinstance(state, io.BytesIO):
