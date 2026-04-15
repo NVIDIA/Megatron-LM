@@ -730,7 +730,6 @@ class TorchDistSaveShardedStrategy:
             return torch.distributed.checkpoint.save(sharded_state_dict, checkpoint_id=checkpoint_dir)
         else:
             strategy = "nvrx" if HAVE_NVRX else "mcore"
-            print(sharded_state_dict["model"]["decoder.layers.0.self_attention.linear_proj.weight"])
             async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
             async_request.execute_sync()
             del async_request
