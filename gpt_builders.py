@@ -145,6 +145,7 @@ def _get_transformer_layer_spec(use_te, config):
             fallback_to_eager_attn=config.fallback_to_eager_attn,
             enable_hyper_connection=config.enable_hyper_connections,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            dense_grouped_gemm=config.dense_grouped_gemm,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
