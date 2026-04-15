@@ -36,13 +36,15 @@ MODEL_ARGS:
   --data-parallel-sharding-strategy: "optim_grads_params"
   --outer-dp-sharding-strategy: "no_shard"
 
+  --init-model-with-meta-device: true
+
   --ckpt-format: "fsdp_dtensor"
   #--no-gradient-accumulation-fusion: true
 
   # Precision
   --fp8-format: "hybrid"
   --fp8-recipe: "tensorwise"
-  #--fp8-param-gather: true
+  --fp8-param-gather: true
 
   # Training args
   --use-mcore-models: true
@@ -58,6 +60,7 @@ MODEL_ARGS:
   --manual-gc-interval: 10
   --deterministic-mode: true
   --seed: 42 
+  --no-check-for-nan-in-loss-and-grad: true # To see if gets better over time.
 
   # Transformer Engine args
   --transformer-impl: transformer_engine

@@ -58,6 +58,7 @@ MODEL_ARGS:
   --manual-gc-interval: 10
   --deterministic-mode: true
   --seed: 42 
+  --no-check-for-nan-in-loss-and-grad: True
 
   # Transformer Engine args
   --transformer-impl: transformer_engine
