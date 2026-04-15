@@ -37,7 +37,7 @@ MODEL_ARGS:
   --manual-gc-interval: 10
   --no-create-attention-mask-in-dataloader: true
   --num-workers: 1
-  --exit-interval: 1000
+  --exit-interval: 150
   --override-opt_param-scheduler: true
 
   # Network size args
@@ -129,15 +129,15 @@ MODEL_ARGS:
   --ckpt-assume-constant-structure: true
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --save-interval: 1000
-  --save-retain-interval: 5000
+  --save-interval: 100
+  --save-retain-interval: 500
 
   # Validation args
-  --eval-interval: 1000
+  --eval-interval: 100
   --eval-iters: 14
 
   # Logging args
-  --log-interval: 1
+  --log-interval: 10
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-timers-to-tensorboard: true
