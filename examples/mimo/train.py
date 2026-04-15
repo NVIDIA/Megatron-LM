@@ -124,6 +124,10 @@ def add_mimo_args(parser):
                        help='Average ViT tokens per micro-batch for FLOPS estimation')
     group.add_argument('--avg-latent-tokens-per-batch', type=int, default=1024,
                        help='Average VAE latent tokens per micro-batch for FLOPS estimation')
+    group.add_argument('--avg-ce-tokens-per-batch', type=int, default=0,
+                       help='Average CE-supervised tokens per micro-batch for FLOPS estimation (0 disables CE logits correction)')
+    group.add_argument('--vae-latent-channels', type=int, default=16,
+                       help='VAE latent channel count (z_channels) used by FLOPS estimation')
     group.add_argument('--freeze-vit', action='store_true', default=False,
                        help='Whether ViT is frozen (affects FLOPS: forward-only vs fwd+bwd)')
     return parser
