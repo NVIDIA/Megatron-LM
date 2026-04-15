@@ -301,8 +301,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         engine_max_tokens: int,
         topk: int,
         hidden_size: int,
-        ep_group: torch.distributed.ProcessGroup,
-        mask_routing_map: bool = False,
+        ep_group: torch.distributed.ProcessGroup
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -319,7 +318,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 with -1 each step so stale rows beyond valid_tokens are pre-masked.
                 Required when using the FlashInfer backend.
         """
-        cls._mask_routing_map = mask_routing_map
         cls._engine_max_tokens = engine_max_tokens
         ep_size = dist.get_world_size(group=ep_group)
         global_max = engine_max_tokens * ep_size
@@ -358,9 +356,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 f"Use inference_moe_token_dispatcher_type='nccl' on non-NVLS systems."
             )
 
-        if mask_routing_map:
-            cls._symm_agv_routing["tensor"].fill_(-1)
-
         # Initialise step-metadata tensor and wire base class valid_tokens pointer.
         cls._step_metadata = torch.zeros(3, dtype=torch.int32, device=device)
         InferenceAllGatherDispatcherBase._valid_tokens_tensor = cls._step_metadata[0:1]
@@ -371,6 +366,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls,
         local_tokens: int,
         ep_group: torch.distributed.ProcessGroup,
+        mask_routing_map: bool = False,
     ) -> None:
         """All-gather per-rank token counts, update NVLS metadata, and mask routing buffer.
 
@@ -382,6 +378,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         Args:
             local_tokens: Number of tokens on this rank this step.
             ep_group: Expert parallel process group.
+            mask_routing_map: If True, fill the routing buffer with -1 so stale rows
+                beyond valid_tokens are pre-masked. Required when using the FlashInfer backend.
         """
         ep_size = dist.get_world_size(group=ep_group)
         device = torch.cuda.current_device()
@@ -399,7 +397,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         )
 
         # Mask stale rows so FlashInfer ignores them; AGV overwrites [0, valid_tokens).
-        if cls._mask_routing_map:
+        if mask_routing_map:
             cls._symm_agv_routing["tensor"].fill_(-1)
 
         dist.barrier(group=ep_group)

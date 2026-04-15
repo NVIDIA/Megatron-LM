@@ -39,6 +39,8 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
 )
 
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
@@ -618,21 +620,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate NVLS symmetric buffers upfront (sized once at model init).
         if self.expert_model_parallel_group is not None and not self._nccl_ep_dispatcher:
-            from megatron.core.transformer.moe.token_dispatcher_inference import (
-                NVLSAllGatherVDispatcher,
-            )
-            from megatron.core.inference.moe import InferenceGroupedGemmBackend
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_symmetric_buffers(
                 engine_max_tokens=self.max_tokens,
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
-                ep_group=self.expert_model_parallel_group,
-                mask_routing_map=(
-                    model_config.inference_grouped_gemm_backend
-                    == InferenceGroupedGemmBackend.FLASHINFER
-                ),
+                ep_group=self.expert_model_parallel_group
             )
 
         # Deal with chunked prefill
@@ -644,6 +638,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         elif inference_config.use_flashinfer_fused_rope is None:
             inference_config.use_flashinfer_fused_rope = HAVE_FLASHINFER
         self.use_flashinfer_fused_rope = inference_config.use_flashinfer_fused_rope
+        self.inference_grouped_gemm_backend = model_config.inference_grouped_gemm_backend
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
@@ -1796,7 +1791,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 local_tokens, ep_group, use_allgather_v=not using_cuda_graph
             )
         else:
-            NVLSAllGatherVDispatcher.set_step_metadata(local_tokens, ep_group)
+            NVLSAllGatherVDispatcher.set_step_metadata(local_tokens, ep_group, mask_routing_map=(
+                    self.inference_grouped_gemm_backend
+                    == InferenceGroupedGemmBackend.FLASHINFER
+                ),)
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""
