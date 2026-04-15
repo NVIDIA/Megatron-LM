@@ -1224,6 +1224,7 @@ def _load_global_dist_base_checkpoint(
         checkpoint_name,
         load_strategy,
         strict=args.dist_ckpt_strictness,
+        use_dtensor_format=args.dist_ckpt_use_dtensor_format,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
