@@ -32,7 +32,6 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import QuantizationConfig
-from megatron.core.safe_globals import SafeUnpickler
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -1925,6 +1924,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             return state_serialized
 
         def _decode_extra_state(self, state):
+            from megatron.core.safe_globals import SafeUnpickler
             if isinstance(state, torch.Tensor):
                 # No FP8 is indicated by an empty tensor we don't need to unpickle.
                 if state.numel() == 0:
