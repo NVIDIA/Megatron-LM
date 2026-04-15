@@ -375,16 +375,18 @@ class DistributedDataParallel(_BaseDataParallel):
                                         self._make_backward_post_hook(param)
                                     )
                                     break
-                elif ETPShardedParam is not None and isinstance(param, ETPShardedParam):
-                    # ETP handles grad accumulation internally in _finalize_wgrad
-                    # (captured by CUDA graph); no DDP hook needed.
-                    pass
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_backward_post_hook(param))
+                    if ETPShardedParam is not None and isinstance(param, ETPShardedParam):
+                        # ETP params: hook is called explicitly from _finalize_wgrad
+                        # (after RS wait + gradient accumulation), not from autograd's
+                        # grad accumulator (which may never fire for async RS returning None).
+                        param.register_grad_accum_hook(grad_acc, self._make_backward_post_hook(param))
+                    else:
+                        grad_acc.register_hook(self._make_backward_post_hook(param))
                     self.grad_accs.append(grad_acc)
 
         self.use_forward_hook = (
@@ -474,9 +476,12 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                    # ETP params may have grad=None: wgrad_reduce_scatter returns None
+                    # for async RS, and _finalize_wgrad accumulates into main_grad directly.
+                    if not (ETPShardedParam is not None and isinstance(param, ETPShardedParam)):
+                        assert (
+                            param.grad is not None
+                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):

@@ -453,13 +453,6 @@ class _AllToAll(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_output):
         """Backward function."""
-        # Drain ETP ag/rs side streams before the backward AllToAll.
-        # During expert backward, ETP reduce-scatter for wgrads may still be
-        # in-flight on ag_stream/rs_stream. Concurrent NCCL ops on different
-        # communicators over IB cause deadlock at 64+ GPU scale.
-        from megatron.core.transformer.moe.fused_a2a import _drain_etp_side_streams
-        _drain_etp_side_streams()
-
         return (
             None,
             _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),

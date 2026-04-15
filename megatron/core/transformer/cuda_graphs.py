@@ -59,6 +59,7 @@ try:
         reallocate_etp_cache_to_mempool,
         wait_async_comms,
     )
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE_GRAPHS = True
 except:
@@ -694,6 +695,17 @@ class _CudagraphReplayNode(torch.autograd.Function):
         # cudagraphs this doesn't occur so we emulate this behavior here.
         for param, grad_added in runner.groundtruth_grad_added_to_main_grad.items():
             param.grad_added_to_main_grad = grad_added
+
+        # For ETP params captured in this graph: _finalize_wgrad ran during capture
+        # but the DDP hook returned early (is_graph_capturing). At replay, _finalize_wgrad
+        # doesn't re-run from Python. Trigger the hook now so register_grad_ready fires
+        # and DDP RS can proceed during backward (not deferred to finish_grad_sync).
+        if runner.parameter_sharding:
+            for param in runner.groundtruth_grad_added_to_main_grad:
+                hook = getattr(param, '_grad_accum_hook', None)
+                if hook is not None and param.grad_added_to_main_grad:
+                    param.grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
+                    hook()
 
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
         # wgrads as autograd may launch the next graph before wgrads are accumulated
