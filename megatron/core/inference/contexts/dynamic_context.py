@@ -590,12 +590,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
         # CUDA graph config list.
-        # NCCLAllGatherDispatcher requires all EP ranks to contribute the same token count,
-        # so force decode-only CUDA graphs (no prefill graphs) when it is selected.
         self._nccl_ep_dispatcher = (
             self.expert_model_parallel_group.size() > 1
             and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
         )
+        # We disable non-decode cuda graphs for the nccl dispatcher. 
+        # The NCCL dispatcher uses allgathers. Thus there is a need to 
+        # run the same sized cuda-graph on every EP rank. This is difficult to 
+        # generalize for non-decode steps. 
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
             and not self._nccl_ep_dispatcher
@@ -612,10 +614,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
             )
-        )
-
-        self.smallest_non_decode_cuda_graph_size = min(
-            inference_config.cuda_graph_mixed_prefill_count, self.max_requests
         )
 
         # Allocate NVLS symmetric buffers upfront (sized once at model init).
