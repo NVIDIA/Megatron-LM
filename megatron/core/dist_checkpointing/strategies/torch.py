@@ -416,10 +416,6 @@ def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -
             if not all(dim_size == 1 for dim_size in x.global_shape):
                 # Non-trivially-sharded ShardedObjects (e.g. rerun_state_machine with
                 # global_shape=(world_size,)) cannot be represented as DTensors.
-                # DCP saves BytesIO from the coordinator rank only, which means only
-                # rank 0's data is preserved.  This is acceptable for objects like the
-                # rerun state machine that reset on checkpoint resume, but callers that
-                # need per-rank fidelity should avoid using DTensor format for such objects.
                 logger.warning(
                     f"ShardedObject '{x.key}' has non-trivial global_shape {x.global_shape}. "
                     "Only coordinator rank's data will be saved in DTensor format."
@@ -736,7 +732,18 @@ class TorchDistSaveShardedStrategy:
             values_to_save = inject_placeholders(sharded_state_dict)
             values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
             fill_placeholders(sharded_state_dict, values_to_save)
-            return torch.distributed.checkpoint.save(sharded_state_dict, checkpoint_id=checkpoint_dir)
+            # With PP > 1 different pipeline stages hold different parameters that
+            # share the same local optimizer-state index (e.g. "state.1.exp_avg_sq").
+            # Wrapping each stage's dict under a "ppN" key gives every stage a unique
+            # DCP path, preventing shape-mismatch collisions on save and load.
+            from megatron.core import parallel_state as mpu
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            if pp_size > 1:
+                pp_rank = mpu.get_pipeline_model_parallel_rank()
+                dcp_state_dict = {f"pp{pp_rank}": sharded_state_dict}
+            else:
+                dcp_state_dict = sharded_state_dict
+            return torch.distributed.checkpoint.save(dcp_state_dict, checkpoint_id=checkpoint_dir)
         else:
             strategy = "nvrx" if HAVE_NVRX else "mcore"
             async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
@@ -937,7 +944,14 @@ class TorchDistLoadShardedStrategy:
             values_to_load = convert_state_dict_to_dcp_compatible(values_to_load)
             fill_placeholders(sharded_state_dict, values_to_load)
 
-            torch.distributed.checkpoint.load(state_dict=sharded_state_dict, checkpoint_id=checkpoint_dir)
+            from megatron.core import parallel_state as mpu
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            if pp_size > 1:
+                pp_rank = mpu.get_pipeline_model_parallel_rank()
+                dcp_state_dict = {f"pp{pp_rank}": sharded_state_dict}
+            else:
+                dcp_state_dict = sharded_state_dict
+            torch.distributed.checkpoint.load(state_dict=dcp_state_dict, checkpoint_id=checkpoint_dir)
             unwrap_dtensors_and_sh_ten(sharded_state_dict)
 
             return sharded_state_dict
