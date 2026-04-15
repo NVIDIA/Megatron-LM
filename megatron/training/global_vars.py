@@ -216,6 +216,8 @@ def _set_wandb_writer(args):
             wandb_kwargs['entity'] = args.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
+        # Log all env vars (as a dictionary) in config.yaml
+        wandb.config.update({"env_vars": dict(os.environ)})
         _GLOBAL_WANDB_WRITER = wandb
 
 
