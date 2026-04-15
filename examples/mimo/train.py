@@ -9,6 +9,7 @@ import sys
 from functools import partial
 from typing import Any, Dict, Iterator
 
+from megatron.training.argument_utils import pretrain_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 import torch
 from megatron.training import get_args, pretrain, print_rank_0
@@ -276,8 +277,10 @@ def model_provider(
 if __name__ == "__main__":
     
     train_valid_test_datasets_provider.is_distributed = True
-    parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
+    args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
+    full_config = pretrain_container_from_args(args)
     pretrain(
+        full_config,
         train_valid_test_datasets_provider,
         model_provider,
         ModelType.encoder_or_decoder,
