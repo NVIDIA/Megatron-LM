@@ -2104,7 +2104,7 @@ def get_batch_on_this_tp_rank(
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
-        
+
         elif is_sft:
             # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermidiate stages
             _broadcast_cu_seqlens(batch['cu_seqlens'])
@@ -2200,14 +2200,14 @@ def get_batch_on_this_tp_rank(
                     cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
-        
+
         elif is_sft:
             # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermidiate stages
             tokens = None
             labels = None
             loss_mask = None
             position_ids = None
-            
+
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
             if cp_size > 1:

@@ -202,10 +202,22 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
-        assert tokens.shape == (1, seq_len_per_rank), f"Expected tokens shape (1, {seq_len_per_rank}), got {tokens.shape}"
-        assert labels.shape == (1, seq_len_per_rank), f"Expected labels shape (1, {seq_len_per_rank}), got {labels.shape}"
-        assert loss_mask.shape == (1, seq_len_per_rank), f"Expected loss_mask shape (1, {seq_len_per_rank}), got {loss_mask.shape}"
-        assert position_ids.shape == (1, seq_len_per_rank), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
+        assert tokens.shape == (
+            1,
+            seq_len_per_rank,
+        ), f"Expected tokens shape (1, {seq_len_per_rank}), got {tokens.shape}"
+        assert labels.shape == (
+            1,
+            seq_len_per_rank,
+        ), f"Expected labels shape (1, {seq_len_per_rank}), got {labels.shape}"
+        assert loss_mask.shape == (
+            1,
+            seq_len_per_rank,
+        ), f"Expected loss_mask shape (1, {seq_len_per_rank}), got {loss_mask.shape}"
+        assert position_ids.shape == (
+            1,
+            seq_len_per_rank,
+        ), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
 
         assert tokens.dtype == torch.int64
         assert labels.dtype == torch.int64
@@ -237,8 +249,14 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
-        assert tokens.shape == (1, seq_len_per_rank), f"Expected tokens shape (1, {seq_len_per_rank}), got {tokens.shape}"
-        assert position_ids.shape == (1, seq_len_per_rank), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
+        assert tokens.shape == (
+            1,
+            seq_len_per_rank,
+        ), f"Expected tokens shape (1, {seq_len_per_rank}), got {tokens.shape}"
+        assert position_ids.shape == (
+            1,
+            seq_len_per_rank,
+        ), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
 
         assert tokens.dtype == torch.int64
         assert position_ids.dtype == torch.int64
@@ -266,8 +284,14 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
-        assert labels.shape == (1, seq_len_per_rank), f"Expected labels shape (1, {seq_len_per_rank}), got {labels.shape}"
-        assert loss_mask.shape == (1, seq_len_per_rank), f"Expected loss_mask shape (1, {seq_len_per_rank}), got {loss_mask.shape}"
+        assert labels.shape == (
+            1,
+            seq_len_per_rank,
+        ), f"Expected labels shape (1, {seq_len_per_rank}), got {labels.shape}"
+        assert loss_mask.shape == (
+            1,
+            seq_len_per_rank,
+        ), f"Expected loss_mask shape (1, {seq_len_per_rank}), got {loss_mask.shape}"
 
         assert labels.dtype == torch.int64
         assert loss_mask.dtype == torch.float32
@@ -346,7 +370,9 @@ def create_pretrain_data_iterator(
 @pytest.mark.parametrize("seq_length", [1024, 2048, 4096])
 @pytest.mark.parametrize("create_attention_mask", [True, False])
 @pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
-def test_pretrain_batch(tp_size, pp_size, cp_size, seq_length, create_attention_mask, micro_batch_size):
+def test_pretrain_batch(
+    tp_size, pp_size, cp_size, seq_length, create_attention_mask, micro_batch_size
+):
     if tp_size * pp_size * cp_size > torch.cuda.device_count():
         pytest.skip(
             f"Skipping test because tp_size * pp_size * cp_size > torch.cuda.device_count() ({tp_size * pp_size * cp_size} > {torch.cuda.device_count()})"
@@ -401,10 +427,22 @@ def test_pretrain_batch(tp_size, pp_size, cp_size, seq_length, create_attention_
         assert hybrid_cp_group is None
         assert local_cp_size is None
 
-        assert tokens.shape == (micro_batch_size, seq_len_per_rank), f"Expected tokens shape ({micro_batch_size}, {seq_len_per_rank}), got {tokens.shape}"
-        assert labels.shape == (micro_batch_size, seq_len_per_rank), f"Expected labels shape ({micro_batch_size}, {seq_len_per_rank}), got {labels.shape}"
-        assert loss_mask.shape == (micro_batch_size, seq_len_per_rank), f"Expected loss_mask shape ({micro_batch_size}, {seq_len_per_rank}), got {loss_mask.shape}"
-        assert position_ids.shape == (micro_batch_size, seq_len_per_rank), f"Expected position_ids shape ({micro_batch_size}, {seq_len_per_rank}), got {position_ids.shape}"
+        assert tokens.shape == (
+            micro_batch_size,
+            seq_len_per_rank,
+        ), f"Expected tokens shape ({micro_batch_size}, {seq_len_per_rank}), got {tokens.shape}"
+        assert labels.shape == (
+            micro_batch_size,
+            seq_len_per_rank,
+        ), f"Expected labels shape ({micro_batch_size}, {seq_len_per_rank}), got {labels.shape}"
+        assert loss_mask.shape == (
+            micro_batch_size,
+            seq_len_per_rank,
+        ), f"Expected loss_mask shape ({micro_batch_size}, {seq_len_per_rank}), got {loss_mask.shape}"
+        assert position_ids.shape == (
+            micro_batch_size,
+            seq_len_per_rank,
+        ), f"Expected position_ids shape ({micro_batch_size}, {seq_len_per_rank}), got {position_ids.shape}"
 
         assert tokens.dtype == torch.int64
         assert labels.dtype == torch.int64
@@ -415,7 +453,12 @@ def test_pretrain_batch(tp_size, pp_size, cp_size, seq_length, create_attention_
 
         if create_attention_mask:
             assert attention_mask is not None
-            assert attention_mask.shape == (micro_batch_size, 1, seq_len_per_rank, seq_length), f"Expected attention_mask shape ({micro_batch_size}, 1, {seq_len_per_rank}, {seq_length}), got {attention_mask.shape}"
+            assert attention_mask.shape == (
+                micro_batch_size,
+                1,
+                seq_len_per_rank,
+                seq_length,
+            ), f"Expected attention_mask shape ({micro_batch_size}, 1, {seq_len_per_rank}, {seq_length}), got {attention_mask.shape}"
             assert attention_mask.dtype == torch.bool
         else:
             assert attention_mask is None
@@ -432,15 +475,26 @@ def test_pretrain_batch(tp_size, pp_size, cp_size, seq_length, create_attention_
         assert hybrid_cp_group is None
         assert local_cp_size is None
 
-        assert tokens.shape == (micro_batch_size, seq_len_per_rank), f"Expected tokens shape ({micro_batch_size}, {seq_len_per_rank}), got {tokens.shape}"
-        assert position_ids.shape == (micro_batch_size, seq_len_per_rank), f"Expected position_ids shape ({micro_batch_size}, {seq_len_per_rank}), got {position_ids.shape}"
+        assert tokens.shape == (
+            micro_batch_size,
+            seq_len_per_rank,
+        ), f"Expected tokens shape ({micro_batch_size}, {seq_len_per_rank}), got {tokens.shape}"
+        assert position_ids.shape == (
+            micro_batch_size,
+            seq_len_per_rank,
+        ), f"Expected position_ids shape ({micro_batch_size}, {seq_len_per_rank}), got {position_ids.shape}"
 
         assert tokens.dtype == torch.int64
         assert position_ids.dtype == torch.int64
 
         if create_attention_mask:
             assert attention_mask is not None
-            assert attention_mask.shape == (micro_batch_size, 1, seq_len_per_rank, seq_length), f"Expected attention_mask shape ({micro_batch_size}, 1, {seq_len_per_rank}, {seq_length}), got {attention_mask.shape}"
+            assert attention_mask.shape == (
+                micro_batch_size,
+                1,
+                seq_len_per_rank,
+                seq_length,
+            ), f"Expected attention_mask shape ({micro_batch_size}, 1, {seq_len_per_rank}, {seq_length}), got {attention_mask.shape}"
             assert attention_mask.dtype == torch.bool
         else:
             assert attention_mask is None
@@ -457,8 +511,14 @@ def test_pretrain_batch(tp_size, pp_size, cp_size, seq_length, create_attention_
         assert hybrid_cp_group is None
         assert local_cp_size is None
 
-        assert labels.shape == (micro_batch_size, seq_len_per_rank), f"Expected labels shape ({micro_batch_size}, {seq_len_per_rank}), got {labels.shape}"
-        assert loss_mask.shape == (micro_batch_size, seq_len_per_rank), f"Expected loss_mask shape ({micro_batch_size}, {seq_len_per_rank}), got {loss_mask.shape}"
+        assert labels.shape == (
+            micro_batch_size,
+            seq_len_per_rank,
+        ), f"Expected labels shape ({micro_batch_size}, {seq_len_per_rank}), got {labels.shape}"
+        assert loss_mask.shape == (
+            micro_batch_size,
+            seq_len_per_rank,
+        ), f"Expected loss_mask shape ({micro_batch_size}, {seq_len_per_rank}), got {loss_mask.shape}"
 
         assert labels.dtype == torch.int64
         assert loss_mask.dtype == torch.float32
@@ -467,7 +527,12 @@ def test_pretrain_batch(tp_size, pp_size, cp_size, seq_length, create_attention_
 
         if create_attention_mask:
             assert attention_mask is not None
-            assert attention_mask.shape == (micro_batch_size, 1, seq_len_per_rank, seq_length), f"Expected attention_mask shape ({micro_batch_size}, 1, {seq_len_per_rank}, {seq_length}), got {attention_mask.shape}"
+            assert attention_mask.shape == (
+                micro_batch_size,
+                1,
+                seq_len_per_rank,
+                seq_length,
+            ), f"Expected attention_mask shape ({micro_batch_size}, 1, {seq_len_per_rank}, {seq_length}), got {attention_mask.shape}"
             assert attention_mask.dtype == torch.bool
         else:
             assert attention_mask is None
@@ -593,10 +658,22 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
 
     # Shape: HybridCP CP splitting gives total_seq_len // cp_size tokens per rank
     seq_len_per_rank = total_seq_len // cp_size
-    assert tokens.shape == (1, seq_len_per_rank), f"Expected tokens shape (1, {seq_len_per_rank}), got {tokens.shape}"
-    assert labels.shape == (1, seq_len_per_rank), f"Expected labels shape (1, {seq_len_per_rank}), got {labels.shape}"
-    assert loss_mask.shape == (1, seq_len_per_rank), f"Expected loss_mask shape (1, {seq_len_per_rank}), got {loss_mask.shape}"
-    assert position_ids.shape == (1, seq_len_per_rank), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
+    assert tokens.shape == (
+        1,
+        seq_len_per_rank,
+    ), f"Expected tokens shape (1, {seq_len_per_rank}), got {tokens.shape}"
+    assert labels.shape == (
+        1,
+        seq_len_per_rank,
+    ), f"Expected labels shape (1, {seq_len_per_rank}), got {labels.shape}"
+    assert loss_mask.shape == (
+        1,
+        seq_len_per_rank,
+    ), f"Expected loss_mask shape (1, {seq_len_per_rank}), got {loss_mask.shape}"
+    assert position_ids.shape == (
+        1,
+        seq_len_per_rank,
+    ), f"Expected position_ids shape (1, {seq_len_per_rank}), got {position_ids.shape}"
 
     # Dtype checks
     assert tokens.dtype == torch.int64
@@ -608,7 +685,9 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert loss_mask.sum().item() == seq_len_per_rank
 
     # cu_seqlens: 1D int32, [0, seq_len_each, 2*seq_len_each, ..., total_seq_len]
-    assert cu_seqlens.shape == (n_seqs + 1,), f"Expected cu_seqlens shape ({n_seqs + 1},), got {cu_seqlens.shape}"
+    assert cu_seqlens.shape == (
+        n_seqs + 1,
+    ), f"Expected cu_seqlens shape ({n_seqs + 1},), got {cu_seqlens.shape}"
     assert cu_seqlens.dtype == torch.int32
     assert cu_seqlens[0].item() == 0
     assert cu_seqlens[-1].item() == total_seq_len
