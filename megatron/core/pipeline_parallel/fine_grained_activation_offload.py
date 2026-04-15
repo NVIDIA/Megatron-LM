@@ -1027,7 +1027,6 @@ class ChunkOffloadHandler:
             ), f"Group {name} not found in {self._groups_to_offload}"
             self._groups_to_reload.append(group_to_offload)
             self.bulk_offload_group(group_to_offload)
-            self._groups_to_offload.remove(group_to_offload)
             # Manually release tensors not auto-freed by torch GC
             if len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
