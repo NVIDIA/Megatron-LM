@@ -22,6 +22,13 @@ from importlib.metadata import version
 from typing import Callable, Optional, Sequence, Union
 
 try:
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    HAVE_MEGATRON_CORE = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_MEGATRON_CORE = False
+
+try:
     import einops
 
     HAVE_EINOPS = True
@@ -831,3 +838,12 @@ def using_tensor_parallel(dist_index, is_expert_parallel: bool = False) -> bool:
     """
     tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_parallel)
     return tp_mesh.mesh.numel() > 1
+
+
+def get_unwrapped_transformer_config_attribute(config, key: str):
+    """
+    Get `key` from config with getattr method, return None otherwise.
+    """
+    if HAVE_MEGATRON_CORE and isinstance(config, TransformerConfig):
+        return getattr(config, key)
+    return None
