@@ -42,7 +42,7 @@ MODEL_ARGS:
   # Precision
   --fp8-format: "hybrid"
   --fp8-recipe: "tensorwise"
-  --fp8-param-gather: true
+  #--fp8-param-gather: true
 
   # Training args
   --use-mcore-models: true
