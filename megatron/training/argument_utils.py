@@ -23,8 +23,6 @@ from megatron.training.config import (
     StragglerDetectionConfig,
     RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
 )
-from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
-
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -281,6 +279,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
 
 def pretrain_container_from_args(args: Namespace) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
+    from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
     ckpt_kwargs["save_optim"] = not args.no_save_optim
