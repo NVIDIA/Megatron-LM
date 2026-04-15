@@ -382,8 +382,13 @@ def save(
 
     def metadata_finalize_fn():
         if torch.distributed.get_rank() == 0:
+            tensor_format = "DTensor" if use_dtensor_format else "ShardedTensor"
             save_config(
-                CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
+                CheckpointingConfig(
+                    sharded_strategy.backend,
+                    sharded_strategy.version,
+                    tensor_format=tensor_format,
+                ),
                 checkpoint_dir,
             )
         torch.distributed.barrier()

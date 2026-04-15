@@ -33,6 +33,7 @@ class CheckpointingConfig:
     sharded_backend_version: int = 1
     common_backend: str = 'torch'
     common_backend_version: int = 1
+    tensor_format: str = "ShardedTensor"
 
 
 def check_is_distributed_checkpoint(checkpoint_dir):
