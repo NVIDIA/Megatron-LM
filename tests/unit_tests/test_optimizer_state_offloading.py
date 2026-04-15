@@ -94,11 +94,11 @@ def test_offloader_initialization():
 
 
 # =============================================================================
-# Test 2: Early Master Weight Offloading Before First Step
+# Test 2: Early Primary Weight Offloading Before First Step
 # =============================================================================
 @pytest.mark.skipif(not TE_FUSED_ADAM_AVAILABLE, reason="Requires TE FusedAdam")
-def test_early_master_weight_offloading():
-    """Test that master weights can be offloaded before the first optimizer step."""
+def test_early_primary_weight_offloading():
+    """Test that primary weights can be offloaded before the first optimizer step."""
     Utils.initialize_model_parallel()
     model, optim = create_model_and_optimizer()
     dist_optim = optim.chained_optimizers[0]
@@ -110,34 +110,34 @@ def test_early_master_weight_offloading():
     # Before first step, optimizer states are not initialized
     assert offloader._optimizer_states_initialized is False
 
-    # Capture original master weights before offload
-    original_master_weights = []
+    # Capture original primary weights before offload
+    original_primary_weights = []
     for group in dist_optim.shard_fp32_from_float16_groups:
         group_weights = [tensor.clone() for tensor in group]
-        original_master_weights.append(group_weights)
+        original_primary_weights.append(group_weights)
 
-    # Offload before first step - should only offload master weights
+    # Offload before first step - should only offload primary weights
     offloader.offload()
     offloader.release_gpu_memory()
     torch.cuda.synchronize()
 
-    # Verify master weights were offloaded (storage resized to 0)
+    # Verify primary weights were offloaded (storage resized to 0)
     for group in dist_optim.shard_fp32_from_float16_groups:
         for tensor in group:
-            assert tensor.untyped_storage().size() == 0, "Master weight should be offloaded"
+            assert tensor.untyped_storage().size() == 0, "Primary weight should be offloaded"
 
-    # Reload master weights
+    # Reload primary weights
     offloader.reload()
     offloader.sync_before_step()
 
-    # Verify master weights match after reload
+    # Verify primary weights match after reload
     for group_idx, group in enumerate(dist_optim.shard_fp32_from_float16_groups):
         for param_idx, tensor in enumerate(group):
-            original = original_master_weights[group_idx][param_idx]
+            original = original_primary_weights[group_idx][param_idx]
             torch.testing.assert_close(
                 tensor,
                 original,
-                msg=f"Master weight [{group_idx}][{param_idx}] mismatch after offload/reload",
+                msg=f"Primary weight [{group_idx}][{param_idx}] mismatch after offload/reload",
             )
 
     # Now run a step and verify optimizer states can be offloaded after
@@ -152,10 +152,10 @@ def test_early_master_weight_offloading():
 # =============================================================================
 @pytest.mark.skipif(not TE_FUSED_ADAM_AVAILABLE, reason="Requires TE FusedAdam")
 @pytest.mark.parametrize("offload_optimizer_states", [True, False])
-@pytest.mark.parametrize("offload_master_weights", [True, False])
-def test_offload_reload_correctness(offload_optimizer_states, offload_master_weights):
+@pytest.mark.parametrize("offload_primary_weights", [True, False])
+def test_offload_reload_correctness(offload_optimizer_states, offload_primary_weights):
     """Test that offload/reload preserves optimizer state values."""
-    if not offload_optimizer_states and not offload_master_weights:
+    if not offload_optimizer_states and not offload_primary_weights:
         pytest.skip("At least one offload type required")
 
     Utils.initialize_model_parallel()
@@ -178,7 +178,7 @@ def test_offload_reload_correctness(offload_optimizer_states, offload_master_wei
     # Offload
     offloader.offload(
         offload_optimizer_states=offload_optimizer_states,
-        offload_master_weights=offload_master_weights,
+        offload_primary_weights=offload_primary_weights,
     )
 
     # Release GPU memory
@@ -304,7 +304,7 @@ def test_training_correctness_with_offloading():
         input_tensor = torch.randn(8, 256, dtype=torch.bfloat16, device='cuda')
 
         # Model 1 with offloading
-        # Offload states (master weights can be offloaded from the start,
+        # Offload states (primary weights can be offloaded from the start,
         # optimizer states will be skipped until after first step)
         offloader.offload()
         offloader.release_gpu_memory()
