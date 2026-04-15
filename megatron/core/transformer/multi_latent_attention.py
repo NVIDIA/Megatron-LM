@@ -968,7 +968,7 @@ class MLASelfAttention(MultiLatentAttention):
             kv_cached, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
 
-        # Seperated out the norm and linear
+        # Separated out the norm and linear
         kv, _ = self.linear_kv_up_proj_linear(kv_compressed)
 
         kv = kv.view(

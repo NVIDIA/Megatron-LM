@@ -68,7 +68,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
         return calc_dtensor_params_l2_norm(params)
 
-    # Seperate moe and dense params
+    # Separate moe and dense params
     params_data = []
     moe_params_data = []
     sharded_params_data = []
