@@ -38,6 +38,7 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_using_quantization_scales,
 )
+from megatron.core.fusions.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 
 
 class GPTModel(LanguageModule):
@@ -106,6 +107,8 @@ class GPTModel(LanguageModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        use_fused_lce: bool = False,
+        logits_split_chunks: int = 8,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -145,6 +148,9 @@ class GPTModel(LanguageModule):
         self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
             self.config, ignore_virtual=False, vp_stage=vp_stage
         )
+
+        self.use_fused_lce = use_fused_lce
+        self.logits_split_chunks = logits_split_chunks
 
         if self.pre_process or self.mtp_process:
             self.embedding = LanguageModelEmbedding(
@@ -241,24 +247,33 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                self.vocab_size,
-                config=config,
-                init_method=(
-                    config.embedding_init_method
-                    if config.use_mup and not self.share_embeddings_and_output_weights
-                    else config.init_method
-                ),
-                bias=False,
-                skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
-                embedding_activation_buffer=self.embedding_activation_buffer,
-                grad_output_buffer=self.grad_output_buffer,
-                tp_group=self.pg_collection.tp,
-            )
+            if self.use_fused_lce:
+                self.output_layer = FusedLinearCrossEntropyLoss(
+                    input_size=config.hidden_size,
+                    output_size=self.vocab_size,
+                    config=config,
+                    init_method=config.init_method,
+                    num_chunks=self.logits_split_chunks
+                )
+            else:
+                self.output_layer = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    self.vocab_size,
+                    config=config,
+                    init_method=(
+                        config.embedding_init_method
+                        if config.use_mup and not self.share_embeddings_and_output_weights
+                        else config.init_method
+                    ),
+                    bias=False,
+                    skip_bias_add=False,
+                    gather_output=not self.parallel_output,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,
+                    embedding_activation_buffer=self.embedding_activation_buffer,
+                    grad_output_buffer=self.grad_output_buffer,
+                    tp_group=self.pg_collection.tp,
+                )
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
@@ -673,6 +688,15 @@ class GPTModel(LanguageModule):
                 # then back to [S’, B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        if self.use_fused_lce:
+            loss = self.output_layer(
+                x=hidden_states.permute(1, 0, 2),
+                target=labels,
+                weight=output_weight,
+                bias=None,
+            )
+            return loss
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output

@@ -1620,6 +1620,9 @@ def validate_args(args, defaults={}):
     if args.cpu_offloading_num_layers > 0:
         args.cpu_offloading = True
 
+    if args.use_fused_lce:
+        assert args.tensor_model_parallel_size == 1, 'fused lce only support tp=1 now'
+
     # CUDA Graphs
     if args.cuda_graph_impl != "none":
         if (
@@ -2588,6 +2591,10 @@ def _add_training_args(parser):
                        '--use-legacy-models to not use core models.')
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
+    group.add_argument('--use-fused-lce', action='store_true', default=False,
+                       help='Use fused linear cross entropy to reduce the peak memory')     
+    group.add_argument('--logits-split-chunks', type=int, default=8,
+                       help='Number of logits to split')
 
     return parser
 
