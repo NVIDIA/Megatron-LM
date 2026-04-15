@@ -3,10 +3,11 @@
 """Forward step, TP broadcast, and loss for multimodal_dev training."""
 
 from functools import partial
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, List
 
 import torch
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -135,6 +136,111 @@ def broadcast_data_batch(data, device="cuda"):
 
 
 # -------------------------------------------------------------------
+# THD (packed sequence) helpers
+# -------------------------------------------------------------------
+
+def _build_packed_seq_params(
+    seq_lengths: List[int], device: torch.device,
+) -> PackedSeqParams:
+    """Build ``PackedSeqParams`` from per-sample valid sequence lengths.
+
+    Args:
+        seq_lengths: Valid token count for each sample in the batch.
+        device: Target device for cu_seqlens tensors.
+
+    Returns:
+        A ``PackedSeqParams`` instance with ``qkv_format='thd'``.
+    """
+    cu_seqlens = torch.zeros(
+        len(seq_lengths) + 1, dtype=torch.int32, device=device,
+    )
+    for i, sl in enumerate(seq_lengths):
+        cu_seqlens[i + 1] = cu_seqlens[i] + sl
+
+    total_tokens = int(cu_seqlens[-1].item())
+    max_seqlen = max(seq_lengths)
+
+    return PackedSeqParams(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv_padded=None,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        qkv_format='thd',
+        total_tokens=total_tokens,
+    )
+
+
+def _pack_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Pack a ``[B, S]`` batch into ``[1, T]`` THD format.
+
+    Concatenates valid tokens from each sample (stripping padding),
+    builds ``PackedSeqParams``, and stores it in
+    ``batch["packed_seq_params"]``.
+
+    Args:
+        batch: Dict with ``input_ids [B, S]``, ``position_ids [3, B, S]``,
+               ``labels [B, S]``, ``loss_mask [B, S]``, and optionally
+               ``attention_mask [B, S]``.
+
+    Returns:
+        Mutated *batch* dict with packed tensors.
+    """
+    input_ids = batch["input_ids"]  # [B, S]
+    B, S = input_ids.shape
+    device = input_ids.device
+
+    # Determine valid lengths per sample.
+    attention_mask = batch.get("attention_mask", None)
+    if attention_mask is not None:
+        seq_lengths = attention_mask.sum(dim=1).tolist()
+    else:
+        seq_lengths = [S] * B
+    seq_lengths = [int(sl) for sl in seq_lengths]
+
+    # Pack input_ids: [B, S] -> [1, T]
+    packed_ids = [input_ids[i, :seq_lengths[i]] for i in range(B)]
+    batch["input_ids"] = torch.cat(packed_ids, dim=0).unsqueeze(0)
+
+    # Pack labels: [B, S] -> [1, T]
+    if batch.get("labels") is not None:
+        labels = batch["labels"]
+        packed_labels = [labels[i, :seq_lengths[i]] for i in range(B)]
+        batch["labels"] = torch.cat(packed_labels, dim=0).unsqueeze(0)
+
+    # Pack loss_mask: [B, S] -> [1, T]
+    if batch.get("loss_mask") is not None:
+        loss_mask = batch["loss_mask"]
+        packed_lm = [loss_mask[i, :seq_lengths[i]] for i in range(B)]
+        batch["loss_mask"] = torch.cat(packed_lm, dim=0).unsqueeze(0)
+
+    # Pack position_ids: [3, B, S] -> [3, 1, T] or [B, S] -> [1, T]
+    if batch.get("position_ids") is not None:
+        pos = batch["position_ids"]
+        if pos.dim() == 3 and pos.shape[0] == 3:
+            # MRoPE: [3, B, S] -> [3, 1, T]
+            packed_pos = [pos[:, i, :seq_lengths[i]] for i in range(B)]
+            batch["position_ids"] = torch.cat(
+                packed_pos, dim=1,
+            ).unsqueeze(1)
+        else:
+            # Standard: [B, S] -> [1, T]
+            packed_pos = [pos[i, :seq_lengths[i]] for i in range(B)]
+            batch["position_ids"] = torch.cat(
+                packed_pos, dim=0,
+            ).unsqueeze(0)
+
+    # THD uses cu_seqlens; attention_mask is no longer needed.
+    batch["attention_mask"] = None
+
+    batch["packed_seq_params"] = _build_packed_seq_params(
+        seq_lengths, device,
+    )
+    return batch
+
+
+# -------------------------------------------------------------------
 # get_batch
 # -------------------------------------------------------------------
 
@@ -218,6 +324,7 @@ def forward_step(data_iterator, model):
     if batch is None:
         return None, None
 
+    # Compute position_ids before packing (MRoPE needs [B, S] input_ids).
     position_ids = batch.get("position_ids", None)
     if position_ids is None:
         inner = unwrap_model(model)
@@ -226,6 +333,16 @@ def forward_step(data_iterator, model):
                 input_ids=batch["input_ids"],
                 image_grid_thw=batch.get("image_grid_thw", None),
             )
+            batch["position_ids"] = position_ids
+
+    # Pack sequences into THD format if enabled.
+    from megatron.training import get_args
+    args = get_args()
+    packed_seq_params = None
+    if getattr(args, "use_packed_sequence", False):
+        batch = _pack_batch(batch)
+        packed_seq_params = batch.pop("packed_seq_params")
+        position_ids = batch["position_ids"]
 
     pixel_values = batch.get("pixel_values", None)
     if (
@@ -243,6 +360,7 @@ def forward_step(data_iterator, model):
         loss_mask=batch.get("loss_mask", None),
         pixel_values=pixel_values,
         image_grid_thw=batch.get("image_grid_thw", None),
+        packed_seq_params=packed_seq_params,
     )
 
     loss_mask = batch.get("loss_mask", None)
