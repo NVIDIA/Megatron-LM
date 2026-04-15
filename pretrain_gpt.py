@@ -64,7 +64,7 @@ stimer = StragglerDetector()
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
 
-    BATCH_KEYS = ["tokens", "labels", "loss_mask", "position_ids", "attention_mask", "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "local_cp_size", "hybrid_cp_group"]
+    BATCH_KEYS = ["attention_mask", "cu_seqlens", "cu_seqlens_padded", "hybrid_cp_group", "labels", "local_cp_size", "loss_mask", "max_seqlen", "position_ids", "tokens"]
 
     args = get_args()
     config = core_transformer_config_from_args(args)
@@ -76,7 +76,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     mtp_on_this_rank = mtp_on_this_rank_func(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
     is_hybrid_cp = args.hybrid_context_parallel
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not is_sft:
         return [None for _ in BATCH_KEYS]
 
     batch = {}
@@ -87,6 +87,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, is_hybrid_cp=is_hybrid_cp, create_attention_mask_in_dataloader=create_attention_mask_in_dataloader, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage())
     batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=get_context_parallel_group(), hybrid_cp_group_func=get_hybrid_data_context_parallel_groups)
+    
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+        assert is_sft
+        return None, batch['cu_seqlens'], batch['cu_seqlens_padded'], None, None, None, None, batch['max_seqlen'], None, None
+
     return [batch[key] for key in sorted(batch.keys())]
 
 
@@ -187,7 +192,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     packed_seq_params = None
     if cu_seqlens is not None:
-        cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+        cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_for_params,

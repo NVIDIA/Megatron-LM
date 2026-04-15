@@ -2040,7 +2040,6 @@ def get_batch_on_this_tp_rank(
         'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
         'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
     """
-    # TODO(asolergi-nv): Enable PP with sft
 
     def _broadcast(item):
         if item is not None:
@@ -2087,25 +2086,31 @@ def get_batch_on_this_tp_rank(
         elif is_pipeline_first_stage:
             _broadcast(batch['tokens'])
             _broadcast(batch['position_ids'])
-            if is_sft or is_hybrid_cp:
+            if is_sft:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
-            if is_hybrid_cp:
-                _broadcast(batch['local_cp_size'])
 
         elif is_pipeline_last_stage:
-            # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate
-            # embedding. Currently the Multi-Token Prediction (MTP) layers is fixed on the
-            # last stage, so we need to broadcast tokens and position_ids to all of the
-            # tensor parallel ranks on the last stage.
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            if is_sft:
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                if cp_size > 1:
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
+        
+        elif is_sft:
+            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermidiate stages
+            _broadcast_cu_seqlens(batch['cu_seqlens'])
+            _broadcast(batch['max_seqlen'])
+            if cp_size > 1:
+                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
 
     else:
         if is_hybrid_cp:
@@ -2174,31 +2179,39 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(tokens)
             _broadcast(position_ids)
-            if is_sft or is_hybrid_cp:
+            if is_sft:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
                     cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
-            if is_hybrid_cp:
-                _broadcast(local_cp_size)
 
         elif is_pipeline_last_stage:
-            # Multi-Token Prediction (MTP) layers need tokens and position_ids
-            # to calculate embedding. Currently the Multi-Token Prediction (MTP) layers
-            # is fixed on the last stage, so we need to broadcast tokens and position_ids
-            # to all of the tensor parallel ranks on the last stage.
             tokens = None
             position_ids = None
-            cu_seqlens = None
-            cu_seqlens_padded = None
-            max_seqlen = None
 
             _broadcast(labels)
             _broadcast(loss_mask)
+            if is_sft:
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
+                if cp_size > 1:
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
+        
+        elif is_sft:
+            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermidiate stages
+            tokens = None
+            labels = None
+            loss_mask = None
+            position_ids = None
+            
+            cu_seqlens = _broadcast_cu_seqlens()
+            _broadcast(max_seqlen)
+            if cp_size > 1:
+                cu_seqlens_padded = _broadcast_cu_seqlens()
 
         batch = {
             'tokens': tokens,
