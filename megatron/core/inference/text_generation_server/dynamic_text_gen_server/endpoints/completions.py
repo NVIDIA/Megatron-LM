@@ -121,6 +121,7 @@ try:
                 skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
                 stop_words=sampling_params.stop_words,
+                termination_id=sampling_params.termination_id,
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
