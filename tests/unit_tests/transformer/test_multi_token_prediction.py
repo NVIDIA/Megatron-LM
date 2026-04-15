@@ -528,6 +528,34 @@ class TestMultiTokenPrediction:
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
 
+    def test_roll_tensor_none_input(self):
+        """Test that roll_tensor returns (None, None) when given None input."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        result, sum_val = roll_tensor(None, shifts=-1, dims=-1)
+        assert result is None
+        assert sum_val is None
+        Utils.destroy_model_parallel()
+
+    def test_roll_tensor_creates_shifted_labels(self):
+        """Test that rolling input_ids by -1 produces shifted labels for RL mode.
+
+        In RL training, labels are not provided. Instead, MTP creates labels by
+        rolling input_ids: label[i] = input_id[i+1], with the last position zeroed.
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        # Simulate input_ids [batch=2, seq=5]
+        input_ids = torch.tensor(
+            [[10, 20, 30, 40, 50], [60, 70, 80, 90, 100]], dtype=torch.int64
+        ).cuda()
+        rolled, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+
+        # Expected: each row shifted left by 1, last element wraps around
+        expected = torch.tensor(
+            [[20, 30, 40, 50, 10], [70, 80, 90, 100, 60]], dtype=torch.int64
+        ).cuda()
+        assert torch.equal(rolled, expected)
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):
         """Test roll_tensor function with packed sequences, with and without CP.
