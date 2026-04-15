@@ -213,7 +213,20 @@ class MXFP8ReshardTransform(ReshardTransform):
                 torch.empty_like(buf.scale[scale_slice].contiguous()),
             ]
         else:
-            # Receive BF16 (1 buffer, same shape as the MXFP8 data slice).
+            # 1D scale: recv directly into the accumulation buffer that
+            # finalize_recv needs anyway, avoiding a second full-param BF16
+            # allocation.  This halves the BF16 overhead for 1D-scale params.
+            if buf.scale.ndim == 1:
+                if buf_key not in self._pending_1d:
+                    self._pending_1d[buf_key] = [
+                        torch.zeros(buf.data.shape, dtype=torch.bfloat16, device=buf.data.device),
+                        0,
+                    ]
+                accum_view = self._pending_1d[buf_key][0][dst_slice]
+                if accum_view.is_contiguous():
+                    return [accum_view]
+                # Non-contiguous slice — fall through to separate buffer.
+            # 2D scale or non-contiguous 1D fallback.
             shape = buf.data[dst_slice].shape
             return [torch.empty(shape, dtype=torch.bfloat16, device=buf.data.device)]
 
@@ -232,13 +245,17 @@ class MXFP8ReshardTransform(ReshardTransform):
             # full weight tensor; partial updates would corrupt the swizzle layout.
             # Accumulate BF16 slices and quantize once all slices are assembled.
             if buf_key not in self._pending_1d:
+                # Fallback: accumulation buffer wasn't pre-allocated in prepare_recv.
                 # Use zeros so that any un-filled slice produces zeros rather than garbage.
                 self._pending_1d[buf_key] = [
-                    torch.zeros_like(buf.data, dtype=torch.bfloat16),
+                    torch.zeros(buf.data.shape, dtype=torch.bfloat16, device=buf.data.device),
                     0,  # elements written so far
                 ]
             accum, written = self._pending_1d[buf_key]
-            accum[dst_slice].copy_(recv_buffers[0])
+            # Skip copy when the recv buffer is already a view into the
+            # accumulation buffer (direct-recv path from prepare_recv).
+            if recv_buffers[0].data_ptr() != accum[dst_slice].data_ptr():
+                accum[dst_slice].copy_(recv_buffers[0])
             written += recv_buffers[0].numel()
             if written >= buf.data.numel():
                 if written != buf.data.numel():

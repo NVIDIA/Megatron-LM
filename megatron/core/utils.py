@@ -2292,7 +2292,7 @@ def nvtx_decorator(
     """
 
     def decorator(func: _Wrapped) -> _Wrapped:
-        if _nvtx_enabled:
+        if _nvtx_enabled and HAVE_NVTX:
             return nvtx.annotate(
                 message=message or _nvtx_decorator_get_func_path(func), color=color
             )(func)
