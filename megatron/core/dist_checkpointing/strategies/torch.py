@@ -932,11 +932,10 @@ class TorchDistLoadShardedStrategy:
         if self.dtensor_format:
             values_to_load = inject_placeholders(sharded_state_dict)
             values_to_load = translate_state_dict_to_dcp_compatible(values_to_load)
+            fill_placeholders(sharded_state_dict, values_to_load)
 
             torch.distributed.checkpoint.load(state_dict=sharded_state_dict, checkpoint_id=checkpoint_dir)
-            unwrap_dtensors_and_sh_ten(values_to_load)
-
-            fill_placeholders(sharded_state_dict, values_to_load)
+            unwrap_dtensors_and_sh_ten(sharded_state_dict)
 
             return sharded_state_dict
 
