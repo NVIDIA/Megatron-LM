@@ -62,7 +62,6 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 
-
 try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
