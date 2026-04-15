@@ -130,6 +130,31 @@ class TestParallelTransformerLayer:
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 
+        # Test gradient equivalence: chunked vs non-chunked training
+        parallel_transformer_layer.train()
+        grads = {}
+        for mlp_chunks_for_training in [1, 4]:
+            transformer_config.mlp_chunks_for_training = mlp_chunks_for_training
+            parallel_transformer_layer.zero_grad()
+            hidden_states, _ = parallel_transformer_layer(
+                hidden_states=input_hidden_states,
+                attention_mask=attention_mask,
+                inference_context=None,
+            )
+            loss = hidden_states.sum()
+            loss.backward()
+            grads[mlp_chunks_for_training] = {
+                name: param.grad.clone()
+                for name, param in parallel_transformer_layer.named_parameters()
+                if param.grad is not None
+            }
+
+        for name in grads[1]:
+            assert torch.allclose(grads[1][name], grads[4][name], atol=1e-6), (
+                f"Gradient mismatch for {name}: "
+                f"max diff={torch.max(torch.abs(grads[1][name] - grads[4][name])).item()}"
+            )
+
     def test_get_layer_offset(self):
         config = self.parallel_transformer_layer.config
         assert get_transformer_layer_offset(config) == 0

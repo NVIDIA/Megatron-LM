@@ -822,7 +822,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
             bias_chunks = [bias for _, bias in outputs if bias is not None]
-            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+            bias_output = bias_chunks[0] if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
             if using_fused_tp_inference_kernel:
