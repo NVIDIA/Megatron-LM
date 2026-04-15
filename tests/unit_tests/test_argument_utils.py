@@ -695,12 +695,10 @@ def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
     with (
         patch(
-            "megatron.training.argument_utils.get_megatron_optimizer_config",
+            "megatron.training.training.get_megatron_optimizer_config",
             return_value=(mock_optimizer_config, {}),
         ),
-        patch(
-            "megatron.training.argument_utils.get_megatron_ddp_config", return_value=mock_ddp_config
-        ),
+        patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config),
     ):
         yield
 
@@ -712,8 +710,8 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
 
-    @patch("megatron.training.argument_utils.get_megatron_ddp_config")
-    @patch("megatron.training.argument_utils.get_megatron_optimizer_config")
+    @patch("megatron.training.training.get_megatron_ddp_config")
+    @patch("megatron.training.training.get_megatron_optimizer_config")
     def test_optimizer_config_comes_from_helper(self, mock_opt, mock_ddp):
         """Test that optimizer config comes from get_megatron_optimizer_config."""
         mock_optimizer = MagicMock(spec=OptimizerConfig)
@@ -724,8 +722,8 @@ class TestPretrainContainerFromArgsStructure:
         mock_opt.assert_called_once_with(args)
         assert result.optimizer is mock_optimizer
 
-    @patch("megatron.training.argument_utils.get_megatron_ddp_config")
-    @patch("megatron.training.argument_utils.get_megatron_optimizer_config")
+    @patch("megatron.training.training.get_megatron_ddp_config")
+    @patch("megatron.training.training.get_megatron_optimizer_config")
     def test_ddp_config_comes_from_helper(self, mock_opt, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
