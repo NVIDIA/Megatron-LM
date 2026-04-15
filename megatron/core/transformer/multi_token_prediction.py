@@ -867,10 +867,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        padding_mask: Optional[torch.Tensor],
         embedding: Callable,
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
