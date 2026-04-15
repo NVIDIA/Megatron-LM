@@ -1619,37 +1619,16 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
+    @torch.inference_mode()
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
         on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
-        # if no cuda graphs, directly use dummy forward
-        if not context.cuda_graph_batch_dimensions_list:
-            self.inference_wrapped_model.dummy_forward()
-
-            # Disable MoE padding for MTP computation
-            if self.model_config.moe_pad_experts_for_cuda_graph_inference:
-                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-                set_decode_expert_padding(unwrapped_model, False)
-
-            self._dummy_serial_mtp_forward()
-
-            return
 
         # attempt to use cuda-graph if possible
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-
-        # _dynamic_step_context_init tries to find a cuda-graph that is compatible
-        # with all EP ranks. It can also return no match, in which case
-        # we run in eager mode.
-
-        if context.using_cuda_graph_this_step():
-            # we found a cuda-graph to run
-            self._dynamic_step_forward_logits(input_ids, position_ids)
-        else:
-            # fallback to eager dummy forward
-            self.inference_wrapped_model.dummy_forward()
+        self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Disable MoE padding for MTP computation
         if self.model_config.moe_pad_experts_for_cuda_graph_inference:
@@ -1664,29 +1643,6 @@ class TextGenerationController:
         self._dummy_serial_mtp_forward()
 
         # clear the context of any temporary state from the dummy forward
-        context.reset()
-
-    def _agv_dummy_forward(self):
-        """Dummy forward for NVLSAllGatherVDispatcher.
-
-        Two cases:
-        1. No CUDA graphs configured: run an eager dummy forward. Dispatcher metadata
-           is set inside dummy_forward for both NCCL and NVLS dispatchers.
-        2. CUDA graphs configured: delegate to _dynamic_step_context_init which calls
-           initialize_attention_state and handles the NVLS metadata all-gather.
-        """
-        context = self.inference_wrapped_model.inference_context
-
-        if not context.cuda_graph_batch_dimensions_list:
-            # Metadata setup is handled inside dummy_forward for the eager path.
-            self.inference_wrapped_model.dummy_forward()
-            return
-
-        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-
-        assert context.using_cuda_graph_this_step()
-        self._dynamic_step_forward_logits(input_ids, position_ids)
-        
         context.reset()
 
     @torch.inference_mode()

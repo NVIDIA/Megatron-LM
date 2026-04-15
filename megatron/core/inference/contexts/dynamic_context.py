@@ -1544,13 +1544,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.add_dummy_requests_parallel(prefill_requests)
         self.num_prefill_requests = graph_dimensions.prefill_req_count
 
-    @property
-    def num_decode_requests(self) -> int:
-        """
-        Returns the number of decode requests.
-        """
-        return self.total_request_count - self.paused_request_count - self.num_prefill_requests
-
     def add_dummy_requests_for_expert_parallel_step(
         self, graph_dimensions: InferenceBatchDimensions
     ) -> None:
@@ -1620,6 +1613,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata.batch_allocate_slots(N)
             )
 
+    @property
+    def num_decode_requests(self) -> int:
+        """
+        Returns the number of decode requests.
+        """
+        return self.total_request_count - self.paused_request_count - self.num_prefill_requests
+
     def initialize_attention_state(
         self,
         *,
@@ -1645,19 +1645,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # EP dummy requests are added AFTER the EP sync below.
         if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
+        elif is_expert_parallel_dummy_cuda_graph_step:
+            self.add_dummy_requests_for_expert_parallel_step(
+                InferenceBatchDimensions(token_count=1, prefill_req_count=0, decode_req_count=1)
+            )
 
-        if is_expert_parallel_dummy_cuda_graph_step:
-            # No real requests on this EP rank. Pass empty dimensions so the EP
-            # all-reduce in match_graph_config picks up the real ranks' values.
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=0, prefill_req_count=0, decode_req_count=0
-            )
-        else:
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
+        batch_dimensions = InferenceBatchDimensions(
+            token_count=self.active_token_count,
+            prefill_req_count=self.num_prefill_requests,
+            decode_req_count=self.num_decode_requests,
+        )
 
         self.batch_dimensions = batch_dimensions
 
@@ -1672,23 +1669,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
-
-        if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
-            # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
-            # could not find a compatible cuda graph for the dummy forward step.
-            # Now, we need not do the remaining setup. The controller
-            # will directly call the model forward pass with a single token.
-            return
-
-        # Add dummy requests AFTER the EP sync so they match the resolved graph.
-        if is_expert_parallel_dummy_cuda_graph_step:
-            self.add_dummy_requests_for_expert_parallel_step(best_graph)
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
-            self.batch_dimensions = batch_dimensions
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph

@@ -131,49 +131,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
             runtime_gather_output=True,  # Inference should always gather the logits
         )
 
-    @torch.inference_mode()
-    def dummy_forward(self):
-        """Run a dummy forward pass through the model, with a single token.
-        Use-case: Used in EP on ranks which do not have any work, but are needed
-        for the all-to-all communication.
-        Runs under inference_mode so that transformer layers can distinguish this eager
-        dummy_forward from training/validation passes and skip matching on CUDA graphs."""
-
-        # we use num_dummy_tokens equal to tensor model parallel size
-        # so that the dummy forward pass will work with sequence parallel
-        num_dummy_tokens = self.tp_size
-
-        # Populate MoE dispatcher step metadata before the eager dummy forward.
-        # For CUDA-graph steps this is handled by initialize_attention_state; here
-        # we cover the eager path (no CG list, or CG list but no match).
-        context = self.inference_context
-        ep_group = context.expert_model_parallel_group
-        if getattr(context, '_nccl_ep_dispatcher', False):
-            # Always non-CG (eager), so use_allgather_v=True.
-            NCCLAllGatherDispatcher.set_step_metadata(
-                num_dummy_tokens, ep_group, use_allgather_v=True
-            )
-        else:
-            NVLSAllGatherVDispatcher.set_step_metadata(num_dummy_tokens, ep_group)
-
-        tokens = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
-        )
-        position_ids = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
-        )
-        attention_mask = None
-        # Always skip MTP during dummy forwards.  When num_speculative_tokens > 0
-        # the serial MTP path handles MTP separately (with its own dummy forward).
-        # When num_speculative_tokens == 0 MTP is not needed at all.  In both
-        # cases, running MTP here would issue MoE all-to-all collectives that the
-        # real EP ranks do not execute, causing a hang.
-        is_spec_decode = (
-            self.inference_context.is_dynamic_batching() and self.config.mtp_num_layers is not None
-        )
-        result = self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
-        return result
-
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
     ):
