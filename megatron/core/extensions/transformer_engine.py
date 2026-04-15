@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 
 import torch
 import torch.nn.functional as F
+from megatrom.core.safe_globals import SafeUnpickler
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
@@ -31,7 +32,6 @@ from megatron.core.parallel_state import (
     model_parallel_is_initialized,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatrom.core.safe_globals import SafeUnpickler
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,

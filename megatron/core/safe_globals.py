@@ -1,12 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
+import pickle
 from argparse import Namespace
 from io import BytesIO
 from pathlib import PosixPath
 from signal import Signals
 from types import SimpleNamespace
 
-import pickle
 import torch
 from numpy import dtype, ndarray
 from numpy.core.multiarray import _reconstruct
