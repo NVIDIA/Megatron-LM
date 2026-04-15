@@ -251,7 +251,7 @@ class MoELayer(BaseMoELayer):
             else:
                 linear_cls = TELinear
             # Latent projections remain in bf16 for inference; disable fp8_model_init
-            if self.config.transformer_impl == "inference_optimized" and self.config.fp8_param:
+            if not torch.is_grad_enabled() and self.config.fp8_param:
                 import transformer_engine.pytorch
 
                 disable_fp8_ctx = transformer_engine.pytorch.fp8_model_init(enabled=False)
