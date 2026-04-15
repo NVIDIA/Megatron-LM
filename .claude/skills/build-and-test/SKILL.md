@@ -1,6 +1,8 @@
 ---
 name: build-and-test
-description: Developer environment setup, CI/CD workflows, and CI failure debugging for Megatron-LM. Covers container-based development, uv package management, linting, running tests, CI failure investigation, and common pitfalls. Use when onboarding, setting up a dev environment, troubleshooting build issues, or investigating CI failures.
+description: Developer environment setup, CI/CD workflows, and CI failure debugging for Megatron-LM. Covers container-based development, uv package management, linting, running tests, CI failure investigation, and common pitfalls.
+TRIGGER when: user asks to add, remove, or update a dependency; user edits or asks about pyproject.toml or uv.lock; user asks to set up a dev environment or run tests; user asks about a CI failure or build error.
+DO NOT TRIGGER when: user is only reading or discussing code unrelated to dependencies, build, or CI.
 ---
 
 # Developer Guide
@@ -25,24 +27,34 @@ dependency.
 - `uv.lock` resolves the same way locally and in CI.
 - GPU-dependent operations (training, testing) work out of the box.
 
-### Option A — Use a Pre-built Image (fastest)
+### Step 1 — Acquire an Image
 
-Images are tagged by PR number and commit SHA:
+**Option A — NVIDIA-internal: pull a CI-built image**
+
+> ⚠️ Requires access to the internal GitLab instance.
+> See `tools/trigger_internal_ci.md` for setup (adding the git remote, obtaining a token).
+
+The internal GitLab CI publishes images to its container registry.
+Derive the registry host from your configured `gitlab` remote — the same
+host you use for `trigger_internal_ci.py`:
 
 ```bash
-# Pull the latest image built for the current PR branch:
-PR_NUMBER=$(git rev-parse --abbrev-ref HEAD | grep -oP '(?<=pull-request/)\d+')
-docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:${PR_NUMBER}
+# Derive host from your 'gitlab' remote:
+GITLAB_HOST=$(git remote get-url gitlab | sed 's/.*@\(.*\):.*/\1/')
 
-# Or pull the image built from main:
-docker pull 766267172432.dkr.ecr.us-east-1.amazonaws.com/megatron-lm:main
+docker pull ${GITLAB_HOST}/adlr/megatron-lm/mcore_ci_dev:main
 ```
 
-### Option B — Build from Scratch
+**Option B — Build from scratch (works for everyone)**
+
+> ⚠️ `Dockerfile.ci.dev` has two stages: `main` and `jet`. The `jet` stage
+> requires an internal build secret and will fail without it. Always pass
+> `--target main` to stop at the public stage.
 
 ```bash
 # dev image (default)
 docker build \
+  --target main \
   --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.dev) \
   --build-arg IMAGE_TYPE=dev \
   -f docker/Dockerfile.ci.dev \
@@ -50,6 +62,7 @@ docker build \
 
 # lts image
 docker build \
+  --target main \
   --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.lts) \
   --build-arg IMAGE_TYPE=lts \
   -f docker/Dockerfile.ci.dev \
@@ -59,7 +72,9 @@ docker build \
 Which image variant is used is controlled by the PR label `container::lts`;
 absent that label, `dev` is used.
 
-### Running Work Inside the Container
+### Step 2 — Launch the Container
+
+**Option A — Local Docker runtime**
 
 ```bash
 docker run --rm --gpus all \
@@ -67,6 +82,32 @@ docker run --rm --gpus all \
   -w /workspace \
   megatron-lm:local \
   bash -c "<your command>"
+```
+
+**Option B — Slurm cluster (for those without a local Docker runtime)**
+
+NVIDIA clusters typically use [Pyxis](https://github.com/NVIDIA/pyxis) +
+[enroot](https://github.com/NVIDIA/enroot). Request an interactive session:
+
+```bash
+srun \
+  --nodes=1 --gpus-per-node=8 \
+  --container-image megatron-lm:local \
+  --container-mounts $(pwd):/workspace \
+  --container-workdir /workspace \
+  --pty bash
+```
+
+For clusters that require a `.sqsh` archive first:
+
+```bash
+enroot import -o megatron-lm.sqsh dockerd://megatron-lm:local
+srun \
+  --nodes=1 --gpus-per-node=8 \
+  --container-image $(pwd)/megatron-lm.sqsh \
+  --container-mounts $(pwd):/workspace \
+  --container-workdir /workspace \
+  --pty bash
 ```
 
 ---
@@ -106,6 +147,23 @@ uv sync --locked --group lts --group test
 Several dependencies are sourced directly from git (TransformerEngine, nemo-run,
 FlashMLA, Emerging-Optimizers, nvidia-resiliency-ext). The locked `uv.lock` file
 pins exact revisions; update it with `uv lock` when changing `pyproject.toml`.
+
+### Adding a New Dependency
+
+Follow this three-step workflow:
+
+1. **Acquire a container image** — see [Step 1](#step-1--acquire-an-image) above.
+2. **Launch the container interactively** — see [Step 2](#step-2--launch-the-container) above.
+3. **Update the lock file inside the container**, then commit it:
+
+   ```bash
+   # Inside the container:
+   uv add <package>          # adds to pyproject.toml and resolves
+   uv lock                   # regenerates uv.lock
+   # Exit the container, then on the host:
+   git add pyproject.toml uv.lock
+   git commit -S -s -m "build: add <package> dependency"
+   ```
 
 ---
 
@@ -398,3 +456,4 @@ PR's changes or is a pre-existing issue on `main`.
 | `No space left on device` during uv ops | Cache fills container's `/root/.cache/` | Mount a host cache dir via `-v $HOME/.cache/uv:/root/.cache/uv` |
 | Pre-commit fails with linting errors | Code style violations | Run `BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh` |
 | Port collision on multi-GPU runs | torchrun binding conflicts | Use `torch.distributed.run` via the container entry point |
+| `docker build` fails with secret-related error | `Dockerfile.ci.dev` has a `jet` stage that requires an internal secret | Add `--target main` to stop before the `jet` stage |
