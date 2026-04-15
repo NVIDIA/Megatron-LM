@@ -44,7 +44,7 @@ class BagelMCoreModel(GPTModel):
             *args, **kwargs: Arguments passed to GPTModel
         """
         super().__init__(*args, **kwargs)
-        self.share_embeddings_and_output_weights = True
+        self.share_embeddings_and_output_weights = False
 
         self.llm_config = llm_config
         self.num_heads = kwargs.get('config').num_attention_heads if 'config' in kwargs else 28
@@ -300,13 +300,22 @@ class BagelMCoreModel(GPTModel):
 
                 # Apply output_layer to get logits
                 # Shape: [seq_len, hidden_size] -> [num_loss_tokens, vocab_size]
-                output_weight = None
                 if self.share_embeddings_and_output_weights:
                     output_weight = self.shared_embedding_or_output_weight()
-                logits_at_loss = F.linear(
-                    last_hidden_state[ce_loss_indexes],
-                    output_weight
+                else:
+                    output_weight = None
+
+                # The output layer handles tensor parallelism properly (and fused CE loss if enabled)
+                # Instead of manually gathering weights or calling F.linear directly which fails under FSDP,
+                # we call the module's forward.
+                # However, since ce_loss_indexes might just be a subset, and output_layer expects
+                # [seq_len, batch, hidden], we can just compute the logits for the relevant hidden states.
+                logits_at_loss, _ = self.output_layer(
+                    last_hidden_state[ce_loss_indexes].unsqueeze(1),
+                    weight=output_weight
                 )
+                logits_at_loss = logits_at_loss.squeeze(1)
+
                 ce = F.cross_entropy(logits_at_loss, packed_label_ids, reduction="none")
 
             return dict(last_hidden_state=last_hidden_state, ce=ce)

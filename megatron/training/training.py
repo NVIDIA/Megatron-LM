@@ -2096,7 +2096,8 @@ def training_log(
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
+        _flops_fn = getattr(args, 'multimodal_flops_fn', None) or num_floating_point_operations
+        throughput = _flops_fn(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
@@ -2993,7 +2994,9 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
+        # Use custom multimodal FLOPS function if registered, otherwise default LLM-only.
+        _flops_fn = getattr(args, 'multimodal_flops_fn', None) or num_floating_point_operations
+        num_floating_point_operations_in_batch = _flops_fn(args, batch_size)
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 

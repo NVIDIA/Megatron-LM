@@ -303,4 +303,12 @@ def model_provider_bagel(
         for param in module.parameters():
             param.requires_grad = False
 
+    # Register multimodal FLOPS function for accurate throughput reporting
+    try:
+        from examples.mimo.utils.flops import num_floating_point_operations_multimodal
+        _args.multimodal_flops_fn = num_floating_point_operations_multimodal
+        print("[model_provider_bagel] Registered multimodal FLOPS function for throughput reporting")
+    except ImportError:
+        pass
+
     return mimo_model

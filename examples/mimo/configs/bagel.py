@@ -79,16 +79,15 @@ def get_bagel_language_model_config(
     cfg.bf16 = True
 
     if use_moe_mlp:
-        # cfg.num_moe_experts = 128
-        cfg.num_moe_experts = 16
+        cfg.num_moe_experts = getattr(hf_config, 'num_experts', 128)
         cfg.moe_router_load_balancing_type = "aux_loss"
         cfg.moe_aux_loss_coeff = 1e-3
-        cfg.moe_router_topk = 8
+        cfg.moe_router_topk = getattr(hf_config, 'num_experts_per_tok', 8)
         cfg.moe_router_pre_softmax = False
         cfg.moe_grouped_gemm = True
         cfg.moe_token_dispatcher_type = "alltoall"
         cfg.moe_permute_fusion = True
-        cfg.moe_ffn_hidden_size = int(0.375 * hf_config.hidden_size) # 0.375 is from Qwen3-30B
+        cfg.moe_ffn_hidden_size = getattr(hf_config, 'moe_intermediate_size', int(0.375 * hf_config.hidden_size))
 
     # Apply user overrides last.
     if config is not None:

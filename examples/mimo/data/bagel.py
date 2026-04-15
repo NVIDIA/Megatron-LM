@@ -23,6 +23,10 @@ from bagel.data import dataset_info as bagel_dataset_info
 from bagel.data.data_utils import add_special_tokens
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
+from megatron.core.parallel_state import (
+    get_data_parallel_rank,
+    get_data_parallel_world_size,
+)
 
 logging.basicConfig(level=logging.INFO, force=True)
 
@@ -93,8 +97,8 @@ def bagel_dataloader_provider(train_val_test_num_samples):
         'data_config': data_config,
         'tokenizer': tokenizer,
         'special_tokens': special_token_ids,
-        'local_rank': args.rank,
-        'world_size': args.world_size,
+        'local_rank': get_data_parallel_rank(),
+        'world_size': get_data_parallel_world_size(),
         'num_workers': getattr(args, 'num_workers', 1),
         'expected_num_tokens': getattr(args, 'seq_length', 32768),
         'max_num_tokens_per_sample': getattr(args, 'max_num_tokens_per_sample', 16384),
