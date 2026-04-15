@@ -10,7 +10,10 @@ import torch
 DEBUG = False
 DEBUG_RANK = 0
 
-from nemo.lens.helpers import trace_fn as _otel_trace_fn
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry._fallbacks import trace_fn as _otel_trace_fn
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 

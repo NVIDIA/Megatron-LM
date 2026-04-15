@@ -207,10 +207,16 @@ stimer = StragglerDetector()
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 # OTel: module-level helpers imported once at startup.
-from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
-from nemo.lens.helpers import managed_span as _otel_managed_span
-from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
-from nemo.lens.helpers import trace_fn as _otel_trace_fn
+try:
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+    from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry._fallbacks import is_span_group_enabled as _otel_sg_enabled
+    from megatron.core.telemetry._fallbacks import managed_span as _otel_managed_span
+    from megatron.core.telemetry._fallbacks import safe_set_span_attributes as _otel_safe_set_attrs
+    from megatron.core.telemetry._fallbacks import trace_fn as _otel_trace_fn
 
 
 def destroy_global_state():
@@ -2217,7 +2223,7 @@ def training_log(
         # OTel: emit training metrics at log interval (export rank only).
         _otel_telemetry_log = get_telemetry()
         if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
-            from nemo.lens.instruments.training import record_training_metrics
+            from megatron.core.telemetry.training_metrics import record_training_metrics
             _meta_keys = (advanced_iters_key, skipped_iters_key, nan_iters_key)
             _loss_keys = [k for k in total_loss_dict if k not in _meta_keys]
             _avg_loss = (

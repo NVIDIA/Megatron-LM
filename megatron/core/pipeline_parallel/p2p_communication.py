@@ -6,7 +6,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from nemo.lens.helpers import trace_fn as _otel_trace_fn
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry._fallbacks import trace_fn as _otel_trace_fn
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.utils import nvtx_decorator

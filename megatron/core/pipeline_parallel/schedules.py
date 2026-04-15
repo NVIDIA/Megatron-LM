@@ -38,7 +38,10 @@ from .combined_1f1b import (
 )
 from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
-from nemo.lens.helpers import trace_fn as _otel_trace_fn
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry._fallbacks import trace_fn as _otel_trace_fn
 
 # Types
 Shape = Union[List[int], torch.Size]

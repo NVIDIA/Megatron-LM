@@ -296,7 +296,7 @@ def _set_telemetry(args):
     """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
     global _GLOBAL_TELEMETRY_HANDLE
     from nemo.lens import NemoLensConfig, setup_telemetry
-    from nemo.lens.groups_megatron import MegatronSpanGroup
+    from megatron.core.telemetry.span_groups import MegatronSpanGroup
 
     config = NemoLensConfig.from_env(
         prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
