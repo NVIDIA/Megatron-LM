@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.inference.communication.torch_symm_triton import (
-    multimem_all_gather_v,
+    multimem_all_gather_v3,
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -455,20 +455,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
-        multimem_all_gather_v(
-            agv_h["tensor"], hidden_states, agv_h["handle"],
-            rank_token_offset=rank_token_offset,
-            ep_max_tokens=ep_max_tokens,
-            engine_max_tokens=engine_max,
-        )
-        multimem_all_gather_v(
-            agv_r["tensor"], self.routing_map, agv_r["handle"],
-            rank_token_offset=rank_token_offset,
-            ep_max_tokens=ep_max_tokens,
-            engine_max_tokens=engine_max,
-        )
-        multimem_all_gather_v(
-            agv_p["tensor"], probs, agv_p["handle"],
+        multimem_all_gather_v3(
+            agv_h["tensor"], agv_r["tensor"], agv_p["tensor"],
+            hidden_states, self.routing_map, probs,
+            agv_h["handle"], agv_r["handle"], agv_p["handle"],
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             engine_max_tokens=engine_max,
