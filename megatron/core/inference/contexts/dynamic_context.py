@@ -1658,7 +1658,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            nvls_dispatcher=not self._nccl_ep_dispatcher,
+            match_ep_token_counts=self._nccl_ep_dispatcher,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 

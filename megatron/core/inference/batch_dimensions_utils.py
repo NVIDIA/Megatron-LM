@@ -457,7 +457,7 @@ class CUDAGraphBatchDimensionBuilder:
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
         strict: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
-        nvls_dispatcher: bool = False,
+        match_ep_token_counts: bool = True,
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -470,10 +470,10 @@ class CUDAGraphBatchDimensionBuilder:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
-            nvls_dispatcher: If True, the NVLS dispatcher is active and handles per-rank token
-                count variation internally via AGV/RSV — EP sync is skipped. If False (default),
-                the NCCL dispatcher is active and requires EP sync to ensure all ranks agree on
-                the same CUDA graph.
+            match_ep_token_counts: If True (default), token counts are synced across EP ranks via
+                all-reduce-max so all ranks select the same CUDA graph. Set to False when the
+                dispatcher handles per-rank token variation internally (e.g. AGV/RSV in the NVLS
+                path) and external EP sync is not needed.
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """
@@ -482,7 +482,7 @@ class CUDAGraphBatchDimensionBuilder:
             # no need to match if no cuda graph batch dimensions are provided
             return None
 
-        if not nvls_dispatcher and ep_group is not None:
+        if match_ep_token_counts and ep_group.size() > 1:
             # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
             # across the EP group so graph selection is consistent.
             adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
