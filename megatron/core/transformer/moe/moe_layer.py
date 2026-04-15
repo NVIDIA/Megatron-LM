@@ -31,7 +31,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -693,8 +693,9 @@ class _RegisterDelayedWgradForExperts(torch.autograd.Function):
 
         wgrad_stream.wait_event(event)
         with torch.cuda.stream(wgrad_stream):
-            with torch.cuda.nvtx.range("delayed_expert_wgrad"):
-                module.backward_dw(routed_experts=True, shared_experts=False)
+            nvtx_range_push("delayed_expert_wgrad")
+            module.backward_dw(routed_experts=True, shared_experts=False)
+            nvtx_range_pop("delayed_expert_wgrad")
             event.record(wgrad_stream)
 
         torch.cuda.current_stream().wait_event(event)
