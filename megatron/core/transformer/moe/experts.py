@@ -1323,6 +1323,14 @@ class TEGroupedMLP(MegatronModule):
                 assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
                 fused_children[2].backward_dw()
                 fused_children[0].backward_dw()
+                # DDP registers wgrad hooks on the original linear_fc1/fc2 module objects
+                # (those are in the nn.Module tree), but backward_dw() is called on the
+                # NEW GroupedLinear instances created by _make_fused_ops().  We must
+                # explicitly fire the hooks on the originals so DDP can zero param.grad
+                # and trigger reduce-scatter – otherwise param.grad is never cleared and
+                # AccumulateGrad performs a spurious add_ into main_grad.
+                self.linear_fc2._trigger_wgrad_accumulation_and_reduce_hooks()
+                self.linear_fc1._trigger_wgrad_accumulation_and_reduce_hooks()
             return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
