@@ -4,7 +4,6 @@ from megatron.training.config.common_config import RNGConfig, DistributedInitCon
 from megatron.training.config.training_config import TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.training.config.resilience_config import RerunStateMachineConfig, StragglerDetectionConfig
 
 @dataclass(kw_only=True)
