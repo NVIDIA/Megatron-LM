@@ -78,7 +78,11 @@ runs:
     - name: Setup python and install dependencies
       shell: bash -x -e -u -o pipefail {0}
       run: |
-        apt-get update
+        for i in 1 2 3; do
+          apt-get update && break
+          echo "apt-get update failed (attempt $i/3), retrying in 10s..."
+          sleep 10
+        done
         apt-get install -y python3.12 python3.12-venv uuid-runtime
         curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
 

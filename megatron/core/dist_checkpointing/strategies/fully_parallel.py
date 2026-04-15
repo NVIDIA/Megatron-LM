@@ -23,10 +23,9 @@ from megatron.core.dist_checkpointing.exchange_utils import (
     exchange_loaded_objects_gather_object,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
-from megatron.core.dist_checkpointing.strategies.base import (
-    AsyncSaveShardedStrategy,
-    LoadShardedStrategy,
-    SaveShardedStrategy,
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
 )
 from megatron.core.dist_checkpointing.utils import (
     _sharded_object_id,
@@ -38,14 +37,13 @@ from megatron.core.dist_checkpointing.validation import (
     determine_global_metadata,
     validate_sharding_integrity,
 )
-from megatron.core.utils import get_pg_rank, get_pg_size
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T', ShardedObject, ShardedTensor)
 
 
-class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
+class FullyParallelSaveStrategyWrapper:
     """Wraps arbitrary strategy and distributes the save during `save`.
 
     The save distribution happens without any *data* communication.
@@ -60,7 +58,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
     described in `distribute_shards_to_ranks`.
 
     Args:
-        strategy (SaveShardedStrategy): base strategy to wrap
+        strategy (TorchDistSaveShardedStrategy): base strategy to wrap
         parallelization_group (ProcessGroup, optional): process group to use for save
             distribution. Note that this doesn't have to match exactly the
             data distribution, but should cover the replication pattern
@@ -72,16 +70,20 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
 
     def __init__(
         self,
-        strategy: SaveShardedStrategy,
+        strategy: TorchDistSaveShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
+        backend: str = "torch_dist",
+        version: int = 1,
     ):
-        super().__init__(strategy.backend, strategy.version)
+        """ """
         self.base_strategy = strategy
         if parallelization_group is None:
             parallelization_group = torch.distributed.group.WORLD
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
+        self.backend = backend
+        self.version = version
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
@@ -92,10 +94,6 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         async_strategy: str = "nvrx",
     ):
         """ """
-        if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
-            raise CheckpointingException(
-                f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
-            )
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
 
@@ -140,19 +138,14 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         end = time()
         logger.debug(f"parallel save sharding, time: {end - start}")
 
-    @property
-    def can_handle_sharded_objects(self):
-        """ """
-        return self.base_strategy.can_handle_sharded_objects
 
-
-class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
+class FullyParallelLoadStrategyWrapper:
     """Wraps arbitrary load strategy and distributes the load during `load`.
 
     See `load` method docs for details.
 
     Args:
-        strategy (LoadShardedStrategy): base strategy to wrap
+        strategy (TorchDistLoadShardedStrategy): base strategy to wrap
         parallelization_group (ProcessGroup, optional): process group to use for load
             distribution. Note that this doesn't have to match exactly the
             data distribution, but should cover the replication pattern
@@ -174,12 +167,11 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
     def __init__(
         self,
-        strategy: LoadShardedStrategy,
+        strategy: TorchDistLoadShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
     ):
-        super().__init__()
         self.base_strategy = strategy
         if parallelization_group is None:
             parallelization_group = (
@@ -227,6 +219,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             a state dict that would be loaded with the underlying strategy
             without this wrapper.
         """
+        from megatron.core.utils import get_pg_size
 
         loaded_state_dict = {}
 
@@ -403,11 +396,6 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         return precomputed_distribution
 
-    @property
-    def can_handle_sharded_objects(self):
-        """ """
-        return self.base_strategy.can_handle_sharded_objects
-
     def load_tensors_metadata(self, checkpoint_dir: Path):
         """ """
         return self.base_strategy.load_tensors_metadata(checkpoint_dir)
@@ -415,14 +403,6 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     def load_sharded_metadata(self, checkpoint_dir: Path):
         """ """
         return self.base_strategy.load_sharded_metadata(checkpoint_dir)
-
-    def check_backend_compatibility(self, loaded_version):
-        """ """
-        return self.base_strategy.check_backend_compatibility(loaded_version)
-
-    def check_version_compatibility(self, loaded_version):
-        """ """
-        return self.base_strategy.check_version_compatibility(loaded_version)
 
 
 def distribute_main_replicas_with_precomputed_distribution(
@@ -455,6 +435,8 @@ def distribute_main_replicas_with_precomputed_distribution(
     rank1: A: 1, B: 0, C: 1
     rank2: A: 1, B: 1, C: 0
     """
+    from megatron.core.utils import get_pg_rank, get_pg_size
+
     if parallelization_group is None:
         parallelization_group = torch.distributed.group.WORLD
     if get_pg_size(group=parallelization_group) <= 1:
