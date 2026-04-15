@@ -1956,30 +1956,29 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Unified loop for both standalone and coordinator modes.
         The coordinator client (`cc`) is absent in standalone mode. When present, it provides
-        `schedule_requests`, `ep_establish_consensus`, `schedule_and_consensus`, and `world_barrier`
+        `schedule_requests`, `ep_establish_consensus`, and `world_barrier`.
 
         Idle-blocking is handled by `_cond`, blocking until one of the following is true:
         - Unfinished requests in the engine.
         - Pending messages from ZMQ.
         - EP peer notifications.
         - A state transition is in-progress.
-        - A pipelined drain+consensus task from the previous iteration is awaiting commit.
+        - A pipelined drain from the previous iteration is awaiting commit.
 
         State machine (coordinator only):
-        - RUNNING: EP consensus to check for work, then step or idle.
-        - PAUSING: EP consensus to reach pause agreement, then world barrier.
+        - RUNNING: Local work or EP signal -> step immediately; NCCL synchronizes ranks.
+        - PAUSING: EP consensus (all-reduce) to reach pause agreement, then world barrier.
         - PAUSED / SUSPENDED: _cond blocks until control signal arrives.
         - UNPAUSING / SUSPENDING / RESUMING / STOPPING: world barrier, then transition.
         """
         self._loop = get_asyncio_loop(loop)
         cc = getattr(self, 'coordinator_client', None)
 
-        # Background task holding the NEXT iteration's drain + ep_consensus work.
-        pending_schedule_and_consensus: Optional[asyncio.Task] = None
+        # Background task holding the NEXT iteration's ZMQ drain.
+        pending_drain: Optional[asyncio.Task] = None
 
         def should_proceed():
-            # Wake up if there's anything to commit, drain, transition, or step.
-            if pending_schedule_and_consensus is not None:
+            if pending_drain is not None:
                 return True
             if cc and cc.pending_messages:
                 return True
@@ -1995,59 +1994,77 @@ class DynamicInferenceEngine(AbstractEngine):
                 async with self._cond:
                     await self._cond.wait_for(should_proceed)
 
-                # Commit the pipelined drain+consensus from the previous iteration.
-                global_work: int = 0
-                all_pausing: bool = False
+                # Commit pipelined drain if it exists.
                 if self.use_coordinator:
-                    if pending_schedule_and_consensus is None:
-                        # Foreground path: schedule_requests applies its own drained state
-                        # immediately (defer=False is the default), so no apply_deferred needed.
-                        await cc.schedule_requests(self)
-                        if self.state in (EngineState.RUNNING, EngineState.PAUSING):
-                            local_pending = self.context.get_active_request_count() + len(
-                                self.waiting_request_ids
-                            )
-                            global_work, all_pausing = await cc.ep_establish_consensus(
-                                local_pending, signal_consensus=(self.state == EngineState.PAUSING)
-                            )
-                    else:
-                        global_work, all_pausing = await pending_schedule_and_consensus
-                        pending_schedule_and_consensus = None
-                        # Side task ran during the previous async_step with defer=True. Now
-                        # that the step is done, mutating engine state is safe again.
+                    if pending_drain is not None:
+                        await pending_drain
+                        pending_drain = None
                         cc.apply_deferred(self)
+                    else:
+                        await cc.schedule_requests(self)
 
-                if self.state in (EngineState.RUNNING, EngineState.PAUSING):
+                if self.state == EngineState.RUNNING:
                     if self.use_coordinator:
+                        local_pending = self.context.get_active_request_count() + len(
+                            self.waiting_request_ids
+                        )
+                        # Consume the EP signal — we're about to act on it.
+                        peer_has_work = cc.ep_peer_has_work
+                        if cc._ep_channel is not None:
+                            cc._ep_channel.has_signal_event.clear()
+
+                        if local_pending > 0:
+                            # This rank has work: global_work > 0 is a tautology.
+                            # Re-signal EP peers so they participate in this step.
+                            if cc._ep_channel is not None:
+                                cc._ep_channel.notify_has_signal()
+                            # Pipeline: drain for the next iteration while stepping.
+                            pending_drain = self._loop.create_task(
+                                cc.schedule_requests(self, defer=True)
+                            )
+                            await self.async_step()
+                        elif peer_has_work:
+                            # No local work, but an EP peer signaled: dummy forward.
+                            pending_drain = self._loop.create_task(
+                                cc.schedule_requests(self, defer=True)
+                            )
+                            self.step_start_event.record()
+                            self.controller.dummy_forward()
+                            self.step_end_event.record()
+                            # Poll the CUDA event instead of blocking the event loop.
+                            while not self.step_end_event.query():
+                                await asyncio.sleep(0)
+                            self.context.step_count += 1
+                            self.context.prefix_cache_lru_clock += 1
+                        # else: no local work, no signal means idle this iteration.
+                    else:
+                        await self.async_step()
+
+                elif self.state == EngineState.PAUSING:
+                    if self.use_coordinator:
+                        # Pause requires unanimous EP agreement; do a real all-reduce.
+                        local_pending = self.context.get_active_request_count() + len(
+                            self.waiting_request_ids
+                        )
+                        global_work, all_pausing = await cc.ep_establish_consensus(
+                            local_pending, signal_consensus=True
+                        )
                         if all_pausing:
                             await cc.world_barrier()
                             self.state = EngineState.PAUSED
                             self._state_events[EngineState.PAUSED].set()
                         elif global_work > 0:
-                            # Kick off the NEXT iteration's drain + consensus as a background
-                            # task. It will populate cc._deferred_requests; the iteration
-                            # that commits it will call apply_deferred before its own step.
-                            pending_schedule_and_consensus = self._loop.create_task(
-                                cc.schedule_and_consensus(self)
-                            )
-                            local_pending = self.context.get_active_request_count() + len(
-                                self.waiting_request_ids
-                            )
                             if local_pending > 0:
                                 await self.async_step()
                             else:
-                                # Dummy forward to participate in EP collective.
                                 self.step_start_event.record()
                                 self.controller.dummy_forward()
                                 self.step_end_event.record()
-                                # Poll the CUDA event instead of blocking the event loop.
                                 while not self.step_end_event.query():
                                     await asyncio.sleep(0)
                                 self.context.step_count += 1
                                 self.context.prefix_cache_lru_clock += 1
-                        # else: no global work and not all pausing → idle this iteration.
-                    else:
-                        await self.async_step()
+                        # else: no global work and not all pausing means idle, re-enter PAUSING.
 
                 elif self.state in (
                     EngineState.UNPAUSING,
@@ -2077,12 +2094,11 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
         finally:
-            # Cancel any outstanding pipelined drain+consensus task before shutdown.
-            if pending_schedule_and_consensus is not None:
-                if not pending_schedule_and_consensus.done():
-                    pending_schedule_and_consensus.cancel()
+            if pending_drain is not None:
+                if not pending_drain.done():
+                    pending_drain.cancel()
                 try:
-                    await pending_schedule_and_consensus
+                    await pending_drain
                 except (asyncio.CancelledError, Exception):
                     pass
             await self.shutdown()

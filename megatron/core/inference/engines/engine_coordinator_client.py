@@ -525,26 +525,6 @@ class EngineCoordinatorClient:
             self._deferred_signals = []
             self._apply_signals(signals, engine)
 
-    async def schedule_and_consensus(self, engine) -> tuple[int, bool]:
-        """Fuse schedule_requests and ep_establish_consensus for pipelined execution.
-
-        Runs as a background task while `async_step` is in flight;
-        must NOT mutate engine state.
-
-        Args:
-            engine: The DynamicInferenceEngine instance, used to read state for consensus.
-
-        Returns:
-            (global_work, all_pausing): max work across EP; whether all peers signaled consensus.
-        """
-        from megatron.core.inference.engines.dynamic_engine import EngineState
-
-        await self.schedule_requests(engine, defer=True)
-        local_pending = self.projected_pending_count(engine)
-        return await self.ep_establish_consensus(
-            local_pending, signal_consensus=(engine.state == EngineState.PAUSING)
-        )
-
     async def world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
 
@@ -574,13 +554,12 @@ class EngineCoordinatorClient:
 
         Args:
             engine: The DynamicInferenceEngine instance.
-            defer: If True (set by the pipelined `schedule_and_consensus` background task),
-                ALL engine mutations are deferred: SUBMIT_REQUEST and SET_GENERATION_EPOCH
-                are stashed in `_deferred_requests` / `_deferred_epoch`, and control signals
-                (PAUSE, UNPAUSE, etc.) are stashed in `_deferred_signals`. The caller must
-                invoke `apply_deferred(engine)` from the main loop after `async_step`
-                finishes to commit everything atomically.
-                When False (foreground path), requests, epochs, and signals are applied
+            defer: If True, ALL engine mutations are deferred: SUBMIT_REQUEST and
+                SET_GENERATION_EPOCH are stashed in `_deferred_requests` / `_deferred_epoch`,
+                and control signals (PAUSE, UNPAUSE, etc.) are stashed in `_deferred_signals`.
+                The caller must invoke `apply_deferred(engine)` after `async_step` finishes to
+                commit everything atomically.
+                When False (default), requests, epochs, and signals are applied
                 immediately since no step is in flight.
         """
         from megatron.core.inference.engines.dynamic_engine import EngineState
