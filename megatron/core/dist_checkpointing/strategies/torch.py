@@ -732,6 +732,7 @@ class TorchDistSaveShardedStrategy:
         if self.dtensor_format:
             values_to_save = inject_placeholders(sharded_state_dict)
             values_to_save = translate_state_dict_to_dcp_compatible(values_to_save)
+            fill_placeholders(sharded_state_dict, values_to_save)
             return torch.distributed.checkpoint.save(sharded_state_dict, checkpoint_id=checkpoint_dir)
         else:
             strategy = "nvrx" if HAVE_NVRX else "mcore"
@@ -929,7 +930,15 @@ class TorchDistLoadShardedStrategy:
         Returns: loaded state dict
         """
         if self.dtensor_format:
-            return torch.distributed.checkpoint.load(state_dict=sharded_state_dict, checkpoint_id=checkpoint_dir)
+            values_to_load = inject_placeholders(sharded_state_dict)
+            values_to_load = translate_state_dict_to_dcp_compatible(values_to_load)
+
+            torch.distributed.checkpoint.load(state_dict=sharded_state_dict, checkpoint_id=checkpoint_dir)
+            unwrap_dtensors_and_sh_ten(values_to_load)
+
+            fill_placeholders(sharded_state_dict, values_to_load)
+
+            return sharded_state_dict
 
         flexible_shape_sharded_tensors = [
             sh_ten
