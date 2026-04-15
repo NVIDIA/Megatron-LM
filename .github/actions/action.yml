@@ -75,16 +75,16 @@ runs:
       shell: bash
       run: sudo chown -R $(whoami) /home/runner/
 
-    - name: Setup python
-      uses: actions/setup-python@v5
-      with:
-        python-version: 3.12
-
-    - name: Install uuidgen
+    - name: Setup python and install dependencies
       shell: bash -x -e -u -o pipefail {0}
       run: |
-        apt-get update
-        apt-get install -y uuid-runtime
+        for i in 1 2 3; do
+          apt-get update && break
+          echo "apt-get update failed (attempt $i/3), retrying in 10s..."
+          sleep 10
+        done
+        apt-get install -y python3.12 python3.12-venv uuid-runtime
+        curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
 
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
@@ -97,7 +97,6 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         export NCCL_DEBUG=INFO
-        pip install --no-cache-dir "uv<0.9.29"
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
@@ -137,7 +136,6 @@ runs:
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
-        pip install --no-cache-dir "uv<0.9.29"
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
