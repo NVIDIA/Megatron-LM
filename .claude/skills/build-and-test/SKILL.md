@@ -47,9 +47,14 @@ docker pull ${GITLAB_HOST}/adlr/megatron-lm/mcore_ci_dev:main
 
 **Option B — Build from scratch (works for everyone)**
 
+> ⚠️ `Dockerfile.ci.dev` has two stages: `main` and `jet`. The `jet` stage
+> requires an internal build secret and will fail without it. Always pass
+> `--target main` to stop at the public stage.
+
 ```bash
 # dev image (default)
 docker build \
+  --target main \
   --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.dev) \
   --build-arg IMAGE_TYPE=dev \
   -f docker/Dockerfile.ci.dev \
@@ -57,6 +62,7 @@ docker build \
 
 # lts image
 docker build \
+  --target main \
   --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.lts) \
   --build-arg IMAGE_TYPE=lts \
   -f docker/Dockerfile.ci.dev \
@@ -450,3 +456,4 @@ PR's changes or is a pre-existing issue on `main`.
 | `No space left on device` during uv ops | Cache fills container's `/root/.cache/` | Mount a host cache dir via `-v $HOME/.cache/uv:/root/.cache/uv` |
 | Pre-commit fails with linting errors | Code style violations | Run `BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh` |
 | Port collision on multi-GPU runs | torchrun binding conflicts | Use `torch.distributed.run` via the container entry point |
+| `docker build` fails with secret-related error | `Dockerfile.ci.dev` has a `jet` stage that requires an internal secret | Add `--target main` to stop before the `jet` stage |
