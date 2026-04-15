@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from _typeshed import DataclassInstance
 import dataclasses
 import typing
 import types
@@ -264,7 +263,7 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
-def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> DataclassInstance | dict[str, Any]:
+def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
     """Create a config dataclass from the appropriate values in the `args` Namespace.
 
     This is generic, i.e. it will work if dataclass attribute names map 1-to-1 with
