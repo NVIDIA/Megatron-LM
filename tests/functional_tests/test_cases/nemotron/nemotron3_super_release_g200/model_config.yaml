@@ -37,7 +37,7 @@ MODEL_ARGS:
   --manual-gc-interval: 10
   --no-create-attention-mask-in-dataloader: true
   --num-workers: 1
-  --exit-interval: 150
+  --exit-interval: 750
   --override-opt_param-scheduler: true
 
   # Network size args
