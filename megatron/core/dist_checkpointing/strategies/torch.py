@@ -424,10 +424,6 @@ def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -
                     f"ShardedObject '{x.key}' has non-trivial global_shape {x.global_shape}. "
                     "Only coordinator rank's data will be saved in DTensor format."
                 )
-            # Serialize to BytesIO so DCP's DefaultSavePlanner can handle it natively.
-            buf = io.BytesIO()
-            torch.save(x.data, buf)
-            x = buf
         return x
 
     dict_list_map_inplace(sh_ten_to_dtensor, sharded_state_dict)
@@ -443,11 +439,6 @@ def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
             x = x._sh_ten.data
         elif isinstance(x, ShardedObject):
             x = x.data
-        elif isinstance(x, io.BytesIO):
-            # Extra states were serialized as BytesIO during DTensor-format save;
-            # DCP loads them back as BytesIO — deserialize to recover the original data.
-            x.seek(0)
-            x = torch.load(x, weights_only=False)
         return x
 
     dict_list_map_inplace(dtensor_to_ten, state_dict)
