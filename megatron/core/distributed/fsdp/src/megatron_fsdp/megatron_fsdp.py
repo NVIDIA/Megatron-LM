@@ -17,6 +17,7 @@ import importlib
 import logging
 from contextlib import contextmanager
 from enum import Enum, auto
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -98,7 +99,7 @@ def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
 
     for param in module.parameters():
         if getattr(param, 'skip_backward_post_hook', False):
-            param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
+            param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param], True)
 
 
 class MegatronFSDP(torch.nn.Module):
@@ -654,7 +655,7 @@ class MegatronFSDP(torch.nn.Module):
             module._training_state = TrainingState.IDLE
 
         @torch.compiler.disable
-        def _process_post_backward_gradients(param_list):
+        def _process_post_backward_gradients(param_list, is_delayed=False):
             """
             Process gradients for a list of parameters after the backward pass.
 
@@ -665,6 +666,9 @@ class MegatronFSDP(torch.nn.Module):
             Args:
                 param_list (List[torch.nn.Parameter]): Parameters whose gradients
                     should be processed.
+                is_delayed (bool, optional): If True, indicates this is a delayed
+                    gradient processing call triggered by a post-wgrad accumulation
+                    hook. Defaults to False.
 
             Behavior:
                 - Skips processing for shared parameters (those with ``_is_shared=True``),
@@ -695,14 +699,15 @@ class MegatronFSDP(torch.nn.Module):
             # wgrad accumulation hook (post_wgrad_grad_acc_hook).  If skip_backward_post_hook
             # is set but the delayed hook was never installed, process the parameter
             # immediately as a safety fallback to avoid silently dropping gradients.
-            param_list = [
-                p
-                for p in param_list
-                if not (
-                    getattr(p, 'skip_backward_post_hook', False)
-                    and hasattr(p, 'post_wgrad_grad_acc_hook')
-                )
-            ]
+            if not is_delayed:
+                param_list = [
+                    p
+                    for p in param_list
+                    if not (
+                        getattr(p, 'skip_backward_post_hook', False)
+                        and hasattr(p, 'post_wgrad_grad_acc_hook')
+                    )
+                ]
 
             if not param_list:
                 return
@@ -903,7 +908,7 @@ class MegatronFSDP(torch.nn.Module):
 
         self._root_pre_backward_hook_issued = False
 
-        def _root_pre_backward(module: nn.Module, *unused):
+        def _root_pre_backward(module: nn.Module, *unused, skip_backward_hook: bool = False):
             """Marks the module's training state as PRE_BACKWARD before the
             backprop, this function is registered on the root module.
 
@@ -940,6 +945,8 @@ class MegatronFSDP(torch.nn.Module):
                     param.grad_added_to_main_grad = False
             # Queue the root post-backward hook to reduce leftover gradients after
             # the backward pass.
+            if skip_backward_hook:
+                return
             torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
 
         @torch.compiler.disable
@@ -1027,6 +1034,12 @@ class MegatronFSDP(torch.nn.Module):
                 create_custom_backward_hook(module, _pre_backward_param_unshard)
             )
 
+        # Saved function handle for manual hook management.
+        self.post_forward_release_module = partial(_post_forward, input=None, output=None)
+        self.post_backward_release_module = _post_backward_release_module
+        self.pre_backward = partial(_root_pre_backward, module=None, skip_backward_hook=True)
+        self.post_backward = _root_post_backward
+
         fsdp_modules = []
         for name, module in root_module.named_modules():
             # Set post backward hook for TE grouped gemm if enabled comm overlap
@@ -1086,7 +1099,11 @@ class MegatronFSDP(torch.nn.Module):
             for param in grad_acc_param_list:
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
                     param.register_post_accumulate_grad_hook(
-                        lambda p: _process_post_backward_gradients([p])
+                        lambda p: (
+                            None
+                            if getattr(p, 'skip_backward_post_hook', False)
+                            else _process_post_backward_gradients([p])
+                        )
                     )
                 )
 

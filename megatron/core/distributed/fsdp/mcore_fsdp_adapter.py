@@ -40,6 +40,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -131,6 +132,31 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self._fix_tensor_parallel_attributes(module)
 
+        if config.overlap_moe_expert_parallel_comm:
+            assert not ddp_config.fsdp_double_buffer, (
+                "1F1B overlap with FSDP does not support double buffer. "
+                "Please set fsdp_double_buffer=False in the ddp config."
+            )
+            partial_cuda_graph_scopes = [
+                scope
+                for scope in config.cuda_graph_scope
+                if scope
+                not in (CudaGraphScope.full_iteration, CudaGraphScope.full_iteration_inference)
+            ]
+            assert not partial_cuda_graph_scopes, (
+                "1F1B overlap with FSDP does not support partial CUDA graph scopes "
+                f"({partial_cuda_graph_scopes}). "
+                "Please use cuda_graph_scope='full' or disable CUDA graphs."
+            )
+
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            assert self.fsdp_unit_modules == [TransformerLayer], (
+                "EP overlap with FSDP currently requires fsdp_unit_modules "
+                f"to be [TransformerLayer], got {self.fsdp_unit_modules}."
+            )
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -143,8 +169,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
+                # EP overlap schedule calls sub-modules directly instead of
+                # TransformerLayer.forward(), so fine-grained hooks are needed
+                # to manage _training_state and all-gather each sub-module's
+                # parameters individually.  This applies to all sharding
+                # strategies (not only optim_grads_params) because the hooks
+                # also maintain per-module training-state bookkeeping that the
+                # gradient-reduction pipeline relies on.
                 enable_fine_grained_param_gather_hook=(
-                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
+                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
+                    or config.overlap_moe_expert_parallel_comm
                 ),
             ),
         )
