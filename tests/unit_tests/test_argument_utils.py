@@ -13,7 +13,7 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
-    pretrain_container_from_args,
+    pretrain_cfg_container_from_args,
 )
 from megatron.training.config import PretrainConfigContainer
 
@@ -652,15 +652,15 @@ class TestArgumentGroupFactoryArgparseMeta:
 
 
 # ---------------------------------------------------------------------------
-# Tests for pretrain_container_from_args
+# Tests for pretrain_cfg_container_from_args
 # ---------------------------------------------------------------------------
 
 
 def _make_args(**overrides):
-    """Build the minimum Namespace required by pretrain_container_from_args.
+    """Build the minimum Namespace required by pretrain_cfg_container_from_args.
 
     These fields have non-trivial CLI→config name mappings or boolean inversions
-    that pretrain_container_from_args handles explicitly.
+    that pretrain_cfg_container_from_args handles explicitly.
     """
     defaults = {
         # CheckpointConfig boolean inversions (legacy-style --no-* flags)
@@ -692,7 +692,7 @@ def mock_ddp_config():
 
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
-    """Patch the two helper functions called by pretrain_container_from_args."""
+    """Patch the two helper functions called by pretrain_cfg_container_from_args."""
     with (
         patch(
             "megatron.training.argument_utils.get_megatron_optimizer_config",
@@ -706,10 +706,10 @@ def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
 
 
 class TestPretrainContainerFromArgsStructure:
-    """Test the top-level structure of the object returned by pretrain_container_from_args."""
+    """Test the top-level structure of the object returned by pretrain_cfg_container_from_args."""
 
     def test_returns_pretrain_config_container(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args())
+        result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
 
     @patch("megatron.training.argument_utils.get_megatron_ddp_config")
@@ -720,7 +720,7 @@ class TestPretrainContainerFromArgsStructure:
         mock_opt.return_value = (mock_optimizer, {})
         mock_ddp.return_value = MagicMock(spec=DistributedDataParallelConfig)
         args = _make_args()
-        result = pretrain_container_from_args(args)
+        result = pretrain_cfg_container_from_args(args)
         mock_opt.assert_called_once_with(args)
         assert result.optimizer is mock_optimizer
 
@@ -732,7 +732,7 @@ class TestPretrainContainerFromArgsStructure:
         mock_opt.return_value = (MagicMock(spec=OptimizerConfig), {})
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
-        result = pretrain_container_from_args(args)
+        result = pretrain_cfg_container_from_args(args)
         mock_ddp.assert_called_once_with(args)
         assert result.ddp is mock_ddp_instance
 
@@ -741,47 +741,47 @@ class TestCheckpointConfigMapping:
     """Test the boolean inversions and custom dest mappings for CheckpointConfig."""
 
     def test_no_save_optim_false_means_save_optim_true(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(no_save_optim=False))
+        result = pretrain_cfg_container_from_args(_make_args(no_save_optim=False))
         assert result.checkpoint.save_optim is True
 
     def test_no_save_optim_true_means_save_optim_false(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(no_save_optim=True))
+        result = pretrain_cfg_container_from_args(_make_args(no_save_optim=True))
         assert result.checkpoint.save_optim is False
 
     def test_no_save_rng_false_means_save_rng_true(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(no_save_rng=False))
+        result = pretrain_cfg_container_from_args(_make_args(no_save_rng=False))
         assert result.checkpoint.save_rng is True
 
     def test_no_save_rng_true_means_save_rng_false(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(no_save_rng=True))
+        result = pretrain_cfg_container_from_args(_make_args(no_save_rng=True))
         assert result.checkpoint.save_rng is False
 
     def test_no_load_optim_false_means_load_optim_true(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(no_load_optim=False))
+        result = pretrain_cfg_container_from_args(_make_args(no_load_optim=False))
         assert result.checkpoint.load_optim is True
 
     def test_no_load_optim_true_means_load_optim_false(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(no_load_optim=True))
+        result = pretrain_cfg_container_from_args(_make_args(no_load_optim=True))
         assert result.checkpoint.load_optim is False
 
     def test_no_load_rng_false_means_load_rng_true(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(no_load_rng=False))
+        result = pretrain_cfg_container_from_args(_make_args(no_load_rng=False))
         assert result.checkpoint.load_rng is True
 
     def test_no_load_rng_true_means_load_rng_false(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(no_load_rng=True))
+        result = pretrain_cfg_container_from_args(_make_args(no_load_rng=True))
         assert result.checkpoint.load_rng is False
 
     def test_ckpt_fully_parallel_save_mapping(self, patch_training_helpers):
         """ckpt_fully_parallel_save in args maps to fully_parallel_save in CheckpointConfig."""
         assert (
-            pretrain_container_from_args(
+            pretrain_cfg_container_from_args(
                 _make_args(ckpt_fully_parallel_save=True)
             ).checkpoint.fully_parallel_save
             is True
         )
         assert (
-            pretrain_container_from_args(
+            pretrain_cfg_container_from_args(
                 _make_args(ckpt_fully_parallel_save=False)
             ).checkpoint.fully_parallel_save
             is False
@@ -790,13 +790,13 @@ class TestCheckpointConfigMapping:
     def test_ckpt_fully_parallel_load_mapping(self, patch_training_helpers):
         """ckpt_fully_parallel_load in args maps to fully_parallel_load in CheckpointConfig."""
         assert (
-            pretrain_container_from_args(
+            pretrain_cfg_container_from_args(
                 _make_args(ckpt_fully_parallel_load=True)
             ).checkpoint.fully_parallel_load
             is True
         )
         assert (
-            pretrain_container_from_args(
+            pretrain_cfg_container_from_args(
                 _make_args(ckpt_fully_parallel_load=False)
             ).checkpoint.fully_parallel_load
             is False
@@ -805,7 +805,7 @@ class TestCheckpointConfigMapping:
     def test_direct_checkpoint_fields_from_args(self, patch_training_helpers):
         """Checkpoint fields with 1-to-1 name mapping are pulled directly from args."""
         args = _make_args(save="/path/to/save", load="/path/to/load", save_interval=500)
-        result = pretrain_container_from_args(args)
+        result = pretrain_cfg_container_from_args(args)
         assert result.checkpoint.save == "/path/to/save"
         assert result.checkpoint.load == "/path/to/load"
         assert result.checkpoint.save_interval == 500
@@ -815,17 +815,17 @@ class TestProfilingConfigMapping:
     """Test the --profile → use_nsys_profiler mapping for ProfilingConfig."""
 
     def test_profile_false_disables_nsys_profiler(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(profile=False))
+        result = pretrain_cfg_container_from_args(_make_args(profile=False))
         assert result.profiling.use_nsys_profiler is False
 
     def test_profile_true_enables_nsys_profiler(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(profile=True))
+        result = pretrain_cfg_container_from_args(_make_args(profile=True))
         assert result.profiling.use_nsys_profiler is True
 
     def test_direct_profiling_fields_from_args(self, patch_training_helpers):
         """Profiling fields with 1-to-1 name mapping are pulled directly from args."""
         args = _make_args(profile_step_start=5, profile_step_end=15)
-        result = pretrain_container_from_args(args)
+        result = pretrain_cfg_container_from_args(args)
         assert result.profiling.profile_step_start == 5
         assert result.profiling.profile_step_end == 15
 
@@ -834,17 +834,17 @@ class TestRerunStateMachineConfigMapping:
     """Test the check_for_nan_in_loss_and_grad → check_for_nan_in_loss mapping."""
 
     def test_check_for_nan_true(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(check_for_nan_in_loss_and_grad=True))
+        result = pretrain_cfg_container_from_args(_make_args(check_for_nan_in_loss_and_grad=True))
         assert result.rerun_state_machine.check_for_nan_in_loss is True
 
     def test_check_for_nan_false(self, patch_training_helpers):
-        result = pretrain_container_from_args(_make_args(check_for_nan_in_loss_and_grad=False))
+        result = pretrain_cfg_container_from_args(_make_args(check_for_nan_in_loss_and_grad=False))
         assert result.rerun_state_machine.check_for_nan_in_loss is False
 
     def test_direct_rerun_state_machine_fields_from_args(self, patch_training_helpers):
         """RerunStateMachineConfig fields with 1-to-1 name mapping are pulled directly from args."""
         args = _make_args(error_injection_rate=500, rerun_mode="report_stats")
-        result = pretrain_container_from_args(args)
+        result = pretrain_cfg_container_from_args(args)
         assert result.rerun_state_machine.error_injection_rate == 500
         assert result.rerun_state_machine.rerun_mode == "report_stats"
 
@@ -855,19 +855,19 @@ class TestTrainingConfigMapping:
     TrainingConfig is used as the representative case. The same pass-through logic applies to
     ValidationConfig, SchedulerConfig, RNGConfig, DistributedInitConfig, LoggerConfig, and
     StragglerDetectionConfig — dedicated test classes for those are only warranted if
-    pretrain_container_from_args() adds special handling for them.
+    pretrain_cfg_container_from_args() adds special handling for them.
     """
 
     def test_training_fields_from_args(self, patch_training_helpers):
         args = _make_args(train_iters=1000, micro_batch_size=4, global_batch_size=64)
-        result = pretrain_container_from_args(args)
+        result = pretrain_cfg_container_from_args(args)
         assert result.train.train_iters == 1000
         assert result.train.micro_batch_size == 4
         assert result.train.global_batch_size == 64
 
     def test_training_uses_defaults_when_fields_absent(self, patch_training_helpers):
         """When training fields are absent from args, TrainingConfig uses its defaults."""
-        result = pretrain_container_from_args(_make_args())
+        result = pretrain_cfg_container_from_args(_make_args())
         assert result.train.train_iters is None
         assert result.train.micro_batch_size is None
         assert result.train.global_batch_size is None

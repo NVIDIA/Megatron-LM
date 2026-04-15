@@ -277,7 +277,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
     else:
         return kwargs
 
-def pretrain_container_from_args(args: Namespace) -> PretrainConfigContainer:
+def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
 
