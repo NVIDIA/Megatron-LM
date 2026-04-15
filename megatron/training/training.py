@@ -1161,7 +1161,7 @@ def pretrain(
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
-        cfg_container.train.train_iters,
+        args.train_iters,
         cfg_container.validation.skip_train,
         args.do_train,
         args.do_valid,
@@ -1189,7 +1189,7 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (cfg_container.train.train_iters or 0) > 0:
+        if args.do_train and (args.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
                 model,
