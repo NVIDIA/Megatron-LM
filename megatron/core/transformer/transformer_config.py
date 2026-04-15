@@ -1190,7 +1190,7 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
-            if self.gated_linear_unit and self.cuda_graph_impl == "local":
+            if self.gated_linear_unit:
                 raise ValueError(
                     "--transformer-impl='inference_optimized' does not yet support "
                     "gated linear units (SwiGLU/GeGLU)."
