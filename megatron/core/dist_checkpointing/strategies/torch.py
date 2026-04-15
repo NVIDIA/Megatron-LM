@@ -404,33 +404,24 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
-def translate_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict,
-                                           sh_ten_mode: str = 'dtensor') -> StateDict:
-    num_dtensor = 0
-    num_ckptable = 0
+def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -> StateDict:
+    num_dtensors = 0
     def sh_ten_to_dtensor(x: Union[ShardedTensor, Any]) -> Union[Any, DTensor]:
-        nonlocal num_dtensor
-        nonlocal num_ckptable
+        nonlocal num_dtensors
 
         if isinstance(x, ShardedTensor):
-            if sh_ten_mode == 'dtensor':
-                x = x.to_dtensor()
-                num_dtensor += 1
-            else:
-                raise NotImplementedError(f'sh_ten_mode: {sh_ten_mode}')
+            x = x.to_dtensor()
+            num_dtensors += 1
         elif isinstance(x, ShardedObject):
             if not all(dim_size == 1 for dim_size in x.global_shape):
-                raise RuntimeError("INTERNAL WARNING: ShardedObjects with non-trivial sharding won't be supported")
+                raise RuntimeError("ShardedObjects with non-trivial sharding are not supported")
         return x
 
     dict_list_map_inplace(sh_ten_to_dtensor, sharded_state_dict)
-    print(f'Translations: DTensor: {num_dtensor}, ShTen(_Checkpointable): {num_ckptable}.')
-    if num_dtensor > 0 and num_ckptable > 0:
-        print(f'Coexisting DTensors ({num_dtensor}) and ShTen(_Checkpointable) tensors ({num_ckptable}) discovered!.')
+    logger.info(f"Num of converted ShardedTensors to DTensors: {num_dtensors}")
     return sharded_state_dict
 
 
-# This stays, but could be simplified to a non-nested case if current code stays
 def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
     def dtensor_to_ten(x: Union[DTensor, Any]) -> Union[Any, torch.Tensor]:
         if isinstance(x, DTensor):
@@ -734,11 +725,12 @@ class TorchDistSaveShardedStrategy:
         """Each async strategy can be trivially used as a sync strategy."""
         if use_dtensor_format:
             values_to_save = inject_placeholders(sharded_state_dict)
-            values_to_save = translate_state_dict_to_dcp_compatible(values_to_save)
+            values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
             fill_placeholders(sharded_state_dict, values_to_save)
             return torch.distributed.checkpoint.save(sharded_state_dict, checkpoint_id=checkpoint_dir)
         else:
             strategy = "nvrx" if HAVE_NVRX else "mcore"
+            print(sharded_state_dict["model"]["decoder.layers.0.self_attention.linear_proj.weight"])
             async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
             async_request.execute_sync()
             del async_request
@@ -934,7 +926,7 @@ class TorchDistLoadShardedStrategy:
         """
         if use_dtensor_format:
             values_to_load = inject_placeholders(sharded_state_dict)
-            values_to_load = translate_state_dict_to_dcp_compatible(values_to_load)
+            values_to_load = convert_state_dict_to_dcp_compatible(values_to_load)
             fill_placeholders(sharded_state_dict, values_to_load)
 
             torch.distributed.checkpoint.load(state_dict=sharded_state_dict, checkpoint_id=checkpoint_dir)
