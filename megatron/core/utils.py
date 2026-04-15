@@ -2084,6 +2084,9 @@ def get_batch_on_this_tp_rank(
                 _broadcast(batch['local_cp_size'])
 
         elif is_pipeline_first_stage:
+            batch["labels"] = None
+            batch["loss_mask"] = None
+
             _broadcast(batch['tokens'])
             _broadcast(batch['position_ids'])
             if is_sft:
@@ -2095,6 +2098,9 @@ def get_batch_on_this_tp_rank(
                 _broadcast(batch['attention_mask'])
 
         elif is_pipeline_last_stage:
+            batch["tokens"] = None
+            batch["position_ids"] = None
+
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             if is_sft:
@@ -2107,6 +2113,12 @@ def get_batch_on_this_tp_rank(
 
         elif is_sft:
             # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermidiate stages
+            batch["tokens"] = None
+            batch["labels"] = None
+            batch["loss_mask"] = None
+            batch["position_ids"] = None
+            batch["attention_mask"] = None
+
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
             if cp_size > 1:
