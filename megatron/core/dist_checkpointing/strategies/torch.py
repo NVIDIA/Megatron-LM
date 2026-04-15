@@ -414,7 +414,20 @@ def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -
             num_dtensors += 1
         elif isinstance(x, ShardedObject):
             if not all(dim_size == 1 for dim_size in x.global_shape):
-                raise RuntimeError("ShardedObjects with non-trivial sharding are not supported")
+                # Non-trivially-sharded ShardedObjects (e.g. rerun_state_machine with
+                # global_shape=(world_size,)) cannot be represented as DTensors.
+                # DCP saves BytesIO from the coordinator rank only, which means only
+                # rank 0's data is preserved.  This is acceptable for objects like the
+                # rerun state machine that reset on checkpoint resume, but callers that
+                # need per-rank fidelity should avoid using DTensor format for such objects.
+                logger.warning(
+                    f"ShardedObject '{x.key}' has non-trivial global_shape {x.global_shape}. "
+                    "Only coordinator rank's data will be saved in DTensor format."
+                )
+            # Serialize to BytesIO so DCP's DefaultSavePlanner can handle it natively.
+            buf = io.BytesIO()
+            torch.save(x.data, buf)
+            x = buf
         return x
 
     dict_list_map_inplace(sh_ten_to_dtensor, sharded_state_dict)
@@ -430,6 +443,11 @@ def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
             x = x._sh_ten.data
         elif isinstance(x, ShardedObject):
             x = x.data
+        elif isinstance(x, io.BytesIO):
+            # Extra states were serialized as BytesIO during DTensor-format save;
+            # DCP loads them back as BytesIO — deserialize to recover the original data.
+            x.seek(0)
+            x = torch.load(x, weights_only=False)
         return x
 
     dict_list_map_inplace(dtensor_to_ten, state_dict)
