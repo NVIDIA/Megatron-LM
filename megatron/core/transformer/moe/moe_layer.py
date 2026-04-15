@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -249,28 +250,36 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
-            self.fc1_latent_proj = linear_cls(
-                self.config.hidden_size,
-                self.config.moe_latent_size,
-                parallel_mode="duplicated",
-                config=self.config,
-                init_method=self.config.init_method,
-                bias=self.config.add_bias_linear,
-                skip_bias_add=False,
-                skip_weight_param_allocation=False,
-                is_expert=False,
-            )
-            self.fc2_latent_proj = linear_cls(
-                self.config.moe_latent_size,
-                self.config.hidden_size,
-                parallel_mode="duplicated",
-                config=self.config,
-                init_method=self.config.output_layer_init_method,
-                bias=self.config.add_bias_linear,
-                skip_bias_add=False,
-                skip_weight_param_allocation=False,
-                is_expert=False,
-            )
+            # Latent projections remain in bf16 for inference; disable fp8_model_init
+            if self.config.transformer_impl == "inference_optimized" and self.config.fp8_param:
+                import transformer_engine.pytorch
+
+                disable_fp8_ctx = transformer_engine.pytorch.fp8_model_init(enabled=False)
+            else:
+                disable_fp8_ctx = nullcontext()
+            with disable_fp8_ctx:
+                self.fc1_latent_proj = linear_cls(
+                    self.config.hidden_size,
+                    self.config.moe_latent_size,
+                    parallel_mode="duplicated",
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    bias=self.config.add_bias_linear,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                    is_expert=False,
+                )
+                self.fc2_latent_proj = linear_cls(
+                    self.config.moe_latent_size,
+                    self.config.hidden_size,
+                    parallel_mode="duplicated",
+                    config=self.config,
+                    init_method=self.config.output_layer_init_method,
+                    bias=self.config.add_bias_linear,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                    is_expert=False,
+                )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":

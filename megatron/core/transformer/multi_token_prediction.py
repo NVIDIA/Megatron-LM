@@ -1315,7 +1315,11 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_layer_legacy(layer_spec, layer_number):
             """Build layer using legacy spec-based approach."""
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            # MTP layers remain in bf16 for inference; skip fp8_model_init
+            if self.config.transformer_impl == "inference_optimized":
+                fp8_init_context = nullcontext()
+            else:
+                fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
                     layer_spec,
@@ -1329,7 +1333,11 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_layer_with_pattern(layer_spec, layer_number, mtp_layer_pattern, mamba_submodules):
             """Build layer using pattern-based approach (new Mamba path)."""
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            # MTP layers remain in bf16 for inference; skip fp8_model_init
+            if self.config.transformer_impl == "inference_optimized":
+                fp8_init_context = nullcontext()
+            else:
+                fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
                     layer_spec,

@@ -1198,7 +1198,7 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "fp8_param must be enabled when using "
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
-                        "Please set --fp8-param-gather."
+                        "Please set --fp8-param."
                     )
 
             assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
