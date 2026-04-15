@@ -53,6 +53,7 @@ class SafeUnpickler(pickle.Unpickler):
     `pickle.UnpicklingError`, preventing arbitrary code execution via a
     crafted checkpoint.
     """
+
     _SAFE_CLASSES: frozenset = frozenset(
         {
             ("builtins", "dict"),

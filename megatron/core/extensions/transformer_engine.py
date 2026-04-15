@@ -1929,9 +1929,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 # No FP8 is indicated by an empty tensor we don't need to unpickle.
                 if state.numel() == 0:
                     return
-                return SafeUnpickler(
-                    io.BytesIO(state.detach().cpu().numpy().tobytes())
-                ).load()
+                return SafeUnpickler(io.BytesIO(state.detach().cpu().numpy().tobytes())).load()
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
                 return torch.load(state, map_location="cuda")
