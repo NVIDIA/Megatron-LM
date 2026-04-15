@@ -26,12 +26,8 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
-from megatron.training import (
-    get_adlr_autoresume,
-    get_args,
-    get_tensorboard_writer,
-    inprocess_restart,
-)
+from megatron.training.global_vars import get_adlr_autoresume, get_args, get_tensorboard_writer
+from megatron.training.inprocess_restart import inprocess_restart
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
