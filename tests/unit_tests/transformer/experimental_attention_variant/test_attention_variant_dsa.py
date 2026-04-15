@@ -491,9 +491,7 @@ class TestFusedDSAIndexerLossGradientTP:
             torch.manual_seed(42)
             model_parallel_cuda_manual_seed(42)
 
-            pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp']
-            )
+            pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
             # query and key split along heads for TP
@@ -620,9 +618,7 @@ class TestDSAIndexer:
             linear_weights_proj=ModuleSpec(module=TELinear),
         )
 
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         cls.indexer = DSAIndexer(cls.config, indexer_submodules, cls.pg_collection)
 
         yield
@@ -762,9 +758,7 @@ class TestDSAttention:
         indexer_spec = ModuleSpec(module=DSAIndexer, submodules=indexer_submodules)
         sparse_attention_submodules = DSAttentionSubmodules(indexer=indexer_spec)
 
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
         cls.sparse_attention = DSAttention(
             config=cls.config,
@@ -1093,9 +1087,7 @@ class TestIndexerTensorParallel:
                     x_tpn = x_input
                     qr_tpn = qr_input
 
-                index_scores_tpn, topk_indices_tpn = indexer_tpn.forward_with_scores(
-                    x_tpn, qr_tpn
-                )
+                index_scores_tpn, topk_indices_tpn = indexer_tpn.forward_with_scores(x_tpn, qr_tpn)
                 loss_tpn = index_scores_tpn.sum()
                 loss_tpn.backward()
 
@@ -1266,16 +1258,12 @@ class TestDSAttentionTensorParallel:
                     pg_collection = ProcessGroupCollection.use_mpu_process_groups(
                         required_pgs=['tp', 'cp']
                     )
-                    sparse_attention = self._create_sparse_attention(
-                        config, pg_collection
-                    ).cuda()
+                    sparse_attention = self._create_sparse_attention(config, pg_collection).cuda()
                     tag = f"[TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse={use_sparse_indexer_loss}]"
 
                     if world_size > 1:
                         for name, param in sparse_attention.indexer.named_parameters():
-                            param_list = [
-                                torch.zeros_like(param.data) for _ in range(world_size)
-                            ]
+                            param_list = [torch.zeros_like(param.data) for _ in range(world_size)]
                             torch.distributed.all_gather(param_list, param.data)
 
                             for i in range(1, world_size):
@@ -1523,9 +1511,7 @@ class TestDSAttentionTensorParallel:
                     pg_collection = ProcessGroupCollection.use_mpu_process_groups(
                         required_pgs=['tp', 'cp']
                     )
-                    sparse_attention = self._create_sparse_attention(
-                        config, pg_collection
-                    ).cuda()
+                    sparse_attention = self._create_sparse_attention(config, pg_collection).cuda()
                     sparse_attention.train()
                     tag = f"[TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse={use_sparse_indexer_loss}]"
 
@@ -1603,9 +1589,7 @@ class TestDSAttentionTensorParallel:
                     if tp_size > 1:
                         for name, param in sparse_attention.indexer.named_parameters():
                             if param.requires_grad and param.grad is not None:
-                                grad_list = [
-                                    torch.zeros_like(param.grad) for _ in range(tp_size)
-                                ]
+                                grad_list = [torch.zeros_like(param.grad) for _ in range(tp_size)]
                                 torch.distributed.all_gather(
                                     grad_list, param.grad, group=pg_collection.tp
                                 )
