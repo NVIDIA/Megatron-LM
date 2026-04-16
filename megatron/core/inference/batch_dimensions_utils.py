@@ -85,6 +85,10 @@ class InferenceBatchDimensions:
         Returns:
             True if the config is valid, False otherwise
         """
+        # A zero-token batch is never valid
+        if self.token_count == 0:
+            return False
+
         # Check if total requests exceed maximum
         if self.prefill_req_count + self.decode_req_count > max_requests:
             return False

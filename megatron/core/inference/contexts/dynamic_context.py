@@ -1640,7 +1640,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
         elif is_expert_parallel_dummy_cuda_graph_step:
             self.add_dummy_requests_for_expert_parallel_step(
-                InferenceBatchDimensions(token_count=1, prefill_req_count=0, decode_req_count=1)
+                InferenceBatchDimensions(token_count=self.num_speculative_tokens + 1, 
+                                         prefill_req_count=0, 
+                                         decode_req_count=1)
             )
 
         batch_dimensions = InferenceBatchDimensions(
