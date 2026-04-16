@@ -53,7 +53,39 @@ gh run view --job <job_id> --repo NVIDIA/Megatron-LM --json name --jq .name
 If the grep output is sparse, download the full logs and look for the pytest
 `FAILURES` section or the last non-zero exit signal.
 
-### 4. Extract the root cause
+### 4. Resolve the triggering PR and test author
+
+**Triggering PR**: the run's head branch follows the pattern `pull-request/<number>`.
+Extract it and resolve the PR:
+
+```bash
+gh run view <run_id> --repo NVIDIA/Megatron-LM --json headBranch --jq .headBranch
+# → e.g. "pull-request/4332"
+# Extract PR number and fetch metadata:
+gh pr view <pr_number> --repo NVIDIA/Megatron-LM --json number,title,url \
+  --jq '{number: .number, title: .title, url: .url}'
+```
+
+**Test file author**: find the GitHub login of whoever last touched the failing
+test file. Use `git log` on the file to get the commit SHA, then resolve the
+login via the API:
+
+```bash
+# Get the most recent commit SHA that touched the test file
+git log -1 --format="%H" -- <test-file-path>
+
+# Resolve GitHub login from commit SHA
+gh api repos/NVIDIA/Megatron-LM/commits/<sha> --jq .author.login
+```
+
+If `git log` is unavailable (no checkout), use the Commits API instead:
+
+```bash
+gh api "repos/NVIDIA/Megatron-LM/commits?path=<test-file-path>&per_page=1" \
+  --jq '.[0].author.login'
+```
+
+### 5. Extract the root cause
 
 From the logs, identify:
 
@@ -61,9 +93,9 @@ From the logs, identify:
 - **Error message**: the assertion failure, exception type, or first meaningful
   traceback frame — keep it under ~30 lines.
 - **Job name**: the GitHub Actions job name (e.g. `tests/unit_tests/transformer/moe/**/*.py - latest`).
-- **Run / job URLs**: for linking in the issue.
+- **Run / job URLs** and **PR URL**: for linking in the issue.
 
-### 5. Check for duplicate issues
+### 6. Check for duplicate issues
 
 Search for open issues that already cover the same test:
 
@@ -79,13 +111,17 @@ gh issue list --repo NVIDIA/Megatron-LM \
   existing issue to the user and stop.
 - If no match is found, proceed to file a new issue.
 
-### 6. Create the issue
+### 7. Create the issue
+
+Pass `--assignee <test-author-login>` to assign the issue to the test file's
+author. Include the triggering PR URL in the issue body.
 
 ```bash
 gh issue create \
   --repo NVIDIA/Megatron-LM \
   --title "🐛 CI failure: <failed-test-node-id>" \
   --label "bug" \
+  --assignee "<test-author-login>" \
   --body "..."
 ```
 
@@ -101,6 +137,7 @@ Tag the [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall) to ge
 
 | Field | Value |
 |-------|-------|
+| PR    | [#<pr_number>: <pr_title>](<pr_url>) |
 | Run   | [<run_id>](<run_url>) |
 | Job   | [<job_name>](<job_url>) |
 
@@ -124,9 +161,10 @@ Triaged automatically via `/triage-issue`.
 ```
 
 If multiple tests failed in the same job, list each one as a separate bullet
-under "Describe the bug" and include the combined error snippets.
+under "Describe the bug" and include the combined error snippets. Assign the
+issue to the author of whichever test file appears first in the failure list.
 
-### 7. Report back to the user
+### 8. Report back to the user
 
 Print the URL of the newly created issue (or the duplicate, if found) so the
 user can review or share it.
@@ -134,6 +172,10 @@ user can review or share it.
 ## Important guidelines
 
 - Never create an issue if a duplicate already exists — link the existing one instead.
+- Always include the triggering PR link in the issue body.
+- Always assign the issue to the test file's most recent author. If the author
+  lookup fails (e.g. the commit was made by a bot or the login is unavailable),
+  skip `--assignee` and note it in the "Additional context" section.
 - Keep the error snippet concise (≤30 lines). Truncate long tracebacks and note that the full log is available via the job URL.
 - Do not guess the root cause — quote the actual log output verbatim.
 - If the job is still in progress or the logs are unavailable, say so and ask the user to retry once the run completes.
