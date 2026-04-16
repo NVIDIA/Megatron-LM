@@ -118,6 +118,7 @@ def create_args():
     args.ckpt_step = None
     args.swiglu = True
     args.num_experts = 1
+    args.verify_integrity = False
 
     yield args
 
@@ -144,7 +145,6 @@ def create_ckpt_load_args(create_args):
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
     args.phase_transition_iterations = None
-    args.verify_integrity = False
 
     yield args
 
