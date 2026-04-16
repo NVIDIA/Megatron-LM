@@ -695,8 +695,8 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
-    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+    moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+    """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
@@ -1267,10 +1267,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"but got {self.moe_shared_expert_intermediate_size}"
                 )
             if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
-                "alltoall"
+                "alltoall",
+                "flex",
             ]:
                 raise ValueError(
-                    f"moe_shared_expert_overlap only works with alltoall token dispatcher."
+                    f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
@@ -1831,10 +1832,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
+            "sigmoid",
+            "sqrtsoftplus",
+        ):
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+                "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
+                "score functions. Please set --moe-router-score-function to 'sigmoid' or "
+                "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
 
         if self.num_moe_experts and self.fp8:

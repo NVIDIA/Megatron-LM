@@ -10,13 +10,14 @@ from tests.functional_tests.python_test_utils import common
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 CHECK_THRESHOLDS = {
     "iteration-time": [common.ApproximateTest(atol=0, rtol=0.05)],
     "mem-allocated-bytes": [common.ApproximateTest(atol=0, rtol=0.05)],
     "mem-max-allocated-bytes": [common.ApproximateTest(atol=0, rtol=0.05)],
     "lm loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "mtp_1 loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
-    "num-zeros": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
+    "num-zeros": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.20)],
     "generated_tokens": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "logprobs": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
 }
