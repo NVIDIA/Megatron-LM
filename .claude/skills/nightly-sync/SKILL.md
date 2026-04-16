@@ -47,6 +47,18 @@ Practical check: run `git diff origin/dev -- <file>` on conflicted files. If
 dev's code was removed or reverted, investigate whether dev's version is the
 more evolved one.
 
+Real examples from PR #4291:
+- `emerging_optimizers.py`: Main's version was MORE complete — it squash-merged
+  dev's PRs plus added more. `-X theirs` was correct.
+- `distrib_optimizer.py`: Main overwrote dev's `GroupedQuantizedTensor` support.
+  Had to restore `_is_distopt_quantized_param` and the expanded
+  `_expand_quantized_param_shard_for_cast` loop while keeping main's NVFP4
+  additions. This required a surgical merge combining sections from both.
+
+Key insight: squash-merge chains can go in EITHER direction. Sometimes main
+is ahead (it squash-merged dev's work + more), sometimes dev is ahead (it has
+follow-up PRs). Always diff both ways before deciding which version to favor.
+
 ### Files to Override from Main
 
 These files have known semantic conflicts where dev's versions reference args
@@ -58,6 +70,11 @@ or APIs that main removed or renamed. Take main's version with
 - `megatron/training/utils.py` — references dev-only args
 - `megatron/training/datasets/data_samplers.py` — references dev-only args
 - `megatron/core/optimizer/layer_wise_optimizer.py` — constructor signature
+
+**Caveat for ALL overrides:** After taking main's version of any file, you
+MUST run the API Mismatch Detection procedure (see below) on that file.
+Taking main's caller code while keeping dev's callee implementations is the
+#1 source of sync bugs.
 
 **IMPORTANT: Do NOT take main's `pyproject.toml`, `uv.lock`, or
 `docker/Dockerfile.ci.dev`.** These three files are a tightly coupled
@@ -71,6 +88,88 @@ of all three files.
 **NEVER manually edit `uv.lock`.** It is a machine-generated lockfile. If
 it needs to change, it must be regenerated with `uv lock` inside a CUDA
 container (see `.claude/skills/build-and-test/SKILL.md`).
+
+### Git Source Reconciliation (pyproject.toml)
+
+After keeping dev's `pyproject.toml`, check whether main has added NEW git
+sources to `[tool.uv.sources]` that don't exist in dev's version. Main's
+merged code may import from packages only available at specific git revisions.
+
+1. Diff the `[tool.uv.sources]` sections:
+   `git show origin/main:pyproject.toml` vs `git show origin/dev:pyproject.toml`
+2. For each git source in main but not dev, add it to dev's `pyproject.toml`
+3. For sources in both but at different revisions, check whether dev's revision
+   works. If dev's revision is broken (TOML parse errors, missing classes main's
+   code imports), take main's revision instead.
+
+Real examples from PR #4291:
+- `nvidia-resiliency-ext`: Main's `torch.py` imports `get_write_results_queue`
+  which only existed in main's pinned git revision, not on PyPI. Had to add
+  main's git source to dev's pyproject.toml.
+- `nemo-run`: Dev's pinned revision had a TOML parse error with uv 0.7.2.
+  Had to swap to main's revision.
+
+After any changes to `pyproject.toml`, regenerate `uv.lock` inside a CUDA
+container:
+```bash
+docker run --rm -v $(pwd):/workspace nvcr.io/nvidia/pytorch:26.02-py3 \
+  bash -c "pip install uv==0.7.2 && cd /workspace && \
+  uv venv .venv --system-site-packages && uv sync --only-group build && uv lock"
+# Clean up root-owned .venv:
+docker run --rm -v $(pwd):/workspace nvcr.io/nvidia/pytorch:26.02-py3 \
+  bash -c "rm -rf /workspace/.venv"
+```
+
+### API Mismatch Detection (Post-Merge Audit)
+
+The merge can create "Frankenstein" code where main's callers use dev's
+implementations (or vice versa) with different method signatures. This
+compiles fine but fails at runtime.
+
+After the merge, audit cross-boundary call sites:
+
+1. Identify files where main's version was taken (`-X theirs` or explicit
+   `git checkout origin/main`)
+2. For each, find all external call sites: classes it instantiates, methods
+   it calls on imported objects, functions from other modules it invokes
+3. Verify method names, parameter counts, and signatures match between the
+   caller and the implementation in the merged tree
+4. Pay special attention to "interface" modules (files defining base classes)
+   — if main and dev evolved the interface differently, every caller and
+   implementer must agree
+
+Real examples from PR #4291:
+- `multi_latent_attention.py` (main) called `off_interface.group_commit()`
+  but dev's interface only had `group_offload()` — method renamed
+- `mamba_model.py` (main) called `init_chunk_handler(3 params)` but dev's
+  interface required 6 params — signature expanded on dev
+- `mamba_model.py` called `mark_not_offloadable()` but dev had
+  `mark_not_offload()` — method renamed
+- `bulk_offload()` did `.remove()` after `bulk_offload_group()` already
+  `.pop()`d the same item — double-removal from a list
+
+Practical detection:
+```bash
+# For each file taken from main, find what it imports and calls
+grep -rn "from <module> import\|<module>\." megatron/
+# Cross-reference with the actual implementations in the merged tree
+```
+
+### File-Specific Merge Lessons
+
+These lessons were learned from PR #4291. They may recur if the same files
+continue to diverge:
+
+- `gated_delta_net.py`: If the merge creates code calling non-existent helper
+  methods (e.g. `_resolve_cu_seqlens`), take dev's version wholesale.
+- `model_chunk_schedule_plan.py`: Watch for missing imports (e.g.
+  `CudaGraphScope`) silently dropped during conflict resolution.
+- `fine_grained_activation_offload.py`: Critical interface file used by many
+  callers. If main and dev have divergent method names/signatures, prefer
+  dev's implementation and patch main-originated callers to match.
+- `distrib_optimizer.py`: Dev may have broader type abstractions (e.g.
+  `_is_distopt_quantized_param` covering both FP8 and GroupedQuantizedTensor).
+  Main may simplify to explicit type checks. Restore dev's abstractions.
 
 ### Special Handling: data_schedule.py
 
@@ -126,6 +225,13 @@ Commit everything and push the branch.
      in a collapsed `<details>` block. If git is too old for `--remerge-diff`,
      note the git version and describe the merge strategy used instead.
 - Save the PR number for later phases
+- **Add the `Run functional tests` label** to the PR immediately after
+  creation. This ensures `/ok to test` triggers the full CI suite (unit tests
+  + functional/integration tests with 100-step training and golden value
+  comparison). Without this label, only a lightweight subset runs.
+  ```bash
+  gh pr edit <PR_NUMBER> --repo $REPO --add-label "Run functional tests"
+  ```
 
 ---
 
@@ -145,7 +251,11 @@ Commit everything and push the branch.
 
 ### Trigger and Poll
 
-1. Comment on PR: `/ok to test <SHA>`
+1. Ensure the `Run functional tests` label is on the PR (added in Phase 2).
+   Then comment on PR: `/ok to test <SHA>`
+   **IMPORTANT:** Do NOT push directly to `pull-request/<PR_NUMBER>` branches.
+   The community bot manages those branches when it processes the `/ok to test`
+   comment. Pushing to them directly breaks the CI trigger mechanism.
 2. Find CI run: `gh run list --json` filtered by
    `headBranch == "pull-request/<PR_NUMBER>"` (no `--branch` flag available)
 3. Poll with a foreground Bash while-loop (`sleep 120`) using:
@@ -175,6 +285,14 @@ Commit everything and push the branch.
   can change library versions in the CI container. Dev-only code may depend on
   newer versions (e.g. TransformerEngine's `single_grouped_weight`). If failures
   trace to missing kwargs or changed APIs in third-party libs, this is the cause.
+- **API mismatch (AttributeError / TypeError at runtime):** Main's callers
+  reference methods that don't exist (or have different signatures) in dev's
+  implementations. See "API Mismatch Detection" in Phase 1. Fix by adding
+  shims, renaming methods, or adjusting call signatures.
+- **Infrastructure / network failures (apt-get, pip download):** Errors like
+  `archive.ubuntu.com unreachable` or `Connection timed out` during package
+  installation are transient CI infrastructure issues, not code problems.
+  Retry CI with the same SHA. Do not investigate as code failures.
 
 ### Pre-Existing Failure Verification
 
@@ -186,6 +304,19 @@ Commit everything and push the branch.
    sync-caused. You must fix it.
 4. Only if the test **also fails on recent dev CI** can you classify it as
    pre-existing. Document with the dev PR number and CI run as evidence.
+
+### Internal GitLab Functional Tests
+
+GitHub CI covers unit tests and some integration tests. Internal GitLab
+(`gitlab-master.nvidia.com`) runs additional functional tests on H100/GB200
+hardware that may reveal issues GitHub CI does not catch.
+
+- Fine-grained activation offloading failures, for example, only showed up
+  in GitLab functional tests during PR #4291
+- If GitHub CI passes but a reviewer reports GitLab failures, investigate
+  with the same rigor as GitHub CI failures
+- The sync PR should ideally pass both GitHub and GitLab CI before merge,
+  but GitHub CI passing is the minimum gate for `gh pr ready`
 
 ### Fix and Re-trigger
 
@@ -210,7 +341,11 @@ Pushing a fix is not enough — wait for confirmation.
 
 Comment on PR confirming which checks passed, listing any pre-existing
 failures with evidence (dev PR number + CI result), and stating it is ready
-for human review.
+for human review. Also note:
+- Which files were taken from main vs. merged manually
+- Any API mismatches detected and fixed
+- Any `pyproject.toml` git source reconciliation performed
+- Links to the CI runs that validated the fixes
 
 ---
 
