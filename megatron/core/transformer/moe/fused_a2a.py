@@ -369,19 +369,26 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
+        if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
+            import inspect
+            import warnings
+
+            sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
+            if 'fuse_permute_dispatch' not in sig.parameters:
+                warnings.warn(
+                    "Current DeepEP version does not support fused permute dispatch or "
+                    "num_blocks_permute/num_blocks_unpermute. Falling back to unfused "
+                    "HybridEP dispatch.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                fused = False
+                num_blocks_permute = None
+                num_blocks_unpermute = None
+
         if _hybrid_ep_buffer is None:
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
-            if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
-                import inspect
-
-                sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
-                if 'fuse_permute_dispatch' not in sig.parameters:
-                    raise RuntimeError(
-                        "Fused permute dispatch or setting num_blocks_permute/num_blocks_unpermute "
-                        "requires DeepEP hybrid-ep branch at commit a0d27f1 or later (PR #588). "
-                        "Please update: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep"
-                    )
             init_hybrid_ep_buffer(
                 group,
                 hidden_dim,
