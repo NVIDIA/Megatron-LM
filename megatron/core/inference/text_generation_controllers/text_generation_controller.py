@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
@@ -576,10 +577,12 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
+        range_push("initialize_attention_state")
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
+        range_pop()
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -1753,6 +1756,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
+        range_push("active_request_mask")
         # Active sequence lengths.
         active_request_ids = context.request_ids[active_request_slice].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
@@ -1788,7 +1792,9 @@ class TextGenerationController:
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused _sampled_tokens_cuda buffer.
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
+        range_pop()
 
+        range_push("update_requests")
         # Update requests.
         # _sampled_mtp_tokens_cuda has shape [num_speculative_tokens, max_requests]
         if self.num_speculative_tokens > 0:
@@ -1798,6 +1804,7 @@ class TextGenerationController:
         update_result = context.update_requests(
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cuda
         )
+        range_pop()
 
         return {
             "active_request_ids": active_request_ids,
@@ -1845,6 +1852,7 @@ class TextGenerationController:
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
+            range_push("forward_pass")
             logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
             # Commit Mamba intermediate states before update_requests, which
@@ -1856,6 +1864,7 @@ class TextGenerationController:
 
             # Collect routing indices per request (must be done before context transitions)
             routing_indices_per_request = self._router_record_bookkeeping()
+            range_pop()
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -1867,6 +1876,7 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         with torch.inference_mode():
+            range_push("sampling")
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             self._dynamic_step_sample_bookkeeping()
@@ -1904,6 +1914,7 @@ class TextGenerationController:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             logits, log_probs_tensor
                         )
+            range_pop()
 
             if skip_bookkeeping:
                 request_bookkeeping = {}
