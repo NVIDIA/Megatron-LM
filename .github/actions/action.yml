@@ -186,7 +186,7 @@ runs:
 
     - name: Check result
       id: check
-      shell: bash -x -e -u -o pipefail {0}
+      shell: bash -e -u -o pipefail {0}
       if: always()
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
@@ -211,32 +211,25 @@ runs:
         LOG_BASE=$([[ "$IS_UNIT_TEST" == "true" ]] && echo "assets_dir/logs" || echo "assets_dir")
         LATEST_LOG=""
         if [[ -d "$LOG_BASE" ]]; then
-          LATEST_LOG=$(find "$LOG_BASE" -maxdepth 3 -name "*.log" -type f 2>/dev/null \
+          LATEST_LOG=$(find "$LOG_BASE" -maxdepth 3 -name "*.log" ! -name "nccl_debug.log" -type f 2>/dev/null \
                          | xargs -r ls -t 2>/dev/null | head -1 || true)
         fi
         if [[ -n "$LATEST_LOG" ]]; then
-          { set +x; } 2>/dev/null
           echo -e "\033[1;36m\n📋 ── log excerpt ───────────────────────────────────────────────────────\033[0m"
           echo -e "\033[1;36m   ${LATEST_LOG} — last 40 lines\033[0m"
           echo -e "\033[1;36m────────────────────────────────────────────────────────────────────────\033[0m"
-          { set -x; } 2>/dev/null
           tail -40 "$LATEST_LOG"
-          { set +x; } 2>/dev/null
           echo -e "\033[1;36m────────────────────────────────────────────────────────────────────────\033[0m\n"
-          { set -x; } 2>/dev/null
         else
-          { set +x; } 2>/dev/null
           echo -e "\033[33m⚠  no log file found in ${LOG_BASE}\033[0m"
-          { set -x; } 2>/dev/null
         fi
 
         if [[ "$coverage_report" != "none" ]]; then
           echo "::group::Coverage report"
-          uv run coverage report -i
+          uv run coverage report -i || true
           echo "::endgroup::"
         fi
 
-        { set +x; } 2>/dev/null
         if [[ "$IS_SUCCESS" == "true" ]]; then
           echo -e "\033[1;32m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
           echo -e "\033[1;32m║                                                                          ║\033[0m"
