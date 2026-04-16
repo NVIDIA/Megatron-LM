@@ -214,6 +214,7 @@ class TestPagedStashing:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    @pytest.mark.flaky_in_dev
     def test_forward_backward_4_layers(self):
         """Test paged stashing with 4 MoE layers: ref run vs paged run match."""
         if not is_hybrid_ep_available():

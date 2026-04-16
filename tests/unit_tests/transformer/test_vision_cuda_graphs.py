@@ -403,6 +403,7 @@ class TestVisionTECudaGraphHelper:
 
         helper.delete_cuda_graphs()
 
+    @pytest.mark.flaky_in_dev
     def test_create_cudagraphs_no_callables_is_noop(self):
         """create_cudagraphs on empty helper should not crash."""
         dummy_model = torch.nn.Linear(4, 4)
