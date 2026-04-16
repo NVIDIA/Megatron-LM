@@ -1967,7 +1967,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         State machine (coordinator only):
         - RUNNING: Local work or EP signal -> step immediately; NCCL synchronizes ranks.
-        - PAUSING: EP consensus (all-reduce) to reach pause agreement, then world barrier.
+        - PAUSING: Fire EP consensus as background task, keep stepping in lockstep with
+          peers, then world barrier at an agreed step count.
         - PAUSED / SUSPENDED: _cond blocks until control signal arrives.
         - UNPAUSING / SUSPENDING / RESUMING / STOPPING: world barrier, then transition.
         """
@@ -1976,6 +1977,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Background task holding the NEXT iteration's ZMQ drain.
         pending_drain: Optional[asyncio.Task] = None
+
+        # PAUSING-state bookkeeping: consensus runs as a background task so the
+        # main loop can keep stepping while peers catch up and post.
+        # `stop_at_step` is the common step count at which every EP peer stops stepping.
+        pausing_consensus_task: Optional[asyncio.Task] = None
+        stop_at_step: Optional[int] = None
+        # Safety-margin to allow for pausing consensus skew.
+        PAUSE_SYNC_MARGIN = 2
 
         def should_proceed():
             if pending_drain is not None:
@@ -2042,18 +2051,38 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 elif self.state == EngineState.PAUSING:
                     if self.use_coordinator:
-                        # Pause requires unanimous EP agreement; do a real all-reduce.
-                        local_pending = self.context.get_active_request_count() + len(
-                            self.waiting_request_ids
-                        )
-                        global_work, all_pausing = await cc.ep_establish_consensus(
-                            local_pending, signal_consensus=True
-                        )
-                        if all_pausing:
+                        # Fire consensus as a background task when we hit PAUSING.
+                        # Subsequent iterations keep stepping while waiting for peers.
+                        if pausing_consensus_task is None:
+                            local_pending = self.context.get_active_request_count() + len(
+                                self.waiting_request_ids
+                            )
+                            pausing_consensus_task = self._loop.create_task(
+                                cc.ep_establish_consensus(
+                                    local_pending, self.context.step_count
+                                )
+                            )
+
+                        # Once consensus completes, compute the common stop step.
+                        if stop_at_step is None and pausing_consensus_task.done():
+                            _, max_step_count = pausing_consensus_task.result()
+                            stop_at_step = max_step_count + PAUSE_SYNC_MARGIN
+
+                        if stop_at_step is not None and self.context.step_count >= stop_at_step:
+                            # Common stop_at_step ensures all EP peers stop at the same iteration.
                             await cc.world_barrier()
                             self.state = EngineState.PAUSED
                             self._state_events[EngineState.PAUSED].set()
-                        elif global_work > 0:
+                            pausing_consensus_task = None
+                            stop_at_step = None
+                        else:
+                            # Keep stepping.
+                            # Signal EP peers so any rank that's still RUNNING wakes up.
+                            if cc._ep_channel is not None:
+                                cc._ep_channel.notify_has_signal()
+                            local_pending = self.context.get_active_request_count() + len(
+                                self.waiting_request_ids
+                            )
                             if local_pending > 0:
                                 await self.async_step()
                             else:
@@ -2064,7 +2093,6 @@ class DynamicInferenceEngine(AbstractEngine):
                                     await asyncio.sleep(0)
                                 self.context.step_count += 1
                                 self.context.prefix_cache_lru_clock += 1
-                        # else: no global work and not all pausing means idle, re-enter PAUSING.
 
                 elif self.state in (
                     EngineState.UNPAUSING,
@@ -2094,11 +2122,13 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
         finally:
-            if pending_drain is not None:
-                if not pending_drain.done():
-                    pending_drain.cancel()
+            for task in (pending_drain, pausing_consensus_task):
+                if task is None:
+                    continue
+                if not task.done():
+                    task.cancel()
                 try:
-                    await pending_drain
+                    await task
                 except (asyncio.CancelledError, Exception):
                     pass
             await self.shutdown()

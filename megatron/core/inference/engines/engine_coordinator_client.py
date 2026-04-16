@@ -393,38 +393,37 @@ class EngineCoordinatorClient:
         return self._ep_channel is not None and self._ep_channel.has_signal_event.is_set()
 
     async def ep_establish_consensus(
-        self, local_work: int, signal_consensus: bool
-    ) -> tuple[int, bool]:
-        """EP all-reduce to share work counts and pause consensus.
+        self, local_work: int, local_step_count: int
+    ) -> tuple[int, int]:
+        """EP all-reduce for pause consensus and step synchronization.
+
+        Called only by ranks in PAUSING state; the all-reduce blocks for every EP peer.
+        Intended to be fired as a background task so the main loop can keep stepping.
 
         All-reduces two integers at once:
-        - local_work: actual pending request count (always >= 0).
-        - consensus flag: -1 if this rank wants to pause, 0 otherwise.
+        - local_work: pending request count on this rank.
+        - local_step_count: current `context.step_count` on this rank.
 
-        Using max for both:
-        - max(work) > 0 means at least one EP peer has real work.
-        - max(consensus) == -1 means ALL peers signaled -1 (PAUSING). A RUNNING peer contributes 0.
+        The max of `local_step_count` across ranks is used to compute a common `stop_at_step`.
 
         Args:
             local_work: Pending request count for this rank.
-            signal_consensus: True if this rank is ready to pause.
+            local_step_count: This rank's current step count at call time.
         Returns:
-            (global_work, all_pausing): max work across EP; whether all peers signaled consensus.
+            (global_work, max_step_count): max across EP of each field.
         """
         range_push("ep_establish_consensus")
 
-        consensus_val = -1 if signal_consensus else 0
-
         if self._ep_channel is not None:
             self._ep_channel.has_signal_event.clear()
-            global_work, global_consensus = await self._ep_channel.all_reduce_max(
-                local_work, consensus_val
+            global_work, max_step_count = await self._ep_channel.all_reduce_max(
+                local_work, local_step_count
             )
         else:
-            global_work, global_consensus = local_work, consensus_val
+            global_work, max_step_count = local_work, local_step_count
 
         range_pop()
-        return global_work, global_consensus == -1
+        return global_work, max_step_count
 
     def projected_pending_count(self, engine) -> int:
         """Pending request count including drained-but-not-yet-applied SUBMIT_REQUESTs."""
