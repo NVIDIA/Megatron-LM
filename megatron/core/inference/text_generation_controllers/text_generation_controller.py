@@ -1269,8 +1269,20 @@ class TextGenerationController:
 
         # All-gather across TP group if using sequence parallelism (tp_size > 1)
         if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
+            # With SP, the model processes padded_active_token_count tokens total,
+            # scattered evenly across TP ranks. Each rank routes
+            # padded_active_token_count // tp_size tokens through MoE layers.
+            #
+            # The CUDA-graph static buffer path in get_routing_indices() may return
+            # a tensor sliced to active_token_count (the global unpadded count),
+            # which can be larger than the per-rank valid count. Truncate to the
+            # true per-rank count before the all-gather so we only gather valid
+            # routing data and reconstruct the full sequence in the correct order.
+            local_token_count = context.padded_active_token_count // tp_size
+
+            stacked_routing = stacked_routing[:local_token_count]
             # gather_from_sequence_parallel_region gathers along dim 0
-            # [local_token_count, num_layers, topk] -> [global_token_count, num_layers, topk]
+            # [local_token_count, num_layers, topk] -> [padded_token_count, num_layers, topk]
             stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
 
         # Slice to real tokens (remove CUDA padding), move to CPU as numpy with target dtype
