@@ -78,3 +78,55 @@ products:
       - environment: [dev]
         scope: [mr-github]
         platforms: [dgx_gb200]
+  #######################################################################
+  # tp1_pp2 MoE variants                                                #
+  #######################################################################
+  - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  #######################################################################
+  # tp2_pp1 MoE variants                                                #
+  #######################################################################
+  - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  #######################################################################
+  # ep8 variant (EP reduced 8→4 for 1-node)                            #
+  #######################################################################
+  - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  #######################################################################
+  # tp4_ep2_etp2_pp2 variant (PP reduced 2→1 for 1-node)               #
+  #######################################################################
+  - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
