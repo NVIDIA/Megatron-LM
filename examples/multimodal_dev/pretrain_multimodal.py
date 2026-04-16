@@ -74,6 +74,7 @@ def model_provider(
     # --- vision config ---
     vision_config = registry["vision_config_fn"](
         num_layers_override=getattr(args, "vision_num_layers", None),
+        variant=getattr(args, "model_variant", None),
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16

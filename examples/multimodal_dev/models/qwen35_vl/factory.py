@@ -81,6 +81,13 @@ def build_model(args, language_config, vision_config, **kwargs):
             pp_rank=None,
         )
 
+    # When --untie-embeddings-and-output-weights is NOT passed, Megatron
+    # defaults to tied embeddings (share_embeddings_and_output_weights=True).
+    # The 0.8B variant uses tied embeddings, while larger variants untie them.
+    share_embeddings = not getattr(
+        args, "untie_embeddings_and_output_weights", False
+    )
+
     return Qwen35VLModel(
         language_config=language_config,
         language_spec=language_spec,
@@ -90,4 +97,5 @@ def build_model(args, language_config, vision_config, **kwargs):
         image_token_id=getattr(args, "image_token_id", 248056),
         mtp_block_spec=mtp_block_spec,
         parallel_output=True,
+        share_embeddings_and_output_weights=share_embeddings,
     )
