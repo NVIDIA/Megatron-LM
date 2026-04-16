@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import inspect
 import multiprocessing
 import os
 import random
@@ -42,7 +43,7 @@ from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, 
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
+from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model, warn_rank_0
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
@@ -631,7 +632,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 validate_sharding_integrity = not args.ckpt_assume_constant_structure
             else:
                 validate_sharding_integrity = True
-                save_strategy = TorchDistSaveShardedStrategy()
+                save_strategy = TorchDistSaveShardedStrategy(
+                    cpu_shm_mode=getattr(args, 'async_ckpt_use_cpu_shm', False)
+                )
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                     if args.async_save:
@@ -681,8 +684,24 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
+                _cpu_shm = getattr(args, 'async_ckpt_use_cpu_shm', False)
+                _writer_kwargs = {}
+                if _cpu_shm:
+                    if (
+                        "use_cpu_shm_for_gpu_tensors"
+                        in inspect.signature(FileSystemWriterAsync.__init__).parameters
+                    ):
+                        _writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
+                    else:
+                        warn_rank_0(
+                            "Installed nvidia-resiliency-ext does not support "
+                            "use_cpu_shm_for_gpu_tensors. Ignoring --async-ckpt-use-cpu-shm."
+                        )
                 fs_storage_writer = FileSystemWriterAsync(
-                    checkpoint_name, thread_count=args.dist_ckpt_workers, use_msc=args.enable_msc
+                    checkpoint_name,
+                    thread_count=args.dist_ckpt_workers,
+                    use_msc=args.enable_msc,
+                    **_writer_kwargs,
                 )
 
                 save_state_dict_ret = save_state_dict_async_plan(
