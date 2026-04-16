@@ -1295,6 +1295,7 @@ class SelfAttention(Attention):
             q_norm_cls = submodules.q_layernorm or L2Norm
             k_norm_cls = submodules.k_layernorm or L2Norm
         elif self.config.qk_layernorm:
+            # TODO(yuzhongw, janpabloe): Support local backend.
             q_norm_cls = submodules.q_layernorm or TENorm
             k_norm_cls = submodules.k_layernorm or TENorm
             if q_norm_cls is None or k_norm_cls is None:
