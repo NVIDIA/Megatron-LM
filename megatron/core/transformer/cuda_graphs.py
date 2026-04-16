@@ -797,6 +797,10 @@ class _CudaGraphRunner(torch.nn.Module):
                 self._register_side_stream(self.fwd_side_streams, get_ag_stream())
                 self._register_side_stream(self.bwd_side_streams, get_ag_stream())
                 self._register_side_stream(self.bwd_side_streams, get_rs_stream())
+                # Fence event: recorded on the shared ag/rs stream after AG handles
+                # are processed but before RS, so we can wait for AG completion
+                # without waiting for RS (enabling cross-graph RS overlap).
+                self.bwd_ag_fence_event = torch.cuda.Event()
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -1180,13 +1184,33 @@ class _CudaGraphRunner(torch.nn.Module):
                 allow_unused=True,
             )
 
-            if self.parameter_sharding:
-                wait_async_comms()
+            if self.use_stream and self.parameter_sharding:
+                # Phase 1: Process AG handles only (skip RS).
+                # Records ag_event on the shared ag/rs stream after each AG completes.
+                wait_async_comms(skip_rs=True)
+                # Record a fence event on the shared stream at the boundary
+                # between AG work and (future) RS work.  ag_stream == rs_stream,
+                # so _wait_side_streams would wait for RS too — use the event
+                # to wait for only the AG portion.
+                self.bwd_ag_fence_event.record(get_ag_stream())
+                torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
+                # Record completion event AFTER AG is done but BEFORE RS.
+                # Since each runner has its own stream, main_stream can proceed
+                # to the next layer's runner while this runner finishes RS join.
+                # This overlaps ETP RS of layer N with layer N-1's bwd compute.
+                self.bwd_completion_event.record()
 
+            # Phase 2: Process remaining RS handles + join all side streams
+            # (CUDA graph capture requires all forked streams to be joined).
+            # On replay this runs AFTER the event, so the RS join only blocks
+            # this runner's stream — not main_stream or the next runner.
+            if self.parameter_sharding:
+                wait_async_comms()  # AG is idempotent (already done), RS processed here
             if self.bwd_side_streams:
                 self._wait_side_streams(self.bwd_side_streams)
 
-            if self.use_stream:
+            if self.use_stream and not self.parameter_sharding:
+                # Non-ETP path: record after full join as before.
                 self.bwd_completion_event.record()
 
         # Unfreeze GC.
