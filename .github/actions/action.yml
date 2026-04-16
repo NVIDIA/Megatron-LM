@@ -83,8 +83,11 @@ runs:
     - name: Install uuidgen
       shell: bash -x -e -u -o pipefail {0}
       run: |
-        apt-get update
-        apt-get install -y uuid-runtime
+        for i in 1 2 3; do
+          apt-get update && apt-get install -y uuid-runtime && break
+          echo "apt attempt $i failed, retrying..."
+          sleep 10
+        done
 
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
