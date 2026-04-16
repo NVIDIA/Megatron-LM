@@ -48,31 +48,6 @@ def _drain_etp_side_streams(chain_id: str = None):
         pass
 
 
-_ddp_module_ref = None
-
-
-def register_ddp_for_expert_drain(ddp_module):
-    """Register the DDP module so expert compute can drain in-flight param gathers.
-
-    Call once after DDP wrapping in the training setup.
-    """
-    global _ddp_module_ref
-    _ddp_module_ref = ddp_module
-
-
-def _drain_param_gather():
-    """Wait for any in-flight async param all-gather from --overlap-param-gather.
-
-    With CUDA graphs + overlap-param-gather, the DDP forward pre-hook that calls
-    finish_param_sync is skipped during graph capture (is_graph_capturing() guard)
-    and never runs during replay (Python hooks don't re-execute). This leaves async
-    param AGs (IB) in-flight when eager expert compute starts, racing with EETP RS
-    (also IB) on a different communicator, causing NCCL deadlock at IB scale.
-    """
-    if _ddp_module_ref is None:
-        return
-    _ddp_module_ref.start_param_sync(force_sync=True)
-
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for a tensor.

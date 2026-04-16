@@ -1337,22 +1337,20 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        # Drain all in-flight async IB ops before eager expert compute.
-        # This is the CG/eager boundary: graphed forward just replayed, now expert
-        # compute runs eagerly. Two sources of in-flight IB ops can race:
+        # Drain in-flight ETP AG on ag_stream before eager expert compute.
+        # The graphed dense forward may have prefetched the next layer's weight
+        # (e.g. AG(next_mamba_fc1)) on ag_stream.  That IB NCCL op can race with
+        # the MoE AllToAll (EP communicator, main_stream) at 64+ GPU IB scale,
+        # causing NCCL deadlock.
         #
-        # 1. ETP ag_stream: AG(next_mamba_fc1) prefetch from shared_expert GEMM.
-        # 2. DDP param AG: with --overlap-param-gather + CG, the forward pre-hook
-        #    (finish_param_sync) is skipped during graph capture/replay, leaving
-        #    async param AGs (IB) in-flight from the graphed forward.
-        #
-        # Either can race with EETP RS (IB) during expert backward, causing NCCL
-        # deadlock at 64+ GPU IB scale.
+        # DDP param AG (--overlap-param-gather) does NOT need draining here:
+        #   - Forward: CudaGraphManager.call_ddp_preforward_hook() fires
+        #     finish_param_sync before each graph replay — overlap chain works.
+        #   - Backward: register_grad_accum_hook serializes DDP RS after ETP RS,
+        #     so no concurrent IB communicator contention.
         if self.config.parameter_sharding_size > 1:
             from megatron.core.transformer.moe.fused_a2a import _drain_etp_side_streams
             _drain_etp_side_streams('dense')
-        from megatron.core.transformer.moe.fused_a2a import _drain_param_gather
-        _drain_param_gather()
 
         # Restore token dispatcher attributes that were captured during CUDA graph recording.
         # After router graph replay, Python code does not re-run, so any attribute that was
