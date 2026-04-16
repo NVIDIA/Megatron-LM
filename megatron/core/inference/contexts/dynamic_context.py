@@ -1848,16 +1848,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
                     self.mamba_slot_allocator.get_intermediate_gpu_data()
                 )
-            self._pending_mamba_transfer = {
-                "active_mamba_indices": self.mamba_metadata.request_to_mamba_state_idx[active_slice],
-                "token_to_request_idx": self.token_to_request_idx[: self.active_token_count],
-                "cu_seqlens": cpu_cu_query,
-                "batch_dimensions": attn_dimensions,
-                "padded_batch_dimensions": self.padded_batch_dimensions,
-                "enable_chunked_prefill": self.is_chunked_prefill_enabled(),
-                "intermediate_offsets_gpu": intermediate_offsets_gpu,
-                "intermediate_counts_gpu": intermediate_counts_gpu,
-            }
+            self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
+                active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
+                token_to_request_idx=self.token_to_request_idx[: self.active_token_count],
+                cpu_cu_query=cpu_cu_query,
+                batch_dimensions=attn_dimensions,
+                padded_batch_dimensions=self.padded_batch_dimensions,
+                enable_chunked_prefill=self.is_chunked_prefill_enabled(),
+                intermediate_offsets_gpu=intermediate_offsets_gpu,
+                intermediate_counts_gpu=intermediate_counts_gpu,
+            )
 
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
@@ -1949,23 +1949,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self._pending_mha_transfer = None
 
-        # Mamba metadata transfer (update writes to GPU buffers).
+        # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
-            d = self._pending_mamba_transfer
-            # cu_seqlens needs to be on GPU for the Mamba metadata update.
-            cu_seqlens_gpu = self.active_attn_metadata["mha_metadata"].state_data[
-                "cu_query_seq_lengths"
-            ]
-            self.mamba_metadata.update(
-                d["active_mamba_indices"],
-                d["token_to_request_idx"],
-                cu_seqlens_gpu,
-                batch_dimensions=d["batch_dimensions"],
-                padded_batch_dimensions=d["padded_batch_dimensions"],
-                enable_chunked_prefill=d["enable_chunked_prefill"],
-                intermediate_offsets_gpu=d["intermediate_offsets_gpu"],
-                intermediate_counts_gpu=d["intermediate_counts_gpu"],
-            )
+            self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
 
     def reset_tensors(self) -> None:
