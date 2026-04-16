@@ -56,10 +56,14 @@ def send_slack_alert(test_case: str, context: str, n_iteration: int, n_attempts:
             [
                 sys.executable,
                 str(BASE_PATH / "notify.py"),
-                "--pipeline-id", pipeline_id,
-                "--check-for", "functional-tests",
-                "--pipeline-context", pipeline_context,
-                "--pipeline-created-at", pipeline_created_at,
+                "--pipeline-id",
+                pipeline_id,
+                "--check-for",
+                "functional-tests",
+                "--pipeline-context",
+                pipeline_context,
+                "--pipeline-created-at",
+                pipeline_created_at,
             ],
             check=False,
         )
