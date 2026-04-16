@@ -22,13 +22,6 @@ from importlib.metadata import version
 from typing import Callable, Optional, Sequence, Union
 
 try:
-    import megatron.core.parallel_state as parallel_state
-
-    HAVE_MEGATRON_CORE = True
-except (ImportError, ModuleNotFoundError):
-    HAVE_MEGATRON_CORE = False
-
-try:
     import einops
 
     HAVE_EINOPS = True
@@ -481,6 +474,8 @@ class FSDPDistributedIndex:
         hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
         hsdp_outer_dp_shard: bool = False,
         expt_device_mesh: Optional[DeviceMesh] = None,
+        fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+        expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -502,6 +497,13 @@ class FSDPDistributedIndex:
                 just sharding across dp_shard ranks and replicating across dp_outer ranks.
             expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
                 to use for the DistributedIndex.
+            fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
+                process group for overlapping all-gather and reduce-scatter operations.
+                When provided, enables AG/RS overlap optimization for regular (non-expert)
+                parameters.
+            expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]): Independent all-gather
+                process group for expert parameters in MoE models. When provided, enables AG/RS
+                overlap optimization for expert parameters.
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
@@ -521,13 +523,9 @@ class FSDPDistributedIndex:
             if contains_submesh(self.device_mesh, self.dp_shard_dim)
             else None
         )
-        # AG group comes from parallel_state, not the mesh
-        # the purpose of this independent group is to overlap all-gather and gradient reduction.
-        self.fsdp_group_ag = None
-        if HAVE_MEGATRON_CORE and parallel_state.has_separate_all_gather_group():
-            self.fsdp_group_ag = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, independent_all_gather=True
-            )
+        # AG groups: supplied via ProcessGroupCollection (Megatron-FSDP entrypoint).
+        self.fsdp_group_ag = fsdp_group_ag
+        self.expt_fsdp_group_ag = expt_fsdp_group_ag
         # Retrieve the outer-FSDP process group from the DeviceMesh.
         self.outer_fsdp_group = (
             self.device_mesh[self.dp_outer_dim].get_group()
@@ -626,7 +624,8 @@ class FSDPDistributedIndex:
         """
         Retrieve an Megatron-FSDP-registered submesh by name(s).
         """
-        if isinstance(mesh_dim_names, str):
+        if isinstance(mesh_dim_names, str) or mesh_dim_names is None:
+            # Create tuple from singleton dim or None.
             mesh_dim_names = (mesh_dim_names,)
 
         # Construct submesh identifier: (*mesh_dim_names, is_expert_parallel)
@@ -636,30 +635,22 @@ class FSDPDistributedIndex:
         device_submesh = self.mesh_library.get(submesh_identifier, None)
 
         if device_submesh is None:
+            device_mesh = self.expt_device_mesh if is_expert_parallel else self.device_mesh
             # Warn about not specifying tp_dim for layers or frameworks that depend on this.
-            if self.tp_dim is None and not is_expert_parallel:
+            if self.tp_dim is None:
                 logger.warning(
-                    "[FSDPDistributedIndex] Note: For TransformerEngine, or "
-                    "other machine learning frameworks like Megatron that assume "
+                    "[FSDPDistributedIndex] For TransformerEngine, or other "
+                    "machine learning frameworks like Megatron that assume "
                     "TP=1, you must specify tp_dim to use Megatron-FSDP. "
-                    "Create a trivial TP dimension by setting the TP dimension size "
-                    "to 1 in the DeviceMesh.\n"
-                    f"DeviceMesh: {self.device_mesh}"
+                    "Create a trivial TP dimension by setting the TP dimension "
+                    "size to 1 in the DeviceMesh.\n"
+                    f"{'Expert ' if is_expert_parallel else ''}DeviceMesh: {device_mesh}"
                 )
-            elif self.tp_dim is None and is_expert_parallel:
-                logger.warning(
-                    "[FSDPDistributedIndex] Note: For TransformerEngine, or "
-                    "other machine learning frameworks like Megatron that assume "
-                    "ETP=1, you must specify tp_dim to use Megatron-FSDP. "
-                    "Create a trivial ETP dimension by setting the ETP dimension size "
-                    "to 1 in the DeviceMesh.\n"
-                    f"DeviceMesh: {self.expt_device_mesh}"
-                )
-
             raise ValueError(
                 f"[FSDPDistributedIndex][get_submesh] No submesh with "
                 f"mesh_dim_names={mesh_dim_names}, is_expert_parallel={is_expert_parallel} "
-                f"has been registered with Megatron-FSDP."
+                f"has been registered with Megatron-FSDP.\n"
+                f"{'Expert ' if is_expert_parallel else ''}DeviceMesh: {device_mesh}"
             )
 
         return device_submesh
@@ -679,6 +670,8 @@ class FSDPDistributedIndex:
     ) -> ProcessGroup:
         """Get the FSDP process group."""
         if is_expert_parallel:
+            if independent_all_gather:
+                return self.expt_fsdp_group_ag
             return self.expt_fsdp_group
         if independent_all_gather:
             return self.fsdp_group_ag
@@ -810,23 +803,31 @@ def is_mcore_tensor_model_parallel(param: torch.Tensor) -> bool:
     """
     Check if the given parameter is Megatron-Core tensor model parallel.
     """
-    return getattr(param, "_mcore_tp", False) or getattr(param, "tensor_model_parallel", False)
+    return get_mcore_tensor_parallel_partition_dim(param) is not None
 
 
 def is_mcore_tensor_parallel_duplicated(param: torch.Tensor) -> bool:
     """
     Check if the given parameter is Megatron-Core tensor model parallel and duplicated.
     """
-    return getattr(param, "_tp_duplicated", False)
+    return get_mcore_tensor_parallel_partition_dim(param) is None
 
 
 def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int]:
     """
     Get the partition dimension for a Megatron-Core tensor model parallel parameter.
     """
-    if is_mcore_tensor_model_parallel(param):
-        if hasattr(param, "_tp_partition_dim"):
-            return param._tp_partition_dim
-        else:
-            return param.partition_dim
+    if hasattr(param, "_tensor_parallel_mode"):
+        if param._tensor_parallel_mode == "column":
+            return 0
+        elif param._tensor_parallel_mode == "row":
+            return 1
     return None
+
+
+def using_tensor_parallel(dist_index, is_expert_parallel: bool = False) -> bool:
+    """
+    Check if tensor parallelism is being used based on the distributed index.
+    """
+    tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_parallel)
+    return tp_mesh.mesh.numel() > 1

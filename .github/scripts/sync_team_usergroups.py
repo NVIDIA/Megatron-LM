@@ -19,11 +19,12 @@ This script reads members from GitHub teams and updates the corresponding
 Slack user groups to match.
 """
 
-import os
-import sys
 import argparse
-import requests
+import os
+import re
+import sys
 
+import requests
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -52,10 +53,7 @@ def get_headers():
         print("Error: GH_TOKEN or GITHUB_TOKEN not set")
         sys.exit(1)
 
-    return {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
 
 
 def get_org():
@@ -198,8 +196,9 @@ def get_user_email(username):
         if resp.status_code == 200:
             commits = resp.json()
             for commit in commits:
-                # Get email from commit author
                 commit_data = commit.get('commit', {})
+
+                # Get email from commit author metadata
                 author_data = commit_data.get('author', {})
                 email = author_data.get('email')
 
@@ -210,6 +209,14 @@ def get_user_email(username):
                         return email
                     elif public_email is None:
                         public_email = email
+
+                # Check Signed-off-by lines in the commit message for @nvidia.com emails
+                message = commit_data.get('message', '')
+                sob_matches = re.findall(r'Signed-off-by:.*<([^>]+@nvidia\.com)>', message)
+                if sob_matches:
+                    _email_cache[username] = sob_matches[0]
+                    print(f"Found @nvidia.com email for {username} from Signed-off-by")
+                    return sob_matches[0]
 
         # 3. Use public email if found, otherwise fallback
         if public_email:
@@ -327,21 +334,14 @@ def create_slack_usergroup(slack_client, handle, team_slug):
 
     try:
         print(f"Creating Slack usergroup '@{handle}' with name '{name}'...")
-        response = slack_client.usergroups_create(
-            name=name,
-            handle=handle,
-            description=description,
-        )
+        response = slack_client.usergroups_create(name=name, handle=handle, description=description)
         usergroup = response.get("usergroup", {})
         usergroup_id = usergroup.get("id")
 
         if usergroup_id:
             # Update cache with new usergroup
             if _usergroups_cache is not None:
-                _usergroups_cache[handle] = {
-                    "id": usergroup_id,
-                    "users": [],
-                }
+                _usergroups_cache[handle] = {"id": usergroup_id, "users": []}
             print(f"Successfully created Slack usergroup '@{handle}'")
             return usergroup_id
         else:
@@ -434,9 +434,7 @@ def sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=False):
 
     # 5. Update the usergroup
     try:
-        slack_client.usergroups_users_update(
-            usergroup=usergroup_id, users=slack_user_ids
-        )
+        slack_client.usergroups_users_update(usergroup=usergroup_id, users=slack_user_ids)
         print(f"\nSuccessfully updated '@{usergroup_handle}' with {len(slack_user_ids)} members")
         return True
     except SlackApiError as e:
@@ -518,18 +516,12 @@ def sync_all_teams(dry_run=False, parent_teams=None, direct_teams=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sync GitHub team membership to Slack user groups"
+    parser = argparse.ArgumentParser(description="Sync GitHub team membership to Slack user groups")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be done without making changes"
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without making changes",
-    )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="List all configured team-to-usergroup mappings",
+        "--list", action="store_true", help="List all configured team-to-usergroup mappings"
     )
     parser.add_argument(
         "--parent-team",
@@ -547,8 +539,7 @@ def main():
         dest="direct_teams",
         metavar="SLUG",
         help=(
-            "Sync this GitHub team directly (can be repeated). "
-            f"Defaults to: {DIRECT_TEAM_SLUGS}"
+            "Sync this GitHub team directly (can be repeated). " f"Defaults to: {DIRECT_TEAM_SLUGS}"
         ),
     )
 
