@@ -316,6 +316,9 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3]],
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
         r2 = TokenRollout(
             trajectory=[[1, 2, 3, 4]],
@@ -324,6 +327,9 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, -1.2]],
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
 
         rollouts = [[r1, r2] for _ in range(dp)]
@@ -342,6 +348,9 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
         r2 = TokenRollout(
             trajectory=torch.tensor([[1, 2, 234, tokenizer.eod]], dtype=torch.float).cuda(),
@@ -350,9 +359,12 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -1.2]]),
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]],
+            kv_cache_epoch=[[(0, 0)]],
+            num_evictions=[0],
         )
         rollouts = [[r1, r2] for _ in range(dp)]
-        data_iter = rl_utils.prepare_data_for_update(
+        data_iter, _, _ = rl_utils.prepare_data_for_update(
             [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
         )
 
@@ -383,6 +395,9 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, 0.35]] * num_turns,
             env_id='MEGAENV',
             problem_id="1",
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
+            num_evictions=[0] * num_turns,
         )
         r2 = TokenRollout(
             trajectory=[[4, 5, 6, 7, tokenizer.eod]] * num_turns,
@@ -391,6 +406,9 @@ class TestRLUtils:
             logprobs=[[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
             env_id='MEGAENV',
             problem_id="2",
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
+            num_evictions=[0] * num_turns,
         )
         r3 = TokenRollout(
             trajectory=[[8, 9, tokenizer.eod]] * num_turns,
@@ -399,6 +417,9 @@ class TestRLUtils:
             logprobs=[[0.8, 0.9, 0.95]] * num_turns,
             env_id='MEGAENV',
             problem_id="3",
+            policy_epoch=[[(0, 0)]] * num_turns,
+            kv_cache_epoch=[[(0, 0)]] * num_turns,
+            num_evictions=[0] * num_turns,
         )
 
         rollouts = [r1, r2, r3]
@@ -687,7 +708,7 @@ class TestRLUtils:
         """
 
         world_size, dp, tp, pp = initialize_model_parallel
-        micro_batch_size = 2
+        micro_batch_size = 1
         self.create_test_args(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
@@ -881,8 +902,25 @@ class TestRLUtils:
         rewards = [[1, 1], [-1, 2]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
+        # Per-rollout min iteration stamps (2 rollouts in group 1, 2 in group 2)
+        policy_epoch = [[4, 2], [5, 0]]
+        kv_cache_epoch = [[4, 3], [5, 1]]
+        # Per-turn max epoch stamps (when each turn completed)
+        completed_epochs = [[5, 3], [5, 1]]
+        num_evictions = [[0, 1], [0, 0]]
+        current_iteration = 6
         metrics = rl_utils.prep_wandb_metrics(
-            MagicMock(), traj_lens, turn_lens, rewards, num_turns, advantages
+            MagicMock(),
+            traj_lens,
+            turn_lens,
+            rewards,
+            num_turns,
+            advantages,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
+            completed_epochs=completed_epochs,
+            num_evictions=num_evictions,
+            current_iteration=current_iteration,
         )
         assert metrics["mean_reward"] == 0.75
         assert metrics["mean_advantage"] == 0.5
@@ -898,3 +936,15 @@ class TestRLUtils:
         assert metrics["mean_num_turns"] == 15.5
         assert metrics["max_num_turns"] == 42
         assert metrics["min_num_turns"] == 2
+        # true_policy_staleness = [6-4, 6-2, 6-5, 6-0] = [2, 4, 1, 6] -> mean=3.25, max=6, min=1
+        assert metrics["mean_policy_staleness"] == np.mean([2, 4, 1, 6])
+        assert metrics["max_policy_staleness"] == 6
+        assert metrics["min_policy_staleness"] == 1
+        # true_kv_staleness = [6-4, 6-3, 6-5, 6-1] = [2, 3, 1, 5] -> mean=2.75, max=5, min=1
+        assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 1, 5])
+        assert metrics["max_kv_cache_staleness"] == 5
+        assert metrics["min_kv_cache_staleness"] == 1
+        assert metrics["total_eviction_count"] == 1
+        assert metrics["max_num_evictions"] == 1
+        # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
+        assert metrics["mean_completion_gap"] == 2.5

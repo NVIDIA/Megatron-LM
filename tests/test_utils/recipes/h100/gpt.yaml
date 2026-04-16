@@ -313,6 +313,11 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mcore_te_tp2_pp1_cp4_dcp]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last]
     products:
       - environment: [dev]
@@ -347,10 +352,20 @@ products:
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp2_mhc]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp2_dsa]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective]
     products:

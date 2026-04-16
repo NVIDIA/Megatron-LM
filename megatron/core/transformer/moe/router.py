@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
@@ -16,7 +17,6 @@ from megatron.core.transformer.moe.moe_utils import (
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
-    save_to_aux_losses_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
@@ -419,7 +419,7 @@ class TopKRouter(Router):
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
-            reduce_group_has_dp=True,
+            needs_dp_avg=False,
             valid_token_count=local_num_tokens,
         )
         return probs
@@ -431,7 +431,7 @@ class TopKRouter(Router):
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
-        reduce_group_has_dp: bool = False,
+        needs_dp_avg: bool = True,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
     ):
         """Attach aux loss function to activation and add to logging.
@@ -442,9 +442,7 @@ class TopKRouter(Router):
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
             reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
-            reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
-                Set this to True if the reduce group has data parallel ranks. This flag is used to
-                ensure the correct reduction in aux loss tracking.
+            needs_dp_avg (bool): Whether to average this metric across DP ranks after reduce_group.
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
@@ -472,13 +470,13 @@ class TopKRouter(Router):
         else:
             layer_number = self.layer_number
 
-        save_to_aux_losses_tracker(
+        get_moe_metrics_tracker().record(
             aux_loss_name,
             aux_loss / aux_loss_coeff,
             layer_number,
             num_layers,
             reduce_group=reduce_group,
-            reduce_group_has_dp=reduce_group_has_dp,
+            needs_dp_avg=needs_dp_avg,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
@@ -545,7 +543,7 @@ class TopKRouter(Router):
             else:
                 layer_number = self.layer_number
 
-            save_to_aux_losses_tracker(
+            get_moe_metrics_tracker().record(
                 "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
             )
         return logits
@@ -718,3 +716,115 @@ class TopKRouter(Router):
         """Save the state dict of the router."""
         self._maintain_float32_expert_bias()  # switch to float32 before saving
         return super()._save_to_state_dict(*args, **kwargs)
+
+
+class InferenceTopKRouter(TopKRouter):
+    """Inference-only top-k router that strips out training-specific overhead.
+
+    A stripped-down version of TopKRouter that skips z-loss, auxiliary load
+    balancing losses, token dropping, and expert bias updates. The _forward()
+    method is @torch.compile()'d and returns dense [num_tokens, topk] tensors
+    instead of sparse [num_tokens, num_experts] for compatibility with FlashInfer.
+
+    Falls back to the parent TopKRouter.forward() for training or
+    non-CUDA-graphed inference iterations.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
+    ) -> None:
+        """Initialize the specialized inference top-k router.
+
+        Args:
+            config (TransformerConfig): The configuration for the transformer model.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+        """
+        # Enforce constraints before calling super().__init__
+        assert config.moe_router_num_groups is None, (
+            f"InferenceTopKRouter requires moe_router_num_groups=None, "
+            f"got {config.moe_router_num_groups}"
+        )
+        assert config.moe_router_score_function in ["sigmoid", "softmax"], (
+            f"InferenceTopKRouter requires moe_router_score_function in "
+            f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
+        )
+
+        super().__init__(config=config, pg_collection=pg_collection)
+
+        self.is_inference_cuda_graphed_iteration = False
+
+    def set_inference_cuda_graphed_iteration(self):
+        """Enable CUDA graph-compatible operations for the router."""
+        self.is_inference_cuda_graphed_iteration = True
+
+    def unset_inference_cuda_graphed_iteration(self):
+        """Disable CUDA graph-compatible operations for the router."""
+        self.is_inference_cuda_graphed_iteration = False
+
+    @staticmethod
+    @torch.compile
+    def _compiled_topk_routing(
+        logits,
+        topk,
+        use_pre_softmax,
+        num_groups,
+        group_topk,
+        scaling_factor,
+        score_function,
+        expert_bias,
+        fused,
+        router_replay,
+        dense_output,
+    ):
+        return topk_routing_with_score_function(
+            logits,
+            topk,
+            use_pre_softmax=use_pre_softmax,
+            num_groups=num_groups,
+            group_topk=group_topk,
+            scaling_factor=scaling_factor,
+            score_function=score_function,
+            expert_bias=expert_bias,
+            fused=fused,
+            router_replay=router_replay,
+            dense_output=dense_output,
+        )
+
+    def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
+
+        probs, top_indices = self._compiled_topk_routing(
+            logits,
+            self.topk,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias,
+            fused=self.config.moe_router_fusion,
+            router_replay=self.router_replay,
+            dense_output=True,
+        )
+        return probs.squeeze(1), top_indices.squeeze(1)
+
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        """Simplified forward pass for inference - returns dense tensors only.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
+            padding_mask (torch.Tensor, optional): Not used in inference.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - probs: Normalized routing probabilities [num_tokens, topk]
+                - top_indices: Selected expert indices [num_tokens, topk]
+        """
+
+        if self.training or not self.is_inference_cuda_graphed_iteration:
+            return super().forward(input, padding_mask)
+
+        return self._forward(input, padding_mask)

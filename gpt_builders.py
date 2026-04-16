@@ -54,7 +54,6 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                     )
                 )
             elif args.num_experts:
-                assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
                     config,
@@ -123,46 +122,46 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
 
 def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
-    
+
     Args:
         use_te (bool): Whether to use Transformer Engine
-        args: Training arguments
         config: Model configuration
-        
+
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
-    args = get_args()
     if use_te:
         return get_gpt_layer_with_transformer_engine_spec(
-            args.num_experts,
-            args.moe_grouped_gemm,
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            args.experimental_attention_variant,
-            moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=args.qk_l2_norm,
+            config.num_moe_experts,
+            config.moe_grouped_gemm,
+            config.qk_layernorm,
+            config.multi_latent_attention,
+            config.experimental_attention_variant,
+            qk_l2_norm=config.qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             fallback_to_eager_attn=config.fallback_to_eager_attn,
+            enable_hyper_connection=config.enable_hyper_connections,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            qk_l2_norm=args.qk_l2_norm,
+            config.qk_layernorm,
+            config.multi_latent_attention,
+            qk_l2_norm=config.qk_l2_norm,
         )
     else:
         return get_gpt_layer_local_spec(
-            args.num_experts,
-            args.moe_grouped_gemm,
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            args.experimental_attention_variant,
-            moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
-            normalization=args.normalization,
+            config.num_moe_experts,
+            config.moe_grouped_gemm,
+            config.qk_layernorm,
+            config.multi_latent_attention,
+            config.experimental_attention_variant,
+            normalization=config.normalization,
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            enable_hyper_connection=config.enable_hyper_connections,
         )

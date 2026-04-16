@@ -12,6 +12,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
@@ -24,6 +25,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
@@ -81,17 +83,6 @@ def get_dsa_module_spec_for_backend(
     assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
 
-    linear_q_up_proj = (
-        backend.column_parallel_layer_norm_linear()
-        if config.qk_layernorm
-        else backend.column_parallel_linear()
-    )
-    linear_kv_up_proj = (
-        backend.column_parallel_layer_norm_linear()
-        if config.qk_layernorm
-        else backend.column_parallel_linear()
-    )
-
     # Because TransformerEngine does not support sparse attention yet, we use local
     # implementation whether the backend is TransformerEngine or not.
     core_attention = ModuleSpec(
@@ -109,20 +100,29 @@ def get_dsa_module_spec_for_backend(
         ),
     )
 
+    # Adjust for RMS norm.
+    rms_norm = config.normalization == "RMSNorm"
+    # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
+    # with linear projection and have to use unfused qk layernorm.
+    qk_norm = (
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+    )
+
     attention = ModuleSpec(
         module=MLASelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
         submodules=MLASelfAttentionSubmodules(
             linear_q_proj=backend.column_parallel_linear(),
             linear_q_down_proj=backend.linear(),
-            linear_q_up_proj=linear_q_up_proj,
+            linear_q_up_proj=backend.column_parallel_linear(),
             linear_kv_down_proj=backend.linear(),
-            linear_kv_up_proj=linear_kv_up_proj,
+            linear_kv_up_proj=backend.column_parallel_linear(),
             core_attention=core_attention,
             linear_proj=backend.row_parallel_linear(),
-            q_layernorm=IdentityOp,
-            kv_layernorm=IdentityOp,
+            q_layernorm=qk_norm,
+            kv_layernorm=qk_norm,
         ),
+        metainfo={"fuse_input_layernorm": False},
     )
 
     return attention
@@ -138,6 +138,8 @@ def get_experimental_attention_variant_module_spec(
 
     if config.experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dsa":
+        return get_dsa_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -221,6 +223,10 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
+    enable_hc = config.enable_hyper_connections
+    hc_module = HyperConnectionModule if enable_hc else IdentityOp
+    layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
+
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -242,14 +248,16 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
         layer_specs.append(
             ModuleSpec(
-                module=TransformerLayer,
+                module=layer_module,
                 submodules=TransformerLayerSubmodules(
                     input_layernorm=input_layernorm,
                     self_attention=attention,
                     self_attn_bda=get_bias_dropout_add,
+                    self_attention_hyper_connection=hc_module,
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=mlp,
                     mlp_bda=get_bias_dropout_add,
+                    mlp_hyper_connection=hc_module,
                 ),
             )
         )
@@ -426,13 +434,13 @@ def _get_self_attention_module_spec(
         moe_grouped_gemm=config.moe_grouped_gemm,
         qk_layernorm=config.qk_layernorm,
         multi_latent_attention=config.multi_latent_attention,
-        moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
         qk_l2_norm=config.qk_l2_norm,
         use_kitchen=config.use_kitchen,
         use_te_activation_func=config.use_te_activation_func,
         fallback_to_eager_attn=config.fallback_to_eager_attn,
         use_kitchen_attention=config.use_kitchen_attention,
         kitchen_attention_backend=config.kitchen_attention_backend,
+        mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
     )
     attn_spec = layer_spec.submodules.self_attention
     if config.multi_latent_attention:
@@ -479,7 +487,6 @@ def _get_moe_module_spec(
         backend=backend,
         num_experts=config.num_moe_experts,
         moe_grouped_gemm=config.moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
         use_te_activation_func=config.use_te_activation_func,
     )
     moe_spec.metainfo["fuse_pre_mlp_layernorm"] = False

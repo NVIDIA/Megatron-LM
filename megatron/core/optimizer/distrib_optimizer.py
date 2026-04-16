@@ -362,7 +362,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
                     # Generate sharded model param.
-                    if is_float8tensor(model_param) and config.fp8_recipe != "delayed":
+                    if (
+                        cls._is_distopt_quantized_param(model_param)
+                        and config.fp8_recipe != "delayed"
+                    ):
                         # MXFP8Tensor and BlockwiseQTensor don't support view(-1)
                         shard_model_param = None
                     else:
@@ -382,7 +385,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
-                        if is_float8tensor(model_param):
+                        if cls._is_distopt_quantized_param(model_param):
                             if hasattr(model_param, 'get_high_precision_init_val'):
                                 shard_main_param = (
                                     model_param.get_high_precision_init_val()
@@ -918,6 +921,70 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(v, torch.Tensor):
                     tensors[k] = v
         return tensors
+
+    @staticmethod
+    def _is_grouped_quantized_tensor(tensor: torch.Tensor) -> bool:
+        """Check if tensor is a TE GroupedTensor using quantized storage."""
+        return (
+            hasattr(tensor, "split_into_quantized_tensors")
+            and callable(tensor.split_into_quantized_tensors)
+            and getattr(tensor, "quantizer", None) is not None
+        )
+
+    @classmethod
+    def _is_distopt_quantized_param(cls, tensor: torch.Tensor) -> bool:
+        """Check if tensor should follow quantized parameter path in dist optimizer."""
+        return is_float8tensor(tensor) or cls._is_grouped_quantized_tensor(tensor)
+
+    def _expand_quantized_param_shard_for_cast(
+        self,
+        model_param: torch.Tensor,
+        shard_main_param: Optional[torch.Tensor],
+        start_offset: Optional[int],
+    ):
+        """Expand one quantized model param to cast-ready entries.
+
+        For grouped quantized tensors, split into member quantized tensors and map the sharded
+        master slice to per-member offset ranges, while preserving deterministic ordering across
+        DP ranks.
+        """
+        if not self._is_grouped_quantized_tensor(model_param):
+            return [model_param], [shard_main_param], [start_offset]
+
+        quantized_members = model_param.quantized_tensors
+        if quantized_members is None:
+            quantized_members = model_param.split_into_quantized_tensors()
+
+        shard_start = 0 if start_offset is None else start_offset
+        shard_size = 0 if shard_main_param is None else shard_main_param.numel()
+        shard_end = shard_start + shard_size
+        shard_flat = None if shard_main_param is None else shard_main_param.view(-1)
+
+        expanded_model_params = []
+        expanded_shard_main_params = []
+        expanded_start_offsets = []
+        member_offset = 0
+        for member in quantized_members:
+            member_numel = member.numel()
+            member_start = member_offset
+            member_end = member_start + member_numel
+            overlap_start = max(member_start, shard_start)
+            overlap_end = min(member_end, shard_end)
+
+            member_master = None
+            member_start_offset = None
+            if overlap_start < overlap_end:
+                local_start = overlap_start - shard_start
+                local_end = overlap_end - shard_start
+                member_master = shard_flat[local_start:local_end]
+                member_start_offset = overlap_start - member_start
+
+            expanded_model_params.append(member)
+            expanded_shard_main_params.append(member_master)
+            expanded_start_offsets.append(member_start_offset)
+            member_offset = member_end
+
+        return expanded_model_params, expanded_shard_main_params, expanded_start_offsets
 
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
         """Set the main param and optimizer states corresponding to the input model_param.
@@ -2151,7 +2218,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         fp8_gbuf_indices = []
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, _ in gbuf_range_maps.items():
-                if is_float8tensor(self.buffers[gbuf_idx].params[0]):
+                if self._is_distopt_quantized_param(self.buffers[gbuf_idx].params[0]):
                     fp8_gbuf_indices.append(gbuf_idx)
         if len(fp8_gbuf_indices) == 0:
             return
@@ -2173,7 +2240,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         new_state_dict = {'buckets_coalesced': state_dict['buckets_coalesced']}
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, _ in gbuf_range_maps.items():
-                if not is_float8tensor(self.buffers[gbuf_idx].params[0]):
+                if not self._is_distopt_quantized_param(self.buffers[gbuf_idx].params[0]):
                     new_state_dict[gbuf_idx] = state_dict[dtype_to_gbuf_idx[dtype]]
 
         for fp8_gbuf_idx in fp8_gbuf_indices:
@@ -2373,7 +2440,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         idx = 0
         for buffer in buffers:
             for param in buffer.params:
-                if is_float8tensor(param):
+                if self._is_distopt_quantized_param(param):
                     fp8_params.append(param)
                     shard_fp32_from_fp8.append(None)
                     shard_offsets_in_fp8.append(None)
@@ -2388,7 +2455,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             """
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
-                    if is_float8tensor(model_param):
+                    if self._is_distopt_quantized_param(model_param):
                         param_range_map = self._get_model_param_range_map(model_param)
                         param_range = param_range_map["param"]
                         assert param_range.size == shard_main_param.nelement()
@@ -2465,8 +2532,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
+        fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
+            self._get_fp8_params_and_shard_fp32_from_fp8()
+        )
+        expanded_fp8_params = []
+        expanded_shard_fp32_from_fp8 = []
+        expanded_shard_offsets_in_fp8 = []
+        for model_param, shard_main_param, start_offset in zip(
+            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
+        ):
+            sub_model_params, sub_shard_main_params, sub_start_offsets = (
+                self._expand_quantized_param_shard_for_cast(
+                    model_param, shard_main_param, start_offset
+                )
+            )
+            expanded_fp8_params.extend(sub_model_params)
+            expanded_shard_fp32_from_fp8.extend(sub_shard_main_params)
+            expanded_shard_offsets_in_fp8.extend(sub_start_offsets)
+
         quantize_param_shard(
-            *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
+            expanded_fp8_params,
+            expanded_shard_fp32_from_fp8,
+            expanded_shard_offsets_in_fp8,
+            self.data_parallel_group,
         )
 
         # Utility method for copying group params.
@@ -2486,7 +2574,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         world_range.start : world_range.end
                     ]
 
-                    if is_float8tensor(model_param):
+                    if self._is_distopt_quantized_param(model_param):
                         # FP8 params are quantized in the above "quantize_param_shard" function.
                         continue
                     else:
@@ -2598,8 +2686,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Use param from state_dict to initialize main_param
                         model_param = model_param_to_state_dict_param_map[model_param]
 
-                    if is_float8tensor(model_param):
-                        shard_model_param = dequantize_fp8_tensor(model_param).view(-1)[
+                    if self._is_distopt_quantized_param(model_param):
+                        if self._is_grouped_quantized_tensor(model_param):
+                            dequantized_model_param = model_param.float()
+                        else:
+                            dequantized_model_param = dequantize_fp8_tensor(model_param)
+                        shard_model_param = dequantized_model_param.view(-1)[
                             param_range.start : param_range.end
                         ]
                     else:
