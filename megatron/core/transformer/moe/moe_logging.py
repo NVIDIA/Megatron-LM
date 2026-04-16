@@ -98,8 +98,8 @@ class MoEOverloadFactorTracker:
     Reductions are over tp_ep then expt_dp (expert data parallel), not dense dp,
     so overload stats stay within the same expert partition across replicas.
 
-    Lifecycle: MoELayer records counts when log_moe_overload_factor is set → report()
-    at step end (sync, aggregate, log, deferred clear) → repeat.
+    Lifecycle: MoELayer records counts when log_moe_overload_factor is set (training only);
+    report() at step end (sync, aggregate, log, deferred clear) → repeat.
 
     Example:
         tracker = get_moe_overload_factor_tracker()
@@ -370,7 +370,6 @@ class MoEOverloadFactorTracker:
         pp_group, use_pp_reduce = self._pipeline_group_and_use_reduce()
         tp_ep_group = self._tp_ep_group
         expt_dp_group = self._expt_dp_group
-
         fwd_tensors, balanced_tensors = self._flatten_recorded_tokens()
 
         if not fwd_tensors:

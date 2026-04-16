@@ -507,8 +507,11 @@ class MoELayer(BaseMoELayer):
         Uses _overload_log_num_local_tokens captured from forward hidden_states and
         applies AllGather fair-share scaling so report()'s SUM over TP×EP matches one
         global balanced count when the map is replicated on every rank.
+
+        Recording is skipped when not in training mode (e.g. Megatron validation uses
+        model.eval()) so eval forwards do not pollute train-only overload stats.
         """
-        if not self.config.log_moe_overload_factor:
+        if not self.config.log_moe_overload_factor or not self.training:
             return dispatched_input
         num_local_tokens = getattr(self, "_overload_log_num_local_tokens", None)
         if num_local_tokens is None:
@@ -627,7 +630,7 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    if self.config.log_moe_overload_factor:
+                    if self.config.log_moe_overload_factor and self.training:
                         self._overload_log_num_local_tokens = (
                             self._num_token_rows_from_moe_hidden_states(hidden_states)
                         )
