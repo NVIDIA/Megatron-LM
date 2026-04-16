@@ -5,6 +5,8 @@ import sys
 
 import requests
 
+DEFAULT_TIMEOUT = 30
+
 
 def _print_usage_and_exit() -> None:
     print("Usage: python tools/text_generation_cli.py <host:port>")
@@ -43,7 +45,7 @@ if __name__ == "__main__":
 
         data = {"prompts": [sentence], "tokens_to_generate": tokens_to_generate}
         try:
-            response = requests.put(url, data=json.dumps(data), headers=headers, timeout=30)
+            response = requests.put(url, data=json.dumps(data), headers=headers, timeout=DEFAULT_TIMEOUT)
         except requests.RequestException as exc:
             print(f"Request failed: {exc}")
             continue
