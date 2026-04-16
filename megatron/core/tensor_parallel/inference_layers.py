@@ -7,6 +7,7 @@ import torch.distributed as dist
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
+    TELinear,
     TERowParallelLinear,
 )
 from megatron.core.inference.communication.torch_symm_triton import (
@@ -55,9 +56,53 @@ def _apply_linear(
     Helper to apply either MXFP8 or standard GEMM based on the configuration.
     """
     kwargs = {"out": out} if out is not None else {}
-    if config.fp8_recipe == "mxfp8":
+    if isinstance(weight, MXFP8Tensor):
         return mm_mxfp8(x, weight, **kwargs)
     return torch.matmul(x, weight.t(), **kwargs)
+
+
+class InferenceLinear(TELinear):
+    """Inference optimized version of TELinear."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        parallel_mode: Optional[str],
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        skip_weight_param_allocation: bool,
+        tp_comm_buffer_name: Optional[str] = None,
+        is_expert: bool = False,
+        symmetric_ar_type: Optional[str] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
+        super().__init__(
+            input_size,
+            output_size,
+            parallel_mode=parallel_mode,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            is_expert=is_expert,
+            symmetric_ar_type=symmetric_ar_type,
+            tp_group=tp_group,
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        """Forward pass."""
+        if self.training:
+            return super().forward(x)
+
+        x = _apply_linear(x, self.weight, self.config)
+        return x, None
 
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
@@ -344,10 +389,10 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         and perform an NVLS multicast reduce-scatter. If that is not possible,
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
-        use_mxfp8 = self.config.fp8_recipe == "mxfp8"
+        use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
-            # Remove batch dimension for FlashInfer mxfp8
+            # Remove seq_len dimension for MXFP8 (mm_mxfp8 squeezes internally)
             del symm_mem_buffer_dims[1]
         symm_mem_buffer_dims[-1] = self.weight.size(0)
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
