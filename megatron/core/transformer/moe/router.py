@@ -176,13 +176,15 @@ class CapacityPricedRouter(Router):
         top1_indices = torch.argmax(effective_logits, dim=-1, keepdim=True)
 
         if self.config.moe_router_score_function == "sigmoid":
-            scores = torch.sigmoid(logits)
+            scores = torch.sigmoid(logits.float()).type_as(logits)
+            top1_scores = torch.gather(scores, dim=1, index=top1_indices)
         else:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-        top1_scores = torch.gather(scores, dim=1, index=top1_indices)
+            # Match TopKRouter: softmax over top-k logits only; for top-1 this sums to 1 per row.
+            selected_logits = torch.gather(logits, dim=1, index=top1_indices)
+            top1_scores = torch.softmax(selected_logits, dim=-1, dtype=torch.float32).type_as(logits)
 
         routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top1_indices, True)
-        probs = torch.zeros_like(scores).scatter(1, top1_indices, top1_scores)
+        probs = torch.zeros_like(logits).scatter(1, top1_indices, top1_scores)
 
         # Keep padded tokens from contributing to dispatch or price updates.
         if padding_mask is not None:
