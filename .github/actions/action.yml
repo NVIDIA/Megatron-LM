@@ -157,10 +157,7 @@ runs:
     - name: Set timeout
       shell: bash -x -e -u -o pipefail {0}
       id: timeout_in_seconds
-      run: |
-        echo "::group::Set timeout"
-        echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
-        echo "::endgroup::"
+      run: echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
 
     - name: Pull container
       shell: bash -x -e -u -o pipefail {0}
@@ -192,7 +189,6 @@ runs:
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
       run: |
-        echo "::group::Collect artifact names"
         logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(uuidgen)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
         if [[ "$IS_UNIT_TEST" == "true" ]]; then
@@ -201,7 +197,6 @@ runs:
           coverage_report=none
         fi
         echo "coverage_report=$coverage_report" | tee -a "$GITHUB_OUTPUT"
-        echo "::endgroup::"
 
         EXIT_CODE=${{ steps.run-main-script.outputs.exit_code }}
         IS_SUCCESS=$([[ "$EXIT_CODE" -eq 0 ]] && echo "true" || echo "false")
