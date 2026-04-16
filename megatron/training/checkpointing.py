@@ -1625,8 +1625,26 @@ def _load_base_checkpoint(
         ckpt_type = CheckpointType.FSDP_DTENSOR
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
+
+        # Stash state_dict keys that have no presence in the checkpoint.
+        # For Megatron-saved checkpoints, DCP stores all entries (tensors
+        # as TensorStorageMetadata, non-tensors as BytesStorageMetadata),
+        # so nothing needs to be stashed.
+        # For Bridge-converted checkpoints, metadata keys like 'args',
+        # 'iteration', etc. don't exist — stash them so DCP doesn't
+        # error, then restore placeholder values after load.
+        state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+        _stashed_keys = {}
+        for key in list(state_dict.keys()):
+            # Keep the key if it exists as a top-level metadata entry
+            # (e.g. 'args', 'iteration') OR if any flattened sub-key
+            # exists (e.g. 'model.layer.weight' for top-level 'model').
+            if key not in state_dict_metadata and not any(
+                k.startswith(key + '.') for k in state_dict_metadata
+            ):
+                _stashed_keys[key] = state_dict.pop(key)
+
         if allow_partial_load:
-            state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
             rank = torch.distributed.get_rank()
             import time as _time
 
@@ -1637,6 +1655,9 @@ def _load_base_checkpoint(
         torch.distributed.checkpoint.load_state_dict(
             state_dict=state_dict, storage_reader=fs_storage_reader, planner=planner
         )
+
+        # Restore stashed keys (Bridge fallback placeholders).
+        state_dict.update(_stashed_keys)
 
         if raw_optimizer_state_dict is not None:
             state_dict["optimizer"] = raw_optimizer_state_dict
