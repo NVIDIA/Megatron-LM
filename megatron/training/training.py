@@ -3289,11 +3289,6 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
-        from megatron.legacy.model.vision.knn_monitor import compute_feature_bank
-
-        compute_feature_bank(model)
-
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
         model_module.eval()
