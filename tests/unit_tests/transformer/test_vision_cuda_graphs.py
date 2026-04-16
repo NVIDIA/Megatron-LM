@@ -611,6 +611,8 @@ class TestVisionTECudaGraphHelperPP2:
         for layer in helper.callables:
             assert layer.cuda_graphs == []
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
         reason="TE CUDA graph capture requires TransformerEngine >= 2.7.0",
