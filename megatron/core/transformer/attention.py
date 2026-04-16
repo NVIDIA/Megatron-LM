@@ -1291,22 +1291,29 @@ class SelfAttention(Attention):
 
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.
-        default_norm_cls = None
         if self.config.qk_l2_norm:
-            default_norm_cls = L2Norm
-        elif self.config.qk_layernorm and TENorm is not None:
-            default_norm_cls = TENorm
-
-        q_norm_cls = submodules.q_layernorm or default_norm_cls
-        k_norm_cls = submodules.k_layernorm or default_norm_cls
-
-        if (self.config.qk_layernorm or self.config.qk_l2_norm) and (
-            q_norm_cls is None or k_norm_cls is None
-        ):
-            raise RuntimeError(
-                "qk_layernorm requires Transformer Engine (for TENorm) or "
-                "q_layernorm/k_layernorm set in the spec."
-            )
+            q_norm_cls = submodules.q_layernorm or L2Norm
+            k_norm_cls = submodules.k_layernorm or L2Norm
+        elif self.config.qk_layernorm:
+            q_norm_cls = submodules.q_layernorm or TENorm
+            k_norm_cls = submodules.k_layernorm or TENorm
+            if q_norm_cls is None or k_norm_cls is None:
+                raise ValueError(
+                    "qk_layernorm requires Transformer Engine (for TENorm) or "
+                    "q_layernorm/k_layernorm set in the spec."
+                )
+        else:
+            if submodules.q_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets q_layernorm={submodules.q_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            if submodules.k_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets k_layernorm={submodules.k_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            q_norm_cls = k_norm_cls = None
 
         self.q_layernorm = (
             q_norm_cls(
