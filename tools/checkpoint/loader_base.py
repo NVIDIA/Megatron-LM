@@ -3,9 +3,10 @@ import json
 import os
 import sys
 import types
-import torch
 
+import torch
 from utils import _ConverterFakeProcessGroup, print_memory_usage
+
 
 class MegatronCheckpointLoaderBase:
     """Orchestrates loading a Megatron checkpoint and sending
@@ -20,10 +21,10 @@ class MegatronCheckpointLoaderBase:
         self.args = args
         self.queue = queue
         self.build_tokenizer = build_tokenizer
-        self.margs = None            # Will hold Megatron's main args
+        self.margs = None  # Will hold Megatron's main args
         self.checkpoint_args = None  # Will hold additional checkpoint args
-        self.all_models = None       # Model sharded over different parallelism
-        self.md = None               # Metadata sent to the saver
+        self.all_models = None  # Model sharded over different parallelism
+        self.md = None  # Metadata sent to the saver
         self.consumed_train_samples = None
         self.consumed_valid_samples = None
 
@@ -68,12 +69,13 @@ class MegatronCheckpointLoaderBase:
         # Expert parallelism requires sequence parallelism
         if margs.expert_model_parallel_size > 1:
             margs.sequence_parallel = True
-        
+
         margs = self._maybe_parse_additional_megatron_args(margs, checkpoint_args)
 
         # Validate final arguments
         try:
             from megatron.training.arguments import validate_args
+
             margs = validate_args(margs)
         except Exception as e:
             print(f"Error validating Megatron arguments: {e}")
@@ -133,8 +135,8 @@ class MegatronCheckpointLoaderBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
-            from megatron.training.global_vars import set_global_variables
             from megatron.core import mpu
+            from megatron.training.global_vars import set_global_variables
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             self.queue.put("exit")
@@ -143,9 +145,11 @@ class MegatronCheckpointLoaderBase:
         set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
-        mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)
+        mpu.set_virtual_pipeline_model_parallel_world_size(
+            self.margs.virtual_pipeline_model_parallel_size
+        )
         mpu.set_expert_model_parallel_world_size(self.margs.expert_model_parallel_size)
-        
+
         # For backward compatibility during local parallel states refactoring
         fake_tp_group = _ConverterFakeProcessGroup(size=self.margs.tensor_model_parallel_size)
         fake_ep_group = _ConverterFakeProcessGroup(size=self.margs.expert_model_parallel_size)
@@ -170,7 +174,9 @@ class MegatronCheckpointLoaderBase:
         if self.args.true_vocab_size is not None and self.args.vocab_file is not None:
             vocab = json.load(open(self.args.vocab_file))
             if len(vocab) != self.args.true_vocab_size:
-                print("Both --true-vocab-size and --vocab-file specified but vocab sizes do not match. Aborting.")
+                print(
+                    "Both --true-vocab-size and --vocab-file specified but vocab sizes do not match. Aborting."
+                )
                 return False
         return True
 
@@ -203,8 +209,9 @@ class MegatronCheckpointLoaderBase:
                     mpu.set_virtual_pipeline_model_parallel_rank(i)
                     pre_process = mpu.is_pipeline_first_stage()
                     post_process = mpu.is_pipeline_last_stage()
-                    this_model = model_provider(pre_process=pre_process,
-                                                post_process=post_process).to(dtype)
+                    this_model = model_provider(
+                        pre_process=pre_process, post_process=post_process
+                    ).to(dtype)
                     model_list.append(this_model)
 
                 # Each time we load, we set counters to 0, pass None for optimizer/ LR
@@ -240,7 +247,7 @@ class MegatronCheckpointLoaderBase:
             all_models.append(get_models_for_pipeline_stage(tp_size, dtype))
 
         return all_models, consumed_train_samples, consumed_valid_samples
-    
+
     def send_metadata_over_queue(self):
         # Let the consumer know the overall metadata:
         self.md.consumed_train_samples = self.consumed_train_samples
@@ -267,9 +274,7 @@ class MegatronCheckpointLoaderBase:
 
         # 1) Embeddings
         embeddings = [schema.get("embeddings", m) for m in first_pipeline_models]
-        message = {
-            "word embeddings": torch.cat([e["word"] for e in embeddings], dim=0)
-        }
+        message = {"word embeddings": torch.cat([e["word"] for e in embeddings], dim=0)}
         if self.md.position_embedding_type == 'learned_absolute':
             # Only send one set from rank 0
             message["position embeddings"] = embeddings[0]["pos"]
@@ -351,19 +356,14 @@ class MegatronCheckpointLoaderBase:
         # 4) Output layer
         if self.md.output_layer:
             output_layers = [schema.get("output_layer", m) for m in models]
-            message = {
-                "weight": torch.cat([layer["weight"] for layer in output_layers], dim=0),
-            }
+            message = {"weight": torch.cat([layer["weight"] for layer in output_layers], dim=0)}
             self.queue_put("output layer", message)
 
         # 5) BERT-specific parameters
         if self.md.model_type == 'BERT':
             # Pooler
             pooler = schema.get("pooler", models[0])
-            message = {
-                "weight": pooler["weight"],
-                "bias": pooler["bias"],
-            }
+            message = {"weight": pooler["weight"], "bias": pooler["bias"]}
             self.queue_put("pooler", message)
 
             # LM head
@@ -380,10 +380,7 @@ class MegatronCheckpointLoaderBase:
             # Binary head
             if self.md.bert_binary_head:
                 binary_head = schema.get("binary_head", models[0])
-                message = {
-                    "weight": binary_head["weight"],
-                    "bias": binary_head["bias"],
-                }
+                message = {"weight": binary_head["weight"], "bias": binary_head["bias"]}
                 self.queue_put("binary head", message)
 
         # Done
@@ -415,12 +412,11 @@ class MegatronCheckpointLoaderBase:
         self.md = self.build_checkpoint_metadata(true_vocab_size)
 
         # 7) Load all model shards
-        self.all_models, self.consumed_train_samples, self.consumed_valid_samples = self.load_model_shards(
-            model_provider,
-            self.md.params_dtype
+        self.all_models, self.consumed_train_samples, self.consumed_valid_samples = (
+            self.load_model_shards(model_provider, self.md.params_dtype)
         )
 
-        # 8) Send model over the queue        
+        # 8) Send model over the queue
         self.send_model_over_queue()
 
     def build_checkpoint_metadata(self, true_vocab_size):
@@ -430,7 +426,7 @@ class MegatronCheckpointLoaderBase:
         norm_has_bias = True
         if hasattr(self.checkpoint_args, 'normalization'):
             # For older models, normalization was always "LayerNorm".
-            norm_has_bias = (self.checkpoint_args.normalization == "LayerNorm")
+            norm_has_bias = self.checkpoint_args.normalization == "LayerNorm"
 
         md = types.SimpleNamespace()
         md.model_type = self.args.model_type
@@ -468,16 +464,17 @@ class MegatronCheckpointLoaderBase:
             '--no-masked-softmax-fusion',
             '--no-bias-gelu-fusion',
             '--no-bias-dropout-fusion',
-            '--no-async-tensor-model-parallel-allreduce',
             '--use-cpu-initialization',
-            '--micro-batch-size', '1',
+            '--micro-batch-size',
+            '1',
             '--no-load-optim',
             '--no-load-rng',
             '--no-save-optim',
             '--no-save-rng',
             '--no-initialization',
             '--mock-data',  # To pass the "blend data checks" in arguments.py
-            '--load', self.args.load_dir,
+            '--load',
+            self.args.load_dir,
             '--exit-on-missing-checkpoint',
             '--use-mp-args-from-checkpoint-args',
             '--no-one-logger',
@@ -490,4 +487,3 @@ class MegatronCheckpointLoaderBase:
     def send_model_over_queue(self):
         """Creates model schema and sends the model over the queue"""
         raise NotImplementedError
-

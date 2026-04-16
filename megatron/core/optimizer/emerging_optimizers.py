@@ -11,7 +11,7 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -28,10 +28,10 @@ try:
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
-    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
 
     # It is necessary to import optimizers for the registry to work.
+    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
@@ -42,6 +42,28 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def get_supported_coefficient_types() -> tuple[str, ...]:
+    """Return the coefficient types supported by the installed emerging_optimizers.
+
+    Reads the members of the ``NSCoeffT`` Literal type so that new types
+    added upstream are automatically available without code changes here.
+    """
+    assert (
+        HAVE_EMERGING_OPTIMIZERS
+    ), "emerging_optimizers >= 0.2 is required for NSCoeffT. Please install or upgrade it."
+    return get_args(NSCoeffT)
+
+
+def validate_coefficient_type(coefficient_type: str) -> None:
+    """Raise ``ValueError`` if *coefficient_type* is not supported."""
+    supported = get_supported_coefficient_types()
+    if coefficient_type not in supported:
+        raise ValueError(
+            f"Unsupported muon coefficient type '{coefficient_type}'. "
+            f"Supported types: {supported}"
+        )
 
 
 # ===========================================================================
@@ -120,6 +142,8 @@ def _get_qkv_split_shapes(model_cfg) -> List[int]:
 # ===========================================================================
 # Registry – populated below only when emerging_optimizers is installed.
 # ===========================================================================
+
+_EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 
 
 # ===========================================================================
@@ -253,7 +277,35 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
-    """Tensor Parallel Adaptive Muon optimizer."""
+    """Tensor Parallel Adaptive Muon optimizer.
+
+    This class extends Muon by adding AdamW-style or NorMuon-style second moment
+    accumulation after orthogonalization. This idea was first explored in D.E. Carlson,
+    E. Collins, Ya-Ping Hsieh, L. Carin, and V. Cevher. *Preconditioned spectral
+    descent for deep learning.* In Advances in neural information processing systems 28 (2015).
+    The step() method is overridden to include second moment normalization logic.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining parameter groups.
+        lr: Learning rate.
+        momentum: The exponential decay rate for momentum.
+        nesterov: Whether to use Nesterov momentum.
+        weight_decay: Weight decay coefficient.
+        use_decoupled_weight_decay: Whether to use decoupled weight decay.
+        split_qkv: Whether to split QKV weights for orthogonalization.
+        is_qkv_fn: Function to determine if a tensor is a QKV weight.
+        qkv_split_shapes: Shapes for splitting QKV weights.
+        fp32_matmul_prec: Precision for FP32 matrix multiplication.
+        coefficient_type: The type of coefficient set to use for the Newton-Schulz iteration.
+        num_ns_steps: The number of iteration steps to use in the Newton-Schulz iteration.
+        scale_mode: The type of scale factor to use for the update.
+        extra_scale_factor: The additional scale factor to use for the update.
+        pg_collection: Process group collection for distributed training.
+        tp_mode: Tensor parallel mode ("blockwise", "duplicated", or "distributed").
+        moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
+        beta2: The exponential decay rate for second moment.
+        eps: Small constant for numerical stability.
+    """
 
     def __init__(
         self,
@@ -357,14 +409,34 @@ def _default_adam_based_eopt_config_to_kwargs(
 # -----------------------------------------------------------------------
 # Register emerging optimizers
 # -----------------------------------------------------------------------
-_EMERGING_OPTIMIZERS = {
-    'muon': EmergingOptimizerEntry(
-        optimizer_cls=TensorParallelMuon, config_to_kwargs=_muon_config_to_kwargs
-    ),
-    "adaptive_muon": EmergingOptimizerEntry(
-        optimizer_cls=TensorParallelAdaptiveMuon, config_to_kwargs=_adaptive_muon_config_to_kwargs
-    ),
-}
+_EMERGING_OPTIMIZERS.update(
+    {
+        'muon': EmergingOptimizerEntry(
+            optimizer_cls=TensorParallelMuon,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_muon_config_to_kwargs,
+            default_param_overrides={
+                ParamKey(
+                    predicate=ParamPredicate(
+                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
+                    )
+                ): {'optimizer': 'adam'}
+            },
+        ),
+        "adaptive_muon": EmergingOptimizerEntry(
+            optimizer_cls=TensorParallelAdaptiveMuon,
+            init_state_fn=_eopt_init_state_fn,
+            config_to_kwargs=_adaptive_muon_config_to_kwargs,
+            default_param_overrides={
+                ParamKey(
+                    predicate=ParamPredicate(
+                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
+                    )
+                ): {'optimizer': 'adam'}
+            },
+        ),
+    }
+)
 
 # Register soap with default config
 # TODO(skyw): register all emerging optimizers.

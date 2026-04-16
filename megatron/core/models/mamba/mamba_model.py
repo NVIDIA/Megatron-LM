@@ -3,7 +3,6 @@
 import logging
 from typing import Literal, Optional
 
-import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -13,6 +12,9 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -130,6 +132,7 @@ class MambaModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
+        self.disable_param_offloading = True
 
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_override_pattern is not None:
@@ -302,6 +305,27 @@ class MambaModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
+    def preprocess_for_fine_grained_offloading(self):
+        """Preprocess for fine-grained activation offloading."""
+        off_interface.init_chunk_handler(
+            pp_rank=self.pg_collection.pp.rank(),
+            vp_size=self.config.virtual_pipeline_model_parallel_size,
+            vp_stage=self.vp_stage,
+            min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction=self.config.activation_offload_fraction,
+        )
+        if self.disable_param_offloading:
+            for param in self.decoder.parameters():
+                off_interface.mark_not_offload(param)
+            if self.mtp_process:
+                for param in self.mtp.parameters():
+                    off_interface.mark_not_offload(param)
+            if self.post_process:
+                for param in self.output_layer.parameters():
+                    off_interface.mark_not_offload(param)
+            self.disable_param_offloading = False
+
     def forward(
         self,
         input_ids: Tensor,
@@ -326,6 +350,9 @@ class MambaModel(LanguageModule):
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -490,46 +517,3 @@ class MambaModel(LanguageModule):
             loss = self.compute_language_model_loss(labels, logits)
 
         return loss
-
-    @torch.inference_mode()
-    def compute_mtp_single_step(
-        self,
-        hidden_states: Tensor,
-        next_token_ids: Tensor,
-        position_ids: Tensor,
-        depth: int,
-        runtime_gather_output: bool = True,
-    ) -> tuple:
-        """Compute a single MTP depth for speculative decoding.
-
-        This is called after speculative token verification to compute MTP
-        predictions conditioned on verified tokens only.
-
-        Args:
-            hidden_states (Tensor): Hidden states at last accepted positions [N, 1, H].
-            next_token_ids (Tensor): Correct next token IDs [1, N].
-            position_ids (Tensor): Position IDs for the next tokens [1, N].
-            depth (int): MTP depth index (0-indexed).
-            runtime_gather_output (bool): Whether to gather output across TP.
-
-        Returns:
-            tuple: (new_hidden_states [N, 1, H], logits [N, 1, vocab_size]).
-        """
-        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
-        mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
-            hidden_states=hidden_states,
-            next_token_ids=next_token_ids,
-            position_ids=position_ids,
-            embedding=self.embedding,
-        )
-
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-
-        logits, _ = self.output_layer(
-            mtp_hidden, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-        logits = self._scale_logits(logits)
-
-        return mtp_hidden, logits
