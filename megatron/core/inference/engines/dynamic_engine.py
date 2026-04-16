@@ -609,6 +609,36 @@ class DynamicInferenceEngine(AbstractEngine):
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
+            # EP "has work" signal: leader binds PULL+PUB, followers PUSH+SUB.
+            # `notify()` is fire-and-forget; `_ep_signal_recv_loop` sets `_ep_has_signal`.
+            # Lets a rank with local work skip the EP all-reduce before stepping.
+            ep_src = get_pg_src_rank(self.pg_collection.ep)
+            ip = hostname or socket.gethostname()
+            if self.ep_rank == 0:
+                self._ep_signal_recv = self.zmq_context.socket(zmq.PULL)
+                self._ep_signal_recv.bind_to_random_port(f"tcp://{ip}")
+                self._ep_signal_send = self.zmq_context.socket(zmq.PUB)
+                self._ep_signal_send.bind_to_random_port(f"tcp://{ip}")
+                torch.distributed.broadcast_object_list(
+                    [
+                        self._ep_signal_recv.getsockopt_string(zmq.LAST_ENDPOINT),
+                        self._ep_signal_send.getsockopt_string(zmq.LAST_ENDPOINT),
+                    ],
+                    src=ep_src,
+                    group=self.pg_collection.ep,
+                )
+            else:
+                addrs = [None, None]
+                torch.distributed.broadcast_object_list(
+                    addrs, src=ep_src, group=self.pg_collection.ep
+                )
+                self._ep_signal_send = self.zmq_context.socket(zmq.PUSH)
+                self._ep_signal_send.connect(addrs[0])
+                self._ep_signal_recv = self.zmq_context.socket(zmq.SUB)
+                self._ep_signal_recv.connect(addrs[1])
+                self._ep_signal_recv.setsockopt_string(zmq.SUBSCRIBE, "")
+            self._ep_has_signal = asyncio.Event()
+            self.zmq_sockets += [self._ep_signal_send, self._ep_signal_recv]
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
@@ -2173,6 +2203,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
             except Exception:
                 pass
+        # Stop the EP signal recv task before closing its sockets.
+        task = getattr(self, '_ep_signal_task', None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         for socket in getattr(self, 'zmq_sockets', []):
             socket.close(linger=0)
         if hasattr(self, 'zmq_sockets'):
@@ -2210,53 +2248,40 @@ class DynamicInferenceEngine(AbstractEngine):
             pass
 
     async def _ep_establish_consensus(
-        self, local_work: int, signal_consensus: bool
-    ) -> tuple[int, bool]:
-        """EP all-reduce to share work counts and pause consensus.
+        self, local_work: int, local_step_count: int
+    ) -> tuple[int, int]:
+        """EP all-reduce for pause step synchronization.
+
+        Called from PAUSING as a background task (every EP rank will eventually
+        fire it once it has received PAUSE); the all-reduce only completes when
+        every peer has joined. The main loop keeps stepping while this task is
+        outstanding so NCCL collectives keep aligning.
 
         All-reduces two integers at once:
-        - local_work: actual pending request count (always >= 0).
-        - consensus flag: -1 if this rank wants to pause, 0 otherwise.
+        - local_work: pending request count on this rank.
+        - local_step_count: this rank's current `context.step_count`.
 
-        Using max for both:
-        - max(work) > 0 means at least one EP peer has real work.
-        - max(consensus) == -1 means ALL peers signaled -1 (all PAUSING).
-          Any RUNNING peer contributes 0, pulling the max to 0.
-
-        Args:
-            local_work: Pending request count for this rank.
-            signal_consensus: True if this rank is ready to pause.
-        Returns:
-            (global_work, all_pausing): max work across EP, and whether
-            all peers signaled consensus.
+        Returns (global_work, max_step_count). The caller uses max_step_count
+        to compute a common stop_at_step across EP so every peer transitions
+        to PAUSED on the same iteration.
         """
         range_push("_ep_establish_consensus")
-
-        consensus_val = -1 if signal_consensus else 0
-
-        # Signals can be received asynchronously on EP ranks.
-        # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
-        # So this is an *attempt* to process the signal. This rank has received the signal
-        # and passes -1 to the all-reduce. If any other rank in the EP group has not received
-        # the signal yet, it will pass a zero value to the all-reduce, hence the global consensus
-        # will be zero and we will defer processing the signal.
-        # When all ranks receive the signal, global consensus will be -1 and we can process.
 
         if self.ep_world_size > 1:
             # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
             # We have tried that and it blocks the event loop in megatron-rl.
-            global_work, global_consensus = (
+            global_work, max_step_count = (
                 await self.expert_parallel_zmq_communicator.all_reduce_max(
-                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
+                    local_work, local_step_count, async_op=True
                 )
             )
         else:
-            global_work, global_consensus = local_work, consensus_val
+            global_work, max_step_count = local_work, local_step_count
 
         range_pop()
-        return global_work, global_consensus == -1
+        return global_work, max_step_count
 
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
@@ -2274,6 +2299,20 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         range_pop()
 
+    async def _ep_signal_recv_loop(self):
+        """Background task: set `_ep_has_signal` on any incoming EP peer signal."""
+        try:
+            while True:
+                try:
+                    msg = self._ep_signal_recv.recv(flags=zmq.NOBLOCK)
+                    if self.ep_rank == 0:
+                        self._ep_signal_send.send(msg)
+                    self._ep_has_signal.set()
+                except zmq.Again:
+                    await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            pass
+
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2281,14 +2320,25 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously.
 
         State-dependent behavior:
-        - RUNNING: EP all-reduce to check for work, then step or idle.
-        - PAUSING: EP all-reduce to reach consensus, then world barrier.
+        - RUNNING: Rank with local work notifies EP peers and steps immediately;
+          Rank without local work dummy-forwards only when a peer has signaled, otherwise idles.
+        - PAUSING: Fire `_ep_establish_consensus` as a background task and keep stepping.
+          Once the consensus returns, every peer agrees on a common `stop_at_step`;
+          transition to PAUSED via world barrier when this rank's step_count reaches it.
         - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
         - UNPAUSING / SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
         - STOPPED: Teardown and exit.
         """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
+
+        if self.ep_world_size > 1:
+            self._ep_signal_task = self._loop.create_task(self._ep_signal_recv_loop())
+
+        # PAUSING bookkeeping: consensus runs in the background so the main loop can keep stepping.
+        pausing_consensus_task: Optional[asyncio.Task] = None
+        stop_at_step: Optional[int] = None
+        PAUSE_SYNC_MARGIN = 2
 
         try:
             while True:
@@ -2298,29 +2348,57 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    global_work, all_pausing = await self._ep_establish_consensus(
-                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
-                    )
+                    should_pause = False
+                    peer_has_work = False
 
-                    if all_pausing:
-                        # All EP peers are PAUSING: pause immediately.
+                    if self.state == EngineState.PAUSING:
+                        # Kick off the consensus once per pause session.
+                        if pausing_consensus_task is None:
+                            pausing_consensus_task = self._loop.create_task(
+                                self._ep_establish_consensus(
+                                    local_pending, self.context.step_count
+                                )
+                            )
+                        # When the consensus finishes, every EP peer has entered PAUSING.
+                        if stop_at_step is None and pausing_consensus_task.done():
+                            _, max_step_count = pausing_consensus_task.result()
+                            stop_at_step = max_step_count + PAUSE_SYNC_MARGIN
+
+                        if (
+                            stop_at_step is not None
+                            and self.context.step_count >= stop_at_step
+                        ):
+                            should_pause = True
+                        else:
+                            # Still PAUSING: step every iteration (never idle) to stay aligned.
+                            peer_has_work = True
+                            if self.ep_world_size > 1:
+                                self._ep_signal_send.send(b"\x01")
+                    else:
+                        # RUNNING: read the peer signal; notify peers if we have work.
+                        if self.ep_world_size > 1:
+                            peer_has_work = self._ep_has_signal.is_set()
+                            self._ep_has_signal.clear()
+                            if local_pending > 0:
+                                self._ep_signal_send.send(b"\x01")
+
+                    if should_pause:
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
-                    elif global_work > 0:
-                        # At least one EP peer has work: all must participate.
-                        if local_pending > 0:
-                            await self.async_step()
-                        else:
-                            # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                        pausing_consensus_task = None
+                        stop_at_step = None
+                    elif local_pending > 0:
+                        await self.async_step()
+                    elif peer_has_work:
+                        # Dummy forward to participate in the EP collective.
+                        self.step_start_event.record()
+                        self.controller.dummy_forward()
+                        self.step_end_event.record()
+                        self.step_end_event.synchronize()
+                        self.context.step_count += 1
+                        self.context.prefix_cache_lru_clock += 1
                     else:
-                        # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.PAUSED:
@@ -2328,6 +2406,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 elif self.state == EngineState.UNPAUSING:
                     await self._world_barrier()
+                    # Stale signals from before the pause would trigger an unwanted dummy-forward.
+                    if self.ep_world_size > 1:
+                        self._ep_has_signal.clear()
                     self.state = EngineState.RUNNING
                     self._state_events[EngineState.PAUSED].clear()
                     self._state_events[EngineState.RUNNING].set()
@@ -2352,4 +2433,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     break
 
         finally:
+            if pausing_consensus_task is not None and not pausing_consensus_task.done():
+                pausing_consensus_task.cancel()
+                try:
+                    await pausing_consensus_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             await self.shutdown()
