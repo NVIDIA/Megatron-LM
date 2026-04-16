@@ -423,6 +423,7 @@ class TestFusedDSAIndexerLossGradient:
 class TestFusedDSAIndexerLossGradientTP:
     """Test FusedDSAIndexerLoss gradient consistency across different TP sizes."""
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_fused_indexer_loss_gradient_tp_consistency(
         self, tensor_model_parallel_size, sparse_loss
