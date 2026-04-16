@@ -161,7 +161,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
     "moe_grouped_gemm": True,
-    "moe_hybridep_num_sms": 16,
+    "moe_hybridep_num_sms": None,
     "moe_hybridep_num_blocks_permute": None,
     "moe_hybridep_num_blocks_unpermute": None,
     "moe_input_jitter_eps": None,
