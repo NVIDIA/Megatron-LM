@@ -4,7 +4,7 @@ maintainers: [mcore]
 loggers: [stdout]
 spec:
   name: "{test_case}_{environment}_{platforms}"
-  model: moe
+  model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
   gpus: 4
@@ -46,7 +46,7 @@ spec:
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
-        "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts/"
         "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
@@ -55,26 +55,37 @@ spec:
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
+    set +x
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+    exit_code=$?
+    echo "Exit code: $exit_code"
+    rm -rf /lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID || true
+    set -x
+    exit $exit_code
 
 products:
-  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_1node]
+  - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_1node]
     products:
       - environment: [dev]
         scope: [mr-github, mr-github-slim]
         platforms: [dgx_gb200]
-  - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_muon_1node]
+  - test_case: [gpt3_mcore_te_tp2_pp1_gdn_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_reruns_persistent_1_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_1node]
     products:
       - environment: [dev]
         scope: [mr-github, mr-github-slim]
-        platforms: [dgx_gb200]
-  - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon_1node]
-    products:
-      - environment: [dev]
-        scope: [mr-github]
-        platforms: [dgx_gb200]
-  - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer_1node]
-    products:
-      - environment: [dev]
-        scope: [mr-github]
         platforms: [dgx_gb200]

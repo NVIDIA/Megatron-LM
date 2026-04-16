@@ -1,193 +1,24 @@
 ---
-name: build-and-test
-description: Developer environment setup, CI/CD workflows, and CI failure debugging for Megatron-LM. Covers container-based development, uv package management, linting, running tests, CI failure investigation, and common pitfalls.
-TRIGGER when: user asks to add, remove, or update a dependency; user edits or asks about pyproject.toml or uv.lock; user asks to set up a dev environment or run tests; user asks about a CI failure or build error.
-DO NOT TRIGGER when: user is only reading or discussing code unrelated to dependencies, build, or CI.
+name: testsystem
+description: Test system, CI pipeline, and CI failure investigation for Megatron-LM. Covers test layout, recipe YAML structure, adding unit and functional tests, CI scope labels, triggering internal GitLab CI, pipeline structure, and debugging CI failures.
+TRIGGER when: user asks to run tests, add a test, investigate a CI failure, understand the CI pipeline, or work with test recipes; user opens or pushes to a PR and needs to know which CI label to attach; user wants to trigger the internal GitLab CI pipeline.
+DO NOT TRIGGER when: user is only setting up the dev environment or managing dependencies (use build-and-dependency instead).
 ---
 
-# Developer Guide
-
-This guide covers the recommended development workflow for Megatron-LM.
-The core principle: **build and develop inside containers** — the CI container
-ships the correct CUDA toolkit, PyTorch build, and pre-compiled native extensions
-(TransformerEngine, DeepEP, …) that cannot be reproduced on a bare host.
+# Test System & CI Guide
 
 ---
 
-## Why Containers
-
-Megatron-LM depends on CUDA, NCCL, PyTorch with GPU support, TransformerEngine,
-and optional components like ModelOpt and DeepEP. Installing these on a bare host
-is fragile and hard to reproduce. The project ships Dockerfiles that pin every
-dependency.
-
-**Use the container as your development environment.** This guarantees:
-
-- Identical CUDA / NCCL / cuDNN versions across all developers and CI.
-- `uv.lock` resolves the same way locally and in CI.
-- GPU-dependent operations (training, testing) work out of the box.
-
-### Step 1 — Acquire an Image
-
-**Option A — NVIDIA-internal: pull a CI-built image**
-
-> ⚠️ Requires access to the internal GitLab instance.
-> See `tools/trigger_internal_ci.md` for setup (adding the git remote, obtaining a token).
-
-The internal GitLab CI publishes images to its container registry.
-Derive the registry host from your configured `gitlab` remote — the same
-host you use for `trigger_internal_ci.py`:
-
-```bash
-# Derive host from your 'gitlab' remote:
-GITLAB_HOST=$(git remote get-url gitlab | sed 's/.*@\(.*\):.*/\1/')
-
-docker pull ${GITLAB_HOST}/adlr/megatron-lm/mcore_ci_dev:main
-```
-
-**Option B — Build from scratch (works for everyone)**
-
-> ⚠️ `Dockerfile.ci.dev` has two stages: `main` and `jet`. The `jet` stage
-> requires an internal build secret and will fail without it. Always pass
-> `--target main` to stop at the public stage.
-
-```bash
-# dev image (default)
-docker build \
-  --target main \
-  --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.dev) \
-  --build-arg IMAGE_TYPE=dev \
-  -f docker/Dockerfile.ci.dev \
-  -t megatron-lm:local .
-
-# lts image
-docker build \
-  --target main \
-  --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.lts) \
-  --build-arg IMAGE_TYPE=lts \
-  -f docker/Dockerfile.ci.dev \
-  -t megatron-lm:local-lts .
-```
-
-Which image variant is used is controlled by the PR label `container::lts`;
-absent that label, `dev` is used.
-
-### Step 2 — Launch the Container
-
-**Option A — Local Docker runtime**
-
-```bash
-docker run --rm --gpus all \
-  -v $(pwd):/workspace \
-  -w /workspace \
-  megatron-lm:local \
-  bash -c "<your command>"
-```
-
-**Option B — Slurm cluster (for those without a local Docker runtime)**
-
-NVIDIA clusters typically use [Pyxis](https://github.com/NVIDIA/pyxis) +
-[enroot](https://github.com/NVIDIA/enroot). Request an interactive session:
-
-```bash
-srun \
-  --nodes=1 --gpus-per-node=8 \
-  --container-image megatron-lm:local \
-  --container-mounts $(pwd):/workspace \
-  --container-workdir /workspace \
-  --pty bash
-```
-
-For clusters that require a `.sqsh` archive first:
-
-```bash
-enroot import -o megatron-lm.sqsh dockerd://megatron-lm:local
-srun \
-  --nodes=1 --gpus-per-node=8 \
-  --container-image $(pwd)/megatron-lm.sqsh \
-  --container-mounts $(pwd):/workspace \
-  --container-workdir /workspace \
-  --pty bash
-```
-
----
-
-## Dependency Management
-
-Dependencies are declared in `pyproject.toml`. The venv lives at `/opt/venv`
-inside the container (already on `PATH`).
-
-> **All `uv` operations must be run inside the container.**
-> Never run `uv sync` / `uv pip install` on the host.
-
-### uv Dependency Groups
-
-| Group | Purpose |
-|-------|---------|
-| `training` | Runtime training extras |
-| `dev` | Full dev environment (TransformerEngine, ModelOpt, …) |
-| `lts` | LTS-safe subset (no ModelOpt) |
-| `test` | pytest, coverage, nemo-run |
-| `linting` | ruff, black, isort, pylint |
-| `build` | Cython, pybind11, nvidia-mathdx |
-
-Install commands (inside the container):
-
-```bash
-# Full dev + test environment
-uv sync --locked --group dev --group test
-
-# Linting only
-uv sync --locked --only-group linting
-
-# LTS environment
-uv sync --locked --group lts --group test
-```
-
-Several dependencies are sourced directly from git (TransformerEngine, nemo-run,
-FlashMLA, Emerging-Optimizers, nvidia-resiliency-ext). The locked `uv.lock` file
-pins exact revisions; update it with `uv lock` when changing `pyproject.toml`.
-
-### Adding a New Dependency
-
-Follow this three-step workflow:
-
-1. **Acquire a container image** — see [Step 1](#step-1--acquire-an-image) above.
-2. **Launch the container interactively** — see [Step 2](#step-2--launch-the-container) above.
-3. **Update the lock file inside the container**, then commit it:
-
-   ```bash
-   # Inside the container:
-   uv add <package>          # adds to pyproject.toml and resolves
-   uv lock                   # regenerates uv.lock
-   # Exit the container, then on the host:
-   git add pyproject.toml uv.lock
-   git commit -S -s -m "build: add <package> dependency"
-   ```
-
----
-
-## Linting
-
-Run before opening a PR:
-
-```bash
-# Check mode (no changes applied)
-BASE_REF=main CHECK_ONLY=true SKIP_DOCS=false bash tools/autoformat.sh
-```
-
-Tools invoked: `black`, `isort`, `pylint`, `ruff`, `mypy`.
-
----
-
-## Running Tests
-
-### Test Layout
+## Test Layout
 
 ```text
 tests/
 ├── unit_tests/          # pytest, 1 node × 8 GPUs, torch.distributed runner
 ├── functional_tests/    # end-to-end shell + training scripts
+│   └── test_cases/
+│       └── {model}/{test_case}/
+│           ├── model_config.yaml          # training args
+│           └── golden_values_{env}_{platform}.json
 └── test_utils/
     ├── recipes/
     │   ├── h100/        # YAML recipes for H100 jobs
@@ -195,12 +26,13 @@ tests/
     └── python_scripts/  # helpers (recipe_parser, golden-value download, …)
 ```
 
-### How Tests Execute
+---
 
-All tests run on a **single DGX H100 node (8 GPUs)**. The GitHub Actions runner
-invokes `launch_nemo_run_workload.py`, which uses **nemo-run** to launch a
-`DockerExecutor` container. The repo is bind-mounted at `/opt/megatron-lm`;
-training data is mounted at `/mnt/artifacts`.
+## How Tests Execute
+
+The GitHub Actions runner invokes `launch_nemo_run_workload.py`, which uses
+**nemo-run** to launch a `DockerExecutor` container. The repo is bind-mounted
+at `/opt/megatron-lm`; training data is mounted at `/mnt/artifacts`.
 
 **Unit tests** are dispatched through `torch.distributed.run`:
 
@@ -216,7 +48,9 @@ pytest validation step; training output from all ranks is uploaded as an artifac
 **3 times** for known transient patterns (NCCL timeout, ECC error, segfault,
 HuggingFace connectivity, …) before declaring a genuine failure.
 
-### Recipe YAML Structure
+---
+
+## Recipe YAML Structure
 
 Recipes live in `tests/test_utils/recipes/` and are parsed by
 `tests/test_utils/python_scripts/recipe_parser.py`. Each file expands a
@@ -225,34 +59,71 @@ cartesian `products` block into individual workload specs:
 ```yaml
 type: basic
 format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}_{tag}"
-  model: gpt
+  name: "{test_case}_{environment}_{platforms}"
+  model: gpt              # maps to tests/functional_tests/test_cases/{model}/
+  build: mcore-pyt-{environment}
   nodes: 1
   gpus: 8
+  n_repeat: 5
   platforms: dgx_h100
   time_limit: 1800
   script_setup: |
     ...
   script: |-
-    bash tests/unit_tests/run_ci_test.sh \
-      --tag {tag} \
-      --environment {environment} \
-      --bucket "tests/unit_tests/models/**/*.py" \
-      --log-dir {assets_dir}/logs/1/
+    bash tests/functional_tests/shell_test_utils/run_ci_test.sh ...
 products:
   - test_case: [my_test]
-    environment: [dev, lts]
-    tag: [latest, legacy]
-    scope: [mr-github]
-    n_repeat: [1]
-    time_limit: [1800]
+    products:
+      - environment: [dev, lts]
+        scope: [mr-github]
+        platforms: [dgx_h100]
 ```
 
 Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
-`{environment}`, `{platforms}`, `{tag}`, `{n_repeat}`.
+`{environment}`, `{platforms}`, `{n_repeat}`.
 
-### Adding a Unit Test
+### CI Test Scope Labels
+
+The CI pipeline reads PR labels to decide test scope, n_repeat, and container image.
+
+**Decision tree (first match wins):**
+
+| Condition | `scope` | `n_repeat` | `lightweight` | Notes |
+|-----------|---------|-----------|---------------|-------|
+| Merge group | `mr-github` | 1 | false | Automatic, no label needed |
+| Label: **`Run tests`** | `mr-github` | 1 | **true** | Trains 4 steps, no golden-value compare |
+| Label: **`Run functional tests`** | `mr-github` | 5 | **false** | Trains 100 steps, golden-value compare |
+| _(no label)_ | `mr-github-slim` | 5 | false | Slim subset only |
+
+**Orthogonal image label:**
+
+| Label | Effect |
+|-------|--------|
+| **`container::lts`** | Use the LTS base image instead of `dev` (combinable with any scope label) |
+| **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
+
+### Which label to attach when opening a PR
+
+Apply this logic based on what the PR changes:
+
+| Changed paths / nature of change | Label to attach |
+|----------------------------------|-----------------|
+| Docs only (`docs/`, `*.md`, docstrings) | _(none)_ |
+| CI/tooling only (`.github/`, `tools/`, `Makefile`) | _(none)_ |
+| Test files only (`tests/`) | `Run tests` |
+| Non-numerical library code (logging, error handling, CLI flags, refactors) | `Run tests` |
+| Could affect training numerics (model arch, attention, optimizer, distributed, MoE routing) | `Run functional tests` |
+| Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` + `container::lts` |
+| Touches MBridge integration | add `Run MBridge tests` |
+
+**Rule of thumb:** default to `Run tests`. Only escalate to `Run functional tests` when the change could plausibly shift loss curves or break determinism.
+
+---
+
+## Adding a Unit Test
 
 1. Create `tests/unit_tests/<category>/test_<name>.py`.
 2. Use fixtures from `tests/unit_tests/conftest.py`.
@@ -260,7 +131,7 @@ Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
    - `@pytest.mark.internal` — skipped on `legacy` tag
    - `@pytest.mark.flaky` — skipped in `lts` environment
    - `@pytest.mark.experimental` — `latest` tag only
-4. Verify the test runs locally inside the container:
+4. Verify locally inside the container:
 
    ```bash
    pytest -xvs tests/unit_tests/<category>/test_<name>.py
@@ -269,10 +140,12 @@ Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
 5. If the test needs a dedicated CI bucket, add an entry to
    `tests/test_utils/recipes/h100/unit-tests.yaml`.
 
-### Adding a Functional / Integration Test
+---
+
+## Adding a Functional / Integration Test
 
 1. Create `tests/functional_tests/test_cases/<model>/<test_name>/`.
-2. Write the shell test script; use `{assets_dir}` for all output paths.
+2. Write `model_config.yaml` with `MODEL_ARGS`, `ENV_VARS`, and `TEST_TYPE`.
 3. Add a YAML recipe under `tests/test_utils/recipes/h100/` (and `gb200/` if
    needed). Required fields: `scope`, `environment`, `platform`, `n_repeat`,
    `time_limit`.
@@ -286,14 +159,38 @@ Key runtime placeholders: `{assets_dir}`, `{artifacts_dir}`, `{test_case}`,
 
 6. Commit the downloaded golden values.
 
-### CI Test Scope Labels
+---
 
-| PR label | Scope | Behaviour |
-|----------|-------|-----------|
-| _(none)_ | `mr-github-slim` | Lightweight subset, fast feedback |
-| `Run tests` | `mr-github` | Full suite, lightweight mode (4 steps, no golden compare) |
-| `Run functional tests` | `mr-github` | Full suite, 100-step training + golden compare, n_repeat=5 |
-| `container::lts` | _(any)_ | Use the LTS base image instead of dev |
+## Triggering Internal CI
+
+Use `tools/trigger_internal_ci.py` to push the current branch to the internal
+GitLab remote and trigger a pipeline — without touching the GitLab UI.
+Full setup and usage details: `tools/trigger_internal_ci.md`.
+
+**Prerequisites** (one-time):
+
+```bash
+# 1. Add the internal GitLab remote
+git remote add gitlab git@<gitlab-hostname>:ADLR/Megatron-LM.git
+
+# 2. Create a personal access token with 'api' scope on your GitLab profile,
+#    then store it:
+export GITLAB_TOKEN=glpat-<your-token>
+```
+
+**Usage:**
+
+```bash
+python tools/trigger_internal_ci.py \
+  --gitlab-origin gitlab \
+  [--functional-test-scope mr] \
+  [--functional-test-repeat 5] \
+  [--functional-test-cases all] \
+  [--dry-run]
+```
+
+The script force-pushes the current branch as `pull-request/<branch>` and
+prints the resulting pipeline URL.
 
 ---
 
@@ -450,10 +347,7 @@ PR's changes or is a pre-existing issue on `main`.
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `uv sync --locked` fails | Dependency conflict or stale `uv.lock` | Re-run `uv lock` inside the container and commit updated lock |
-| `ModuleNotFoundError` after pip install | pip installed outside the uv-managed venv | Use `uv add` and `uv sync`, never bare `pip install` |
-| `uv: command not found` inside container | Wrong container image | Use the `megatron-lm` image built from `Dockerfile.ci.dev` |
-| `No space left on device` during uv ops | Cache fills container's `/root/.cache/` | Mount a host cache dir via `-v $HOME/.cache/uv:/root/.cache/uv` |
-| Pre-commit fails with linting errors | Code style violations | Run `BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh` |
 | Port collision on multi-GPU runs | torchrun binding conflicts | Use `torch.distributed.run` via the container entry point |
-| `docker build` fails with secret-related error | `Dockerfile.ci.dev` has a `jet` stage that requires an internal secret | Add `--target main` to stop before the `jet` stage |
+| Test passes locally but fails in CI | Different environment or data path | Check `DATA_PATH`, `DATA_CACHE_PATH`, and the `environment` tag (`dev` vs `lts`) |
+| Golden value mismatch after a code change | Numerical regression | Download new golden values via `download_golden_values.py` after a clean run |
+| `cicd-integration-tests-gb200` not triggered | GB200 jobs require maintainer status | Ask a maintainer to trigger, or add the `Run functional tests` label |
