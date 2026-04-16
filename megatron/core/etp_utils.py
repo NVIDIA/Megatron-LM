@@ -23,6 +23,7 @@ try:
         tag_etp_params_with_names,
         wait_async_comms,
         wrap_module_params_etp,
+        _inflight_comm_params,
     )
 
     HAVE_ETP = True
@@ -42,6 +43,7 @@ except ImportError:
     tag_etp_params_with_names = None
     wait_async_comms = None
     wrap_module_params_etp = None
+    _inflight_comm_params = None
     HAVE_ETP = False
 
 
