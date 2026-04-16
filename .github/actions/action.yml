@@ -175,7 +175,12 @@ runs:
       shell: bash -x -e -u -o pipefail {0}
       id: run-main-script
       run: |
-        echo "::group::Run main script"
+        echo -e "\033[1;34m┌─ launching test ─────────────────────────────────────────────────────────┐\033[0m"
+        echo -e "\033[1;34m│  test case : ${{ inputs.test_case }}\033[0m"
+        echo -e "\033[1;34m│  platform  : ${{ inputs.platform }}   scope: ${{ inputs.scope }}\033[0m"
+        echo -e "\033[1;34m│  container : ${{ inputs.container-image }}\033[0m"
+        echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
+        echo "::group::Logs"
         EXIT_CODE=0
         /bin/bash job.sh || EXIT_CODE=$?
         echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
@@ -215,11 +220,13 @@ runs:
                          | xargs -r ls -t 2>/dev/null | head -1 || true)
         fi
         if [[ -n "$LATEST_LOG" ]]; then
-          echo "━━━ log excerpt: ${LATEST_LOG} (last 40 lines) ━━━"
+          echo -e "\033[1;36m\n📋 ── log excerpt ───────────────────────────────────────────────────────\033[0m"
+          echo -e "\033[1;36m   ${LATEST_LOG} — last 40 lines\033[0m"
+          echo -e "\033[1;36m────────────────────────────────────────────────────────────────────────\033[0m"
           tail -40 "$LATEST_LOG"
-          echo "━━━ end of excerpt ━━━"
+          echo -e "\033[1;36m────────────────────────────────────────────────────────────────────────\033[0m\n"
         else
-          echo "(no log file found in ${LOG_BASE})"
+          echo -e "\033[33m⚠  no log file found in ${LOG_BASE}\033[0m"
         fi
 
         if [[ "$coverage_report" != "none" ]]; then
@@ -229,9 +236,21 @@ runs:
         fi
 
         if [[ "$IS_SUCCESS" == "true" ]]; then
+          echo -e "\033[1;32m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;32m║                                                                          ║\033[0m"
+          echo -e "\033[1;32m║   ✅  PASSED                                                             ║\033[0m"
+          echo -e "\033[1;32m║   ${{ inputs.test_case }}\033[0m"
+          echo -e "\033[1;32m║                                                                          ║\033[0m"
+          echo -e "\033[1;32m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
           echo "::notice title=Result::✅ ${{ inputs.test_case }} — PASSED"
           exit 0
         else
+          echo -e "\033[1;31m╔══════════════════════════════════════════════════════════════════════════╗\033[0m"
+          echo -e "\033[1;31m║                                                                          ║\033[0m"
+          echo -e "\033[1;31m║   ❌  FAILED  (exit code: ${EXIT_CODE})                                  ║\033[0m"
+          echo -e "\033[1;31m║   ${{ inputs.test_case }}\033[0m"
+          echo -e "\033[1;31m║                                                                          ║\033[0m"
+          echo -e "\033[1;31m╚══════════════════════════════════════════════════════════════════════════╝\033[0m"
           echo "::error title=Result::❌ ${{ inputs.test_case }} — FAILED (exit $EXIT_CODE)"
           exit 1
         fi
