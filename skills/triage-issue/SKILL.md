@@ -67,23 +67,28 @@ gh pr view <pr_number> --repo NVIDIA/Megatron-LM --json number,title,url \
 ```
 
 **Test file author**: find the GitHub login of whoever last touched the failing
-test file. Use `git log` on the file to get the commit SHA, then resolve the
-login via the API:
+test file. The file may not exist on `main` — first determine the PR's base
+branch, then search from there:
 
 ```bash
-# Get the most recent commit SHA that touched the test file
-git log -1 --format="%H" -- <test-file-path>
+# 1. Get the PR's base branch (e.g. "main", "dev", "release/X.Y")
+gh pr view <pr_number> --repo NVIDIA/Megatron-LM --json baseRefName --jq .baseRefName
 
-# Resolve GitHub login from commit SHA
-gh api repos/NVIDIA/Megatron-LM/commits/<sha> --jq .author.login
+# 2. Search commits on that base branch
+gh api "repos/NVIDIA/Megatron-LM/commits?path=<test-file-path>&sha=<base-branch>&per_page=1" \
+  --jq '.[0] | {login: .author.login, name: .commit.author.name, sha: .sha}'
 ```
 
-If `git log` is unavailable (no checkout), use the Commits API instead:
+If the result is empty (file was introduced by the PR itself), query the PR's
+commits instead:
 
 ```bash
-gh api "repos/NVIDIA/Megatron-LM/commits?path=<test-file-path>&per_page=1" \
-  --jq '.[0].author.login'
+gh api "repos/NVIDIA/Megatron-LM/pulls/<pr_number>/commits" \
+  --jq '[.[] | select(.files? // [] | any(.filename == "<test-file-path>"))] | .[0].author.login'
 ```
+
+As a last resort, list the PR commits and pick the author of the commit whose
+message most closely relates to the failing test file.
 
 ### 5. Extract the root cause
 
