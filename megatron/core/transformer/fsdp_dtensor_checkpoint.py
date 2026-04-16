@@ -291,7 +291,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
         view_shape = list(data.shape)
         view_shape[swiglu_shard_axis] = -1
-        local_tensor = data.to_local()
+        local_tensor = data.to_local() if isinstance(data, DTensor) else data
         weight_w = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
