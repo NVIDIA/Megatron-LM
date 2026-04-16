@@ -70,6 +70,13 @@ class SafeUnpickler(pickle.Unpickler):
             ("torch._tensor", "_rebuild_from_type_v2"),
             ("torch.storage", "UntypedStorage"),
             ("torch.storage", "_load_from_bytes"),
+            ("transformer_engine.common.recipe", "DelayedScaling"),
+            ("transformer_engine.common.recipe", "Float8CurrentScaling"),
+            ("transformer_engine.common.recipe", "Float8BlockScaling"),
+            ("transformer_engine.common.recipe", "MXFP8BlockScaling"),
+            ("transformer_engine.common.recipe", "NVFP4BlockScaling"),
+            ("transformer_engine.common.recipe", "Format"),
+            ("megatron.core.extensions.transformer_engine", "TEDelayedScaling"),
         }
     )
 
