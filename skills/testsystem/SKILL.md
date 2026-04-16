@@ -105,6 +105,23 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | **`container::lts`** | Use the LTS base image instead of `dev` (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
 
+### Disabling a Test Without Deleting It
+
+To temporarily disable a test case in a recipe YAML, suffix its `scope` value
+with `-broken` — **do not delete the entry**:
+
+```yaml
+# before (test runs in CI)
+scope: [mr-github]
+
+# after (test is skipped; entry preserved for easy re-enable)
+scope: [mr-github-broken]
+```
+
+This applies to any scope token (`mr-github`, `mr-github-slim`, `mr-gitlab`,
+etc.). Deleting the entry entirely would require recreating the test case
+definition when the fix lands.
+
 ### Which label to attach when opening a PR
 
 Apply this logic based on what the PR changes:
