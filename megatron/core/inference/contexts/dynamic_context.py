@@ -1644,6 +1644,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
+        # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
+        # overlap with the CPU work below.  These are non-blocking GPU kernels.
+        self._execute_pending_mamba_ops()
+
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
             self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
@@ -1894,9 +1898,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         All copies use non_blocking=True with pinned CPU memory. CUDA stream
         ordering guarantees the forward pass sees completed transfers.
         """
-        # Execute deferred Mamba GPU operations first (state zeroing, restore, offsets).
-        self._execute_pending_mamba_ops()
-
         n_tok = self.padded_active_token_count
 
         # Token-level transfers.
