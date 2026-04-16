@@ -1842,11 +1842,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
             # because it writes to GPU buffers. Store the parameters here.
+            # intermediate_offsets_gpu / intermediate_counts_gpu get the CPU-side
+            # slices here; H2D transfer happens in transfer_bookkeeping_to_gpu().
             intermediate_offsets_gpu = None
             intermediate_counts_gpu = None
             if self.mamba_slot_allocator is not None:
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
-                    self.mamba_slot_allocator.get_intermediate_gpu_data()
+                    self.mamba_slot_allocator.get_intermediate_cpu_data()
                 )
             self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
                 active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
@@ -2594,13 +2596,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             self.mamba_metadata.free_slots(request_indexes)
 
-        # Clear intermediate offset entries for released requests
+        # Clear intermediate offset entries for released requests (CPU writes).
         if self.mamba_slot_allocator is not None:
             sa = self.mamba_slot_allocator
-            sa._intermediate_counts_gpu[request_indexes] = 0
-            sa._intermediate_offsets_gpu[request_indexes] = 0
-            sa._intermediate_block_ids_gpu[request_indexes] = -1
-            sa._eos_cache_block_id_gpu[request_indexes] = -1
+            sa._intermediate_counts_cpu[request_indexes] = 0
+            sa._intermediate_offsets_cpu[request_indexes] = 0
+            sa._intermediate_block_ids_cpu[request_indexes] = -1
+            sa._eos_cache_block_id_cpu[request_indexes] = -1
 
     def resume_paused_requests(
         self, active_request_count: int, newly_paused_request_ids: torch.Tensor

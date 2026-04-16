@@ -357,9 +357,19 @@ class MambaMetadata:
         max_count = self.max_intermediate_count
 
         if intermediate_offsets_gpu is not None and real_prefill_count > 0:
-            # Transfer counts to CPU (single sync) for per_request_counts and total check
+            # counts_list is CPU-cheap (source is already CPU from MambaSlotAllocator).
             counts_list = intermediate_counts_gpu.tolist()
             total = sum(counts_list)
+
+            # Ensure GPU copies for vectorized GPU ops below.
+            if not intermediate_offsets_gpu.is_cuda:
+                intermediate_offsets_gpu = intermediate_offsets_gpu.to(
+                    self.device, non_blocking=True,
+                )
+            if not intermediate_counts_gpu.is_cuda:
+                intermediate_counts_gpu = intermediate_counts_gpu.to(
+                    self.device, non_blocking=True,
+                )
 
             if total > 0:
                 # Compute cumulative chunk counts from cu_seqlens (already on GPU)

@@ -73,21 +73,29 @@ class MambaSlotAllocator:
         # Hash-to-block mapping: only blocks with cached Mamba state
         self.hash_to_block_id: Dict[int, int] = {}
 
-        # Per-request intermediate state storage (GPU tensors, fixed-size per request).
-        # These are consumed by Triton kernels during the forward pass.
-        # 0 = no offset, -1 = no block
+        # Per-request intermediate state storage.
+        # offsets_cpu and counts_cpu: CPU source of truth.  GPU copies are
+        # populated by transfer_bookkeeping_to_gpu() since Triton kernels read them.
+        # block_ids and eos_cache_block_id: CPU only (consumed by CPU code).
         k = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
+        self._intermediate_offsets_cpu = torch.zeros(
+            (context.max_requests, k), dtype=torch.int32, device='cpu',
+        )
+        self._intermediate_counts_cpu = torch.zeros(
+            context.max_requests, dtype=torch.int32, device='cpu',
+        )
         self._intermediate_offsets_gpu = torch.zeros(
             (context.max_requests, k), dtype=torch.int32, device=gpu_device,
-        )
-        self._intermediate_block_ids_gpu = torch.full(
-            (context.max_requests, k), -1, dtype=torch.int32, device=gpu_device,
         )
         self._intermediate_counts_gpu = torch.zeros(
             context.max_requests, dtype=torch.int32, device=gpu_device,
         )
-        self._eos_cache_block_id_gpu = torch.full(
-            (context.max_requests,), -1, dtype=torch.int32, device=gpu_device,
+        # CPU-only: consumed by _collect_commit_data() which needs .tolist() anyway.
+        self._intermediate_block_ids_cpu = torch.full(
+            (context.max_requests, k), -1, dtype=torch.int32, device='cpu',
+        )
+        self._eos_cache_block_id_cpu = torch.full(
+            (context.max_requests,), -1, dtype=torch.int32, device='cpu',
         )
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
@@ -418,42 +426,41 @@ class MambaSlotAllocator:
         offsets = sorted(offsets_set)
         count = len(offsets)
 
-        # Vectorized block ID lookup: GPU gather avoids per-block .item() syncs
+        # CPU bookkeeping writes (no GPU kernel launches).
         if count > 0:
-            device = self._intermediate_offsets_gpu.device
-            abs_tokens = torch.tensor(
-                [skip_tokens + o for o in offsets], dtype=torch.int64, device=device
+            abs_tokens_cpu = torch.tensor(
+                [skip_tokens + o for o in offsets], dtype=torch.int64,
             )
-            block_indices = abs_tokens // ctx.block_size_tokens - 1
-            bids = ctx.request_to_kv_block_ids[current_id][block_indices.cpu()].to(device)
+            block_indices_cpu = abs_tokens_cpu // ctx.block_size_tokens - 1
+            bids_cpu = ctx.request_to_kv_block_ids[current_id][block_indices_cpu]
 
-            self._intermediate_offsets_gpu[current_id, :count] = torch.tensor(
-                offsets, dtype=torch.int32, device=device
+            self._intermediate_offsets_cpu[current_id, :count] = torch.tensor(
+                offsets, dtype=torch.int32,
             )
-            self._intermediate_block_ids_gpu[current_id, :count] = bids.to(torch.int32)
+            self._intermediate_block_ids_cpu[current_id, :count] = bids_cpu.to(torch.int32)
             self._has_intermediates = True
-        self._intermediate_counts_gpu[current_id] = count
+        self._intermediate_counts_cpu[current_id] = count
 
         # Block-aligned EOS: prompt_len is exactly block-aligned
         if last_aligned_abs == prompt_len and prompt_len > 0:
             last_block_idx = prompt_len // ctx.block_size_tokens - 1
             if last_block_idx >= 0:
-                self._eos_cache_block_id_gpu[current_id] = ctx.request_to_kv_block_ids[current_id][
+                self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
                     last_block_idx
                 ]
                 self._has_intermediates = True
             else:
-                self._eos_cache_block_id_gpu[current_id] = -1
+                self._eos_cache_block_id_cpu[current_id] = -1
         else:
-            self._eos_cache_block_id_gpu[current_id] = -1
+            self._eos_cache_block_id_cpu[current_id] = -1
 
-    def get_intermediate_gpu_data(self):
-        """Get intermediate offsets and counts as GPU tensor slices for current prefill batch.
+    def get_intermediate_cpu_data(self):
+        """Get intermediate offsets and counts as CPU tensor slices for current prefill batch.
 
         Returns:
-            Tuple of (offsets_gpu, counts_gpu) where:
-                offsets_gpu: [prefill_count, 3] int32 GPU tensor
-                counts_gpu: [prefill_count] int32 GPU tensor
+            Tuple of (offsets_cpu, counts_cpu) where:
+                offsets_cpu: [prefill_count, 3] int32 CPU tensor
+                counts_cpu: [prefill_count] int32 CPU tensor
             Returns (None, None) if no prefill requests or no intermediates.
         """
         if not self._has_intermediates:
@@ -468,9 +475,32 @@ class MambaSlotAllocator:
         decode_count = ctx.batch_dimensions.decode_req_count
         prefill_start = active_start + decode_count
 
-        offsets = self._intermediate_offsets_gpu[prefill_start : prefill_start + prefill_count]
-        counts = self._intermediate_counts_gpu[prefill_start : prefill_start + prefill_count]
+        offsets = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
+        counts = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
         return offsets, counts
+
+    def transfer_intermediate_to_gpu(self, prefill_start: int, prefill_count: int):
+        """Copy intermediate offsets/counts slice from CPU to GPU for Mamba kernels.
+
+        Returns the GPU tensor views for the forward-pass kernels to consume.
+        """
+        if prefill_count == 0:
+            return None, None
+        offsets_cpu = self._intermediate_offsets_cpu[
+            prefill_start : prefill_start + prefill_count
+        ]
+        counts_cpu = self._intermediate_counts_cpu[
+            prefill_start : prefill_start + prefill_count
+        ]
+        offsets_gpu = self._intermediate_offsets_gpu[
+            prefill_start : prefill_start + prefill_count
+        ]
+        counts_gpu = self._intermediate_counts_gpu[
+            prefill_start : prefill_start + prefill_count
+        ]
+        offsets_gpu.copy_(offsets_cpu, non_blocking=True)
+        counts_gpu.copy_(counts_cpu, non_blocking=True)
+        return offsets_gpu, counts_gpu
 
     # =========================================================================
     # Intermediate state commit
@@ -522,14 +552,14 @@ class MambaSlotAllocator:
         decode_count = ctx.batch_dimensions.decode_req_count
         prefill_start = active_start + decode_count
 
-        # Batch-transfer block IDs and EOS block IDs from GPU (2 GPU syncs)
+        # Block IDs and EOS block IDs live on CPU (no GPU sync needed).
         intermediate_count = metadata.intermediate_count
         per_request_counts = metadata.per_request_intermediate_counts
 
-        all_block_ids_cpu = self._intermediate_block_ids_gpu[
+        all_block_ids_cpu = self._intermediate_block_ids_cpu[
             prefill_start : prefill_start + prefill_count
         ].tolist()
-        eos_bids_cpu = self._eos_cache_block_id_gpu[
+        eos_bids_cpu = self._eos_cache_block_id_cpu[
             prefill_start : prefill_start + prefill_count
         ].tolist()
 
@@ -591,10 +621,10 @@ class MambaSlotAllocator:
             decode_count = ctx.batch_dimensions.decode_req_count
             prefill_start = active_start + decode_count
             end = prefill_start + prefill_count
-            self._intermediate_counts_gpu[prefill_start:end].fill_(0)
-            self._intermediate_offsets_gpu[prefill_start:end].fill_(0)
-            self._intermediate_block_ids_gpu[prefill_start:end].fill_(-1)
-            self._eos_cache_block_id_gpu[prefill_start:end].fill_(-1)
+            self._intermediate_counts_cpu[prefill_start:end].fill_(0)
+            self._intermediate_offsets_cpu[prefill_start:end].fill_(0)
+            self._intermediate_block_ids_cpu[prefill_start:end].fill_(-1)
+            self._eos_cache_block_id_cpu[prefill_start:end].fill_(-1)
         self._has_intermediates = False
 
     # =========================================================================
@@ -612,8 +642,8 @@ class MambaSlotAllocator:
         self.hash_to_block_id.clear()
         self.intermediate_ssm_out.zero_()
         self.intermediate_conv_out.zero_()
-        self._intermediate_offsets_gpu.fill_(0)
-        self._intermediate_block_ids_gpu.fill_(-1)
-        self._intermediate_counts_gpu.fill_(0)
-        self._eos_cache_block_id_gpu.fill_(-1)
+        self._intermediate_offsets_cpu.fill_(0)
+        self._intermediate_counts_cpu.fill_(0)
+        self._intermediate_block_ids_cpu.fill_(-1)
+        self._eos_cache_block_id_cpu.fill_(-1)
         self._has_intermediates = False
