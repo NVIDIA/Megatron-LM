@@ -435,72 +435,77 @@ def _permute_quantize_mxfp8_kernel(
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     K,
     n_col_blocks,
+    max_pairs,         # max_tokens * topk (fixed for CG)
     topk: tl.constexpr,
     local_expert_start,
     num_local_experts: tl.constexpr,
     REAL_GROUPS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
     """Fused permute + MXFP8 quantize + swizzle in one kernel.
 
-    Grid: (max_tokens * topk,) — one program per (token, k) pair.
-    Programs beyond valid_tokens exit immediately — required for CUDA graph compatibility.
+    Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple (token, topk) pairs.
+    valid_tokens gates which pairs are actually processed — required for CUDA graph
+    compatibility since the grid size never changes across steps.
     """
-    pair = tl.program_id(0)
-    tok = pair // topk
-    k = pair % topk
+    pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    if tok >= valid_tokens:
-        return
-    eid = tl.load(routing_map_ptr + tok * topk + k)
-    lid = eid - local_expert_start
-    if lid < 0 or lid >= num_local_experts:
+    valid_pairs = valid_tokens * topk
+    if pid >= valid_pairs:
         return
 
-    pos = tl.atomic_add(counters_ptr + lid, 1)
+    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
+        tok = pair // topk
+        if tok < valid_tokens:
+            k = pair % topk
+            eid = tl.load(routing_map_ptr + tok * topk + k)
+            lid = eid - local_expert_start
+            if lid >= 0 and lid < num_local_experts:
+                pos = tl.atomic_add(counters_ptr + lid, 1)
 
-    # Load full row from source token
-    offs = tl.arange(0, BLOCK_K)
-    mask = offs < K
-    x = tl.load(hidden_ptr + tok * K + offs, mask=mask, other=0.0).to(tl.float32)
+                # Load full row from source token
+                offs = tl.arange(0, BLOCK_K)
+                mask = offs < K
+                x = tl.load(hidden_ptr + tok * K + offs, mask=mask, other=0.0).to(tl.float32)
 
-    # Per-group-of-32 quantization
-    x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
-    abs_grouped = tl.abs(x_grouped)
-    max_vals = tl.max(abs_grouped, axis=1)
+                # Per-group-of-32 quantization
+                x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
+                abs_grouped = tl.abs(x_grouped)
+                max_vals = tl.max(abs_grouped, axis=1)
 
-    dequant_scale = max_vals / 448.0
-    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+                dequant_scale = max_vals / 448.0
+                dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+                dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+                quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
 
-    quantized = x_grouped * quant_scale[:, None]
-    quantized_flat = tl.reshape(quantized, [BLOCK_K])
-    out_fp8 = quantized_flat.to(tl.float8e4nv)
+                quantized = x_grouped * quant_scale[:, None]
+                quantized_flat = tl.reshape(quantized, [BLOCK_K])
+                out_fp8 = quantized_flat.to(tl.float8e4nv)
 
-    # Store FP8 data at permuted position
-    tl.store(out_fp8_ptr + pos * K + offs, out_fp8, mask=mask)
+                # Store FP8 data at permuted position
+                tl.store(out_fp8_ptr + pos * K + offs, out_fp8, mask=mask)
 
-    # Store swizzled scales at permuted position
-    scale_exp = (dequant_exp >> 23).to(tl.uint8)
-    col_offs = tl.arange(0, BLOCK_GROUPS)
-    col_mask = col_offs < REAL_GROUPS
+                # Store swizzled scales at permuted position
+                scale_exp = (dequant_exp >> 23).to(tl.uint8)
+                col_offs = tl.arange(0, BLOCK_GROUPS)
+                col_mask = col_offs < REAL_GROUPS
 
-    macro_row_block = pos // 128
-    macro_col_block = col_offs // 4
-    local_row = pos % 128
-    local_col = col_offs % 4
-    group = local_row // 32
-    sub_row = local_row % 32
-    tile_idx = macro_row_block * n_col_blocks + macro_col_block
-    swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
+                macro_row_block = pos // 128
+                macro_col_block = col_offs // 4
+                local_row = pos % 128
+                local_col = col_offs % 4
+                group = local_row // 32
+                sub_row = local_row % 32
+                tile_idx = macro_row_block * n_col_blocks + macro_col_block
+                swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
 
-    tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+                tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
 
-    # Store prob and source index
-    tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
-    tl.store(out_src_idx_ptr + pos, tok)
+                # Store prob and source index
+                tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
+                tl.store(out_src_idx_ptr + pos, tok)
 
 
 def permute_and_quantize_mxfp8(
@@ -569,8 +574,9 @@ def permute_and_quantize_mxfp8(
 
     BLOCK_K = triton.next_power_of_2(K)
     BLOCK_GROUPS = BLOCK_K // 32
-
-    _permute_quantize_mxfp8_kernel[(max_tokens * topk,)](
+    max_pairs = max_tokens * topk
+    NUM_BLOCKS = min(max_pairs, 512)
+    _permute_quantize_mxfp8_kernel[(NUM_BLOCKS,)](
         hidden_states,
         probs,
         routing_map,
@@ -582,12 +588,14 @@ def permute_and_quantize_mxfp8(
         valid_tokens,
         K,
         n_col_blocks,
+        max_pairs,
         topk,
         local_expert_start,
         num_local_experts,
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,
+        NUM_BLOCKS=NUM_BLOCKS,
     )
 
     permuted_mxfp8 = MXFP8Tensor(
