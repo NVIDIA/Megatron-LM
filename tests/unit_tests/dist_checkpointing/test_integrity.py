@@ -52,6 +52,8 @@ class TestIntegrity:
 
             loaded_state_dict = load(load_state_dict, ckpt_dir, verify_integrity=True)
 
+        Utils.destroy_model_parallel()
+
     def test_save_verify_integrity_manifest_directly(self, tmp_path_dist_ckpt):
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_directly', sync=True
