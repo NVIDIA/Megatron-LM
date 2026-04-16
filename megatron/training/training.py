@@ -159,6 +159,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
@@ -2863,7 +2864,20 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            config,
+            copy_main_params,
+            model,
+            optimizer,
+            forward_backward_func,
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3366,7 +3380,20 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            config,
+            copy_main_params,
+            model,
+            None,
+            forward_backward_func,
+        )
 
     if has_nvidia_modelopt:
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors

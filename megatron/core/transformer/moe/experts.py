@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
@@ -42,6 +43,11 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
     skip_routed_expert_padding,
+)
+from megatron.core.transformer.moe.paged_stash import (
+    get_paged_stash_context,
+    paged_stash_group_commit,
+    paged_stash_group_start,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -766,45 +772,70 @@ class TEGroupedMLP(MegatronModule):
         )
 
     def _is_fused_impl_supported(self) -> bool:
-        """Check if the TE op fuser supports implementing this module."""
+        """Check if the TE op fuser supports implementing this module.
+
+        Logs a warning for each unsatisfied condition to aid debugging
+        (e.g. when CUDA graph fails because the CuTe DSL fused kernel
+        was not activated and GroupedLinear falls back to tolist()).
+        """
+
+        def _unsupported(reason):
+            logger.warning("TE fused GroupedMLP not available: %s", reason)
+            return False
 
         # Check Transformer Engine installation
         if not HAVE_TE:
-            return False  # Transformer Engine is not available
+            return _unsupported("Transformer Engine is not installed")
         try:
             from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
         except ImportError:
-            return False  # Transformer Engine version is too old
+            return _unsupported("TE too old (missing pytorch.ops.GroupedLinear)")
 
         if not is_te_min_version("2.14.0"):
-            return False
+            return _unsupported("TE version < 2.14.0")
 
         # Check for unsupported features
         if self.tp_group.size() > 1:
-            return False  # Tensor parallelism is not supported
+            return _unsupported(f"expert TP > 1 (tp_size={self.tp_group.size()})")
         if self.offload_expert_fc1 or self.offload_moe_act:
-            return False  # Fine-grained activation offloading is not supported
+            return _unsupported("fine-grained activation offloading enabled")
         if self.config.moe_apply_probs_on_input:
-            return False  # Pre-multiplying probs is not supported
+            return _unsupported("moe_apply_probs_on_input enabled")
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
-            return False
+            return _unsupported(f"linear_fc1 is {type(self.linear_fc1).__name__}")
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
-            return False
+            return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU (ScaledSwiGLU) or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
-        if self.config.gated_linear_unit:
-            if self.activation_func == F.silu:
-                return True
-            if self.activation_func == quick_gelu:
-                try:
-                    from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-                except ImportError:
-                    return False
-                return True
+        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
+        if not self.config.gated_linear_unit:
+            return _unsupported("gated_linear_unit not enabled")
+        if self.activation_func == F.silu:
+            pass  # SwiGLU — supported
+        elif self.activation_func == quick_gelu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
+            except ImportError:
+                return _unsupported("quick_gelu needs TE >= 2.15")
+        else:
+            return _unsupported(f"unsupported activation: {self.activation_func}")
 
-        return False
+        # Check TE CuTe DSL fused kernel conditions (must match TE's
+        # fuse_grouped_mlp_ops matching logic)
+        import os
+
+        if os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0") == "0":
+            return _unsupported(
+                "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set — CuTe DSL fused kernel disabled"
+            )
+        if self.config.moe_mlp_glu_interleave_size != 32:
+            return _unsupported(
+                f"moe_mlp_glu_interleave_size={self.config.moe_mlp_glu_interleave_size} "
+                f"(CuTe DSL requires 32)"
+            )
+
+        return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
@@ -965,19 +996,40 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = torch.tensor(
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
+        # if the number of tokens is 0, pad the hidden states to 256
 
-        # Call fused impl
-        output = ops(
-            permuted_local_hidden_states,
-            tokens_per_expert,  # FC1
-            permuted_probs,  # Scaled SwiGLU
-            tokens_per_expert,  # FC2
-        )
-
+        if self.config.moe_paged_stash:
+            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+            max_num_tokens = permuted_local_hidden_states.shape[0]
+            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+            cap_factor = self.config.moe_expert_rank_capacity_factor
+            avg_num_tokens = (
+                int(max_num_tokens // cap_factor)
+                if cap_factor is not None and cap_factor > 0
+                else None
+            )
+            stash_context = get_paged_stash_context(
+                name="grouped_mlp",
+                max_num_tokens=max_num_tokens,
+                num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
+            )
+        else:
+            stash_context = nullcontext()
+        with stash_context:
+            # Call fused impl
+            output = ops(
+                permuted_local_hidden_states,
+                tokens_per_expert,  # FC1
+                permuted_probs,  # Scaled SwiGLU
+                tokens_per_expert,  # FC2
+            )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
-
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
     def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
