@@ -113,13 +113,14 @@ Apply this logic based on what the PR changes:
 |----------------------------------|-----------------|
 | Docs only (`docs/`, `*.md`, docstrings) | _(none)_ |
 | CI/tooling only (`.github/`, `tools/`, `Makefile`) | _(none)_ |
-| Test files only (`tests/`) | `Run tests` |
+| Test files only (`tests/`) — existing tests, no new golden values | `Run tests` |
+| **New test cases added** (no golden values exist yet) | `Run functional tests` |
 | Non-numerical library code (logging, error handling, CLI flags, refactors) | `Run tests` |
 | Could affect training numerics (model arch, attention, optimizer, distributed, MoE routing) | `Run functional tests` |
 | Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` + `container::lts` |
 | Touches MBridge integration | add `Run MBridge tests` |
 
-**Rule of thumb:** default to `Run tests`. Only escalate to `Run functional tests` when the change could plausibly shift loss curves or break determinism.
+**Rule of thumb:** default to `Run tests`. Always use `Run functional tests` when the PR adds new test cases (golden values must be generated) or when the change could plausibly shift loss curves.
 
 ---
 
