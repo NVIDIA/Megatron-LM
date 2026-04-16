@@ -31,6 +31,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -170,6 +171,16 @@ class TextGenerationController:
         self._is_last_pp_stage = is_pipeline_last_stage(self.pp_group)
         self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
+
+        if self._enable_cuda_graph:
+            CudaGraphManager(
+                self.model_config,
+                context,
+                function_name="run_attn_init_graph_body",
+                need_backward=False,
+                inline_capture=True,
+                num_warmup_steps=1,
+            )
 
         self._init_mtp_sampling_tensors()
 
@@ -609,10 +620,16 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(
+        if context.prepare_attn_init(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
-        )
+        ):
+            use_graph = context.using_cuda_graph_this_step()
+            context.run_attn_init_graph_body(
+                eager=not use_graph,
+                cache_key=context.padded_batch_dimensions if use_graph else None,
+            )
+            context.finalize_attn_init()
 
         # Derive the MTP padded batch size from the existing padded graph dimensions.
         # For MoE models this is post EP sync. In eager mode MTP uses locally SP-aligned

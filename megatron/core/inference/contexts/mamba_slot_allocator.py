@@ -515,7 +515,9 @@ class MambaSlotAllocator:
         decode_count = ctx.batch_dimensions.decode_req_count
         prefill_start = decode_count
 
-        # Resolve deferred intermediate counts (GPU -> CPU).
+        # Resolve deferred intermediate counts via GPU sync.
+        # This .tolist() was deferred from _update_intermediate_metadata so the sync overlaps with
+        # the forward pass rather than stalling pre-forward setup.
         if metadata._pending_intermediate_counts_gpu is not None:
             per_request_counts = metadata._pending_intermediate_counts_gpu.tolist()
             metadata._pending_intermediate_counts_gpu = None
@@ -531,9 +533,9 @@ class MambaSlotAllocator:
             prefill_start : prefill_start + prefill_count
         ].tolist()
 
-        # Flatten intermediate block IDs and source offsets.
-        # Entries are at stride-3 positions in the buffer (fixed layout, no compaction),
-        # matching `_update_intermediate_metadata`.
+        # Flatten intermediate block IDs and source offsets
+        # Entries are at stride-3 positions in the buffer (fixed layout,
+        # no compaction), matching _update_intermediate_metadata.
         intermediate_bids = []
         src_offsets = []
         for req_idx, count in enumerate(per_request_counts):

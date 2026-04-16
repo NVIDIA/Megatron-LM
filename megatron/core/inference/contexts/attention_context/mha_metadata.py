@@ -41,14 +41,8 @@ class MHAMetadata(MetadataBase):
         padded_batch_dimensions: InferenceBatchDimensions,
         num_speculative_tokens: int = 0,
     ):
-        """Assemble state_data.
-
-        Args:
-            batch_dimensions: Configuration object with real batch settings.
-            padded_batch_dimensions: Configuration object with padded batch settings.
-            num_speculative_tokens: Number of speculative tokens.
-        """
-        padded_active_request_count = padded_batch_dimensions.req_count
+        """Assemble state_data from already-populated buffers."""
+        padded_request_count = padded_batch_dimensions.req_count
 
         if padded_batch_dimensions.prefill_req_count == 0:
             self._max_seqlen_q = num_speculative_tokens + 1
@@ -59,13 +53,11 @@ class MHAMetadata(MetadataBase):
         self._max_seqlen_k = self.max_seqlen
 
         self.state_data = {
-            "query_lengths": self._query_lengths_buf[:padded_active_request_count],
-            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[
-                : padded_active_request_count + 1
-            ],
-            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: padded_active_request_count + 1],
-            "kv_seq_lengths": self._kv_seq_lengths_buf[:padded_active_request_count],
-            "block_table": self._block_table_buf[0:padded_active_request_count, :],
+            "query_lengths": self._query_lengths_buf[:padded_request_count],
+            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[: padded_request_count + 1],
+            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: padded_request_count + 1],
+            "kv_seq_lengths": self._kv_seq_lengths_buf[:padded_request_count],
+            "block_table": self._block_table_buf[:padded_request_count, :],
             "max_seqlen_q": self._max_seqlen_q,
             "max_seqlen_k": self._max_seqlen_k,
         }
@@ -87,9 +79,11 @@ class NonGraphedMHAMetadata(MHAMetadata):
             padded_batch_dimensions,
             num_speculative_tokens,
         )
-        if len(self.state_data["query_lengths"]) > 0:
-            self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"])
+        query_lengths = self.state_data["query_lengths"]
+        if len(query_lengths) > 0:
+            self.state_data["max_seqlen_q"] = torch.max(query_lengths)
             self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"])
         else:
-            self.state_data["max_seqlen_q"] = num_speculative_tokens + 1
-            self.state_data["max_seqlen_k"] = 1
+            # Empty-batch fallback: allow for unconditional `.item()` in post-forward resolution.
+            self.state_data["max_seqlen_q"] = query_lengths.new_full((), num_speculative_tokens + 1)
+            self.state_data["max_seqlen_k"] = query_lengths.new_full((), 1)
