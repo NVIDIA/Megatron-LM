@@ -25,7 +25,7 @@ megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 
 megatron/core/pipeline_parallel/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/pipeline-parallelism
 
-megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo
+megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/transformer
 
 megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech
 
@@ -39,8 +39,12 @@ megatron/post_training/ @NVIDIA/post-training
 
 megatron/core/transformer/cuda_graphs.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/cuda-graphs
 
+megatron/training/ @NVIDIA/training-adlr @NVIDIA/training-nemo
+megatron/training/arguments.py
+
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
+.github/oncall_schedule.json @NVIDIA/mcore-oncall-rotation
 .gitlab-ci.yml @NVIDIA/ci
 docker/  @NVIDIA/ci
 tests/functional_tests/python_test_utils/ @NVIDIA/ci

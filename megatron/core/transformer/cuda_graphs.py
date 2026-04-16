@@ -20,8 +20,8 @@ from typing import Any, Dict, List
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
-from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     get_all_rng_states,
@@ -112,6 +112,7 @@ def _set_warmup_start():
 def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
+    _IS_GRAPH_WARMUP = False
 
 
 @dataclass
@@ -584,7 +585,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 need_copy_inputs.append(user_input)
                 assert user_input.data_ptr() == cudagraph_input.data_ptr()
             else:
-                cudagraph_input.copy_(user_input)
+                if user_input.data_ptr() != cudagraph_input.data_ptr():
+                    cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
         ctx.save_for_backward(*need_copy_inputs)
@@ -928,6 +930,7 @@ class _CudaGraphRunner(torch.nn.Module):
                         only_inputs=True,
                         allow_unused=True,
                     )
+
             _set_warmup_end()
 
             with self.get_quantization_context():
@@ -1128,19 +1131,51 @@ class _CudaGraphRunner(torch.nn.Module):
                 if not torch.is_tensor(arg):
                     return arg
 
-                ref = make_weak_ref(arg)
+                try:
+                    ref = make_weak_ref(arg)
+                except RuntimeError:
+                    # Fallback to keeping a strong reference. There is a known bug where some
+                    # dtypes (e.g. torch.float64) are not mapped to a representation in
+                    # transformer_engine/pytorch/utils.py.
+                    if torch.distributed.get_rank() == 0:
+                        logger.warning(
+                            f"Could not create weak ref for tensor with dtype {arg.dtype}; "
+                            f"keeping strong ref with a potential memory overhead."
+                        )
+                    return arg
                 ref.requires_grad = arg.requires_grad
                 if hasattr(arg, "can_skip_replay_copy"):
                     ref.can_skip_replay_copy = arg.can_skip_replay_copy
                 return ref
 
+            # Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
+            # reference.  Only graph mempool tensors in the graph mempool (e.g. a previous layer's
+            # output reused as this graph's input) are safe to weak-ref since their memory is
+            # driver-pinned with stable addresses.  We identify them as tensors that are not owned
+            # by the reuse pool and have the attribute `can_skip_replay_copy` set by
+            # _resolve_input_buffer.  Everything else, including reuse-pool buffers, stray tensors
+            # from dataclass __post_init__ side-effects (e.g. seq_idx created by
+            # PackedSeqParams.__post_init__ during dataclasses.replace inside the tree_map) must
+            # retain strong refs, or it will cause a use-after-free on replay that manifests as a
+            # segfault under memory pressure.
+            def replace_with_weak_ref_for_input_surface(arg):
+                if not torch.is_tensor(arg):
+                    return replace_with_weak_ref(arg)
+                if not _CudagraphGlobalRecord.tensor_reuse_pool.owns(arg) and hasattr(
+                    arg, 'can_skip_replay_copy'
+                ):
+                    return replace_with_weak_ref(arg)
+                return arg
+
             self.fwd_graph_input_surface = tree_map(
-                replace_with_weak_ref, self.fwd_graph_input_surface
+                replace_with_weak_ref_for_input_surface, self.fwd_graph_input_surface
             )
+
             self.fwd_graph_input_args = tree_map(replace_with_weak_ref, self.fwd_graph_input_args)
             self.fwd_graph_input_kwargs = tree_map(
                 replace_with_weak_ref, self.fwd_graph_input_kwargs
             )
+            # Outputs can be weakref'd as they are managed by the graph pool
             self.fwd_graph_output_surface = tree_map(
                 replace_with_weak_ref, self.fwd_graph_output_surface
             )
@@ -1267,17 +1302,19 @@ class _CudaGraphRunner(torch.nn.Module):
             _check_supported_type(ref)
 
             if val.type != ref.type and not (is_dataclass(val.value) and is_dataclass(ref.value)):
-                add_error(f"Type mismatch at {context}: {val.type} vs {ref.type}")
+                add_error(
+                    f"Type mismatch at {context}: Received {val.type} but expected {ref.type}"
+                )
                 return False
 
             if ref.type == torch.Tensor or issubclass(ref.type, torch.Tensor):
                 mismatches = []
                 if val.shape != ref.shape:
-                    mismatches.append(f"expected shape {val.shape} vs. {ref.shape}")
+                    mismatches.append(f"Received shape {val.shape} but expected {ref.shape}")
                 if val.dtype != ref.dtype:
-                    mismatches.append(f"expected dtype {val.dtype} vs. {ref.dtype}")
+                    mismatches.append(f"Received dtype {val.dtype} but expected {ref.dtype}")
                 if val.device != ref.device:
-                    mismatches.append(f"expected device {val.device} vs. {ref.device}")
+                    mismatches.append(f"Received device {val.device} but expected {ref.device}")
                 if mismatches:
                     add_error(f"Tensor mismatch at {context}: {', '.join(mismatches)}")
 
@@ -1372,7 +1409,12 @@ class CudaGraphManager(torch.nn.Module):
     global_mempool = None
 
     def __init__(
-        self, config: TransformerConfig, base_module=None, function_name=None, need_backward=True
+        self,
+        config: TransformerConfig,
+        base_module=None,
+        function_name=None,
+        need_backward=True,
+        pg_collection=None,
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
@@ -1381,6 +1423,9 @@ class CudaGraphManager(torch.nn.Module):
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
         """
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
 
@@ -1426,7 +1471,7 @@ class CudaGraphManager(torch.nn.Module):
         # Without pipeline parallelism, microbatches execute one at a time.
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
-        self.reuse_cudagraphs = parallel_state.get_pipeline_model_parallel_world_size() == 1
+        self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
         if CudaGraphManager.global_mempool is None:
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
             # Cudagraph stream capture requires no operations on the default stream prior to the
@@ -1555,7 +1600,6 @@ class CudaGraphManager(torch.nn.Module):
             if is_inference_mode:
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
-                runner.eval()
 
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
@@ -1586,6 +1630,7 @@ class CudaGraphManager(torch.nn.Module):
                     )
                     runner.fwd_graph_recorded = True
                     runner.cudagraph_created = True
+                    runner = runner.eval()
 
                     # Record this to the global execution record
                     _CudagraphGlobalRecord.cudagraph_inference_record.append(
@@ -1674,7 +1719,9 @@ class TECudaGraphHelper:
     parameters that are covered by cudagraphs.
     """
 
-    def __init__(self, model, config, seq_length, micro_batch_size, optimizers=[]):
+    def __init__(
+        self, model, config, seq_length, micro_batch_size, optimizers=[], pg_collection=None
+    ):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
             config.cuda_graph_impl == "transformer_engine"
@@ -1696,19 +1743,38 @@ class TECudaGraphHelper:
         self.seq_length = seq_length
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
+        self.pg_collection = pg_collection
+        if self.pg_collection is None:
+            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.tp_group = self.pg_collection.tp
+        self.dp_cp_group = self.pg_collection.dp_cp
+        self.pp_group = self.pg_collection.pp
+        from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+
+        self.p2p_communicator = P2PCommunicator(pp_group=self.pp_group, config=self.config)
         self.num_model_chunks = len(model)
 
         # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
         self.num_microbatches = None
 
-        # Get callables with captureable layers.
+        self._discover_layers()
+
+        # Flags to track CUDA Graph state:
+        # - _capture_finished: Whether create_cudagraphs() has been called (used by training loop)
+        # - _graphs_created: Whether any graphs were actually created (may be False if no
+        #   layers found)
+        self._capture_finished = False
+        self._graphs_created = False
+
+    def _discover_layers(self):
+        """Discover captureable layers from the model and populate internal data structures."""
         self.chunks_with_decoder = []
         self.num_layers_per_chunk = []
         self.callables_per_chunk = []
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
-        for chunk_number, model_chunk in enumerate(model):
+        for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
                     model_chunk, 'decoder', allow_none=False, return_model_obj=True
@@ -1717,8 +1783,8 @@ class TECudaGraphHelper:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
                     logger=logger,
-                    tp_group=None,
-                    dp_cp_group=None,
+                    tp_group=self.tp_group,
+                    dp_cp_group=self.dp_cp_group,
                     level=logging.DEBUG,
                     msg=f'Rank {torch.distributed.get_rank()}: '
                     f'No valid layer in model chunk {chunk_number}.',
@@ -1733,20 +1799,20 @@ class TECudaGraphHelper:
                 callables, callables_is_mtp = [], []
                 for layer_number in range(num_decoder_layers):
                     layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, config):
+                    if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, config):
+                    if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(True)
                 log_on_each_pipeline_stage(
                     logger=logger,
-                    tp_group=None,
-                    dp_cp_group=None,
+                    tp_group=self.tp_group,
+                    dp_cp_group=self.dp_cp_group,
                     level=logging.DEBUG,
                     msg=f'Rank {torch.distributed.get_rank()}: '
                     f'{num_decoder_layers} decoder layers and {num_mtp_layers} MTP layers in '
@@ -1768,20 +1834,29 @@ class TECudaGraphHelper:
 
         log_on_each_pipeline_stage(
             logger=logger,
-            tp_group=None,
-            dp_cp_group=None,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
             level=logging.INFO,
             msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
 
-        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
-        # have been created.
-        self._graphs_created = False
+    def capture_finished(self):
+        """
+        Returns whether create_cudagraphs() has been called.
+
+        This is used by the training loop to determine if the capture process has run.
+        Returns True after create_cudagraphs() completes, regardless of whether any
+        graphs were actually created.
+        """
+        return self._capture_finished
 
     def graphs_created(self):
         """
-        Returns whether the CUDA Graphs have been created.
+        Returns whether any CUDA Graphs were actually created.
+
+        This returns False if create_cudagraphs() was called but no graphable layers
+        were found, and True if at least one graph was successfully created.
         """
         return self._graphs_created
 
@@ -2030,6 +2105,23 @@ class TECudaGraphHelper:
 
         return sample_args, sample_kwargs
 
+    def _get_amax_reduction_group(self, with_context_parallel=False, tp_only_amax_red=False):
+        """Get the FP8 amax reduction group the caller rank belongs to."""
+        if with_context_parallel:
+            if not tp_only_amax_red:
+                assert self.pg_collection.tp_dp_cp is not None
+                return self.pg_collection.tp_dp_cp
+            else:
+                assert self.pg_collection.tp_cp is not None
+                return self.pg_collection.tp_cp
+        else:
+            if not tp_only_amax_red:
+                assert self.pg_collection.tp_dp is not None
+                return self.pg_collection.tp_dp
+            else:
+                assert self.pg_collection.tp is not None
+                return self.pg_collection.tp
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
@@ -2043,10 +2135,7 @@ class TECudaGraphHelper:
         )
 
         # If PP is not enabled, we only need to capture one microbatch.
-        if (
-            parallel_state.get_pipeline_model_parallel_world_size() == 1
-            and not self.config.overlap_moe_expert_parallel_comm
-        ):
+        if self.pp_group.size() == 1 and not self.config.overlap_moe_expert_parallel_comm:
             assert (
                 self.num_model_chunks == 1
             ), "If PP is not enabled, there should be only one model chunk."
@@ -2058,7 +2147,8 @@ class TECudaGraphHelper:
             self.num_microbatches,
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
-            False,
+            forward_only=False,
+            p2p_communicator=self.p2p_communicator,
         )
         schedule_table = get_schedule_table(
             self.num_microbatches,
@@ -2070,8 +2160,8 @@ class TECudaGraphHelper:
         )
         log_on_each_pipeline_stage(
             logger=logger,
-            tp_group=None,
-            dp_cp_group=None,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
             level=logging.DEBUG,
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
@@ -2096,8 +2186,8 @@ class TECudaGraphHelper:
             self.num_microbatches = len(_order_without_wgrad) // self.num_model_chunks // 2
             log_on_each_pipeline_stage(
                 logger=logger,
-                tp_group=None,
-                dp_cp_group=None,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
                 level=logging.DEBUG,
                 msg=f'Rank {torch.distributed.get_rank()}: '
                 f'ORDER after overlap_moe_expert_parallel_comm {order}',
@@ -2168,8 +2258,12 @@ class TECudaGraphHelper:
                     get_fp8_recipe(self.config) if self.config.fp8 else get_fp4_recipe(self.config)
                 )
                 kwargs['fp8_weight_caching'] = True
-                if is_te_min_version("1.14.0") and parallel_state.model_parallel_is_initialized():
-                    kwargs['fp8_group'] = parallel_state.get_amax_reduction_group(
+                if (
+                    is_te_min_version("1.14.0")
+                    and self.pg_collection is not None
+                    and self.pg_collection.tp is not None
+                ):
+                    kwargs['fp8_group'] = self._get_amax_reduction_group(
                         with_context_parallel=True, tp_only_amax_red=self.config.tp_only_amax_red
                     )
             else:
@@ -2183,9 +2277,9 @@ class TECudaGraphHelper:
         """
         Start capturing CUDA Graphs.
         """
-        assert not self._graphs_created, "CUDA Graphs have already been created."
+        assert not self._capture_finished, "CUDA Graph capture has already been finished."
 
-        torch.distributed.barrier()
+        torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
         if FREEZE_GC:
@@ -2194,6 +2288,20 @@ class TECudaGraphHelper:
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()
+
+    def _reset_after_capture(self):
+        """
+        Reset the model and optimizer state after capturing CUDA Graphs.
+        """
+        from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+        from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+
+        for model_chunk in self.model:
+            model_chunk.zero_grad_buffer()
+        for optimizer in self.optimizers:
+            optimizer.zero_grad()
+        clear_aux_losses_tracker()
+        reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
         """
@@ -2207,23 +2315,14 @@ class TECudaGraphHelper:
         )
         _set_capture_end()
 
-        from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
-        from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
-
-        torch.distributed.barrier()
-        for model_chunk in self.model:
-            model_chunk.zero_grad_buffer()
-        for optimizer in self.optimizers:
-            optimizer.zero_grad()
-        clear_aux_losses_tracker()
-        reset_model_temporary_tensors(self.config, self.model)
-
+        torch.cuda.synchronize()
+        self._reset_after_capture()
         if FREEZE_GC:
             gc.unfreeze()
         gc.collect()
         torch.cuda.empty_cache()
 
-        self._graphs_created = True
+        self._capture_finished = True
 
     def create_cudagraphs(self):
         """
@@ -2231,33 +2330,44 @@ class TECudaGraphHelper:
         """
         start_time = self._start_capturing()
 
-        # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-        sample_args, kwargs = self._get_cuda_graph_input_data()
-        if self.config.sequence_parallel:
-            rng_context = get_cuda_rng_tracker().fork()
+        if not self.flattened_callables:
+            # Check if there are any graphable layers. If not, log a warning and skip capture,
+            # but still call _finish_capturing to ensure all ranks complete the capture phase.
+            logger.warning(
+                'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
+            )
         else:
-            rng_context = nullcontext()
-        with rng_context:
-            graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
+            # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
+            sample_args, kwargs = self._get_cuda_graph_input_data()
+            if self.config.sequence_parallel:
+                rng_context = get_cuda_rng_tracker().fork()
+            else:
+                rng_context = nullcontext()
+            with rng_context:
+                graphs = make_graphed_callables(
+                    tuple(self.flattened_callables), sample_args, **kwargs
+                )
 
-        # Push the captured graphs to the corresponding TransformerBlock.
-        num_layers_accumulated = 0
-        for layers in self.callables_per_chunk:
-            for layer_number, layer in enumerate(layers):
-                layer.cuda_graphs = []
-                for batch_number in range(self.num_microbatches):
-                    if self.config.overlap_moe_expert_parallel_comm:
-                        graph_idx = (
-                            num_layers_accumulated + layer_number
-                        ) * self.num_microbatches + batch_number
-                    else:
-                        graph_idx = (
-                            num_layers_accumulated * self.num_microbatches
-                            + batch_number * len(layers)
-                            + layer_number
-                        )
-                    layer.cuda_graphs.append(graphs[graph_idx])
-            num_layers_accumulated += len(layers)
+            # Push the captured graphs to the corresponding TransformerBlock.
+            num_layers_accumulated = 0
+            for layers in self.callables_per_chunk:
+                for layer_number, layer in enumerate(layers):
+                    layer.cuda_graphs = []
+                    for batch_number in range(self.num_microbatches):
+                        if self.config.overlap_moe_expert_parallel_comm:
+                            graph_idx = (
+                                num_layers_accumulated + layer_number
+                            ) * self.num_microbatches + batch_number
+                        else:
+                            graph_idx = (
+                                num_layers_accumulated * self.num_microbatches
+                                + batch_number * len(layers)
+                                + layer_number
+                            )
+                        layer.cuda_graphs.append(graphs[graph_idx])
+                num_layers_accumulated += len(layers)
+
+            self._graphs_created = True
 
         self._finish_capturing(start_time)
 
@@ -2275,7 +2385,7 @@ class TECudaGraphHelper:
         """
         Delete all CUDA graphs.
         """
-        assert self._graphs_created, "CUDA Graphs have not been created."
+        assert self._graphs_created, "No CUDA Graphs were created to delete."
 
         graph_resettable = is_te_min_version("2.10.0")
         graphs_reset, graphs_not_reset = 0, 0
@@ -2292,8 +2402,8 @@ class TECudaGraphHelper:
 
         log_on_each_pipeline_stage(
             logger=logger,
-            tp_group=None,
-            dp_cp_group=None,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
             level=logging.INFO,
             msg=f'Rank {torch.distributed.get_rank()}: '
             f'{graphs_reset} graphs deleted with explicit reset, '
@@ -2430,3 +2540,286 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
                 add_order(c_id, l_b, is_wgrad=True)
 
     return new_order, chunk_id_list
+
+
+# ---------------------------------------------------------------------------
+# set_current_microbatch: sets per-layer microbatch index for TE graph replay
+# ---------------------------------------------------------------------------
+
+
+def set_current_microbatch(model, microbatch_id):
+    """Set the current microbatch on all layers that use TE CUDA graph replay.
+
+    current_microbatch is read by _te_cuda_graph_replay to select the
+    correct graph index.  This helper is called from the pipeline-parallel
+    schedule before each forward step.
+    """
+    decoder_exists = True
+    model_with_decoder = None
+    try:
+        model_with_decoder = get_attr_wrapped_model(
+            model, "decoder", allow_none=False, return_model_obj=True
+        )
+    except RuntimeError:
+        decoder_exists = False
+    if decoder_exists and model_with_decoder is not None:
+        for layer in model_with_decoder.decoder.layers:
+            layer.current_microbatch = microbatch_id
+        if hasattr(model_with_decoder, 'mtp'):
+            for layer in model_with_decoder.mtp.layers:
+                assert hasattr(
+                    layer, 'mtp_model_layer'
+                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                layer.mtp_model_layer.current_microbatch = microbatch_id
+
+    # Also set current_microbatch on vision encoder layers so that
+    # _te_cuda_graph_replay selects the correct graph index. Without this,
+    # vision layers always use graph 0 (since current_microbatch defaults to 0),
+    # causing all microbatch forwards to overwrite the same static buffers.
+    # When backward runs for earlier microbatches, the buffers contain stale
+    # data from later forwards, producing NaN gradients.
+    try:
+        model_with_vision = get_attr_wrapped_model(
+            model, "vision_model", allow_none=True, return_model_obj=True
+        )
+    except RuntimeError:
+        model_with_vision = None
+    if model_with_vision is not None and hasattr(model_with_vision, 'vision_model'):
+        vision_model = model_with_vision.vision_model
+        if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
+            for layer in vision_model.decoder.layers:
+                layer.current_microbatch = microbatch_id
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder CUDA graph helpers
+# ---------------------------------------------------------------------------
+
+
+def _wrap_graph_for_vision(graph_fn):
+    """Wrap a graphed callable to filter out None outputs.
+
+    During make_graphed_callables warmup, vision encoder layers go through their
+    normal forward() path which returns (output, context=None). _te_cuda_graph_replay
+    asserts len(output) == 1 but gets 2 elements. This wrapper filters out None
+    values so replay sees (output,) instead of (output, None).
+    """
+
+    def wrapped(*args, **kwargs):
+        result = graph_fn(*args, **kwargs)
+        if isinstance(result, tuple):
+            filtered = tuple(r for r in result if r is not None)
+            return filtered if filtered else result
+        return result
+
+    for attr in ('backward_dw', 'reset'):
+        if hasattr(graph_fn, attr):
+            setattr(wrapped, attr, getattr(graph_fn, attr))
+    return wrapped
+
+
+def get_vision_cuda_graph_seq_length(vision_config, default_seq_length: int = 4096) -> int:
+    """Calculate the sequence length for vision encoder CUDA graphs.
+
+    For vision encoders, the sequence length depends on:
+    - max_vision_cuda_graph_seq_length: explicit maximum (if set)
+    - num_position_embeddings: maximum number of patches
+    - spatial_merge_size: pooling factor that reduces sequence length
+
+    Args:
+        vision_config: The TransformerConfig for vision encoder
+        default_seq_length: Default sequence length if cannot be calculated
+
+    Returns:
+        The sequence length to use for CUDA graph capture
+    """
+    if (
+        hasattr(vision_config, 'max_vision_cuda_graph_seq_length')
+        and vision_config.max_vision_cuda_graph_seq_length
+    ):
+        return vision_config.max_vision_cuda_graph_seq_length
+
+    if hasattr(vision_config, 'num_position_embeddings'):
+        seq_length = vision_config.num_position_embeddings
+        if hasattr(vision_config, 'spatial_merge_size'):
+            merge_factor = vision_config.spatial_merge_size**2
+            seq_length = seq_length // merge_factor
+        return seq_length
+
+    return default_seq_length
+
+
+class VisionTECudaGraphHelper(TECudaGraphHelper):
+    """Helper to capture CUDA Graphs for vision encoder layers using TE.
+
+    Inherits from TECudaGraphHelper and overrides only the
+    vision-specific behaviour:
+
+    * Layer discovery finds vision_model.decoder.layers instead of the
+      language decoder layers.
+    * num_model_chunks is always 1 (vision has no virtual pipeline stages).
+    * Batch dimension is always 1 (images are concatenated along the sequence
+      dimension).
+    * Sample argument generation uses a simple loop (no rotary embeddings or
+      buffer-reuse optimization).
+    * _finish_capturing wraps captured graphs to filter None values that arise
+      from vision encoder layers returning (output, None), and skips cleanup
+      that is handled by the LM decoder helper.
+
+    Note:
+        With pipeline parallelism > 1, only the first pipeline stage typically
+        has vision layers. Ranks without vision layers can safely skip calling
+        create_cudagraphs() or will gracefully return with no graphs created.
+
+    Args:
+        model: The full model (list of model chunks) containing vision_model.
+        vision_config: TransformerConfig for the vision encoder.
+        vision_seq_length: Sequence length for vision (max vision tokens).
+        micro_batch_size: Micro-batch size (unused for sample-arg generation
+            since the vision encoder always uses batch-dim = 1).
+        num_microbatches: Number of microbatches per step.
+    """
+
+    def __init__(
+        self,
+        model,
+        vision_config,
+        vision_seq_length: int,
+        micro_batch_size: int,
+        num_microbatches: int = 1,
+        pg_collection=None,
+    ):
+        super().__init__(
+            model, vision_config, vision_seq_length, micro_batch_size, pg_collection=pg_collection
+        )
+        # Vision encoder concatenates all images along the sequence dimension
+        # with a fixed batch dimension of 1, regardless of the training MBS.
+        self.micro_batch_size = 1
+        self.num_model_chunks = 1
+        self.num_microbatches = num_microbatches
+
+    def _discover_layers(self):
+        """Discover captureable layers from the vision encoder."""
+        self.vision_model = None
+        vision_layers = []
+
+        for model_chunk in self.model:
+            try:
+                unwrapped = get_attr_wrapped_model(
+                    model_chunk, 'vision_model', allow_none=True, return_model_obj=True
+                )
+                if unwrapped is not None and hasattr(unwrapped, 'vision_model'):
+                    self.vision_model = unwrapped.vision_model
+                    break
+            except (RuntimeError, AttributeError):
+                continue
+
+        if self.vision_model is not None:
+            if hasattr(self.vision_model, 'decoder') and hasattr(
+                self.vision_model.decoder, 'layers'
+            ):
+                for layer in self.vision_model.decoder.layers:
+                    if _layer_is_graphable(layer, self.config):
+                        vision_layers.append(layer)
+
+        if vision_layers:
+            self.chunks_with_decoder = [self.vision_model]
+            self.num_layers_per_chunk = [len(vision_layers)]
+            self.callables_per_chunk = [vision_layers]
+            self.callables_per_chunk_is_mtp = [[False] * len(vision_layers)]
+            self.flattened_callables = list(vision_layers)
+            self.flattened_callables_is_mtp = [False] * len(vision_layers)
+        else:
+            if self.vision_model is None:
+                logger.warning(
+                    'VisionTECudaGraphHelper: No vision_model found in model. '
+                    'CUDA graphs will not be captured for vision encoder.'
+                )
+            self.chunks_with_decoder = [None]
+            self.num_layers_per_chunk = [0]
+            self.callables_per_chunk = [[]]
+            self.callables_per_chunk_is_mtp = [[]]
+            self.flattened_callables = []
+            self.flattened_callables_is_mtp = []
+
+        # backward-compat aliases used by callers / tests
+        self.callables = vision_layers
+        self.num_layers = len(vision_layers)
+
+        if vision_layers:
+            logger.info(
+                f'VisionTECudaGraphHelper: Found {self.num_layers} graphable vision encoder '
+                f'layers. seq_length={self.seq_length} (all images concatenated, batch_dim=1)'
+            )
+
+    def _reset_after_capture(self):
+        """
+        No-op: vision encoder layers do not require any reset:
+        - model_chunk.zero_grad_buffer() / optimizer.zero_grad() (handled
+          by the LM decoder helper's _finish_capturing which runs on all ranks).
+        - clear_aux_losses_tracker / reset_model_temporary_tensors
+          (LM-specific cleanup already handled by the LM helper).
+        """
+
+    def _finish_capturing(self, start_time):
+        """
+        Before calling super()._finish_capturing, wrap the captured graphs with
+        _wrap_graph_for_vision to filter None from (output, None) tuples so that
+        _te_cuda_graph_replay's len == 1 assertion passes.
+        """
+        # Wrap the captured graphs before finishing
+        for layer in self.flattened_callables:
+            if hasattr(layer, 'cuda_graphs'):
+                layer.cuda_graphs = [_wrap_graph_for_vision(g) for g in layer.cuda_graphs]
+
+        super()._finish_capturing(start_time)
+
+    def _get_sample_arguments(self, order, chunk_id_list=None):
+        """Generate sample arguments for vision encoder CUDA Graph capturing.
+
+        Vision uses a simple per-layer-per-microbatch loop with batch_dim=1
+        and no rotary embeddings (unlike the parent's buffer-reuse
+        optimization). The order and chunk_id_list arguments are
+        unused because vision has num_model_chunks=1 and does not need
+        the pipeline-schedule-aware buffer lifecycle tracking.
+
+        Returns:
+            Tuple of (sample_args, sample_kwargs) lists for each
+            (layer, microbatch) pair.
+        """
+        if not self.flattened_callables:
+            return [], []
+
+        sample_args = []
+        sample_kwargs_list = []
+        hidden_size = self.config.hidden_size
+
+        for _microbatch_idx in range(self.num_microbatches):
+            for layer in self.flattened_callables:
+                hidden_states = torch.zeros(
+                    self.seq_length,
+                    1,
+                    hidden_size,
+                    dtype=torch.bfloat16,
+                    device='cuda',
+                    requires_grad=True,
+                )
+
+                if hasattr(layer, 'get_layer_static_inputs'):
+                    static_inputs = layer.get_layer_static_inputs(self.seq_length, 1)
+                    hidden_states = static_inputs.pop('hidden_states', hidden_states)
+                    sample_args.append((hidden_states,))
+                    sample_kwargs_list.append(static_inputs)
+                else:
+                    sample_args.append((hidden_states,))
+                    sample_kwargs_list.append({})
+
+        return sample_args, sample_kwargs_list
+
+    def cuda_graph_set_manual_hooks(self):
+        """No-op: vision encoder layers do not use DDP parameter-gather hooks.
+
+        The parent derives hooks from model_chunk._make_forward_pre_hook which
+        requires overlap_param_gather=True.  Vision encoder parameters are not
+        distributed with the same overlap strategy, so we skip hook setup.
+        """

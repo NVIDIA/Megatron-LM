@@ -11,6 +11,7 @@ DEBUG = False
 DEBUG_RANK = 0
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 def debug_rank(message):
@@ -873,7 +874,8 @@ class ChunkOffloadHandler:
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
         group_to_offload = self._groups_to_offload[-1]
-        torch.cuda.nvtx.range_push("activation offloading " + group_to_offload._name)
+        nvtx_msg = "activation offloading " + group_to_offload._name
+        nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
@@ -886,7 +888,7 @@ class ChunkOffloadHandler:
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
         self._groups_to_offload.pop()
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop(nvtx_msg)
 
     def get_max_deduplicated_groups(self):
         """Get the maximum number of deduplicated groups."""
@@ -900,7 +902,8 @@ class ChunkOffloadHandler:
         """Bulk reload group."""
         debug_rank("----bulk_reload_group")
         group_to_reload = self._groups_to_reload[-1]
-        torch.cuda.nvtx.range_push("activation reloading " + group_to_reload._name)
+        nvtx_msg = "activation reloading " + group_to_reload._name
+        nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.h2d_stream):
             # Wait for offload to complete before reloading
             if not is_graph_capturing():
@@ -915,7 +918,7 @@ class ChunkOffloadHandler:
         self._groups_to_reload.pop()
         # Add the group to the reloading group to wait for the reload event.
         self._reloading_group.append(group_to_reload)
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop(nvtx_msg)
 
     def pre_reload_last_layer(self):
         """Pre-reload the last layer of this chunk to hide reload latency."""

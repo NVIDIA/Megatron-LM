@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PackingInfo:
     """Information about how sequences are packed into bins.
-    
+
     Attributes:
         bin_seq_indices: List where each element contains the global sequence indices in that bin
         seq_starts: Dict mapping bin index to list of start positions for each sequence in that bin
@@ -42,7 +42,7 @@ class PackingInfo:
 @dataclass
 class PackingContext:
     """Context containing all information needed for sequence packing during training.
-    
+
     Attributes:
         bin_size: Maximum size of each bin (in tokens)
         packer: 'SequencePacker' instance used for packing
@@ -93,11 +93,11 @@ def load_packed_data_by_index(bin_idx: int, packing_context: PackingContext, log
     old_logprobs = getattr(packing_context, 'old_logprobs', None)
     if old_logprobs is not None:
         old_logprobs = old_logprobs[idx]
-    
+
     ref_logprobs = getattr(packing_context, 'ref_logprobs', None)
     if ref_logprobs is not None:
         ref_logprobs = ref_logprobs[idx]
-        
+
     # Slice from position 1 because logprobs predict the next token, so they are
     # shifted by 1 relative to the input tokens (logprobs has shape [batch, seq_len-1])
     loss_mask = packing_context.packed_loss_mask[idx, 1:]
@@ -403,7 +403,7 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, d
     means no actual packing boundaries
 
     Args:
-        seq_length: The sequence length 
+        seq_length: The sequence length
         max_sequences_per_bin: Max sequences to pack in a bin.
         device: Device to create tensors on.
 
@@ -414,7 +414,10 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, d
     args = get_args()
 
     # Pad to the maximum number of sequences in the bin for the attention kernel.
-    cu_seqlens = torch.full((max_sequences_per_bin,), seq_length, dtype=torch.int32, device=device)
+    # We add 2 to account for the initial 0 and the final bin_size.
+    cu_seqlens = torch.full(
+        (max_sequences_per_bin + 2,), seq_length, dtype=torch.int32, device=device,
+    )
     cu_seqlens[0] = 0
 
     return PackedSeqParams(
@@ -425,6 +428,7 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, d
         cu_seqlens_kv_padded=None,
         max_seqlen_q=seq_length,
         max_seqlen_kv=seq_length,
+        total_tokens=seq_length,
     )
 
 def create_packed_seq_params(packing_context: PackingContext):
@@ -484,8 +488,9 @@ def create_packed_seq_params_for_bin(
 
     # Pad cu_seqlens to bin_size by repeating the last value (creates zero-length ghost sequences)
     # This ensures a fixed tensor size for CUDA graph compatibility
-    if len(cu_seqlens) < max_sequences_per_bin:
-        out = cu_seqlens.new_full((max_sequences_per_bin,), bin_size)
+    # We add 2 to account for the initial 0 and the final bin_size.
+    if len(cu_seqlens) < max_sequences_per_bin + 2:
+        out = cu_seqlens.new_full((max_sequences_per_bin + 2,), bin_size)
         out[:len(cu_seqlens)] = cu_seqlens
         cu_seqlens = out
 
@@ -499,6 +504,7 @@ def create_packed_seq_params_for_bin(
         cu_seqlens_kv_padded=None,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
+        total_tokens=bin_size,
     )
 
 
@@ -970,19 +976,19 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
     data_parallel_group = mpu.get_data_parallel_group()
     nvtx_range = get_nvtx_range()
 
-    with nvtx_range("regather_trajectories", time=True):
+    with nvtx_range("rl/regather-trajectories", time=True):
         def _gather(data):
             data = data.cuda()
             data_list = [torch.empty_like(data) for _ in range(data_parallel_world_size)]
             torch.distributed.all_gather(data_list, data, group=data_parallel_group)
             return torch.cat(data_list, dim=0)
 
-        trajs = _gather(trajs)    
-        generation_masks = _gather(generation_masks) 
+        trajs = _gather(trajs)
+        generation_masks = _gather(generation_masks)
         if inference_logprobs is not None:
             inference_logprobs = _gather(inference_logprobs)
 
-    with nvtx_range("pack_sequences", time=True):
+    with nvtx_range("rl/pack-sequences", time=True):
         # Create packer with max sequences per bin limit to prevent extreme imbalance
         packer = SequencePacker(
             bin_size=bin_size,
@@ -1062,9 +1068,9 @@ def update_microbatch_calculator(
     samples_ratio_per_step: float,
     num_bins_this_rank: int,
     bin_seq_indices: List[List[int]],
-    global_batch_size: int, 
-    rampup_batch_size: int, 
-    micro_batch_size: int, 
+    global_batch_size: int,
+    rampup_batch_size: int,
+    micro_batch_size: int,
     decrease_batch_size_if_needed: bool,
 ):
     """Return a data loader with seqpacked indices with microbatches in bins frame of reference.

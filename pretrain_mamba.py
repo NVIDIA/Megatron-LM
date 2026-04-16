@@ -42,6 +42,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -236,7 +237,7 @@ def forward_step(data_iterator, model: MambaModel):
     if cu_seqlens is None:
         packed_seq_params = None
     else:
-        # TODO(duncan): This class seems overly complex for what needs to be conveyed
+        total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
@@ -245,6 +246,7 @@ def forward_step(data_iterator, model: MambaModel):
             cu_seqlens_kv_padded=None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            total_tokens=total_tokens,
         )
 
     timers('batch-generator').stop()
@@ -355,11 +357,13 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
+    args = parse_and_validate_args(
+        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
     pretrain(train_valid_test_datasets_provider,
              partial(model_provider, mamba_builder),
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
              store=store,
-             extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
              )

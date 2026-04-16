@@ -8,12 +8,17 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+from megatron.core.models.gpt.moe_module_specs import (
+    get_inference_optimized_moe_spec,
+    get_moe_module_spec,
+)
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel import (
+    InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
     InferenceRowParallelLinear,
 )
@@ -38,8 +43,10 @@ moe = get_moe_module_spec(
     use_te=True,
     num_experts=8,  # Can be any positive integer (must not be None).
     moe_grouped_gemm=True,
-    moe_use_legacy_grouped_gemm=False,
 )
+
+# Inference-optimized MoE spec
+moe_inference = get_inference_optimized_moe_spec()
 
 
 # MTP block spec for Mamba - provides norms and projection only.
@@ -76,6 +83,20 @@ mamba_stack_spec = ModuleSpec(
                     ),
                 ),
                 mamba_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=TELayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=TERowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
             ),
         ),
         # Started with spec from gpt_layer_specs.py (with MLP removed)
@@ -173,12 +194,28 @@ mamba_inference_stack_spec = ModuleSpec(
             ),
         ),
         moe_layer=ModuleSpec(
-            # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
+            # Use inference-optimized MoE layer for end-to-end CUDA graph support
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
+                pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
             ),
         ),
-        mtp_block_spec=_mamba_mtp_block_spec,
+        mtp_block_spec=ModuleSpec(
+            module=MultiTokenPredictionBlock,
+            submodules=MultiTokenPredictionBlockSubmodules(
+                layer_specs=[
+                    ModuleSpec(
+                        module=MultiTokenPredictionLayer,
+                        submodules=MultiTokenPredictionLayerSubmodules(
+                            enorm=TENorm,
+                            hnorm=TENorm,
+                            eh_proj=InferenceColumnParallelLinear,
+                            mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                            layer_norm=TENorm,
+                        ),
+                    )
+                ]
+            ),
+        ),
     ),
 )

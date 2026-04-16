@@ -14,6 +14,7 @@
 
 import logging
 from contextlib import nullcontext
+from dataclasses import dataclass
 from importlib.metadata import version
 from typing import List, Optional, Tuple
 
@@ -275,9 +276,22 @@ def fp8_quantize(
     fsdp_shard_model_params = [x[0] if x[1] is None else x for x in fsdp_shard_model_params]
 
     if HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
-        cast_master_weights_to_fp8(
-            model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
-        )
+        args = [
+            model_params,
+            main_params,
+            start_offsets,
+            data_parallel_group,
+            fsdp_shard_model_params,
+        ]
+
+        # For newer TE versions (i.e., have post_all_gather_processing function), we keep the
+        # columnwise data and manually call post_all_gather_processing after all-gather, this
+        # makes fp8 params compatible with CUDA graph.
+        kwargs = {}
+        if HAVE_TE_POST_ALL_GATHER_PROCESSING:
+            kwargs["manual_post_all_gather_processing"] = True
+
+        cast_master_weights_to_fp8(*args, **kwargs)
     else:
         _fp8_quantize_fallback(
             model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
@@ -359,3 +373,35 @@ def get_quantized_model_init_context_cls():
             f"Verify TransformerEngine is installed (TE_INSTALLED={HAVE_TE})."
         )
     return QUANTIZED_MODEL_INIT_CLASS
+
+
+@dataclass(frozen=True)
+class MixedPrecisionPolicy:
+    """Megatron-FSDP Mixed Precision Dataclass"""
+
+    main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
+      buffer will take the role of the main weights, or when no sharding is applied,
+      the native model weights become the main weights. Defaults to torch.float32.
+    """
+
+    main_grads_dtype: Optional[torch.dtype] = None
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to None.
+    """
+
+    grad_comm_dtype: Optional[torch.dtype] = None
+    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and copy operations.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support
+      `FP32` reduction even though we have `BF16` input and output communication buffers.
+      If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
+      or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
+      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
+      communication buffers (per FSDP group) adds memory overhead. Defaults to None.
+      No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
+    """

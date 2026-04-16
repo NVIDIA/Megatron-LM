@@ -6,6 +6,15 @@ from packaging import version
 
 from megatron.core.tokenizers import MegatronTokenizer
 
+try:
+    from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import (
+        HAVE_TRANSFORMERS,
+        HuggingFaceTokenizer,
+    )
+except Exception:
+    HAVE_TRANSFORMERS = False
+    HuggingFaceTokenizer = None
+
 
 def get_conversation():
     return [
@@ -102,6 +111,7 @@ def test_hf_tokenizer():
         "/opt/data/tokenizers/huggingface",
         metadata_path=metadata,
         chat_template=chat_template,
+        include_special_tokens=False,
         **special_tokens,
     )
 
@@ -109,6 +119,70 @@ def test_hf_tokenizer():
     assert tokenizer.tokenize("<TEST_BOS><TEST_EOS>") == [128257, 128256]
     assert tokenizer.detokenize([3, 4, 5]) == "$%&"
     assert tokenizer.vocab_size == 128258
+
+
+# HuggingFaceTokenizer.ids_to_text and include_special_tokens (--tokenizer-hf-include-special-tokens).
+# Uses same local path as test_hf_tokenizer; tests EOS stripping vs keeping in detokenized output (e.g. RL).
+LOCAL_HF_TOKENIZER_PATH = "/opt/data/tokenizers/huggingface"
+
+
+def _eos_in_text(text: str, eos_token: str) -> bool:
+    return eos_token in text or text.endswith(eos_token.strip())
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+@pytest.mark.parametrize("include_special_tokens", [True, False])
+@pytest.mark.parametrize("remove_special_tokens", [True, False])
+def test_hf_ids_to_text_eos_with_include_and_remove_special_tokens(
+    include_special_tokens, remove_special_tokens
+):
+    """ids_to_text EOS presence: parametrized on include_special_tokens and remove_special_tokens.
+    When remove_special_tokens=True, EOS is stripped; when False, EOS is kept (explicit overrides default).
+    """
+    try:
+        tok = HuggingFaceTokenizer(
+            LOCAL_HF_TOKENIZER_PATH, include_special_tokens=include_special_tokens
+        )
+    except Exception:
+        pytest.skip("Could not load local HuggingFace tokenizer (path not available)")
+    eos_id = tok.eos_id
+    ids = tok.text_to_ids("hello") + [eos_id]
+    text = tok.ids_to_text(ids, remove_special_tokens=remove_special_tokens)
+    eos_expected = not remove_special_tokens
+    if eos_expected:
+        assert _eos_in_text(text, tok.tokenizer.eos_token), (
+            f"Expected EOS in output for include_special_tokens={include_special_tokens}, "
+            f"remove_special_tokens={remove_special_tokens}. Got: {text!r}"
+        )
+    else:
+        assert tok.tokenizer.eos_token not in text, (
+            f"Expected EOS stripped for include_special_tokens={include_special_tokens}, "
+            f"remove_special_tokens={remove_special_tokens}. Got: {text!r}"
+        )
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+@pytest.mark.parametrize("skip_special_tokens", [True, False])
+def test_hf_detokenize_skip_special_tokens(skip_special_tokens):
+    """Test that MegatronTokenizerText.detokenize forwards skip_special_tokens correctly."""
+    try:
+        tokenizer = MegatronTokenizer.from_pretrained(
+            LOCAL_HF_TOKENIZER_PATH, metadata_path={"library": "huggingface"}
+        )
+    except Exception:
+        pytest.skip("Could not load local HuggingFace tokenizer (path not available)")
+    eos_id = tokenizer.eos_id
+    ids = tokenizer.tokenize("hello") + [eos_id]
+    text = tokenizer.detokenize(ids, skip_special_tokens=skip_special_tokens)
+    eos_token = tokenizer._tokenizer.tokenizer.eos_token
+    if skip_special_tokens:
+        assert (
+            eos_token not in text
+        ), f"Expected EOS stripped when skip_special_tokens=True. Got: {text!r}"
+    else:
+        assert _eos_in_text(
+            text, eos_token
+        ), f"Expected EOS preserved when skip_special_tokens=False. Got: {text!r}"
 
 
 def test_megatron_tokenizer():
@@ -202,6 +276,43 @@ def test_null_tokenizer():
 
     assert ids == [11, 325, 97]
     assert tokenizer.vocab_size == 131073
+
+
+@pytest.mark.parametrize("skip_special_tokens", [True, False])
+@pytest.mark.parametrize("library", ["null-text", "byte-level", "sentencepiece", "sft"])
+def test_detokenize_skip_special_tokens_unsupported_backend(library, skip_special_tokens):
+    """skip_special_tokens must not raise on backends whose ids_to_text lacks the parameter."""
+    try:
+        if library == "null-text":
+            tokenizer = MegatronTokenizer.from_pretrained(
+                metadata_path={"library": library}, vocab_size=131072
+            )
+            ids = tokenizer.tokenize("11 325 97")
+            expected = "11 325 97"
+        elif library == "byte-level":
+            tokenizer = MegatronTokenizer.from_pretrained(
+                metadata_path={"library": library}, vocab_size=1024, _bos_id=3, special_tokens=[]
+            )
+            ids = tokenizer.tokenize("Hello")
+            expected = "Hello"
+        elif library == "sentencepiece":
+            tokenizer = MegatronTokenizer.from_pretrained(
+                "/opt/data/tokenizers/sentencepiece/tokenizer.model"
+            )
+            ids = tokenizer.tokenize("I'm fine thanks.")
+            expected = "I'm fine thanks."
+        elif library == "sft":
+            tokenizer = MegatronTokenizer.from_pretrained(
+                tokenizer_path="/opt/data/tokenizers/multimodal",
+                metadata_path={"library": "sft"},
+                prompt_format="nemotron-nano-v2",
+            )
+            ids = tokenizer.tokenize("abc")
+            expected = "abc"
+    except Exception:
+        pytest.skip(f"Could not load {library} tokenizer (path not available)")
+
+    assert tokenizer.detokenize(ids, skip_special_tokens=skip_special_tokens) == expected
 
 
 def test_bytelevel_tokenizer():

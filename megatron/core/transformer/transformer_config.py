@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
+import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -12,6 +14,7 @@ from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
+from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -19,8 +22,11 @@ from ..utils import (
     init_method_normal,
     is_te_min_version,
     is_torch_min_version,
+    mup_scaled_init_method_normal,
     scaled_init_method_normal,
 )
+
+logger = logging.getLogger(__name__)
 
 try:
     from packaging.version import Version as PkgVersion
@@ -63,7 +69,7 @@ class TransformerConfig(ModelParallelConfig):
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
     mtp_hybrid_override_pattern: Optional[str] = None
-    """DEPRECATED: Use unified hybrid_override_pattern instead.
+    """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
     Force a specific hybrid layer pattern for MTP layers.
     """
@@ -315,7 +321,8 @@ class TransformerConfig(ModelParallelConfig):
     output_layer_init_method: Optional[Callable] = None
     """Method to initialize weights of the output layer of both attention and MLP blocks. If None,
     will be set to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn
-    init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers)."""
+    init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers).
+    Note: this does not control vocab readout/unembedding initialization."""
 
     init_method_std: float = 0.02
     """Standard deviation of the zero mean normal for the default initialization method, not used if
@@ -340,6 +347,59 @@ class TransformerConfig(ModelParallelConfig):
     """
     If True, initializes the model with the meta device. This is helpful for
     training of very large models. This feature is only works when megatron fsdp is turned on.
+    """
+
+    ####################
+    # MuP (Maximal Update Parameterization)
+    ####################
+    use_mup: bool = False
+    """
+    Enable Maximal Update Parameterization (MuP) for hyperparameter transfer across
+    model widths. When enabled, learning rates and initialization are scaled according
+    to the width multiplier to ensure consistent training dynamics.
+    """
+
+    mup_width_mult: float = 1.0
+    """
+    Width multiplier for MuP scaling, computed as hidden_size / mup_base_hidden_size.
+    This value is automatically computed in __post_init__ when use_mup is enabled.
+    """
+
+    mup_base_hidden_size: Optional[int] = None
+    """
+    Base hidden size for MuP width scaling. This is the reference width from which
+    scaling factors are computed. Defaults to hidden_size if not specified (base model
+    case where width_mult=1.0). Set this to your base/proxy model's hidden size when
+    scaling up.
+    """
+
+    mup_embedding_mult: float = 1.0
+    """
+    Multiplier for embedding layer output. Applied after the embedding lookup.
+    Default: 1.0 (no scaling).
+    """
+
+    mup_output_mult: float = 1.0
+    """
+    Multiplier for output logits before softmax. When MuP is enabled and this is left
+    at 1.0, it is auto-set to 1/mup_width_mult to keep output variance stable across
+    widths. Override to customize output scaling.
+    Default: 1.0.
+    """
+
+    mup_base_head_dim: Optional[float] = None
+    """
+    Base head dimension for MuP attention scaling. When set,
+    softmax_scale = sqrt(mup_base_head_dim) / (kv_channels ** mup_attn_scale_power).
+    Set to base model's d_head (e.g., 64) to match standard 1/sqrt(d_head) scaling
+    at the base width, ensuring non-MuP compatibility for that specific value.
+    """
+
+    mup_attn_scale_power: float = 1.0
+    """
+    Power for attention scaling: softmax_scale = 1 / (kv_channels ** mup_attn_scale_power).
+    0.5 = standard attention (1/sqrt(d_head)), 1.0 = MuP attention (1/d_head).
+    Default: 1.0 (MuP scaling when use_mup is True). Set to 0.5 for standard scaling.
     """
 
     ####################
@@ -385,6 +445,9 @@ class TransformerConfig(ModelParallelConfig):
 
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
+
+    fused_residual_rmsnorm: bool = False
+    """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
     ####################
     # activation recomputation
@@ -632,8 +695,8 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
-    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+    moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+    """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
@@ -655,15 +718,18 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_biased: Optional[float] = None
+    """Apply random expert bias in normal distribution with specified std
+    to router logits. Shared seed across all ranks ensures identical bias.
+    If positive, generates new random bias each forward pass.
+    If negative, generates bias once per layer and reuses it (abs value is std).
+    This is an experimental feature for benchmarking purposes."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
-
-    moe_use_legacy_grouped_gemm: bool = False
-    """Use legacy GroupedMLP rather than TEGroupedMLP.
-    Note: The legacy one will be deprecated soon."""
 
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
@@ -854,6 +920,27 @@ class TransformerConfig(ModelParallelConfig):
     inference_fuse_tp_communication: bool = False
     """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
 
+    inference_disable_triton_nvls_kernels: bool = False
+    """ If true, disables the use of Triton NVLS kernels during inference. """
+
+    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
+    """Specifies the backend to use for grouped GEMM operations during inference.
+    Options:
+    - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
+      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
+      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
+      in future releases.
+    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
+      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
+    - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
+    """
+
+    inference_moe_disable_fused_quant_kernels: bool = False
+    """When False (default), use fused kernels that combine permute/activation with
+    MXFP8 quantization + swizzle into a single kernel launch. Only applies when
+    fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
+    launches (useful for debugging)."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -930,6 +1017,20 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        # When fp32 residual connections are enabled, pipeline parallel communication must
+        # use fp32 to match the dtype of the residual stream between pipeline stages.
+        if self.fp32_residual_connection and self.pipeline_dtype is not None:
+            if self.pipeline_dtype != torch.float:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"fp32_residual_connection is enabled, overriding pipeline_dtype "
+                    f"from {self.pipeline_dtype} to torch.float to match the "
+                    f"residual stream dtype between pipeline stages.",
+                )
+            self.pipeline_dtype = torch.float
+
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
@@ -990,18 +1091,17 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             # Check tensor parallelism compatibility
-            assert (
-                self.linear_num_key_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
-            assert (
-                self.linear_num_value_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
-
-            # Do not support yet, but coming soon.
-            assert self.context_parallel_size == 1, (
-                f"Gated delta net does not support context parallel for now,"
-                f" but got {self.context_parallel_size=}."
+            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            assert self.linear_num_key_heads % tp_cp_size == 0, (
+                f"{self.linear_num_key_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
+            assert self.linear_num_value_heads % tp_cp_size == 0, (
+                f"{self.linear_num_value_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+            )
+        elif self.experimental_attention_variant == "dsa":
+            pass
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1066,6 +1166,54 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
+        if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
+            if self.expert_tensor_parallel_size > 1:
+                raise ValueError(
+                    "Inference-optimized MoE layers does not support expert tensor parallelism."
+                )
+            if self.moe_expert_capacity_factor is not None:
+                raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
+            if self.moe_router_padding_for_quantization:
+                raise ValueError(
+                    "Inference-optimized MoE layers do not support padded "
+                    "routing map for quantization."
+                )
+            if self.moe_router_dtype != "fp32":
+                raise ValueError(
+                    "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
+                    "to avoid costly dtype conversions during decode."
+                )
+
+            if self.gated_linear_unit and self.cuda_graph_impl == "local":
+                raise ValueError(
+                    "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
+                    "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
+                    "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
+                    "graphs (--cuda-graph-impl=none) or use a non-gated activation "
+                    "(e.g. squared_relu)."
+                )
+
+            if self.fp8 == "mxfp8":
+                if not self.fp8_param:
+                    raise ValueError(
+                        "fp8_param must be enabled when using "
+                        "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
+                        "Please set --fp8-param-gather."
+                    )
+
+            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
+                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
+                f"got '{self.inference_grouped_gemm_backend}'"
+            )
+
+            if self.cuda_graph_impl == "local":
+                if self.inference_grouped_gemm_backend == "te":
+                    raise ValueError(
+                        "TE GroupedGEMM is not supported with CUDA graphs. Please set "
+                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
+                        "CUDA graphs (--cuda-graph-impl=none)."
+                    )
+
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
 
@@ -1073,10 +1221,23 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
 
-        if self.num_moe_experts is None:
-            assert (
-                self.moe_ffn_hidden_size is None
-            ), "moe_ffn_hidden_size must be None when num_experts is not set."
+        if self.num_moe_experts is None and self.moe_ffn_hidden_size is not None:
+            is_mixed_model = (
+                isinstance(self.moe_layer_freq, list) and 0 in self.moe_layer_freq
+            ) or (isinstance(self.moe_layer_freq, int) and self.moe_layer_freq > 1)
+            if is_mixed_model:
+                warnings.warn(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "This is expected for dense layers in a mixed dense/MoE model "
+                    "(moe_layer_freq indicates some layers remain dense). "
+                    "moe_ffn_hidden_size will be ignored for this layer."
+                )
+                self.moe_ffn_hidden_size = None
+            else:
+                raise ValueError(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "Please set num_moe_experts or remove moe_ffn_hidden_size."
+                )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
@@ -1106,10 +1267,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"but got {self.moe_shared_expert_intermediate_size}"
                 )
             if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
-                "alltoall"
+                "alltoall",
+                "flex",
             ]:
                 raise ValueError(
-                    f"moe_shared_expert_overlap only works with alltoall token dispatcher."
+                    f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
@@ -1533,6 +1695,12 @@ class TransformerConfig(ModelParallelConfig):
                     "to True and use_te_activation_func to False."
                 )
 
+        if self.fused_residual_rmsnorm:
+            if self.normalization != "RMSNorm":
+                raise ValueError(
+                    "fused_residual_rmsnorm is only supported when normalization is RMSNorm."
+                )
+
         if self.use_te_activation_func:
             if self.activation_func not in (F.gelu, F.silu, F.relu):
                 raise ValueError(
@@ -1576,7 +1744,48 @@ class TransformerConfig(ModelParallelConfig):
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
-        # Set the embedding init method
+        # MuP (Maximal Update Parameterization) configuration
+        if self.use_mup:
+            # Default base_hidden_size to hidden_size (base model case, width_mult=1.0)
+            if self.mup_base_hidden_size is None:
+                self.mup_base_hidden_size = self.hidden_size
+            assert self.mup_base_hidden_size > 0, "--mup-base-hidden-size must be positive."
+            # Compute width multiplier
+            self.mup_width_mult = self.hidden_size / self.mup_base_hidden_size
+
+            # MuP attention scaling: 1/d_head instead of 1/sqrt(d_head).
+            if self.softmax_scale is None:
+                base_head_scale = (
+                    1.0 if self.mup_base_head_dim is None else self.mup_base_head_dim**0.5
+                )
+                self.softmax_scale = base_head_scale / (self.kv_channels**self.mup_attn_scale_power)
+
+            # MuP output scaling: scale logits by 1/width_mult to keep outputs O(1).
+            # Only auto-set if user hasn't explicitly configured it.
+            if self.mup_output_mult == 1.0 and self.mup_width_mult != 1.0:
+                self.mup_output_mult = 1.0 / self.mup_width_mult
+
+            overridden_init_methods = []
+            if self.init_method is not None:
+                overridden_init_methods.append("init_method")
+            if self.output_layer_init_method is not None:
+                overridden_init_methods.append("output_layer_init_method")
+            if overridden_init_methods:
+                overridden_init_methods_text = " and ".join(overridden_init_methods)
+                verb = "is" if len(overridden_init_methods) == 1 else "are"
+                warnings.warn(
+                    "use_mup is enabled, but custom "
+                    + overridden_init_methods_text
+                    + f" {verb} set. This may break MuP initialization assumptions.",
+                    UserWarning,
+                )
+
+        # Set the embedding init method.
+        # NOTE: This block must run AFTER the MuP block above but BEFORE the init_method
+        # block below. When MuP is enabled and init_method is None (the common case),
+        # embedding_init_method is set here using the unscaled init_method_std, while
+        # init_method (set below) gets MuP width-scaling. This ordering ensures embeddings
+        # use the base (unscaled) initialization as required by MuP.
         if self.embedding_init_method_std is None:
             # By default, use the same init std as you use for every other non-output layer.
             self.embedding_init_method_std = self.init_method_std
@@ -1594,24 +1803,43 @@ class TransformerConfig(ModelParallelConfig):
                 self.embedding_init_method = self.init_method
 
         if self.init_method is None:
-            self.init_method = init_method_normal(self.init_method_std)
+            if self.use_mup:
+                # MuP: scale std by 1/sqrt(width_mult).
+                self.init_method = init_method_normal(
+                    self.init_method_std / math.sqrt(self.mup_width_mult)
+                )
+            else:
+                self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
-            self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std,
-                self.num_layers,
-                multiplier=2.0 if not self.is_hybrid_model else 1.0,
-            )
+            if self.use_mup:
+                # MuP: depth and width scaling for output layers.
+                self.output_layer_init_method = mup_scaled_init_method_normal(
+                    self.init_method_std,
+                    self.num_layers,
+                    self.mup_width_mult,
+                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
+                )
+            else:
+                self.output_layer_init_method = scaled_init_method_normal(
+                    self.init_method_std,
+                    self.num_layers,
+                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
+                )
 
         if self.num_moe_experts is not None and self.add_bias_linear:
             assert (
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
+            "sigmoid",
+            "sqrtsoftplus",
+        ):
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+                "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
+                "score functions. Please set --moe-router-score-function to 'sigmoid' or "
+                "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
 
         if self.num_moe_experts and self.fp8:
@@ -1737,7 +1965,7 @@ class TransformerConfig(ModelParallelConfig):
                 "local",
             ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
-            if self.cpu_offloading:
+            if self.cpu_offloading and self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
             if self.cuda_graph_impl == "local":
@@ -1895,6 +2123,9 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.recompute_num_layers is None
             ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                "moe" not in self.recompute_modules
+            ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
 
             # Check if bf16 or fp16 is used
             assert (
@@ -1928,14 +2159,24 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.overlap_moe_expert_parallel_comm
             ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
-            assert (
-                not self.moe_use_legacy_grouped_gemm
-            ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
             if self.cuda_graph_impl == "transformer_engine":
                 assert is_te_min_version("2.10.0"), (
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
                 )
+
+        if self.overlap_dispatch_backward_with_experts_wgrad:
+            assert not self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be disabled when enabling '
+                'overlap_dispatch_backward_with_experts_wgrad.'
+            )
+            assert is_te_min_version(
+                "2.3.0"
+            ), 'TE version >= 2.3.0 is required for overlap_dispatch_backward_with_experts_wgrad'
+            assert not self.delay_wgrad_compute, (
+                'delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad '
+                'are mutually exclusive; use only one'
+            )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
@@ -2013,6 +2254,15 @@ class TransformerConfig(ModelParallelConfig):
                 "inference_fuse_tp_communication is only supported "
                 "for inference_optimized transformer implementation."
             )
+            assert (
+                self.num_moe_experts is None
+            ), "--inference-fuse-tp-communication is not supported for MoE models."
+
+        if self.inference_disable_triton_nvls_kernels:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_disable_triton_nvls_kernels is only supported "
+                "for inference_optimized transformer implementation."
+            )
 
         if self.batch_invariant_mode:
             assert (
@@ -2080,6 +2330,11 @@ class MLATransformerConfig(TransformerConfig):
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
+
+    mla_down_proj_fusion: bool = False
+    """Enable fused q/kv down-projection and fused input layernorm when backend supports.
+       Otherwise fall back to the unfused MLA.
+    """
 
     def __post_init__(self):
         super().__post_init__()

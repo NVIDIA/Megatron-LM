@@ -30,6 +30,16 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         split = None
 
+    if args.dataloader_type == "external":
+        # External dataloaders are passed through. User is expected to provide a
+        # torch-compatible dataloader and define samplers, if needed.
+        return dataset
+
+    # Use eval-specific batch sizes for validation/test splits
+    is_eval = split in (Split.valid, Split.test)
+    micro_batch_size = getattr(args, 'eval_micro_batch_size', args.micro_batch_size) if is_eval else args.micro_batch_size
+    global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
+
     if split == Split.valid and args.full_validation:
         # Use specialized sampler for full validation that handles small datasets
         batch_sampler = MegatronFullValidationSampler(
@@ -41,8 +51,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             batch_sampler = HybridCPMegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
-                micro_batch_size=args.micro_batch_size,
-                global_batch_size=args.global_batch_size,
+                micro_batch_size=micro_batch_size,
+                global_batch_size=global_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
                 data_parallel_size=mpu.get_data_parallel_world_size())
         else:
@@ -50,7 +60,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             batch_sampler = MegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
-                micro_batch_size=args.micro_batch_size,
+                micro_batch_size=micro_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
                 data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'cyclic':
@@ -58,23 +68,35 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             dataset,
             total_samples=len(dataset),
             consumed_samples=consumed_samples,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
             data_sharding=args.data_sharding,
         )
-    elif args.dataloader_type == "external":
-        # External dataloaders are passed through. User is expected to provide a
-        # torch-compatible dataloader and define samplers, if needed.
-        return dataset
     else:
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
 
     def worker_init_fn(_):
-        DistributedSignalHandler(args.exit_signal).__enter__()
+        import os
+
+        # Defensively close GPU device FDs in worker processes so workers do not
+        # keep references into NVIDIA memory space. This helps ensure GPU memory
+        # can be reclaimed even if a dataloader worker is delayed or fails to exit.
+        def close_nvidia_fds():
+            for fd in os.listdir("/proc/self/fd"):
+                try:
+                    path = os.readlink(f"/proc/self/fd/{fd}")
+                    if path.startswith("/dev/nvidia"):
+                        os.close(int(fd))
+                except OSError:
+                    pass
+
+        close_nvidia_fds()
+        if args.exit_signal_handler:
+            DistributedSignalHandler(args.exit_signal).__enter__()
 
     maybe_worker_init_fn = (
-        worker_init_fn if args.exit_signal_handler and args.num_workers > 0 else None
+        worker_init_fn if args.num_workers > 0 else None
     )
     # Torch dataloader.
     if args.hybrid_context_parallel:
