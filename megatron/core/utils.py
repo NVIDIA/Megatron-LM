@@ -976,18 +976,23 @@ def make_tp_sharded_tensor_for_checkpoint(
             for _, _, offset_dim_size in prepend_offsets:
                 assert offset_dim_size == 1, f'Non-trivial prepended-style sharding not supported with DTensors: {prepend_offsets}'
         
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+        tp_group_for_mesh = parallel_state.get_tensor_model_parallel_group()
+        dp_group_for_mesh = parallel_state.get_data_parallel_group(with_context_parallel=True)
         process_group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
-        mesh_shape = (
-            parallel_state.get_tensor_model_parallel_world_size(),
-            parallel_state.get_data_parallel_world_size(with_context_parallel=True),
-        )
         with torch.device("cpu"):
             group_ranks = get_process_group_ranks(process_group)
-            mesh = torch.tensor(group_ranks, dtype=torch.int).view(mesh_shape)
+            # Megatron ranks within tp+dp group are ordered: dp_rank * tp_size + tp_rank.
+            # Reshape as (dp_size, tp_size) then transpose to get (tp_size, dp_size) mesh
+            # where row=tp_rank and col=dp_rank, matching mesh_dim_names=('tp', 'dp').
+            mesh = torch.tensor(group_ranks, dtype=torch.int).view(dp_size, tp_size).T.contiguous()
         device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('tp', 'dp',), _init_backend=False)
+        tp_ranks = get_process_group_ranks(tp_group_for_mesh)
+        dp_ranks = get_process_group_ranks(dp_group_for_mesh)
         device_mesh._dim_group_infos = [
-            (_get_group_tag(process_group), group_ranks,
-                process_group.group_name)
+            (_get_group_tag(tp_group_for_mesh), tp_ranks, tp_group_for_mesh.group_name),
+            (_get_group_tag(dp_group_for_mesh), dp_ranks, dp_group_for_mesh.group_name),
         ]
         placements = [Shard(tp_axis), Replicate()]
 
