@@ -12,6 +12,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
+from megatron.core.utils import unwrap_model
 
 
 # -------------------------------------------------------------------
@@ -219,7 +220,6 @@ def forward_step(data_iterator, model):
 
     position_ids = batch.get("position_ids", None)
     if position_ids is None:
-        from megatron.core.utils import unwrap_model
         inner = unwrap_model(model)
         if hasattr(inner, "compute_position_ids"):
             position_ids = inner.compute_position_ids(

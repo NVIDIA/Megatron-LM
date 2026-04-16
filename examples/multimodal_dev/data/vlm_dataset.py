@@ -20,11 +20,14 @@ Usage::
 """
 
 import json
+import logging
 import random
 from typing import Dict, List, Optional
 
 import torch
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -51,11 +54,12 @@ def load_cord_v2(split="train"):
     from datasets import load_dataset
 
     ds = load_dataset("naver-clova-ix/cord-v2", split=split)
+    rng = random.Random(42)
     examples = []
     for ex in ds:
         gt = json.loads(ex["ground_truth"])
         gt_jsons = gt.get("gt_parses") or [gt["gt_parse"]]
-        text = random.choice(
+        text = rng.choice(
             [_json2token(g, sort_json_key=True) for g in gt_jsons]
         )
         examples.append(
@@ -152,7 +156,13 @@ class CordV2VLMDataset(Dataset):
 
         # Pad or truncate input_ids to seq_length
         cur_len = len(input_ids)
-        if cur_len >= self.seq_length:
+        if cur_len > self.seq_length:
+            logger.warning(
+                "Truncating input_ids from %d to %d tokens (seq_length). "
+                "Consider increasing --seq-length to avoid dropping tokens.",
+                cur_len,
+                self.seq_length,
+            )
             input_ids = input_ids[: self.seq_length]
         else:
             pad = torch.full(
