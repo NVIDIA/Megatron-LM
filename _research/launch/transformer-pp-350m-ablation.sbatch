@@ -132,6 +132,9 @@ if [[ "$OPTIMIZER" == *muon* ]]; then
         --muon-nesterov
         --muon-momentum 0.95
     )
+    if [ "${SWEEP_MUON_NO_SPLIT_QKV:-0}" = "1" ]; then
+        MUON_ARGS+=(--muon-no-split-qkv)
+    fi
 fi
 
 LEARNING_RATE_ARGS=(
