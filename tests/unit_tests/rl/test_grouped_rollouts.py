@@ -80,41 +80,73 @@ class TestGroupedRollouts:
             assert [g.batch_id for g in groups] == expected_batch_ids
 
     @pytest.mark.asyncio
-    async def test_weighted_multi_task(self):
+    @pytest.mark.parametrize(
+        "agents, num_groups, pgt, streaming, expected_count, expected_env_ids",
+        [
+            pytest.param(
+                [("a", 3.0), ("b", 1.0)], 4, 4, False, 4, ["a", "a", "a", "b"], id="unequal w"
+            ),
+            pytest.param(
+                [("a", 3), ("b", 3), ("c", 4)], 4, 100, False, 4, ["a", "b", "c", "c"], id="no_hang"
+            ),
+            pytest.param(
+                [("a", 1.0), ("b", 1.0)], 2, 3, False, 2, ["a", "b"], id="small_pgt"
+            ),
+            pytest.param(
+                [("a", 1.0), ("b", 1.0)], 5, 100, True, 10, ["a", "b"] * 5, id="stream_interleave"
+            ),
+            pytest.param(
+                [("a", 2), ("b", 3), ("c", 5)], 3, 3, True, 6, ["a", "b", "c"] * 2, id="jagged"
+            ),
+        ],
+    )
+    async def test_weighted_multi_task(
+        self, agents, num_groups, pgt, streaming, expected_count, expected_env_ids
+    ):
         configs = [
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight)
+            for env_id, weight in agents
         ]
         mt = WeightedMultiTask(configs)
-        mt.parallel_generation_tasks = 4
-
-        captured = []
-        for agent in mt.agents:
-            original = agent.get_grouped_rollouts
-
-            async def spy(req, orig=original):
-                captured.append(req)
-                async for group in orig(req):
-                    yield group
-
-            agent.get_grouped_rollouts = spy
+        mt.parallel_generation_tasks = pgt
 
         request = GroupedRolloutRequest(
-            num_groups=4,
+            num_groups=num_groups,
             rollouts_per_group=1,
             inference_interface=MagicMock(spec=ReturnsRaw),
-            streaming=False,
+            streaming=streaming,
             enforce_order=False,
         )
         groups = []
         async for group in mt.get_grouped_rollouts(request):
             groups.append(group)
+            if streaming and len(groups) >= expected_count:
+                break
 
-        assert len(groups) == 4
-        # Weights 3:1 → agent "a" produces 3 groups, agent "b" produces 1.
+        assert len(groups) == expected_count
         env_ids = [g[0].env_id for g in groups]
-        assert sorted(env_ids) == ["a", "a", "a", "b"]
-        for sub_req in captured:
-            assert sub_req.num_groups in (1, 3)  # distributed proportionally by weight
-            assert sub_req.enforce_order == request.enforce_order
-            assert sub_req.streaming == request.streaming
+        assert env_ids == expected_env_ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "agents, num_groups, pgt",
+        [pytest.param([("a", 0.01), ("b", 0.01), ("c", 0.98)], 3, 100, id="extreme_weights")],
+    )
+    async def test_weighted_multi_task_error(self, agents, num_groups, pgt):
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight)
+            for env_id, weight in agents
+        ]
+        mt = WeightedMultiTask(configs)
+        mt.parallel_generation_tasks = pgt
+
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=1,
+            inference_interface=MagicMock(spec=ReturnsRaw),
+            streaming=False,
+            enforce_order=False,
+        )
+        with pytest.raises(ValueError, match="too small for the configured weights"):
+            async for _ in mt.get_grouped_rollouts(request):
+                pass
