@@ -1329,6 +1329,11 @@ class TEGroupedMLP(MegatronModule):
                 # explicitly fire the hooks on the originals so DDP can zero param.grad
                 # and trigger reduce-scatter – otherwise param.grad is never cleared and
                 # AccumulateGrad performs a spurious add_ into main_grad.
+                # TODO: find a better place to invoke _trigger_wgrad_accumulation_and_reduce_hooks.
+                # The wgrad hook registration lives in TE while the trigger is issued here
+                # in MCore, so the hook lifecycle is split across both codebases. Consolidate
+                # ownership on one side (either register+trigger entirely in TE, or expose
+                # the fused backward_dw through MCore) to remove this fragmentation.
                 self.linear_fc2._trigger_wgrad_accumulation_and_reduce_hooks()
                 self.linear_fc1._trigger_wgrad_accumulation_and_reduce_hooks()
             return
