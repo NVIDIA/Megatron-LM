@@ -7,21 +7,24 @@ the async checkpoint save calls.
 import inspect
 import logging
 import time
-
 from abc import ABC
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.training import get_args
-from megatron.training.utils import print_rank_0, warn_rank_0
+from megatron.training.utils import print_rank_0
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import _results_queue
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import save_state_dict_async_finalize
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+        save_state_dict_async_finalize,
+    )
 except (ImportError, ModuleNotFoundError):
     from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
-    from megatron.core.dist_checkpointing.strategies.state_dict_saver import save_state_dict_async_finalize
+    from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
+        save_state_dict_async_finalize,
+    )
 
     NVRxAsyncRequest = ABC
 
