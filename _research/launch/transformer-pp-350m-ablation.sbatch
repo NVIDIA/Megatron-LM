@@ -129,6 +129,8 @@ MUON_ARGS=()
 if [[ "$OPTIMIZER" == *muon* ]]; then
     MUON_ARGS=(
         --muon-scale-mode $MUON_SCALE_MODE
+        --muon-nesterov
+        --muon-momentum 0.95
     )
 fi
 
