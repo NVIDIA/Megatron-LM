@@ -809,17 +809,19 @@ class TEGroupedMLP(MegatronModule):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
         # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
+        # Use config.activation_func instead of self.activation_func because when
+        # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
         if not self.config.gated_linear_unit:
             return _unsupported("gated_linear_unit not enabled")
-        if self.activation_func == F.silu:
+        if self.config.activation_func == F.silu:
             pass  # SwiGLU — supported
-        elif self.activation_func == quick_gelu:
+        elif self.config.activation_func == quick_gelu:
             try:
                 from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
             except ImportError:
                 return _unsupported("quick_gelu needs TE >= 2.15")
         else:
-            return _unsupported(f"unsupported activation: {self.activation_func}")
+            return _unsupported(f"unsupported activation: {self.config.activation_func}")
 
         # Check TE CuTe DSL fused kernel conditions (must match TE's
         # fuse_grouped_mlp_ops matching logic)
@@ -888,9 +890,9 @@ class TEGroupedMLP(MegatronModule):
 
         # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
-        if self.activation_func == F.silu and self.config.gated_linear_unit:
+        if self.config.activation_func == F.silu and self.config.gated_linear_unit:
             op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
-        elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+        elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:
                 op = te.pytorch.ops.ScaledClampedQGeGLU(
@@ -1323,6 +1325,19 @@ class TEGroupedMLP(MegatronModule):
                 assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
                 fused_children[2].backward_dw()
                 fused_children[0].backward_dw()
+                # DDP registers wgrad hooks on the original linear_fc1/fc2 module objects
+                # (those are in the nn.Module tree), but backward_dw() is called on the
+                # NEW GroupedLinear instances created by _make_fused_ops().  We must
+                # explicitly fire the hooks on the originals so DDP can zero param.grad
+                # and trigger reduce-scatter – otherwise param.grad is never cleared and
+                # AccumulateGrad performs a spurious add_ into main_grad.
+                # TODO: find a better place to invoke _trigger_wgrad_accumulation_and_reduce_hooks.
+                # The wgrad hook registration lives in TE while the trigger is issued here
+                # in MCore, so the hook lifecycle is split across both codebases. Consolidate
+                # ownership on one side (either register+trigger entirely in TE, or expose
+                # the fused backward_dw through MCore) to remove this fragmentation.
+                self.linear_fc2._trigger_wgrad_accumulation_and_reduce_hooks()
+                self.linear_fc1._trigger_wgrad_accumulation_and_reduce_hooks()
             return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
