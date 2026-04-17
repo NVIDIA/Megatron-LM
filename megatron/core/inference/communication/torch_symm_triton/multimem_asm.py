@@ -300,6 +300,94 @@ def st_64(ptr, x, y, mask, multicast_op: tl.constexpr):
 
 
 @triton.jit
+def ld_32(ptr, mask):
+    """
+    Loads 32 bits from local global memory into one 32-bit register.
+
+    Uses `ld.global.u32`. Scalar version of ld_64/ld_128.
+
+    Args:
+        ptr: source pointer typed as uint32 (4-byte aligned).
+        mask: boolean predicate — if False, the load is skipped.
+
+    Returns:
+        x: one tl.uint32 register containing 32 bits of loaded data.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.ne.s32 %p0, $2, 1;
+            @%p0 bra end;
+            ld.global.u32 $0, [$1];
+            end:
+        }
+        """,
+        "=r,l,r",
+        args=[ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32,),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def st_32(ptr, x, mask, multicast_op: tl.constexpr):
+    """
+    Stores 32 bits (one 32-bit register) to memory.
+
+    Scalar version of st_64/st_128.
+
+    1.  **Standard Store (`multicast_op=False`)**:
+        -   `st.global.f32` — writes 32 bits to local global memory.
+
+    2.  **Multicast Store (`multicast_op=True`)**:
+        -   `multimem.st.relaxed.sys.global.f32` — broadcasts 32 bits to all
+            peers in the multicast group simultaneously.
+
+    Args:
+        ptr: destination pointer typed as uint32 (4-byte aligned).
+        x: one tl.uint32 register containing the data to store.
+        mask: boolean predicate — if False, the store is skipped.
+        multicast_op (tl.constexpr): False = local store, True = multicast broadcast.
+    """
+    if multicast_op:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $3, 1;
+                @%p0 bra end;
+                multimem.st.relaxed.sys.global.f32 [$1], $2;
+                end:
+            }
+            """,
+            "=r,l,r,r",
+            args=[ptr, x, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $3, 1;
+                @%p0 bra end;
+                st.global.f32 [$1], $2;
+                end:
+            }
+            """,
+            "=r,l,r,r",
+            args=[ptr, x, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+
+
+@triton.jit
 def asm_rsqrt(x, eps):
     """
     Computes the reciprocal square root of a float32 number using inline assembly.

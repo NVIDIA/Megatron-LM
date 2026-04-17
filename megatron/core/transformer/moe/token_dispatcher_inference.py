@@ -30,6 +30,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather_v3,
     multimem_reduce_scatter_v,
 )
+from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
@@ -339,6 +340,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             "ep_rsv", process_group=ep_group
         ).maybe_get_tensor([global_max, hidden_size], dtype=torch.bfloat16)
 
+        # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
+        cls._symm_metadata = SymmetricMemoryManager.get_buffer(
+            "ep_meta", process_group=ep_group
+        ).maybe_get_tensor([ep_size], dtype=torch.int32)
+
         failed = [
             name
             for name, buf in (
@@ -346,6 +352,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 ("ep_agv_r", cls._symm_agv_routing),
                 ("ep_agv_p", cls._symm_agv_probs),
                 ("ep_rsv",   cls._symm_rsv),
+                ("ep_meta",  cls._symm_metadata),
             )
             if buf["handle"] is None
         ]
@@ -381,26 +388,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             mask_routing_map: If True, fill the routing buffer with -1 so stale rows
                 beyond valid_tokens are pre-masked. Required when using the FlashInfer backend.
         """
-        ep_size = dist.get_world_size(group=ep_group)
-        device = torch.cuda.current_device()
-        local_count = torch.tensor([local_tokens], dtype=torch.int32, device=device)
-        local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
-        dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
-
-        ep_rank = cls._ep_rank
-        cls._step_metadata.copy_(
-            torch.stack([
-                local_tokens_per_rank.sum(),           # valid_tokens
-                local_tokens_per_rank[:ep_rank].sum(), # rank_token_offset
-                local_tokens_per_rank.max(),           # ep_max_tokens
-            ])
+        fused_metadata_update(
+            local_tokens=local_tokens,
+            local_buf=cls._symm_metadata["tensor"],
+            symm_mem_hdl=cls._symm_metadata["handle"],
+            step_metadata=cls._step_metadata,
         )
 
         # Mask stale rows so FlashInfer ignores them; AGV overwrites [0, valid_tokens).
         if mask_routing_map:
             cls._symm_agv_routing["tensor"].fill_(-1)
-
-        dist.barrier(group=ep_group)
 
     def __init__(
         self,
