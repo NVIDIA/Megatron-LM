@@ -52,18 +52,18 @@ NUM_HEADS=16
 NUM_KV_HEADS=4
 
 MBS=${SWEEP_MBS:-16}
-GBS=128
+GBS=${SWEEP_GBS:-128}
 SEQ_LEN=4096
 TRAIN_SAMPLES=244141    # 1B tokens / 4096 seq_len
-LR=3e-4
-MIN_LR=3e-5
+LR=${SWEEP_LR:-3e-4}
+MIN_LR=$(python3 -c "print(f'{float(\"$LR\")*0.1:.1e}')")
 
 TP=1
 PP=1
 CP=1
 
 PROJECT=megatron-lm-research-baseline
-EXP_NAME=transformer-pp-350m-ablation-$(git rev-parse --short HEAD)
+EXP_NAME=transformer-pp-350m-abl-lr${LR}-gbs${GBS}-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=transformer-pp
