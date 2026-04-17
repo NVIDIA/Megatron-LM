@@ -8,7 +8,14 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_viewless_tensor
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +161,7 @@ class ScheduleNode:
 
         Args:
             forward_func (callable): Function to execute during the forward pass.
-            stream (torch.cuda.Stream): The CUDA stream for this node's computation.
+            stream (Callable): Func that returns CUDA stream for computation.
                 This can be either a 'compute' stream or a 'communicate' stream.
                 - 'compute' stream: Used for computational nodes like attention and experts.
                 - 'communicate' stream: Used for nodes that handle token communication,
@@ -198,6 +205,9 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
+        # Lazy initialization of stream
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
         with self.stream_acquire_context(f"{self.name} forward"):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
@@ -235,6 +245,9 @@ class ScheduleNode:
         return self._backward(*output_grad)
 
     def _backward(self, *output_grad):
+        # Lazy initialization of stream
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
         with self.stream_acquire_context(f"{self.name} backward"):
             outputs = self.output
             if not isinstance(outputs, tuple):
@@ -285,13 +298,13 @@ class ScheduleNode:
         """
         self.event.wait(self.stream)
         if name:
-            torch.cuda.nvtx.range_push(name)
+            nvtx_range_push(name)
         try:
             with torch.cuda.stream(self.stream):
                 yield
         finally:
             if name:
-                torch.cuda.nvtx.range_pop()
+                nvtx_range_pop(name)
             self.event.record(self.stream)
 
     def _release_state(self):
@@ -323,32 +336,25 @@ class AbstractSchedulePlan(ABC):
         ...
 
 
+_USE_DYNAMIC_COMP_STREAM = None
 _COMP_STREAM = None
 _COMM_STREAM = None
 
 
-def set_streams(comp_stream=None, comm_stream=None):
-    """Set the streams for communication and computation"""
-    global _COMP_STREAM
+def set_streams(comm_stream=None):
+    """Set the stream for communication operations."""
     global _COMM_STREAM
-    if _COMP_STREAM is not None and _COMM_STREAM is not None:
-        return
 
-    if comp_stream is None:
-        comp_stream = torch.cuda.current_stream()
-    if comm_stream is None:
-        comm_stream = torch.cuda.Stream(device="cuda")
-
-    assert _COMP_STREAM is None
-    assert _COMM_STREAM is None
-    _COMP_STREAM = comp_stream
-    _COMM_STREAM = comm_stream
+    # Set communication stream
+    if _COMM_STREAM is None:
+        if comm_stream is None:
+            comm_stream = torch.cuda.Stream(device="cuda")
+        _COMM_STREAM = comm_stream
 
 
 def get_comp_stream():
     """Get the stream for computation"""
-    global _COMP_STREAM
-    return _COMP_STREAM
+    return torch.cuda.current_stream()
 
 
 def get_comm_stream():

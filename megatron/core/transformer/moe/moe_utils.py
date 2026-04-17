@@ -8,10 +8,15 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.tensor_parallel import (
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
+    get_expert_parallel_rng_tracker_name,
+)
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
@@ -19,9 +24,7 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         fused_compute_score_for_moe_aux_loss,
         fused_moe_aux_loss,
@@ -34,10 +37,19 @@ try:
         fused_unpermute,
         te_general_gemm,
     )
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    (
+        fused_compute_score_for_moe_aux_loss,
+        fused_moe_aux_loss,
+        fused_permute,
+        fused_permute_and_pad_with_probs,
+        fused_permute_with_probs,
+        fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
+        fused_topk_with_score_function,
+        fused_unpermute,
+        te_general_gemm,
+    ) = (None, None, None, None, None, None, None, None, None, None)
 
 
 # MOE logging
@@ -295,7 +307,7 @@ def permute(
     fused: bool = False,
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
-    align_size: int = -1,
+    align_size: int = 0,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -357,7 +369,11 @@ def permute(
                 "fused_permute_with_probs typically requires TE >= 2.1.0, and "
                 "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
+        if (
+            fused_permute_and_pad_with_probs is not None
+            and tokens_per_expert is not None
+            and align_size > 0
+        ):
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
@@ -680,8 +696,8 @@ def topk_routing_with_score_function(
         group_topk (int, optional): Number of selected groups for each token. Defaults to None.
         scaling_factor (float, optional): Scaling factor of routing score in top-k selection.
                                          Defaults to None.
-        score_function (str, optional): The score function to use. Can be either "softmax" or
-                                        "sigmoid". Defaults to "softmax".
+        score_function (str, optional): The score function to use. Can be "softmax", "sigmoid"
+                                        or "sqrtsoftplus". Defaults to "softmax".
         expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
                                               Defaults to None.
         fused (bool, optional): Whether to use the fused version. Defaults to False.
@@ -714,6 +730,11 @@ def topk_routing_with_score_function(
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
                 "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
+            )
+        if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
+            raise ValueError(
+                "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
         return fused_topk_with_score_function(
             logits=logits,
@@ -767,19 +788,26 @@ def topk_routing_with_score_function(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
 
+    # Precision notes:
+    # - Logits are converted to fp32 for score functions.
+    # - All the intermediate calculations are in fp32.
+    # - The final probs are casted to the same dtype as the logits.
     if score_function == "softmax":
         if use_pre_softmax:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
-    elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits.float()).type_as(logits)
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    elif score_function in ("sigmoid", "sqrtsoftplus"):
+        if score_function == "sigmoid":
+            scores = torch.sigmoid(logits.float())
+        else:
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
         if expert_bias is not None:
-            scores_for_routing = scores + expert_bias
+            scores_for_routing = scores + expert_bias.float()
             _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
-            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            scores = torch.gather(scores, dim=1, index=top_indices)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
@@ -788,6 +816,8 @@ def topk_routing_with_score_function(
 
     if scaling_factor:
         probs = probs * scaling_factor
+
+    probs = probs.type_as(logits)
 
     if dense_output:
         return probs, top_indices
@@ -823,7 +853,8 @@ def compute_routing_scores_for_aux_loss(
     Args:
         logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
         topk (int): The number of top-k indices to compute.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        score_function (str): The score function to use. Can be "softmax", "sigmoid"
+                              or "sqrtsoftplus".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
@@ -837,6 +868,11 @@ def compute_routing_scores_for_aux_loss(
             raise ValueError(
                 "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
             )
+        if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
+            raise ValueError(
+                "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                "Please upgrade Transformer Engine or disable moe_router_fusion."
+            )
         routing_map, scores = fused_compute_score_for_moe_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
@@ -844,8 +880,10 @@ def compute_routing_scores_for_aux_loss(
         if score_function == "softmax":
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif score_function == "sigmoid":
-            # Cast logits to float32 before sigmoid for stability
-            scores = torch.sigmoid(logits.to(torch.float32))
+            scores = torch.sigmoid(logits.float())
+            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        elif score_function == "sqrtsoftplus":
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
@@ -1229,6 +1267,55 @@ def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
     return RandomSTE.apply(logits)
 
 
+@internal_api
+class RandomSTEShared(torch.autograd.Function):
+    """
+    Straight-Through Estimator(STE) function that returns random values
+    with a shared seed across all ranks.
+    When std < 0, caches and reuses values per layer.
+    """
+
+    _cache = {}
+
+    @staticmethod
+    def forward(ctx, logits, std, layer_number):
+        """Forward pass: apply random bias to logits."""
+        # Check cache if reuse mode (negative std)
+        if std < 0 and layer_number in RandomSTEShared._cache:
+            return logits + RandomSTEShared._cache[layer_number]
+
+        # Generate random bias with shared seed across all ranks
+        with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+            bias = torch.empty(logits.shape[-1], device=logits.device, dtype=logits.dtype).normal_(
+                std=abs(std)
+            )
+
+        # Cache if reuse mode
+        if std < 0 and layer_number is not None:
+            RandomSTEShared._cache[layer_number] = bias
+
+        return logits + bias
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: pass through gradients."""
+        return grad_output, None, None
+
+
+def apply_biased_logits(logits, std, layer_number=None):
+    """
+    Apply random bias to logits. All ranks get the same random values.
+
+    Args:
+        logits: Input logits tensor [num_tokens, num_experts]
+        std: Standard deviation for random bias. If negative, generate once
+             per layer and reuse (using abs(std) as actual std).
+        layer_number: Layer number for caching when std is negative.
+    """
+    logits = apply_random_logits(logits)
+    return RandomSTEShared.apply(logits, std, layer_number)
+
+
 class RouterGatingLinearFunction(torch.autograd.Function):
     """
     Autograd function for router gating linear.
@@ -1345,7 +1432,8 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
         return get_fp8_align_size(config.fp8_recipe)
     elif config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    return 16
+    # Only FP8 or FP4 requires padding. Defaults to 0.
+    return 0
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.
