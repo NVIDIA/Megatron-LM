@@ -194,7 +194,13 @@ class TransformerLayerSchedulePlan:
 
     @staticmethod
     def run(
-        f_layer, b_layer, f_input=None, b_grad=None, delay_attn_wgrad=False, delay_mlp_wgrad=False
+        f_layer,
+        b_layer,
+        f_input=None,
+        b_grad=None,
+        delay_attn_wgrad=False,
+        delay_mlp_wgrad=False,
+        skip_fwd_attn=False,
     ):
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
@@ -217,6 +223,8 @@ class TransformerLayerSchedulePlan:
                 Whether to delay attention weight gradient computation for this layer.
             delay_mlp_wgrad (bool):
                 Whether to delay MLP weight gradient computation for this layer.
+            skip_fwd_attn (bool):
+                Whether to skip forward attention (already executed earlier for P2P overlap).
 
         Returns:
             Functions or values for next iteration's computation
@@ -226,7 +234,7 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
-        if f_layer is not None:
+        if f_layer is not None and not skip_fwd_attn:
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
 
@@ -465,6 +473,27 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.record_current_stream()
             f_input = f_schedule_plan.pre_process.forward()
 
+        f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
+        b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
+        overlapped_layers = min(f_num_layers, b_num_layers)
+
+        # When backward P2P runs on the comm stream, pre_backward's
+        # recv_next_wait_handle.wait() forces comp_stream to wait for the backward
+        # recv—the last operation on comm_stream—before any layer computation.
+        # By executing the first forward attention BEFORE pre_backward, it can
+        # overlap with the backward P2P still in flight on comm_stream.
+        _skip_first_fwd_attn = False
+        if (
+            f_schedule_plan is not None
+            and b_schedule_plan is not None
+            and b_schedule_plan.config.overlap_p2p_backward_on_comm_stream
+            and f_num_layers > 0
+        ):
+            first_f_layer = f_schedule_plan.get_layer(0)
+            with first_f_layer.get_fp8_context():
+                f_input = first_f_layer.attn.forward(f_input)
+            _skip_first_fwd_attn = True
+
         if b_schedule_plan:
             b_schedule_plan.record_current_stream()
             assert b_grad is not None
@@ -474,10 +503,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
             if b_schedule_plan.post_process is not None:
                 b_grad = b_schedule_plan.post_process.backward(b_grad)
-
-        f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
-        b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
-        overlapped_layers = min(f_num_layers, b_num_layers)
 
         # Determine how many backward layers should defer wgrad for P2P overlap.
         num_wgrad_delayed = 0
@@ -505,6 +530,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 b_grad=b_grad,
                 delay_attn_wgrad=should_delay,
                 delay_mlp_wgrad=(should_delay and delay_mlp_wgrad),
+                skip_fwd_attn=(_skip_first_fwd_attn and i == 0),
             )
             if should_delay:
                 deferred_wgrad_layers.append(b_layer)
