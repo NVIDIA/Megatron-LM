@@ -62,5 +62,6 @@ MODEL_ARGS:
   --num-distributed-optimizer-instances: 2
   --async-save: true
   --use-persistent-ckpt-worker: true
+  --async-ckpt-use-cpu-shm: true
 TEST_TYPE: ckpt-resume
 LAUNCHER: ft_launcher
