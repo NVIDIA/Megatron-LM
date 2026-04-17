@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.parameterization import (
     ROLE_EMBEDDING,
     ROLE_OUTPUT,
@@ -212,6 +213,8 @@ class LanguageModule(MegatronModule):
         # This is the original Megatron attribute used by decoupled_lr, Muon, FSDP, etc.
         if self.pre_process and hasattr(self, 'embedding'):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
+            if self.share_embeddings_and_output_weights:
+                self.embedding.word_embeddings.weight.is_output_parameter = True
             set_parameterization_metadata(
                 self.embedding.word_embeddings.weight,
                 role=(
@@ -219,9 +222,9 @@ class LanguageModule(MegatronModule):
                     if self.share_embeddings_and_output_weights
                     else ROLE_EMBEDDING
                 ),
-                shared_group='lm_embedding_output'
-                if self.share_embeddings_and_output_weights
-                else None,
+                shared_group=(
+                    'lm_embedding_output' if self.share_embeddings_and_output_weights else None
+                ),
             )
         if (
             self.post_process
@@ -229,6 +232,7 @@ class LanguageModule(MegatronModule):
             and self.output_layer.weight is not None
         ):
             self.output_layer.weight.is_embedding_or_output_parameter = True
+            self.output_layer.weight.is_output_parameter = True
             set_parameterization_metadata(
                 self.output_layer.weight,
                 role=(
@@ -236,17 +240,19 @@ class LanguageModule(MegatronModule):
                     if self.share_embeddings_and_output_weights
                     else ROLE_OUTPUT
                 ),
-                shared_group='lm_embedding_output'
-                if self.share_embeddings_and_output_weights
-                else None,
+                shared_group=(
+                    'lm_embedding_output' if self.share_embeddings_and_output_weights else None
+                ),
             )
 
         # Mark embedding-class parameters for MuP optimizer grouping.
         # Under MuP table-8-style grouping, embeddings/output use base LR/eps while
         # hidden matrix-like params use width-scaled LR/eps.
         mtp_process = getattr(self, 'mtp_process', False)
-        if self.model_scaling_policy.enabled and (self.pre_process or mtp_process) and hasattr(
-            self, 'embedding'
+        if (
+            self.model_scaling_policy.enabled
+            and (self.pre_process or mtp_process)
+            and hasattr(self, 'embedding')
         ):
             for param in self.embedding.parameters():
                 if not hasattr(param, 'parameterization_role'):
@@ -298,11 +304,11 @@ class LanguageModule(MegatronModule):
             weight.data.fill_(0)
             weight.shared = True
             weight.shared_embedding = True
+            weight.is_embedding_or_output_parameter = True
+            weight.is_output_parameter = True
             # Keep optimizer grouping consistent for tied embedding/output copies.
             set_parameterization_metadata(
-                weight,
-                role=ROLE_SHARED_EMBEDDING_OUTPUT,
-                shared_group='lm_embedding_output',
+                weight, role=ROLE_SHARED_EMBEDDING_OUTPUT, shared_group='lm_embedding_output'
             )
             if self.model_scaling_policy.enabled:
                 self.model_scaling_policy.mark_embedding_class_parameters([weight])
