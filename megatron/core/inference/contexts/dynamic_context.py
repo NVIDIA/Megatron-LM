@@ -1110,12 +1110,20 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
-        # Some tensors need to be padded at the token level.
-        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
 
+        # Token-level padding.
+        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
         self.token_to_block_idx[padding_token_slice] = self.kv_block_allocator.dummy_block_idx
         self.token_to_local_position_within_kv_block[padding_token_slice] = 0
         self.token_to_position_in_request[padding_token_slice] = 0
+
+        # Request-level padding.
+        active_request_count = self.total_request_count - self.paused_request_count
+        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
+        self.active_request_query_lengths[padding_request_slice].fill_(
+            self.num_speculative_tokens + 1
+        )
+        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
