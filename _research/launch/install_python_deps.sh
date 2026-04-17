@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 PKG_DIR=${1:?usage: install_python_deps.sh PKG_DIR}
-MARKER=$PKG_DIR/.deps_installed_v1
+MARKER=$PKG_DIR/.deps_installed_v2
 LOCK=$PKG_DIR/.install.lockdir
 
 mkdir -p "$PKG_DIR"
@@ -21,6 +21,6 @@ else
     INSTALL="pip install --quiet"
 fi
 
-$INSTALL --target="$PKG_DIR" transformers
+$INSTALL --target="$PKG_DIR" transformers wandb
 
 touch "$MARKER"
