@@ -10,7 +10,10 @@ These tests verify that MuP is correctly implemented in Megatron-LM:
 """
 
 import logging
+import dataclasses
 import math
+from argparse import ArgumentParser
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -19,13 +22,111 @@ import torch
 from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
+from megatron.core.parameterization import build_resolved_scaling_context
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
+from megatron.training.arguments import add_megatron_arguments, core_transformer_config_from_args
+from megatron.training.checkpointing import check_checkpoint_args, load_args_from_checkpoint
+from megatron.training.yaml_arguments import core_config_from_args as core_config_from_yaml_args
+
+
+def _build_transformer_namespace(**overrides):
+    values = {}
+    for field in dataclasses.fields(TransformerConfig):
+        if field.default is not dataclasses.MISSING:
+            values[field.name] = field.default
+        elif field.default_factory is not dataclasses.MISSING:
+            values[field.name] = field.default_factory()
+        else:
+            assert field.name in overrides, f"Missing required override for {field.name}"
+            values[field.name] = overrides.pop(field.name)
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _prepare_parsed_args_for_core_config(args):
+    # parse_args() populates CLI-backed fields only; validate_args() normally derives params_dtype.
+    args.params_dtype = torch.float32
+    return args
 
 
 class TestMuPConfigValidation:
     """Tests for MuP config validation and width_mult computation."""
+
+    def test_scaling_recipe_mup_matches_legacy_alias(self):
+        legacy = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_base_head_dim=64,
+        )
+        recipe = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_head_dim=64,
+        )
+
+        assert recipe.use_mup is True
+        assert recipe.scaling_recipe == 'mup'
+        assert recipe.mup_width_mult == legacy.mup_width_mult
+        assert recipe.mup_base_hidden_size == legacy.mup_base_hidden_size
+        assert recipe.softmax_scale == legacy.softmax_scale
+        assert recipe.mup_output_mult == legacy.mup_output_mult
+
+    def test_conflicting_legacy_and_canonical_scaling_args_error(self):
+        with pytest.raises(ValueError, match='conflicts with'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='mup',
+                scaling_base_hidden_size=256,
+                mup_base_hidden_size=512,
+            )
+
+    def test_explicit_none_conflicts_with_legacy_use_mup_alias(self):
+        with pytest.raises(ValueError, match='conflicts with --use-mup'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='none',
+                use_mup=True,
+            )
+
+    def test_scaling_overrides_require_recipe(self):
+        with pytest.raises(ValueError, match='Scaling overrides require --scaling-recipe mup'):
+            TransformerConfig(
+                hidden_size=512,
+                num_layers=12,
+                num_attention_heads=8,
+                scaling_residual_branch_depth_power=-0.5,
+            )
+
+    def test_legacy_mup_knobs_require_mup_recipe(self):
+        with pytest.raises(ValueError, match='Scaling overrides require --scaling-recipe mup'):
+            TransformerConfig(
+                hidden_size=512,
+                num_layers=12,
+                num_attention_heads=8,
+                mup_base_hidden_size=256,
+            )
+
+    def test_scaling_base_head_dim_must_be_positive(self):
+        with pytest.raises(AssertionError, match='scaling-base-head-dim'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='mup',
+                scaling_base_head_dim=-64,
+            )
 
     def test_mup_defaults_base_hidden_size(self):
         """use_mup without base_hidden_size defaults to hidden_size (width_mult=1.0)."""
@@ -60,6 +161,263 @@ class TestMuPConfigValidation:
             mup_base_hidden_size=256,
         )
         assert config.mup_width_mult == 0.5
+
+    def test_resolved_scaling_context_matches_transformer_config_fields(self):
+        config = TransformerConfig(
+            hidden_size=1536,
+            num_layers=18,
+            num_attention_heads=12,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=384,
+            scaling_base_num_layers=9,
+            scaling_base_head_dim=64,
+        )
+        context = build_resolved_scaling_context(config)
+
+        assert context.recipe == 'mup'
+        assert context.width_mult == pytest.approx(config.mup_width_mult)
+        assert context.references.base_hidden_size == config.mup_base_hidden_size
+        assert context.references.base_num_layers == config.scaling_base_num_layers
+        assert context.references.base_head_dim == config.mup_base_head_dim
+
+    def test_parser_accepts_canonical_and_legacy_mup_flags(self):
+        parser = ArgumentParser(allow_abbrev=False)
+        parser = add_megatron_arguments(parser)
+
+        canonical_args = parser.parse_args(
+            [
+                '--num-layers', '12',
+                '--hidden-size', '1024',
+                '--num-attention-heads', '16',
+                '--scaling-recipe', 'mup',
+                '--scaling-base-hidden-size', '256',
+                '--scaling-base-head-dim', '64',
+            ]
+        )
+        canonical_args = _prepare_parsed_args_for_core_config(canonical_args)
+        canonical_config = core_transformer_config_from_args(canonical_args)
+        assert canonical_config.use_mup is True
+        assert canonical_config.scaling_recipe == 'mup'
+        assert canonical_config.mup_width_mult == pytest.approx(4.0)
+
+        legacy_args = parser.parse_args(
+            [
+                '--num-layers', '12',
+                '--hidden-size', '1024',
+                '--num-attention-heads', '16',
+                '--use-mup',
+                '--mup-base-hidden-size', '256',
+                '--mup-base-head-dim', '64',
+                '--mup-width-mult', '3.0',
+            ]
+        )
+        legacy_args = _prepare_parsed_args_for_core_config(legacy_args)
+        legacy_config = core_transformer_config_from_args(legacy_args)
+        assert legacy_args.mup_width_mult == pytest.approx(3.0)
+        assert legacy_config.use_mup is True
+        assert legacy_config.mup_width_mult == pytest.approx(4.0)
+
+    def test_yaml_namespace_without_scaling_fields_still_builds_transformer_config(self):
+        args = _build_transformer_namespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+        )
+        for field_name in (
+            'scaling_recipe',
+            'scaling_base_hidden_size',
+            'scaling_base_num_layers',
+            'scaling_base_head_dim',
+            'scaling_residual_branch_depth_power',
+            'scaling_hidden_lr_depth_power',
+            'scaling_block_out_proj_init_depth_power',
+        ):
+            delattr(args, field_name)
+
+        kw_args = core_config_from_yaml_args(args, TransformerConfig)
+
+        assert kw_args['scaling_recipe'] is None
+        assert kw_args['scaling_base_hidden_size'] is None
+        assert kw_args['scaling_base_num_layers'] is None
+        assert kw_args['scaling_base_head_dim'] is None
+
+    def test_checkpoint_args_compare_effective_scaling_context(self):
+        runtime_args = _build_transformer_namespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_head_dim=64,
+            add_position_embedding=True,
+            vocab_file=None,
+            data_parallel_random_init=False,
+            phase_transition_iterations=None,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_dist_ckpt=False,
+        )
+        checkpoint_args = _build_transformer_namespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_base_head_dim=64,
+            add_position_embedding=True,
+            vocab_file=None,
+            data_parallel_random_init=False,
+            phase_transition_iterations=None,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_dist_ckpt=False,
+        )
+        delattr(runtime_args, 'kv_channels')
+        delattr(checkpoint_args, 'kv_channels')
+
+        with (
+            patch('megatron.training.checkpointing.get_args', return_value=runtime_args),
+            patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+        ):
+            check_checkpoint_args(checkpoint_args)
+
+    def test_checkpoint_args_raise_on_scaling_mismatch(self):
+        runtime_args = _build_transformer_namespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            add_position_embedding=True,
+            vocab_file=None,
+            data_parallel_random_init=False,
+            phase_transition_iterations=None,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_dist_ckpt=False,
+        )
+        checkpoint_args = _build_transformer_namespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            use_mup=True,
+            mup_base_hidden_size=512,
+            add_position_embedding=True,
+            vocab_file=None,
+            data_parallel_random_init=False,
+            phase_transition_iterations=None,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_dist_ckpt=False,
+        )
+
+        with (
+            patch('megatron.training.checkpointing.get_args', return_value=runtime_args),
+            patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+        ):
+            with pytest.raises(AssertionError, match='Resolved scaling context'):
+                check_checkpoint_args(checkpoint_args)
+
+    def test_checkpoint_args_raise_on_legacy_mup_knob_mismatch(self):
+        runtime_args = _build_transformer_namespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            mup_embedding_mult=1.2,
+            mup_output_mult=0.35,
+            mup_attn_scale_power=0.8,
+            add_position_embedding=True,
+            vocab_file=None,
+            data_parallel_random_init=False,
+            phase_transition_iterations=None,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_dist_ckpt=False,
+        )
+        checkpoint_args = _build_transformer_namespace(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            use_mup=True,
+            mup_base_hidden_size=256,
+            mup_embedding_mult=1.1,
+            mup_output_mult=0.35,
+            mup_attn_scale_power=0.8,
+            add_position_embedding=True,
+            vocab_file=None,
+            data_parallel_random_init=False,
+            phase_transition_iterations=None,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_dist_ckpt=False,
+        )
+
+        with (
+            patch('megatron.training.checkpointing.get_args', return_value=runtime_args),
+            patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+        ):
+            with pytest.raises(AssertionError, match='Resolved scaling context'):
+                check_checkpoint_args(checkpoint_args)
+
+    def test_use_checkpoint_args_restores_scaling_surface(self):
+        args = SimpleNamespace(
+            load='dummy',
+            iteration=0,
+            use_mp_args_from_checkpoint_args=False,
+            use_tokenizer_model_from_checkpoint_args=False,
+            use_mup=False,
+            scaling_recipe=None,
+            scaling_base_hidden_size=None,
+            scaling_base_num_layers=None,
+            scaling_base_head_dim=None,
+            scaling_residual_branch_depth_power=None,
+            scaling_hidden_lr_depth_power=None,
+            scaling_block_out_proj_init_depth_power=None,
+            mup_width_mult=1.0,
+            mup_base_hidden_size=None,
+            mup_embedding_mult=1.0,
+            mup_output_mult=1.0,
+            mup_base_head_dim=None,
+            mup_attn_scale_power=1.0,
+        )
+        checkpoint_args = SimpleNamespace(
+            use_mup=True,
+            mup_width_mult=4.0,
+            mup_base_hidden_size=256,
+            mup_embedding_mult=1.5,
+            mup_output_mult=0.3,
+            mup_base_head_dim=64,
+            mup_attn_scale_power=0.75,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=12,
+            scaling_base_head_dim=64,
+            scaling_residual_branch_depth_power=-0.5,
+            scaling_hidden_lr_depth_power=-0.25,
+            scaling_block_out_proj_init_depth_power=-0.5,
+        )
+        state_dict = {'args': checkpoint_args, 'checkpoint_version': 3.0, 'iteration': 17}
+
+        with patch(
+            'megatron.training.checkpointing._load_base_checkpoint',
+            return_value=(state_dict, 'dummy', False, None),
+        ):
+            load_args_from_checkpoint(args)
+
+        assert args.iteration == 17
+        assert args.use_mup is True
+        assert args.mup_embedding_mult == pytest.approx(1.5)
+        assert args.mup_output_mult == pytest.approx(0.3)
+        assert args.mup_attn_scale_power == pytest.approx(0.75)
+        assert args.scaling_recipe == 'mup'
+        assert args.scaling_base_hidden_size == 256
+        assert args.scaling_base_num_layers == 12
+        assert args.scaling_base_head_dim == 64
+        assert args.scaling_residual_branch_depth_power == pytest.approx(-0.5)
+        assert args.scaling_hidden_lr_depth_power == pytest.approx(-0.25)
+        assert args.scaling_block_out_proj_init_depth_power == pytest.approx(-0.5)
 
     def test_mup_backward_compatible(self):
         """Default config unchanged when MuP disabled."""

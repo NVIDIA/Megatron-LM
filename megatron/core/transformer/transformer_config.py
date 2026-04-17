@@ -11,6 +11,11 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.parameterization import (
+    SCALING_RECIPE_NONE,
+    build_resolved_scaling_context,
+    sync_legacy_mup_fields,
+)
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
@@ -353,11 +358,50 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # MuP (Maximal Update Parameterization)
     ####################
+    scaling_recipe: Optional[Literal['none', 'mup']] = None
+    """
+    Canonical scaling recipe. `mup` preserves the current Megatron MuP semantics,
+    `none` keeps the standard parameterization, and `None` means unspecified so
+    legacy alias resolution can decide the recipe.
+    """
+
+    scaling_base_hidden_size: Optional[int] = None
+    """
+    Reference hidden size for width-based scaling recipes. Under `mup`, this is
+    equivalent to `mup_base_hidden_size`.
+    """
+
+    scaling_base_num_layers: Optional[int] = None
+    """
+    Reference number of transformer layers for depth-based scaling recipes.
+    Defaults to `num_layers` when not specified.
+    """
+
+    scaling_base_head_dim: Optional[float] = None
+    """
+    Reference attention head dimension for head-dimension-aware scaling rules.
+    Under `mup`, this is equivalent to `mup_base_head_dim`.
+    """
+
+    scaling_residual_branch_depth_power: Optional[float] = None
+    """
+    Relative depth exponent for residual-branch outputs. Added as the first dense-depth
+    proof knob for the generalized scaling framework.
+    """
+
+    scaling_hidden_lr_depth_power: Optional[float] = None
+    """
+    Relative depth exponent for hidden matrix-like LR overrides.
+    """
+
+    scaling_block_out_proj_init_depth_power: Optional[float] = None
+    """
+    Relative depth exponent for block output projection initialization.
+    """
+
     use_mup: bool = False
     """
-    Enable Maximal Update Parameterization (MuP) for hyperparameter transfer across
-    model widths. When enabled, learning rates and initialization are scaled according
-    to the width multiplier to ensure consistent training dynamics.
+    Backward-compatible alias for `scaling_recipe="mup"`.
     """
 
     mup_width_mult: float = 1.0
@@ -1778,6 +1822,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
+
+        scaling_context = build_resolved_scaling_context(self)
+        sync_legacy_mup_fields(self, scaling_context)
 
         # MuP (Maximal Update Parameterization) configuration
         if self.use_mup:
