@@ -728,10 +728,8 @@ def test_parallel_attention_correctness_num_query_groups_less_than_tp_size(
 
 def test_qk_layernorm_from_config_fallback():
     """config.qk_layernorm=True with spec q/k_layernorm=None builds TENorm."""
-    pytest.importorskip("transformer_engine")
+    te_pytorch = pytest.importorskip("transformer_engine.pytorch")
     from dataclasses import replace
-
-    from megatron.core.extensions.transformer_engine import TENorm
 
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
@@ -746,8 +744,34 @@ def test_qk_layernorm_from_config_fallback():
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=None, k_layernorm=None)
         attn = SelfAttention(config, submodules, layer_number=1)
-        assert isinstance(attn.q_layernorm, TENorm)
-        assert isinstance(attn.k_layernorm, TENorm)
+        assert isinstance(attn.q_layernorm, te_pytorch.LayerNorm)
+        assert isinstance(attn.k_layernorm, te_pytorch.LayerNorm)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_qk_l2_norm_from_config_fallback():
+    """config.qk_l2_norm=True with spec q/k_layernorm=None builds L2Norm."""
+    pytest.importorskip("transformer_engine.pytorch")
+    from dataclasses import replace
+
+    from megatron.core.transformer.torch_norm import L2Norm
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_l2_norm=True,
+        )
+        base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        submodules = replace(base, q_layernorm=None, k_layernorm=None)
+        attn = SelfAttention(config, submodules, layer_number=1)
+        assert isinstance(attn.q_layernorm, L2Norm)
+        assert isinstance(attn.k_layernorm, L2Norm)
     finally:
         Utils.destroy_model_parallel()
 
