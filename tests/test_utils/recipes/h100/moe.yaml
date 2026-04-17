@@ -193,7 +193,7 @@ products:
   - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr-broken, mr-github-broken]  # KNOWN_ISSUE: https://github.com/NVIDIA/Megatron-LM/issues/4353
         platforms: [dgx_h100]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon]
     products:

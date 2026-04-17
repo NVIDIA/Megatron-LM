@@ -175,7 +175,7 @@ products:
   - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [nightly-broken]  # KNOWN_ISSUE: https://github.com/NVIDIA/Megatron-LM/issues/4353
         platforms: [dgx_gb200]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon]
     products:
