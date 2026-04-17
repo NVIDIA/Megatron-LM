@@ -359,7 +359,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
-            name=name + ".linear_proj",
+            name=(name + ".linear_proj") if name is not None else None,
         )
 
         if (
@@ -1328,7 +1328,7 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
-            name=name + ".linear_qkv",
+            name=(name + ".linear_qkv") if name is not None else None,
         )
 
         if submodules.q_layernorm is not None:
@@ -1710,7 +1710,7 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
-            name=name + ".linear_q",
+            name=(name + ".linear_q") if name is not None else None,
         )
 
         self.linear_kv = submodules.linear_kv(
@@ -1722,7 +1722,7 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
-            name=name + ".linear_kv",
+            name=(name + ".linear_kv") if name is not None else None,
         )
 
     def get_query_key_value_tensors(

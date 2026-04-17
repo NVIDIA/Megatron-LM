@@ -222,7 +222,7 @@ class MLP(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
             stride=fc1_stride,
-            name=name + ".linear_fc1",
+            name=(name + ".linear_fc1") if name is not None else None,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -243,7 +243,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
-            name=name + ".linear_fc2",
+            name=(name + ".linear_fc2") if name is not None else None,
         )
 
     def forward(

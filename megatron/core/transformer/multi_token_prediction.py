@@ -807,7 +807,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
             tp_group=pg_collection.tp if pg_collection is not None else None,
-            name=name + ".eh_proj",
+            name=(name + ".eh_proj") if name is not None else None,
         )
 
         # Build inner layers: two possible paths
@@ -827,7 +827,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
-                name=name + ".mtp_model_layer",
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
@@ -841,7 +841,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
                 pg_collection=pg_collection,
-                name=name + ".mtp_model_layer",
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -1330,7 +1330,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=self.mtp_layer_pattern,
-                    name=self.name + f".layers.{layer_number}",
+                    name=(self.name + f".layers.{layer_number}")
+                    if self.name is not None
+                    else None,
                 )
             return module
 
@@ -1346,7 +1348,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     mamba_submodules=mamba_submodules,
-                    name=self.name + f".layers.{layer_number}",
+                    name=(self.name + f".layers.{layer_number}")
+                    if self.name is not None
+                    else None,
                 )
             return module
 

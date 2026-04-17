@@ -194,7 +194,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc1',
             pg_collection=pg_collection,
-            name=name + ".linear_fc1",
+            name=(name + ".linear_fc1") if name is not None else None,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -217,7 +217,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc2',
             pg_collection=pg_collection,
-            name=name + ".linear_fc2",
+            name=(name + ".linear_fc2") if name is not None else None,
         )
 
         self.offload_expert_fc1 = (

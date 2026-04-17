@@ -88,7 +88,7 @@ class MambaLayer(GraphableMegatronModule):
             layer_number=layer_number,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
-            name=name + f".mixer",
+            name=(name + f".mixer") if name is not None else None,
         )
         self.norm = submodules.norm(self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)

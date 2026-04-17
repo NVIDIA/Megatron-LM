@@ -260,7 +260,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
-                name=name + ".fc1_latent_proj",
+                name=(name + ".fc1_latent_proj") if name is not None else None,
             )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
@@ -272,7 +272,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
-                name=name + ".fc2_latent_proj",
+                name=(name + ".fc2_latent_proj") if name is not None else None,
             )
 
         # Initialize token dispatcher
@@ -304,7 +304,10 @@ class MoELayer(BaseMoELayer):
 
         # Initialize experts
         self.experts = self.submodules.experts(
-            self.num_local_experts, self.config, pg_collection=pg_collection, name=name + ".experts"
+            self.num_local_experts,
+            self.config,
+            pg_collection=pg_collection,
+            name=(name + ".experts") if name is not None else None,
         )
 
         # Initialize shared experts
@@ -316,7 +319,7 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 pg_collection=pg_collection,
                 gate=self.config.moe_shared_expert_gate,
-                name=name + ".shared_experts",
+                name=(name + ".shared_experts") if name is not None else None,
             )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
