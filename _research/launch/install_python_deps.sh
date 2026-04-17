@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 PKG_DIR=${1:?usage: install_python_deps.sh PKG_DIR}
-MARKER=$PKG_DIR/.deps_installed_v2
+MARKER=$PKG_DIR/.deps_installed_v3
 LOCK=$PKG_DIR/.install.lockdir
 
 mkdir -p "$PKG_DIR"
@@ -22,5 +22,7 @@ else
 fi
 
 $INSTALL --target="$PKG_DIR" transformers wandb
+$INSTALL --no-deps --target="$PKG_DIR" \
+    'git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0'
 
 touch "$MARKER"

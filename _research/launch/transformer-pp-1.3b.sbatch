@@ -7,7 +7,7 @@
 #
 #SBATCH --account=infra01
 #SBATCH --job-name=transformer-pp-1.3b
-#SBATCH --time=20:00:00
+#SBATCH --time=24:00:00
 # 8 nodes (32 GPUs), TP=1, DP=32. MBS=2 at DP=32: num_microbatches = 128/(2*32) = 2.
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -100,7 +100,7 @@ TRAINING_ARGS=(
     --micro-batch-size $MBS
     --global-batch-size $GBS
     --train-samples ${SWEEP_TRAIN_SAMPLES:-$TRAIN_SAMPLES}
-    --exit-duration-in-mins 1190
+    --exit-duration-in-mins 1430
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
     --eval-iters 0
