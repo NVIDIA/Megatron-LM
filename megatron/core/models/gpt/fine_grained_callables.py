@@ -43,6 +43,19 @@ def weak_method(method):
     return wrapped_func
 
 
+def _apply_mlp_bda_with_scaling(layer: TransformerLayer, output: torch.Tensor, residual: torch.Tensor):
+    mlp_output_with_bias = layer._scale_dense_residual_branch_output(
+        (output, None),
+        branch_name="mlp",
+        using_fused_tp_inference_kernel=False,
+        apply_depth_hook=not layer.is_moe_layer,
+    )
+    with layer.bias_dropout_add_exec_handler():
+        return layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
+            mlp_output_with_bias, residual, layer.hidden_dropout
+        )
+
+
 @internal_api
 def should_free_input(name, is_moe, config, num_local_experts):
     """Determine if the node should free its input memory.
@@ -595,13 +608,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = layer.mlp.combine(output)
         output = layer.mlp.postprocess(output, shared_expert_output)
 
-        mlp_output_with_bias = (output, None)
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
-        with layer.bias_dropout_add_exec_handler():
-            hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, layer.hidden_dropout
-            )
+        hidden_states = _apply_mlp_bda_with_scaling(layer, output, residual)
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if layer.offload_mlp_norm:

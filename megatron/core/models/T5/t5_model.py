@@ -10,6 +10,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.enums import ModelType
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -51,15 +52,16 @@ class T5LMHead(MegatronModule):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         self.parallel_output = parallel_output
+        self.model_scaling_policy = build_resolved_model_policy(config)
 
         self.output_layer = tensor_parallel.ColumnParallelLinear(
             config.hidden_size,
             vocab_size,
             config=config,
-            init_method=(
-                config.embedding_init_method
-                if config.use_mup and not share_embeddings_and_output_weights
-                else config.init_method
+            init_method=self.model_scaling_policy.output_layer_init_method(
+                share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                default_init_method=config.init_method,
+                embedding_init_method=config.embedding_init_method,
             ),
             bias=share_embeddings_and_output_weights,
             skip_bias_add=not share_embeddings_and_output_weights,

@@ -22,9 +22,12 @@ import torch
 from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
-from megatron.core.parameterization import build_resolved_scaling_context
+from megatron.core.models.gpt.fine_grained_callables import _apply_mlp_bda_with_scaling
+from megatron.core.parameterization import build_resolved_model_policy, build_resolved_scaling_context
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
 from megatron.training.arguments import add_megatron_arguments, core_transformer_config_from_args
 from megatron.training.checkpointing import check_checkpoint_args, load_args_from_checkpoint
@@ -425,6 +428,286 @@ class TestMuPConfigValidation:
         assert config.use_mup is False
         assert config.mup_width_mult == 1.0
         assert config.mup_base_hidden_size is None
+
+
+class TestMuPModelPolicy:
+    def test_model_policy_scales_embedding_and_logits(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            mup_embedding_mult=1.25,
+            mup_output_mult=0.2,
+        )
+        policy = build_resolved_model_policy(config)
+        embeddings = torch.ones(2, 3)
+        logits = torch.ones(2, 3)
+
+        assert torch.equal(policy.scale_embedding_activations(embeddings), embeddings * 1.25)
+        assert torch.equal(policy.scale_output_logits(logits), logits * 0.2)
+
+    def test_model_policy_uses_embedding_init_for_untied_readout(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+        )
+        policy = build_resolved_model_policy(config)
+
+        assert (
+            policy.output_layer_init_method(
+                share_embeddings_and_output_weights=False,
+                default_init_method=config.init_method,
+                embedding_init_method=config.embedding_init_method,
+            )
+            is config.embedding_init_method
+        )
+        assert (
+            policy.output_layer_init_method(
+                share_embeddings_and_output_weights=True,
+                default_init_method=config.init_method,
+                embedding_init_method=config.embedding_init_method,
+            )
+            is config.init_method
+        )
+
+    def test_dense_block_output_init_depth_scaling(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_block_out_proj_init_depth_power=-0.5,
+        )
+        policy = build_resolved_model_policy(config)
+        init_fn = policy.dense_block_output_init_method(
+            default_init_method=config.output_layer_init_method,
+            init_method_std=config.init_method_std,
+            num_layers=config.num_layers,
+            is_hybrid_model=config.is_hybrid_model,
+            output_layer_init_method_is_user_provided=False,
+        )
+        weights = torch.empty(200_000)
+        init_fn(weights)
+
+        expected_std = (
+            config.init_method_std
+            / (math.sqrt(2 * config.num_layers) * math.sqrt(config.mup_width_mult))
+            * (policy.context.depth_mult ** config.scaling_block_out_proj_init_depth_power)
+        )
+        actual_std = weights.std().item()
+        assert abs(actual_std - expected_std) < expected_std * 0.05
+
+    def test_dense_block_output_init_can_be_disabled_per_site(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_block_out_proj_init_depth_power=-0.5,
+        )
+        policy = build_resolved_model_policy(config)
+
+        assert (
+            policy.dense_block_output_init_method(
+                default_init_method=config.output_layer_init_method,
+                init_method_std=config.init_method_std,
+                num_layers=config.num_layers,
+                is_hybrid_model=config.is_hybrid_model,
+                output_layer_init_method_is_user_provided=False,
+                apply_depth_hook=False,
+            )
+            is config.output_layer_init_method
+        )
+
+    def test_plain_mlp_requires_explicit_block_output_init_scaling_opt_in(self):
+        class DummyLinear(torch.nn.Module):
+            def __init__(self, init_method):
+                super().__init__()
+                self.init_method = init_method
+
+            def forward(self, hidden_states):
+                return hidden_states, None
+
+            def backward_dw(self):
+                return None
+
+        def fc1_builder(input_size, output_size, *, init_method, **kwargs):
+            return DummyLinear(init_method)
+
+        def fc2_builder(input_size, output_size, *, init_method, **kwargs):
+            return DummyLinear(init_method)
+
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_block_out_proj_init_depth_power=-0.5,
+        )
+        submodules = MLPSubmodules(linear_fc1=fc1_builder, linear_fc2=fc2_builder)
+
+        plain_mlp = MLP(config, submodules, apply_block_output_init_scaling=False)
+        scaled_mlp = MLP(config, submodules, apply_block_output_init_scaling=True)
+
+        assert plain_mlp.linear_fc2.init_method is config.output_layer_init_method
+        assert scaled_mlp.linear_fc2.init_method is not config.output_layer_init_method
+
+    def test_transformer_layer_residual_branch_scaling_helper(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_residual_branch_depth_power=-0.5,
+        )
+        layer = object.__new__(TransformerLayer)
+        layer.model_scaling_policy = build_resolved_model_policy(config)
+
+        output = torch.ones(4, 8)
+        bias = torch.ones(8)
+        scaled_output, scaled_bias = layer._scale_dense_residual_branch_output(
+            (output, bias),
+            branch_name='self attention',
+            using_fused_tp_inference_kernel=False,
+        )
+        expected_mult = (
+            config.num_layers / config.scaling_base_num_layers
+        ) ** config.scaling_residual_branch_depth_power
+        assert torch.equal(scaled_output, output * expected_mult)
+        assert torch.equal(scaled_bias, bias * expected_mult)
+
+        with pytest.raises(NotImplementedError, match='Residual-branch scaling'):
+            layer._scale_dense_residual_branch_output(
+                (output, bias),
+                branch_name='self attention',
+                using_fused_tp_inference_kernel=True,
+            )
+
+    def test_overlap_helper_routes_through_residual_branch_scaler(self):
+        class DummyCtx:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyConfig:
+            bias_dropout_fusion = False
+
+        class DummyLayer:
+            training = True
+            hidden_dropout = 0.1
+            is_moe_layer = False
+            config = DummyConfig()
+
+            def __init__(self):
+                self.scaler_called = False
+
+            def _scale_dense_residual_branch_output(
+                self,
+                output_with_bias,
+                *,
+                branch_name,
+                using_fused_tp_inference_kernel,
+                apply_depth_hook,
+            ):
+                self.scaler_called = True
+                assert branch_name == 'mlp'
+                assert using_fused_tp_inference_kernel is False
+                assert apply_depth_hook is True
+                output, _ = output_with_bias
+                return (output * 2.0, None)
+
+            def bias_dropout_add_exec_handler(self):
+                return DummyCtx()
+
+            def mlp_bda(self, training, bias_dropout_fusion):
+                assert training is True
+                assert bias_dropout_fusion is False
+
+                def apply(output_with_bias, residual, hidden_dropout):
+                    output, bias = output_with_bias
+                    assert bias is None
+                    return output + residual + hidden_dropout
+
+                return apply
+
+        layer = DummyLayer()
+        output = torch.ones(3, 4)
+        residual = torch.ones(3, 4)
+        hidden_states = _apply_mlp_bda_with_scaling(layer, output, residual)
+
+        assert layer.scaler_called is True
+        assert torch.equal(hidden_states, output * 2.0 + residual + layer.hidden_dropout)
+
+    def test_overlap_helper_disables_depth_hook_for_moe_layers(self):
+        class DummyCtx:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyConfig:
+            bias_dropout_fusion = False
+
+        class DummyLayer:
+            training = True
+            hidden_dropout = 0.1
+            is_moe_layer = True
+            config = DummyConfig()
+
+            def __init__(self):
+                self.scaler_called = False
+
+            def _scale_dense_residual_branch_output(
+                self,
+                output_with_bias,
+                *,
+                branch_name,
+                using_fused_tp_inference_kernel,
+                apply_depth_hook,
+            ):
+                self.scaler_called = True
+                assert branch_name == 'mlp'
+                assert using_fused_tp_inference_kernel is False
+                assert apply_depth_hook is False
+                return output_with_bias
+
+            def bias_dropout_add_exec_handler(self):
+                return DummyCtx()
+
+            def mlp_bda(self, training, bias_dropout_fusion):
+                assert training is True
+                assert bias_dropout_fusion is False
+
+                def apply(output_with_bias, residual, hidden_dropout):
+                    output, bias = output_with_bias
+                    assert bias is None
+                    return output + residual + hidden_dropout
+
+                return apply
+
+        layer = DummyLayer()
+        output = torch.ones(3, 4)
+        residual = torch.ones(3, 4)
+        hidden_states = _apply_mlp_bda_with_scaling(layer, output, residual)
+
+        assert layer.scaler_called is True
+        assert torch.equal(hidden_states, output + residual + layer.hidden_dropout)
 
     def test_mup_base_hidden_size_must_be_positive(self):
         """mup_base_hidden_size must be positive."""

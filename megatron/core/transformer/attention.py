@@ -14,6 +14,7 @@ from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
@@ -352,6 +353,21 @@ class Attention(MegatronModule, ABC):
             self.config.fine_grained_activation_offloading
             and "attn_proj" in self.config.offload_modules
         )
+        model_scaling_policy = build_resolved_model_policy(self.config)
+        linear_proj_init_method = self.config.output_layer_init_method
+        if self.attention_type != "cross":
+            linear_proj_init_method = model_scaling_policy.dense_block_output_init_method(
+                default_init_method=self.config.output_layer_init_method,
+                init_method_std=self.config.init_method_std,
+                num_layers=self.config.num_layers,
+                is_hybrid_model=self.config.is_hybrid_model,
+                output_layer_init_method_is_user_provided=getattr(
+                    self.config,
+                    '_parameterization_output_layer_init_method_user_provided',
+                    False,
+                ),
+                apply_depth_hook=self.attention_type != "cross",
+            )
 
         # Output.
         self.linear_proj = build_module(
@@ -359,7 +375,7 @@ class Attention(MegatronModule, ABC):
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=linear_proj_init_method,
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,

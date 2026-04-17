@@ -17,6 +17,7 @@ from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.parameterization import ROLE_EMBEDDING, ROLE_OUTPUT, ROLE_SHARED_EMBEDDING_OUTPUT
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
@@ -88,6 +89,49 @@ class TestGPTModel:
         assert self.gpt_model.embedding.word_embeddings.weight.mean().cpu().item() == approx(
             0.0, abs=1e-1
         )
+
+    def test_mup_setup_embeddings_and_output_layer_marks_real_model_parameters(self):
+        untied_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=6,
+        )
+        untied_model = GPTModel(
+            config=untied_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+            share_embeddings_and_output_weights=False,
+        )
+        assert untied_model.embedding.word_embeddings.weight.is_embedding_or_output_parameter is True
+        assert untied_model.embedding.word_embeddings.weight.is_embedding_parameter is True
+        assert untied_model.embedding.word_embeddings.weight.parameterization_role == ROLE_EMBEDDING
+        assert untied_model.output_layer.weight.is_embedding_or_output_parameter is True
+        assert untied_model.output_layer.weight.is_embedding_parameter is True
+        assert untied_model.output_layer.weight.parameterization_role == ROLE_OUTPUT
+
+        shared_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=6,
+        )
+        shared_model = GPTModel(
+            config=shared_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+            share_embeddings_and_output_weights=True,
+        )
+        shared_weight = shared_model.shared_embedding_or_output_weight()
+        assert shared_weight.is_embedding_or_output_parameter is True
+        assert shared_weight.is_embedding_parameter is True
+        assert shared_weight.parameterization_role == ROLE_SHARED_EMBEDDING_OUTPUT
 
     @pytest.mark.internal
     def test_post_process_forward(self):
