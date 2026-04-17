@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Transformer++ 760M baseline on 1 GH200 node (4 GPUs).
+# Transformer++ 760M baseline on 4 GH200 nodes (16 GPUs).
 # 24L / 1536H / 4096F / 24h / 8kv (GQA).
 # SwiGLU, RMSNorm, RoPE, AdamW, WSD schedule, bf16.
 # 30B tokens on ClimbMix, ~57220 steps at 524K tokens/step.
@@ -8,9 +8,10 @@
 #SBATCH --account=infra01
 #SBATCH --job-name=transformer-pp-760m
 #SBATCH --time=08:00:00
+# 4 nodes (16 GPUs), TP=1, DP=16. MBS=4 at DP=16: num_microbatches = 128/(4*16) = 2.
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
-#SBATCH --nodes=1
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
@@ -51,7 +52,7 @@ FFN_HIDDEN=4096
 NUM_HEADS=24
 NUM_KV_HEADS=8
 
-MBS=${SWEEP_MBS:-8}
+MBS=${SWEEP_MBS:-4}
 GBS=128
 SEQ_LEN=4096
 TRAIN_SAMPLES=7324219

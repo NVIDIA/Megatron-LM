@@ -1,16 +1,17 @@
 #!/bin/bash
 #
-# Transformer++ 2.7B baseline on 1 GH200 node (4 GPUs).
+# Transformer++ 2.7B baseline on 16 GH200 nodes (64 GPUs).
 # 32L / 2560H / 7680F / 32h / 8kv (GQA).
 # SwiGLU, RMSNorm, RoPE, AdamW, WSD schedule, bf16.
 # 300B tokens on ClimbMix, ~572205 steps at 524K tokens/step.
 #
 #SBATCH --account=infra01
 #SBATCH --job-name=transformer-pp-2.7b
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00
+# 16 nodes (64 GPUs), TP=1, DP=64. MBS=1 at DP=64: num_microbatches = 128/(1*64) = 2.
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
-#SBATCH --nodes=1
+#SBATCH --nodes=16
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
@@ -51,7 +52,7 @@ FFN_HIDDEN=7680
 NUM_HEADS=32
 NUM_KV_HEADS=8
 
-MBS=${SWEEP_MBS:-4}
+MBS=${SWEEP_MBS:-1}
 GBS=128
 SEQ_LEN=4096
 TRAIN_SAMPLES=73242188
@@ -99,7 +100,7 @@ TRAINING_ARGS=(
     --micro-batch-size $MBS
     --global-batch-size $GBS
     --train-samples ${SWEEP_TRAIN_SAMPLES:-$TRAIN_SAMPLES}
-    --exit-duration-in-mins 2870
+    --exit-duration-in-mins 4310
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
     --eval-iters 0
