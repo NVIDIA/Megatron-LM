@@ -7,7 +7,7 @@
 #
 #SBATCH --account=infra01
 #SBATCH --job-name=transformer-pp-350m-ablation
-#SBATCH --time=01:30:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --nodes=1
@@ -99,7 +99,7 @@ TRAINING_ARGS=(
     --micro-batch-size $MBS
     --global-batch-size $GBS
     --train-samples ${SWEEP_TRAIN_SAMPLES:-$TRAIN_SAMPLES}
-    --exit-duration-in-mins 85
+    --exit-duration-in-mins 55
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
     --eval-iters 0
