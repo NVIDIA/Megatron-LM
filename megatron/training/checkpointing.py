@@ -693,9 +693,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     ):
                         _writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
                     else:
-                        warn_rank_0(
+                        raise AssertionError(
                             "Installed nvidia-resiliency-ext does not support "
-                            "use_cpu_shm_for_gpu_tensors. Ignoring --async-ckpt-use-cpu-shm."
+                            "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
+                            "to use --async-ckpt-use-cpu-shm."
                         )
                 fs_storage_writer = FileSystemWriterAsync(
                     checkpoint_name,

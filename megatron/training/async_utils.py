@@ -75,9 +75,9 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         if "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
             kwargs["cpu_shm_mode"] = args.async_ckpt_use_cpu_shm
         elif args.async_ckpt_use_cpu_shm:
-            warn_rank_0(
+            raise AssertionError(
                 "Installed nvidia-resiliency-ext does not support cpu_shm_mode. "
-                "Ignoring --async-ckpt-use-cpu-shm."
+                "Update nvidia-resiliency-ext to use --async-ckpt-use-cpu-shm."
             )
     AsyncCallsQueue.warmup_persistent_caller(
         rank,

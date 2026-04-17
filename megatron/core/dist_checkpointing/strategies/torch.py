@@ -712,9 +712,10 @@ class TorchDistSaveShardedStrategy:
                 ):
                     async_writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
                 else:
-                    logger.warning(
+                    raise AssertionError(
                         "Installed nvidia-resiliency-ext does not support "
-                        "use_cpu_shm_for_gpu_tensors. cpu_shm_mode will be ignored."
+                        "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
+                        "to enable cpu_shm_mode."
                     )
             state_dict_saver_kwargs["enable_cache"] = self.use_cached_ckpt_structure
             state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache
