@@ -2262,6 +2262,17 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.fine_grained_activation_offloading:
                 assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                    or (
+                        self.cuda_graph_impl == "local"
+                        and self.cuda_graph_scope == "full_iteration"
+                    )
+                ), (
+                    "fine-grained activation offloading is only supported with "
+                    "transformer_engine CUDA graph implementation or local CUDA graph "
+                    "implementation with full_iteration scope."
+                )
+                assert (
                     CudaGraphScope.moe not in self.cuda_graph_scope
                 ), "Token-drop MoE is temporarily not supported with activation offloading."
                 assert self.cuda_graph_warmup_steps > 0, (
