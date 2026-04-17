@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass, field
 import signal
+from dataclasses import dataclass, field
 from typing import Literal, Optional
+
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -16,7 +17,9 @@ class TrainingConfig:
     data-parallel-size. If this value is None, then use micro-batch-size * data-parallel-size
     as the global batch size. This choice will result in 1 for number of micro-batches."""
 
-    rampup_batch_size: list[int] | None = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
+    rampup_batch_size: list[int] | None = field(
+        default=None, metadata={"argparse_meta": {"nargs": 3}}
+    )
     """Batch size ramp up with the following values: <start batch size>, <batch size increment>,
     <ramp-up samples>
     For example:
@@ -67,6 +70,9 @@ class TrainingConfig:
     exit_signal_handler_for_dataloader: bool = False
     """Use signal handler for dataloader workers"""
 
+    exit_signal_handler_for_training: bool = False
+    """Shutdown the training when SIGINT or SIGTERM received to avoid unclear traceback"""
+
     manual_gc: bool = False
     """Disable the threshold-based default garbage collector and trigger the garbage collection
     manually. Manual garbage collection helps to align the timing of the collection across ranks
@@ -98,6 +104,23 @@ class ValidationConfig:
     eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
     during training.
+    """
+
+    start_eval_at_iter: int | None = None
+    """If set, evaluation will only start after this iteration number. Useful for skipping
+    evaluation during early training iterations when the model is not yet meaningful.
+    If not set, evaluation starts from the first eval_interval.
+    """
+
+    eval_global_batch_size: int | None = None
+    """Global batch size to use during evaluation. If not set, defaults to global_batch_size.
+    Must be divisible by (eval_micro_batch_size * data_parallel_size).
+    """
+
+    eval_micro_batch_size: int | None = None
+    """Micro batch size to use during evaluation. If not set, defaults to micro_batch_size.
+    Changing this affects per-device memory usage during eval and the number of microbatches per
+    eval step.
     """
 
     skip_train: bool = False
@@ -160,13 +183,30 @@ class SchedulerConfig:
     """number of samples to warmup learning rate over. Calculated at runtime from
     lr_warmup_fraction, lr_warmup_iters, or lr_warmup_samples.
     """
-    
-    override_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]}})
+
+    override_opt_param_scheduler: bool = field(
+        default=False,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]
+            }
+        },
+    )
     """Reset the values of the scheduler (learning rate, warmup iterations, minimum learning rate,
     maximum number of iterations, and decay style) from input arguments and ignore values from
     checkpoints. Note that all the above values will be reset."""
 
-    use_checkpoint_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--use-checkpoint-opt_param-scheduler", "--use-checkpoint-opt-param-scheduler"]}})
+    use_checkpoint_opt_param_scheduler: bool = field(
+        default=False,
+        metadata={
+            "argparse_meta": {
+                "arg_names": [
+                    "--use-checkpoint-opt_param-scheduler",
+                    "--use-checkpoint-opt-param-scheduler",
+                ]
+            }
+        },
+    )
     """Use checkpoint to set the values of the scheduler (learning rate, warmup iterations,
     minimum learning rate, maximum number of iterations, and decay style) from checkpoint
     and ignore input arguments."""
@@ -282,7 +322,10 @@ class LoggerConfig:
     runtime_time_unit: str = "hours"
     """Time unit to use for time logging. """
 
-    barrier_with_L1_time: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}})
+    barrier_with_L1_time: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}},
+    )
     """If not disabled, use barrier with level 1 time measurements. Note that this is up to the user to
     make sure calling barrier with their timers will not result in hangs. This can happen if for
     example the user adds a level 1 timer that is not called by all ranks.
@@ -329,7 +372,12 @@ class CheckpointConfig:
     save: str | None = None
     """Output directory to save checkpoints to."""
 
-    save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
+    save_interval: int | None = field(
+        default=None,
+        metadata={
+            "argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}
+        },
+    )
     """Number of iterations between persistent checkpoint saves."""
 
     save_wgrads_interval: int | None = None
@@ -433,13 +481,24 @@ class CheckpointConfig:
     The legacy format was deprecated on Feb 13, 2024.
     """
 
-    fully_parallel_save: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-ckpt-fully-parallel-save"], "dest": "ckpt_fully_parallel_save"}})
+    fully_parallel_save: bool = field(
+        default=True,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--no-ckpt-fully-parallel-save"],
+                "dest": "ckpt_fully_parallel_save",
+            }
+        },
+    )
     """Disable applying full save parallelization across DP for distributed checkpoints.
     Depending on ckpt format might decrease the number of files in the checkpoint.
     Makes DistributedOptimizer checkpoint non-reshardable."""
 
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
+
+    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
+    """Which async save strategy to use. Available strategies: nvrx, mcore."""
 
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
@@ -454,10 +513,20 @@ class CheckpointConfig:
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
 
-    fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
+    fully_parallel_load: bool = field(
+        default=False,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--ckpt-fully-parallel-load"],
+                "dest": "ckpt_fully_parallel_load",
+            }
+        },
+    )
     """Apply full load parallelization across DP for distributed checkpoints."""
 
-    ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_rounds", "gather_object"] = "broadcast"
+    ckpt_fully_parallel_load_exchange_algo: Literal[
+        "broadcast", "gather_rounds", "gather_object"
+    ] = "broadcast"
     """Algorithm for fully parallel load of distributed checkpoints.
     "broadcast"(default): Broadcast the checkpoint from rank 0 to all other ranks.
     "gather_rounds": Gather the checkpoint from all ranks in rounds.
@@ -523,3 +592,17 @@ class CheckpointConfig:
 
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
+
+    def __post_init__(self):
+        from megatron.training.utils import has_nvrx_installed
+
+        assert self.async_strategy in [
+            "nvrx",
+            "mcore",
+        ], f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
+
+        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
+            assert has_nvrx_installed(), (
+                "nvidia-resiliency-ext is not installed. "
+                "Please, install nvidia-resiliency-ext to enable async save."
+            )
