@@ -34,7 +34,11 @@ class TestSpecCustomization:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_l2_norm=True,
         )
 
         # specify Transformer Layer spec with all identity ops
@@ -250,16 +254,8 @@ class TestSpecCustomization:
         """Test L2 normalization for QK vectors using local spec."""
         submodules = get_gpt_layer_local_submodules(qk_l2_norm=True)
 
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            qk_l2_norm=True,
-        )
-
         # Build the self-attention module from the spec
-        self_attention = build_module(submodules.self_attention, config=config, layer_number=1)
+        self_attention = build_module(submodules.self_attention, config=self.config, layer_number=1)
 
         assert isinstance(self_attention, SelfAttention)
         # Verify that q_layernorm and k_layernorm are L2Norm instances
@@ -273,7 +269,7 @@ class TestSpecCustomization:
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, config.hidden_size)
+            (sequence_length, micro_batch_size, self.config.hidden_size)
         ).cuda()
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
