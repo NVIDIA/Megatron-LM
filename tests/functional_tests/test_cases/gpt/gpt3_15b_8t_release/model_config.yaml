@@ -22,7 +22,6 @@ MODEL_ARGS:
   --sequence-parallel: true
   --disable-bias-linear: true
   --micro-batch-size: 4
-  --rampup-batch-size: "[384 384 97656250]"
   --global-batch-size: 1152
   --train-samples: 19531250
   --manual-gc: true

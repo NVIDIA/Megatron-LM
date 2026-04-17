@@ -136,7 +136,6 @@ use_legacy_models: False
 spec: null
 micro_batch_size: 2
 global_batch_size: 128
-rampup_batch_size: [32, 32, 65324160] 
 check_for_nan_in_loss_and_grad: True
 num_layers_per_virtual_pipeline_stage: null
 

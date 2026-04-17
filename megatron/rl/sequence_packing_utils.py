@@ -1069,7 +1069,6 @@ def update_microbatch_calculator(
     num_bins_this_rank: int,
     bin_seq_indices: List[List[int]],
     global_batch_size: int,
-    rampup_batch_size: int,
     micro_batch_size: int,
     decrease_batch_size_if_needed: bool,
 ):
@@ -1079,7 +1078,6 @@ def update_microbatch_calculator(
         num_bins_this_rank: Amount of packing bins that belongs to current rank.
         bin_seq_indices: Global seq indices in the bin, see PackingInfo.
         global_batch_size: Current global batch size.
-        rampup_batch_size: Rampup batch size. See num_microbatches_calculator.py for more.
         micro_batch_size: Micro batch size at init.
         decrease_batch_size_if_needed: Scale down batch size. See num_microbatches_calculator.py for more.
 
@@ -1099,7 +1097,6 @@ def update_microbatch_calculator(
     old_num_microbatches = get_num_microbatches()
     reconfigure_num_microbatches_calculator(
         rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-        rampup_batch_size=rampup_batch_size,
         global_batch_size=bins_bs,
         micro_batch_size=micro_batch_size,
         data_parallel_size=dp_world_size,

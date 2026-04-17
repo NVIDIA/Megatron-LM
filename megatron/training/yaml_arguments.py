@@ -188,8 +188,6 @@ def validate_yaml(args, defaults={}):
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'

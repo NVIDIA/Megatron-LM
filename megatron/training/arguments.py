@@ -593,8 +593,6 @@ def validate_args(args, defaults={}):
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
         )
-        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
-
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -617,7 +615,6 @@ def validate_args(args, defaults={}):
             args.grpo_samples_per_iteration * args.grpo_iterations)
 
         # Ensure that the number of prompts we collect is a multiple of the global batch size.
-        # TODO: Make this account for batch size rampup?
         assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
             f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
 
@@ -1116,8 +1113,6 @@ def validate_args(args, defaults={}):
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
@@ -2908,8 +2903,7 @@ def _add_data_args(parser):
                        'This argument is exclusive to the other independent --*-data-path arguments.')
     group.add_argument('--phase-transition-iterations', type=str, default=None,
                        help='Comma-separated list of iterations where phase '
-                       'transitions occur. Requires fixed global batch size across phases. '
-                       'Does not support batch size ramp-up.')
+                       'transitions occur. Requires fixed global batch size across phases.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

@@ -1285,29 +1285,7 @@ def update_train_iters(args):
     if args.train_iters:
         return
 
-    # Constant batch size with sample-based training.
-    if args.rampup_batch_size is None:
-        args.train_iters = args.train_samples // args.global_batch_size
-
-    else:
-        # Sample based training with rampup batch size.
-        iterations = 0
-        consumed_samples = 0
-        # Rampup phase.
-        while (
-            consumed_samples <= int(args.rampup_batch_size[2])
-            and consumed_samples <= args.train_samples
-        ):
-            update_num_microbatches(consumed_samples, consistency_check=False)
-            consumed_samples += get_current_global_batch_size()
-            iterations += 1
-        # Reset
-        update_num_microbatches(0, consistency_check=False)
-        # Constant phase
-        # Note that we throw away any partial last batch.
-        if args.train_samples > consumed_samples:
-            iterations += (args.train_samples - consumed_samples) // args.global_batch_size
-        args.train_iters = iterations
+    args.train_iters = args.train_samples // args.global_batch_size
 
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
@@ -2679,7 +2657,6 @@ def train(
         # Then initialize with the correct perform_rl_step=True context
         init_num_microbatches_calculator(
             args.rank,
-            args.rampup_batch_size,
             args.global_batch_size,
             args.micro_batch_size,
             mpu.get_data_parallel_world_size(),
@@ -2935,8 +2912,8 @@ def train(
                 )
             else:
                 assert get_num_microbatches() > num_microbatches, (
-                    f"Number of microbatches should be increasing due to batch size rampup; "
-                    f"instead going from {num_microbatches} to {get_num_microbatches()}"
+                    f"Number of microbatches should not decrease; "
+                    f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
                 if args.save is not None:
                     save_checkpoint_and_time(
