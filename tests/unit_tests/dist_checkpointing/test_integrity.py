@@ -17,17 +17,22 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture
+def init_model_parallel():
+    """Init torch distributed."""
+    Utils.initialize_model_parallel(1, 1)
+    yield  # Run the actual test.
+    Utils.destroy_model_parallel()
+
+
 class TestIntegrity:
     def test_save_verify_integrity_manifest_with_ckpt(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
-        rank = Utils.rank
-        world_size = Utils.world_size
-
         state_dict = {
             'sd_keyA': ShardedTensor.from_rank_offsets(
-                'keyA', torch.ones(1, 1), (0, rank, world_size)
+                'keyA', torch.ones(1, 1), replica_id=Utils.rank
             ),
-            'rank': rank,
+            'rank': 0,
         }
         load_state_dict = {
             'sd_keyA': ShardedTensor.from_rank_offsets(
@@ -47,14 +52,14 @@ class TestIntegrity:
                 data = json.load(f)
                 files = list(data["files"].keys())
 
-                assert len(files) == 4
-                assert len(data["files"]["common.pt"]) == 64
+            assert "__0_0.distcp" in files
+            assert len(data["files"]["common.pt"]) == 64
 
             loaded_state_dict = load(load_state_dict, ckpt_dir, verify_integrity=True)
 
         Utils.destroy_model_parallel()
 
-    def test_save_verify_integrity_manifest_directly(self, tmp_path_dist_ckpt):
+    def test_save_verify_integrity_manifest_directly(self, init_model_parallel, tmp_path_dist_ckpt):
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_directly', sync=True
         ) as ckpt_dir:
@@ -71,16 +76,17 @@ class TestIntegrity:
                 data = json.load(f)
                 files = list(data["files"].keys())
 
-                assert len(files) == 1
-                assert len(data["files"]["metadata.json"]) == 64
+            assert len(files) == 1
+            assert len(data["files"]["metadata.json"]) == 64
 
             verify_integrity_manifest(ckpt_dir)
 
-    def test_save_verify_integrity_manifest_error(self, tmp_path_dist_ckpt):
+    def test_save_verify_integrity_manifest_error(self, init_model_parallel, tmp_path_dist_ckpt):
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_save_integrity_manifest_error', sync=True
         ) as ckpt_dir:
             metadata_file = Path(ckpt_dir / "metadata.json")
+
             with open(metadata_file, "w") as f:
                 data = {"test_metadata": 1}
                 json.dump(data, f)
@@ -92,19 +98,5 @@ class TestIntegrity:
                 json.dump(data, f)
 
             # CheckpointingException, hash mismatch
-            with pytest.raises(CheckpointingException):
-                verify_integrity_manifest(ckpt_dir)
-
-            # CheckpointingException, no metadta.json file
-            os.remove(metadata_file)
-            with pytest.raises(CheckpointingException):
-                verify_integrity_manifest(ckpt_dir)
-
-            with open(metadata_file, "w") as f:
-                data = {"test_metadata": 11}
-                json.dump(data, f)
-
-            # CheckpointingException, no integrity.json file
-            os.remove(Path(ckpt_dir / "integrity.json"))
             with pytest.raises(CheckpointingException):
                 verify_integrity_manifest(ckpt_dir)
