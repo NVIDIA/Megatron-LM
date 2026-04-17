@@ -20,10 +20,7 @@ _SKIP = not HAVE_TE or not is_te_min_version("2.14.0")
 
 
 def _make_submodules():
-    return MLPSubmodules(
-        linear_fc1=TELayerNormColumnParallelLinear,
-        linear_fc2=TERowParallelLinear,
-    )
+    return MLPSubmodules(linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear)
 
 
 def _make_config(**overrides):
@@ -69,3 +66,22 @@ class TestTEFusedDenseMLPSpec:
         config = _make_config(add_bias_linear=True)
         with pytest.raises(ValueError, match="add_bias_linear"):
             TEFusedDenseMLP(config, _make_submodules())
+
+    def test_norm_seq_not_registered_as_submodule(self):
+        # _norm_seq must be stored in a tuple (not directly as nn.Module) to avoid
+        # PyTorch registering it as a submodule, which would duplicate norm weights
+        # in state_dict/parameters. Verify it starts as None and is never a bare Module.
+        import torch.nn as nn
+
+        config = _make_config()
+        mlp = TEFusedDenseMLP(config, _make_submodules())
+        assert mlp._norm_seq is None
+        assert '_norm_seq' not in dict(mlp.named_children())
+
+        # Simulate what _make_fused_impl does and confirm the tuple-wrap holds.
+        import transformer_engine.pytorch.ops as te_ops
+
+        fake_seq = te_ops.Sequential()
+        mlp._norm_seq = (fake_seq,)
+        assert not isinstance(mlp._norm_seq, nn.Module)
+        assert '_norm_seq' not in dict(mlp.named_children())

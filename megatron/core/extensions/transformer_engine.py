@@ -2536,6 +2536,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            self._norm_seq: Optional[Tuple[te.pytorch.ops.Sequential]] = None
             if not is_te_min_version("2.14.0"):
                 raise RuntimeError(
                     f"{self.__class__.__name__} requires Transformer Engine >= 2.14.0 "
@@ -2607,8 +2608,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Store norm in a separate Sequential applied OUTSIDE the MXFP8 autocast
             # in forward(). Running norm inside MXFP8 context corrupts the saved rstd
             # used in RMSNorm backward, causing gradient amplification up to 10^6.
-            self._norm_seq = te.pytorch.ops.Sequential()
-            self._norm_seq.append(op)
+            # Wrapped in tuple to avoid nn.Module submodule registration (which would
+            # duplicate the shared norm weight in state_dict/parameters).
+            norm_seq = te.pytorch.ops.Sequential()
+            norm_seq.append(op)
+            self._norm_seq = (norm_seq,)
 
             # GLU interleave size must match ScaledSwiGLU and the CuTe kernel.
             _GLU_INTERLEAVE_SIZE = 32
@@ -2690,7 +2694,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Apply norm in BF16 OUTSIDE the MXFP8 autocast to preserve the rstd
             # tensor used by RMSNorm backward (running it inside causes up to 10^6
             # gradient amplification, and causes convergence issues).
-            normed = self._norm_seq(hidden_states_2d)
+            normed = self._norm_seq[0](hidden_states_2d)
 
             with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
                 out = self._fused_impl[0](normed, tokens_per_expert, scales, tokens_per_expert)
