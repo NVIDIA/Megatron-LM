@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import torch.nn.functional as F
 import pytest
+import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
