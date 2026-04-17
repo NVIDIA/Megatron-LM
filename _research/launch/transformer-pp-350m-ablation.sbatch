@@ -62,8 +62,11 @@ TP=1
 PP=1
 CP=1
 
+OPTIMIZER=${SWEEP_OPTIMIZER:-adam}
+MUON_SCALE_MODE=${SWEEP_MUON_SCALE_MODE:-spectral}
+
 PROJECT=megatron-lm-research-baseline
-EXP_NAME=transformer-pp-350m-abl-lr${LR}-gbs${GBS}-$(git rev-parse --short HEAD)
+EXP_NAME=transformer-pp-350m-abl-${OPTIMIZER}-lr${LR}-gbs${GBS}-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=transformer-pp
@@ -103,7 +106,7 @@ TRAINING_ARGS=(
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
     --eval-iters 0
-    --optimizer adam
+    --optimizer $OPTIMIZER
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -120,6 +123,14 @@ REGULARIZATION_ARGS=(
     --adam-beta1 0.9
     --adam-beta2 0.95
 )
+
+# Muon-specific args (ignored by adam/sgd).
+MUON_ARGS=()
+if [[ "$OPTIMIZER" == *muon* ]]; then
+    MUON_ARGS=(
+        --muon-scale-mode $MUON_SCALE_MODE
+    )
+fi
 
 LEARNING_RATE_ARGS=(
     --lr $LR
@@ -184,6 +195,7 @@ MEGATRON_ARGS="\
     ${NETWORK_SIZE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
+    ${MUON_ARGS[@]} \
     ${LEARNING_RATE_ARGS[@]} \
     ${INITIALIZATION_ARGS[@]} \
     ${MIXED_PRECISION_ARGS[@]} \
