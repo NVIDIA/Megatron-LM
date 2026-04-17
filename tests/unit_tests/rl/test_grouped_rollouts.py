@@ -73,8 +73,9 @@ class TestGroupedRollouts:
     @pytest.mark.parametrize(
         "num_slow_calls, streaming, num_groups, expected_count, expected_batch_ids",
         [
-            pytest.param(0, False, 1, 8, None, id="non_batched"),
-            pytest.param(4, False, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
+            pytest.param(0, False, 8, 8, None, id="non_batched"),
+            pytest.param(0, False, 4, 4, None, id="non_streaming_fewer_than_parallel"),
+            pytest.param(4, True, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
             pytest.param(0, True, 1, 10, None, id="streaming"),
         ],
     )
