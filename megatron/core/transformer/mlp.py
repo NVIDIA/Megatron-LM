@@ -25,6 +25,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -171,6 +172,7 @@ class MLP(MegatronModule):
         is_expert: bool = False,
         input_size: Optional[int] = None,
         ffn_hidden_size: Optional[int] = None,
+        apply_block_output_init_scaling: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
@@ -204,6 +206,21 @@ class MLP(MegatronModule):
                 fc1_stride = 1
         else:
             fc1_stride = 1
+        model_scaling_policy = build_resolved_model_policy(self.config)
+        fc2_init_method = not_none(self.config.output_layer_init_method)
+        if apply_block_output_init_scaling and not is_expert:
+            fc2_init_method = model_scaling_policy.dense_block_output_init_method(
+                default_init_method=not_none(self.config.output_layer_init_method),
+                init_method_std=self.config.init_method_std,
+                num_layers=self.config.num_layers,
+                is_hybrid_model=self.config.is_hybrid_model,
+                output_layer_init_method_is_user_provided=getattr(
+                    self.config,
+                    '_parameterization_output_layer_init_method_user_provided',
+                    False,
+                ),
+                apply_depth_hook=not is_expert,
+            )
 
         # Use moe_latent_size only for routed experts. 'is_expert' is false for
         # shared_experts.
@@ -234,7 +251,7 @@ class MLP(MegatronModule):
                 self.config.hidden_size if not use_latent_size else self.config.moe_latent_size
             ),
             config=self.config,
-            init_method=not_none(self.config.output_layer_init_method),
+            init_method=fc2_init_method,
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,

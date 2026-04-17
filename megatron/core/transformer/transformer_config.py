@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -11,7 +10,7 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.parameterization import (
-    SCALING_RECIPE_NONE,
+    build_resolved_model_policy,
     build_resolved_scaling_context,
     sync_legacy_mup_fields,
 )
@@ -27,8 +26,6 @@ from ..utils import (
     init_method_normal,
     is_te_min_version,
     is_torch_min_version,
-    mup_scaled_init_method_normal,
-    scaled_init_method_normal,
 )
 
 logger = logging.getLogger(__name__)
@@ -384,8 +381,8 @@ class TransformerConfig(ModelParallelConfig):
 
     scaling_residual_branch_depth_power: Optional[float] = None
     """
-    Relative depth exponent for residual-branch outputs. Added as the first dense-depth
-    proof knob for the generalized scaling framework.
+    Relative depth exponent for dense self-attention/MLP residual-branch outputs.
+    Added as the first dense-depth proof knob for the generalized scaling framework.
     """
 
     scaling_hidden_lr_depth_power: Optional[float] = None
@@ -395,7 +392,8 @@ class TransformerConfig(ModelParallelConfig):
 
     scaling_block_out_proj_init_depth_power: Optional[float] = None
     """
-    Relative depth exponent for block output projection initialization.
+    Relative depth exponent for dense transformer block output projection
+    initialization (self-attention proj and dense MLP fc2).
     """
 
     use_mup: bool = False
@@ -1790,28 +1788,10 @@ class TransformerConfig(ModelParallelConfig):
 
         scaling_context = build_resolved_scaling_context(self)
         sync_legacy_mup_fields(self, scaling_context)
+        model_scaling_policy = build_resolved_model_policy(self)
 
         # MuP (Maximal Update Parameterization) configuration
         if self.use_mup:
-            # Default base_hidden_size to hidden_size (base model case, width_mult=1.0)
-            if self.mup_base_hidden_size is None:
-                self.mup_base_hidden_size = self.hidden_size
-            assert self.mup_base_hidden_size > 0, "--mup-base-hidden-size must be positive."
-            # Compute width multiplier
-            self.mup_width_mult = self.hidden_size / self.mup_base_hidden_size
-
-            # MuP attention scaling: 1/d_head instead of 1/sqrt(d_head).
-            if self.softmax_scale is None:
-                base_head_scale = (
-                    1.0 if self.mup_base_head_dim is None else self.mup_base_head_dim**0.5
-                )
-                self.softmax_scale = base_head_scale / (self.kv_channels**self.mup_attn_scale_power)
-
-            # MuP output scaling: scale logits by 1/width_mult to keep outputs O(1).
-            # Only auto-set if user hasn't explicitly configured it.
-            if self.mup_output_mult == 1.0 and self.mup_width_mult != 1.0:
-                self.mup_output_mult = 1.0 / self.mup_width_mult
-
             overridden_init_methods = []
             if self.init_method is not None:
                 overridden_init_methods.append("init_method")
@@ -1826,6 +1806,23 @@ class TransformerConfig(ModelParallelConfig):
                     + f" {verb} set. This may break MuP initialization assumptions.",
                     UserWarning,
                 )
+
+        self._parameterization_output_layer_init_method_user_provided = (
+            self.output_layer_init_method is not None
+        )
+        if (
+            self._parameterization_output_layer_init_method_user_provided
+            and model_scaling_policy.dense_block_out_proj_init_multiplier != 1.0
+        ):
+            warnings.warn(
+                "Custom output_layer_init_method is set, so dense block output projection "
+                "depth scaling will be ignored.",
+                UserWarning,
+            )
+        self.softmax_scale = model_scaling_policy.resolve_attention_softmax_scale(
+            softmax_scale=self.softmax_scale,
+            kv_channels=self.kv_channels,
+        )
 
         # Set the embedding init method.
         # NOTE: This block must run AFTER the MuP block above but BEFORE the init_method
@@ -1850,29 +1847,16 @@ class TransformerConfig(ModelParallelConfig):
                 self.embedding_init_method = self.init_method
 
         if self.init_method is None:
-            if self.use_mup:
-                # MuP: scale std by 1/sqrt(width_mult).
-                self.init_method = init_method_normal(
-                    self.init_method_std / math.sqrt(self.mup_width_mult)
-                )
-            else:
-                self.init_method = init_method_normal(self.init_method_std)
+            self.init_method = model_scaling_policy.build_hidden_init_method(
+                init_method_std=self.init_method_std
+            )
 
         if self.output_layer_init_method is None:
-            if self.use_mup:
-                # MuP: depth and width scaling for output layers.
-                self.output_layer_init_method = mup_scaled_init_method_normal(
-                    self.init_method_std,
-                    self.num_layers,
-                    self.mup_width_mult,
-                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
-                )
-            else:
-                self.output_layer_init_method = scaled_init_method_normal(
-                    self.init_method_std,
-                    self.num_layers,
-                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
-                )
+            self.output_layer_init_method = model_scaling_policy.build_default_output_layer_init_method(
+                init_method_std=self.init_method_std,
+                num_layers=self.num_layers,
+                is_hybrid_model=self.is_hybrid_model,
+            )
 
         if self.num_moe_experts is not None and self.add_bias_linear:
             assert (

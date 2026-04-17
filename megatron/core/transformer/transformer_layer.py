@@ -15,6 +15,7 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -301,6 +302,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+        self.model_scaling_policy = build_resolved_model_policy(config)
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -381,11 +383,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     pg_collection, 'tp'
                 ), 'TP process group is required for MLP in TransformerLayer'
                 additional_mlp_kwargs["tp_group"] = pg_collection.tp
+                additional_mlp_kwargs["apply_block_output_init_scaling"] = True
             elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
                 assert hasattr(
                     pg_collection, 'tp'
                 ), 'TP process group is required for TEFusedMLP in TransformerLayer'
                 additional_mlp_kwargs["tp_group"] = pg_collection.tp
+                additional_mlp_kwargs["apply_block_output_init_scaling"] = True
             else:
                 log_single_rank(
                     logger,
@@ -636,6 +640,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
+        attention_output_with_bias = self._scale_dense_residual_branch_output(
+            attention_output_with_bias,
+            branch_name="self attention",
+            using_fused_tp_inference_kernel=using_fused_tp_inference_kernel,
+        )
         if using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
@@ -691,6 +700,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         return hidden_states, context
+
+    def _scale_dense_residual_branch_output(
+        self,
+        output_with_bias: tuple[Tensor, Tensor | None],
+        *,
+        branch_name: str,
+        using_fused_tp_inference_kernel: bool,
+        apply_depth_hook: bool = True,
+    ) -> tuple[Tensor, Tensor | None]:
+        if not apply_depth_hook:
+            return output_with_bias
+        if self.model_scaling_policy.residual_branch_multiplier == 1.0:
+            return output_with_bias
+        if using_fused_tp_inference_kernel:
+            raise NotImplementedError(
+                f"Residual-branch scaling is not supported with fused TP inference for {branch_name}."
+            )
+        return self.model_scaling_policy.scale_residual_branch_output(output_with_bias)
 
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
@@ -868,6 +895,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
+        mlp_output_with_bias = self._scale_dense_residual_branch_output(
+            mlp_output_with_bias,
+            branch_name="mlp",
+            using_fused_tp_inference_kernel=using_fused_tp_inference_kernel,
+            apply_depth_hook=not self.is_moe_layer,
+        )
         if using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
