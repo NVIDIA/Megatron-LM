@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
+
 
 @dataclass(kw_only=True)
 class RerunStateMachineConfig:
@@ -40,3 +41,35 @@ class StragglerDetectionConfig:
     disable_straggler_on_startup: bool = False
     """If set, StragglerDetector is disabled on startup."""
 
+
+@dataclass(kw_only=True)
+class FaultInjectorConfig:
+    """Configuration for fault injection testing via nvidia_resiliency_ext."""
+
+    fault_injector_ranks: Optional[str] = None
+    """Comma-separated list of ranks to inject faults on."""
+
+    fault_injector_num_ranks: Optional[int] = None
+    """Number of ranks to inject faults on (random selection)."""
+
+    fault_injector_fault_types: Optional[str] = None
+    """Comma-separated list of fault types to inject (e.g. 'hang,crash')."""
+
+    fault_injector_fault_probabilities: Optional[str] = None
+    """Comma-separated list of fault probabilities (normalized at runtime)."""
+
+    fault_injector_fault_delay: Optional[float] = None
+    """Force a specific fault delay in seconds from training start or delay_start_iteration."""
+
+    fault_injector_delay_start_iteration: Optional[int] = None
+    """Start the fault delay timer after iteration N completes.
+    If unset, fault delay timing starts from the beginning of training."""
+
+    fault_injector_mtti_seconds: Optional[float] = None
+    """Mean time to inject (MTTI) in seconds; used when fault_delay is None."""
+
+    fault_injector_offset_seconds: Optional[float] = None
+    """Offset seconds added to the sampled fault delay."""
+
+    fault_injector_seed: Optional[int] = None
+    """RNG seed for the fault injector."""
