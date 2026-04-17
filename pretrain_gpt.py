@@ -403,6 +403,14 @@ if __name__ == "__main__":
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
+    # Research logging patch (JSONL writer, act stats, phase timer, MFU, top-1).
+    # No-op if _research/ is not on PYTHONPATH.
+    try:
+        from _research.logging_patch import install as _research_install
+        _research_install()
+    except ImportError:
+        pass
+
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
