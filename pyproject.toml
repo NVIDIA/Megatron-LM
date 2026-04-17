@@ -23,7 +23,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "megatron-core"
 dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "Apache 2.0" }
 dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
@@ -202,10 +202,10 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "71bbefbf153418f943640df0f7373625dc93fa46" }
-nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
-emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "v0.5.0" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
+nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
+emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
@@ -234,7 +234,7 @@ exclude = '''
 '''
 
 [tool.pytest.ini_options]
-addopts = "--durations=15 -s -rA -x"
+addopts = "--durations=15 -s -rA"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [

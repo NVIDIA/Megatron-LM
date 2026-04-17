@@ -571,14 +571,19 @@ class MambaMixer(MegatronModule):
         MambaMetadata.update() to avoid .item() calls and data-dependent
         control flow, enabling CUDA graph compatibility.
 
+        When padded_prefill_count > 0 but real_prefill_count == 0 (e.g. a
+        decode-only rank in expert parallelism that must match a mixed CUDA
+        graph), this function still executes the full kernel path.
+        The metadata reflects zero-length sequences (cu_seqlens all equal,
+        batch_indices all -1) so kernels produce a zero output tensor of the
+        correct padded shape, which is required by the merge logic in
+        _dynamic_inference.
+
         Intermediate state extraction (for Mamba prefix caching) is performed
         inside _ssm_prefill via pre-allocated output buffers, making it fully
         CUDA graph compatible.
         """
         metadata = context.mamba_metadata
-        real_prefill_count = context.batch_dimensions.prefill_req_count
-        if real_prefill_count <= 0:
-            return None
 
         # Use precomputed metadata (no .item() calls, no stripping).
         cu_seqlens = metadata.cu_seqlens
