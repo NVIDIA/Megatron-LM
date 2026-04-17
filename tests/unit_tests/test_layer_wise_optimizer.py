@@ -10,9 +10,8 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -118,19 +117,14 @@ class TestLayerWiseOptimizer:
             use_distributed_optimizer=False,
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=use_layer_wise,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=use_layer_wise,
-            pg_collection=pg_collection,
-        )
+        optimizer = get_megatron_optimizer(optimizer_config, [model], pg_collection=pg_collection)
         return model, optimizer, pg_collection
 
     def create_model_and_optimizer_with_overlap_param_gather(
@@ -139,14 +133,14 @@ class TestLayerWiseOptimizer:
         clip_grad=1.0,
         model_kwargs=None,
         copy_from=None,
-        async_allgather=True,
+        overlap_param_gather=True,
         grad_reduce_in_fp32=False,
         bucket_size=None,
     ):
         """Create model, DDP wrapper, and optimizer with overlap-param-gather enabled.
 
         This variant sets overlap_param_gather=True in DDP config and uses
-        get_megatron_muon_optimizer with layer_wise_distributed_optimizer=True,
+        get_megatron_optimizer with layer_wise_distributed_optimizer=True,
         enabling the bucket-based async param gather path.
 
         Args:
@@ -154,7 +148,7 @@ class TestLayerWiseOptimizer:
             clip_grad: Optional gradient clipping value
             model_kwargs: Optional kwargs for model initialization
             copy_from: Optional DDP model to copy weights from
-            async_allgather: If True, defer param all-gather to bucket infrastructure
+            overlap_param_gather: If True, defer param all-gather to bucket infrastructure
             grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
             bucket_size: Maximum number of parameters per bucket (None = single bucket)
 
@@ -189,19 +183,19 @@ class TestLayerWiseOptimizer:
             bf16=True,
             use_distributed_optimizer=False,
             clip_grad=clip_grad,
-            overlap_param_gather=async_allgather,
+            overlap_param_gather=overlap_param_gather,
             muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=True,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        optimizer = get_megatron_muon_optimizer(
+        optimizer = get_megatron_optimizer(
             config=optimizer_config,
             model_chunks=[model],
             use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=True,
             pg_collection=pg_collection,
         )
         return model, optimizer, pg_collection
@@ -350,8 +344,34 @@ class TestLayerWiseOptimizer:
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer()
 
-        # get_megatron_muon_optimizer produces muon + adam chained optimizers
-        assert len(optimizer.chained_optimizers) >= 2, "Should have multiple chained optimizers"
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+
+        optimizer_config = OptimizerConfig(
+            optimizer='adam', lr=0.01, bf16=True, use_distributed_optimizer=False
+        )
+
+        # Split parameters into two groups for testing multiple optimizers
+        params = list(model.parameters())
+        mid_point = len(params) // 2
+        param_groups_1 = [{'params': params[:mid_point]}]
+        param_groups_2 = [{'params': params[mid_point:]}]
+
+        # Create two separate plain base optimizers (LayerWise wraps them itself)
+        base_optimizer_1 = torch.optim.Adam(param_groups_1, lr=optimizer_config.lr)
+        base_optimizer_2 = torch.optim.Adam(param_groups_2, lr=optimizer_config.lr)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+
+        optimizer = LayerWiseDistributedOptimizer(
+            [base_optimizer_1, base_optimizer_2], optimizer_config, pg_collection
+        )
+
+        assert len(optimizer.chained_optimizers) == 2, "Should have two chained optimizers"
 
         # Set gradients and test optimizer step - this will trigger allgather
         for param in model.parameters():
@@ -391,7 +411,7 @@ class TestLayerWiseOptimizer:
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        # Create muon optimizer (non-layer-wise) — produces Float16-wrapped chained optimizers
+        # Create optimizer (non-layer-wise) — produces Float16-wrapped chained optimizers
         optimizer_config = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
@@ -399,12 +419,8 @@ class TestLayerWiseOptimizer:
             use_distributed_optimizer=False,
             muon_tp_mode="duplicated",
         )
-        muon_optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=False,
-            pg_collection=pg_collection,
+        muon_optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
 
         # Extract a Float16-wrapped chained optimizer
@@ -412,7 +428,6 @@ class TestLayerWiseOptimizer:
         assert isinstance(wrapped_optimizer, Float16OptimizerWithFloat16Params)
 
         # Should raise TypeError when receiving already-wrapped Float16 optimizer
-        # Use a fresh config since get_megatron_muon_optimizer mutates config.optimizer
         lw_config = OptimizerConfig(
             optimizer='muon', lr=0.01, bf16=True, use_distributed_optimizer=False
         )
@@ -516,7 +531,7 @@ class TestLayerWiseOptimizer:
         )
 
         assert optimizer is not None, "Optimizer should not be None"
-        assert optimizer.async_allgather, "async_allgather should be True"
+        assert optimizer.overlap_param_gather, "overlap_param_gather should be True"
 
         reference_model = self.create_reference_model(model)
 
@@ -525,7 +540,7 @@ class TestLayerWiseOptimizer:
         loss = output.sum()
         loss.backward()
 
-        # step() updates local params but skips allgather (async_allgather=True)
+        # step() updates local params but skips allgather (overlap_param_gather=True)
         update_successful, grad_norm, num_zeros = optimizer.step()
 
         assert update_successful, "Optimizer step should be successful"
@@ -576,7 +591,7 @@ class TestLayerWiseOptimizer:
             param.main_grad = grad_value.clone().detach()
             ref_param.main_grad = grad_value.clone().detach()
 
-        # step() with async_allgather=True: updates but no allgather
+        # step() with overlap_param_gather=True: updates but no allgather
         optimizer.step()
         # Manually sync params via bucket infrastructure
         model.start_param_sync(force_sync=True)
@@ -591,17 +606,17 @@ class TestLayerWiseOptimizer:
         """Key correctness test: overlap path and sync allgather produce identical updates.
 
         Compares:
-        - Overlap path: async_allgather=True, bucket-based param sync
-        - Sync path: async_allgather=False, optimizer.allgather_params() in step()
+        - Overlap path: overlap_param_gather=True, bucket-based param sync
+        - Sync path: overlap_param_gather=False, optimizer.allgather_params() in step()
         """
         # Create overlap model
         overlap_model, overlap_optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+            self.create_model_and_optimizer_with_overlap_param_gather(overlap_param_gather=True)
         )
 
         # Create sync model with same weights (overlap_param_gather=True but sync allgather)
         sync_model, sync_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=overlap_model
+            overlap_param_gather=False, copy_from=overlap_model
         )
 
         # Verify initial parameters match
@@ -633,7 +648,7 @@ class TestLayerWiseOptimizer:
             )
 
     def test_overlap_param_gather_bucket_lw_params(self):
-        """Verify bucket.layerwise_params_list is populated when async_allgather is enabled."""
+        """Verify bucket.layerwise_params_list is populated when overlap_param_gather is enabled."""
         model, optimizer, pg_collection = (
             self.create_model_and_optimizer_with_overlap_param_gather()
         )
@@ -680,7 +695,7 @@ class TestLayerWiseOptimizer:
         """
         # Create overlap-param-gather model (sync allgather for simpler comparison)
         opg_model, opg_optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=False)
+            self.create_model_and_optimizer_with_overlap_param_gather(overlap_param_gather=False)
         )
 
         # Create standard model with same weights
@@ -741,13 +756,13 @@ class TestLayerWiseOptimizer:
     def test_overlap_param_gather_broadcast_vs_allgather(self):
         """Test overlap-param-gather: allgather vs broadcast produce same results."""
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            model_class=SimpleModel, async_allgather=False
+            model_class=SimpleModel, overlap_param_gather=False
         )
 
         # Create reference model with overlap-param-gather path too
         reference_model, reference_optimizer, _ = (
             self.create_model_and_optimizer_with_overlap_param_gather(
-                model_class=SimpleModel, async_allgather=False, copy_from=model
+                model_class=SimpleModel, overlap_param_gather=False, copy_from=model
             )
         )
 
@@ -786,12 +801,12 @@ class TestLayerWiseOptimizer:
         model using the sync path.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=True
+            overlap_param_gather=True
         )
 
         # Create reference model with sync allgather for comparison
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model
         )
 
         for iteration in range(3):
@@ -826,10 +841,10 @@ class TestLayerWiseOptimizer:
         finish_param_sync() waits on the handle and unflattens gathered params.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=True
+            overlap_param_gather=True
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model
         )
 
         # Set identical gradients on both models
@@ -878,7 +893,7 @@ class TestLayerWiseOptimizer:
         only the last bucket group and verifies that finishing it chains to the next.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=True, bucket_size=2000
+            overlap_param_gather=True, bucket_size=2000
         )
 
         bucket_groups = model.bucket_groups
@@ -886,7 +901,7 @@ class TestLayerWiseOptimizer:
             pytest.skip("Need multiple bucket groups to test chaining")
 
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=model, bucket_size=2000
+            overlap_param_gather=False, copy_from=model, bucket_size=2000
         )
 
         # Set identical gradients on both models
@@ -939,10 +954,10 @@ class TestLayerWiseOptimizer:
         call finish_param_sync() on each bucket group, completing the param sync.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=True
+            overlap_param_gather=True
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model
         )
 
         # Set identical gradients on both models
@@ -981,10 +996,10 @@ class TestLayerWiseOptimizer:
         would cause a dtype mismatch error in the per-rank broadcast calls.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=True, grad_reduce_in_fp32=True
+            overlap_param_gather=True, grad_reduce_in_fp32=True
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=model, grad_reduce_in_fp32=True
+            overlap_param_gather=False, copy_from=model, grad_reduce_in_fp32=True
         )
 
         # Set identical gradients on both models
@@ -1018,10 +1033,10 @@ class TestLayerWiseOptimizer:
         then enables them for subsequent iterations. This test exercises that cycle.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=True
+            overlap_param_gather=True
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model
         )
 
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
@@ -1081,10 +1096,10 @@ class TestLayerWiseOptimizer:
         allgather after each iteration.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=True
+            overlap_param_gather=True
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model
         )
 
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
@@ -1131,10 +1146,10 @@ class TestLayerWiseOptimizer:
         next bucket group.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=True
+            overlap_param_gather=True
         )
         ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
-            async_allgather=False, copy_from=model
+            overlap_param_gather=False, copy_from=model
         )
 
         # Confirm params require grad (the precondition for this bug).

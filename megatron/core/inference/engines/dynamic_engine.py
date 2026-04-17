@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import multiprocessing
 import socket
 import struct
@@ -18,10 +19,10 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
-from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
@@ -60,6 +61,8 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    nvtx_range_pop,
+    nvtx_range_push,
     trace_async_exceptions,
 )
 
@@ -212,12 +215,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.num_speculative_tokens > 0:
             assert (
-                self.num_speculative_tokens <= self.controller.num_mtp_heads
+                model_config.mtp_use_repeated_layer
+                or self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
-            assert (
-                not self.materialize_only_last_token_logits
-            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
-
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -426,6 +426,7 @@ class DynamicInferenceEngine(AbstractEngine):
         inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
+        hostname: str | None = None,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
@@ -463,6 +464,9 @@ class DynamicInferenceEngine(AbstractEngine):
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+            hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
+                If None, defaults to `socket.gethostname()`. Should be set to a routable
+                address in multi-node settings where gethostname() may return 127.0.0.1.
 
         Returns:
             inference_coordinator_addresss (str): The network address of the central
@@ -495,7 +499,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
-        local_ip = socket.gethostname()
+        local_ip = hostname or socket.gethostname()
 
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
@@ -505,18 +509,21 @@ class DynamicInferenceEngine(AbstractEngine):
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
-                args=(
-                    dp_process_pipe,
-                    coordinator_ready_event,
-                    get_pg_size(self.pg_collection.dp),
-                    self.controller.tokenizer,
-                    inference_coordinator_port,
-                    deterministic_mode,
-                    self.context.block_size_tokens,
-                    self.context.enable_prefix_caching,
-                    self.context.prefix_caching_coordinator_policy,
-                    coordinator_schedule_output_path,
-                ),
+                kwargs={
+                    "pipe_connection": dp_process_pipe,
+                    "ready_event": coordinator_ready_event,
+                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    "tokenizer": self.controller.tokenizer,
+                    "max_requests": self.context.max_requests,
+                    "inference_coordinator_port": inference_coordinator_port,
+                    "deterministic_mode": deterministic_mode,
+                    "block_size_tokens": self.context.block_size_tokens,
+                    "enable_prefix_caching": self.context.enable_prefix_caching,
+                    "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
+                    "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "schedule_output_path": coordinator_schedule_output_path,
+                    "hostname": hostname,
+                },
             )
             self.inference_coordinator_process.start()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
@@ -601,13 +608,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.ep
+                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
         if total_world_size > 1:
-            self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+            self.world_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=None, hostname=hostname
+            )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
@@ -642,14 +651,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
-            range_push(f"{key}-inference-context")
+            nvtx_range_push(f"{key}-inference-context")
             torch.cuda.synchronize()
 
             yield
 
         finally:
 
-            range_pop()
+            nvtx_range_pop(f"{key}-inference-context")
             end_time = time.time()
 
             end_mem = torch.cuda.memory_stats()
@@ -932,6 +941,16 @@ class DynamicInferenceEngine(AbstractEngine):
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
+        # Check that the KV cache has enough blocks for this request's max sequence length.
+        max_request_tokens = (
+            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
+        )
+        request_block_count = math.ceil(max_request_tokens / self.context.block_size_tokens)
+        total_blocks = self.context.kv_block_allocator.total_count - 1  # -1 for dummy block
+        if request_block_count > total_blocks:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(BlockOverflowError(request_id))
+
         # Tokenize stop words if provided
         if request.sampling_params.stop_words:
             stop_word_ids = [
@@ -1096,10 +1115,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     len(request.generated_tokens) + len(tokens)
                     >= request.sampling_params.num_tokens_to_generate
                 ):
-                    tokens = tokens[
-                        : request.sampling_params.num_tokens_to_generate
-                        - len(request.generated_tokens)
-                    ]
+                    keep = request.sampling_params.num_tokens_to_generate - len(
+                        request.generated_tokens
+                    )
+                    tokens = tokens[:keep]
+                    # Trim log probs / top-n to match so the counts stay in sync.
+                    if request_log_probs is not None:
+                        request_log_probs = request_log_probs[:keep]
+                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1190,7 +1214,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
-            if request_log_probs is not None:
+            # Skip for requests being finished due to stop words — tokens are not
+            # appended for these requests, so log probs must also be skipped to keep
+            # the two lists in sync.
+            if (
+                request_log_probs is not None
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []
@@ -1223,7 +1253,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_log_probs.extend(request_log_probs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
-            if top_n_logprobs is not None and req_idx in top_n_logprobs:
+            # Same stop-word guard as log probs above.
+            if (
+                top_n_logprobs is not None
+                and req_idx in top_n_logprobs
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if request.prompt_top_n_logprobs is None:
                     request.prompt_top_n_logprobs = []
@@ -1622,7 +1657,7 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
         # Generate tokens.
-        range_push("Prefill" if not is_decode_only else "Decode")
+        nvtx_range_push("Prefill" if not is_decode_only else "Decode")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
@@ -1634,7 +1669,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
-        range_pop()
+        nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
         if (
             self.logging_step_interval > 0
@@ -1681,7 +1716,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
         # Increment finished_request_count.
-        range_push("bookkeeping")
+        nvtx_range_push("bookkeeping")
         cuda_graph_request_count = None
 
         if step_result is not None:
@@ -1730,13 +1765,13 @@ class DynamicInferenceEngine(AbstractEngine):
             ), f"Failed request {failed_request_id} future has not been properly resolved."
         self.failed_request_ids.clear()
 
-        range_pop()
+        nvtx_range_pop("bookkeeping")
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will
         # overlap detokenization with the engine.
         if not self.use_coordinator:
-            range_push("detokenization")
+            nvtx_range_push("detokenization")
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
@@ -1750,7 +1785,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_tokens,
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
-            range_pop()
+            nvtx_range_pop("detokenization")
 
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,
@@ -1760,13 +1795,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
             if records_to_send:
-                range_push("coordinator_communication")
+                nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
                     [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
                     use_bin_type=True,
                 )
                 self.socket_for_receiving_requests.send(payload)
-                range_pop()
+                nvtx_range_pop("coordinator_communication")
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
@@ -2006,7 +2041,7 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
-        range_push("drain_zmq_socket")
+        nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
             while True:
@@ -2039,7 +2074,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 all_messages = []
 
-        range_pop()
+        nvtx_range_pop("drain_zmq_socket")
 
         # First pass: add requests.
         # Control signals are queued for the second pass.
@@ -2050,9 +2085,9 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                range_push("add_request")
+                nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
-                range_pop()
+                nvtx_range_pop("add_request")
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:
@@ -2196,7 +2231,7 @@ class DynamicInferenceEngine(AbstractEngine):
             (global_work, all_pausing): max work across EP, and whether
             all peers signaled consensus.
         """
-        range_push("_ep_establish_consensus")
+        nvtx_range_push("_ep_establish_consensus")
 
         consensus_val = -1 if signal_consensus else 0
 
@@ -2221,7 +2256,7 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             global_work, global_consensus = local_work, consensus_val
 
-        range_pop()
+        nvtx_range_pop("_ep_establish_consensus")
         return global_work, global_consensus == -1
 
     async def _world_barrier(self):
@@ -2233,12 +2268,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         No-op when world_size == 1 (communicator is not created).
         """
-        range_push("world_barrier")
+        nvtx_range_push("world_barrier")
         if hasattr(self, 'world_zmq_communicator'):
             await self.world_zmq_communicator.all_reduce_max(
                 1, async_op=(not self.use_synchronous_zmq_collectives)
             )
-        range_pop()
+        nvtx_range_pop("world_barrier")
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(

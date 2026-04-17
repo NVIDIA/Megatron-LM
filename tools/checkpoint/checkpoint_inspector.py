@@ -1,17 +1,22 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# python checkpoint_inspector.py inspect /path/to/checkpoint
-# torchrun --nproc_per_node=8 --nnodes=1 checkpoint_inspector.py convert-torch-dist-to-fsdp-dtensor /path/to/input_checkpoint /path/to/output_checkpoint --swiglu
+# Usage examples:
+#   python checkpoint_inspector.py inspect /path/to/checkpoint
+#
+#   torchrun --nproc_per_node=8 --nnodes=1 checkpoint_inspector.py \
+#       convert-torch-dist-to-fsdp-dtensor \
+#       /path/to/input_checkpoint /path/to/output_checkpoint \
+#       --swiglu-modules language_model --rename-mtp-keys
 import gc
 import io
 import json
 import os
-from pathlib import Path
-import time
 import re
 import shutil
-from typing import Optional
 import tempfile
+import time
+from pathlib import Path
+from typing import Optional
 
 import click
 import torch
@@ -24,26 +29,19 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
 )
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
-from torch.distributed.checkpoint.metadata import (
-    BytesStorageMetadata,
-    TensorStorageMetadata,
-)
+from torch.distributed.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_saver import _save_state_dict
 from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, gather_uneven_dtensor_to_full_tensor
-
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-)
+from megatron.core.dist_checkpointing.strategies.common import load_common
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
-from megatron.core.dist_checkpointing.strategies.torch import (
-    TorchDistLoadShardedStrategy,
-)
-from megatron.core.dist_checkpointing.validation import (
-    verify_checkpoint_and_load_strategy,
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
+from megatron.core.dist_checkpointing.validation import verify_checkpoint
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    redistribute_uneven_dtensor_to_replicated,
+    split_dtensor,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature
 
@@ -69,7 +67,9 @@ def cli():
 @cli.command()
 @click.argument("checkpoint_dir", type=click.Path(exists=True))
 @click.option("--enable-msc", is_flag=True, help="Enable MultiStorageClient feature.")
-@click.option("--not-ignore-param-to-group-meta", is_flag=True, help="Ignore parameter-to-group metadata.")
+@click.option(
+    "--not-ignore-param-to-group-meta", is_flag=True, help="Ignore parameter-to-group metadata."
+)
 def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
     """Inspect a Megatron Core Distributed Checkpoint"""
     ckpt_path = Path(checkpoint_dir)
@@ -81,34 +81,24 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
     metadata_json = ckpt_path / "metadata.json"
     if not metadata_json.exists():
         click.echo(
-            click.style(
-                "Metadata file not found in the checkpoint directory.",
-                fg="red",
-                bold=True,
-            )
+            click.style("Metadata file not found in the checkpoint directory.", fg="red", bold=True)
         )
     else:
         metadata_json = json.loads(metadata_json.read_text())
         print_header("checkpoint metadata", "blue")
-        click.echo(
-            click.style(json.dumps(metadata_json, indent=2), fg="bright_magenta")
-        )
+        click.echo(click.style(json.dumps(metadata_json, indent=2), fg="bright_magenta"))
 
     try:
         # Strategies initialization
-        sharded_strategy = get_default_load_sharded_strategy(checkpoint_dir)
+        sharded_strategy = TorchDistLoadShardedStrategy()
         sharded_strategy = FullyParallelLoadStrategyWrapper(sharded_strategy)
-        sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
-            checkpoint_dir, sharded_strategy, common_strategy=None
-        )
+        verify_checkpoint(checkpoint_dir)
         assert isinstance(
             sharded_strategy.base_strategy, TorchDistLoadShardedStrategy
-        ), click.style(
-            f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True
-        )
+        ), click.style(f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True)
 
         # Common state section
-        common_state = common_strategy.load_common(checkpoint_dir)
+        common_state = load_common(checkpoint_dir)
         print_header(f"common state ({len(common_state)} items)", "cyan")
         for key, value in common_state.items():
             bullet = click.style("•", fg="magenta")
@@ -116,17 +106,14 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
                 f"  {bullet} {click.style(key, fg='green')}: {click.style(str(value), fg='white')}"
             )
     except:
-        click.echo(
-            click.style("Failed to load checkpoint strategies.", fg="red", bold=True)
-        )
+        click.echo(click.style("Failed to load checkpoint strategies.", fg="red", bold=True))
 
     # Tensor metadata section
     reader = FileSystemReader(ckpt_path)
     metadata = reader.read_metadata()
-    total_tensors = len([
-        v for v in metadata.state_dict_metadata.values()
-        if isinstance(v, TensorStorageMetadata)
-    ])
+    total_tensors = len(
+        [v for v in metadata.state_dict_metadata.values() if isinstance(v, TensorStorageMetadata)]
+    )
     total_elements = sum(
         v.size.numel()
         for v in metadata.state_dict_metadata.values()
@@ -135,12 +122,8 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
 
     print_header("sharded tensors metadata", "yellow")
     stats = [
-        click.style(
-            f"Total Tensors: {total_tensors}", fg="bright_magenta"
-        ),
-        click.style(
-            f"Total Elements: {total_elements / 1e9:.2f}B", fg="bright_magenta"
-        ),
+        click.style(f"Total Tensors: {total_tensors}", fg="bright_magenta"),
+        click.style(f"Total Elements: {total_elements / 1e9:.2f}B", fg="bright_magenta"),
     ]
     click.echo(" | ".join(stats) + "\n")
 
@@ -160,12 +143,13 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
                 continue
             click.echo(f"  {bullet} {key_styled} {click.style('[BYTES]', fg='yellow')}")
         else:
-            click.echo(
-                f"  {bullet} {key_styled} {click.style('[UNKNOWN TYPE]', fg='red')}"
-            )
+            click.echo(f"  {bullet} {key_styled} {click.style('[UNKNOWN TYPE]', fg='red')}")
     if ignore_param_to_group_meta:
         click.echo(
-            click.style(f"Ignored parameter-to-group metadata: {ignore_param_to_group_meta_count}", fg="yellow")
+            click.style(
+                f"Ignored parameter-to-group metadata: {ignore_param_to_group_meta_count}",
+                fg="yellow",
+            )
         )
 
     # MCore data section
@@ -178,9 +162,7 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
                 f"  {bullet} {click.style(key, fg='blue')}: {click.style(str(value), fg='white')}"
             )
     except:
-        click.echo(
-            click.style("No MCore data found in the checkpoint.", fg="red", bold=True)
-        )
+        click.echo(click.style("No MCore data found in the checkpoint.", fg="red", bold=True))
         pass
 
 
@@ -198,9 +180,7 @@ def print_tensor(checkpoint_dir, key):
     print_header("tensor metadata", "green")
     if key not in metadata.state_dict_metadata:
         click.echo(
-            click.style(
-                f"Key '{key}' not found in checkpoint metadata.", fg="red", bold=True
-            )
+            click.style(f"Key '{key}' not found in checkpoint metadata.", fg="red", bold=True)
         )
         return
 
@@ -208,9 +188,7 @@ def print_tensor(checkpoint_dir, key):
     if isinstance(tensor_metadata, TensorStorageMetadata):
         click.echo(click.style(f"Key: {key}", fg="blue"))
         click.echo(click.style(f"Shape: {tensor_metadata.size}", fg="cyan"))
-        click.echo(
-            click.style(f"Dtype: {tensor_metadata.properties.dtype}", fg="magenta")
-        )
+        click.echo(click.style(f"Dtype: {tensor_metadata.properties.dtype}", fg="magenta"))
     elif isinstance(tensor_metadata, BytesStorageMetadata):
         click.echo(click.style(f"Key: {key} (Bytes Storage)", fg="blue"))
     else:
@@ -265,9 +243,7 @@ def check_gpu_memory(threshold=0.9):
     near_full = allocated_ratio >= threshold or reserved_ratio >= threshold
 
     if near_full and torch.distributed.get_rank() == 0:
-        print(
-            f"GPU Memory: Allocated: {allocated_ratio:.2%}, Reserved: {reserved_ratio:.2%}"
-        )
+        print(f"GPU Memory: Allocated: {allocated_ratio:.2%}, Reserved: {reserved_ratio:.2%}")
     return near_full
 
 
@@ -316,9 +292,7 @@ class VerboseLoadPlanner(DefaultLoadPlanner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def set_up_planner(
-        self, state_dict, metadata, is_coordinator: bool = False
-    ) -> None:
+    def set_up_planner(self, state_dict, metadata, is_coordinator: bool = False) -> None:
         self.__total_items = len(state_dict)
         self.__resolve_items = {}
         super().set_up_planner(state_dict, metadata, is_coordinator)
@@ -342,8 +316,51 @@ def convert_checkpoint(
     optimizer_state_prefix="optimizer.state.module.module.module",
     model_weight_prefix="model.module",
     param_to_param_group_map={},
+    rename_mtp_keys=False,
+    swiglu_modules=None,
 ):
-    """Convert a Megatron Core Distributed Checkpoint from torch_dist to standard fsdp_dtensor format."""
+    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
+
+    \b
+    Model-specific flags
+    ====================
+    Different model architectures require different conversion flags.
+    Use the table below to determine which flags your model needs:
+
+    \b
+      Flag               When to use                              Auto-detected?
+      ─────────────────  ───────────────────────────────────────  ──────────────
+      --swiglu-modules   Model uses SWiGLU activation in MLP.     No (manual).
+                         Check HuggingFace config for              Specify which
+                         "hidden_act": "silu" + gate_proj.         modules use it.
+      --swiglu           Same as above, but applies globally       No (manual).
+                         to ALL modules. Use --swiglu-modules
+                         if only some modules use SWiGLU.
+      --rename-mtp-keys  Model uses Multi-Token Prediction          YES.
+                         (MTP) with 'transformer_layer' naming
+                         in the torch_dist checkpoint.
+
+    \b
+    Auto-detection: --rename-mtp-keys is auto-detected from checkpoint keys
+    if not explicitly set. --swiglu / --swiglu-modules must always be specified
+    manually because SWiGLU and GeLU MLP weights are indistinguishable in the
+    MCore torch_dist format.
+
+    \b
+    Examples
+    ========
+    Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu-modules language_model
+
+    Model with SWiGLU in all modules, no GDN/MTP:
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu
+    """
     device_mesh = DeviceMesh.from_group(process_group, device_type="cuda")
 
     # 1. Initialize state_dict with proper metadata
@@ -353,14 +370,11 @@ def convert_checkpoint(
     for key, md in metadata.state_dict_metadata.items():
         if isinstance(md, TensorStorageMetadata):
             # Initialize tensor storage
-            assert len(md.size) > 0, (
-                f"Expected size for key '{key}' to be non-empty, got {md.size}."
-            )
+            assert (
+                len(md.size) > 0
+            ), f"Expected size for key '{key}' to be non-empty, got {md.size}."
             state_dict[key] = torch.distributed.tensor.empty(
-                md.size,
-                dtype=md.properties.dtype,
-                device_mesh=device_mesh,
-                placements=[Shard(0)],
+                md.size, dtype=md.properties.dtype, device_mesh=device_mesh, placements=[Shard(0)]
             )
         elif isinstance(md, BytesStorageMetadata):
             # Initialize bytes storage
@@ -374,11 +388,44 @@ def convert_checkpoint(
     elapsed_time = time.time() - start_time
     rank0_echo(f"[Load] Finished loading state_dict in {elapsed_time:.2f}s.")
 
+    # --- Resolve SWiGLU scope ---
+    # --swiglu-modules (per-module) takes priority over --swiglu (global).
+    if swiglu_modules is not None:
+        _swiglu_prefixes = list(swiglu_modules)
+        rank0_echo(f"[SWiGLU] Per-module splitting enabled for: {_swiglu_prefixes}")
+    elif swiglu:
+        _swiglu_prefixes = None  # None = match everything (backward compatible)
+        rank0_echo("[SWiGLU] Global splitting enabled (all modules).")
+    else:
+        _swiglu_prefixes = []  # no SWiGLU splitting
+        rank0_echo("[SWiGLU] Disabled (no --swiglu or --swiglu-modules specified).")
+
+    # --- Auto-detect MTP from checkpoint keys ---
+    # GDN sub-keys are kept un-merged; handle_gdn_in_state_dict() in
+    # fsdp_dtensor_checkpoint.py wraps each sub-tensor with correct TP metadata
+    # at runtime.
+    all_keys = list(state_dict.keys())
+    _detected = []
+
+    if not rename_mtp_keys and any(
+        ".mtp.layers." in k and ".transformer_layer." in k for k in all_keys
+    ):
+        rename_mtp_keys = True
+        _detected.append("MTP (transformer_layer -> mtp_model_layer rename needed)")
+
+    if _detected:
+        rank0_echo(
+            "[Auto-detect] Enabled transformations based on checkpoint keys:\n"
+            + "\n".join(f"  - {d}" for d in _detected)
+        )
+    del all_keys
+
     # Handle optimizer state and module parameters
     fsdp_dtensor_state_dict = {}
     rerun_state_machine_state = None
     process_count = 0
     total_items = len(state_dict)
+    _swiglu_split_count = 0
 
     def _free_up_some_gpu_memory():
         if check_gpu_memory(0.5):
@@ -389,9 +436,7 @@ def convert_checkpoint(
             torch.cuda.empty_cache()
 
     def split_layers(
-        key: str,
-        value: torch.Tensor,
-        orig_shape: Optional[torch.Size] = None,
+        key: str, value: torch.Tensor, orig_shape: Optional[torch.Size] = None
     ) -> dict[str, torch.Tensor]:
         """
         Split layers into separate tensors.
@@ -399,9 +444,11 @@ def convert_checkpoint(
         _free_up_some_gpu_memory()
         layers = {}
         for i, v in enumerate(split_dtensor(value, 1, dim=0)):
-            v = gather_uneven_dtensor_to_full_tensor(v).reshape(
-                orig_shape[1:] if orig_shape else value.shape[1:]
-            ).redistribute(placements=[Shard(0)])
+            v = (
+                redistribute_uneven_dtensor_to_replicated(v)
+                .reshape(orig_shape[1:] if orig_shape else value.shape[1:])
+                .redistribute(placements=[Shard(0)])
+            )
 
             layer_key = key.replace(".layers.", f".layers.{i}.")
             layers[layer_key] = v
@@ -409,9 +456,7 @@ def convert_checkpoint(
         return layers
 
     def split_expert_weights(
-        key: str,
-        value: torch.Tensor,
-        orig_shape: Optional[torch.Size] = None,
+        key: str, value: torch.Tensor, orig_shape: Optional[torch.Size] = None
     ) -> dict[str, torch.Tensor]:
         """
         Split expert weights into separate tensors for each expert.
@@ -428,7 +473,7 @@ def convert_checkpoint(
             else:
                 raise ValueError(f"Unexpected expert layer key: {layer_key}")
 
-            expert_weight = gather_uneven_dtensor_to_full_tensor(expert_weight)
+            expert_weight = redistribute_uneven_dtensor_to_replicated(expert_weight)
             expert_shape = orig_shape[1:] if orig_shape else value.shape[1:]
             # Handle optimizer states for expert linear_fc2 when ETP is enabled
             if (
@@ -456,29 +501,38 @@ def convert_checkpoint(
             experts[expert_key] = expert_weight
         return experts
 
+    _SWIGLU_PATTERNS = [
+        r"(.*)\.mlp\.linear_fc1\.weight",
+        r"(.*)\.mlp\.linear_fc1\.bias",
+        r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)",
+        r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias",
+    ]
+
     def is_swiglu_key(key):
-        return any(re.search(pat, key) for pat in [
-            r"(.*)\.mlp\.linear_fc1\.weight",
-            r"(.*)\.mlp\.linear_fc1\.bias",
-            r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)",
-            r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias",
-        ])
+        if not any(re.search(pat, key) for pat in _SWIGLU_PATTERNS):
+            return False
+        # _swiglu_prefixes=None means global (--swiglu), match all.
+        # _swiglu_prefixes=[] means nothing detected, match none.
+        # _swiglu_prefixes=["language_model", ...] means per-module match.
+        if _swiglu_prefixes is None:
+            return True
+        return any(f".{mod}." in key or key.startswith(f"{mod}.") for mod in _swiglu_prefixes)
 
     def split_swiglu_weight(key: str, value: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        Split SwiGLU weights into separate tensors.
+        Split SwiGLU weights/biases into separate _w and _v tensors.
         """
-        value = gather_uneven_dtensor_to_full_tensor(value)
+        value = redistribute_uneven_dtensor_to_replicated(value)
         swiglu_w_and_v = {}
         w, v = torch.chunk(value, 2, dim=0)
         w = w.redistribute(placements=[Shard(0)])
         v = v.redistribute(placements=[Shard(0)])
-        w_key = re.sub(r'(weight\d*)(.*)', r'\1_w\2', key)
-        v_key = re.sub(r'(weight\d*)(.*)', r'\1_v\2', key)
+        w_key = re.sub(r'((?:weight|bias)\d*)(.*)', r'\1_w\2', key)
+        v_key = re.sub(r'((?:weight|bias)\d*)(.*)', r'\1_v\2', key)
         swiglu_w_and_v[w_key] = w
         swiglu_w_and_v[v_key] = v
         return swiglu_w_and_v
@@ -509,14 +563,16 @@ def convert_checkpoint(
                 is_param = True
 
             # Handle dist-opt flatten tensors
+            _has_mcore = hasattr(metadata, "mcore_data")
             if (
-                key in metadata.mcore_data
+                _has_mcore
+                and key in metadata.mcore_data
                 and "nd_reformulated_orig_global_shape" in metadata.mcore_data[key]
             ):
                 mcore_data = metadata.mcore_data[key]
-                assert len(mcore_data) == 1, (
-                    f"Expected exactly one reformulated shape for key '{key}'."
-                )
+                assert (
+                    len(mcore_data) == 1
+                ), f"Expected exactly one reformulated shape for key '{key}'."
                 # Get the original global shape from mcore_data
                 orig_shape = mcore_data["nd_reformulated_orig_global_shape"]
                 metadata.mcore_data[key] = {}
@@ -531,7 +587,7 @@ def convert_checkpoint(
                 split_tensors = split_expert_weights(new_key, value, orig_shape)
             else:
                 if orig_shape:
-                    value = gather_uneven_dtensor_to_full_tensor(value)
+                    value = redistribute_uneven_dtensor_to_replicated(value)
                     # Handle optimizer states with partition_dim=1 when TP is enabled
                     if (
                         new_key.startswith("optimizer.state.")
@@ -553,12 +609,13 @@ def convert_checkpoint(
                         value = value.reshape(orig_shape).redistribute(placements=[Shard(0)])
                 split_tensors = {new_key: value}
 
-            # Handle SWiGLU weights
+            # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes)
             for key, value in list(split_tensors.items()):
-                if swiglu and is_swiglu_key(key):
+                if is_swiglu_key(key):
                     swiglu_w_and_v = split_swiglu_weight(key, value)
                     split_tensors.update(swiglu_w_and_v)
                     del split_tensors[key]
+                    _swiglu_split_count += 1
 
             fsdp_dtensor_state_dict.update(split_tensors)
             if is_param and key in param_to_param_group_map:
@@ -568,10 +625,7 @@ def convert_checkpoint(
             # Skip RNG states
             continue
         elif key.startswith("rerun_state_machine_state"):
-            if (
-                rerun_state_machine_state is not None
-                and torch.distributed.get_rank() == 0
-            ):
+            if rerun_state_machine_state is not None and torch.distributed.get_rank() == 0:
                 click.echo(
                     click.style(
                         "Warning: Multiple rerun_state_machine_state found, only the first one will be saved.",
@@ -597,35 +651,59 @@ def convert_checkpoint(
             torch.save(value, serialized_data)
             fsdp_dtensor_state_dict[key] = serialized_data
 
+    if _swiglu_split_count > 0:
+        rank0_echo(f"[SWiGLU] Split {_swiglu_split_count} fc1 keys into _w/_v pairs.")
+    elif _swiglu_prefixes is not None and len(_swiglu_prefixes) > 0:
+        rank0_echo(
+            "[SWiGLU] WARNING: modules specified but 0 keys were split — check module names."
+        )
+
+    # Rename MTP keys: torch_dist uses "transformer_layer" for MTP sub-modules,
+    # but the FSDP model's state_dict() uses "mtp_model_layer".
+    if rename_mtp_keys:
+        _MTP_OLD = ".mtp.layers."
+        _MTP_SRC = ".transformer_layer."
+        _MTP_DST = ".mtp_model_layer."
+        renamed_count = 0
+        for k in list(fsdp_dtensor_state_dict.keys()):
+            if _MTP_OLD in k and _MTP_SRC in k:
+                new_k = k.replace(_MTP_SRC, _MTP_DST, 1)
+                fsdp_dtensor_state_dict[new_k] = fsdp_dtensor_state_dict.pop(k)
+                if k in param_to_param_group_map:
+                    param_to_param_group_map[new_k] = param_to_param_group_map.pop(k)
+                renamed_count += 1
+        if renamed_count > 0:
+            rank0_echo(
+                f"[MTP rename] Renamed {renamed_count} keys: "
+                f"'transformer_layer' -> 'mtp_model_layer'."
+            )
+
     # Move back to GPU if necessary
     for key in fsdp_dtensor_state_dict:
         if isinstance(fsdp_dtensor_state_dict[key], torch.Tensor):
             fsdp_dtensor_state_dict[key] = fsdp_dtensor_state_dict[key].cuda()
 
-    # Check MCore data
-    for key, value in list(metadata.mcore_data.items()):
-        if len(value) == 0:
-            del metadata.mcore_data[key]
-    if len(metadata.mcore_data) != 0 and torch.distributed.get_rank() == 0:
-        click.echo(
-            click.style(
-                f"Warning: {metadata.mcore_data.keys()} MCore data items were not processed.",
-                fg="yellow",
+    # Check MCore data (may not exist for pretrained-only checkpoints)
+    if hasattr(metadata, "mcore_data"):
+        for key, value in list(metadata.mcore_data.items()):
+            if len(value) == 0:
+                del metadata.mcore_data[key]
+        if len(metadata.mcore_data) != 0 and torch.distributed.get_rank() == 0:
+            click.echo(
+                click.style(
+                    f"Warning: {metadata.mcore_data.keys()} MCore data items were not processed.",
+                    fg="yellow",
+                )
             )
-        )
 
     # Handle args, optimizer.param_groups and other shared objects.
-    sharded_strategy = get_default_load_sharded_strategy(input_dir)
+    sharded_strategy = TorchDistLoadShardedStrategy()
     sharded_strategy = FullyParallelLoadStrategyWrapper(sharded_strategy)
-    sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
-        input_dir, sharded_strategy, common_strategy=None
+    verify_checkpoint(str(input_dir))
+    assert isinstance(sharded_strategy.base_strategy, TorchDistLoadShardedStrategy), click.style(
+        f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True
     )
-    assert isinstance(sharded_strategy.base_strategy, TorchDistLoadShardedStrategy), (
-        click.style(
-            f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True
-        )
-    )
-    common_state = common_strategy.load_common(input_dir)
+    common_state = load_common(input_dir)
     try:
         if "param_groups" in common_state["optimizer"]:
             ckpt_param_groups = common_state["optimizer"]["param_groups"]
@@ -638,12 +716,10 @@ def convert_checkpoint(
     common_state = flatten(common_state)
     for key, value in common_state.items():
         if key.startswith("optimizer.optimizer.param_groups."):
-            key = key.replace(
-                "optimizer.optimizer.param_groups.", "optimizer.param_groups."
-            )
-        assert key not in fsdp_dtensor_state_dict, (
-            f"Key '{key}' already exists in fsdp_dtensor_state_dict."
-        )
+            key = key.replace("optimizer.optimizer.param_groups.", "optimizer.param_groups.")
+        assert (
+            key not in fsdp_dtensor_state_dict
+        ), f"Key '{key}' already exists in fsdp_dtensor_state_dict."
         fsdp_dtensor_state_dict[key] = value
 
     # set up per-parameter param_groups
@@ -654,11 +730,13 @@ def convert_checkpoint(
 
             assert name in param_to_param_group_map, f"Missing param group for {name}"
             param_group_id = param_to_param_group_map[name]
-            assert param_group_id < len(ckpt_param_groups), f"Invalid param group id {param_group_id} for {name}"
-            name_without_prefix = name[len(model_weight_prefix):]
-            fsdp_dtensor_state_dict[
-                f"{optimizer_param_to_group_prefix}.{name_without_prefix}"
-            ] = ckpt_param_groups[param_group_id]
+            assert param_group_id < len(
+                ckpt_param_groups
+            ), f"Invalid param group id {param_group_id} for {name}"
+            name_without_prefix = name[len(model_weight_prefix) :]
+            fsdp_dtensor_state_dict[f"{optimizer_param_to_group_prefix}.{name_without_prefix}"] = (
+                ckpt_param_groups[param_group_id]
+            )
 
     if "checkpoint_version" not in fsdp_dtensor_state_dict:
         fsdp_dtensor_state_dict["checkpoint_version"] = 3.0
@@ -666,7 +744,7 @@ def convert_checkpoint(
     # Save modified checkpoint
     save_checkpoint_with_pickle_protocol(fsdp_dtensor_state_dict, output_dir)
 
-    dist.barrier()              # Synchronize all ranks
+    dist.barrier()  # Synchronize all ranks
     dist.destroy_process_group()
 
 
@@ -676,11 +754,19 @@ def convert_checkpoint(
 @click.option(
     "--swiglu",
     is_flag=True,
-    help="SwiGLU is used in checkpoint, and MLP linear_fc1 is specially treated.",
+    help="Split SWiGLU fc1 weights/biases into _w and _v for ALL modules. "
+    "Use --swiglu-modules instead if only some modules use SWiGLU (e.g. VLMs). "
+    "NOT auto-detected; must be specified manually.",
 )
 @click.option(
-    "--oom-traceback", is_flag=True, help="Enable OOM traceback for debugging."
+    "--swiglu-modules",
+    type=str,
+    default=None,
+    help="Comma-separated module names that use SWiGLU (e.g. 'language_model'). "
+    "Only these modules will have fc1 split into _w/_v. Overrides --swiglu. "
+    "NOT auto-detected; must be specified manually.",
 )
+@click.option("--oom-traceback", is_flag=True, help="Enable OOM traceback for debugging.")
 @click.option("--enable-msc", is_flag=True, help="Enable MultiStorageClient feature.")
 @click.option(
     "--output-optimizer-state-prefix",
@@ -696,19 +782,74 @@ def convert_checkpoint(
     "--param-to-param-group-map-json",
     type=str,
     default="{}",
-    help="JSON string representing the param to parameter group map."
+    help="JSON string representing the param to parameter group map.",
+)
+@click.option(
+    "--rename-mtp-keys",
+    is_flag=True,
+    help="Rename MTP layer keys from 'transformer_layer' to 'mtp_model_layer' "
+    "to match the FSDP model's state_dict naming. "
+    "Auto-detected if not set: enabled when '.mtp.layers.*.transformer_layer' "
+    "keys are found in the checkpoint.",
 )
 def convert_torch_dist_to_fsdp_dtensor(
     input_dir,
     output_dir,
     swiglu,
+    swiglu_modules,
     oom_traceback,
     enable_msc,
     output_optimizer_state_prefix,
     output_model_weight_prefix,
     param_to_param_group_map_json,
+    rename_mtp_keys,
 ):
-    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format."""
+    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
+
+    \b
+    Model-specific flags
+    ====================
+    Different model architectures require different conversion flags.
+    Use the guide below to determine which flags your model needs:
+
+    \b
+      Flag               When to use                            Auto-detected?
+      ─────────────────  ────────────────────────────────────── ──────────────
+      --swiglu-modules   Model uses SWiGLU activation in MLP.   No (manual).
+                         Check HuggingFace config for            Specify which
+                         "hidden_act": "silu" + gate_proj.       modules use it.
+      --swiglu           Same as above, but applies globally     No (manual).
+                         to ALL modules. Use --swiglu-modules
+                         if only some modules use SWiGLU.
+      --rename-mtp-keys  Model uses Multi-Token Prediction        YES.
+                         (MTP) with 'transformer_layer' naming
+                         in the torch_dist checkpoint.
+
+    \b
+    Auto-detection note:
+      --rename-mtp-keys is auto-detected from checkpoint keys if not explicitly
+      set. --swiglu / --swiglu-modules must always be specified manually.
+
+    \b
+    Examples
+    ========
+    Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
+
+    \b
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu-modules language_model
+
+    \b
+    Model with SWiGLU in all modules, no GDN/MTP:
+
+    \b
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu
+    """
     if not enable_msc:
         MultiStorageClientFeature.disable()
 
@@ -733,13 +874,9 @@ def convert_torch_dist_to_fsdp_dtensor(
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
-            dump(
-                snapshot,
-                open(f"oom_rank-{torch.distributed.get_rank()}_snapshot.pickle", "wb"),
-            )
+            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_snapshot.pickle", "wb"))
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
-
 
     # Initialize distributed process group
     init_process_group(f"convert_torch_dist_to_fsdp_dtensor from {input_dir} to {output_dir}")
@@ -748,18 +885,24 @@ def convert_torch_dist_to_fsdp_dtensor(
     output_dir = Path(output_dir)
     with open(param_to_param_group_map_json, "r") as f:
         param_to_param_group_map = json.load(f)
+    _swiglu_modules = (
+        [m.strip() for m in swiglu_modules.split(",") if m.strip()]
+        if swiglu_modules is not None
+        else None
+    )
     convert_checkpoint(
-        ckpt_path, output_dir, swiglu, process_group=dist.group.WORLD,
+        ckpt_path,
+        output_dir,
+        swiglu,
+        process_group=dist.group.WORLD,
         optimizer_state_prefix=output_optimizer_state_prefix,
         model_weight_prefix=output_model_weight_prefix,
         param_to_param_group_map=param_to_param_group_map,
+        rename_mtp_keys=rename_mtp_keys,
+        swiglu_modules=_swiglu_modules,
     )
 
-    click.echo(
-        click.style(
-            f"Converted checkpoint saved to {output_dir}.", fg="green", bold=True
-        )
-    )
+    click.echo(click.style(f"Converted checkpoint saved to {output_dir}.", fg="green", bold=True))
 
 
 def _modify_state_dict(input_dir, output_dir, ops, process_group, enable_msc=False):
@@ -770,10 +913,14 @@ def _modify_state_dict(input_dir, output_dir, ops, process_group, enable_msc=Fal
         assert isinstance(op, str), f"Operation '{op}' must be a string."
         op_items = op.split()
         if op_items[0] == "remove":
-            assert len(op_items) == 2, f"Remove operation requires exactly one argument: {op_items[1]}"
+            assert (
+                len(op_items) == 2
+            ), f"Remove operation requires exactly one argument: {op_items[1]}"
             remove_items.append(op_items[1])
         elif op_items[0] == "rename":
-            assert len(op_items) == 3, f"Rename operation requires exactly two arguments: {op_items[1]} {op_items[2]}"
+            assert (
+                len(op_items) == 3
+            ), f"Rename operation requires exactly two arguments: {op_items[1]} {op_items[2]}"
             rename_items.append((op_items[1], op_items[2]))
         else:
             raise NotImplementedError(f"Unsupported operation: {op} | {op_items}")
@@ -785,9 +932,7 @@ def _modify_state_dict(input_dir, output_dir, ops, process_group, enable_msc=Fal
     for key, md in metadata.state_dict_metadata.items():
         if re.search(combined_remove_items, key):
             if torch.distributed.get_rank() == 0:
-                click.echo(
-                    click.style(f"Removing key '{key}' from state_dict.", fg="yellow")
-                )
+                click.echo(click.style(f"Removing key '{key}' from state_dict.", fg="yellow"))
             if hasattr(metadata, "mcore_data") and key in metadata.mcore_data:
                 del metadata.mcore_data[key]
             continue
@@ -811,10 +956,7 @@ def _modify_state_dict(input_dir, output_dir, ops, process_group, enable_msc=Fal
             state_dict[key] = torch.distributed.tensor.empty(
                 md.size,
                 dtype=md.properties.dtype,
-                device_mesh=DeviceMesh.from_group(
-                    group=process_group,
-                    device_type="cuda",
-                ),
+                device_mesh=DeviceMesh.from_group(group=process_group, device_type="cuda"),
                 placements=[Shard(0)],
             )
         elif isinstance(md, BytesStorageMetadata):
@@ -823,15 +965,9 @@ def _modify_state_dict(input_dir, output_dir, ops, process_group, enable_msc=Fal
             raise NotImplementedError(f"Unsupported metadata type: {type(md)}")
 
     # Save the modified state dict
-    click.echo(
-        click.style(
-            f"Saving modified state_dict to {output_dir}.", fg="green", bold=True
-        )
-    )
+    click.echo(click.style(f"Saving modified state_dict to {output_dir}.", fg="green", bold=True))
     save_checkpoint_with_pickle_protocol(
-        state_dict,
-        output_dir,
-        pickle_protocol=4,  # Use protocol 4 for OOM issue
+        state_dict, output_dir, pickle_protocol=4  # Use protocol 4 for OOM issue
     )
 
     # Copy metadata.json, common.pt
@@ -853,17 +989,11 @@ def modify_state_dict(input_dir, output_dir, op, enable_msc):
         MultiStorageClientFeature.disable()
 
     _modify_state_dict(
-        Path(input_dir),
-        Path(output_dir),
-        op,
-        process_group=dist.group.WORLD,
-        enable_msc=enable_msc,
+        Path(input_dir), Path(output_dir), op, process_group=dist.group.WORLD, enable_msc=enable_msc
     )
 
     click.echo(
-        click.style(
-            f"State dict items modified and saved to {output_dir}.", fg="green", bold=True
-        )
+        click.style(f"State dict items modified and saved to {output_dir}.", fg="green", bold=True)
     )
 
 
@@ -902,7 +1032,11 @@ def _compare_two_checkpoint(checkpoint_1, checkpoint_2):
             continue
 
         if meta_1.size != meta_2.size or meta_1.properties.dtype != meta_2.properties.dtype:
-            click.echo(click.style(f" - {key} (metadata differ) meta_1: {meta_1}, meta_2: {meta_2}", fg="red"))
+            click.echo(
+                click.style(
+                    f" - {key} (metadata differ) meta_1: {meta_1}, meta_2: {meta_2}", fg="red"
+                )
+            )
         else:
             value_1 = torch.empty(meta_1.size, dtype=meta_1.properties.dtype)
             value_2 = value_1.clone()
@@ -910,10 +1044,12 @@ def _compare_two_checkpoint(checkpoint_1, checkpoint_2):
             dcp.load({key: value_1}, storage_reader=reader_1, planner=DefaultLoadPlanner())
             dcp.load({key: value_2}, storage_reader=reader_2, planner=DefaultLoadPlanner())
 
-            if not torch.allclose(
-                value_1, value_2, atol=1e-8, rtol=1e-5
-            ):
-                click.echo(click.style(f" - {key} (values differ) value_1: {value_1}, value_2: {value_2}", fg="red"))
+            if not torch.allclose(value_1, value_2, atol=1e-8, rtol=1e-5):
+                click.echo(
+                    click.style(
+                        f" - {key} (values differ) value_1: {value_1}, value_2: {value_2}", fg="red"
+                    )
+                )
 
 
 @cli.command()
@@ -929,14 +1065,13 @@ def compare_two_checkpoint(checkpoint_1, checkpoint_2, enable_msc):
     if not enable_msc:
         MultiStorageClientFeature.disable()
 
-    _compare_two_checkpoint(
-        Path(checkpoint_1),
-        Path(checkpoint_2),
-    )
+    _compare_two_checkpoint(Path(checkpoint_1), Path(checkpoint_2))
 
     click.echo(
         click.style(
-            f"Comparison between {checkpoint_1} and {checkpoint_2} completed.", fg="green", bold=True
+            f"Comparison between {checkpoint_1} and {checkpoint_2} completed.",
+            fg="green",
+            bold=True,
         )
     )
 
@@ -959,9 +1094,11 @@ def print_torch_dcp_in_json(torch_dcp_dir, model_weight_prefix="model.module"):
         for key, value in state_dict.items():
             new_key = key.replace("module.module", model_weight_prefix)
             new_state_dict[new_key] = value
-        
+
         # Convert state dict to JSON-serializable format
-        serializable_dict = {k: v.tolist() if hasattr(v, "tolist") else v for k, v in new_state_dict.items()}
+        serializable_dict = {
+            k: v.tolist() if hasattr(v, "tolist") else v for k, v in new_state_dict.items()
+        }
 
         # Save to a JSON file
         json_file_path = os.path.join(torch_dcp_dir, "param_to_param_group_map.json")
@@ -977,11 +1114,7 @@ def init_process_group(message):
     time.sleep(rank * 0.01)  # Ensure all ranks are synchronized before loading
     click.echo(f"[{rank}/{world_size}] [cuda:{local_rank}] {message}")
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend="nccl",
-        rank=rank,
-        world_size=world_size,
-    )
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 
 if __name__ == "__main__":
