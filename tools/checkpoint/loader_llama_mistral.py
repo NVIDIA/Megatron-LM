@@ -3,44 +3,81 @@
 import json
 import os
 import sys
-import torch
 
+import torch
 from utils import _ConverterFakeProcessGroup
+
 try:
     import transformers
 except ImportError:
     raise ImportError("The 'transformers' package is not installed.")
 import gc
 import shutil
-from tqdm import tqdm
 import types
+
+from tqdm import tqdm
 
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Llama/Mistral loader.')
 
     # TODO(jbarker): Need assertion to make sure *exactly* one of these is used
-    parser.add_argument('--model-size', type=str, required=True,
-                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3', 'mistral', 'yi-34B', 'qwen2.5'],
-                        help='Select model size/type')
-    parser.add_argument('--checkpoint-type', type=str, required=True,
-                        choices=['meta', 'hf'],
-                        help='Type of checkpoint to convert, options are "meta" or "hf"')
+    parser.add_argument(
+        '--model-size',
+        type=str,
+        required=True,
+        choices=[
+            'llama2-7B',
+            'llama2-13B',
+            'llama2-70B',
+            'llama2-7Bf',
+            'llama2-13Bf',
+            'llama2-70Bf',
+            'llama3',
+            'mistral',
+            'yi-34B',
+            'qwen2.5',
+        ],
+        help='Select model size/type',
+    )
+    parser.add_argument(
+        '--checkpoint-type',
+        type=str,
+        required=True,
+        choices=['meta', 'hf'],
+        help='Type of checkpoint to convert, options are "meta" or "hf"',
+    )
     parser.add_argument('--bf16', action='store_true', help='Whether to load weights in bf16.')
     parser.add_argument('--fp16', action='store_true', help='Whether to load weights in fp16.')
-    group.add_argument('--true-vocab-size', type=int, default=None,
-                       help='original size of vocab, if specified will trim padding from embedding table.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file. If specified will use this to get vocab size and '
-                       'trim padding from the embedding table.')
-    group.add_argument('--tokenizer-model', required=True,
-                       help='Tokenizer model file.')
-    group.add_argument('--megatron-path', type=str, default=None,
-                       help='Base directory of Megatron repository')
-    group.add_argument("--make-vocab-size-divisible-by", type=int, default=None, help="Make vocab size divisible by")
-    group.add_argument('--loader-transformer-impl', default='local',
-                       choices=['local', 'transformer_engine'],
-                       help='Which Transformer implementation to use.')
+    group.add_argument(
+        '--true-vocab-size',
+        type=int,
+        default=None,
+        help='original size of vocab, if specified will trim padding from embedding table.',
+    )
+    group.add_argument(
+        '--vocab-file',
+        type=str,
+        default=None,
+        help='Path to the vocab file. If specified will use this to get vocab size and '
+        'trim padding from the embedding table.',
+    )
+    group.add_argument('--tokenizer-model', required=True, help='Tokenizer model file.')
+    group.add_argument(
+        '--megatron-path', type=str, default=None, help='Base directory of Megatron repository'
+    )
+    group.add_argument(
+        "--make-vocab-size-divisible-by",
+        type=int,
+        default=None,
+        help="Make vocab size divisible by",
+    )
+    group.add_argument(
+        '--loader-transformer-impl',
+        default='local',
+        choices=['local', 'transformer_engine'],
+        help='Which Transformer implementation to use.',
+    )
 
 
 def verify_transformers_version():
@@ -59,7 +96,9 @@ NUM_SHARDS = {
 
 
 def compute_intermediate_size(n, ffn_dim_multiplier=1, multiple_of=256):
-    return multiple_of * ((int(ffn_dim_multiplier * int(8 * n / 3)) + multiple_of - 1) // multiple_of)
+    return multiple_of * (
+        (int(ffn_dim_multiplier * int(8 * n / 3)) + multiple_of - 1) // multiple_of
+    )
 
 
 def read_json(path):
@@ -77,9 +116,11 @@ def write_json(text, path):
 def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if "llama2" in model_size:
         from transformers import LlamaConfig as ModelConfig
-        from transformers import  LlamaTokenizer, LlamaTokenizerFast
+        from transformers import LlamaTokenizer, LlamaTokenizerFast
     else:
-        raise NotImplementedError(f"converting {model_size} is only supported using HuggingFace weights")
+        raise NotImplementedError(
+            f"converting {model_size} is only supported using HuggingFace weights"
+        )
 
     # for backward compatibility, before you needed the repo to be called `my_repo/model_size`
     if not os.path.isfile(os.path.join(input_base_path, "params.json")):
@@ -133,11 +174,15 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if num_shards == 1:
         # Not sharded
         # (The sharded implementation would also work, but this is simpler.)
-        loaded = torch.load(os.path.join(input_base_path, "consolidated.00.pth"), map_location="cpu")
+        loaded = torch.load(
+            os.path.join(input_base_path, "consolidated.00.pth"), map_location="cpu"
+        )
     else:
         # Sharded
         loaded = [
-            torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location="cpu")
+            torch.load(
+                os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location="cpu"
+            )
             for i in range(num_shards)
         ]
     param_count = 0
@@ -154,13 +199,27 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
             state_dict = {
                 f"model.layers.{layer_i}.self_attn.q_proj.weight": q_proj,
                 f"model.layers.{layer_i}.self_attn.k_proj.weight": k_proj,
-                f"model.layers.{layer_i}.self_attn.v_proj.weight": loaded[f"layers.{layer_i}.attention.wv.weight"],
-                f"model.layers.{layer_i}.self_attn.o_proj.weight": loaded[f"layers.{layer_i}.attention.wo.weight"],
-                f"model.layers.{layer_i}.mlp.gate_proj.weight": loaded[f"layers.{layer_i}.feed_forward.w1.weight"],
-                f"model.layers.{layer_i}.mlp.down_proj.weight": loaded[f"layers.{layer_i}.feed_forward.w2.weight"],
-                f"model.layers.{layer_i}.mlp.up_proj.weight": loaded[f"layers.{layer_i}.feed_forward.w3.weight"],
-                f"model.layers.{layer_i}.input_layernorm.weight": loaded[f"layers.{layer_i}.attention_norm.weight"],
-                f"model.layers.{layer_i}.post_attention_layernorm.weight": loaded[f"layers.{layer_i}.ffn_norm.weight"],
+                f"model.layers.{layer_i}.self_attn.v_proj.weight": loaded[
+                    f"layers.{layer_i}.attention.wv.weight"
+                ],
+                f"model.layers.{layer_i}.self_attn.o_proj.weight": loaded[
+                    f"layers.{layer_i}.attention.wo.weight"
+                ],
+                f"model.layers.{layer_i}.mlp.gate_proj.weight": loaded[
+                    f"layers.{layer_i}.feed_forward.w1.weight"
+                ],
+                f"model.layers.{layer_i}.mlp.down_proj.weight": loaded[
+                    f"layers.{layer_i}.feed_forward.w2.weight"
+                ],
+                f"model.layers.{layer_i}.mlp.up_proj.weight": loaded[
+                    f"layers.{layer_i}.feed_forward.w3.weight"
+                ],
+                f"model.layers.{layer_i}.input_layernorm.weight": loaded[
+                    f"layers.{layer_i}.attention_norm.weight"
+                ],
+                f"model.layers.{layer_i}.post_attention_layernorm.weight": loaded[
+                    f"layers.{layer_i}.ffn_norm.weight"
+                ],
             }
         else:
             # Sharded
@@ -179,7 +238,9 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
             state_dict[f"model.layers.{layer_i}.self_attn.q_proj.weight"] = permute(
                 torch.cat(
                     [
-                        loaded[i][f"layers.{layer_i}.attention.wq.weight"].view(n_heads_per_shard, dims_per_head, dim)
+                        loaded[i][f"layers.{layer_i}.attention.wq.weight"].view(
+                            n_heads_per_shard, dims_per_head, dim
+                        )
                         for i in range(num_shards)
                     ],
                     dim=0,
@@ -210,16 +271,20 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
             ).reshape(key_value_dim, dim)
 
             state_dict[f"model.layers.{layer_i}.self_attn.o_proj.weight"] = torch.cat(
-                [loaded[i][f"layers.{layer_i}.attention.wo.weight"] for i in range(num_shards)], dim=1
+                [loaded[i][f"layers.{layer_i}.attention.wo.weight"] for i in range(num_shards)],
+                dim=1,
             )
             state_dict[f"model.layers.{layer_i}.mlp.gate_proj.weight"] = torch.cat(
-                [loaded[i][f"layers.{layer_i}.feed_forward.w1.weight"] for i in range(num_shards)], dim=0
+                [loaded[i][f"layers.{layer_i}.feed_forward.w1.weight"] for i in range(num_shards)],
+                dim=0,
             )
             state_dict[f"model.layers.{layer_i}.mlp.down_proj.weight"] = torch.cat(
-                [loaded[i][f"layers.{layer_i}.feed_forward.w2.weight"] for i in range(num_shards)], dim=1
+                [loaded[i][f"layers.{layer_i}.feed_forward.w2.weight"] for i in range(num_shards)],
+                dim=1,
             )
             state_dict[f"model.layers.{layer_i}.mlp.up_proj.weight"] = torch.cat(
-                [loaded[i][f"layers.{layer_i}.feed_forward.w3.weight"] for i in range(num_shards)], dim=0
+                [loaded[i][f"layers.{layer_i}.feed_forward.w3.weight"] for i in range(num_shards)],
+                dim=0,
             )
 
         state_dict[f"model.layers.{layer_i}.self_attn.rotary_emb.inv_freq"] = inv_freq
@@ -243,7 +308,9 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
             "model.embed_tokens.weight": torch.cat(
                 [loaded[i]["tok_embeddings.weight"] for i in range(num_shards)], dim=d
             ),
-            "lm_head.weight": torch.cat([loaded[i]["output.weight"] for i in range(num_shards)], dim=0),
+            "lm_head.weight": torch.cat(
+                [loaded[i]["output.weight"] for i in range(num_shards)], dim=0
+            ),
         }
 
     for k, v in state_dict.items():
@@ -297,7 +364,7 @@ def load_args_from_checkpoint(args, model_size):
     args.num_layers = model_args["num_hidden_layers"]
     args.global_batch_size = 1024
     args.norm_epsilon = model_args["rms_norm_eps"]
-    args.iteration = 1 # '0', 'release' don't work
+    args.iteration = 1  # '0', 'release' don't work
     args.position_embedding_type = "rope"
     args.swiglu = True
     args.normalization = "RMSNorm"
@@ -315,7 +382,8 @@ def load_args_from_checkpoint(args, model_size):
 def set_preprocess_state(args, model, hf_model):
     '''Set embedding params.'''
     model.language_model.embedding.word_embeddings.weight.data.copy_(
-        hf_model.model.embed_tokens.weight)
+        hf_model.model.embed_tokens.weight
+    )
 
 
 def set_postprocess_state(args, model, hf_model):
@@ -335,23 +403,32 @@ def set_attn_state(args, layer, hf_layer):
     # Reshape loaded weights.
     tp = args.tensor_model_parallel_size
     nh = args.num_attention_heads // tp
-    ng = (args.num_query_groups if args.group_query_attention \
-        else args.num_attention_heads) // tp
+    ng = (args.num_query_groups if args.group_query_attention else args.num_attention_heads) // tp
     dim = args.kv_channels
     assert nh % ng == 0
 
     # Copy weights (re-order dimensions for Megatron).
-    attn.query_key_value.weight.data.copy_(torch.cat([
-        hf_attn.q_proj.weight.reshape((ng, dim*nh//ng, -1)),
-        hf_attn.k_proj.weight.reshape((ng, dim, -1)),
-        hf_attn.v_proj.weight.reshape((ng, dim, -1)),
-    ], dim=1).reshape((-1, args.hidden_size)))
+    attn.query_key_value.weight.data.copy_(
+        torch.cat(
+            [
+                hf_attn.q_proj.weight.reshape((ng, dim * nh // ng, -1)),
+                hf_attn.k_proj.weight.reshape((ng, dim, -1)),
+                hf_attn.v_proj.weight.reshape((ng, dim, -1)),
+            ],
+            dim=1,
+        ).reshape((-1, args.hidden_size))
+    )
     if args.add_qkv_bias:
-        attn.query_key_value.bias.data.copy_(torch.cat([
-            hf_attn.q_proj.bias.reshape((ng, dim*nh//ng)),
-            hf_attn.k_proj.bias.reshape((ng, dim)),
-            hf_attn.v_proj.bias.reshape((ng, dim)),
-        ], dim=1).reshape(-1))
+        attn.query_key_value.bias.data.copy_(
+            torch.cat(
+                [
+                    hf_attn.q_proj.bias.reshape((ng, dim * nh // ng)),
+                    hf_attn.k_proj.bias.reshape((ng, dim)),
+                    hf_attn.v_proj.bias.reshape((ng, dim)),
+                ],
+                dim=1,
+            ).reshape(-1)
+        )
 
     attn.dense.weight.data.copy_(hf_attn.o_proj.weight)
 
@@ -362,10 +439,9 @@ def set_mlp_state(args, layer, hf_layer):
     mlp = layer.mlp
     hf_mlp = hf_layer.mlp
 
-    mlp.dense_h_to_4h.weight.data.copy_(torch.cat([
-        hf_mlp.gate_proj.weight,
-        hf_mlp.up_proj.weight,
-    ], dim=0))
+    mlp.dense_h_to_4h.weight.data.copy_(
+        torch.cat([hf_mlp.gate_proj.weight, hf_mlp.up_proj.weight], dim=0)
+    )
     mlp.dense_4h_to_h.weight.data.copy_(hf_mlp.down_proj.weight)
 
 
@@ -384,12 +460,15 @@ def set_layer_state(args, model, hf_model, layer_idx):
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
-    from model_provider import model_provider
-    from gpt_builders import gpt_builder
     from transformers import AutoModelForCausalLM
 
+    from gpt_builders import gpt_builder
+    from model_provider import model_provider
+
     # Load Huggingface model.
-    hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu"
+    )
 
     # Init Megatron model.
     model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
@@ -408,47 +487,55 @@ def _load_checkpoint(queue, args):
     verify_transformers_version()
 
     # Search in directory above this.
-    sys.path.append(os.path.abspath(
-        os.path.join(os.path.dirname(__file__),
-                     os.path.pardir,
-                     os.path.pardir)))
+    sys.path.append(
+        os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+    )
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
 
     # Convert Meta checkpoint to HF format as an intermediate step
     if args.checkpoint_type == "meta":
-        model_tmp_path = convert_to_hf(model_path=os.path.join(args.save_dir, 'tmp'), input_base_path=args.load_dir, model_size=args.model_size, tokenizer_path=args.tokenizer_model)
+        model_tmp_path = convert_to_hf(
+            model_path=os.path.join(args.save_dir, 'tmp'),
+            input_base_path=args.load_dir,
+            model_size=args.model_size,
+            tokenizer_path=args.tokenizer_model,
+        )
         args.load_dir = model_tmp_path
-        args.tokenizer_model = model_tmp_path # point to HF tokenizer model
+        args.tokenizer_model = model_tmp_path  # point to HF tokenizer model
 
     try:
-        from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
-        from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
+        from megatron.legacy.model import module
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.global_vars import set_args, set_global_variables
     except ModuleNotFoundError:
-        print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
+        print(
+            "Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting."
+        )
         queue.put("exit")
         exit(1)
 
     # We want all arguments to come from us.
-    sys.argv = ['script.py',
-                '--no-masked-softmax-fusion',
-                '--no-bias-gelu-fusion',
-                '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
-                '--use-cpu-initialization',
-                '--micro-batch-size', '1',
-                '--no-load-optim',
-                '--no-load-rng',
-                '--no-save-optim',
-                '--no-save-rng',
-                '--mock-data', # To pass the "blend data checks" in arguments.py
-                '--no-initialization',
-                '--load', args.load_dir,
-                '--no-one-logger',
-                ]
+    sys.argv = [
+        'script.py',
+        '--no-masked-softmax-fusion',
+        '--no-bias-gelu-fusion',
+        '--no-bias-dropout-fusion',
+        '--use-cpu-initialization',
+        '--micro-batch-size',
+        '1',
+        '--no-load-optim',
+        '--no-load-rng',
+        '--no-save-optim',
+        '--no-save-rng',
+        '--mock-data',  # To pass the "blend data checks" in arguments.py
+        '--no-initialization',
+        '--load',
+        args.load_dir,
+        '--no-one-logger',
+    ]
 
     if args.make_vocab_size_divisible_by is not None:
         sys.argv.extend(["--make-vocab-size-divisible-by", str(args.make_vocab_size_divisible_by)])
@@ -507,7 +594,9 @@ def _load_checkpoint(queue, args):
     # Determine how to make our models.
     assert args.model_type == 'GPT', 'Llama-2, Llama-3 and Mistral are GPT models.'
     margs.model_type = ModelType.encoder_or_decoder
-    margs.params_dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
+    margs.params_dtype = (
+        torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
+    )
 
     # Suppress warning about torch.distributed not being initialized.
     module.MegatronModule.embedding_warning_printed = True
@@ -574,11 +663,11 @@ def _load_checkpoint(queue, args):
         queue.put(msg)
 
     # Send embeddings.
-    message = {
-        "word embeddings": model.language_model.embedding.word_embeddings.weight.data
-    }
+    message = {"word embeddings": model.language_model.embedding.word_embeddings.weight.data}
     if md.position_embedding_type == 'learned_absolute':
-        message["position embeddings"] = model.language_model.embedding.position_embeddings.weight.data
+        message["position embeddings"] = (
+            model.language_model.embedding.position_embeddings.weight.data
+        )
     else:
         assert not hasattr(model.language_model.embedding, 'position_embeddings')
 
@@ -633,23 +722,19 @@ def _load_checkpoint(queue, args):
             if md.swiglu:
                 for tp_rank in range(tp_size):
                     mlp_l0_bias[tp_rank] = torch.chunk(mlp_l0_bias[tp_rank], 2, dim=0)
-                message["mlp l0 bias W"] = torch.cat([b[0] for b in mlp_l0_bias],dim=0)
-                message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias],dim=0)
+                message["mlp l0 bias W"] = torch.cat([b[0] for b in mlp_l0_bias], dim=0)
+                message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias], dim=0)
             else:
                 message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
 
         queue_put(f"transformer layer {layer_num}", message)
 
     # Send final norm from tp_rank 0.
-    message = {
-        "weight": model.language_model.encoder.final_norm.weight.data,
-    }
+    message = {"weight": model.language_model.encoder.final_norm.weight.data}
     queue_put("final norm", message)
 
     if md.output_layer:
-        message = {
-            "weight": model.language_model.output_layer.weight.data
-        }
+        message = {"weight": model.language_model.output_layer.weight.data}
         queue_put("output layer", message)
 
     queue.put("done")

@@ -4,15 +4,6 @@
 
 from typing import Any
 
-# TODO: Remove this separate try/except once the next version of emerging_optimizers
-# (which includes Lion) is released. Then Lion can be imported in the block above.
-try:
-    from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
-
-    HAVE_LION = True
-except ImportError:
-    HAVE_LION = False
-
 
 def get_megatron_muon_optimizer(*args: Any, **kwargs: Any) -> Any:
     """Backward compatible muon optimizer getter.
@@ -22,9 +13,16 @@ def get_megatron_muon_optimizer(*args: Any, **kwargs: Any) -> Any:
     """
     from . import get_megatron_optimizer
 
-    if kwargs.pop('layer_wise_distributed_optimizer', False):
-        config = args[0] if args else kwargs.get('config')
-        if config is not None:
-            config.use_layer_wise_distributed_optimizer = True
+    use_layer_wise = kwargs.pop('layer_wise_distributed_optimizer', False)
+
+    if "config" in kwargs:
+        config = kwargs["config"]
+    else:
+        config = args[0]
+
+    if use_layer_wise and not config.optimizer.startswith('dist_'):
+        raise ValueError(
+            "Layer-wise distributed optimizer is enabled by dist_ prefix in optimizer name."
+        )
 
     return get_megatron_optimizer(*args, **kwargs)
