@@ -60,6 +60,5 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --async-ckpt-use-cpu-shm: true
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
 LAUNCHER: ft_launcher
