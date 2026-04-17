@@ -762,12 +762,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             overall,
         )
         # Penultimate block offset (block 2 boundary) is a valid intermediate
-        count = msa._intermediate_counts_gpu[1].item()
+        count = msa._intermediate_counts_cpu[1].item()
         if count > 0:
-            offsets = msa._intermediate_offsets_gpu[1, :count].tolist()
+            offsets = msa._intermediate_offsets_cpu[1, :count].tolist()
             for o in offsets:
                 assert o > 0 and o % 128 == 0
-        assert msa._eos_cache_block_id_gpu[1].item() >= 0
+        assert msa._eos_cache_block_id_cpu[1].item() >= 0
 
         # non-aligned prompt produces last_aligned intermediate offset
         ctx2 = self._mctx(block_size_tokens=bs)
@@ -779,12 +779,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 2
         ctx2.add_request(req2b)
-        count2 = msa2._intermediate_counts_gpu[1].item()
+        count2 = msa2._intermediate_counts_cpu[1].item()
         if count2 > 0:
-            offsets = msa2._intermediate_offsets_gpu[1, :count2].tolist()
+            offsets = msa2._intermediate_offsets_cpu[1, :count2].tolist()
             for o in offsets:
                 assert o > 0 and o % 128 == 0
-        assert msa2._eos_cache_block_id_gpu[1].item() < 0
+        assert msa2._eos_cache_block_id_cpu[1].item() < 0
 
         # block-aligned prompts set EOS cache block ID
         ctx3 = self._mctx(block_size_tokens=bs)
@@ -793,7 +793,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 0
         ctx3.add_request(req3)
-        assert ctx3.mamba_slot_allocator._eos_cache_block_id_gpu[1].item() >= 0
+        # Deferred Mamba ops execute during transfer.
+        ctx3.initialize_attention_state()
+        ctx3.transfer_bookkeeping_to_gpu()
+        assert ctx3.mamba_slot_allocator._eos_cache_block_id_cpu[1].item() >= 0
 
         # intermediate output buffers are pre-allocated
         ctx4 = self._mctx()
@@ -901,6 +904,7 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 
         # last_token_logits
         ctx.initialize_attention_state()
+        ctx.transfer_bookkeeping_to_gpu()
         logits = torch.randn(
             1, ctx.padded_active_token_count, vocab_size, device=torch.cuda.current_device()
         )
@@ -1026,9 +1030,9 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
         # Set up intermediate offsets: 1 intermediate at src_offset=0
         bid0 = ctx.request_to_kv_block_ids[ctx_idx][0].item()
-        msa._intermediate_block_ids_gpu[ctx_idx, 0] = bid0
-        msa._intermediate_offsets_gpu[ctx_idx, 0] = 128
-        msa._intermediate_counts_gpu[ctx_idx] = 1
+        msa._intermediate_block_ids_cpu[ctx_idx, 0] = bid0
+        msa._intermediate_offsets_cpu[ctx_idx, 0] = 128
+        msa._intermediate_counts_cpu[ctx_idx] = 1
         msa._has_intermediates = True
 
         # Set metadata fields that would normally be set by _update_intermediate_offsets
@@ -1037,7 +1041,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
         # Set up EOS block (block-aligned prompt)
         eos_bid = ctx.request_to_kv_block_ids[ctx_idx][2].item()
-        msa._eos_cache_block_id_gpu[ctx_idx] = eos_bid
+        msa._eos_cache_block_id_cpu[ctx_idx] = eos_bid
 
         # Write known patterns to live mamba state for EOS copy
         mamba_idx = metadata.request_to_mamba_state_idx[ctx_idx].item()

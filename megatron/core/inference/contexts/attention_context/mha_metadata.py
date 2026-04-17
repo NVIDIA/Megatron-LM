@@ -120,6 +120,51 @@ class MHAMetadata(MetadataBase):
             "max_seqlen_k": self._max_seqlen_k,
         }
 
+    def load_from_cpu(
+        self,
+        query_lengths: torch.Tensor,
+        cu_query_seq_lengths: torch.Tensor,
+        kv_seq_lengths: torch.Tensor,
+        cu_kv_seq_lengths: torch.Tensor,
+        block_table: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        padded_active_request_count: int,
+    ):
+        """Load pre-computed CPU metadata into GPU buffers.
+
+        All computation (cumsum, padding) has already been done on CPU.
+        This method only performs H2D copies into the fixed-address GPU buffers.
+
+        Args:
+            query_lengths: Padded query lengths, shape (padded_active_request_count,).
+            cu_query_seq_lengths: Padded cumulative query lengths, shape (padded_active_request_count + 1,).
+            kv_seq_lengths: Padded KV lengths, shape (padded_active_request_count,).
+            cu_kv_seq_lengths: Padded cumulative KV lengths, shape (padded_active_request_count + 1,).
+            block_table: Padded block table, shape (padded_active_request_count, max_kv_blocks).
+            max_seqlen_q: Maximum query sequence length.
+            max_seqlen_k: Maximum KV sequence length.
+            padded_active_request_count: Number of padded active requests.
+        """
+        n = padded_active_request_count
+        self._query_lengths_buf[:n].copy_(query_lengths[:n], non_blocking=True)
+        self._cu_query_seq_lengths_buf[: n + 1].copy_(cu_query_seq_lengths[: n + 1], non_blocking=True)
+        self._kv_seq_lengths_buf[:n].copy_(kv_seq_lengths[:n], non_blocking=True)
+        self._cu_kv_seq_lengths_buf[: n + 1].copy_(cu_kv_seq_lengths[: n + 1], non_blocking=True)
+        self._block_table_buf[:n].copy_(block_table[:n], non_blocking=True)
+        self._max_seqlen_q = max_seqlen_q
+        self._max_seqlen_k = max_seqlen_k
+
+        self.state_data = {
+            "query_lengths": self._query_lengths_buf[:n],
+            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[: n + 1],
+            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: n + 1],
+            "kv_seq_lengths": self._kv_seq_lengths_buf[:n],
+            "block_table": self._block_table_buf[:n, :],
+            "max_seqlen_q": self._max_seqlen_q,
+            "max_seqlen_k": self._max_seqlen_k,
+        }
+
     def reset(self):
         """
         Reset the metadata for the next batch.
