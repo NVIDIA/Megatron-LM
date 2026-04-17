@@ -2536,12 +2536,22 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            if self.activation_func != F.silu or not self.config.gated_linear_unit:
+            if not is_te_min_version("2.14.0"):
+                raise RuntimeError(
+                    f"{self.__class__.__name__} requires Transformer Engine >= 2.14.0 "
+                    "(needs pytorch.ops.GroupedLinear and pytorch.ops.ScaledSwiGLU)"
+                )
+            if self.config.add_bias_linear:
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support add_bias_linear=True; "
+                    "the CuTeGEMM fused kernel requires bias-free linear layers."
+                )
+            if self.config.activation_func != F.silu or not self.config.gated_linear_unit:
                 raise ValueError(
                     f"{self.__class__.__name__} requires SwiGLU activation "
                     "(activation_func=F.silu, gated_linear_unit=True) "
                     "for the CuTeGEMM fused kernel, but got "
-                    f"activation_func={self.activation_func}, "
+                    f"activation_func={self.config.activation_func}, "
                     f"gated_linear_unit={self.config.gated_linear_unit}."
                 )
 
