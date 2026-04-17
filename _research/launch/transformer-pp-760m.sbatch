@@ -126,7 +126,7 @@ LEARNING_RATE_ARGS=(
     --min-lr $MIN_LR
     --lr-decay-style WSD
     --lr-warmup-iters 200
-    --lr-wsd-decay-style 1-sqrt
+    --lr-wsd-decay-style minus_sqrt
     --lr-wsd-decay-samples 1464844
 )
 
