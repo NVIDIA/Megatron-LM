@@ -488,8 +488,11 @@ jobs:
       - name: Install GH CLI
         shell: bash -x -e -u -o pipefail {0}
         run: |
-          apt-get update
-          apt-get install -y gh
+          for i in 1 2 3; do
+            apt-get update && apt-get install -y gh && break
+            echo "apt attempt $i failed, retrying..."
+            sleep 10
+          done
 
       - name: Download test data
         shell: bash
@@ -502,8 +505,11 @@ jobs:
       - name: Install GH CLI
         shell: bash
         run: |
-          apt-get update
-          apt-get install -y gh
+          for i in 1 2 3; do
+            apt-get update && apt-get install -y gh && break
+            echo "apt attempt $i failed, retrying..."
+            sleep 10
+          done
 
       - name: Get last merged PR
         id: cache_from
