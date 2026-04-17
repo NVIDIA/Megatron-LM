@@ -372,10 +372,33 @@ def core_config_from_args(args, dataclass=TransformerConfig):
     Returns:
         SimpleNamespace: The returned namespace to build core config from
     """
+    defaultable_scaling_fields = {
+        "use_mup",
+        "mup_width_mult",
+        "mup_base_hidden_size",
+        "mup_embedding_mult",
+        "mup_output_mult",
+        "mup_base_head_dim",
+        "mup_attn_scale_power",
+        "scaling_recipe",
+        "scaling_base_hidden_size",
+        "scaling_base_num_layers",
+        "scaling_base_head_dim",
+        "scaling_residual_branch_depth_power",
+        "scaling_hidden_lr_depth_power",
+        "scaling_block_out_proj_init_depth_power",
+    }
     kw_args = {}
     for f in dataclasses.fields(dataclass):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+        elif f.name in defaultable_scaling_fields and f.default is not dataclasses.MISSING:
+            kw_args[f.name] = f.default
+        elif (
+            f.name in defaultable_scaling_fields
+            and f.default_factory is not dataclasses.MISSING
+        ):
+            kw_args[f.name] = f.default_factory()
         else:
             raise Exception(f"Missing argument {f.name} for {str(dataclass)} config")
     return kw_args
@@ -431,4 +454,3 @@ def load_yaml(yaml_path):
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
         return config_namespace
-

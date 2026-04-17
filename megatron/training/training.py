@@ -1640,11 +1640,11 @@ def setup_model_and_optimizer(
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
-        if getattr(args, "use_mup", False):
-            model_config_source = (
-                unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
-            )
-            model_config = get_model_config(model_config_source)
+        model_config_source = (
+            unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
+        )
+        model_config = get_model_config(model_config_source)
+        if getattr(model_config, "use_mup", False):
             mup_overrides = get_mup_config_overrides(
                 config=config,
                 mup_width_mult=model_config.mup_width_mult,

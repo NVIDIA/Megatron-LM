@@ -47,11 +47,13 @@ from megatron.core.quantization.utils import (
 
 from megatron.training.argument_utils import ArgumentGroupFactory
 
+
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
+    parser = _add_scaling_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
     parser = _add_rl_args(parser)
@@ -2025,6 +2027,20 @@ def _add_network_size_args(parser):
         "moe_aux_loss_coeff",
         "cp_comm_type",
         "cuda_graph_scope",
+        "use_mup",
+        "mup_width_mult",
+        "mup_base_hidden_size",
+        "mup_embedding_mult",
+        "mup_output_mult",
+        "mup_base_head_dim",
+        "mup_attn_scale_power",
+        "scaling_recipe",
+        "scaling_base_hidden_size",
+        "scaling_base_num_layers",
+        "scaling_base_head_dim",
+        "scaling_residual_branch_depth_power",
+        "scaling_hidden_lr_depth_power",
+        "scaling_block_out_proj_init_depth_power",
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",
         "params_dtype",
@@ -2165,6 +2181,42 @@ def _add_network_size_args(parser):
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
     return parser
+
+
+def _add_scaling_args(parser):
+    group = parser.add_argument_group(title='scaling')
+
+    group.add_argument('--scaling-recipe', type=str, default=None, choices=['none', 'mup'],
+                       help='Canonical scaling recipe. `mup` preserves current Megatron MuP.')
+    group.add_argument('--scaling-base-hidden-size', type=int, default=None,
+                       help='Reference hidden size for width-based scaling recipes.')
+    group.add_argument('--scaling-base-num-layers', type=int, default=None,
+                       help='Reference number of transformer layers for depth-based scaling recipes.')
+    group.add_argument('--scaling-base-head-dim', type=float, default=None,
+                       help='Reference attention head dimension for scaling recipes.')
+    group.add_argument('--scaling-residual-branch-depth-power', type=float, default=None,
+                       help='Relative depth exponent for residual branch outputs.')
+    group.add_argument('--scaling-hidden-lr-depth-power', type=float, default=None,
+                       help='Relative depth exponent for hidden matrix-like LR scaling.')
+    group.add_argument('--scaling-block-out-proj-init-depth-power', type=float, default=None,
+                       help='Relative depth exponent for block output projection initialization.')
+
+    group.add_argument('--use-mup', action='store_true',
+                       help='Backward-compatible alias for `--scaling-recipe mup`.')
+    group.add_argument('--mup-width-mult', type=float, default=1.0,
+                       help='Backward-compatible compatibility field. Preserved for existing CLI/YAML surfaces.')
+    group.add_argument('--mup-base-hidden-size', type=int, default=None,
+                       help='Backward-compatible alias for `--scaling-base-hidden-size`.')
+    group.add_argument('--mup-embedding-mult', type=float, default=1.0,
+                       help='MuP embedding output multiplier. Preserved for compatibility.')
+    group.add_argument('--mup-output-mult', type=float, default=1.0,
+                       help='MuP output/logit multiplier. Preserved for compatibility.')
+    group.add_argument('--mup-base-head-dim', type=float, default=None,
+                       help='Backward-compatible alias for `--scaling-base-head-dim`.')
+    group.add_argument('--mup-attn-scale-power', type=float, default=1.0,
+                       help='MuP attention scaling power. Preserved for compatibility.')
+    return parser
+
 
 def _add_straggler_detector_args(parser):
     from megatron.training.config import StragglerDetectionConfig
