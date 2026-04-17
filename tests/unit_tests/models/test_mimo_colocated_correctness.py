@@ -207,11 +207,15 @@ class TestColocatedCorrectness:
             torch.testing.assert_close(
                 cl.detach(), rls.detach().sum(), atol=1e-1, rtol=0, msg=f"{t} loss"
             )
+            # Tight check: catches a class of bugs where fan-out backward drops
+            # cross-rank gradient contributions (zero-pad-without-gather regression).
+            # Observed numerical noise floor is ~2e-7; the old zero-pad bug
+            # produced ~1e-5 disagreement on samples handled by sibling llm_dp ranks.
             torch.testing.assert_close(
                 ci.grad,
                 ri.grad[:, e_di * be : (e_di + 1) * be, :],
-                atol=5e-3,
-                rtol=0,
+                atol=5e-6,
+                rtol=1e-3,
                 msg=f"{t} input_grad",
             )
 

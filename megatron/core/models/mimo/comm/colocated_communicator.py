@@ -42,9 +42,13 @@ class ColocatedBridgeCommunicator:
 
         self.all_gather_pg: Optional[dist.ProcessGroup] = None
         self.all_gather_group_ranks: List[List[int]] = []
+        self.fan_out_gather_pg: Optional[dist.ProcessGroup] = None
+        self.fan_out_gather_group_ranks: List[List[int]] = []
 
         if self.dp_scale_factor > 1:
             self._build_all_gather_groups()
+        elif self.dp_scale_factor < 1:
+            self._build_fan_out_gather_groups()
 
         logging.info(
             f"[Rank {self.current_rank}] ColocatedBridgeCommunicator: "
@@ -161,6 +165,47 @@ class ColocatedBridgeCommunicator:
             return 1
         return dist.get_world_size(self.all_gather_pg)
 
+    def _build_fan_out_gather_groups(self):
+        """Build all-gather groups used by the fan-out backward.
+
+        In fan-out forward, each dest rank takes a local slice of its src rank's
+        batch. The src rank's full-batch gradient is the concatenation of the
+        slice gradients produced by every dest rank that consumed one of its
+        slices. We build a group per (src_dp_idx, dest_tp_idx) containing the
+        ``scale = dest_dp / src_dp`` dest ranks that cover consecutive
+        dest_dp_idx values mapping to this src_dp_idx. Rank order inside the
+        group matches slot order, so all_gather_into_tensor reconstructs the
+        full batch gradient in the correct layout.
+        """
+        scale = int(1 / self.dp_scale_factor)
+        all_groups: List[List[int]] = []
+
+        for src_dp_idx in range(self.src_dp_size):
+            dest_dp_start = src_dp_idx * scale
+            dest_dp_indices = range(dest_dp_start, dest_dp_start + scale)
+
+            for dest_tp_idx in range(self.dest_tp_size):
+                group_ranks = []
+                for dest_dp_idx in dest_dp_indices:
+                    for rank, (dp, tp) in self.rank_to_dest_pos.items():
+                        if dp == dest_dp_idx and tp == dest_tp_idx:
+                            group_ranks.append(rank)
+                            break
+                all_groups.append(sorted(group_ranks))
+
+        self.fan_out_gather_group_ranks = all_groups
+        self.fan_out_gather_pg, _ = dist.new_subgroups_by_enumeration(all_groups, backend='nccl')
+
+    def get_fan_out_gather_group(self) -> Optional[dist.ProcessGroup]:
+        """Return the all-gather process group for fan-out backward."""
+        return self.fan_out_gather_pg
+
+    def get_fan_out_gather_world_size(self) -> int:
+        """Return the world size of the fan-out backward all-gather group."""
+        if self.fan_out_gather_pg is None:
+            return 1
+        return dist.get_world_size(self.fan_out_gather_pg)
+
     def get_slice_info(self, batch_size: int) -> SliceInfo:
         """Compute batch slice info for the current rank given the full batch size."""
         if self.dp_scale_factor < 1:
@@ -247,20 +292,36 @@ class _ColocatedCommunicate(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
-        """Backward: adjoint of forward (zero-pad for fan-out, slice for fan-in)."""
+        """Backward: adjoint of forward (all-gather for fan-out, slice for fan-in).
+
+        Fan-out forward is ``narrow``, which is a local slice with no cross-rank
+        communication. Its autograd adjoint on a single rank is zero-pad, but
+        that would leave each src rank with only its own dest rank's slice of
+        the gradient — missing the contributions from every other dest rank
+        that consumed a different slice of the same src rank's activation.
+        Instead we all-gather the slice gradients across the fan-out sibling
+        group, which reconstructs the full src-batch gradient and hands every
+        participating rank the same full gradient (symmetric with the fan-in
+        forward's all_gather_into_tensor).
+        """
         comm = ctx.comm
         batch_dim = ctx.batch_dim
 
         if comm.is_fan_out():
-            grad_input = torch.zeros(
-                *grad_output.shape[:batch_dim],
-                ctx.input_batch_size,
-                *grad_output.shape[batch_dim + 1 :],
-                dtype=grad_output.dtype,
-                device=grad_output.device,
-            )
-            slice_info = comm.get_slice_info(ctx.input_batch_size)
-            grad_input.narrow(batch_dim, slice_info.start, slice_info.size).copy_(grad_output)
+            group = comm.get_fan_out_gather_group()
+            world_size = comm.get_fan_out_gather_world_size()
+
+            input_contig = grad_output.contiguous()
+            if batch_dim != 0:
+                input_contig = input_contig.movedim(batch_dim, 0).contiguous()
+
+            out_shape = list(input_contig.shape)
+            out_shape[0] *= world_size
+            grad_input = torch.empty(out_shape, dtype=grad_output.dtype, device=grad_output.device)
+            dist.all_gather_into_tensor(grad_input, input_contig, group=group)
+
+            if batch_dim != 0:
+                grad_input = grad_input.movedim(0, batch_dim).contiguous()
             return grad_input, None
 
         elif comm.is_fan_in():
