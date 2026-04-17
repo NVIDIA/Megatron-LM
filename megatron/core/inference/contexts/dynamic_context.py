@@ -844,7 +844,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             label: torch.empty(
                 (self.max_requests,), dtype=dtype, device=torch.cuda.current_device()
             )
-            for label, dtype, _ in self.request_metadata_types
+            for label, dtype in self.request_metadata_types
         }
 
         # Per-token state.
@@ -861,15 +861,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
         # Static tensor addresses of active slices to enable fast inference kernels.
-        self.active_request_metadata: Dict[str, Tensor] = {}
-        for label, _, on_gpu in self.request_metadata_types:
-            if on_gpu:
-                tensor = torch.empty_like(self.request_metadata[label])
-            else:
-                tensor = torch.empty_like(
-                    self.request_metadata[label], device="cpu", pin_memory=True
-                )
-            self.active_request_metadata[label] = tensor
+        self.active_request_metadata = {
+            label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
+        }
 
         self.active_request_ids = torch.empty_like(self.request_ids, dtype=torch.int64)
         self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
@@ -1082,7 +1076,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         padded_slice = slice(self.paused_request_count, self.paused_request_count + batch_size)
 
         # Request metadata all needs to be sliced.
-        for label, _, _ in self.request_metadata_types:
+        for label in self.request_metadata:
             self.active_request_metadata[label][:batch_size].copy_(
                 self.request_metadata[label][padded_slice], non_blocking=True
             )
@@ -1452,7 +1446,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
-        for i, (label, dtype, _) in enumerate(self.request_metadata_types):
+        for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
                 metadata_cols[i], dtype=dtype, device=torch.cuda.current_device()
             )
@@ -2228,7 +2222,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metadata = req.tracked_metadata
         metadata_types = req.get_metadata_types()
         for m, m_type in zip(metadata, metadata_types):
-            label, _, _ = m_type
+            label, _ = m_type
             if not isinstance(m, torch.Tensor):
                 m = torch.as_tensor(
                     m,
