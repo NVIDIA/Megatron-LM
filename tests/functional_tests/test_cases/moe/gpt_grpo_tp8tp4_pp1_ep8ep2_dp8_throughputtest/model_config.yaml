@@ -94,7 +94,7 @@ MODEL_ARGS:
   --rl-use-sequence-packing: true
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
-  --rl-desired-lag: -0.5
+  --rl-num-parallel-generations: 2
   --cuda-graph-impl: local
   --micro-batch-size: 1
   --global-batch-size: 4
