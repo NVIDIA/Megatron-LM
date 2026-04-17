@@ -11,6 +11,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.parameterization import SCALING_RECIPE_MUP
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -113,7 +114,9 @@ class MambaModel(LanguageModule):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        if self.config.use_mup and not getattr(MambaModel, "mup_warning_printed", False):
+        if self.config.scaling_recipe == SCALING_RECIPE_MUP and not getattr(
+            MambaModel, "mup_warning_printed", False
+        ):
             log_single_rank(
                 logger,
                 logging.WARNING,

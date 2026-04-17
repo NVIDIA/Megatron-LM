@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.parameterization import (
+    SCALING_RECIPE_MUP,
     build_resolved_model_policy,
     build_resolved_scaling_context,
     sync_legacy_mup_fields,
@@ -1791,7 +1792,7 @@ class TransformerConfig(ModelParallelConfig):
         model_scaling_policy = build_resolved_model_policy(self)
 
         # MuP (Maximal Update Parameterization) configuration
-        if self.use_mup:
+        if scaling_context.recipe == SCALING_RECIPE_MUP:
             overridden_init_methods = []
             if self.init_method is not None:
                 overridden_init_methods.append("init_method")
