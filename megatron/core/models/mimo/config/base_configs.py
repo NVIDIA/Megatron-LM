@@ -23,9 +23,11 @@ class MimoModelConfig:
             in the input_ids to insert the modality embeddings at the correct positions.
         module_to_grid_map (Optional[Dict[str, HyperCommGrid]]):
             Dictionary mapping module keys (e.g., "vision", "language") to their
-            corresponding HyperCommGrid configurations for non-colocated pipeline
-            parallelism. The language model must use the key MIMO_LANGUAGE_MODULE_KEY.
-            When None, all modules are assumed to be colocated on the same ranks.
+            corresponding HyperCommGrid configurations. The language model must use
+            the key MIMO_LANGUAGE_MODULE_KEY.
+            When grids span the same ranks → colocated (same or different TP/DP).
+            When grids span disjoint ranks → non-colocated (pipeline parallel).
+            When None → colocated with legacy global parallel_state.
         kv_format (str):
             Key-value format for attention: "sbhd" (seq-batch-head-dim) or "thd" (total-head-dim).
             Default is "sbhd".

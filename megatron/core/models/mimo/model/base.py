@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from megatron.core.distributed import DistributedDataParallel
+from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
@@ -59,10 +60,23 @@ class MimoModel(MegatronModule):
 
         self.mimo_config = mimo_config
         modality_names = list(mimo_config.modality_submodules_spec.keys())
+        self.colocated_comms = {}
         if mimo_config.module_to_grid_map:
-            self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
+            expected_keys = set(modality_names) | {MIMO_LANGUAGE_MODULE_KEY}
+            grid_keys = set(mimo_config.module_to_grid_map.keys())
+            if grid_keys != expected_keys:
+                raise ValueError(
+                    f"module_to_grid_map keys must match modality module names + "
+                    f"'{MIMO_LANGUAGE_MODULE_KEY}'. Missing: {expected_keys - grid_keys}, "
+                    f"Extra: {grid_keys - expected_keys}"
+                )
+            if self._is_colocated(mimo_config.module_to_grid_map):
+                self.role = RankRole.colocated(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
+                self._build_colocated_communicators()
+            else:
+                self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
         else:
-            self.role = RankRole.unified(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
+            self.role = RankRole.colocated(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
 
         # Use special token IDs from the config
         self.special_token_ids = (
@@ -358,7 +372,7 @@ class MimoModel(MegatronModule):
         # Get any tensors passed via set_input_tensor
         input_tensors = getattr(self, 'input_tensors', None)
 
-        if self.role.mode == ModuleLayout.UNIFIED:
+        if self.role.mode == ModuleLayout.COLOCATED:
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -491,6 +505,40 @@ class MimoModel(MegatronModule):
 
         return lm_output
 
+    @staticmethod
+    def _is_colocated(module_to_grid_map):
+        """Check if all grids span the same ranks (colocated)."""
+        grids = list(module_to_grid_map.values())
+        first = grids[0]
+        return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
+
+    def _build_colocated_communicators(self):
+        """Build communicators for each encoder → language edge."""
+        grid_map = self.mimo_config.module_to_grid_map
+        lang_key = MIMO_LANGUAGE_MODULE_KEY
+        lang_grid = grid_map[lang_key]
+        for mod_name in self.mimo_config.modality_submodules_spec:
+            if mod_name in grid_map and mod_name != lang_key:
+                src_grid = grid_map[mod_name]
+                if src_grid.size == lang_grid.size:
+                    self.colocated_comms[(mod_name, lang_key)] = ColocatedBridgeCommunicator(
+                        src_grid=src_grid,
+                        dest_grid=lang_grid,
+                        src_module_name=mod_name,
+                        dest_module_name=lang_key,
+                    )
+
+    def _apply_colocated_comms(self, modality_embeddings):
+        """Transform encoder embeddings from encoder TP/DP to LLM TP/DP layout."""
+        lang_key = MIMO_LANGUAGE_MODULE_KEY
+        for modality_name in list(modality_embeddings.keys()):
+            comm = self.colocated_comms.get((modality_name, lang_key))
+            if comm is not None:
+                modality_embeddings[modality_name] = comm.communicate(
+                    modality_embeddings[modality_name]
+                )
+        return modality_embeddings
+
     def _forward_all_modules(
         self,
         input_ids: torch.Tensor,
@@ -532,6 +580,10 @@ class MimoModel(MegatronModule):
                     logger.debug(
                         f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
                     )
+
+        # Apply colocated communication if configured (no-op when colocated_comms is empty)
+        if self.colocated_comms:
+            modality_embeddings = self._apply_colocated_comms(modality_embeddings)
 
         # Get text embeddings
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)

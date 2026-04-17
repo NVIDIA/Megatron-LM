@@ -24,22 +24,17 @@ class ModuleLayout(Enum):
     Determines how modules are distributed across ranks and which
     forward path is used.
 
-    UNIFIED: No module_to_grid_map. All modules share same ranks and
-        parallelism. Uses the unified forward path (_forward_all_modules).
+    COLOCATED: All modules share the same ranks. Covers both legacy
+        (no grid map, global parallel_state) and heterogeneous TP/DP
+        (grid map with overlapping ranks). Uses _forward_all_modules.
 
     NON_COLOCATED: module_to_grid_map is set with non-overlapping rank
         ranges. Each rank runs EITHER encoder(s) OR the language model.
         Uses role-based dispatch with separate forward paths.
-
-    COLOCATED: (future) module_to_grid_map is set with overlapping rank
-        ranges. Encoder(s) and language model share ranks but have
-        different parallelism configs. Uses role-based dispatch but
-        allows both module types on the same rank.
     """
 
-    UNIFIED = "unified"
-    NON_COLOCATED = "non_colocated"
     COLOCATED = "colocated"
+    NON_COLOCATED = "non_colocated"
 
 
 @dataclass
@@ -70,17 +65,17 @@ class RankRole:
     """
 
     modules: Dict[str, ModuleStageInfo] = field(default_factory=dict)
-    mode: ModuleLayout = ModuleLayout.UNIFIED
+    mode: ModuleLayout = ModuleLayout.COLOCATED
 
     @classmethod
-    def unified(cls, module_names: List[str]) -> 'RankRole':
-        """Create a role for the unified case: every module, first+last stage."""
+    def colocated(cls, module_names: List[str]) -> 'RankRole':
+        """Create a role for colocated: every module on every rank, PP=1."""
         return cls(
             modules={
                 name: ModuleStageInfo(is_first_stage=True, is_last_stage=True)
                 for name in module_names
             },
-            mode=ModuleLayout.UNIFIED,
+            mode=ModuleLayout.COLOCATED,
         )
 
     @classmethod
