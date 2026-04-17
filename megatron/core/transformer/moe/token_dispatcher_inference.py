@@ -399,6 +399,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         if mask_routing_map:
             cls._symm_agv_routing["tensor"].fill_(-1)
 
+        dist.barrier(group=ep_group)  # Ensure all ranks have updated metadata before forward.
+
     def __init__(
         self,
         num_local_experts: int,
