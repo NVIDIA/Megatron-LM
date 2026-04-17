@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -54,25 +54,11 @@ class GlooCopyService(CopyService):
                 f"GlooCopyService initialized on rank {self.rank} with {self.world_size} ranks"
             )
 
-    def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
-        self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
-
-    def submit_send_with_id(self, task_id: int, src_tensor: torch.Tensor, dest_rank: int):
-        """Submit a send operation with a unique task identifier."""
+    def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
         self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
 
-    def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int):
-        """Submit a receive operation."""
+    def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int, task_id: Optional[int] = None):
         # Allocate a pinned CPU buffer for faster CPU↔GPU transfer.
-        cpu_buffer = torch.empty(
-            dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True
-        )
-        self.recv_ops.append(
-            (RecvOp(task_id=None, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)
-        )
-
-    def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
-        """Submit a receive operation with a unique task identifier."""
         cpu_buffer = torch.empty(
             dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True
         )
@@ -100,14 +86,14 @@ class GlooCopyService(CopyService):
             local_sends_by_id = {op.task_id: op for op in local_sends}
             if None in local_sends_by_id:
                 raise RuntimeError(
-                    "GlooCopyService: local send missing task_id; "
-                    "use submit_send_with_id/submit_recv_with_id for local copies"
+                    "GlooCopyService: local (same-rank) transfer requires a task_id "
+                    "to match sends with recvs"
                 )
             local_recvs_by_id = {recv.task_id: (recv, dst) for (recv, dst) in local_recvs}
             if None in local_recvs_by_id:
                 raise RuntimeError(
-                    "GlooCopyService: local recv missing task_id; "
-                    "use submit_send_with_id/submit_recv_with_id for local copies"
+                    "GlooCopyService: local (same-rank) transfer requires a task_id "
+                    "to match sends with recvs"
                 )
             if len(local_sends_by_id) != len(local_sends) or len(local_recvs_by_id) != len(
                 local_recvs

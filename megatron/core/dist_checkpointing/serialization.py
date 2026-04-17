@@ -21,7 +21,6 @@ from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
 from .dict_utils import merge
 from .mapping import (
-    CheckpointingException,
     CommonStateDict,
     ShardedObject,
     ShardedStateDict,
@@ -30,7 +29,6 @@ from .mapping import (
 )
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
-from .strategies.base import AsyncSaveShardedStrategy
 from .strategies.common import load_common, save_common
 from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
@@ -393,10 +391,6 @@ def save(
         metadata_finalize_fn()
         return None
 
-    if not isinstance(sharded_strategy, AsyncSaveShardedStrategy):
-        raise CheckpointingException(
-            f'Cannot apply async_save to non-async strategy {sharded_strategy}'
-        )
     async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
     async_request.finalize_fns.append(metadata_finalize_fn)
     return async_request
