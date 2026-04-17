@@ -1537,6 +1537,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.add_dummy_requests_parallel(prefill_requests)
         self.num_prefill_requests = graph_dimensions.prefill_req_count
 
+    @property
+    def num_decode_requests(self) -> int:
+        """
+        Returns the number of decode requests.
+        """
+        return self.total_request_count - self.paused_request_count - self.num_prefill_requests
+
     def add_dummy_requests_for_expert_parallel_step(
         self, graph_dimensions: InferenceBatchDimensions
     ) -> None:
@@ -1606,12 +1613,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata.batch_allocate_slots(N)
             )
 
-    @property
-    def num_decode_requests(self) -> int:
-        """
-        Returns the number of decode requests.
-        """
-        return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
     def initialize_attention_state(
         self,
