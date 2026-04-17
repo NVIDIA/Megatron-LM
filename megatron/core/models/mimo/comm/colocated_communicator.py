@@ -58,6 +58,14 @@ class ColocatedBridgeCommunicator:
         )
 
     def _validate_grids(self):
+        for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
+            for required in ('tp', 'dp'):
+                if required not in grid.dim_names:
+                    raise ValueError(
+                        f"{name} grid must have '{required}' dimension, "
+                        f"got dim_names={grid.dim_names}"
+                    )
+
         if self.src_grid.size != self.dest_grid.size:
             raise ValueError(
                 f"Grids must span same number of ranks: "
@@ -76,6 +84,18 @@ class ColocatedBridgeCommunicator:
             pp_size = self.src_grid.shape[self.src_grid.dim_names.index('pp')]
             if pp_size != 1:
                 raise ValueError(f"Source PP must be 1 for colocated, got {pp_size}")
+
+        # CP>1 on either grid is not yet supported. See NMFW-17 task #1:
+        # _build_rank_mappings uses _gen_rank_enum(['tp']) which returns
+        # cp*pp*dp groups, so enumerating them directly corrupts dp_idx
+        # when CP>1. Reject explicitly until the fix lands.
+        for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
+            if 'cp' in grid.dim_names:
+                cp_size = grid.shape[grid.dim_names.index('cp')]
+                if cp_size != 1:
+                    raise ValueError(
+                        f"{name} CP must be 1 for ColocatedBridgeCommunicator, " f"got {cp_size}"
+                    )
 
         src_dp = self.src_grid.shape[self.src_grid.dim_names.index('dp')]
         dest_dp = self.dest_grid.shape[self.dest_grid.dim_names.index('dp')]
@@ -125,6 +145,12 @@ class ColocatedBridgeCommunicator:
             dp_idx += 1
 
     def _build_all_gather_groups(self):
+        # Ranks are appended in (src_dp_idx, src_tp_idx) slot order so that the
+        # position inside ``group_ranks`` equals each participant's slot in the
+        # gathered output. ``new_subgroups_by_enumeration`` assigns group-local
+        # ranks by list position, and ``all_gather_into_tensor`` concatenates
+        # outputs in group-local-rank order — so preserving append order is
+        # load-bearing. Do not sort.
         scale = int(self.dp_scale_factor)
         all_groups: List[List[int]] = []
 
@@ -139,21 +165,12 @@ class ColocatedBridgeCommunicator:
                         if dp == src_dp_idx and tp == src_tp_idx:
                             group_ranks.append(rank)
                             break
-                all_groups.append(sorted(group_ranks))
+                all_groups.append(group_ranks)
 
         self.all_gather_group_ranks = all_groups
         self.all_gather_pg, _ = dist.new_subgroups_by_enumeration(all_groups, backend='nccl')
 
-        self._my_all_gather_group_idx = None
-        for idx, group_ranks in enumerate(all_groups):
-            if self.current_rank in group_ranks:
-                self._my_all_gather_group_idx = idx
-                break
-
-        logging.debug(
-            f"[Rank {self.current_rank}] All-gather groups: {all_groups}, "
-            f"my_group_idx={self._my_all_gather_group_idx}"
-        )
+        logging.debug(f"[Rank {self.current_rank}] All-gather groups: {all_groups}")
 
     def get_all_gather_group(self) -> Optional[dist.ProcessGroup]:
         """Return the all-gather process group for fan-in communication."""
@@ -173,9 +190,11 @@ class ColocatedBridgeCommunicator:
         slice gradients produced by every dest rank that consumed one of its
         slices. We build a group per (src_dp_idx, dest_tp_idx) containing the
         ``scale = dest_dp / src_dp`` dest ranks that cover consecutive
-        dest_dp_idx values mapping to this src_dp_idx. Rank order inside the
-        group matches slot order, so all_gather_into_tensor reconstructs the
-        full batch gradient in the correct layout.
+        dest_dp_idx values mapping to this src_dp_idx. Ranks are appended in
+        slot order (increasing dest_dp_idx), which equals group-local-rank
+        order inside ``new_subgroups_by_enumeration`` — so the subsequent
+        ``all_gather_into_tensor`` reconstructs the full-batch gradient in the
+        correct layout. Do not sort this list.
         """
         scale = int(1 / self.dp_scale_factor)
         all_groups: List[List[int]] = []
@@ -191,7 +210,7 @@ class ColocatedBridgeCommunicator:
                         if dp == dest_dp_idx and tp == dest_tp_idx:
                             group_ranks.append(rank)
                             break
-                all_groups.append(sorted(group_ranks))
+                all_groups.append(group_ranks)
 
         self.fan_out_gather_group_ranks = all_groups
         self.fan_out_gather_pg, _ = dist.new_subgroups_by_enumeration(all_groups, backend='nccl')
@@ -227,6 +246,8 @@ class ColocatedBridgeCommunicator:
         return SliceInfo(start=slot * slice_size, size=slice_size)
 
     def _get_fan_in_slice_info(self, batch_size: int) -> SliceInfo:
+        if self.current_rank not in self.rank_to_src_pos:
+            return SliceInfo(start=0, size=batch_size)
         src_dp_idx = self.rank_to_src_pos[self.current_rank][0]
         scale = int(self.dp_scale_factor)
         slot = src_dp_idx % scale
@@ -249,6 +270,19 @@ class ColocatedBridgeCommunicator:
         """Transform tensor from src TP/DP layout to dest TP/DP layout."""
         return _ColocatedCommunicate.apply(tensor, self)
 
+    def destroy(self) -> None:
+        """Release NCCL process groups created by this communicator.
+
+        NCCL enforces a hard cap on concurrent communicators (~500). Long-lived
+        or repeated construction (e.g. per-test fixtures, checkpoint reloads)
+        leaks PGs without this call.
+        """
+        for attr in ('all_gather_pg', 'fan_out_gather_pg'):
+            pg = getattr(self, attr, None)
+            if pg is not None:
+                dist.destroy_process_group(pg)
+                setattr(self, attr, None)
+
 
 class _ColocatedCommunicate(torch.autograd.Function):
     """Autograd function for colocated communication with correct backward pass."""
@@ -261,7 +295,6 @@ class _ColocatedCommunicate(torch.autograd.Function):
         batch_size = tensor.shape[ctx.batch_dim]
 
         if comm.is_fan_out():
-            ctx.input_batch_size = batch_size
             slice_info = comm.get_slice_info(batch_size)
             return tensor.narrow(ctx.batch_dim, slice_info.start, slice_info.size).contiguous()
 

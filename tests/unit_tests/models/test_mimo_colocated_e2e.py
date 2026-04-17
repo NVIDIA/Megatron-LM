@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """End-to-end integration test for MIMO model with colocated modules (no pipeline parallelism).
 
@@ -601,6 +601,7 @@ def run_colocated_test(
     # Verify losses from all iterations
     assert len(all_losses) > 0, f"Rank {rank}: Expected non-empty losses list"
 
+    loss_values = []
     for i, loss_dict in enumerate(all_losses):
         assert 'loss_reduced' in loss_dict, f"Rank {rank}: Missing 'loss_reduced' in microbatch {i}"
         loss_val = loss_dict['loss_reduced']
@@ -609,18 +610,12 @@ def run_colocated_test(
         assert loss_val == loss_val, f"Rank {rank}: Loss is NaN at microbatch {i}"  # NaN check
         assert abs(loss_val) != float('inf'), f"Rank {rank}: Loss is inf at microbatch {i}"
         logger.info(f"Rank {rank}: microbatch {i} loss = {loss_val}")
+        loss_values.append(loss_val)
 
     # At least one microbatch should have non-zero loss
-    any_nonzero = any(
-        (
-            loss_dict['loss_reduced'].item()
-            if isinstance(loss_dict['loss_reduced'], torch.Tensor)
-            else loss_dict['loss_reduced']
-        )
-        != 0.0
-        for loss_dict in all_losses
-    )
-    assert any_nonzero, f"Rank {rank}: All losses are zero -- model did not compute anything"
+    assert any(
+        v != 0.0 for v in loss_values
+    ), f"Rank {rank}: All losses are zero -- model did not compute anything"
 
     # Verify we got losses from all iterations (num_iterations * num_microbatches)
     expected_total = num_iterations * num_microbatches
@@ -629,6 +624,39 @@ def run_colocated_test(
         f"({num_iterations} iterations x {num_microbatches} microbatches), "
         f"got {len(all_losses)}"
     )
+
+    # Oracle check 1: cross-rank loss consistency within the LLM DP group.
+    # All TP ranks in the same DP replica should see identical losses (same
+    # batch, same weights after param-sync). A silently wrong bridge would
+    # route the wrong batch slice and break this invariance.
+    llm_dp_pg = llm_grid.get_pg('dp')
+    llm_tp_pg = llm_grid.get_pg('tp')
+    per_rank = torch.tensor(loss_values, device='cuda', dtype=torch.float64)
+    gathered_tp = [torch.empty_like(per_rank) for _ in range(dist.get_world_size(llm_tp_pg))]
+    dist.all_gather(gathered_tp, per_rank, group=llm_tp_pg)
+    for other in gathered_tp:
+        torch.testing.assert_close(per_rank, other, rtol=1e-5, atol=1e-5)
+
+    # Oracle check 2: training signal — sum of losses in iteration 0 should
+    # differ from iteration (num_iterations-1). If the optimizer step or the
+    # backward path is silently a no-op (e.g. gradients landing on the wrong
+    # params), the loss trajectory stays flat and this fires.
+    first_iter_sum = sum(loss_values[:num_microbatches])
+    last_iter_sum = sum(loss_values[-num_microbatches:])
+    assert first_iter_sum != last_iter_sum, (
+        f"Rank {rank}: loss unchanged across {num_iterations} iterations "
+        f"(first={first_iter_sum}, last={last_iter_sum}) — optimizer step may "
+        f"not be updating parameters"
+    )
+    # And across the full DP group the iteration-0 mean should also change —
+    # this rules out the case where per-rank drift happens to cancel.
+    first_iter_mean = torch.tensor([first_iter_sum], device='cuda', dtype=torch.float64)
+    last_iter_mean = torch.tensor([last_iter_sum], device='cuda', dtype=torch.float64)
+    dist.all_reduce(first_iter_mean, group=llm_dp_pg)
+    dist.all_reduce(last_iter_mean, group=llm_dp_pg)
+    assert not torch.equal(
+        first_iter_mean, last_iter_mean
+    ), f"Rank {rank}: DP-reduced loss unchanged across iterations"
 
     return all_losses
 

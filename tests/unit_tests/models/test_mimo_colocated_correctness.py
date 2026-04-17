@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 """TransformerBlock correctness test for colocated MIMO communication (9 checks x 3 iters).
 
 Run:  uv run python -m torch.distributed.run --nproc_per_node=8 \

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import logging
 import os
 import sys
@@ -221,6 +221,38 @@ class TestAllGatherGroups:
 
         assert comm.all_gather_group_ranks == []
         assert comm.all_gather_pg is None
+
+    @pytest.mark.parametrize(
+        "src_tp, src_dp, dest_tp, dest_dp, expected_groups",
+        [
+            # Fan-out: TP4/DP2 → TP2/DP4. Two src DP groups, two dest TP shards;
+            # for each src_dp_idx we sweep dest_tp_idx over 2 dest DP replicas.
+            # Expected groups are (src_dp_idx, dest_tp_idx) sweeping dest_dp_idx
+            # in slot order.
+            (4, 2, 2, 4, [[0, 2], [1, 3], [4, 6], [5, 7]]),
+            # Extreme fan-out: TP8/DP1 → TP1/DP8 (one src DP group, one dest TP).
+            (8, 1, 1, 8, [[0, 1, 2, 3, 4, 5, 6, 7]]),
+        ],
+        ids=["fan_out_2x", "extreme_8x"],
+    )
+    def test_fan_out_gather_groups(self, src_tp, src_dp, dest_tp, dest_dp, expected_groups):
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
+        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+
+        # Direct equality check enforces both membership and slot order —
+        # all_gather_into_tensor concatenates by group-local-rank, and backward
+        # relies on slot 0 of each group holding dest_dp_start's slice.
+        assert comm.fan_out_gather_group_ranks == expected_groups
+        assert comm.fan_out_gather_pg is not None
+
+    def test_fan_in_no_fan_out_gather(self):
+        src_grid = create_hypercomm_grid(tp=2, dp=4)
+        dest_grid = create_hypercomm_grid(tp=4, dp=2)
+        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+
+        assert comm.fan_out_gather_group_ranks == []
+        assert comm.fan_out_gather_pg is None
 
 
 # ── Test 3: Slice info ─────────────────────────────────────────────────────────
