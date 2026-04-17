@@ -763,10 +763,7 @@ def test_qk_layernorm_spec_config_mismatch_raises():
     model_parallel_cuda_manual_seed(123)
     try:
         config = TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
+            num_layers=1, hidden_size=128, num_attention_heads=4, use_cpu_initialization=True
         )
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=L2Norm, k_layernorm=L2Norm)
