@@ -198,7 +198,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "5671fd3675906cda1ade26c24a65d3dedd88eb89" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
