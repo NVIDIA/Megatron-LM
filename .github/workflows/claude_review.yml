@@ -33,6 +33,12 @@ jobs:
           fetch-depth: 1
           ref: ${{ steps.get-pr-head-commit.outputs.sha }}
 
+      - name: React to trigger comment
+        run: |
+          gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
+            --method POST \
+            -f content='eyes'
+
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1
         with:
@@ -52,6 +58,8 @@ jobs:
             - Critical bugs or logic errors
             - Typos in code, comments, or strings
             - Missing or insufficient test coverage for changed code
+              - If the PR adds a new feature or significant functionality without corresponding tests, suggest adding tests
+              - If the PR fixes a bug that was not caught by an existing unit test, suggest adding a regression test to prevent recurrence
             - Outdated or inaccurate documentation affected by the changes
 
             Do NOT comment on:

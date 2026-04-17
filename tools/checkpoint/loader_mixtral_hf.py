@@ -3,10 +3,11 @@
 import json
 import os
 import sys
+import types
+
 import torch
 import transformers
 from tqdm import tqdm
-import types
 
 from tools.checkpoint.utils import _ConverterFakeProcessGroup
 
@@ -14,27 +15,36 @@ from tools.checkpoint.utils import _ConverterFakeProcessGroup
 def add_arguments(parser):
     group = parser.add_argument_group(title='Mixtral HF loader.')
 
-    group.add_argument('--true-vocab-size', type=int, default=None,
-                       help='original size of vocab, if specified will trim padding from embedding table.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file. If specified will use this to get vocab size and '
-                       'trim padding from the embedding table.')
-    group.add_argument('--tokenizer-model', required=True,
-                       help='Sentencepiece tokenizer model.')
-    group.add_argument('--megatron-path', type=str, default=None,
-                       help='Base directory of deepspeed repository')
+    group.add_argument(
+        '--true-vocab-size',
+        type=int,
+        default=None,
+        help='original size of vocab, if specified will trim padding from embedding table.',
+    )
+    group.add_argument(
+        '--vocab-file',
+        type=str,
+        default=None,
+        help='Path to the vocab file. If specified will use this to get vocab size and '
+        'trim padding from the embedding table.',
+    )
+    group.add_argument('--tokenizer-model', required=True, help='Sentencepiece tokenizer model.')
+    group.add_argument(
+        '--megatron-path', type=str, default=None, help='Base directory of deepspeed repository'
+    )
 
 
 def load_args_from_checkpoint(args):
     # Read Mixtral 8x7B args.
     from transformers import MixtralConfig
+
     mixtral_config = MixtralConfig.from_pretrained(args.load)
 
     # Update Megatron args.
     args.untie_embeddings_and_output_weights = True
     args.seq_length = 4096
     args.global_batch_size = 1024
-    args.iteration = 1 # '0', 'release' don't work
+    args.iteration = 1  # '0', 'release' don't work
     args.add_position_embedding = False
     args.use_rotary_position_embeddings = True
     args.swiglu = True
@@ -60,19 +70,22 @@ def load_args_from_checkpoint(args):
         args.group_query_attention = True
         args.num_query_groups = mixtral_config.num_key_value_heads
 
+
 def verify_transformers_version():
     major, minor, patch = map(int, transformers.__version__.split('.'))
     assert major >= 4 and minor >= 36
 
+
 def set_preprocess_state(args, model, hf_model):
     '''Set embedding params.'''
-    model.embedding.word_embeddings.weight.data.copy_(
-        hf_model.model.embed_tokens.weight)
+    model.embedding.word_embeddings.weight.data.copy_(hf_model.model.embed_tokens.weight)
+
 
 def set_postprocess_state(args, model, hf_model):
     '''Set output layer & norm params.'''
     model.decoder.final_layernorm.weight.data.copy_(hf_model.model.norm.weight)
     model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
+
 
 def set_attn_state(args, layer, hf_layer):
     '''Set self-attention params.'''
@@ -84,18 +97,26 @@ def set_attn_state(args, layer, hf_layer):
     # Reshape loaded weights.
     tp = args.tensor_model_parallel_size
     num_heads = args.num_attention_heads // tp
-    num_query_groups = (args.num_query_groups if args.group_query_attention else args.num_attention_heads) // tp
+    num_query_groups = (
+        args.num_query_groups if args.group_query_attention else args.num_attention_heads
+    ) // tp
     num_querys_per_group = num_heads // num_query_groups
     dim = args.kv_channels
     assert num_heads % num_querys_per_group == 0
 
     # Copy weights (re-order dimensions for Megatron).
-    attn.linear_qkv.weight.data.copy_(torch.cat([
-        hf_attn.q_proj.weight.reshape((num_query_groups, num_querys_per_group*dim, -1)),
-        hf_attn.k_proj.weight.reshape((num_query_groups, dim, -1)),
-        hf_attn.v_proj.weight.reshape((num_query_groups, dim, -1)),
-    ], dim=1).reshape((-1, args.hidden_size)))
+    attn.linear_qkv.weight.data.copy_(
+        torch.cat(
+            [
+                hf_attn.q_proj.weight.reshape((num_query_groups, num_querys_per_group * dim, -1)),
+                hf_attn.k_proj.weight.reshape((num_query_groups, dim, -1)),
+                hf_attn.v_proj.weight.reshape((num_query_groups, dim, -1)),
+            ],
+            dim=1,
+        ).reshape((-1, args.hidden_size))
+    )
     attn.linear_proj.weight.data.copy_(hf_attn.o_proj.weight)
+
 
 def set_mlp_state(args, layer, hf_layer):
     '''Set MLP params.'''
@@ -106,14 +127,10 @@ def set_mlp_state(args, layer, hf_layer):
     hf_experts = hf_layer.block_sparse_moe.experts
     for expert_idx in range(args.num_experts):
         mcore_experts[expert_idx].linear_fc1.weight.data.copy_(
-            torch.cat([
-                hf_experts[expert_idx].w1.weight,
-                hf_experts[expert_idx].w3.weight
-            ], dim=0)
+            torch.cat([hf_experts[expert_idx].w1.weight, hf_experts[expert_idx].w3.weight], dim=0)
         )
-        mcore_experts[expert_idx].linear_fc2.weight.data.copy_(
-            hf_experts[expert_idx].w2.weight
-        )
+        mcore_experts[expert_idx].linear_fc2.weight.data.copy_(hf_experts[expert_idx].w2.weight)
+
 
 def set_layer_state(args, model, hf_model, layer_idx):
     '''Set transformer layer params.'''
@@ -127,12 +144,14 @@ def set_layer_state(args, model, hf_model, layer_idx):
     layer.self_attention.linear_qkv.layer_norm_weight.data.copy_(hf_layer.input_layernorm.weight)
     layer.pre_mlp_layernorm.weight.data.copy_(hf_layer.post_attention_layernorm.weight)
 
+
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
-    from model_provider import model_provider
+    from transformers import MixtralConfig, MixtralForCausalLM
+
     from gpt_builders import gpt_builder
-    from transformers import MixtralForCausalLM, MixtralConfig
+    from model_provider import model_provider
 
     # Load Huggingface model.
 
@@ -155,44 +174,48 @@ def _load_checkpoint(queue, args):
     verify_transformers_version()
 
     # Search in directory above this.
-    sys.path.append(os.path.abspath(
-        os.path.join(os.path.dirname(__file__),
-                     os.path.pardir,
-                     os.path.pardir)))
+    sys.path.append(
+        os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+    )
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
-        from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
+        from megatron.legacy.model import module
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.global_vars import set_args, set_global_variables
     except ModuleNotFoundError:
-        print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
+        print(
+            "Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting."
+        )
         queue.put("exit")
         exit(1)
 
     # We want all arguments to come from us.
-    sys.argv = ['script.py',
-                '--use-mcore-models',
-                '--disable-bias-linear',
-                '--no-masked-softmax-fusion',
-                '--no-bias-gelu-fusion',
-                '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
-                '--use-cpu-initialization',
-                '--micro-batch-size', '1',
-                '--no-load-optim',
-                '--no-load-rng',
-                '--no-save-optim',
-                '--no-save-rng',
-                '--no-initialization',
-                '--mock-data', # To pass the "blend data checks" in arguments.py
-                '--transformer-impl', 'transformer_engine',
-                '--load', args.load_dir,
-                '--no-one-logger',
-                ]
+    sys.argv = [
+        'script.py',
+        '--use-mcore-models',
+        '--disable-bias-linear',
+        '--no-masked-softmax-fusion',
+        '--no-bias-gelu-fusion',
+        '--no-bias-dropout-fusion',
+        '--use-cpu-initialization',
+        '--micro-batch-size',
+        '1',
+        '--no-load-optim',
+        '--no-load-rng',
+        '--no-save-optim',
+        '--no-save-rng',
+        '--no-initialization',
+        '--mock-data',  # To pass the "blend data checks" in arguments.py
+        '--transformer-impl',
+        'transformer_engine',
+        '--load',
+        args.load_dir,
+        '--no-one-logger',
+    ]
 
     margs = parse_args()
     margs.tokenizer_model = args.tokenizer_model
@@ -240,7 +263,7 @@ def _load_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
-    
+
     # For backward compatibility during local parallel states refactoring
     fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
     fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
@@ -266,7 +289,7 @@ def _load_checkpoint(queue, args):
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
-    md.true_vocab_size = margs.vocab_size # skips padding in saver
+    md.true_vocab_size = margs.vocab_size  # skips padding in saver
     md.make_vocab_size_divisible_by = None
     md.checkpoint_args = margs
     md.consumed_train_samples = 0
@@ -287,9 +310,7 @@ def _load_checkpoint(queue, args):
         queue.put(msg)
 
     # Send embeddings.
-    message = {
-        "word embeddings": model.embedding.word_embeddings.weight.data
-    }
+    message = {"word embeddings": model.embedding.word_embeddings.weight.data}
     if md.position_embedding_type == 'learned_absolute':
         message["position embeddings"] = model.embedding.position_embeddings.weight.data
     else:
@@ -315,25 +336,33 @@ def _load_checkpoint(queue, args):
 
         message["router weight"] = layer.mlp.router.weight.data
         if md.swiglu:
-            chunked_mlp_l0_weight =  [torch.chunk(local_expert.linear_fc1.weight.data, 2, dim=0) for local_expert in experts]
-            message["mlp l0 weight W"] = torch.stack([local_weight[0] for local_weight in chunked_mlp_l0_weight], dim=0)
-            message["mlp l0 weight V"] = torch.stack([local_weight[1] for local_weight in chunked_mlp_l0_weight], dim=0)
+            chunked_mlp_l0_weight = [
+                torch.chunk(local_expert.linear_fc1.weight.data, 2, dim=0)
+                for local_expert in experts
+            ]
+            message["mlp l0 weight W"] = torch.stack(
+                [local_weight[0] for local_weight in chunked_mlp_l0_weight], dim=0
+            )
+            message["mlp l0 weight V"] = torch.stack(
+                [local_weight[1] for local_weight in chunked_mlp_l0_weight], dim=0
+            )
         else:
-            message["mlp l0 weight"] = torch.stack([local_expert.linear_fc1.weight.data for local_expert in experts])
-        message["mlp l1 weight"] = torch.stack([local_expert.linear_fc2.weight.data for local_expert in experts], dim=0)
+            message["mlp l0 weight"] = torch.stack(
+                [local_expert.linear_fc1.weight.data for local_expert in experts]
+            )
+        message["mlp l1 weight"] = torch.stack(
+            [local_expert.linear_fc2.weight.data for local_expert in experts], dim=0
+        )
 
         queue_put(f"transformer layer {layer_idx}", message)
 
-    queue_put("final norm", {
-        "weight": model.decoder.final_layernorm.weight.data,
-    })
+    queue_put("final norm", {"weight": model.decoder.final_layernorm.weight.data})
 
     if md.output_layer:
-        queue_put("output layer", {
-            "weight": model.output_layer.weight.data
-        })
+        queue_put("output layer", {"weight": model.output_layer.weight.data})
 
     queue.put("done")
+
 
 def load_checkpoint(queue, args):
     try:

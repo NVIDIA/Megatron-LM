@@ -22,6 +22,8 @@ except ImportError:
 
 import torch
 
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
 from ..logger import PELogger
 from ..memory.double_buffer_manager import DoubleBufferManager
 from ..nvshmem_types import ReceiveRequest, ScheduledBatch, SendRequest
@@ -118,13 +120,14 @@ class PipelineExecutor:
         # Priming: Pack iteration 0 (async, no CPU sync needed —
         # step 3 uses GPU-level event wait for pack→put ordering)
         if num_iterations > 0 and iter_schedules[0]["send"]:
-            torch.cuda.nvtx.range_push("Priming")
+            nvtx_range_push("Priming")
             PELogger.debug("Priming: Packing iteration 0")
             self._launch_pack(0, iter_schedules[0]["send"])
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop("Priming")
 
         for i in range(num_iterations):
-            torch.cuda.nvtx.range_push(f"Iteration {i}")
+            nvtx_iter_msg = f"Iteration {i}"
+            nvtx_range_push(nvtx_iter_msg)
             has_send = iter_schedules[i]["send"] is not None
             has_recv = iter_schedules[i]["recv"] is not None
             has_next_send = i + 1 < num_iterations and iter_schedules[i + 1]["send"] is not None
@@ -149,7 +152,7 @@ class PipelineExecutor:
 
             # Step 1: Pack NEXT iteration (async)
             if has_next_send:
-                torch.cuda.nvtx.range_push("Step 1: Pack Next")
+                nvtx_range_push("Step 1: Pack Next")
                 next_batch = iter_schedules[i + 1]["send"]
                 assert next_batch is not None
                 PELogger.debug(
@@ -157,11 +160,11 @@ class PipelineExecutor:
                     f"→ PE {next_batch.dest_pe}"
                 )
                 self._launch_pack(i + 1, next_batch)
-                torch.cuda.nvtx.range_pop()
+                nvtx_range_pop("Step 1: Pack Next")
 
             # Step 2: Unpack PRIOR iteration (async)
             if has_prior_recv:
-                torch.cuda.nvtx.range_push("Step 2: Unpack Prior")
+                nvtx_range_push("Step 2: Unpack Prior")
                 prior_batch = iter_schedules[i - 1]["recv"]
                 assert prior_batch is not None
                 PELogger.debug(
@@ -172,11 +175,11 @@ class PipelineExecutor:
                 # the prior iteration has completed before unpack_stream proceeds.
                 self.torch_unpack_stream_wrapper.wait_event(self.barrier_events[(i - 1) % 2])
                 self._launch_unpack(i - 1, prior_batch)
-                torch.cuda.nvtx.range_pop()
+                nvtx_range_pop("Step 2: Unpack Prior")
 
             # Step 3: Send CURRENT iteration
             if has_send:
-                torch.cuda.nvtx.range_push("Step 3: Send Current")
+                nvtx_range_push("Step 3: Send Current")
                 batch = iter_schedules[i]["send"]
                 assert batch is not None
                 transfer_size = batch.total_size
@@ -194,19 +197,19 @@ class PipelineExecutor:
                     batch.dest_pe,
                     stream=self.send_stream,
                 )
-                torch.cuda.nvtx.range_pop()
+                nvtx_range_pop("Step 3: Send Current")
 
             # Step 4a: Wait for prior unpack to complete BEFORE the barrier.
-            torch.cuda.nvtx.range_push("Step 4a: Wait Unpack")
+            nvtx_range_push("Step 4a: Wait Unpack")
             if has_prior_recv:
                 self.unpack_events[(i - 1) % 2].synchronize()
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop("Step 4a: Wait Unpack")
 
             # Ensure all NVSHMEM operations on send_stream complete (stream-ordered)
             nvshmem.core.quiet(stream=self.send_stream)
 
             # Step 4b: Global barrier + CPU sync + record event
-            torch.cuda.nvtx.range_push("Step 4b: Barrier")
+            nvtx_range_push("Step 4b: Barrier")
             nvshmem.core.barrier_all(stream=self.send_stream)
             # CPU-sync the send_stream to ensure barrier_all has actually
             # completed (not just submitted). Without this, the barrier_event
@@ -215,19 +218,19 @@ class PipelineExecutor:
             # not completed, when the event is recorded.
             self.torch_send_stream_wrapper.synchronize()
             self.barrier_events[slot].record(stream=self.torch_send_stream_wrapper)
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop("Step 4b: Barrier")
 
             # Step 5: Wait for async pack to complete (double-buffer safety)
-            torch.cuda.nvtx.range_push("Step 5: Wait Pack")
+            nvtx_range_push("Step 5: Wait Pack")
             if has_next_send:
                 self.pack_events[(i + 1) % 2].synchronize()
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop("Step 5: Wait Pack")
 
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop(nvtx_iter_msg)
 
         # Final unpack for last iteration
         if num_iterations > 0 and iter_schedules[num_iterations - 1]["recv"]:
-            torch.cuda.nvtx.range_push("Final Unpack")
+            nvtx_range_push("Final Unpack")
             PELogger.debug(f"Final unpack: iteration {num_iterations-1}")
             last_recv = iter_schedules[num_iterations - 1]["recv"]
             assert last_recv is not None
@@ -237,7 +240,7 @@ class PipelineExecutor:
             )
             self._launch_unpack(num_iterations - 1, last_recv)
             self.unpack_events[(num_iterations - 1) % 2].synchronize()
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop("Final Unpack")
 
         PELogger.info(f"Pipeline complete: {num_iterations} iterations")
 
