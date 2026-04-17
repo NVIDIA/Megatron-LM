@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -301,6 +302,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+        self.is_first_microbatch = True
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -700,12 +702,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        if self.is_first_microbatch and os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1":
+            from megatron.core.extensions.transformer_engine import qtype_debug_log
+
+            qtype_debug_log(f"[{self.layer_number}] transformer layer")
+
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
         )
+        self.is_first_microbatch = False
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):

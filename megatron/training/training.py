@@ -3026,6 +3026,9 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+            # If we were logging quantization types, stop after first step.
+            if os.getenv("QUANTIZATION_TYPE_DEBUG", "0") == "1":
+                del os.environ["QUANTIZATION_TYPE_DEBUG"]
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
