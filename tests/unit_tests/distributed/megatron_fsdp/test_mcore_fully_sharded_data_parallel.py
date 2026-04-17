@@ -816,6 +816,7 @@ class TestMegatronFSDPE2E:
                     data_parallel_sharding_strategy="optim_grads_params",
                     megatron_fsdp_main_params_dtype=torch.float32,
                     use_precision_aware_optimizer=True,
+                    fp8="hybrid",
                     fp8_recipe="delayed",
                     fp8_param_gather=True,
                     bf16=True,
