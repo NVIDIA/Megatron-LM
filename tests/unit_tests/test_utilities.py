@@ -96,7 +96,7 @@ class Utils:
             # Flush pending CUDA work before the barrier so slow ranks don't
             # time out while fast ranks tear down process groups.
             torch.cuda.synchronize()
-            torch.distributed.barrier(timeout=timedelta(seconds=30))
+            torch.distributed.barrier(timeout=timedelta(seconds=300))
         except Exception:
             Utils.inited = False
             return
