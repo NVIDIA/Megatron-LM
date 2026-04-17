@@ -782,6 +782,9 @@ class TransformerConfig(ModelParallelConfig):
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
 
+    moe_permute_fusion_into_hybridep: bool = False
+    """Fuse token rearrangement ops during token dispatching for HybridEP."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -826,9 +829,19 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
-    moe_hybridep_num_sms: int = 16
-    """Number of SMs to use for HybridEP. In pure NVL scenarios,
-    16 SMs can generally achieve good bandwidth."""
+    moe_hybridep_num_sms: Optional[int] = None
+    """Number of SMs to use for HybridEP. None uses the default from DeepEP.
+    In pure NVL scenarios, 16 SMs can generally achieve good bandwidth."""
+
+    moe_hybridep_num_blocks_permute: Optional[int] = None
+    """Number of cuda threads blocks to use for permute part in HybridEP. 
+    If permute_fusion_into_hybridep is True, this is the number of sms 
+    to use for the permute part."""
+
+    moe_hybridep_num_blocks_unpermute: Optional[int] = None
+    """Number of cuda threads blocks to use for unpermute part in HybridEP. 
+    If permute_fusion_into_hybridep is True, this is the number of sms to 
+    use for the unpermute part."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
