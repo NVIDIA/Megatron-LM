@@ -187,8 +187,21 @@ class WeightedMultiTask(
         """Distribute grouped rollouts across sub-agents according to weights."""
         agent_groups = self._distribute_counts(request.num_groups)
         agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
-        agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
-        agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
+        agent_slot_dist = self._distribute_counts(
+            self.parallel_generation_tasks, distribute_remainder=False
+        )
+        # Prevent any agent from having agent_groups > 0 but agent_slots == 0.
+        if all(s > 0 for s, g in zip(agent_slot_dist, agent_groups) if g > 0):
+            agent_slots = np.array(agent_slot_dist) / np.gcd.reduce(agent_slot_dist)
+        else:
+            agent_slots = np.array(agent_groups) / np.gcd.reduce(agent_groups)
+
+        if any(g == 0 for g, c in zip(agent_groups, self.agent_configs) if not c.evaluation_only):
+            raise ValueError(
+                f"Generation batch size ({request.num_groups}) is too small for the configured "
+                f"weights. Some non-evaluation environments would receive no work. "
+                f"Adjust environment weights to be less extreme."
+            )
 
         # Create tasks for each agent with non-zero groups
         generators = []

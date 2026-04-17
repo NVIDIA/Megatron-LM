@@ -459,8 +459,26 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     global _ROLLOUT_GENERATOR
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
+        num_non_eval = sum(1 for c in agent.agent_configs if not c.evaluation_only)
+        if args.grpo_prompts_per_step < num_non_eval:
+            raise ValueError(
+                f"grpo_prompts_per_step ({args.grpo_prompts_per_step}) must be >= "
+                f"the number of non-evaluation environments ({num_non_eval})"
+            )
+        if streaming:
+            if args.rl_generation_batch_size is None:
+                num_groups = num_non_eval
+            elif args.rl_generation_batch_size < num_non_eval:
+                raise ValueError(
+                    f"Generation batch size ({args.rl_generation_batch_size}) must be >= "
+                    f"the number of non-evaluation environments ({num_non_eval})"
+                )
+            else:
+                num_groups = args.rl_generation_batch_size
+        else:
+            num_groups = n_prompts
         request = GroupedRolloutRequest(
-            num_groups=args.rl_generation_batch_size if streaming else n_prompts,
+            num_groups=num_groups,
             streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,

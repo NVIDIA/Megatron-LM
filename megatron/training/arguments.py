@@ -468,8 +468,6 @@ def validate_args(args, defaults={}):
                 f"must be divisible by --grpo-group-size ({args.grpo_group_size})."
             args.rl_parallel_generation_tasks = (
                 args.rl_num_parallel_generations // args.grpo_group_size)
-            if args.rl_generation_batch_size is None:
-                args.rl_generation_batch_size = 1
         elif args.rl_num_parallel_generation_batches is not None:
             assert args.rl_partial_rollouts, \
                 "--rl-num-parallel-generation-batches requires --rl-partial-rollouts."
@@ -478,12 +476,11 @@ def validate_args(args, defaults={}):
             args.rl_parallel_generation_tasks = (
                 args.rl_num_parallel_generation_batches * args.rl_generation_batch_size)
         else:
-            if args.rl_generation_batch_size is None:
-                args.rl_generation_batch_size = 1
             args.rl_parallel_generation_tasks = 512
 
-        # Derive enforce_order after all resolution is complete.
-        args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
+        args.rl_enforce_generation_order = (
+            args.rl_num_parallel_generation_batches is not None
+        )
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
