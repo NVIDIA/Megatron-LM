@@ -217,7 +217,9 @@ class MambaModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.position_embedding_type == 'rope':
+        # MLA (also used by DeepSeek Sparse Attention) uses its own decoupled RoPE, therefore we do
+        # not build standard RoPE here when using MLA.
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -372,7 +374,7 @@ class MambaModel(LanguageModule):
             decoder_input = None
 
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope':
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )

@@ -3,6 +3,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
   NON_DETERMINSTIC_RESULTS: 1
 TEST_TYPE: "release"
+LAUNCHER: ft_launcher
 MODEL_ARGS:
   # T5 model args
   --encoder-num-layers: 12
