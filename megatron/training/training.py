@@ -134,6 +134,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
+from megatron.core.parameterization import build_resolved_training_policy
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
@@ -151,7 +152,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer import get_scaling_config_overrides, get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
@@ -1644,14 +1645,16 @@ def setup_model_and_optimizer(
             unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
         )
         model_config = get_model_config(model_config_source)
-        if getattr(model_config, "use_mup", False):
-            mup_overrides = get_mup_config_overrides(
+        scaling_policy = build_resolved_training_policy(
+            model_config, optimizer_type=config.optimizer
+        )
+        if scaling_policy.enabled:
+            scaling_overrides = get_scaling_config_overrides(
                 config=config,
-                mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=config.optimizer,
+                scaling_policy=scaling_policy,
             )
-            if mup_overrides:
-                config_overrides = {**(config_overrides or {}), **mup_overrides}
+            if scaling_overrides:
+                config_overrides = {**(config_overrides or {}), **scaling_overrides}
 
         optimizer = get_megatron_optimizer(
             config,

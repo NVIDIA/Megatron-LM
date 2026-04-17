@@ -23,6 +23,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.optimizer import MegatronOptimizer, get_param_group_identifier_tuple
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -209,6 +210,65 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
     assert param_groups[1]['max_lr'] == 20
     assert param_groups[2]['min_lr'] is None
     assert param_groups[2]['max_lr'] == 0.01
+
+
+def test_param_group_identifier_tuple_distinguishes_lr_schedule_and_eps():
+    default_group = {
+        'wd_mult': 1.0,
+        'lr_mult': 1.0,
+        'is_expert_parallel': False,
+        'is_decoupled_lr': False,
+        'max_lr': 1e-3,
+        'min_lr': 1e-5,
+    }
+    scaled_group = {
+        **default_group,
+        'max_lr': 2.5e-4,
+        'min_lr': 2.5e-6,
+        'eps': 2.5e-9,
+    }
+    assert get_param_group_identifier_tuple(default_group) != get_param_group_identifier_tuple(
+        scaled_group
+    )
+
+
+def test_filter_and_reorder_param_groups_keeps_distinct_lr_schedule_groups():
+    current_groups = [
+        {
+            'params': ['hidden'],
+            'wd_mult': 1.0,
+            'lr_mult': 1.0,
+            'is_expert_parallel': False,
+            'is_decoupled_lr': False,
+            'max_lr': 2.5e-4,
+            'min_lr': 2.5e-6,
+            'eps': 2.5e-9,
+        },
+        {
+            'params': ['default'],
+            'wd_mult': 1.0,
+            'lr_mult': 1.0,
+            'is_expert_parallel': False,
+            'is_decoupled_lr': False,
+            'max_lr': 1e-3,
+            'min_lr': 1e-5,
+        },
+    ]
+    state_dict_groups = [
+        dict(current_groups[0]),
+        dict(current_groups[1]),
+    ]
+
+    filtered_groups = MegatronOptimizer._filter_and_reorder_param_groups(
+        current_groups, state_dict_groups
+    )
+
+    assert filtered_groups[0]['max_lr'] == pytest.approx(2.5e-4)
+    assert filtered_groups[0]['min_lr'] == pytest.approx(2.5e-6)
+    assert filtered_groups[0]['eps'] == pytest.approx(2.5e-9)
+    assert filtered_groups[1]['max_lr'] == pytest.approx(1e-3)
+    assert filtered_groups[1]['min_lr'] == pytest.approx(1e-5)
+    assert 'eps' not in filtered_groups[1]
 
 
 @patch('torch.distributed.get_world_size', return_value=1)

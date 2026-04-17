@@ -2890,6 +2890,10 @@ class ParamAndGradBuffer:
                             "partition_stride",
                             "is_embedding_or_output_parameter",
                             "is_embedding_parameter",
+                            "is_output_parameter",
+                            "parameterization_role",
+                            "parameterization_shared_group",
+                            "parameterization_tags",
                             "_tensor_parallel_mode",
                         ]:
                             if hasattr(orig_param, attr_name):

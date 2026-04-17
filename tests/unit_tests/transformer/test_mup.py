@@ -19,11 +19,19 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer import (
+    get_mup_config_overrides,
+    get_scaling_config_overrides,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
 from megatron.core.models.gpt.fine_grained_callables import _apply_mlp_bda_with_scaling
-from megatron.core.parameterization import build_resolved_model_policy, build_resolved_scaling_context
+from megatron.core.parameterization import (
+    build_resolved_model_policy,
+    build_resolved_scaling_context,
+    build_resolved_training_policy,
+)
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -52,6 +60,15 @@ def _prepare_parsed_args_for_core_config(args):
     # parse_args() populates CLI-backed fields only; validate_args() normally derives params_dtype.
     args.params_dtype = torch.float32
     return args
+
+
+def _combined_override_for_param(overrides, param, param_name):
+    matches = [
+        override
+        for param_key, override in overrides.items()
+        if param_key.matches(param, param_name)
+    ]
+    return combine_param_group_overrides(matches)
 
 
 class TestMuPConfigValidation:
@@ -991,6 +1008,118 @@ class TestMuPLRScaling:
         assert shared_output_override['max_lr'] == pytest.approx(2e-4)
         assert shared_output_override['min_lr'] == pytest.approx(2e-6)
         assert 'eps' not in shared_output_override
+
+    def test_scaling_policy_matches_legacy_optimizer_overrides_for_width_only(self):
+        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
+        model_config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=8,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+        )
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
+
+        policy_overrides = get_scaling_config_overrides(optimizer_config, scaling_policy)
+        legacy_overrides = get_mup_config_overrides(
+            optimizer_config, model_config.mup_width_mult, optimizer_type='adam'
+        )
+
+        hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+        bias_param = torch.nn.Parameter(torch.zeros(10))
+        embedding_param = torch.nn.Parameter(torch.zeros(10, 10))
+        embedding_param.is_embedding_parameter = True
+        output_param = torch.nn.Parameter(torch.zeros(10, 10))
+        output_param.is_embedding_parameter = True
+        output_param.is_embedding_or_output_parameter = True
+
+        sample_params = [
+            (hidden_param, 'decoder.layers.0.self_attention.linear_qkv.weight'),
+            (bias_param, 'decoder.layers.0.self_attention.linear_qkv.bias'),
+            (embedding_param, 'embedding.word_embeddings.weight'),
+            (output_param, 'output_layer.weight'),
+        ]
+
+        for param, name in sample_params:
+            assert _combined_override_for_param(
+                policy_overrides, param, name
+            ) == _combined_override_for_param(legacy_overrides, param, name)
+
+    def test_scaling_policy_applies_hidden_lr_depth_power_for_adam(self):
+        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
+        model_config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=16,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=4,
+            scaling_hidden_lr_depth_power=-0.5,
+        )
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
+        overrides = get_scaling_config_overrides(optimizer_config, scaling_policy)
+
+        hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+        bias_param = torch.nn.Parameter(torch.zeros(10))
+        hidden_override = _combined_override_for_param(
+            overrides, hidden_param, 'decoder.layers.0.self_attention.linear_qkv.weight'
+        )
+        bias_override = _combined_override_for_param(
+            overrides, bias_param, 'decoder.layers.0.self_attention.linear_qkv.bias'
+        )
+
+        expected_lr_mult = (1.0 / model_config.mup_width_mult) * (
+            scaling_policy.context.depth_mult**model_config.scaling_hidden_lr_depth_power
+        )
+        assert hidden_override['max_lr'] == pytest.approx(optimizer_config.lr * expected_lr_mult)
+        assert hidden_override['min_lr'] == pytest.approx(
+            optimizer_config.min_lr * expected_lr_mult
+        )
+        assert hidden_override['eps'] == pytest.approx(
+            optimizer_config.adam_eps / model_config.mup_width_mult
+        )
+        assert 'max_lr' not in bias_override
+        assert 'min_lr' not in bias_override
+        assert 'eps' not in bias_override
+
+    def test_scaling_policy_applies_hidden_lr_depth_power_for_sgd(self):
+        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
+        model_config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=16,
+            num_attention_heads=16,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=4,
+            scaling_hidden_lr_depth_power=-0.5,
+        )
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='sgd')
+        overrides = get_scaling_config_overrides(optimizer_config, scaling_policy)
+
+        hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+        bias_param = torch.nn.Parameter(torch.zeros(10))
+        hidden_override = _combined_override_for_param(
+            overrides, hidden_param, 'decoder.layers.0.mlp.linear_fc1.weight'
+        )
+        bias_override = _combined_override_for_param(
+            overrides, bias_param, 'decoder.layers.0.mlp.linear_fc1.bias'
+        )
+
+        expected_hidden_lr_mult = scaling_policy.context.depth_mult ** (
+            model_config.scaling_hidden_lr_depth_power
+        )
+        assert hidden_override['max_lr'] == pytest.approx(
+            optimizer_config.lr * expected_hidden_lr_mult
+        )
+        assert hidden_override['min_lr'] == pytest.approx(
+            optimizer_config.min_lr * expected_hidden_lr_mult
+        )
+        assert bias_override['max_lr'] == pytest.approx(
+            optimizer_config.lr * model_config.mup_width_mult
+        )
+        assert bias_override['min_lr'] == pytest.approx(
+            optimizer_config.min_lr * model_config.mup_width_mult
+        )
 
 
 class TestMuPConfigIntegration:
