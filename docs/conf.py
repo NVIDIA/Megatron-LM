@@ -99,7 +99,7 @@ if not skip_autodoc:
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
     "switcher": {
-        "json_url": "versions1.json",
+        "json_url": "../versions1.json",
         "version_match": release,
     },
     "icon_links": [
