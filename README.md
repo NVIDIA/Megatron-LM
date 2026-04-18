@@ -46,12 +46,6 @@ the optimizer block (validated on `-ablation`: NorMuon beats AdamW by
 | ffn (SwiGLU) | 2560 | 4096 | 5632 | 7680 |
 | peak LR | 3e-4 | 2.5e-4 | 2e-4 | 1.6e-4 |
 
-Common: seq_len 4096, WSD schedule with 200-step warmup (25600 samples),
-minus_sqrt decay over last 20% of training, grad clip 1.0, weight decay 0.1,
-AdamW (beta1=0.9, beta2=0.95), untied embeddings, TP=1 PP=1, distributed
-optimizer with overlap-grad-reduce and overlap-param-gather (overlap-param-gather
-omitted for Muon, see Muon section below).
-
 ### Leaderboards
 
 Ranked per-size run lists live under
