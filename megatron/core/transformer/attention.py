@@ -35,7 +35,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
+from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -102,10 +102,11 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         SplitAlongDim,
         TELinear,
+        TENorm,
         set_save_original_input,
     )
 else:
-    SplitAlongDim, TELinear, set_save_original_input = None, None, None
+    SplitAlongDim, TELinear, TENorm, set_save_original_input = None, None, None, None
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -867,7 +868,9 @@ class Attention(MegatronModule, ABC):
             q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
 
             # If using MLA we use the FlashMLA kernel
-            if isinstance(self.config, MLATransformerConfig):
+            # The `softmax_scale` attribute check is to find out whether this is an MLA layer or
+            # standard Attention.
+            if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
@@ -1326,23 +1329,51 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
         )
 
-        if submodules.q_layernorm is not None:
-            self.q_layernorm = submodules.q_layernorm(
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
+        # Resolve which norm class to use for Q and K.
+        # Config selects the default norm class; spec overrides if set.
+        if self.config.qk_l2_norm:
+            q_norm_cls = submodules.q_layernorm or L2Norm
+            k_norm_cls = submodules.k_layernorm or L2Norm
+        elif self.config.qk_layernorm:
+            # TODO(yuzhongw, janpabloe): Support local backend.
+            q_norm_cls = submodules.q_layernorm or TENorm
+            k_norm_cls = submodules.k_layernorm or TENorm
+            if q_norm_cls is None or k_norm_cls is None:
+                raise ValueError(
+                    "qk_layernorm requires Transformer Engine (for TENorm) or "
+                    "q_layernorm/k_layernorm set in the spec."
+                )
         else:
-            self.q_layernorm = None
+            if submodules.q_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets q_layernorm={submodules.q_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            if submodules.k_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets k_layernorm={submodules.k_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            q_norm_cls = k_norm_cls = None
 
-        if submodules.k_layernorm is not None:
-            self.k_layernorm = submodules.k_layernorm(
+        self.q_layernorm = (
+            q_norm_cls(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
-        else:
-            self.k_layernorm = None
+            if q_norm_cls is not None
+            else None
+        )
+        self.k_layernorm = (
+            k_norm_cls(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+            if k_norm_cls is not None
+            else None
+        )
 
     def run_realtime_tests(self):
         """Performs a consistency check.
