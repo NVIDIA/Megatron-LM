@@ -1057,7 +1057,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         ctx.initialize_attention_state()
 
         # Determine prefill_start for this batch
-        prefill_start = ctx.paused_request_count + ctx.batch_dimensions.decode_req_count
+        prefill_start = ctx.batch_dimensions.decode_req_count
         ctx_idx = prefill_start  # first prefill request
 
         # Write known patterns to intermediate output buffers

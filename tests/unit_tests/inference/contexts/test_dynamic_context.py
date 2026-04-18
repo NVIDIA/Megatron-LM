@@ -646,10 +646,11 @@ class TestDynamicContext:
         # 3. The active requests will also have some requests that have to be paused because of reaching max token limit within block
         # 4. Some of these requests will be resumed.
         # Setup is as follows :
-        # Request ids 0, 1 are paused
-        # Request ids 2, 4, 9 are active requests
-        # Request ids 3 7 8 have completed
-        # Request ids 5 and 6 will require on more block later on because they finished their current block
+        # Indices 0-7 active, indices 8-9 paused
+        # Request ids 0, 1 are paused (at indices 8, 9)
+        # Request ids 2, 4, 9 are active requests that stay active
+        # Request ids 3, 7, 8 have completed
+        # Request ids 5 and 6 will require one more block later on because they finished their current block
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -684,30 +685,34 @@ class TestDynamicContext:
             dynamic_context.kv_block_allocator.total_avail,
             dynamic_context.kv_block_allocator.total_avail + 10,
         )
-        dynamic_context.request_to_kv_block_ids[3][
+        dynamic_context.request_to_kv_block_ids[1][
             1
         ] = dynamic_context.kv_block_allocator.total_avail  # Assign one extra block  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
-        # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks
-        dynamic_context.request_kv_length_offsets[0:2] = dynamic_context.block_size_tokens - 1
-        dynamic_context.request_kv_length_offsets[5:7] = dynamic_context.block_size_tokens - 1
-        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size
-        dynamic_context.request_kv_length_offsets[3] = dynamic_context.block_size_bytes + 10
+        # IDs 5, 6 (at indices 3, 4) and IDs 0, 1 (paused at indices 8, 9)
+        # have block_size-1 tokens in their last block, so they all need extra blocks.
+        dynamic_context.request_kv_length_offsets[3:5] = dynamic_context.block_size_tokens - 1
+        dynamic_context.request_kv_length_offsets[8:10] = dynamic_context.block_size_tokens - 1
+        # ID 3 (at index 1) is completed and required 2 blocks.
+        dynamic_context.request_kv_length_offsets[1] = dynamic_context.block_size_bytes + 10
         dynamic_context.request_query_lengths[0:total_request_count] = (
             1  # Everything is in decode phase
         )
 
-        dynamic_context.request_ids[0:total_request_count] = torch.arange(0, total_request_count)
+        # Layout: [active(IDs 2-9) | paused(IDs 0,1)]
+        dynamic_context.request_ids[0:total_request_count] = torch.tensor(
+            [2, 3, 4, 5, 6, 7, 8, 9, 0, 1], device='cuda'
+        )
         dynamic_context.request_kv_block_counts[0:total_request_count] = 1
-        dynamic_context.request_kv_block_counts[3] = 2  # 3rd block alone requies 2 blocks
+        dynamic_context.request_kv_block_counts[1] = 2  # ID 3 (index 1) requires 2 blocks
         dynamic_context.request_last_kv_block_id[0:total_request_count] = torch.arange(
             0, total_request_count
         )
-        dynamic_context.request_last_kv_block_id[3] = 11
+        dynamic_context.request_last_kv_block_id[1] = 11  # ID 3 (index 1)
         dynamic_context.request_last_kv_block_offset[0:total_request_count] = 10
-        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size
-        dynamic_context.request_last_kv_block_offset[0:2] = dynamic_context.block_size_tokens - 1
-        dynamic_context.request_last_kv_block_offset[5:7] = dynamic_context.block_size_tokens - 1
+        # IDs 5, 6 (indices 3, 4) and paused IDs 0, 1 (indices 8, 9)
+        dynamic_context.request_last_kv_block_offset[3:5] = dynamic_context.block_size_tokens - 1
+        dynamic_context.request_last_kv_block_offset[8:10] = dynamic_context.block_size_tokens - 1
 
         if is_hybrid_model:
             # Dummy fill for states to be non-zero before update
@@ -721,45 +726,34 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=next_tokens
         )
 
-        # Then set up the test data
-        dynamic_context.request_ids[0:10] = torch.tensor(
-            [0, 1, 5, 6, 4, 2, 9, 7, 8, 9], device=torch.cuda.current_device()
-        )
-
-        # Now verify the values
-        assert dynamic_context.request_ids[0:10].cpu().numpy().tolist() == [
-            0,
-            1,
-            5,
-            6,
-            4,
-            2,
-            9,
-            7,
-            8,
-            9,
-        ]
-
+        # Verify structural invariants.
         assert dynamic_context.paused_request_count == 0
         assert dynamic_context.total_request_count == 7
         assert dynamic_context.active_token_count == 7
 
-        # The first four are zero because they have all obtained a new block
+        # All 7 surviving request IDs should be present in [0, total).
+        surviving_ids = set(
+            dynamic_context.request_ids[: dynamic_context.total_request_count].cpu().tolist()
+        )
+        assert surviving_ids == {0, 1, 2, 4, 5, 6, 9}  # IDs 3, 7, 8 finished
+
+        # IDs 2,9,4 stayed active (offset 10+1=11); IDs 5,6,0,1 got new blocks (offset (127+1)%128=0).
+        # Indices 7-9 are stale.
         assert dynamic_context.request_last_kv_block_offset[0:10].cpu().numpy().tolist() == [
-            0,
-            0,
-            0,
-            0,
             11,
             11,
             11,
+            0,
+            0,
+            0,
+            0,
             10,
-            10,
-            10,
+            127,
+            127,
         ]
         assert dynamic_context.token_to_input_ids[
             : dynamic_context.active_token_count
-        ].cpu().numpy().tolist() == [0, 1, 5, 6, 4, 2, 9]
+        ].cpu().numpy().tolist() == [2, 9, 4, 5, 6, 0, 1]
 
         assert dynamic_context.token_to_pos_ids[
             : dynamic_context.active_token_count
@@ -2739,11 +2733,12 @@ class TestDynamicContext:
         # Both blocks should be safely shared with ref count 2
         assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
 
-        # Mock the state to make req1 paused and req2 active
+        # Mock the state to make req2 active and req1 paused.
+        # Layout: [active | paused] => request_ids[0] = active (req2), request_ids[1] = paused (req1).
         ctx.paused_request_count = 1
         ctx.total_request_count = 2
-        ctx.request_ids[0] = 1
-        ctx.request_ids[1] = 2
+        ctx.request_ids[0] = 2
+        ctx.request_ids[1] = 1
         ctx.request_kv_block_counts[0] = 2
         ctx.request_kv_block_counts[1] = 2
 
