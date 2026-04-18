@@ -201,6 +201,36 @@ class TestGatedDeltaNet:
         assert g.shape == alpha.shape
         assert beta_sig.shape == beta.shape
 
+    def test_accepts_cp_comm_type_kwarg(self):
+        """Regression: TransformerLayer injects ``cp_comm_type`` into the
+        attention-submodule constructor whenever ``context_parallel_size > 1``
+        (see ``megatron/core/transformer/transformer_layer.py``). Without the
+        kwarg being declared, GDN build fails with ``TypeError`` for any
+        hybrid model using Gated Delta Net layers with CP>1 (e.g. Qwen3-Next /
+        Qwen3.5). GatedDeltaNet handles CP communication via
+        ``pg_collection.cp`` (added in #2642), so the value itself is unused."""
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=self.transformer_config
+        ).submodules
+
+        # Must accept and ignore cp_comm_type without raising.
+        gdn = GatedDeltaNet(
+            self.transformer_config,
+            submodules=gdn_submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=pg_collection,
+            cp_comm_type="p2p",
+        )
+        assert gdn is not None
+
 
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
