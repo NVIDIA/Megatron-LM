@@ -103,6 +103,23 @@ class ValidationConfig:
     during training.
     """
 
+    start_eval_at_iter: int | None = None
+    """If set, evaluation will only start after this iteration number. Useful for skipping
+    evaluation during early training iterations when the model is not yet meaningful.
+    If not set, evaluation starts from the first eval_interval.
+    """
+
+    eval_global_batch_size: int | None = None
+    """Global batch size to use during evaluation. If not set, defaults to global_batch_size.
+    Must be divisible by (eval_micro_batch_size * data_parallel_size).
+    """
+
+    eval_micro_batch_size: int | None = None
+    """Micro batch size to use during evaluation. If not set, defaults to micro_batch_size.
+    Changing this affects per-device memory usage during eval and the number of microbatches per
+    eval step.
+    """
+
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
 
@@ -531,5 +548,13 @@ class CheckpointConfig:
     """Number of machines storing the replica of a given rank's data."""
 
     def __post_init__(self):
+        from megatron.training.utils import has_nvrx_installed
+
         assert self.async_strategy in ["nvrx", "mcore"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
+
+        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
+            assert has_nvrx_installed(), (
+                "nvidia-resiliency-ext is not installed. "
+                "Please, install nvidia-resiliency-ext to enable async save."
+            )

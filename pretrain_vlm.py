@@ -38,7 +38,7 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from pretrain_gpt import loss_func
 
 
@@ -439,13 +439,15 @@ def llava_position_embedding_ranks(pp_ranks):
 if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
+    parse_and_validate_args(
+        extra_args_provider=add_vlm_extra_args,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_vlm_extra_args,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
     )
