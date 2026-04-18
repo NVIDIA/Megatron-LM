@@ -36,6 +36,13 @@ try:
 except ImportError:
     HAVE_FA3 = False
 
+try:
+    from flash_attn.cute.interface import flash_attn_func
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
 
 class DummyTokenizer:
     def __init__(self, vocab_size: int, bos: int | None = None, eod: int = 0, pad: int = 0):
@@ -118,8 +125,8 @@ def _train_forward_logprobs(model: torch.nn.Module, tokens: torch.Tensor) -> tor
 
 
 @pytest.mark.skipif(
-    not (is_te_min_version("2.10.0") and HAVE_FA3),
-    reason="TestGPTModelBatchInvariant requires TE >= 2.10.0 and FlashAttention-3",
+    not (is_te_min_version("2.10.0") and (HAVE_FA3 or HAVE_FA4)),
+    reason="TestGPTModelBatchInvariant requires TE >= 2.10.0 and FlashAttention-3 or -4",
 )
 class TestGPTModelBatchInvariant:
     """End-to-end batch-invariance tests for GPT."""

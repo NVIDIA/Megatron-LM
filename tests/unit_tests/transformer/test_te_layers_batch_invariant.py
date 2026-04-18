@@ -29,6 +29,13 @@ try:
 except ImportError:
     HAVE_FA3 = False
 
+try:
+    from flash_attn.cute.interface import flash_attn_func
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
 
 # ============================================================================
 # Batch-Invariant test helpers
@@ -312,8 +319,8 @@ def test_column_parallel_linear_batch_invariant_randomized():
 
 
 @pytest.mark.skipif(
-    not (is_te_min_version("2.10.0") and HAVE_FA3),
-    reason="TE attention BIK tests require TE >= 2.10.0 and FlashAttention-3",
+    not (is_te_min_version("2.10.0") and (HAVE_FA3 or HAVE_FA4)),
+    reason="TE attention BIK tests require TE >= 2.10.0 and FlashAttention-3 or -4",
 )
 def test_te_attention_layer_batch_invariant_randomized():
     torch.backends.cuda.matmul.allow_tf32 = False
