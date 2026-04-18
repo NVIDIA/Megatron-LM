@@ -429,6 +429,7 @@ class T5Model(LanguageModule):
             if self.share_embeddings_and_output_weights:
                 output_weight = self.shared_embedding_or_output_weight()
             lm_logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
+            lm_logits = self._scale_logits(lm_logits)
 
             if lm_labels is None:
                 # [s b h] => [b s h]
