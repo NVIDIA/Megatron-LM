@@ -1,12 +1,10 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Inference FLOPs calculator for hybrid Mamba/Attention/MoE models.
 
 Computes forward-pass FLOPs per inference step using model architecture
 parameters. Used by the dynamic inference engine to report per-step
 FLOPs and MFU (Model FLOPs Utilization).
-
-Reference: nemotron6_3b_moe_flops_equations.md
 """
 
 import logging
