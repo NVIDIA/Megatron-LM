@@ -46,7 +46,31 @@ the optimizer block (validated on `-ablation`: NorMuon beats AdamW by
 Common: seq_len 4096, WSD schedule with 200-step warmup (25600 samples),
 minus_sqrt decay over last 20% of training, grad clip 1.0, weight decay 0.1,
 AdamW (beta1=0.9, beta2=0.95), untied embeddings, TP=1 PP=1, distributed
-optimizer with overlap-grad-reduce and overlap-param-gather.
+optimizer with overlap-grad-reduce and overlap-param-gather (overlap-param-gather
+omitted for Muon, see Muon section below).
+
+### 350M ablation results (1B tokens, GBS=128, 1 node)
+
+All runs share architecture, data, schedule, seed; only the optimizer
+block differs. W&B project [megatron-lm-research-baseline](https://wandb.ai/ischlag/megatron-lm-research-baseline).
+
+| optimizer | matrix LR | final loss | min loss | run |
+| --- | ---: | ---: | ---: | --- |
+| NorMuon | 3.6e-4 | **2.219** | **2.058** | [915a3ek8](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/915a3ek8) |
+| NorMuon | 3.6e-4 | 2.224 | 2.061 | [7b52h3zh](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/7b52h3zh) (distopt) |
+| NorMuon | 3.6e-4 | 2.225 | 2.061 | [137djf7r](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/137djf7r) (distopt+overlap-grad) |
+| NorMuon | 2e-4 | 2.226 | 2.063 | [aygv2bqb](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/aygv2bqb) |
+| Muon (shape_scaling) | 2e-2 | 2.232 | 2.069 | [5kmiazba](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/5kmiazba) |
+| NorMuon | 6e-4 | 2.244 | 2.082 | [taefn8ax](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/taefn8ax) |
+| AdamW | 1e-3 | 2.314 | 2.148 | [gzhef3ao](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/gzhef3ao) |
+| AdamW | 5e-4 | 2.366 | 2.204 | [qstcfiz9](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/qstcfiz9) |
+| AdamW | 3e-4 | 2.417 | 2.259 | [w1sn75pp](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/w1sn75pp) |
+| NorMuon | 1e-3 | 2.622 | 2.466 | [jr95ykb3](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/jr95ykb3) (too hot) |
+
+Key finding: NorMuon (matrix LR 3.6e-4, scalar LR 1.5e-3, scalar WD 0)
+beats best AdamW (LR 1e-3) by ~0.10 nats final loss. Plain Muon with
+Keller Jordan recipe (shape_scaling + LR 2e-2) is competitive. NorMuon
+is LR-robust across 2e-4 to 6e-4; only 1e-3 falls off.
 
 All scripts live in `_research/launch/` and accept `SWEEP_MBS` and
 `SWEEP_MOCK` env-var overrides for quick sweeps.
