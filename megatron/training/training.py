@@ -3750,6 +3750,8 @@ def should_disable_forward_pre_hook(args):
     has_normal_optimizer = not args.skip_train
     # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
+    # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
+    # so in order to disable them, we must check that the optimizer actually exists.
     has_optimizer = has_normal_optimizer or has_rl_optimizer
     return (
         not args.use_megatron_fsdp
