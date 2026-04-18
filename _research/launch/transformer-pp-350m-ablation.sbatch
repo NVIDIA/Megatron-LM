@@ -70,7 +70,8 @@ OPT_TAG=$OPTIMIZER
 if [ "$OPTIMIZER" = "adaptive_muon" ] && [ -n "${SWEEP_ADAPTIVE_MUON_M2:-}" ]; then
     OPT_TAG=${SWEEP_ADAPTIVE_MUON_M2}
 fi
-EXP_NAME=transformer-pp-350m-abl-${OPT_TAG}-lr${LR}-gbs${GBS}-$(git rev-parse --short HEAD)
+FLAG_TAG=${SWEEP_FLAG_TAG:-}
+EXP_NAME=transformer-pp-350m-abl-${OPT_TAG}-lr${LR}-gbs${GBS}${FLAG_TAG:+-$FLAG_TAG}-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=transformer-pp
@@ -174,14 +175,14 @@ DISTRIBUTED_ARGS=(
     --context-parallel-size $CP
     --sequence-parallel
 )
-if [ "${SWEEP_NO_DISTOPT:-0}" = "1" ]; then
-    :
-else
-    DISTRIBUTED_ARGS+=(
-        --use-distributed-optimizer
-        --overlap-grad-reduce
-        --overlap-param-gather
-    )
+if [ "${SWEEP_DISTOPT:-1}" = "1" ]; then
+    DISTRIBUTED_ARGS+=(--use-distributed-optimizer)
+fi
+if [ "${SWEEP_OVERLAP_GRAD:-1}" = "1" ]; then
+    DISTRIBUTED_ARGS+=(--overlap-grad-reduce)
+fi
+if [ "${SWEEP_OVERLAP_PARAM:-1}" = "1" ]; then
+    DISTRIBUTED_ARGS+=(--overlap-param-gather)
 fi
 
 LOGGING_ARGS=(
