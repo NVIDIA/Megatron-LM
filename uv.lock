@@ -2255,7 +2255,7 @@ wheels = [
 
 [[package]]
 name = "langchain-core"
-version = "0.3.83"
+version = "0.3.84"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jsonpatch" },
@@ -2267,9 +2267,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "uuid-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/21/a4/24f2d787bfcf56e5990924cacefe6f6e7971a3629f97c8162fc7a2a3d851/langchain_core-0.3.83.tar.gz", hash = "sha256:a0a4c7b6ea1c446d3b432116f405dc2afa1fe7891c44140d3d5acca221909415", size = 597965, upload-time = "2026-01-13T01:19:23.854Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/13/3e/1e70598fac522eaeeeb22f03107da06495160533b25ba4388be9cef01d55/langchain_core-0.3.84.tar.gz", hash = "sha256:814b75bfe67a8460a53f5839bae9505bbfffc7af6f1aa0a5155715563f5cc490", size = 599092, upload-time = "2026-04-08T19:14:00.106Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5a/db/d71b80d3bd6193812485acea4001cdf86cf95a44bbf942f7a240120ff762/langchain_core-0.3.83-py3-none-any.whl", hash = "sha256:8c92506f8b53fc1958b1c07447f58c5783eb8833dd3cb6dc75607c80891ab1ae", size = 458890, upload-time = "2026-01-13T01:19:21.748Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/5b/ba75d5b80bd1f60ae799c8cbda5477eb7489fb21d40c967ec509bbd51933/langchain_core-0.3.84-py3-none-any.whl", hash = "sha256:d0b3a7b6473e30a2b3d4588ee09dc6471b8d38c46cd48f3e7c3d1ab6547f63cb", size = 459123, upload-time = "2026-04-08T19:13:57.818Z" },
 ]
 
 [[package]]
@@ -2284,6 +2284,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/4d/6f/0fcad6732f124c0d96fd7e8487a0b51db9f167964cfe041e4669a2148dbe/langchain_nvidia_ai_endpoints-0.3.19.tar.gz", hash = "sha256:1c420c88f7c78b2b2c2fdcef8e46104c2dd19c81e036bdd03a4838a6340950fe", size = 42884, upload-time = "2025-10-31T00:17:19.352Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/de/46/d7529004de384b2abc9e5b76cf4a84a23f3028ec6381bd5f7c00ac39bfab/langchain_nvidia_ai_endpoints-0.3.19-py3-none-any.whl", hash = "sha256:40161a71646fcbe457ac5f2222c5eadcbe31a7d79d618f5a0857c37fffa3a6d5", size = 46229, upload-time = "2025-10-31T00:17:18.306Z" },
+]
+
+[[package]]
+name = "langchain-openai"
+version = "0.3.35"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langchain-core" },
+    { name = "openai" },
+    { name = "tiktoken" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/fb/96/06d0d25a37e05a0ff2d918f0a4b0bf0732aed6a43b472b0b68426ce04ef8/langchain_openai-0.3.35.tar.gz", hash = "sha256:fa985fd041c3809da256a040c98e8a43e91c6d165b96dcfeb770d8bd457bf76f", size = 786635, upload-time = "2025-10-06T15:09:28.463Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d8/d5/c90c5478215c20ee71d8feaf676f7ffd78d0568f8c98bd83f81ce7562ed7/langchain_openai-0.3.35-py3-none-any.whl", hash = "sha256:76d5707e6e81fd461d33964ad618bd326cb661a1975cef7c1cb0703576bdada5", size = 75952, upload-time = "2025-10-06T15:09:27.137Z" },
 ]
 
 [[package]]
@@ -2420,7 +2434,7 @@ wheels = [
 
 [[package]]
 name = "logsage"
-version = "0.1.5"
+version = "0.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "drain3" },
@@ -2434,7 +2448,7 @@ dependencies = [
     { name = "requests" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/eb/d44608c5fc69ac216a41cd164453df5784114d07f28ece6c6ab8a351f636/logsage-0.1.5-py3-none-any.whl", hash = "sha256:4c144ea2b339f370e943929dc2d1f755b04351a75a2d8fd4201bd6d90045ed7a", size = 65098, upload-time = "2026-01-25T10:12:30.042Z" },
+    { url = "https://files.pythonhosted.org/packages/00/29/41ca46b94399d55569b1a19d909115cfef47456b88bb302960d58e3fd1f3/logsage-0.1.7-py3-none-any.whl", hash = "sha256:690e9f6dc56bf369b90aad91d7463e4c1689feb589148481955437ec8d33088a", size = 75267, upload-time = "2026-04-13T07:59:47.001Z" },
 ]
 
 [[package]]
@@ -2765,7 +2779,7 @@ requires-dist = [
     { name = "multi-storage-client", marker = "extra == 'lts'", specifier = "~=0.27" },
     { name = "numpy" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
-    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=15a851565a4ce846c04431ecb0cf09903ab4837e" },
+    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=b2bb3d728a18795807d9f76c535e005a609a1b01" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
     { name = "nvtx", marker = "extra == 'lts'", specifier = "~=0.2" },
     { name = "onnxscript", marker = "extra == 'dev'" },
@@ -2785,7 +2799,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=71bbefbf153418f943640df0f7373625dc93fa46" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=f031cf87bd054c7558b887df7bed93975456667f" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -3690,13 +3704,13 @@ wheels = [
 
 [[package]]
 name = "nvidia-resiliency-ext"
-version = "0.6.0.dev33+15a8515"
-source = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=15a851565a4ce846c04431ecb0cf09903ab4837e#15a851565a4ce846c04431ecb0cf09903ab4837e" }
+version = "0.6.0.dev69+b2bb3d7"
+source = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=b2bb3d728a18795807d9f76c535e005a609a1b01#b2bb3d728a18795807d9f76c535e005a609a1b01" }
 dependencies = [
     { name = "defusedxml" },
     { name = "grpcio" },
     { name = "grpcio-tools" },
-    { name = "langchain-nvidia-ai-endpoints" },
+    { name = "langchain-openai" },
     { name = "logsage" },
     { name = "mcp" },
     { name = "nvidia-ml-py" },
@@ -4071,7 +4085,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-api"
-version = "1.40.0"
+version = "1.41.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4088,9 +4102,9 @@ dependencies = [
     { name = "importlib-metadata", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2c/1d/4049a9e8698361cc1a1aa03a6c59e4fa4c71e0c0f94a30f988a6876a2ae6/opentelemetry_api-1.40.0.tar.gz", hash = "sha256:159be641c0b04d11e9ecd576906462773eb97ae1b657730f0ecf64d32071569f", size = 70851, upload-time = "2026-03-04T14:17:21.555Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/8e/3778a7e87801d994869a9396b9fc2a289e5f9be91ff54a27d41eace494b0/opentelemetry_api-1.41.0.tar.gz", hash = "sha256:9421d911326ec12dee8bc933f7839090cad7a3f13fcfb0f9e82f8174dc003c09", size = 71416, upload-time = "2026-04-09T14:38:34.544Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5f/bf/93795954016c522008da367da292adceed71cca6ee1717e1d64c83089099/opentelemetry_api-1.40.0-py3-none-any.whl", hash = "sha256:82dd69331ae74b06f6a874704be0cfaa49a1650e1537d4a813b86ecef7d0ecf9", size = 68676, upload-time = "2026-03-04T14:17:01.24Z" },
+    { url = "https://files.pythonhosted.org/packages/58/ee/99ab786653b3bda9c37ade7e24a7b607a1b1f696063172768417539d876d/opentelemetry_api-1.41.0-py3-none-any.whl", hash = "sha256:0e77c806e6a89c9e4f8d372034622f3e1418a11bdbe1c80a50b3d3397ad0fa4f", size = 69007, upload-time = "2026-04-09T14:38:11.833Z" },
 ]
 
 [[package]]
@@ -4129,7 +4143,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-exporter-prometheus"
-version = "0.61b0"
+version = "0.62b0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4143,13 +4157,13 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
-    { name = "opentelemetry-sdk", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-sdk", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "prometheus-client", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4a/20/9e818fd364d12e8d0cfdce4a3b2d82e24d98c4ceebb315de6b6770b5f214/opentelemetry_exporter_prometheus-0.61b0.tar.gz", hash = "sha256:7c4919bd8e79abd62b610767e80f42c9c3a06c5183f4dd9141eedeb57aea284b", size = 15136, upload-time = "2026-03-04T14:17:26.275Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/ec/fa8a722199dc2e75dc582779d62207b00b0bdb014b5635594afa0cf3ee43/opentelemetry_exporter_prometheus-0.62b0.tar.gz", hash = "sha256:4d1106566a9b3e8dff028e69e9f2dc90723e6b431c900ff8c72982fcf11dbae5", size = 15441, upload-time = "2026-04-09T14:38:38.934Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/02/4a/b65d40e94d1d930aee73a1a2857211ee6ab10ce3686cbdae5eea78cd9d34/opentelemetry_exporter_prometheus-0.61b0-py3-none-any.whl", hash = "sha256:3013b41f4370143d48d219a2351473761423e5882fa4c213811eaefacba39cb7", size = 13149, upload-time = "2026-03-04T14:17:08.983Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/1e/43645fadd561471af2aec95906a3dd54af1a8e7782322310e802a810ad3a/opentelemetry_exporter_prometheus-0.62b0-py3-none-any.whl", hash = "sha256:cd7e8acae3be5f425ffa2e0864eea474fa7a40706f786de7a2d23846573d8f75", size = 13278, upload-time = "2026-04-09T14:38:19.367Z" },
 ]
 
 [[package]]
@@ -4200,7 +4214,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-sdk"
-version = "1.40.0"
+version = "1.41.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4214,13 +4228,13 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
-    { name = "opentelemetry-semantic-conventions", version = "0.61b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-semantic-conventions", version = "0.62b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/58/fd/3c3125b20ba18ce2155ba9ea74acb0ae5d25f8cd39cfd37455601b7955cc/opentelemetry_sdk-1.40.0.tar.gz", hash = "sha256:18e9f5ec20d859d268c7cb3c5198c8d105d073714db3de50b593b8c1345a48f2", size = 184252, upload-time = "2026-03-04T14:17:31.87Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/0e/a586df1186f9f56b5a0879d52653effc40357b8e88fc50fe300038c3c08b/opentelemetry_sdk-1.41.0.tar.gz", hash = "sha256:7bddf3961131b318fc2d158947971a8e37e38b1cd23470cfb72b624e7cc108bd", size = 230181, upload-time = "2026-04-09T14:38:47.225Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2c/c5/6a852903d8bfac758c6dc6e9a68b015d3c33f2f1be5e9591e0f4b69c7e0a/opentelemetry_sdk-1.40.0-py3-none-any.whl", hash = "sha256:787d2154a71f4b3d81f20524a8ce061b7db667d24e46753f32a7bc48f1c1f3f1", size = 141951, upload-time = "2026-03-04T14:17:17.961Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/13/a7825118208cb32e6a4edcd0a99f925cbef81e77b3b0aedfd9125583c543/opentelemetry_sdk-1.41.0-py3-none-any.whl", hash = "sha256:a596f5687964a3e0d7f8edfdcf5b79cbca9c93c7025ebf5fb00f398a9443b0bd", size = 180214, upload-time = "2026-04-09T14:38:30.657Z" },
 ]
 
 [[package]]
@@ -4258,7 +4272,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.61b0"
+version = "0.62b0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4272,12 +4286,12 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/c0/4ae7973f3c2cfd2b6e321f1675626f0dab0a97027cc7a297474c9c8f3d04/opentelemetry_semantic_conventions-0.61b0.tar.gz", hash = "sha256:072f65473c5d7c6dc0355b27d6c9d1a679d63b6d4b4b16a9773062cb7e31192a", size = 145755, upload-time = "2026-03-04T14:17:32.664Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a3/b0/c14f723e86c049b7bf8ff431160d982519b97a7be2857ed2247377397a24/opentelemetry_semantic_conventions-0.62b0.tar.gz", hash = "sha256:cbfb3c8fc259575cf68a6e1b94083cc35adc4a6b06e8cf431efa0d62606c0097", size = 145753, upload-time = "2026-04-09T14:38:48.274Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/37/cc6a55e448deaa9b27377d087da8615a3416d8ad523d5960b78dbeadd02a/opentelemetry_semantic_conventions-0.61b0-py3-none-any.whl", hash = "sha256:fa530a96be229795f8cef353739b618148b0fe2b4b3f005e60e262926c4d38e2", size = 231621, upload-time = "2026-03-04T14:17:19.33Z" },
+    { url = "https://files.pythonhosted.org/packages/58/6c/5e86fa1759a525ef91c2d8b79d668574760ff3f900d114297765eb8786cb/opentelemetry_semantic_conventions-0.62b0-py3-none-any.whl", hash = "sha256:0ddac1ce59eaf1a827d9987ab60d9315fb27aea23304144242d1fcad9e16b489", size = 231619, upload-time = "2026-04-09T14:38:32.394Z" },
 ]
 
 [[package]]
@@ -5480,10 +5494,10 @@ default = [
     { name = "grpcio" },
     { name = "opencensus" },
     { name = "opentelemetry-exporter-prometheus", version = "0.54b1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
-    { name = "opentelemetry-exporter-prometheus", version = "0.61b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-exporter-prometheus", version = "0.62b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "opentelemetry-proto" },
     { name = "opentelemetry-sdk", version = "1.33.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
-    { name = "opentelemetry-sdk", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-sdk", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "prometheus-client" },
     { name = "py-spy" },
     { name = "pydantic" },
@@ -6681,8 +6695,8 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.14.0+71bbefbf"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=71bbefbf153418f943640df0f7373625dc93fa46#71bbefbf153418f943640df0f7373625dc93fa46" }
+version = "2.14.0+f031cf87"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=f031cf87bd054c7558b887df7bed93975456667f#f031cf87bd054c7558b887df7bed93975456667f" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
