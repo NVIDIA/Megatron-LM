@@ -26,7 +26,7 @@ from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
-class TestMambaModel:
+class TestHybridModel:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -292,7 +292,136 @@ class TestMambaModel:
         assert logits.shape[2] == divide(model.vocab_size, tp_size)
 
 
-class TestMambaWithDynamicInference:
+class TestHybridQKLayernorm:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build_model(self, **config_overrides):
+        config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            **config_overrides,
+        )
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",
+        )
+
+    def _get_attention_layer(self, model):
+        """Return the SelfAttention submodule from the attention layer."""
+        for layer in model.decoder.layers:
+            if hasattr(layer, 'self_attention') and hasattr(layer.self_attention, 'q_layernorm'):
+                return layer.self_attention
+        return None
+
+    def test_no_qk_norm_by_default(self):
+        """Without qk_layernorm, attention has no q/k layernorm."""
+        model = self._build_model()
+        attn = self._get_attention_layer(model)
+        assert attn is not None
+        assert attn.q_layernorm is None
+        assert attn.k_layernorm is None
+
+    def test_qk_layernorm_from_config(self):
+        """config.qk_layernorm=True creates q/k layernorm even with static spec."""
+        model = self._build_model(qk_layernorm=True)
+        attn = self._get_attention_layer(model)
+        assert attn is not None
+        # TENorm is a factory (__new__ returns a TE LayerNorm/RMSNorm), so we
+        # verify the norm was created rather than checking for a specific type.
+        assert attn.q_layernorm is not None
+        assert attn.k_layernorm is not None
+
+    def test_qk_l2_norm_from_config(self):
+        """config.qk_l2_norm=True creates L2Norm q/k layernorm."""
+        from megatron.core.transformer.torch_norm import L2Norm
+
+        model = self._build_model(qk_l2_norm=True)
+        attn = self._get_attention_layer(model)
+        assert attn is not None
+        assert isinstance(attn.q_layernorm, L2Norm)
+        assert isinstance(attn.k_layernorm, L2Norm)
+
+    def test_spec_provided_norm_not_overwritten(self):
+        """When the spec already provides q/k layernorm, config doesn't override it."""
+        import copy
+
+        from megatron.core.extensions.transformer_engine import (
+            TEDotProductAttention,
+            TELayerNormColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+        from megatron.core.transformer.enums import AttnMaskType
+        from megatron.core.transformer.identity_op import IdentityOp
+        from megatron.core.transformer.spec_utils import ModuleSpec
+        from megatron.core.transformer.transformer_layer import (
+            TransformerLayer,
+            TransformerLayerSubmodules,
+        )
+
+        # Build a spec that explicitly sets q/k layernorm to IdentityOp
+        spec = copy.deepcopy(hybrid_stack_spec)
+        spec.submodules.attention_layer.submodules.self_attention.submodules.q_layernorm = (
+            IdentityOp
+        )
+        spec.submodules.attention_layer.submodules.self_attention.submodules.k_layernorm = (
+            IdentityOp
+        )
+
+        config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_layernorm=True,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",
+        )
+        attn = self._get_attention_layer(model)
+        assert attn is not None
+        assert isinstance(attn.q_layernorm, IdentityOp)
+        assert isinstance(attn.k_layernorm, IdentityOp)
+
+    def test_forward_with_qk_layernorm(self):
+        """HybridModel forward pass works with qk_layernorm enabled."""
+        model = self._build_model(qk_layernorm=True)
+        model.cuda()
+
+        sequence_length = 4
+        micro_batch_size = 2
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == 100
+
+
+class TestHybridWithDynamicInference:
     """Tests HybridModel with dynamic inference."""
 
     @torch.inference_mode()

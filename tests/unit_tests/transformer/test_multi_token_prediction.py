@@ -686,7 +686,7 @@ class TestMTPLossLoggingHelper:
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 
 
-class TestMultiTokenPredictionMamba:
+class TestMultiTokenPredictionHybrid:
     """Test Multi-Token Prediction with Mamba hybrid models."""
 
     def setup_method(self, method):

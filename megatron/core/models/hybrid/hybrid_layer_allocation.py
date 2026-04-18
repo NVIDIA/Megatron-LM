@@ -17,11 +17,24 @@ class Symbols:
     MAMBA = "M"
     GDN = 'G'
     ATTENTION = "*"
+    DS_ATTENTION = "D"
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
+
+    @classmethod
+    def name_sorted_valid_layer_symbols(cls) -> list[str]:
+        """Return the valid layer symbols sorted lexicographically by their public attribute
+        name.
+        """
+        valid_layer_attrs = []
+        for name, value in vars(cls).items():
+            if not name.startswith('_') and value in cls.VALID_LAYERS:
+                valid_layer_attrs.append((name, value))
+        valid_layer_attrs.sort()
+        return [value for (_, value) in valid_layer_attrs]
 
 
 @dataclass
@@ -155,24 +168,18 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
         pattern: Full hybrid layer pattern string.
 
     Returns:
-        Dictionary mapping layer symbol to count. Keys are Symbols.MAMBA,
-        Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, and Symbols.MOE.
+        Dictionary mapping layer symbol to count. Keys are all valid layer symbols
+            (Symbols.VALID_LAYERS).
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'M': 2, 'G': 0, '*': 2, '-': 0, 'E': 0}
+        {'*': 2, 'G': 0, 'D': 0, 'M': 2, '-': 0, 'E': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'M': 8, 'G': 0, '*': 1, '-': 4, 'E': 0}
+        {'*': 1, 'G': 0, 'D': 0, 'M': 8, '-': 4, 'E': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
-    counts = {
-        Symbols.MAMBA: 0,
-        Symbols.GDN: 0,
-        Symbols.ATTENTION: 0,
-        Symbols.MLP: 0,
-        Symbols.MOE: 0,
-    }
+    counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
 
     # Count main decoder layers (skip '|' pipe separators)
     if parsed.main_pattern:
@@ -285,6 +292,10 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
+    # Disallow Attention + MLA/DSA hybridity.
+    if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
+        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+
 
 def validate_segment_layers(segment: str) -> List[str]:
     """Validate and convert a single pipeline segment pattern to a layer type list.
@@ -308,6 +319,11 @@ def validate_segment_layers(segment: str) -> List[str]:
                 f"In hybrid layer pattern segment, '{layer_char}' is not "
                 f"one of {Symbols.VALID_LAYERS}"
             )
+
+    # Disallow Attention + MLA/DSA hybridity.
+    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
+        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+
     return layer_type_list
 
 
@@ -468,17 +484,15 @@ def select_pipeline_segment(
     return layer_type_list, layer_offset
 
 
-def get_layer_maps_from_layer_type_list(
-    layer_type_list: List[str],
-) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int]]:
+def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str, dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each layer type in [Mamba, GDN, Attention, MLP, MoE] given a layer type list.
+    for each valid layer type (those in Symbols.VALID_LAYERS) given a layer type list.
     """
-    layer_types = [Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE]
+    layer_types = [symbol for symbol in Symbols.name_sorted_valid_layer_symbols()]
     layer_maps = {layer_type: {} for layer_type in layer_types}
     for global_layer_idx, layer_type in enumerate(layer_type_list):
         layer_map = layer_maps[layer_type]
         local_layer_idx = len(layer_map)
         layer_map[global_layer_idx] = local_layer_idx
-    return [layer_maps[layer_type] for layer_type in layer_types]
+    return layer_maps

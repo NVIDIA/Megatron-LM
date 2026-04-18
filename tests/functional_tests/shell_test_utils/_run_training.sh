@@ -159,9 +159,12 @@ MASTER_PORT=${MASTER_PORT:-6000}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
-LAST_RANK=$((GPUS_PER_NODE - 1)) 
+LAST_RANK=$((GPUS_PER_NODE - 1))
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR
+
+# Read launcher type from model config (default: torchrun)
+LAUNCHER=$(/usr/local/bin/yq '.LAUNCHER // "torchrun"' "$TRAINING_PARAMS_PATH")
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
@@ -176,11 +179,21 @@ DISTRIBUTED_ARGS=(
 
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
-        --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    if [[ "$LAUNCHER" == "ft_launcher" ]]; then
+        ft_launcher ${DISTRIBUTED_ARGS[@]} \
+            --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    else
+        uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+            --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    fi
 else
-    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
-        $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    if [[ "$LAUNCHER" == "ft_launcher" ]]; then
+        ft_launcher ${DISTRIBUTED_ARGS[@]} \
+            $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    else
+        uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
+            $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    fi
 fi
 
 # Run after script

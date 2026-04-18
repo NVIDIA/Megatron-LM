@@ -197,7 +197,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
         )
 
 
-class TestModelOptMambaModel(TestModelOptGPTModel):
+class TestModelOptHybridModel(TestModelOptGPTModel):
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)

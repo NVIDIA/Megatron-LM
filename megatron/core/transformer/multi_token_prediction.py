@@ -1327,7 +1327,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                 )
             return module
 
-        def build_layer_with_pattern(layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules):
+        def build_layer_with_pattern(
+            layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
+        ):
             """Build layer using pattern-based approach (new Mamba path)."""
             fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
