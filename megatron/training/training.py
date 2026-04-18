@@ -62,17 +62,15 @@ import torch
 
 try:
     from megatron.rl import rl_utils
+    from megatron.rl.rl_profiling import (
+        initialize_rl_profiler,
+        log_iteration_profile,
+        shutdown_rl_profiler,
+        RL_LOGGABLE_TIMER_NAMES,
+    )
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
-
-from megatron.rl.rl_profiling import (
-    initialize_rl_profiler,
-    log_iteration_profile,
-    shutdown_rl_profiler,
-    RL_LOGGABLE_TIMER_NAMES,
-)
-from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
         get_tensor_shapes_adjust_fn_for_distillation,
