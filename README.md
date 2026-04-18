@@ -72,6 +72,38 @@ The JSONL writer scales O(1) per step (no full-file rewrite). An analysis
 loader at `_research/analyse/load_runs.py` reads both the new JSONL format and
 legacy single-file JSON for backward compatibility.
 
+### Muon / NorMuon (`--optimizer muon`, `--optimizer adaptive_muon`)
+
+Muon uses Newton-Schulz orthogonalization on the momentum matrix to take
+spectrally-normalized steps. Routing: 2D matrix params use Muon; scalar
+params (embeddings, norms, biases) use AdamW via the upstream
+`_is_nonlinear_or_embedding` predicate. Relevant flags (we added three
+on top of upstream):
+
+- `--muon-scalar-lr` (decouples the AdamW-group LR from the Muon-group LR;
+  NorMuon recipe uses matrix LR 3.6e-4 and scalar LR 1.5e-3).
+- `--muon-scalar-weight-decay` (set to 0 to keep WD on the Muon matrix
+  group only).
+- `--adaptive-muon-moment2-method` (`adamuon` default, or `normuon` for
+  per-row second-moment rescale, arXiv 2510.05491).
+
+**Must omit `--overlap-param-gather` when training with Muon.** This flag
+is safe for AdamW because Adam's update is elementwise: each weight moves
+by `lr * m / (sqrt(v) + eps)` regardless of when other weights are
+gathered, so pipelining the per-bucket all-gather with the next forward
+pass is correctness-neutral. Muon's update is spectral: Newton-Schulz
+orthogonalizes the full momentum matrix, and every row's update
+direction depends on every other row's magnitude (via the `X Xᵀ X` terms
+inside NS5). If `--overlap-param-gather` assembles the matrix from shards
+gathered at inconsistent async states, NS5 sees a corrupted matrix, its
+output isn't an orthogonal projection of the true momentum, and the step
+has the wrong spectrum. Empirically this manifests as monotonically
+growing `params_norm` and `grad_norm` from step 1, not just slower
+convergence. Keep `--overlap-grad-reduce` and `--use-distributed-optimizer`
+(both verified safe for Muon). Throughput cost of dropping
+`--overlap-param-gather` at 350M / 1 node is ~2-3%; may grow at larger
+scale where param-gather overlap matters more.
+
 ### AdEMAMix optimizer (`--optimizer ademamix`)
 
 Ported from the [swiss-ai/Megatron-LM](https://github.com/swiss-ai/Megatron-LM)

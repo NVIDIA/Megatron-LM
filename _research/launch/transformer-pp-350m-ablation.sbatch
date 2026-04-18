@@ -181,7 +181,17 @@ fi
 if [ "${SWEEP_OVERLAP_GRAD:-1}" = "1" ]; then
     DISTRIBUTED_ARGS+=(--overlap-grad-reduce)
 fi
-if [ "${SWEEP_OVERLAP_PARAM:-1}" = "1" ]; then
+# --overlap-param-gather breaks Muon's Newton-Schulz (per-bucket async
+# gather feeds NS5 a cross-shard-inconsistent matrix, see README).
+# Default off for muon/adaptive_muon, on otherwise.
+if [ -z "${SWEEP_OVERLAP_PARAM:-}" ]; then
+    if [[ "$OPTIMIZER" == *muon* ]]; then
+        SWEEP_OVERLAP_PARAM=0
+    else
+        SWEEP_OVERLAP_PARAM=1
+    fi
+fi
+if [ "$SWEEP_OVERLAP_PARAM" = "1" ]; then
     DISTRIBUTED_ARGS+=(--overlap-param-gather)
 fi
 
