@@ -49,27 +49,29 @@ AdamW (beta1=0.9, beta2=0.95), untied embeddings, TP=1 PP=1, distributed
 optimizer with overlap-grad-reduce and overlap-param-gather (overlap-param-gather
 omitted for Muon, see Muon section below).
 
-### 350M ablation results (1B tokens, GBS=128, 1 node)
+### Leaderboards
 
-All runs share architecture, data, schedule, seed; only the optimizer
-block differs. W&B project [megatron-lm-research-baseline](https://wandb.ai/ischlag/megatron-lm-research-baseline).
+Ranked per-size run lists live under
+[`_research/leaderboards/`](_research/leaderboards/README.md). Each entry
+has a self-contained sbatch (no env-var branching, all hparams pinned)
+plus a W&B link and the git sha it was executed at. Current leaderboards:
 
-| optimizer | matrix LR | final loss | min loss | run |
-| --- | ---: | ---: | ---: | --- |
-| NorMuon | 3.6e-4 | **2.225** | **2.061** | [137djf7r](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/137djf7r) |
-| NorMuon | 2e-4 | 2.226 | 2.063 | [aygv2bqb](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/aygv2bqb) |
-| Muon (shape_scaling) | 2e-2 | 2.232 | 2.069 | [5kmiazba](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/5kmiazba) |
-| NorMuon | 6e-4 | 2.244 | 2.082 | [taefn8ax](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/taefn8ax) |
-| AdamW | 1e-3 | 2.314 | 2.148 | [gzhef3ao](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/gzhef3ao) |
-| AdamW | 5e-4 | 2.366 | 2.204 | [qstcfiz9](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/qstcfiz9) |
+- [`350m-ablation`](_research/leaderboards/350m-ablation/README.md) —
+  1B-token optimizer ablations. Top entry: NorMuon @ 3.6e-4, final loss
+  2.225 (beats best AdamW @ 1e-3 by ~0.09 nats).
+- `350m`, `760m`, `1.3b`, `2.7b` — placeholder dirs; no full runs yet.
 
-Key finding: NorMuon (matrix LR 3.6e-4, scalar LR 1.5e-3, scalar WD 0)
-beats best AdamW (LR 1e-3) by ~0.10 nats final loss. Plain Muon with
-Keller Jordan recipe (shape_scaling + LR 2e-2) is competitive. NorMuon
-is LR-robust across 2e-4 to 6e-4; LR=1e-3 diverges (final 2.62). The
-winning row uses distopt + overlap-grad-reduce (our recommended recipe);
-two additional flag-config variants of the same LR landed at 2.22 / 2.22
-within numerical noise.
+### Launch vs sweeps vs leaderboards
+
+| folder | purpose |
+| --- | --- |
+| `_research/launch/` | canonical baseline scripts, one `-adamw` and (at 350m) one `-muon` per size. The *recommended* config. |
+| `_research/sweeps/` | sweep harnesses with `SWEEP_*` env-var branching. Use these to explore new ablation axes. |
+| `_research/leaderboards/` | historical ranked runs. Each entry is a frozen, reproducible sbatch + W&B link. |
+
+Workflow: sweep in `sweeps/` → once a variant wins, snapshot a
+self-contained sbatch into the matching `leaderboards/<size>/runs/` and
+add a row to that size's `README.md` table.
 
 All scripts live in `_research/launch/` and accept `SWEEP_MBS` and
 `SWEEP_MOCK` env-var overrides for quick sweeps.
