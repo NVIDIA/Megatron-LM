@@ -14,8 +14,7 @@ and MoE transformers. Upstream is untouched except flag-gated edits in
 
 | path | contents |
 | --- | --- |
-| `_research/launch/` | canonical baseline sbatches (`transformer-pp-<size>-<adamw\|muon>.sbatch`) |
-| `_research/sweeps/` | sweep harnesses with `SWEEP_*` env-var branching |
+| `_research/launch/` | launchable sbatches: baselines (`transformer-pp-<size>-<adamw\|muon>.sbatch`) and ablation harnesses (`-ablation.sbatch`) with `SWEEP_*` env-var branching |
 | `_research/leaderboards/<size>/README.md` | ranked result table + W&B links for that size |
 | `_research/leaderboards/<size>/runs/NN-*.sbatch` | frozen, self-contained sbatches (no env vars, hparams pinned) |
 | `_research/logging_patch/` | JSONL + wandb telemetry, activated by a two-line hook in `pretrain_gpt.py` |
@@ -34,7 +33,7 @@ you're adding a flag-gated code path.
 ## How experiments flow
 
 ```
-sweeps/ (with SWEEP_* env vars)
+launch/<size>-ablation.sbatch (with SWEEP_* env vars)
         ↓  a config wins
 snapshot a self-contained sbatch into
 leaderboards/<size>/runs/NN-*.sbatch  +  add a row to that README.md

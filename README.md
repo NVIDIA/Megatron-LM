@@ -58,20 +58,16 @@ plus a W&B link and the git sha it was executed at. Current leaderboards:
   2.225 (beats best AdamW @ 1e-3 by ~0.09 nats).
 - `350m`, `760m`, `1.3b`, `2.7b` — placeholder dirs; no full runs yet.
 
-### Launch vs sweeps vs leaderboards
+### Launch vs leaderboards
 
 | folder | purpose |
 | --- | --- |
-| `_research/launch/` | canonical baseline scripts, one `-adamw` and (at 350m) one `-muon` per size. The *recommended* config. |
-| `_research/sweeps/` | sweep harnesses with `SWEEP_*` env-var branching. Use these to explore new ablation axes. |
+| `_research/launch/` | launchable sbatches: baseline full-run per size (`-adamw`, `-muon`) plus `-ablation` harnesses for quick hypothesis testing with `SWEEP_*` env vars. |
 | `_research/leaderboards/` | historical ranked runs. Each entry is a frozen, reproducible sbatch + W&B link. |
 
-Workflow: sweep in `sweeps/` → once a variant wins, snapshot a
-self-contained sbatch into the matching `leaderboards/<size>/runs/` and
-add a row to that size's `README.md` table.
-
-All scripts live in `_research/launch/` and accept `SWEEP_MBS` and
-`SWEEP_MOCK` env-var overrides for quick sweeps.
+Workflow: iterate in `launch/<size>-ablation.sbatch` with `SWEEP_*` vars →
+once a variant wins, snapshot a self-contained sbatch into
+`leaderboards/<size>/runs/` and add a row to its `README.md`.
 
 ## Changes from upstream
 

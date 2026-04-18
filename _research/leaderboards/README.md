@@ -35,8 +35,8 @@ To reproduce an entry bitwise: `git checkout <sha>` then
 
 ## Related folders
 
-- `_research/launch/` — canonical baseline launch scripts (one `-adamw`
-  and one `-muon` per size). These are the *recommended* configs.
-- `_research/sweeps/` — sweep harnesses with `SWEEP_*` env-var
-  branching. Use these to explore new ablation axes; once a variant
-  wins, snapshot a self-contained copy into the matching leaderboard.
+- `_research/launch/` — launchable sbatches: baseline full-runs
+  (`transformer-pp-<size>-<adamw|muon>.sbatch`) and ablation harnesses
+  (`-ablation.sbatch`) with `SWEEP_*` env-var branching. Once a sweep
+  variant wins, snapshot a self-contained copy into the matching
+  leaderboard under `leaderboards/<size>/runs/`.
