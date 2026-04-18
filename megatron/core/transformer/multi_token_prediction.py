@@ -736,11 +736,24 @@ class MultiTokenPredictionLayer(MegatronModule):
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # For Mamba path - pattern and submodules to build inner layers directly
+        # For hybrid path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
+        mamba_submodules: Optional[HybridStackSubmodules] = None,
     ):
         super().__init__(config=config)
+        if mamba_submodules is not None:
+            if hybrid_submodules is not None:
+                raise ValueError(
+                    "Cannot specify both hybrid_submodules and mamba_submodules. "
+                    "mamba_submodules has been deprecated; use hybrid_submodules instead."
+                )
+            warnings.warn(
+                "mamba_submodules has been deprecated. Use hybrid_submodules instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            hybrid_submodules = mamba_submodules
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
@@ -1269,12 +1282,25 @@ class MultiTokenPredictionBlock(MegatronModule):
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # New: For Mamba path with unified pattern syntax
+        # New: For hybrid path with unified pattern syntax
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
+        mamba_submodules: Optional["HybridStackSubmodules"] = None,
     ):
         super().__init__(config=config)
+        if mamba_submodules is not None:
+            if hybrid_submodules is not None:
+                raise ValueError(
+                    "Cannot specify both hybrid_submodules and mamba_submodules. "
+                    "mamba_submodules has been deprecated; use hybrid_submodules instead."
+                )
+            warnings.warn(
+                "mamba_submodules has been deprecated. Use hybrid_submodules instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            hybrid_submodules = mamba_submodules
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
