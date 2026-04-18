@@ -1796,6 +1796,8 @@ class TransformerConfig(ModelParallelConfig):
             overridden_init_methods = []
             if self.init_method is not None:
                 overridden_init_methods.append("init_method")
+            if self.embedding_init_method is not None:
+                overridden_init_methods.append("embedding_init_method")
             if self.output_layer_init_method is not None:
                 overridden_init_methods.append("output_layer_init_method")
             if overridden_init_methods:

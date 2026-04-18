@@ -849,6 +849,20 @@ class TestMuPWarnings:
                 output_layer_init_method=init_method_normal(0.01),
             )
 
+    def test_mup_warns_with_custom_embedding_init_method(self):
+        """Warn when MuP is enabled and embedding_init_method is user-provided."""
+        with pytest.warns(
+            UserWarning, match="use_mup is enabled, but custom embedding_init_method is set"
+        ):
+            TransformerConfig(
+                hidden_size=512,
+                num_layers=4,
+                num_attention_heads=8,
+                use_mup=True,
+                mup_base_hidden_size=128,
+                embedding_init_method=init_method_normal(0.01),
+            )
+
 
 class TestMuPLRScaling:
     """Tests for MuP learning rate and Adam epsilon scaling."""

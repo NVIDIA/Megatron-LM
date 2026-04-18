@@ -377,6 +377,7 @@ class BertModel(LanguageModule):
 
         hidden_states_after_lm_head = self.lm_head(hidden_states=hidden_states)
         logits, _ = self.output_layer(hidden_states_after_lm_head, weight=output_weight)
+        logits = self._scale_logits(logits)
 
         binary_logits = None
         if self.binary_head is not None:

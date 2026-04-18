@@ -22,10 +22,9 @@ from tests.unit_tests.test_utilities import Utils
 
 class TestBertModel:
 
-    def setup_method(self, method):
+    def _build_bert_model(self, **config_overrides):
         tp = 1
         pp = 1
-        Utils.initialize_model_parallel(tp, pp)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(
             num_layers=2,
@@ -37,14 +36,21 @@ class TestBertModel:
             pipeline_model_parallel_size=pp,
             pipeline_dtype=torch.bfloat16,
             attention_backend=AttnBackend.unfused,
+            **config_overrides,
         )
-        self.bert_model = BertModel(
+        return BertModel(
             config=transformer_config,
             num_tokentypes=0,
             transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
         )
+
+    def setup_method(self, method):
+        tp = 1
+        pp = 1
+        Utils.initialize_model_parallel(tp, pp)
+        self.bert_model = self._build_bert_model()
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -91,6 +97,97 @@ class TestBertModel:
         assert logits[0].shape[0] == micro_batch_size
         assert logits[0].shape[1] == sequence_length
         assert logits[0].shape[2] == self.bert_model.vocab_size
+
+    @pytest.mark.internal
+    def test_forward_uses_scale_logits(self, mocker):
+        output_mult = 3.0
+        bert_model = self._build_bert_model(
+            use_mup=True,
+            mup_base_hidden_size=6,
+            mup_output_mult=output_mult,
+        )
+        sequence_length = bert_model.max_sequence_length
+        micro_batch_size = 2
+
+        bert_model.eval()
+        bert_model.cuda()
+        assert bert_model.model_scaling_policy.enabled
+        assert bert_model.model_scaling_policy.context.output_mult == pytest.approx(output_mult)
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones((micro_batch_size, sequence_length), dtype=bool).cuda()
+        captured = {}
+
+        real_scale_logits = bert_model.model_scaling_policy.scale_output_logits
+
+        def capture_scaled_logits(logits):
+            captured['raw_logits'] = logits.detach().clone()
+            return real_scale_logits(logits)
+
+        with torch.no_grad():
+            scale_spy = mocker.patch.object(
+                bert_model.model_scaling_policy,
+                'scale_output_logits',
+                side_effect=capture_scaled_logits,
+            )
+            scaled_logits, _ = bert_model.forward(
+                input_ids=input_ids, attention_mask=attention_mask
+            )
+
+        scale_spy.assert_called()
+        expected_logits = captured['raw_logits'].transpose(0, 1).contiguous() * output_mult
+        assert torch.allclose(scaled_logits, expected_logits, atol=1e-3, rtol=0.0)
+
+    @pytest.mark.internal
+    def test_loss_path_uses_scaled_logits(self, mocker):
+        output_mult = 3.0
+        bert_model = self._build_bert_model(
+            use_mup=True,
+            mup_base_hidden_size=6,
+            mup_output_mult=output_mult,
+        )
+        sequence_length = bert_model.max_sequence_length
+        micro_batch_size = 2
+
+        bert_model.eval()
+        bert_model.cuda()
+        assert bert_model.model_scaling_policy.enabled
+        assert bert_model.model_scaling_policy.context.output_mult == pytest.approx(output_mult)
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones((micro_batch_size, sequence_length), dtype=bool).cuda()
+        lm_labels = torch.zeros((micro_batch_size, sequence_length), dtype=torch.int64).cuda()
+        captured = {}
+
+        def fake_loss(labels, logits):
+            captured['logits'] = logits.detach().clone()
+            return logits.float().mean()
+
+        real_scale_logits = bert_model.model_scaling_policy.scale_output_logits
+
+        def capture_scaled_logits(logits):
+            captured['raw_logits'] = logits.detach().clone()
+            return real_scale_logits(logits)
+
+        with torch.no_grad():
+            scale_spy = mocker.patch.object(
+                bert_model.model_scaling_policy,
+                'scale_output_logits',
+                side_effect=capture_scaled_logits,
+            )
+            loss_spy = mocker.patch.object(
+                bert_model, 'compute_language_model_loss', side_effect=fake_loss
+            )
+            bert_model.forward(
+                input_ids=input_ids, attention_mask=attention_mask, lm_labels=lm_labels
+            )
+
+        scale_spy.assert_called()
+        loss_spy.assert_called()
+        expected_logits = captured['raw_logits'] * output_mult
+        assert torch.allclose(captured['logits'], expected_logits, atol=1e-3, rtol=0.0)
 
 
 class TestBertModelAttentionDimensions:
