@@ -67,6 +67,9 @@ MUON_SCALE_MODE=${SWEEP_MUON_SCALE_MODE:-spectral}
 
 PROJECT=megatron-lm-research-baseline
 OPT_TAG=$OPTIMIZER
+if [ "$OPTIMIZER" = "adam" ]; then
+    OPT_TAG=adamw   # Megatron's "adam" is decoupled WD = AdamW
+fi
 if [ "$OPTIMIZER" = "adaptive_muon" ] && [ -n "${SWEEP_ADAPTIVE_MUON_M2:-}" ]; then
     OPT_TAG=${SWEEP_ADAPTIVE_MUON_M2}
 fi
