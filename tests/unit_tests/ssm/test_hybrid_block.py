@@ -21,7 +21,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.internal
-class TestMambaBlock:
+class TestHybridBlock:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)

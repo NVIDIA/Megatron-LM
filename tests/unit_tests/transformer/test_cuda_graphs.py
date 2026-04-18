@@ -462,7 +462,7 @@ class TestLLaVACudaGraph:
                 del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
 
 
-class TestParallelMambaBlockCudagraphs:
+class TestParallelHybridBlockCudagraphs:
     def setup_method(self, method):
         # initialize parallel state
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)

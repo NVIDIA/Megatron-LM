@@ -390,8 +390,8 @@ def _diff_configs(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> Tup
     return added, removed, changed
 
 
-class TestMambaMoEModel:
-    """Test the initialization and use of an MoE Mamba model."""
+class TestHybridMoEModel:
+    """Test the initialization and use of an MoE Hybrid model."""
 
     def create_test_args(self):
         destroy_global_vars()

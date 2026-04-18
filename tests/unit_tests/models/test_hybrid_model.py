@@ -26,7 +26,7 @@ from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
-class TestMambaModel:
+class TestHybridModel:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -292,7 +292,7 @@ class TestMambaModel:
         assert logits.shape[2] == divide(model.vocab_size, tp_size)
 
 
-class TestMambaQKLayernorm:
+class TestHybridQKLayernorm:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -309,9 +309,9 @@ class TestMambaQKLayernorm:
             use_cpu_initialization=True,
             **config_overrides,
         )
-        return MambaModel(
+        return HybridModel(
             config=config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
@@ -371,7 +371,7 @@ class TestMambaQKLayernorm:
         )
 
         # Build a spec that explicitly sets q/k layernorm to IdentityOp
-        spec = copy.deepcopy(mamba_stack_spec)
+        spec = copy.deepcopy(hybrid_stack_spec)
         spec.submodules.attention_layer.submodules.self_attention.submodules.q_layernorm = (
             IdentityOp
         )
@@ -386,9 +386,9 @@ class TestMambaQKLayernorm:
             use_cpu_initialization=True,
             qk_layernorm=True,
         )
-        model = MambaModel(
+        model = HybridModel(
             config=config,
-            mamba_stack_spec=spec,
+            hybrid_stack_spec=spec,
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
@@ -399,7 +399,7 @@ class TestMambaQKLayernorm:
         assert isinstance(attn.k_layernorm, IdentityOp)
 
     def test_forward_with_qk_layernorm(self):
-        """MambaModel forward pass works with qk_layernorm enabled."""
+        """HybridModel forward pass works with qk_layernorm enabled."""
         model = self._build_model(qk_layernorm=True)
         model.cuda()
 
@@ -421,7 +421,7 @@ class TestMambaQKLayernorm:
         assert logits.shape[2] == 100
 
 
-class TestMambaWithDynamicInference:
+class TestHybridWithDynamicInference:
     """Tests HybridModel with dynamic inference."""
 
     @torch.inference_mode()
