@@ -728,9 +728,9 @@ class TextGenerationController:
             bucket_map = defaultdict(list)
 
             # Shorthands for the dictionary comprehension.
-            temp = context.active_request_metadata["temperature"][:active_request_count].tolist()
-            top_k = context.active_request_metadata["top_k"][:active_request_count].tolist()
-            top_p = context.active_request_metadata["top_p"][:active_request_count].tolist()
+            temp = context.request_metadata["temperature"][:active_request_count].tolist()
+            top_k = context.request_metadata["top_k"][:active_request_count].tolist()
+            top_p = context.request_metadata["top_p"][:active_request_count].tolist()
 
             for request_index, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
                 sampling_params = (t, k, p)
@@ -760,7 +760,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_slice = slice(0, active_request_count)
 
         accepted_tokens_per_request = self._accepted_token_counts_per_request[:active_request_count]
 
@@ -846,7 +846,7 @@ class TextGenerationController:
         nvtx_range_push("mtp-spec-decoding/serial-mtp-init")
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_slice = slice(context.paused_request_count, context.total_request_count)
+        active_slice = slice(0, active_request_count)
 
         unwrapped_model = self._unwrapped_model
 
@@ -1049,7 +1049,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
 
         # Get the logit indices for tokens that need sampling.
@@ -1188,8 +1188,8 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         return (
-            (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
-            (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+            (context.request_metadata["return_log_probs"][:active_request_count]).any(),
+            (context.request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
         )
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
@@ -1290,11 +1290,9 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
-        request_query_lengths = context.request_query_lengths[
-            context.paused_request_count : context.total_request_count
-        ]
+        request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1401,11 +1399,9 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
-        request_query_lengths = context.request_query_lengths[
-            context.paused_request_count : context.total_request_count
-        ]
+        request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
         num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
@@ -1418,9 +1414,7 @@ class TextGenerationController:
                 num_decode_requests, self.num_speculative_tokens + 1, -1
             )
             accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
-            top_n_per_request = context.active_request_metadata["top_n_logprobs"][
-                :num_decode_requests
-            ]
+            top_n_per_request = context.request_metadata["top_n_logprobs"][:num_decode_requests]
             max_top_n = int(top_n_per_request.max().item())
 
             if max_top_n > 0:
@@ -1447,7 +1441,7 @@ class TextGenerationController:
             prefill_log_probs = log_probs_tensor[decode_len:]
 
             # Batch metadata reads: single CPU transfer for all prefill requests.
-            prefill_top_n = context.active_request_metadata["top_n_logprobs"][
+            prefill_top_n = context.request_metadata["top_n_logprobs"][
                 num_decode_requests:active_request_count
             ].tolist()
             max_top_n_prefill = int(max(prefill_top_n)) if prefill_top_n else 0
@@ -1475,7 +1469,7 @@ class TextGenerationController:
                     prefill_log_probs_per_request = prefill_log_probs.split(
                         prefill_query_lengths.tolist(), dim=0
                     )
-                    prefill_skip_prompt = context.active_request_metadata["skip_prompt_log_probs"][
+                    prefill_skip_prompt = context.request_metadata["skip_prompt_log_probs"][
                         num_decode_requests:active_request_count
                     ].tolist()
 
@@ -1523,7 +1517,6 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Handle decode-only mode (only last token)
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
@@ -1533,7 +1526,7 @@ class TextGenerationController:
 
             top_n_results = {}
             for req_idx in range(active_request_count):
-                top_n = int(context.active_request_metadata["top_n_logprobs"][req_idx].item())
+                top_n = int(context.request_metadata["top_n_logprobs"][req_idx].item())
                 if top_n > 0:
                     # Get top-n logprobs and indices for this request (single token)
                     top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
@@ -1547,7 +1540,7 @@ class TextGenerationController:
         # Note: logits may be padded, so we only take the first active_token_count tokens
         log_probs = log_probs_tensor[: context.active_token_count]
 
-        active_query_lengths = context.request_query_lengths[active_request_slice]
+        active_query_lengths = context.active_request_query_lengths[:active_request_count]
 
         # Split log_probs across request boundaries
         # log_probs has shape [active_token_count, vocab_size]
@@ -1555,13 +1548,13 @@ class TextGenerationController:
 
         top_n_results = {}
         for req_idx in range(active_request_count):
-            top_n = int(context.active_request_metadata["top_n_logprobs"][req_idx].item())
+            top_n = int(context.request_metadata["top_n_logprobs"][req_idx].item())
             if top_n > 0:
                 request_log_probs = log_probs_per_request[
                     req_idx
                 ]  # [num_tokens_for_request, vocab_size]
                 skip_prompt = bool(
-                    context.active_request_metadata["skip_prompt_log_probs"][req_idx].item()
+                    context.request_metadata["skip_prompt_log_probs"][req_idx].item()
                 )
 
                 # If skip_prompt_log_probs is True, only compute for last token
@@ -1735,7 +1728,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_slice = slice(0, active_request_count)
 
         # Active sequence lengths.
         active_request_ids = context.request_ids[active_request_slice].long()
@@ -1752,7 +1745,7 @@ class TextGenerationController:
         # Note: termination_id tensor has per-request termination IDs from mixed sampling
         active_request_mask = (
             self._sampled_tokens_cuda[:active_request_count]
-            != context.active_request_metadata["termination_id"][:active_request_count]
+            != context.request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
         # Mark requests as finished if they hit stop words
@@ -1765,9 +1758,7 @@ class TextGenerationController:
                     if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
 
-        finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
-        )
+        finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
         finished_request_ids = context.request_ids[finished_idxs]
 
         # Save block IDs for finished requests before update_requests releases them.
