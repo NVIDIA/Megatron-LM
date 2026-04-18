@@ -77,8 +77,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "psutil" },
     { name = "pyyaml" },
     { name = "safetensors" },
@@ -545,8 +544,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "mypy-extensions" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "pathspec" },
     { name = "platformdirs" },
 ]
@@ -624,8 +622,7 @@ version = "1.6.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ninja" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
+    { name = "packaging" },
     { name = "torch", marker = "sys_platform == 'never'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/63/15/ec51d77a2df03ee93410f8ee97fceeb7181da213813c51243e9dd6d7e144/causal_conv1d-1.6.1.tar.gz", hash = "sha256:e4a697ec2db3906f012e675125569f8b510b4559bc53e3095143d91369e1221b", size = 29426, upload-time = "2026-03-10T08:56:35.305Z" }
@@ -1088,8 +1085,7 @@ dependencies = [
     { name = "multiprocess", marker = "python_full_version >= '3.14' and sys_platform == 'win32'" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-lts') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-lts') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "packaging", marker = "python_full_version >= '3.14' and sys_platform == 'win32'" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'win32' and extra == 'extra-13-megatron-core-lts') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "pyarrow", marker = "python_full_version >= '3.14' and sys_platform == 'win32'" },
@@ -1134,8 +1130,7 @@ dependencies = [
     { name = "multiprocess", marker = "python_full_version < '3.14' or sys_platform != 'win32'" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "packaging", marker = "python_full_version < '3.14' or sys_platform != 'win32'" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.14' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "pyarrow", marker = "python_full_version < '3.14' or sys_platform != 'win32'" },
@@ -1410,8 +1405,7 @@ dependencies = [
     { name = "nvidia-cudnn-frontend" },
     { name = "nvidia-cutlass-dsl" },
     { name = "nvidia-ml-py" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
+    { name = "packaging" },
     { name = "requests" },
     { name = "tabulate" },
     { name = "torch", marker = "sys_platform == 'never'" },
@@ -1848,8 +1842,7 @@ name = "hatchling"
 version = "1.29.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "pathspec" },
     { name = "pluggy" },
     { name = "trove-classifiers" },
@@ -1965,8 +1958,7 @@ dependencies = [
     { name = "fsspec", version = "2026.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14' or sys_platform != 'win32' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "fsspec", version = "2026.3.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.14' and sys_platform == 'win32') or (python_full_version < '3.14' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (sys_platform != 'win32' and extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "hf-xet", marker = "platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "pyyaml" },
     { name = "requests" },
     { name = "tqdm" },
@@ -2255,21 +2247,20 @@ wheels = [
 
 [[package]]
 name = "langchain-core"
-version = "0.3.83"
+version = "0.3.76"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jsonpatch" },
     { name = "langsmith" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "packaging" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "tenacity" },
     { name = "typing-extensions" },
-    { name = "uuid-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/21/a4/24f2d787bfcf56e5990924cacefe6f6e7971a3629f97c8162fc7a2a3d851/langchain_core-0.3.83.tar.gz", hash = "sha256:a0a4c7b6ea1c446d3b432116f405dc2afa1fe7891c44140d3d5acca221909415", size = 597965, upload-time = "2026-01-13T01:19:23.854Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/4d/5e2ea7754ee0a1f524c412801c6ba9ad49318ecb58b0d524903c3d9efe0a/langchain_core-0.3.76.tar.gz", hash = "sha256:71136a122dd1abae2c289c5809d035cf12b5f2bb682d8a4c1078cd94feae7419", size = 573568, upload-time = "2025-09-10T14:49:39.863Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5a/db/d71b80d3bd6193812485acea4001cdf86cf95a44bbf942f7a240120ff762/langchain_core-0.3.83-py3-none-any.whl", hash = "sha256:8c92506f8b53fc1958b1c07447f58c5783eb8833dd3cb6dc75607c80891ab1ae", size = 458890, upload-time = "2026-01-13T01:19:21.748Z" },
+    { url = "https://files.pythonhosted.org/packages/77/b5/501c0ffcb09c734457ceaa86bc7b1dd37b6a261147bd653add03b838aacb/langchain_core-0.3.76-py3-none-any.whl", hash = "sha256:46e0eb48c7ac532432d51f8ca1ece1804c82afe9ae3dcf027b867edadf82b3ec", size = 447508, upload-time = "2025-09-10T14:49:38.179Z" },
 ]
 
 [[package]]
@@ -2305,7 +2296,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "orjson", marker = "platform_python_implementation != 'PyPy'" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "packaging" },
     { name = "pydantic" },
     { name = "requests" },
     { name = "requests-toolbelt" },
@@ -2457,8 +2448,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
     { name = "ninja" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
+    { name = "packaging" },
     { name = "setuptools" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "transformers" },
@@ -2611,8 +2601,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "torch", marker = "sys_platform == 'never' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
 ]
 
@@ -2687,8 +2676,7 @@ build = [
     { name = "cython" },
     { name = "hatchling" },
     { name = "nvidia-mathdx" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "pybind11" },
     { name = "setuptools" },
     { name = "torch", marker = "sys_platform == 'never' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
@@ -2785,7 +2773,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=71bbefbf153418f943640df0f7373625dc93fa46" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=f031cf87bd054c7558b887df7bed93975456667f" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -3210,8 +3198,7 @@ dependencies = [
     { name = "leptonai" },
     { name = "networkx" },
     { name = "omegaconf" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "rich" },
     { name = "toml" },
     { name = "torchx" },
@@ -3636,7 +3623,7 @@ dependencies = [
     { name = "ninja" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" } },
     { name = "nvidia-ml-py" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "packaging" },
     { name = "pulp" },
     { name = "pydantic" },
     { name = "regex" },
@@ -3700,7 +3687,7 @@ dependencies = [
     { name = "logsage" },
     { name = "mcp" },
     { name = "nvidia-ml-py" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "packaging" },
     { name = "protobuf" },
     { name = "psutil" },
     { name = "pyyaml" },
@@ -3941,7 +3928,7 @@ dependencies = [
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "onnx", version = "1.19.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "onnx-ir", version = "0.1.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
+    { name = "packaging", marker = "python_full_version >= '3.13'" },
     { name = "typing-extensions", marker = "python_full_version >= '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f5/2f/0bb2b6ca727e4d5173f640527f402ab4225def4bc8d667269b83047be8c4/onnxscript-0.5.0.tar.gz", hash = "sha256:4aba215e1f80fbcd07ba0d97d6bca96797fc3e9639eacb5434d35317ce1406aa", size = 588762, upload-time = "2025-09-12T16:57:46.484Z" }
@@ -3979,8 +3966,7 @@ dependencies = [
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
     { name = "onnx", version = "1.21.0", source = { registry = "https://pypi.org/simple" } },
     { name = "onnx-ir", version = "0.2.0", source = { registry = "https://pypi.org/simple" } },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
+    { name = "packaging" },
     { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e7/2b/538fdeb0e25bed5d7e0f954af5710543e2629499fb74381afc3333f8a8ae/onnxscript-0.6.2.tar.gz", hash = "sha256:abb2e6f464db40c9b8c7fbb3e64cca04cf3f4495e67c4eda5eac17b784191ce3", size = 590865, upload-time = "2026-02-10T22:53:39.638Z" }
@@ -4071,7 +4057,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-api"
-version = "1.40.0"
+version = "1.41.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4088,9 +4074,9 @@ dependencies = [
     { name = "importlib-metadata", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2c/1d/4049a9e8698361cc1a1aa03a6c59e4fa4c71e0c0f94a30f988a6876a2ae6/opentelemetry_api-1.40.0.tar.gz", hash = "sha256:159be641c0b04d11e9ecd576906462773eb97ae1b657730f0ecf64d32071569f", size = 70851, upload-time = "2026-03-04T14:17:21.555Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/8e/3778a7e87801d994869a9396b9fc2a289e5f9be91ff54a27d41eace494b0/opentelemetry_api-1.41.0.tar.gz", hash = "sha256:9421d911326ec12dee8bc933f7839090cad7a3f13fcfb0f9e82f8174dc003c09", size = 71416, upload-time = "2026-04-09T14:38:34.544Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5f/bf/93795954016c522008da367da292adceed71cca6ee1717e1d64c83089099/opentelemetry_api-1.40.0-py3-none-any.whl", hash = "sha256:82dd69331ae74b06f6a874704be0cfaa49a1650e1537d4a813b86ecef7d0ecf9", size = 68676, upload-time = "2026-03-04T14:17:01.24Z" },
+    { url = "https://files.pythonhosted.org/packages/58/ee/99ab786653b3bda9c37ade7e24a7b607a1b1f696063172768417539d876d/opentelemetry_api-1.41.0-py3-none-any.whl", hash = "sha256:0e77c806e6a89c9e4f8d372034622f3e1418a11bdbe1c80a50b3d3397ad0fa4f", size = 69007, upload-time = "2026-04-09T14:38:11.833Z" },
 ]
 
 [[package]]
@@ -4129,7 +4115,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-exporter-prometheus"
-version = "0.61b0"
+version = "0.62b0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4143,13 +4129,13 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
-    { name = "opentelemetry-sdk", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-sdk", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "prometheus-client", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4a/20/9e818fd364d12e8d0cfdce4a3b2d82e24d98c4ceebb315de6b6770b5f214/opentelemetry_exporter_prometheus-0.61b0.tar.gz", hash = "sha256:7c4919bd8e79abd62b610767e80f42c9c3a06c5183f4dd9141eedeb57aea284b", size = 15136, upload-time = "2026-03-04T14:17:26.275Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/ec/fa8a722199dc2e75dc582779d62207b00b0bdb014b5635594afa0cf3ee43/opentelemetry_exporter_prometheus-0.62b0.tar.gz", hash = "sha256:4d1106566a9b3e8dff028e69e9f2dc90723e6b431c900ff8c72982fcf11dbae5", size = 15441, upload-time = "2026-04-09T14:38:38.934Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/02/4a/b65d40e94d1d930aee73a1a2857211ee6ab10ce3686cbdae5eea78cd9d34/opentelemetry_exporter_prometheus-0.61b0-py3-none-any.whl", hash = "sha256:3013b41f4370143d48d219a2351473761423e5882fa4c213811eaefacba39cb7", size = 13149, upload-time = "2026-03-04T14:17:08.983Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/1e/43645fadd561471af2aec95906a3dd54af1a8e7782322310e802a810ad3a/opentelemetry_exporter_prometheus-0.62b0-py3-none-any.whl", hash = "sha256:cd7e8acae3be5f425ffa2e0864eea474fa7a40706f786de7a2d23846573d8f75", size = 13278, upload-time = "2026-04-09T14:38:19.367Z" },
 ]
 
 [[package]]
@@ -4200,7 +4186,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-sdk"
-version = "1.40.0"
+version = "1.41.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4214,13 +4200,13 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
-    { name = "opentelemetry-semantic-conventions", version = "0.61b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-semantic-conventions", version = "0.62b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/58/fd/3c3125b20ba18ce2155ba9ea74acb0ae5d25f8cd39cfd37455601b7955cc/opentelemetry_sdk-1.40.0.tar.gz", hash = "sha256:18e9f5ec20d859d268c7cb3c5198c8d105d073714db3de50b593b8c1345a48f2", size = 184252, upload-time = "2026-03-04T14:17:31.87Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/0e/a586df1186f9f56b5a0879d52653effc40357b8e88fc50fe300038c3c08b/opentelemetry_sdk-1.41.0.tar.gz", hash = "sha256:7bddf3961131b318fc2d158947971a8e37e38b1cd23470cfb72b624e7cc108bd", size = 230181, upload-time = "2026-04-09T14:38:47.225Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2c/c5/6a852903d8bfac758c6dc6e9a68b015d3c33f2f1be5e9591e0f4b69c7e0a/opentelemetry_sdk-1.40.0-py3-none-any.whl", hash = "sha256:787d2154a71f4b3d81f20524a8ce061b7db667d24e46753f32a7bc48f1c1f3f1", size = 141951, upload-time = "2026-03-04T14:17:17.961Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/13/a7825118208cb32e6a4edcd0a99f925cbef81e77b3b0aedfd9125583c543/opentelemetry_sdk-1.41.0-py3-none-any.whl", hash = "sha256:a596f5687964a3e0d7f8edfdcf5b79cbca9c93c7025ebf5fb00f398a9443b0bd", size = 180214, upload-time = "2026-04-09T14:38:30.657Z" },
 ]
 
 [[package]]
@@ -4258,7 +4244,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.61b0"
+version = "0.62b0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4272,12 +4258,12 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/c0/4ae7973f3c2cfd2b6e321f1675626f0dab0a97027cc7a297474c9c8f3d04/opentelemetry_semantic_conventions-0.61b0.tar.gz", hash = "sha256:072f65473c5d7c6dc0355b27d6c9d1a679d63b6d4b4b16a9773062cb7e31192a", size = 145755, upload-time = "2026-03-04T14:17:32.664Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a3/b0/c14f723e86c049b7bf8ff431160d982519b97a7be2857ed2247377397a24/opentelemetry_semantic_conventions-0.62b0.tar.gz", hash = "sha256:cbfb3c8fc259575cf68a6e1b94083cc35adc4a6b06e8cf431efa0d62606c0097", size = 145753, upload-time = "2026-04-09T14:38:48.274Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/37/cc6a55e448deaa9b27377d087da8615a3416d8ad523d5960b78dbeadd02a/opentelemetry_semantic_conventions-0.61b0-py3-none-any.whl", hash = "sha256:fa530a96be229795f8cef353739b618148b0fe2b4b3f005e60e262926c4d38e2", size = 231621, upload-time = "2026-03-04T14:17:19.33Z" },
+    { url = "https://files.pythonhosted.org/packages/58/6c/5e86fa1759a525ef91c2d8b79d668574760ff3f900d114297765eb8786cb/opentelemetry_semantic_conventions-0.62b0-py3-none-any.whl", hash = "sha256:0ddac1ce59eaf1a827d9987ab60d9315fb27aea23304144242d1fcad9e16b489", size = 231619, upload-time = "2026-04-09T14:38:32.394Z" },
 ]
 
 [[package]]
@@ -4335,66 +4321,8 @@ wheels = [
 
 [[package]]
 name = "packaging"
-version = "25.0"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/d4/1fc4078c65507b51b96ca8f8c3ba19e6a61c8253c72794544580a7b6c24d/packaging-25.0.tar.gz", hash = "sha256:d443872c98d677bf60f6a1f2f8c1cb748e8fe762d2bf9d3148b5599295b0fc4f", size = 165727, upload-time = "2025-04-19T11:48:59.673Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl", hash = "sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484", size = 66469, upload-time = "2025-04-19T11:48:57.875Z" },
-]
-
-[[package]]
-name = "packaging"
 version = "26.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
-    "python_full_version >= '3.14' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-    "python_full_version >= '3.14' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and sys_platform == 'emscripten' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-    "python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32' and extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts'",
-]
 sdist = { url = "https://files.pythonhosted.org/packages/65/ee/299d360cdc32edc7d2cf530f3accf79c4fca01e96ffc950d8a52213bd8e4/packaging-26.0.tar.gz", hash = "sha256:00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4", size = 143416, upload-time = "2026-01-21T20:50:39.064Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/b9/c538f279a4e237a006a2c98387d081e9eb060d203d8ed34467cc0f0b9b53/packaging-26.0-py3-none-any.whl", hash = "sha256:b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529", size = 74366, upload-time = "2026-01-21T20:50:37.788Z" },
@@ -5216,8 +5144,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "iniconfig" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "pluggy" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ae/3c/c9d525a414d506893f0cd8a8d0de7706446213181570cdbd766691164e40/pytest-8.3.5.tar.gz", hash = "sha256:f4efe70cc14e511565ac476b57c279e12a855b11f48f212af1080ef2263d3845", size = 1450891, upload-time = "2025-03-02T12:54:54.503Z" }
@@ -5456,8 +5383,7 @@ dependencies = [
     { name = "filelock" },
     { name = "jsonschema" },
     { name = "msgpack" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "protobuf" },
     { name = "pyyaml" },
     { name = "requests" },
@@ -5480,10 +5406,10 @@ default = [
     { name = "grpcio" },
     { name = "opencensus" },
     { name = "opentelemetry-exporter-prometheus", version = "0.54b1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
-    { name = "opentelemetry-exporter-prometheus", version = "0.61b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-exporter-prometheus", version = "0.62b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "opentelemetry-proto" },
     { name = "opentelemetry-sdk", version = "1.33.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
-    { name = "opentelemetry-sdk", version = "1.40.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-sdk", version = "1.41.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "prometheus-client" },
     { name = "py-spy" },
     { name = "pydantic" },
@@ -6138,8 +6064,7 @@ dependencies = [
     { name = "docutils" },
     { name = "imagesize" },
     { name = "jinja2" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "pygments" },
     { name = "requests" },
     { name = "roman-numerals" },
@@ -6364,8 +6289,7 @@ dependencies = [
     { name = "markdown" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "pillow" },
     { name = "protobuf" },
     { name = "setuptools" },
@@ -6681,8 +6605,8 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.14.0+71bbefbf"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=71bbefbf153418f943640df0f7373625dc93fa46#71bbefbf153418f943640df0f7373625dc93fa46" }
+version = "2.14.0+f031cf87"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=f031cf87bd054c7558b887df7bed93975456667f#f031cf87bd054c7558b887df7bed93975456667f" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
@@ -6691,7 +6615,7 @@ dependencies = [
     { name = "onnx", version = "1.21.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "onnxscript", version = "0.5.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "onnxscript", version = "0.6.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "packaging" },
     { name = "pydantic" },
     { name = "torch", marker = "sys_platform == 'never'" },
 ]
@@ -6705,8 +6629,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "pyyaml" },
     { name = "regex" },
     { name = "requests" },
@@ -6869,8 +6792,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "gitpython" },
-    { name = "packaging", version = "25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "packaging", version = "26.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts' or extra != 'extra-13-megatron-core-dev'" },
+    { name = "packaging" },
     { name = "platformdirs" },
     { name = "protobuf" },
     { name = "pydantic" },
