@@ -3,7 +3,6 @@
 import logging
 
 from megatron.core.models.hybrid.hybrid_model import *  # noqa: F401,F403 # pylint: disable=unused-import
-from megatron.core.models.hybrid.hybrid_model import HybridModel  # noqa: F401
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import log_single_rank
 

@@ -72,8 +72,8 @@ class TestHybridBlock:
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
         )
-        modules = mamba_stack_spec.submodules
-        return MambaStack(
+        modules = hybrid_stack_spec.submodules
+        return HybridStack(
             transformer_config,
             modules,
             layer_type_list=layer_type_list,
