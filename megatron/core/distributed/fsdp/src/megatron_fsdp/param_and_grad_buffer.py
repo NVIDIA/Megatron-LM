@@ -1613,24 +1613,28 @@ class ParamAndGradBuffer:
             )
             # Select the communicator groups to register FSDP buffers.
             self.ubr_groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
-            if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
-                # Expert-DP group when using EP
-                self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=True))
-            if self.dist_index.get_outer_fsdp_group() is not None:
-                # Outer/Inter-FSDP group when using hybrid FSDP
-                self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
-            if (
-                self.dist_index.get_fsdp_group(
-                    is_expert_parallel=False, independent_all_gather=True
-                )
-                is not None
-            ):
-                # All-gather group used when overlapping all-gather and gradient reduction.
-                self.ubr_groups.append(
+            # Currernlty we are not supporting symmetric registration for other groups.
+            # For now, we only allow to register buffer to other groups when symmetric
+            # registration is disabled. We will support it in the future.
+            if self.ddp_config.disable_symmetric_registration:
+                if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
+                    # Expert-DP group when using EP
+                    self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=True))
+                if self.dist_index.get_outer_fsdp_group() is not None:
+                    # Outer/Inter-FSDP group when using hybrid FSDP
+                    self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
+                if (
                     self.dist_index.get_fsdp_group(
                         is_expert_parallel=False, independent_all_gather=True
                     )
-                )
+                    is not None
+                ):
+                    # All-gather group used when overlapping all-gather and gradient reduction.
+                    self.ubr_groups.append(
+                        self.dist_index.get_fsdp_group(
+                            is_expert_parallel=False, independent_all_gather=True
+                        )
+                    )
 
             log_single_rank(
                 logger,
