@@ -66,7 +66,11 @@ OPTIMIZER=${SWEEP_OPTIMIZER:-adam}
 MUON_SCALE_MODE=${SWEEP_MUON_SCALE_MODE:-spectral}
 
 PROJECT=megatron-lm-research-baseline
-EXP_NAME=transformer-pp-350m-abl-${OPTIMIZER}-lr${LR}-gbs${GBS}-$(git rev-parse --short HEAD)
+OPT_TAG=$OPTIMIZER
+if [ "$OPTIMIZER" = "adaptive_muon" ] && [ -n "${SWEEP_ADAPTIVE_MUON_M2:-}" ]; then
+    OPT_TAG=${SWEEP_ADAPTIVE_MUON_M2}
+fi
+EXP_NAME=transformer-pp-350m-abl-${OPT_TAG}-lr${LR}-gbs${GBS}-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=transformer-pp
