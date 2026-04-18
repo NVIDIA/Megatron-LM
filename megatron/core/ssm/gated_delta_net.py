@@ -84,6 +84,7 @@ class GatedDeltaNet(MegatronModule):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: Optional[str] = None,
     ):
         """
         Args:
@@ -97,7 +98,13 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            cp_comm_type: Context-parallel communication type. Accepted for interface
+                compatibility with the attention submodule builder in TransformerLayer
+                (which injects this kwarg whenever config.context_parallel_size > 1).
+                GatedDeltaNet implements its own context-parallel communication via
+                ``pg_collection.cp``, so the value is currently unused.
         """
+        del cp_comm_type  # unused; see docstring
 
         if not HAVE_FLA:
             raise ImportError(
