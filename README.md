@@ -12,6 +12,9 @@ in Megatron binary format with the GPT-2 BPE tokenizer (50257 vocab).
 See [README.nvidia.md](README.nvidia.md) for the original NVIDIA Megatron-LM
 documentation.
 
+**AI assistants**: read [AGENTS.md](AGENTS.md) before making changes — it
+documents the repo layout, experiment flow, and conventions.
+
 ## Changes from upstream
 
 ## Configurations
