@@ -2332,6 +2332,19 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument('--muon-scalar-lr', type=float, default=None,
+                       help='Learning rate for the scalar-optimizer param group (non-2D / '
+                       'embedding / output params) when using muon. When unset, inherits '
+                       '--lr.')
+    group.add_argument('--muon-scalar-weight-decay', type=float, default=None,
+                       help='Weight decay for the scalar-optimizer param group when using '
+                       'muon. When unset, inherits --weight-decay. Set to 0 to disable '
+                       'WD on the Adam group while keeping it on the Muon matrix group.')
+    group.add_argument('--adaptive-muon-moment2-method', type=str, default='adamuon',
+                       choices=['adamuon', 'normuon'],
+                       help='Second-moment accumulation method for adaptive_muon. '
+                       '"normuon" applies per-row (neuron) normalisation after '
+                       'Newton-Schulz (NorMuon, arXiv 2510.05491). Default "adamuon".')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')

@@ -289,6 +289,18 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
+    muon_scalar_lr: Optional[float] = None
+    """Learning rate for the scalar-optimizer param group (non-2D / embedding / output
+    params routed to Adam or Lion when using muon). When None, inherits ``config.lr``."""
+
+    muon_scalar_weight_decay: Optional[float] = None
+    """Weight decay for the scalar-optimizer param group. When None, inherits
+    ``config.weight_decay``. Set to 0.0 to decouple WD from the Muon 2D-matrix group."""
+
+    adaptive_muon_moment2_method: str = 'adamuon'
+    """Second-moment accumulation method for adaptive_muon. 'normuon' applies per-row
+    (neuron) normalisation after Newton-Schulz (NorMuon, arXiv 2510.05491)."""
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""

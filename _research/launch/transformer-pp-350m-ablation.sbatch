@@ -135,6 +135,15 @@ if [[ "$OPTIMIZER" == *muon* ]]; then
     if [ "${SWEEP_MUON_NO_SPLIT_QKV:-0}" = "1" ]; then
         MUON_ARGS+=(--muon-no-split-qkv)
     fi
+    if [ -n "${SWEEP_MUON_SCALAR_LR:-}" ]; then
+        MUON_ARGS+=(--muon-scalar-lr $SWEEP_MUON_SCALAR_LR)
+    fi
+    if [ -n "${SWEEP_MUON_SCALAR_WD:-}" ]; then
+        MUON_ARGS+=(--muon-scalar-weight-decay $SWEEP_MUON_SCALAR_WD)
+    fi
+    if [ "$OPTIMIZER" = "adaptive_muon" ] && [ -n "${SWEEP_ADAPTIVE_MUON_M2:-}" ]; then
+        MUON_ARGS+=(--adaptive-muon-moment2-method $SWEEP_ADAPTIVE_MUON_M2)
+    fi
 fi
 
 LEARNING_RATE_ARGS=(

@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _is_nonlinear_or_embedding,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -780,6 +781,51 @@ def _get_megatron_emerging_optimizer(
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+
+    # Muon-specific: apply independent LR and/or WD to the scalar-optimizer
+    # (Adam/Lion) group when --muon-scalar-lr / --muon-scalar-weight-decay are
+    # set. combine_param_group_overrides merges the {optimizer: adam} route
+    # registered above with these lr/wd fields into a single override.
+    if eopt_name in ('muon', 'adaptive_muon'):
+        muon_scalar_lr = getattr(config, 'muon_scalar_lr', None)
+        muon_scalar_wd = getattr(config, 'muon_scalar_weight_decay', None)
+
+        if muon_scalar_lr is not None:
+            lr_key = ParamKey(
+                predicate=ParamPredicate(
+                    name="muon_scalar_group_lr", fn=_is_nonlinear_or_embedding
+                )
+            )
+            config_overrides[lr_key] = {
+                'max_lr': muon_scalar_lr,
+                'min_lr': muon_scalar_lr,
+            }
+
+        if muon_scalar_wd is not None:
+            base_wd = config.weight_decay or 0.0
+            if base_wd == 0.0:
+                if muon_scalar_wd != 0.0:
+                    raise ValueError(
+                        "muon_scalar_weight_decay > 0 requires --weight-decay > 0 "
+                        "(wd_mult is applied on top of the base weight_decay)."
+                    )
+                wd_mult = 0.0
+            else:
+                wd_mult = muon_scalar_wd / base_wd
+
+            # Narrow the wd_mult override to Adam-group params that are NOT
+            # shape-1 biases/norms — those already have wd_mult=0 from the
+            # standard override (see get_standard_config_overrides).
+            def _is_nonlinear_or_embedding_dim_not_1(param):
+                return len(param.shape) != 1 and _is_nonlinear_or_embedding(param)
+
+            wd_key = ParamKey(
+                predicate=ParamPredicate(
+                    name="muon_scalar_group_wd",
+                    fn=_is_nonlinear_or_embedding_dim_not_1,
+                )
+            )
+            config_overrides[wd_key] = {'wd_mult': wd_mult}
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
