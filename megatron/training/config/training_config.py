@@ -477,6 +477,12 @@ class CheckpointConfig:
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
 
+    async_ckpt_use_cpu_shm: bool = False
+    """Copy GPU tensors to CPU shared-memory in the training process before handing off to
+    the async checkpoint worker. Avoids CUDA IPC / NVLink fabric handles in the worker
+    subprocess. Useful on MNNVL systems where fabric resources are exhausted.
+    Only applies with the nvrx async strategy."""
+
     fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""
 
