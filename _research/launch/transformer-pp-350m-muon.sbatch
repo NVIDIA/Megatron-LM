@@ -1,17 +1,18 @@
 #!/bin/bash
 #
-# Transformer++ 1.3B baseline on 8 GH200 nodes (32 GPUs).
-# 24L / 2048H / 5632F / 32h / 8kv (GQA).
-# SwiGLU, RMSNorm, RoPE, AdamW, WSD schedule, bf16.
-# 100B tokens on ClimbMix, ~190735 steps at 524K tokens/step.
+# Transformer++ 350M baseline on 1 GH200 node (4 GPUs).
+# 24L / 1024H / 2560F / 16h / 4kv (GQA).
+# SwiGLU, RMSNorm, RoPE, NorMuon (adaptive_muon + normuon), WSD, bf16.
+# 15B tokens on ClimbMix, ~28610 steps at 524K tokens/step.
+# Muon recipe validated on 1B-token ablation: NorMuon beats AdamW by ~0.10 nats.
+# --overlap-param-gather intentionally omitted (breaks Muon, see README).
 #
 #SBATCH --account=infra01
-#SBATCH --job-name=transformer-pp-1.3b
-#SBATCH --time=24:00:00
-# 8 nodes (32 GPUs), TP=1, DP=32. MBS=2 at DP=32: num_microbatches = 128/(2*32) = 2.
+#SBATCH --job-name=transformer-pp-350m-muon
+#SBATCH --time=10:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
-#SBATCH --nodes=8
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
@@ -47,28 +48,28 @@ MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
 NUM_LAYERS=24
-HIDDEN=2048
-FFN_HIDDEN=5632
-NUM_HEADS=32
-NUM_KV_HEADS=8
+HIDDEN=1024
+FFN_HIDDEN=2560
+NUM_HEADS=16
+NUM_KV_HEADS=4
 
-MBS=${SWEEP_MBS:-2}
+MBS=${SWEEP_MBS:-16}
 GBS=128
 SEQ_LEN=4096
-TRAIN_SAMPLES=24414063
-LR=2e-4
-MIN_LR=2e-5
+TRAIN_SAMPLES=3662109
+LR=3.6e-4
+MIN_LR=3.6e-5
 
 TP=1
 PP=1
 CP=1
 
 PROJECT=megatron-lm-research-baseline
-EXP_NAME=transformer-pp-1.3b-$(git rev-parse --short HEAD)
+EXP_NAME=transformer-pp-350m-muon-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=transformer-pp
-export APERTUS_TRACK=transformer-pp-1.3b
+export APERTUS_TRACK=transformer-pp-350m
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=0
 export APERTUS_LOG_TOP1_ACC=0
@@ -100,11 +101,11 @@ TRAINING_ARGS=(
     --micro-batch-size $MBS
     --global-batch-size $GBS
     --train-samples ${SWEEP_TRAIN_SAMPLES:-$TRAIN_SAMPLES}
-    --exit-duration-in-mins 1430
+    --exit-duration-in-mins 595
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
     --eval-iters 0
-    --optimizer adam
+    --optimizer adaptive_muon
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -122,13 +123,23 @@ REGULARIZATION_ARGS=(
     --adam-beta2 0.95
 )
 
+# NorMuon recipe (validated on 1B-token 350M ablation).
+MUON_ARGS=(
+    --muon-scale-mode spectral
+    --muon-nesterov
+    --muon-momentum 0.95
+    --muon-scalar-lr 1.5e-3
+    --muon-scalar-weight-decay 0.0
+    --adaptive-muon-moment2-method normuon
+)
+
 LEARNING_RATE_ARGS=(
     --lr $LR
     --min-lr $MIN_LR
     --lr-decay-style WSD
     --lr-warmup-samples 25600
     --lr-wsd-decay-style minus_sqrt
-    --lr-wsd-decay-samples 4882813
+    --lr-wsd-decay-samples 732422
 )
 
 INITIALIZATION_ARGS=(
@@ -184,6 +195,7 @@ MEGATRON_ARGS="\
     ${NETWORK_SIZE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
+    ${MUON_ARGS[@]} \
     ${LEARNING_RATE_ARGS[@]} \
     ${INITIALIZATION_ARGS[@]} \
     ${MIXED_PRECISION_ARGS[@]} \

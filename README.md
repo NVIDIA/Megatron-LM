@@ -23,10 +23,15 @@ sequences (524K tokens/step) and are tuned for GH200 nodes with 4 GPUs each.
 | config | params | tokens | nodes | GPUs | DP | MBS | est. wall | GPU-h |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `transformer-pp-350m-ablation` | 350M | 1B | 1 | 4 | 4 | 16 | ~30 min | 2 |
-| `transformer-pp-350m` | 350M | 15B | 1 | 4 | 4 | 16 | ~8 h | 31 |
-| `transformer-pp-760m` | 760M | 30B | 4 | 16 | 16 | 4 | ~7 h | 115 |
-| `transformer-pp-1.3b` | 1.3B | 100B | 8 | 32 | 32 | 2 | ~19 h | 596 |
-| `transformer-pp-2.7b` | 2.7B | 300B | 16 | 64 | 64 | 1 | ~60 h | 3,834 |
+| `transformer-pp-350m-{adamw,muon}` | 350M | 15B | 1 | 4 | 4 | 16 | ~8 h | 31 |
+| `transformer-pp-760m-adamw` | 760M | 30B | 4 | 16 | 16 | 4 | ~7 h | 115 |
+| `transformer-pp-1.3b-adamw` | 1.3B | 100B | 8 | 32 | 32 | 2 | ~19 h | 596 |
+| `transformer-pp-2.7b-adamw` | 2.7B | 300B | 16 | 64 | 64 | 1 | ~60 h | 3,834 |
+
+The `-muon` variant at 350M uses NorMuon (adaptive_muon + normuon) with
+matrix LR 3.6e-4 and scalar LR 1.5e-3; it differs from `-adamw` only in
+the optimizer block (validated on `-ablation`: NorMuon beats AdamW by
+~0.10 nats final loss).
 
 ### Architectures
 

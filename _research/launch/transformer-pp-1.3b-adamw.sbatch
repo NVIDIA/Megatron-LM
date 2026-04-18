@@ -1,17 +1,17 @@
 #!/bin/bash
 #
-# Transformer++ 2.7B baseline on 16 GH200 nodes (64 GPUs).
-# 32L / 2560H / 7680F / 32h / 8kv (GQA).
+# Transformer++ 1.3B baseline on 8 GH200 nodes (32 GPUs).
+# 24L / 2048H / 5632F / 32h / 8kv (GQA).
 # SwiGLU, RMSNorm, RoPE, AdamW, WSD schedule, bf16.
-# 300B tokens on ClimbMix, ~572205 steps at 524K tokens/step.
+# 100B tokens on ClimbMix, ~190735 steps at 524K tokens/step.
 #
 #SBATCH --account=infra01
-#SBATCH --job-name=transformer-pp-2.7b
-#SBATCH --time=72:00:00
-# 16 nodes (64 GPUs), TP=1, DP=64. MBS=1 at DP=64: num_microbatches = 128/(1*64) = 2.
+#SBATCH --job-name=transformer-pp-1.3b-adamw
+#SBATCH --time=24:00:00
+# 8 nodes (32 GPUs), TP=1, DP=32. MBS=2 at DP=32: num_microbatches = 128/(2*32) = 2.
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
 #SBATCH --error=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
-#SBATCH --nodes=16
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=72
@@ -46,29 +46,29 @@ mkdir -p $DATASET_CACHE_DIR $TRITON_CACHE_DIR $TORCHINDUCTOR_CACHE_DIR $TMP_CACH
 MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 MASTER_PORT=25678
 
-NUM_LAYERS=32
-HIDDEN=2560
-FFN_HIDDEN=7680
+NUM_LAYERS=24
+HIDDEN=2048
+FFN_HIDDEN=5632
 NUM_HEADS=32
 NUM_KV_HEADS=8
 
-MBS=${SWEEP_MBS:-1}
+MBS=${SWEEP_MBS:-2}
 GBS=128
 SEQ_LEN=4096
-TRAIN_SAMPLES=73242188
-LR=1.6e-4
-MIN_LR=1.6e-5
+TRAIN_SAMPLES=24414063
+LR=2e-4
+MIN_LR=2e-5
 
 TP=1
 PP=1
 CP=1
 
 PROJECT=megatron-lm-research-baseline
-EXP_NAME=transformer-pp-2.7b-$(git rev-parse --short HEAD)
+EXP_NAME=transformer-pp-1.3b-adamw-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=transformer-pp
-export APERTUS_TRACK=transformer-pp-2.7b
+export APERTUS_TRACK=transformer-pp-1.3b
 export APERTUS_RUN_NAME=$EXP_NAME-$SLURM_JOB_ID
 export APERTUS_LOG_ACT_STATS=0
 export APERTUS_LOG_TOP1_ACC=0
@@ -100,7 +100,7 @@ TRAINING_ARGS=(
     --micro-batch-size $MBS
     --global-batch-size $GBS
     --train-samples ${SWEEP_TRAIN_SAMPLES:-$TRAIN_SAMPLES}
-    --exit-duration-in-mins 4310
+    --exit-duration-in-mins 1430
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
     --eval-iters 0
@@ -128,7 +128,7 @@ LEARNING_RATE_ARGS=(
     --lr-decay-style WSD
     --lr-warmup-samples 25600
     --lr-wsd-decay-style minus_sqrt
-    --lr-wsd-decay-samples 14648438
+    --lr-wsd-decay-samples 4882813
 )
 
 INITIALIZATION_ARGS=(
