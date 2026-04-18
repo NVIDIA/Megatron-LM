@@ -172,11 +172,17 @@ DISTRIBUTED_ARGS=(
     --tensor-model-parallel-size $TP
     --pipeline-model-parallel-size $PP
     --context-parallel-size $CP
-    --use-distributed-optimizer
-    --overlap-grad-reduce
-    --overlap-param-gather
     --sequence-parallel
 )
+if [ "${SWEEP_NO_DISTOPT:-0}" = "1" ]; then
+    :
+else
+    DISTRIBUTED_ARGS+=(
+        --use-distributed-optimizer
+        --overlap-grad-reduce
+        --overlap-param-gather
+    )
+fi
 
 LOGGING_ARGS=(
     --log-throughput
