@@ -9,6 +9,46 @@ interconnect).
 Training data is [ClimbMix](https://huggingface.co/datasets/nvidia/Nemotron-ClimbMix)
 in Megatron binary format with the GPT-2 BPE tokenizer (50257 vocab).
 
+## Leaderboards
+
+Ranked run lists per model size; each entry is a self-contained sbatch + W&B link.
+
+- [`350m-ablation`](_research/leaderboards/350m-ablation/README.md) — 1B-token optimizer ablations (NorMuon / Muon / AdamW)
+- [`350m`](_research/leaderboards/350m/README.md) — 15B-token full baseline (placeholder)
+- [`760m`](_research/leaderboards/760m/README.md) — 30B-token full baseline (placeholder)
+- [`1.3b`](_research/leaderboards/1.3b/README.md) — 100B-token full baseline (placeholder)
+- [`2.7b`](_research/leaderboards/2.7b/README.md) — 300B-token full baseline (placeholder)
+
+## Quick start
+
+```bash
+# 1. clone and enter the repo
+git clone https://github.com/ischlag/megatron-lm-research-baseline.git
+cd megatron-lm-research-baseline
+
+# 2. export secrets once (wandb optional; without it logging falls back to disabled)
+export WANDB_API_KEY=<your-key>
+
+# 3. submit a run (the alps3 enroot container + _research/launch/install_python_deps.sh
+#    handle the Python environment inside the job; no local install required)
+sbatch _research/launch/transformer-pp-350m-adamw.sbatch
+# or the NorMuon variant:
+sbatch _research/launch/transformer-pp-350m-muon.sbatch
+# or the 1B-token ablation harness (overrides via SWEEP_*):
+SWEEP_OPTIMIZER=adaptive_muon SWEEP_LR=3.6e-4 \
+    sbatch _research/launch/transformer-pp-350m-ablation.sbatch
+```
+
+Each sbatch hardcodes CSCS-specific `--reservation`, `--account`, storage
+paths, `--environment=alps3`, and the dataset path. To adapt to a
+different site, edit the `#SBATCH` header and `--data-path` lines; the
+model / optimizer / schedule args are portable.
+
+Python dependencies (`transformers`, `wandb`, `emerging-optimizers`) are
+installed into `_research/packages/` inside the container on first run
+via `_research/launch/install_python_deps.sh`; no `pip install` on the
+login node is needed.
+
 See [README.nvidia.md](README.nvidia.md) for the original NVIDIA Megatron-LM
 documentation.
 
