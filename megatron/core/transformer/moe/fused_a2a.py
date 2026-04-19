@@ -25,16 +25,19 @@ def _drain_etp_side_streams(chain_id: str = None):
     at scale over IB if concurrent NCCL ops are still running on ag/rs side streams.
 
     Args:
-        chain_id: 'dense', 'expert', or None (drain all chains).
+        chain_id: ETPChain.GRAPHED.value, ETPChain.UNGRAPHED.value, or None
+                  (drain all chains).
     """
     try:
         if chain_id is not None:
             from transformer_engine.pytorch.module.extended_tensor_parallelism import (
-                get_ag_stream,
-                get_rs_stream,
+                get_ag_streams_for_chain,
+                get_rs_streams_for_chain,
             )
-            torch.cuda.current_stream().wait_stream(get_ag_stream(chain_id))
-            torch.cuda.current_stream().wait_stream(get_rs_stream(chain_id))
+            for s in get_ag_streams_for_chain(chain_id):
+                torch.cuda.current_stream().wait_stream(s)
+            for s in get_rs_streams_for_chain(chain_id):
+                torch.cuda.current_stream().wait_stream(s)
         else:
             from transformer_engine.pytorch.module.extended_tensor_parallelism import (
                 get_all_ag_streams,

@@ -1290,13 +1290,29 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if not isinstance(model, list):
         model = [model]
 
-    # Tag ETP params with their full dotted names for debug logging.
+    # Tag ETP params with their full dotted names for debug logging, and
+    # classify each ETP param into its prefetch chain (ETP_graphed vs
+    # ETP_ungraphed) based on the configured cuda_graph_scope. Classification
+    # must run after the model is built (for named_parameters()) and before
+    # the first forward pass (which lazily builds chain links).
     try:
         from transformer_engine.pytorch.module.extended_tensor_parallelism import (
-            ETPShardedParam, tag_etp_params_with_names,
+            ETPShardedParam,
+            tag_etp_params_with_names,
+            set_cuda_graph_scope,
+            classify_etp_chains,
         )
+        # Pass the active scope + moe_shared_expert_overlap flag so the
+        # classifier knows which MoE submodules will be captured. Convert
+        # args.cuda_graph_scope (list of CudaGraphScope enum members) to the
+        # lowercase-name set the TE classifier expects (e.g., {"mamba","attn","moe_router"}).
+        _raw_scope = getattr(args, 'cuda_graph_scope', None) or []
+        _cg_scope = {getattr(s, 'name', str(s)) for s in _raw_scope} if _raw_scope else None
+        _mse_overlap = getattr(args, 'moe_shared_expert_overlap', False)
+        set_cuda_graph_scope(_cg_scope, moe_shared_expert_overlap=_mse_overlap)
         for model_module in model:
             tag_etp_params_with_names(model_module)
+            classify_etp_chains(model_module)
     except ImportError:
         pass
 

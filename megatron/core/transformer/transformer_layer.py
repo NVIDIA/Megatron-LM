@@ -1337,20 +1337,13 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        # Drain in-flight ETP AG on ag_stream before eager expert compute.
-        # The graphed dense forward may have prefetched the next layer's weight
-        # (e.g. AG(next_mamba_fc1)) on ag_stream.  That IB NCCL op can race with
-        # the MoE AllToAll (EP communicator, main_stream) at 64+ GPU IB scale,
-        # causing NCCL deadlock.
-        #
-        # DDP param AG (--overlap-param-gather) does NOT need draining here:
-        #   - Forward: CudaGraphManager.call_ddp_preforward_hook() fires
-        #     finish_param_sync before each graph replay — overlap chain works.
-        #   - Backward: register_grad_accum_hook serializes DDP RS after ETP RS,
-        #     so no concurrent IB communicator contention.
-        if self.config.parameter_sharding_size > 1:
+        # Drain all in-flight ETP AG/RS side streams before eager expert
+        # compute. UNGRAPHED prefetches can cross MoE layer boundaries and
+        # still be running when the eager MoE AllToAll dispatches; draining
+        # both chains here serializes them against the AllToAll.
+        if self.config.parameter_sharding_size > 1 or self.config.expert_parameter_sharding_size > 1:
             from megatron.core.transformer.moe.fused_a2a import _drain_etp_side_streams
-            _drain_etp_side_streams('dense')
+            _drain_etp_side_streams()
 
         # Restore token dispatcher attributes that were captured during CUDA graph recording.
         # After router graph replay, Python code does not re-run, so any attribute that was

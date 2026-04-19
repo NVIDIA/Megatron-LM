@@ -54,6 +54,7 @@ try:
     from transformer_engine.pytorch.utils import make_weak_ref
     from transformer_engine.pytorch.module.extended_tensor_parallelism import (
         ETP_CONFIG,
+        ETPChain,
         get_ag_stream,
         get_rs_stream,
         reallocate_etp_cache_to_mempool,
@@ -794,9 +795,17 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.stream = torch.cuda.Stream()
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
-                self._register_side_stream(self.fwd_side_streams, get_ag_stream())
-                self._register_side_stream(self.bwd_side_streams, get_ag_stream())
-                self._register_side_stream(self.bwd_side_streams, get_rs_stream())
+                # GRAPHED chain only hits dense modules (mamba/attn/moe_router),
+                # all sharded across PARAMETER_SHARDING_GROUP. Materialize that
+                # (chain, group) stream pair now so it is registered as a
+                # captured side stream before the first forward.
+                from megatron.core.parallel_state import get_parameter_sharding_group
+                etp_group = get_parameter_sharding_group()
+                graphed_ag = get_ag_stream(ETPChain.GRAPHED.value, etp_group)
+                graphed_rs = get_rs_stream(ETPChain.GRAPHED.value, etp_group)
+                self._register_side_stream(self.fwd_side_streams, graphed_ag)
+                self._register_side_stream(self.bwd_side_streams, graphed_ag)
+                self._register_side_stream(self.bwd_side_streams, graphed_rs)
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -1017,7 +1026,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     )
 
                 if self.parameter_sharding:
-                    wait_async_comms()
+                    wait_async_comms(ETPChain.GRAPHED.value)
                     self._sync_against_side_streams(self.bwd_side_streams)
 
             _set_warmup_end()
@@ -1048,7 +1057,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     )
 
                     if self.parameter_sharding:
-                        wait_async_comms()
+                        wait_async_comms(ETPChain.GRAPHED.value)
 
                     if self.fwd_side_streams:
                         self._wait_side_streams(self.fwd_side_streams)
@@ -1181,7 +1190,7 @@ class _CudaGraphRunner(torch.nn.Module):
             )
 
             if self.parameter_sharding:
-                wait_async_comms()
+                wait_async_comms(ETPChain.GRAPHED.value)
 
             if self.bwd_side_streams:
                 self._wait_side_streams(self.bwd_side_streams)
