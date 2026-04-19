@@ -37,6 +37,13 @@ export WANDB_API_KEY=<your-wandb-key>             # optional; omit to log locall
 export MEGATRON_DATA_PATH=/path/to/climbmix_small # required; Megatron-binary prefix without .bin/.idx
 ```
 
+On Clariden, a tokenized ClimbMix copy is available at a shared
+read-only path:
+
+```bash
+export MEGATRON_DATA_PATH=/capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
+```
+
 `sbatch` reads `SBATCH_ACCOUNT` / `SBATCH_RESERVATION` natively — no
 wrapper needed. The sbatches abort with a clear error at submit time
 if `MEGATRON_DATA_PATH` is unset.
