@@ -21,20 +21,26 @@ Ranked run lists per model size; each entry is a self-contained sbatch + W&B lin
 
 ## Quick start
 
+**On Clariden (Swiss AI Alps, infra01 project):**
+
 ```bash
-# 1. clone and enter the repo
+# 1. Clone into the expected path. The sbatches write the Python
+#    package dir, caches, and SLURM logs to this exact location;
+#    cloning elsewhere will scatter outputs across two directories.
+cd /iopsstor/scratch/cscs/$USER
 git clone https://github.com/ischlag/megatron-lm-research-baseline.git
 cd megatron-lm-research-baseline
 
-# 2. export secrets once (wandb optional; without it logging falls back to disabled)
+# 2. Export secrets once (wandb optional; without it logging is disabled).
 export WANDB_API_KEY=<your-key>
 
-# 3. submit a run (the alps3 enroot container + _research/launch/install_python_deps.sh
-#    handle the Python environment inside the job; no local install required)
+# 3. Submit a run. The alps3 enroot container +
+#    _research/launch/install_python_deps.sh handle the Python
+#    environment inside the job; no local install required.
 sbatch _research/launch/transformer-pp-350m-adamw.sbatch
 # or the NorMuon variant:
 sbatch _research/launch/transformer-pp-350m-muon.sbatch
-# or a 1B-token quick reference (AdamW, ~30 min):
+# or a 1B-token quick reference (AdamW, ~30 min — good first smoke test):
 sbatch _research/launch/transformer-pp-350m-ablation.sbatch
 ```
 
