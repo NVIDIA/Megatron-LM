@@ -11,8 +11,37 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
+
+
+class TestModelWithExperts(torch.nn.Module):
+    """Model with both dense and expert-parallel parameters.
+
+    Dense layers have the default allreduce=True. Expert layers have
+    allreduce=False on their parameters, which routes them to a separate
+    buffer with a different data-parallel group.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_dense_layers: int,
+        num_expert_layers: int,
+        bias: bool,
+    ):
+        super().__init__()
+        self.dense_layers = torch.nn.ModuleList(
+            [torch.nn.Linear(input_dim, output_dim, bias) for _ in range(num_dense_layers)]
+        )
+        self.expert_layers = torch.nn.ModuleList(
+            [torch.nn.Linear(input_dim, output_dim, bias) for _ in range(num_expert_layers)]
+        )
+        for layer in self.expert_layers:
+            for param in layer.parameters():
+                param.allreduce = False
 
 
 def get_model_and_buffers(
@@ -49,8 +78,18 @@ def get_model_and_buffers(
     # Wrap with DistributedDataParallel, and get underlying buffer.
     # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
     # errors for num_attention_heads and num_layers.
+    # Pre-compute parameter layouts for the distributed optimizer.
+    full_param_layout = None
+    if use_distributed_optimizer:
+        all_params = [p for p in model.parameters() if p.requires_grad]
+        full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            all_params, bucket_size, parallel_state.get_data_parallel_world_size(), ddp_config
+        )
     model = DistributedDataParallel(
-        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=model
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        ddp_config=ddp_config,
+        module=model,
+        full_param_layout=full_param_layout,
     )
     assert len(model.buffers) == 1
     param_and_grad_buffer = model.buffers[0]
@@ -733,6 +772,15 @@ class TestNVFP4IndexMaps:
             average_in_collective=False,
         )
 
+        # Pre-compute layout for distributed optimizer (with padding);
+        # otherwise use default (no padding).
+        param_layout = None
+        if use_distributed_optimizer:
+            param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                params, bucket_size, dp_world_size, ddp_config
+            )
+            param_layout.param_indices = list(range(len(params)))
+
         with (
             mock.patch(
                 'megatron.core.distributed.param_and_grad_buffer.is_nvfp4tensor',
@@ -760,6 +808,7 @@ class TestNVFP4IndexMaps:
                 param_indices=list(range(len(params))),
                 nccl_ub=False,
                 pg_collection=mock_pg,
+                param_layout=param_layout,
             )
 
         return buffer, params
@@ -884,3 +933,101 @@ class TestNVFP4IndexMaps:
 
         assert buffer.param_index_map[params[1]] == (large_unpacked_start, large_unpacked_end, 0)
         assert buffer.param_index_map[params[0]] == (small_unpacked_start, small_unpacked_end, 0)
+
+
+@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: bool):
+    """Verify that expert-parallel params (allreduce=False) land in separate buffers
+    with correctly scoped layouts and independent param_index_maps."""
+    Utils.initialize_model_parallel()
+
+    input_dim = 95
+    output_dim = 95
+    num_dense_layers = 3
+    num_expert_layers = 2
+    bucket_size = None  # Single bucket per buffer.
+
+    ddp_config = DistributedDataParallelConfig(
+        grad_reduce_in_fp32=True,
+        use_distributed_optimizer=use_distributed_optimizer,
+        overlap_grad_reduce=True,
+        bucket_size=bucket_size,
+        average_in_collective=False,
+    )
+    model = TestModelWithExperts(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        num_dense_layers=num_dense_layers,
+        num_expert_layers=num_expert_layers,
+        bias=True,
+    ).bfloat16()
+
+    full_param_layout = None
+    if use_distributed_optimizer:
+        all_params = [p for p in model.parameters() if p.requires_grad]
+        full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            all_params, bucket_size, parallel_state.get_data_parallel_world_size(), ddp_config
+        )
+
+    ddp_model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        ddp_config=ddp_config,
+        module=model,
+        full_param_layout=full_param_layout,
+    )
+
+    # Should have exactly one dense buffer and one expert buffer.
+    assert len(ddp_model.buffers) == 1, f"Expected 1 dense buffer, got {len(ddp_model.buffers)}"
+    assert (
+        len(ddp_model.expert_parallel_buffers) == 1
+    ), f"Expected 1 expert buffer, got {len(ddp_model.expert_parallel_buffers)}"
+
+    dense_buffer = ddp_model.buffers[0]
+    expert_buffer = ddp_model.expert_parallel_buffers[0]
+
+    # Collect expected params for each buffer.
+    expected_dense_params = set()
+    expected_expert_params = set()
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if getattr(param, 'allreduce', True):
+            expected_dense_params.add(param)
+        else:
+            expected_expert_params.add(param)
+
+    # Verify each buffer contains exactly the right params.
+    dense_buffer_params = set()
+    for bucket in dense_buffer.buckets:
+        dense_buffer_params.update(bucket.params)
+    assert (
+        dense_buffer_params == expected_dense_params
+    ), "Dense buffer should contain exactly the dense params"
+
+    expert_buffer_params = set()
+    for bucket in expert_buffer.buckets:
+        expert_buffer_params.update(bucket.params)
+    assert (
+        expert_buffer_params == expected_expert_params
+    ), "Expert buffer should contain exactly the expert-parallel params"
+
+    # Verify param_index_maps are scoped to their own buffer (no cross-contamination).
+    assert set(dense_buffer.param_index_map.keys()) == expected_dense_params
+    assert set(expert_buffer.param_index_map.keys()) == expected_expert_params
+
+    # Verify both buffers have indices starting from 0 (independent index spaces).
+    dense_starts = [s for s, _, _ in dense_buffer.param_index_map.values()]
+    expert_starts = [s for s, _, _ in expert_buffer.param_index_map.values()]
+    assert min(dense_starts) == 0, "Dense buffer indices should start at 0"
+    assert min(expert_starts) == 0, "Expert buffer indices should start at 0"
+
+    # Verify DP divisibility for distributed optimizer.
+    if use_distributed_optimizer:
+        dp_world_size = parallel_state.get_data_parallel_world_size()
+        for buffer_name, buffer in [("dense", dense_buffer), ("expert", expert_buffer)]:
+            assert buffer.numel % dp_world_size == 0, (
+                f"{buffer_name} buffer numel ({buffer.numel}) should be "
+                f"divisible by dp_world_size ({dp_world_size})"
+            )
+
+    Utils.destroy_model_parallel()
