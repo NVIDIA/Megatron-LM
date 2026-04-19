@@ -1428,10 +1428,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe in recompute_modules is not supported with moe_expert in recompute_modules"
                 )
-            if "moe_expert" in self.recompute_modules and (not self.fp8 or (self.fp8 and self.fp8_recipe != 'blockwise')):
-                raise ValueError(
-                    "moe_expert recompute_modules is supported fp8 blockwise recipe"
-                )
+            if "moe_expert" in self.recompute_modules and (
+                not self.fp8 or (self.fp8 and self.fp8_recipe != 'blockwise')
+            ):
+                raise ValueError("moe_expert recompute_modules is supported fp8 blockwise recipe")
 
         if self.moe_layer_recompute:
             warnings.warn(

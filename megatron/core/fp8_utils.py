@@ -787,6 +787,7 @@ else:
 
 if HAVE_TE:
     from functools import lru_cache
+
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
         Float8BlockQuantizer,

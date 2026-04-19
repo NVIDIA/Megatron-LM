@@ -1,8 +1,6 @@
 import torch
-
 import triton
 import triton.language as tl
-
 
 SCALE_MIN_THRES = 1e-10
 FP8_MAX_VALUE = {torch.float8_e4m3fn: 448.0, torch.float8_e5m2: 57344.0}
@@ -71,6 +69,7 @@ def fused_weighted_swiglu_quant_kernel(
     sig = tl.sigmoid(a)
     silu = a * sig
     data = silu * b * w
+    data = data.to(inp_ptr.type.element_ty).to(tl.float32)
 
     # Scale
     data = tl.reshape(data, (BLOCK_M, BLOCK_SN, block_size))
@@ -233,6 +232,8 @@ def fused_weighted_swiglu_quant_back_kernel(
     g_eff = g * w
     dy1 = g_eff * dsilu * b
     dy2 = g_eff * silu
+    dy1 = dy1.to(inp_ptr.type.element_ty).to(tl.float32)
+    dy2 = dy2.to(inp_ptr.type.element_ty).to(tl.float32)
 
     # grad_w
     contrib = (silu * b) * g

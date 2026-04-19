@@ -6,12 +6,12 @@
 import torch
 import torch.nn.functional as F
 
-from megatron.core.jit import jit_fuser
-from megatron.core.utils import nvtx_decorator
 from megatron.core.fusions.fused_weighted_swiglu_quant import (
     fused_weighted_swiglu_quant,
     fused_weighted_swiglu_quant_back,
 )
+from megatron.core.jit import jit_fuser
+from megatron.core.utils import nvtx_decorator
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 

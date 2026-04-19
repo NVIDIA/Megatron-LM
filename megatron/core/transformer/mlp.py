@@ -270,6 +270,7 @@ class MLP(MegatronModule):
                         bias_parallel,
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
+                        self.config,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
