@@ -359,9 +359,10 @@ class TransformerConfig(ModelParallelConfig):
     scaling_recipe: Optional[Literal['none', 'mup', 'depth_mup']] = None
     """
     Canonical scaling recipe. `mup` preserves the current Megatron MuP semantics,
-    `depth_mup` is reserved for the first explicit depth recipe, `none` keeps the
-    standard parameterization, and `None` means unspecified so legacy alias
-    resolution can decide the recipe.
+    `depth_mup` is the initial Adam/AdamW-scoped dense GPT-style residual
+    Transformer Depth-MuP candidate,
+    `none` keeps the standard parameterization, and `None` means unspecified so
+    legacy alias resolution can decide the recipe.
     """
 
     scaling_base_hidden_size: Optional[int] = None
@@ -385,18 +386,21 @@ class TransformerConfig(ModelParallelConfig):
     scaling_residual_branch_depth_power: Optional[float] = None
     """
     Relative depth exponent for dense self-attention/MLP residual-branch outputs.
-    Added as the first dense-depth proof knob for the generalized scaling framework.
+    Under `depth_mup`, the default is `-1.0`.
     """
 
     scaling_hidden_lr_depth_power: Optional[float] = None
     """
-    Relative depth exponent for hidden matrix-like LR overrides.
+    Relative depth exponent for hidden matrix-like LR overrides. Under
+    `depth_mup`, the default is `0.0` for Adam/AdamW.
     """
 
     scaling_block_out_proj_init_depth_power: Optional[float] = None
     """
     Relative depth exponent for dense transformer block output projection
-    initialization (self-attention proj and dense MLP fc2).
+    initialization (self-attention proj and dense MLP fc2). Under `depth_mup`,
+    the default is `+0.5` to compensate for Megatron's built-in layer-count-
+    dependent output-projection initialization.
     """
 
     use_mup: bool = False
@@ -1792,6 +1796,23 @@ class TransformerConfig(ModelParallelConfig):
         scaling_context = build_resolved_scaling_context(self)
         sync_legacy_mup_fields(self, scaling_context)
         model_scaling_policy = build_resolved_model_policy(self)
+
+        if scaling_context.is_depth_mup:
+            if self.multi_latent_attention:
+                raise NotImplementedError(
+                    "scaling_recipe='depth_mup' currently supports dense residual Transformer "
+                    "self-attention only. multi_latent_attention is out of scope for v1."
+                )
+            if self.experimental_attention_variant is not None:
+                raise NotImplementedError(
+                    "scaling_recipe='depth_mup' currently supports dense residual Transformer "
+                    "self-attention only. experimental attention variants are out of scope for v1."
+                )
+            if self.num_moe_experts is not None:
+                raise NotImplementedError(
+                    "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
+                    "Transformer blocks only. MoE depth transfer is out of scope for v1."
+                )
 
         # MuP (Maximal Update Parameterization) configuration
         if scaling_context.recipe in (SCALING_RECIPE_MUP, SCALING_RECIPE_DEPTH_MUP):

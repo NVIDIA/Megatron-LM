@@ -279,6 +279,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
     ):
+        cross_attention_spec = submodules.cross_attention
+        uses_cross_attention = not (
+            cross_attention_spec is IdentityOp
+            or (
+                isinstance(cross_attention_spec, ModuleSpec)
+                and cross_attention_spec.module is IdentityOp
+            )
+        )
+        if config.scaling_recipe == 'depth_mup' and uses_cross_attention:
+            raise NotImplementedError(
+                "scaling_recipe='depth_mup' currently supports dense self-attention-only "
+                "Transformer blocks. Cross-attention is out of scope for v1."
+            )
+
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
 
@@ -351,7 +365,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             layer_number=self.layer_number,
             **attention_optional_kwargs,
         )
-
         # [Module 6: BiasDropoutFusion]
         self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
 
@@ -711,6 +724,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     ) -> tuple[Tensor, Tensor | None]:
         if not apply_depth_hook:
             return output_with_bias
+        if self.model_scaling_policy.context.is_depth_mup and not getattr(self, 'training', True):
+            if using_fused_tp_inference_kernel:
+                raise NotImplementedError(
+                    f"Residual-branch scaling is not supported with fused TP inference for {branch_name}."
+                )
+            raise NotImplementedError(
+                f"Residual-branch scaling is not supported during inference for {branch_name}."
+            )
         if self.model_scaling_policy.residual_branch_multiplier == 1.0:
             return output_with_bias
         if using_fused_tp_inference_kernel:

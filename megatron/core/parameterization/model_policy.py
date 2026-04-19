@@ -24,6 +24,10 @@ class ResolvedModelPolicy:
         return self.context.enabled
 
     @property
+    def uses_width_mup(self) -> bool:
+        return self.context.uses_width_mup
+
+    @property
     def residual_branch_multiplier(self) -> float:
         return self.context.depth_mult**self.context.residual_branch_depth_power
 
@@ -34,7 +38,7 @@ class ResolvedModelPolicy:
     def resolve_attention_softmax_scale(
         self, *, softmax_scale: Optional[float], kv_channels: int
     ) -> Optional[float]:
-        if softmax_scale is not None or not self.enabled:
+        if softmax_scale is not None or not self.uses_width_mup:
             return softmax_scale
         base_head_scale = (
             1.0
@@ -44,7 +48,7 @@ class ResolvedModelPolicy:
         return base_head_scale / (kv_channels**self.context.attention_scale_power)
 
     def build_hidden_init_method(self, *, init_method_std: float):
-        if not self.enabled:
+        if not self.uses_width_mup:
             return init_method_normal(init_method_std)
         return init_method_normal(init_method_std / math.sqrt(self.context.width_mult))
 
@@ -52,7 +56,7 @@ class ResolvedModelPolicy:
         self, *, init_method_std: float, num_layers: int, is_hybrid_model: bool
     ):
         multiplier = 2.0 if not is_hybrid_model else 1.0
-        if self.enabled:
+        if self.uses_width_mup:
             return mup_scaled_init_method_normal(
                 init_method_std,
                 num_layers,
@@ -84,7 +88,7 @@ class ResolvedModelPolicy:
 
         multiplier = 2.0 if not is_hybrid_model else 1.0
         std = init_method_std / math.sqrt(multiplier * num_layers)
-        if self.enabled:
+        if self.uses_width_mup:
             std = std / math.sqrt(self.context.width_mult)
         std = std * self.dense_block_out_proj_init_multiplier
         return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
@@ -96,23 +100,23 @@ class ResolvedModelPolicy:
         default_init_method,
         embedding_init_method,
     ):
-        if self.enabled and not share_embeddings_and_output_weights:
+        if self.uses_width_mup and not share_embeddings_and_output_weights:
             return embedding_init_method
         return default_init_method
 
     def mark_embedding_class_parameters(self, parameters: Iterable[torch.nn.Parameter]) -> None:
-        if not self.enabled:
+        if not self.uses_width_mup:
             return
         for param in parameters:
             param.is_embedding_parameter = True
 
     def scale_embedding_activations(self, embeddings: Tensor) -> Tensor:
-        if not self.enabled or self.context.embedding_mult == 1.0:
+        if not self.uses_width_mup or self.context.embedding_mult == 1.0:
             return embeddings
         return embeddings * self.context.embedding_mult
 
     def scale_output_logits(self, logits: Tensor) -> Tensor:
-        if not self.enabled or self.context.output_mult == 1.0:
+        if not self.uses_width_mup or self.context.output_mult == 1.0:
             return logits
         return logits * self.context.output_mult
 

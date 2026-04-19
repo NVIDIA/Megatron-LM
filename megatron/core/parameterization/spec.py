@@ -67,6 +67,14 @@ class ResolvedScalingContext:
     def enabled(self) -> bool:
         return self.recipe != SCALING_RECIPE_NONE
 
+    @property
+    def uses_width_mup(self) -> bool:
+        return self.recipe in (SCALING_RECIPE_MUP, SCALING_RECIPE_DEPTH_MUP)
+
+    @property
+    def is_depth_mup(self) -> bool:
+        return self.recipe == SCALING_RECIPE_DEPTH_MUP
+
 
 def _resolve_aliased_value(
     explicit_value: Optional[float | int],
@@ -207,17 +215,27 @@ def canonicalize_scaling_user_config(user_config: ScalingUserConfig, config: Any
         base_num_layers=base_num_layers,
         base_head_dim=base_head_dim,
     )
+    residual_branch_depth_power = user_config.residual_branch_depth_power
+    if residual_branch_depth_power is None:
+        residual_branch_depth_power = -1.0 if recipe == SCALING_RECIPE_DEPTH_MUP else 0.0
+
+    hidden_lr_depth_power = user_config.hidden_lr_depth_power
+    if hidden_lr_depth_power is None:
+        hidden_lr_depth_power = 0.0
+
+    block_out_proj_init_depth_power = user_config.block_out_proj_init_depth_power
+    if block_out_proj_init_depth_power is None:
+        block_out_proj_init_depth_power = 0.5 if recipe == SCALING_RECIPE_DEPTH_MUP else 0.0
+
     return CanonicalScalingSpec(
         recipe=recipe,
         references=references,
         embedding_mult=user_config.mup_embedding_mult,
         output_mult=user_config.mup_output_mult,
         attention_scale_power=user_config.mup_attn_scale_power,
-        residual_branch_depth_power=float(user_config.residual_branch_depth_power or 0.0),
-        hidden_lr_depth_power=float(user_config.hidden_lr_depth_power or 0.0),
-        block_out_proj_init_depth_power=float(
-            user_config.block_out_proj_init_depth_power or 0.0
-        ),
+        residual_branch_depth_power=float(residual_branch_depth_power),
+        hidden_lr_depth_power=float(hidden_lr_depth_power),
+        block_out_proj_init_depth_power=float(block_out_proj_init_depth_power),
     )
 
 
@@ -257,12 +275,19 @@ def build_resolved_scaling_context(config: Any) -> ResolvedScalingContext:
 def sync_legacy_mup_fields(config: Any, context: ResolvedScalingContext) -> None:
     config.scaling_recipe = context.recipe
     config.use_mup = context.recipe == SCALING_RECIPE_MUP
-    if context.recipe != SCALING_RECIPE_MUP:
+    if context.recipe == SCALING_RECIPE_NONE:
         return
 
     config.scaling_base_hidden_size = context.references.base_hidden_size
     config.scaling_base_num_layers = context.references.base_num_layers
     config.scaling_base_head_dim = context.references.base_head_dim
+    config.scaling_residual_branch_depth_power = context.residual_branch_depth_power
+    config.scaling_hidden_lr_depth_power = context.hidden_lr_depth_power
+    config.scaling_block_out_proj_init_depth_power = context.block_out_proj_init_depth_power
+
+    if context.recipe != SCALING_RECIPE_MUP:
+        return
+
     config.mup_base_hidden_size = context.references.base_hidden_size
     config.mup_base_head_dim = context.references.base_head_dim
     config.mup_width_mult = context.width_mult

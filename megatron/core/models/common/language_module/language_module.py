@@ -229,8 +229,8 @@ class LanguageModule(MegatronModule):
                 ),
             )
 
-        # Mark embedding-class parameters for MuP optimizer grouping.
-        # Under MuP table-8-style grouping, embeddings/output use base LR/eps while
+        # Mark embedding-class parameters for MuP-family optimizer grouping.
+        # Under MuP-style table-8 grouping, embeddings/output use base LR/eps while
         # hidden matrix-like params use width-scaled LR/eps.
         mtp_process = getattr(self, 'mtp_process', False)
         if (
@@ -331,9 +331,9 @@ class LanguageModule(MegatronModule):
     def _scale_logits(self, logits: Tensor) -> Tensor:
         """Apply scaling-policy output scaling to logits.
 
-        Under the current `mup` recipe, this scales logits by `mup_output_mult`
-        (auto-set to `1 / width_mult` when left at default) to keep output
-        variance stable across widths.
+        Under the active MuP-family width recipe (`mup` or `depth_mup`), this
+        scales logits by `mup_output_mult` (auto-set to `1 / width_mult` when
+        left at default) to keep output variance stable across widths.
 
         Args:
             logits (Tensor): Raw logits from the output layer.

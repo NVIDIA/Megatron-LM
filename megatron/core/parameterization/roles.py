@@ -54,6 +54,8 @@ def is_embedding_class_parameter(param: Any, param_name: Optional[str] = None) -
         return bool(param.is_embedding_parameter)
     if get_parameterization_role(param) in _EMBEDDING_CLASS_ROLES:
         return True
+    # Compatibility-only fallback for older unannotated parameters. The scaling
+    # recipes added in this branch are intended to rely on explicit metadata.
     return bool(param_name and 'embedding' in param_name.lower())
 
 
