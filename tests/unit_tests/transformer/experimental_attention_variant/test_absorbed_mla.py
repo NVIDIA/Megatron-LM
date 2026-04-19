@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import math
 import random
 from typing import List, Optional, Tuple
 
@@ -226,57 +225,6 @@ def get_mla_submodules(
         q_layernorm=qk_norm,
         kv_layernorm=qk_norm,
     )
-
-
-def test_absorbed_mla_linear_proj_uses_dense_depth_init_scaling():
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
-    model_parallel_cuda_manual_seed(123)
-    try:
-        config = MLATransformerConfig(
-            multi_latent_attention=True,
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            q_lora_rank=32,
-            kv_lora_rank=32,
-            qk_head_dim=128,
-            v_head_dim=128,
-            qk_pos_emb_head_dim=64,
-            add_bias_linear=False,
-            rope_type="rope",
-            rotary_base=10000,
-            original_max_position_embeddings=32,
-            scaling_recipe='mup',
-            scaling_base_hidden_size=6,
-            scaling_base_num_layers=1,
-            scaling_block_out_proj_init_depth_power=-0.5,
-        )
-        absorbed_mla = AbsorbedMLASelfAttention(
-            config=config,
-            submodules=get_absorbed_mla_submodules(
-                down_proj_use_column_parallel=False,
-                qk_layernorm=True,
-                rms_norm=True,
-            ),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-            cp_comm_type=None,
-            pg_collection=None,
-        )
-
-        expected_std = (
-            config.init_method_std
-            / (math.sqrt(2 * config.num_layers) * math.sqrt(config.mup_width_mult))
-            * (
-                (config.num_layers / config.scaling_base_num_layers)
-                ** config.scaling_block_out_proj_init_depth_power
-            )
-        )
-        actual_std = absorbed_mla.linear_proj.weight.std().cpu().item()
-        assert actual_std == pytest.approx(expected_std, rel=0.1)
-    finally:
-        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("tp_cp", [[1, 1], [2, 1], [1, 2], [2, 2]])

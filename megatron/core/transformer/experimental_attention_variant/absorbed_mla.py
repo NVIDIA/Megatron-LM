@@ -19,7 +19,6 @@ from typing import NoReturn, Optional, Union
 import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -169,26 +168,13 @@ class AbsorbedMLASelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
-        model_scaling_policy = build_resolved_model_policy(self.config)
-
         # Output.
         self.linear_proj = build_module(
             submodules.linear_proj,
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=model_scaling_policy.dense_block_output_init_method(
-                default_init_method=self.config.output_layer_init_method,
-                init_method_std=self.config.init_method_std,
-                num_layers=self.config.num_layers,
-                is_hybrid_model=self.config.is_hybrid_model,
-                output_layer_init_method_is_user_provided=getattr(
-                    self.config,
-                    '_parameterization_output_layer_init_method_user_provided',
-                    False,
-                ),
-                apply_depth_hook=True,
-            ),
+            init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
