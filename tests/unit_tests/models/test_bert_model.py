@@ -117,26 +117,16 @@ class TestBertModel:
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         attention_mask = torch.ones((micro_batch_size, sequence_length), dtype=bool).cuda()
-        captured = {}
-
-        real_scale_logits = bert_model.model_scaling_policy.scale_output_logits
-
-        def capture_scaled_logits(logits):
-            captured['raw_logits'] = logits.detach().clone()
-            return real_scale_logits(logits)
+        scale_spy = mocker.spy(type(bert_model.model_scaling_policy), 'scale_output_logits')
 
         with torch.no_grad():
-            scale_spy = mocker.patch.object(
-                bert_model.model_scaling_policy,
-                'scale_output_logits',
-                side_effect=capture_scaled_logits,
-            )
             scaled_logits, _ = bert_model.forward(
                 input_ids=input_ids, attention_mask=attention_mask
             )
 
         scale_spy.assert_called()
-        expected_logits = captured['raw_logits'].transpose(0, 1).contiguous() * output_mult
+        raw_logits = scale_spy.call_args.args[1].detach().clone()
+        expected_logits = raw_logits.transpose(0, 1).contiguous() * output_mult
         assert torch.allclose(scaled_logits, expected_logits, atol=1e-3, rtol=0.0)
 
     @pytest.mark.internal
@@ -165,18 +155,9 @@ class TestBertModel:
             captured['logits'] = logits.detach().clone()
             return logits.float().mean()
 
-        real_scale_logits = bert_model.model_scaling_policy.scale_output_logits
-
-        def capture_scaled_logits(logits):
-            captured['raw_logits'] = logits.detach().clone()
-            return real_scale_logits(logits)
+        scale_spy = mocker.spy(type(bert_model.model_scaling_policy), 'scale_output_logits')
 
         with torch.no_grad():
-            scale_spy = mocker.patch.object(
-                bert_model.model_scaling_policy,
-                'scale_output_logits',
-                side_effect=capture_scaled_logits,
-            )
             loss_spy = mocker.patch.object(
                 bert_model, 'compute_language_model_loss', side_effect=fake_loss
             )
@@ -186,7 +167,8 @@ class TestBertModel:
 
         scale_spy.assert_called()
         loss_spy.assert_called()
-        expected_logits = captured['raw_logits'] * output_mult
+        raw_logits = scale_spy.call_args.args[1].detach().clone()
+        expected_logits = raw_logits * output_mult
         assert torch.allclose(captured['logits'], expected_logits, atol=1e-3, rtol=0.0)
 
 
@@ -270,6 +252,7 @@ class TestBertModelAttentionDimensions:
         submodules = get_bert_layer_with_transformer_engine_submodules()
         submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
+        mocker.patch("megatron.core.transformer.transformer_block.get_cpu_offload_context", None)
         with pytest.raises(Exception) as exc_info:
             self.bert_model = BertModel(
                 config=self.transformer_config,

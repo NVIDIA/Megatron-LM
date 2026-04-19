@@ -38,6 +38,13 @@ from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
+def _is_fa_min_version_or_false(version: str) -> bool:
+    try:
+        return is_fa_min_version(version)
+    except ModuleNotFoundError:
+        return False
+
+
 class TestGPTModel:
 
     def setup_method(self, method):
@@ -488,7 +495,8 @@ class TestGPTWithDynamicInference:
 
     @pytest.mark.internal
     @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+        not _is_fa_min_version_or_false("2.7.3"),
+        reason="need latest flash attn for dynamic batching",
     )
     @torch.inference_mode()
     def test_dynamic_inference_padding_with_fp8(self):
