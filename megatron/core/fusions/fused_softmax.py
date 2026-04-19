@@ -229,10 +229,12 @@ class FusedScaleMaskSoftmax(nn.Module):
         """
         # [b, np, sq, sk]
         assert input.dim() == 4
-
-        if self.is_kernel_available(mask, *input.size()) and softmax_offset is None:
-            return self.forward_fused_softmax(input, mask)
-        else:
+        try:
+            if self.is_kernel_available(mask, *input.size()) and softmax_offset is None:
+                return self.forward_fused_softmax(input, mask)
+            else:
+                return self.forward_torch_softmax(input, mask, softmax_offset)
+        except:
             return self.forward_torch_softmax(input, mask, softmax_offset)
 
     def is_kernel_available(self, mask, b, np, sq, sk):
