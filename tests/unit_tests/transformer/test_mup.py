@@ -22,6 +22,7 @@ import torch
 
 import megatron.training.arguments as training_args_module
 import megatron.training.yaml_arguments as yaml_args_module
+import megatron.core.optimizer as optimizer_module
 from megatron.core.optimizer import (
     _get_megatron_optimizer_based_on_param_groups,
     get_mup_config_overrides,
@@ -437,12 +438,15 @@ class TestMuPConfigValidation:
                 '--hidden-size', '1024',
                 '--num-attention-heads', '16',
                 '--seq-length', '128',
+                '--micro-batch-size', '1',
                 '--max-position-embeddings', '128',
                 '--no-rope-fusion',
                 '--optimizer', 'adamw',
                 '--scaling-recipe', 'depth_mup',
             ]
         )
+        args.world_size = 1
+        args.rank = 0
 
         with patch.object(
             training_args_module,
@@ -463,12 +467,15 @@ class TestMuPConfigValidation:
                 '--hidden-size', '1024',
                 '--num-attention-heads', '16',
                 '--seq-length', '128',
+                '--micro-batch-size', '1',
                 '--max-position-embeddings', '128',
                 '--no-rope-fusion',
                 '--optimizer', 'muon',
                 '--muon-scalar-optimizer', 'lion',
             ]
         )
+        args.world_size = 1
+        args.rank = 0
 
         with patch.object(
             training_args_module, 'validate_depth_mup_optimizer_support', return_value=None
@@ -1924,7 +1931,7 @@ class TestMuPOptimizerTypeHandling:
             skip_megatron_wrapping=True,
         )
 
-        assert isinstance(raw_optimizer, torch.optim.AdamW)
+        assert isinstance(raw_optimizer, optimizer_module.Adam)
 
     def test_sgd_scales_vector_like_lr_only(self):
         """SGD scales vector-like params by width_mult; hidden params keep base LR."""
