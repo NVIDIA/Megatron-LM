@@ -161,7 +161,7 @@ TRAINING_CMD="bash $WORKDIR/_research/launch/install_python_deps.sh $PACKAGE_DIR
 
 echo "CMD: $TRAINING_CMD"
 export APERTUS_PHASE_PRE_SRUN=$(date +%s.%N)
-srun -lu --mpi=pmix --network=disable_rdzv_get --environment=alps3 \
+srun -lu --mpi=pmix --network=disable_rdzv_get --environment=$WORKDIR/_research/launch/alps3.toml \
     --cpus-per-task $SLURM_CPUS_PER_TASK --wait 120 \
     bash -c "export APERTUS_PHASE_CONTAINER_STARTED=\$(date +%s.%N); $ENV_SETUP; $TRAINING_CMD"
 

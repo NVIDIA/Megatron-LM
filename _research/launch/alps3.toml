@@ -1,0 +1,10 @@
+image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-pytorch:26.01-py3-alps3"
+mounts = ["/capstor:/capstor", "/users:/users", "/iopsstor:/iopsstor"]
+workdir = "/users/${USER}"
+writable = true
+
+[env]
+PMIX_MCA_psec = "native"
+
+[annotations]
+com.hooks.cxi.enabled = "false"
