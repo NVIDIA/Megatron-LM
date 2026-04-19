@@ -108,6 +108,7 @@ class SFTTokenizer:
 
         self._prompt_format = prompt_format
 
+
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
     ):
