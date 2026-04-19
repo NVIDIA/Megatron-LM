@@ -31,7 +31,5 @@ optimizer block differs. W&B project:
   scale mode, LR 2e-2. Works competitively out of the box on the 350M.
 - **AdamW ranks** use `--optimizer adam` which in Megatron is decoupled-WD
   AdamW; the naming in the table reflects that.
-- A higher-LR NorMuon run (1e-3) diverged to final loss 2.62; kept out of
-  the leaderboard but the data is in the W&B project.
 - `--overlap-param-gather` is **on** for AdamW rows and **off** for Muon
   rows (it corrupts Muon's Newton-Schulz, see the main README).
