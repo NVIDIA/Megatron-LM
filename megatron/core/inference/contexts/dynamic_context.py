@@ -861,6 +861,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
         # Static tensor addresses of active slices to enable fast inference kernels.
+        self.active_request_ids = torch.empty_like(self.request_ids, dtype=torch.int64)
         self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
 
@@ -1072,7 +1073,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         If the context is reordered to active -> paused -> finished, this can be graphed.
         """
-        # Active copies are only needed for tensors that require padding, or are freshly computed.
+        # Active copies are only needed for tensors that require padding, are freshly
+        # computed, or must snapshot pre-update_requests state for post-processing.
+        self.active_request_ids[:batch_size].copy_(self.request_ids[:batch_size])
         self.active_request_query_lengths[:batch_size].copy_(
             self.request_query_lengths[:batch_size]
         )
@@ -2348,7 +2351,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.num_prefill_requests += 1
 
     def _move_book_keeping_tensors(
-        self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
+        self, src_idxs, dst_idxs, next_tokens=None, new_speculative_tokens=None
     ):
         """
         Move all the relevent booking tensors with src idxs to dst idxs
@@ -2360,7 +2363,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
-        next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
+        if next_tokens is not None:
+            next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
         if new_speculative_tokens is not None:
             new_speculative_tokens[:, dst_idxs] = new_speculative_tokens[:, src_idxs]
         self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[src_idxs]
@@ -2781,12 +2785,21 @@ class DynamicInferenceContext(BaseInferenceContext):
                     active_request_count + self.paused_request_count,
                     device=self.request_ids.device,
                 )
+                # Note: src and dst may overlap when paused_count > finished_count
+                # (dst starts before src ends). This is safe because PyTorch fancy
+                # indexing fully materialises the RHS before writing to the LHS.
                 self._move_book_keeping_tensors(
                     src_idxs=paused_src,
                     dst_idxs=paused_dst,
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
+                # Clear stale request IDs left behind so that
+                # get_index_of_chunked_prefill_request(safe=False) cannot match them.
+                stale_start = active_request_count + self.paused_request_count
+                stale_end = old_active_count + self.paused_request_count
+                if stale_start < stale_end:
+                    self.request_ids[stale_start:stale_end] = -1
 
         # 5. Identify requests that require a new block and pause them.
         #       a) Partition active region: staying-active on the left, pausing on the right
@@ -2893,31 +2906,39 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) != -1:
             if chunked_prefill_request_idx < self.total_request_count:
                 # Chunked prefill request was active this step.
-                # Copy it to the hidden slot (just past total), then compact
-                # the gap by shifting all subsequent requests left by 1.
-                device = self.request_ids.device
-                hidden_idx = torch.tensor([self.total_request_count], device=device)
-                chunked_idx = torch.tensor([chunked_prefill_request_idx], device=device)
-                self._move_book_keeping_tensors(
-                    src_idxs=chunked_idx,
-                    dst_idxs=hidden_idx,
+                # Swap to the end of active, then hide it out of bounds.
+                self._swap_book_keeping_tensors(
+                    src_idxs=torch.tensor(
+                        [chunked_prefill_request_idx], device=self.request_ids.device
+                    ),
+                    dst_idxs=torch.tensor(
+                        [self.total_request_count - 1], device=self.request_ids.device
+                    ),
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
-                if chunked_prefill_request_idx < self.total_request_count - 1:
-                    shift_src = torch.arange(
-                        chunked_prefill_request_idx + 1, self.total_request_count, device=device
-                    )
-                    shift_dst = torch.arange(
-                        chunked_prefill_request_idx, self.total_request_count - 1, device=device
-                    )
-                    self._move_book_keeping_tensors(
-                        src_idxs=shift_src,
-                        dst_idxs=shift_dst,
+
+                # If a paused request was displaced into the active region,
+                # swap it to the active-paused boundary so that after decrementing
+                # active_request_count it becomes the first paused slot.
+                if (
+                    self.paused_request_count > 0
+                    and chunked_prefill_request_idx < active_request_count - 1
+                ):
+                    self._swap_book_keeping_tensors(
+                        src_idxs=torch.tensor(
+                            [chunked_prefill_request_idx], device=self.request_ids.device
+                        ),
+                        dst_idxs=torch.tensor(
+                            [active_request_count - 1], device=self.request_ids.device
+                        ),
                         next_tokens=next_tokens,
                         new_speculative_tokens=new_speculative_tokens,
                     )
 
+                # Explicitly decrement the active and total request counts here so that the chunked
+                # prefill request metadata is not updated. This will all be restored when the next
+                # chunk is added through add_request.
                 active_request_count -= 1
                 self.total_request_count -= 1
             else:

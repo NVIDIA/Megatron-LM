@@ -1728,10 +1728,10 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(0, active_request_count)
 
         # Active sequence lengths.
-        active_request_ids = context.request_ids[active_request_slice].long()
+        # Use the snapshot taken during build_active_slices.
+        active_request_ids = context.active_request_ids[:active_request_count]
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -1759,7 +1759,7 @@ class TextGenerationController:
                         active_request_mask[idx] = 0
 
         finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
-        finished_request_ids = context.request_ids[finished_idxs]
+        finished_request_ids = context.active_request_ids[finished_idxs]
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
