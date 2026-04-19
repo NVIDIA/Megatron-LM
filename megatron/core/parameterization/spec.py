@@ -7,12 +7,13 @@ from typing import Any, Literal, Optional
 
 SCALING_RECIPE_NONE = 'none'
 SCALING_RECIPE_MUP = 'mup'
-SCALING_RECIPE_VALUES = (SCALING_RECIPE_NONE, SCALING_RECIPE_MUP)
+SCALING_RECIPE_DEPTH_MUP = 'depth_mup'
+SCALING_RECIPE_VALUES = (SCALING_RECIPE_NONE, SCALING_RECIPE_MUP, SCALING_RECIPE_DEPTH_MUP)
 
 
 @dataclass(frozen=True)
 class ScalingUserConfig:
-    recipe: Optional[Literal['none', 'mup']] = None
+    recipe: Optional[Literal['none', 'mup', 'depth_mup']] = None
     base_hidden_size: Optional[int] = None
     base_num_layers: Optional[int] = None
     base_head_dim: Optional[float] = None
@@ -39,7 +40,7 @@ class ScalingReferences:
 
 @dataclass(frozen=True)
 class CanonicalScalingSpec:
-    recipe: Literal['none', 'mup']
+    recipe: Literal['none', 'mup', 'depth_mup']
     references: ScalingReferences
     embedding_mult: float = 1.0
     output_mult: float = 1.0
@@ -51,7 +52,7 @@ class CanonicalScalingSpec:
 
 @dataclass(frozen=True)
 class ResolvedScalingContext:
-    recipe: Literal['none', 'mup']
+    recipe: Literal['none', 'mup', 'depth_mup']
     references: ScalingReferences
     width_mult: float = 1.0
     depth_mult: float = 1.0
@@ -206,7 +207,7 @@ def canonicalize_scaling_user_config(user_config: ScalingUserConfig, config: Any
         base_head_dim=base_head_dim,
     )
     return CanonicalScalingSpec(
-        recipe=SCALING_RECIPE_MUP,
+        recipe=recipe,
         references=references,
         embedding_mult=user_config.mup_embedding_mult,
         output_mult=user_config.mup_output_mult,

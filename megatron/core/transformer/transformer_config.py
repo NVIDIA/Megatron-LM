@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.parameterization import (
+    SCALING_RECIPE_DEPTH_MUP,
     SCALING_RECIPE_MUP,
     build_resolved_model_policy,
     build_resolved_scaling_context,
@@ -356,11 +357,12 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # MuP (Maximal Update Parameterization)
     ####################
-    scaling_recipe: Optional[Literal['none', 'mup']] = None
+    scaling_recipe: Optional[Literal['none', 'mup', 'depth_mup']] = None
     """
     Canonical scaling recipe. `mup` preserves the current Megatron MuP semantics,
-    `none` keeps the standard parameterization, and `None` means unspecified so
-    legacy alias resolution can decide the recipe.
+    `depth_mup` is reserved for the first explicit depth recipe, `none` keeps the
+    standard parameterization, and `None` means unspecified so legacy alias
+    resolution can decide the recipe.
     """
 
     scaling_base_hidden_size: Optional[int] = None
@@ -1827,7 +1829,7 @@ class TransformerConfig(ModelParallelConfig):
         model_scaling_policy = build_resolved_model_policy(self)
 
         # MuP (Maximal Update Parameterization) configuration
-        if scaling_context.recipe == SCALING_RECIPE_MUP:
+        if scaling_context.recipe in (SCALING_RECIPE_MUP, SCALING_RECIPE_DEPTH_MUP):
             overridden_init_methods = []
             if self.init_method is not None:
                 overridden_init_methods.append("init_method")
@@ -1839,9 +1841,9 @@ class TransformerConfig(ModelParallelConfig):
                 overridden_init_methods_text = " and ".join(overridden_init_methods)
                 verb = "is" if len(overridden_init_methods) == 1 else "are"
                 warnings.warn(
-                    "use_mup is enabled, but custom "
+                    f"scaling recipe {scaling_context.recipe!r} is enabled, but custom "
                     + overridden_init_methods_text
-                    + f" {verb} set. This may break MuP initialization assumptions.",
+                    + f" {verb} set. This may break scaling initialization assumptions.",
                     UserWarning,
                 )
 
