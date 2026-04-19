@@ -17,6 +17,14 @@ class ResolvedTrainingPolicy:
     context: ResolvedScalingContext
     optimizer_type: str = 'adam'
 
+    def __post_init__(self) -> None:
+        if self.context.is_depth_mup and not self.is_adam_optimizer:
+            raise ValueError(
+                "scaling_recipe='depth_mup' currently supports Adam/AdamW only. "
+                "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
+                "and input/output-bias rules and is intentionally out of scope for v1."
+            )
+
     @property
     def enabled(self) -> bool:
         return self.context.enabled
@@ -26,12 +34,16 @@ class ResolvedTrainingPolicy:
         return self.optimizer_type.lower()
 
     @property
+    def uses_width_mup(self) -> bool:
+        return self.context.uses_width_mup
+
+    @property
     def is_sgd_optimizer(self) -> bool:
         return self.optimizer_type_lower == 'sgd'
 
     @property
     def is_adam_optimizer(self) -> bool:
-        return 'adam' in self.optimizer_type_lower
+        return self.optimizer_type_lower in ('adam', 'adamw')
 
     @property
     def is_muon_optimizer(self) -> bool:
@@ -39,7 +51,7 @@ class ResolvedTrainingPolicy:
 
     @property
     def hidden_lr_width_power(self) -> float:
-        if not self.enabled:
+        if not self.enabled or not self.uses_width_mup:
             return 0.0
         return 0.0 if self.is_sgd_optimizer else -1.0
 
@@ -53,15 +65,23 @@ class ResolvedTrainingPolicy:
 
     @property
     def vector_like_lr_multiplier(self) -> float:
-        if not (self.enabled and self.is_sgd_optimizer):
+        if not (self.enabled and self.uses_width_mup and self.is_sgd_optimizer):
             return 1.0
         return self.context.width_mult
 
     @property
+    def hidden_eps_depth_power(self) -> float:
+        if not (self.enabled and self.uses_width_mup and self.is_adam_optimizer):
+            return 0.0
+        return -1.0 if self.context.is_depth_mup else 0.0
+
+    @property
     def hidden_eps_multiplier(self) -> float:
-        if not (self.enabled and self.is_adam_optimizer):
+        if not (self.enabled and self.uses_width_mup and self.is_adam_optimizer):
             return 1.0
-        return 1.0 / self.context.width_mult
+        return (1.0 / self.context.width_mult) * (
+            self.context.depth_mult**self.hidden_eps_depth_power
+        )
 
 
 def build_resolved_training_policy(config, optimizer_type: str = 'adam') -> ResolvedTrainingPolicy:

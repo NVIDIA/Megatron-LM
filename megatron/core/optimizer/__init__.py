@@ -152,13 +152,14 @@ def get_scaling_config_overrides(
 ) -> Dict[ParamKey, ParamGroupOverride]:
     """Get resolved scaling-policy overrides for per-parameter optimizer settings.
 
-    In v1, the only nontrivial recipe is ``mup``. This path preserves current Megatron
-    MuP behavior while sourcing width/depth multipliers from a resolved scaling policy.
+    In v1, the named scaling recipes are ``mup`` and ``depth_mup``. ``mup`` preserves
+    current Megatron MuP behavior, while ``depth_mup`` adds the initial Adam/AdamW-scoped
+    dense GPT-style residual Transformer depth recipe candidate.
 
-    MuP optimizer scaling rules (as implemented here):
+    Scaling optimizer rules (as implemented here):
     - Adam/AdamW:
       - hidden (matrix-like) lr = base_lr / width_mult * depth_mult^hidden_lr_depth_power
-      - hidden (matrix-like) eps = base_eps / width_mult
+      - hidden (matrix-like) eps = base_eps / width_mult * depth_mult^hidden_eps_depth_power
       - vector-like params keep base lr and eps
     - SGD:
       - vector-like lr = base_lr * width_mult
@@ -186,12 +187,12 @@ def get_scaling_config_overrides(
     decoupled_lr_enabled = config.decoupled_lr is not None
     if decoupled_lr_enabled:
         message = (
-            "Both decoupled_lr and MuP LR scaling are enabled. decoupled_lr sets an "
-            "absolute LR for embedding+output params, and MuP LR scaling will not "
+            "Both decoupled_lr and scaling-recipe LR scaling are enabled. decoupled_lr sets an "
+            "absolute LR for embedding+output params, and the active scaling recipe will not "
             "override those parameters."
         )
         if scaling_policy.is_adam_optimizer:
-            message += " MuP Adam epsilon scaling remains applied to hidden matrix-like parameters."
+            message += " Adam epsilon scaling remains applied to hidden matrix-like parameters."
         log_single_rank(logger, logging.WARNING, message)
 
     if scaling_policy.is_muon_optimizer:
@@ -234,7 +235,7 @@ def get_scaling_config_overrides(
         # This implementation follows the common denominator form: sqrt(v) + eps.
         return True
 
-    mup_overrides: Dict[ParamKey, ParamGroupOverride] = {}
+    scaling_overrides: Dict[ParamKey, ParamGroupOverride] = {}
 
     if scaling_policy.is_sgd_optimizer:
         hidden_lr_override: ParamGroupOverride = {}
@@ -246,7 +247,7 @@ def get_scaling_config_overrides(
             hidden_predicate = ParamWithNamePredicate(
                 name="scaling_hidden_only_excluding_embedding_output", fn=should_scale_lr_with_mup
             )
-            mup_overrides[ParamKey(with_name_predicate=hidden_predicate)] = hidden_lr_override
+            scaling_overrides[ParamKey(with_name_predicate=hidden_predicate)] = hidden_lr_override
 
         vector_like_lr_override: ParamGroupOverride = {}
         if base_lr is not None and vector_like_lr_mult != 1.0:
@@ -259,11 +260,11 @@ def get_scaling_config_overrides(
                 name="mup_sgd_vector_like_excluding_embedding_output",
                 fn=should_scale_vector_like_lr_with_mup,
             )
-            mup_overrides[ParamKey(with_name_predicate=vector_like_predicate)] = (
+            scaling_overrides[ParamKey(with_name_predicate=vector_like_predicate)] = (
                 vector_like_lr_override
             )
 
-        return mup_overrides
+        return scaling_overrides
 
     lr_override: ParamGroupOverride = {}
     if base_lr is not None and hidden_lr_mult != 1.0:
@@ -280,13 +281,13 @@ def get_scaling_config_overrides(
             hidden_predicate = ParamWithNamePredicate(
                 name="mup_hidden_only_excluding_embedding_output", fn=should_scale_lr_with_mup
             )
-            mup_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
+            scaling_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
 
         if eps_override:
             hidden_output_predicate = ParamWithNamePredicate(
                 name="mup_hidden_only_for_adam_eps", fn=should_scale_eps_with_mup
             )
-            mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
+            scaling_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
     else:
         if lr_override and eps_override:
             combined_override: ParamGroupOverride = {}
@@ -295,19 +296,21 @@ def get_scaling_config_overrides(
             hidden_output_predicate = ParamWithNamePredicate(
                 name="mup_hidden_and_output", fn=should_scale_eps_with_mup
             )
-            mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = combined_override
+            scaling_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = (
+                combined_override
+            )
         elif lr_override:
             hidden_predicate = ParamWithNamePredicate(
                 name="scaling_hidden_and_output_lr", fn=should_scale_lr_with_mup
             )
-            mup_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
+            scaling_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
         elif eps_override:
             hidden_output_predicate = ParamWithNamePredicate(
                 name="mup_hidden_and_output_eps", fn=should_scale_eps_with_mup
             )
-            mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
+            scaling_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
 
-    return mup_overrides
+    return scaling_overrides
 
 
 def _get_param_groups(
@@ -522,11 +525,12 @@ def _get_megatron_optimizer_based_on_param_groups(
             assert (
                 config.decoupled_weight_decay
             ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
-            gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
-            cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
+            is_adam_optimizer = config.optimizer in ('adam', 'adamw')
+            gpu_optimizer_cls = Adam if is_adam_optimizer else SGD
+            cpu_optimizer_cls = CPUAdam if is_adam_optimizer else CPUSGD
             if config.use_torch_optimizer_for_cpu_offload:
                 gpu_optimizer_cls = cpu_optimizer_cls
-            if config.optimizer == 'adam':
+            if is_adam_optimizer:
                 gpu_optimizer_cls = Adam
                 cpu_optimizer_cls = CPUAdam
                 optimizer_defaults = dict(
@@ -555,7 +559,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 **optimizer_defaults,
             )
             init_state_fn = None
-        elif config.optimizer == 'adam':
+        elif config.optimizer in ('adam', 'adamw'):
             kwargs = {
                 "params": param_groups,
                 "lr": config.lr,
@@ -909,7 +913,7 @@ def get_megatron_optimizer(
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    if config.optimizer not in ('adam', 'adamw', 'sgd'):
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,

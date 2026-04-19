@@ -10,7 +10,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.enums import ModelType
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.parameterization import build_resolved_model_policy
+from megatron.core.parameterization import SCALING_RECIPE_DEPTH_MUP, build_resolved_model_policy
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -159,6 +159,12 @@ class T5Model(LanguageModule):
         add_decoder: bool = True,
         pg_collection: ProcessGroupCollection = None,
     ):
+
+        if config.scaling_recipe == SCALING_RECIPE_DEPTH_MUP:
+            raise NotImplementedError(
+                "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
+                "Transformer blocks only. T5Model is out of scope for v1."
+            )
 
         super(T5Model, self).__init__(config=config)
 
