@@ -34,6 +34,7 @@ your dataset:
 export SBATCH_ACCOUNT=<your-slurm-account>        # required
 export SBATCH_RESERVATION=<your-reservation>      # optional; omit for normal queue
 export WANDB_API_KEY=<your-wandb-key>             # optional; omit to log locally only
+export WANDB_PROJECT=<your-wandb-project>         # optional; defaults to megatron-lm-research-baseline
 export MEGATRON_DATA_PATH=/path/to/climbmix_small # required; Megatron-binary prefix without .bin/.idx
 ```
 

@@ -62,7 +62,7 @@ TP=1
 PP=1
 CP=1
 
-PROJECT=megatron-lm-research-baseline
+PROJECT=${WANDB_PROJECT:-megatron-lm-research-baseline}
 EXP_NAME=transformer-pp-2.7b-adamw-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
