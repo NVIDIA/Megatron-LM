@@ -6,7 +6,11 @@ import torch.nn as nn
 
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.utils import get_default_causal_mask, get_sliding_window_causal_mask
-
+try:
+    import scaled_masked_softmax_cuda
+    _FUSED_SOFTMAX_AVAILABLE = True
+except ModuleNotFoundError:
+    _FUSED_SOFTMAX_AVAILABLE = False
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
     """
@@ -229,17 +233,13 @@ class FusedScaleMaskSoftmax(nn.Module):
         """
         # [b, np, sq, sk]
         assert input.dim() == 4
-        try:
-            if self.is_kernel_available(mask, *input.size()) and softmax_offset is None:
-                return self.forward_fused_softmax(input, mask)
-            else:
-                return self.forward_torch_softmax(input, mask, softmax_offset)
-        except:
+        if self.is_kernel_available(mask, *input.size()) and softmax_offset is None:
+            return self.forward_fused_softmax(input, mask)
+        else:
             return self.forward_torch_softmax(input, mask, softmax_offset)
 
     def is_kernel_available(self, mask, b, np, sq, sk):
         """Check whether the fused CUDA kernel can be used for the given shapes and settings.
-
         Args:
             mask (Optional[torch.Tensor]): Attention mask or None.
             b (int): Batch size.
@@ -251,7 +251,8 @@ class FusedScaleMaskSoftmax(nn.Module):
             bool: True if the fused kernel constraints are satisfied; otherwise False.
         """
         attn_batches = b * np
-
+        if not _FUSED_SOFTMAX_AVAILABLE:
+            return False
         if (
             self.scaled_masked_softmax_fusion  # user want to fuse
             and self.input_in_float16  # input must be fp16
