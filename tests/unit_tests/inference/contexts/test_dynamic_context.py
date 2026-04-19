@@ -15,6 +15,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.logprobs import calculate_log_probs
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -1098,8 +1099,11 @@ class TestDynamicContext:
         dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
 
         # Call the function for prefill
-        prefill_log_probs, _ = dynamic_context.calculate_log_probs(
-            prefill_logits, prefill_new_tokens, log_prob_request_count=num_active_requests
+        prefill_log_probs, _ = calculate_log_probs(
+            dynamic_context,
+            prefill_logits,
+            prefill_new_tokens,
+            log_prob_request_count=num_active_requests,
         )
 
         # Calculate expected prefill log probs for the selected tokens
@@ -1144,8 +1148,11 @@ class TestDynamicContext:
         dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
         dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
 
-        decode_log_probs, _ = dynamic_context.calculate_log_probs(
-            decode_logits, decode_new_tokens, log_prob_request_count=num_active_requests
+        decode_log_probs, _ = calculate_log_probs(
+            dynamic_context,
+            decode_logits,
+            decode_new_tokens,
+            log_prob_request_count=num_active_requests,
         )
 
         # Verify the stored decode log probabilities
@@ -1207,7 +1214,8 @@ class TestDynamicContext:
             :num_active_requests_mixed_step
         ] = True
 
-        mixed_step_log_probs, _ = dynamic_context.calculate_log_probs(
+        mixed_step_log_probs, _ = calculate_log_probs(
+            dynamic_context,
             mixed_step_logits,
             mixed_step_new_tokens,
             log_prob_request_count=num_active_requests_mixed_step,
@@ -1330,7 +1338,8 @@ class TestDynamicContext:
         dynamic_context.initialize_attention_state()
         _set_active_metadata(num_active_requests)
 
-        _, top_n_dict = dynamic_context.calculate_log_probs(
+        _, top_n_dict = calculate_log_probs(
+            dynamic_context,
             prefill_logits,
             prefill_new_tokens,
             log_prob_request_count=num_active_requests,
@@ -1377,7 +1386,8 @@ class TestDynamicContext:
         dynamic_context.initialize_attention_state()
         _set_active_metadata(num_active_requests)
 
-        _, decode_top_n = dynamic_context.calculate_log_probs(
+        _, decode_top_n = calculate_log_probs(
+            dynamic_context,
             decode_logits,
             decode_new_tokens,
             log_prob_request_count=num_active_requests,
@@ -1438,8 +1448,8 @@ class TestDynamicContext:
         dynamic_context.active_request_metadata["return_log_probs"][0] = True
         dynamic_context.active_request_metadata["return_log_probs"][2] = True
 
-        log_probs, _ = dynamic_context.calculate_log_probs(
-            logits, new_tokens, log_prob_request_count=2
+        log_probs, _ = calculate_log_probs(
+            dynamic_context, logits, new_tokens, log_prob_request_count=2
         )
 
         # Request 0 should have log probs (length = request_lengths[0])
@@ -1473,8 +1483,8 @@ class TestDynamicContext:
         dynamic_context.active_request_metadata["return_log_probs"][0] = True
         dynamic_context.active_request_metadata["return_log_probs"][2] = True
 
-        decode_log_probs, _ = dynamic_context.calculate_log_probs(
-            decode_logits, decode_new_tokens, log_prob_request_count=2
+        decode_log_probs, _ = calculate_log_probs(
+            dynamic_context, decode_logits, decode_new_tokens, log_prob_request_count=2
         )
 
         assert decode_log_probs[0] is not None and len(decode_log_probs[0]) == 1

@@ -55,6 +55,7 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.logprobs import LogProbsDecode, LogProbsPrefill, LogProbsSpeculative
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
     prepare_next_forward_pass,
@@ -180,6 +181,11 @@ class TextGenerationController:
         # Filled on the bookkeeping stream; guaranteed ready after _pre_forward_bookkeeping_event.
         self._log_prob_count_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
         self._top_n_max_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
+
+        # Log-prob computation backends (graph caching is per-backend).
+        self._log_probs_decode = LogProbsDecode(self.model_config)
+        self._log_probs_prefill = LogProbsPrefill(self.model_config)
+        self._log_probs_speculative = LogProbsSpeculative(self.model_config)
 
 
         # Used for inefficient torch sampling.
@@ -1208,9 +1214,9 @@ class TextGenerationController:
             log_prob_count = (
                 context.active_request_metadata["return_log_probs"][:active_request_count] > 0
             ).sum()
-            top_n_max_gpu = (
-                context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0
-            ).max()
+            top_n_max_gpu = context.active_request_metadata["top_n_logprobs"][
+                :active_request_count
+            ].max()
         else:
             log_prob_count = torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
             top_n_max_gpu = torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
@@ -1228,19 +1234,17 @@ class TextGenerationController:
             return
 
         context = self.inference_wrapped_model.inference_context
+        eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
 
         if context.num_speculative_tokens > 0:
-            only_last = context.config.materialize_only_last_token_logits
-            if not only_last:
-                self._log_probs_spec_fp_idx = (
-                    context.log_probs_spec_prefill_indexing_kernel()
-                )
+            if not context.config.materialize_only_last_token_logits:
+                self._log_probs_speculative.prefill_indexing(context, eager=eager)
             return
 
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            self._log_probs_decode_idx = context.log_probs_decode_indexing_kernel()
+            self._log_probs_decode.indexing(context, eager=eager)
         else:
-            self._log_probs_prefill_idx = context.log_probs_prefill_indexing_kernel()
+            self._log_probs_prefill.indexing(context, eager=eager)
 
     def _dynamic_step_log_probs_softmax(self):
         """Conditionally launch the speculative softmax kernel on the bookkeeping stream."""
@@ -1257,8 +1261,8 @@ class TextGenerationController:
             else context.padded_active_token_count
         )
         logits = self._all_logits_cuda[:, :logits_seq_len, :]
-
-        self._log_probs_spec_sm = context.log_probs_speculative_softmax_kernel(logits)
+        eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
+        self._log_probs_speculative.softmax(context, logits, eager=eager)
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
@@ -1339,118 +1343,35 @@ class TextGenerationController:
         eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
 
         if context.num_speculative_tokens > 0:
-            return self._calculate_log_probs_speculative(
-                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
-            )
-
-        if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            return self._calculate_log_probs_decode(
-                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
-            )
-        else:
-            return self._calculate_log_probs_prefill(
-                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
-            )
-
-    def _calculate_log_probs_decode(
-        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
-    ):
-        """Run decode softmax kernel (post-forward). Returns a deferred extract callable."""
-        ri, padded_arange = self._log_probs_decode_idx
-        slp, sl = context.log_probs_decode_softmax_kernel(logits, new_tokens, ri, padded_arange)
-        active_request_count = context.total_request_count - context.paused_request_count
-        return functools.partial(
-            context.log_probs_decode_extract,
-            ri,
-            slp,
-            log_prob_request_count,
-            active_request_count,
-            selected_logits=sl,
-            top_n_max=top_n_max,
-        )
-
-    def _calculate_log_probs_prefill(
-        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
-    ):
-        """Run prefill softmax kernel (post-forward). Returns a deferred extract callable."""
-        ri, cu_ml, li, li_range, mt = self._log_probs_prefill_idx
-        slp = context.log_probs_prefill_softmax_kernel(
-            logits, new_tokens, ri, cu_ml, li, li_range, mt
-        )
-        active_request_count = context.total_request_count - context.paused_request_count
-        return functools.partial(
-            context.log_probs_prefill_extract,
-            ri,
-            cu_ml,
-            slp,
-            log_prob_request_count,
-            active_request_count,
-            top_n_max=top_n_max,
-            logits=logits,
-            logit_indices=li,
-        )
-
-    def _calculate_log_probs_speculative(
-        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
-    ):
-        """Run speculative gather kernel (post-verification). Returns a deferred extract callable."""
-        active_request_count = context.total_request_count - context.paused_request_count
-        num_prefill = active_request_count - context.num_decode_requests
-        only_last = context.config.materialize_only_last_token_logits
-
-        # Speculative gather: runs post-verification.
-        decode_log_probs, prefill_log_probs = self._log_probs_spec_sm
-        decode_gathered, prefill_gathered = context.log_probs_speculative_gather_kernel(
-            decode_log_probs,
-            prefill_log_probs,
-            new_tokens,
-            self._accepted_tokens_per_request,
-            self._accepted_token_counts_per_request,
-        )
-
-        # Full prefill softmax (if needed) — runs post-verification, before extract.
-        fp_slp = None
-        fp_ri = fp_cu_ml = fp_li = fp_count_gpu = None
-        if not only_last and num_prefill > 0:
-            fp_ri, fp_cu_ml, fp_li, li_range, mt, fp_count_gpu = self._log_probs_spec_fp_idx
-            fp_slp = context.log_probs_prefill_softmax_kernel(
-                logits, new_tokens, fp_ri, fp_cu_ml, fp_li, li_range, mt
-            )
-
-        def extract():
-            result: List[Optional[List[float]]] = [None] * active_request_count
-            top_n_dict = context.log_probs_speculative_extract(
-                decode_gathered,
-                prefill_gathered,
+            return self._log_probs_speculative.calculate(
+                context,
+                logits,
+                new_tokens,
+                log_prob_request_count,
+                self._accepted_tokens_per_request,
                 self._accepted_token_counts_per_request,
-                result,
-                logits=logits,
+                eager=eager,
                 top_n_max=top_n_max,
             )
 
-            if fp_slp is not None:
-                prefill_result, prefill_top_n = context.log_probs_prefill_extract(
-                    fp_ri,
-                    fp_cu_ml,
-                    fp_slp,
-                    fp_count_gpu.item(),
-                    active_request_count,
-                    top_n_max=top_n_max,
-                    logits=logits,
-                    logit_indices=fp_li,
-                )
-                for i, lp in enumerate(prefill_result):
-                    if lp is not None:
-                        result[i] = lp
-                if prefill_top_n:
-                    if top_n_dict is None:
-                        top_n_dict = prefill_top_n
-                    else:
-                        top_n_dict.update(prefill_top_n)
-
-            return result, top_n_dict
-
-        return extract
+        if context.config.materialize_only_last_token_logits or context.is_decode_only():
+            return self._log_probs_decode.calculate(
+                context,
+                logits,
+                new_tokens,
+                log_prob_request_count,
+                eager=eager,
+                top_n_max=top_n_max,
+            )
+        else:
+            return self._log_probs_prefill.calculate(
+                context,
+                logits,
+                new_tokens,
+                log_prob_request_count,
+                eager=eager,
+                top_n_max=top_n_max,
+            )
 
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
