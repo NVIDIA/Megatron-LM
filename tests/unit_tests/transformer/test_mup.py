@@ -139,8 +139,18 @@ class TestMuPConfigValidation:
                 use_mup=True,
             )
 
+    def test_depth_mup_conflicts_with_legacy_use_mup_alias(self):
+        with pytest.raises(ValueError, match='conflicts with --use-mup'):
+            TransformerConfig(
+                hidden_size=1024,
+                num_layers=12,
+                num_attention_heads=16,
+                scaling_recipe='depth_mup',
+                use_mup=True,
+            )
+
     def test_scaling_overrides_require_recipe(self):
-        with pytest.raises(ValueError, match='Scaling overrides require --scaling-recipe mup'):
+        with pytest.raises(ValueError, match="Scaling overrides require a non-'none' scaling recipe"):
             TransformerConfig(
                 hidden_size=512,
                 num_layers=12,
@@ -149,7 +159,7 @@ class TestMuPConfigValidation:
             )
 
     def test_legacy_mup_knobs_require_mup_recipe(self):
-        with pytest.raises(ValueError, match='Scaling overrides require --scaling-recipe mup'):
+        with pytest.raises(ValueError, match="Scaling overrides require a non-'none' scaling recipe"):
             TransformerConfig(
                 hidden_size=512,
                 num_layers=12,

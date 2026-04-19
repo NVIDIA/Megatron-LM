@@ -150,10 +150,10 @@ def canonicalize_scaling_user_config(user_config: ScalingUserConfig, config: Any
     if recipe is None:
         recipe = SCALING_RECIPE_MUP if user_config.use_mup_alias else SCALING_RECIPE_NONE
     elif user_config.use_mup_alias:
-        if recipe == SCALING_RECIPE_NONE:
+        if recipe != SCALING_RECIPE_MUP:
             raise ValueError(
-                "--scaling-recipe none conflicts with --use-mup. "
-                "Use either the canonical scaling recipe or the legacy MuP alias, not both."
+                f"--scaling-recipe {recipe} conflicts with --use-mup. "
+                "Use either the canonical MuP recipe or the legacy MuP alias, not both."
             )
     if recipe not in SCALING_RECIPE_VALUES:
         raise ValueError(f"Unsupported scaling recipe: {recipe}")
@@ -175,7 +175,8 @@ def canonicalize_scaling_user_config(user_config: ScalingUserConfig, config: Any
         non_default_fields = _non_default_scaling_fields(user_config, include_legacy_mup_fields=True)
         if non_default_fields:
             raise ValueError(
-                "Scaling overrides require --scaling-recipe mup. Non-default fields: "
+                "Scaling overrides require a non-'none' scaling recipe (for example `mup` or "
+                "`depth_mup`). Non-default fields: "
                 + ", ".join(non_default_fields)
             )
         references = ScalingReferences(
