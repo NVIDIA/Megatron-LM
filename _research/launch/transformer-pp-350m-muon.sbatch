@@ -53,7 +53,7 @@ FFN_HIDDEN=2560
 NUM_HEADS=16
 NUM_KV_HEADS=4
 
-MBS=${SWEEP_MBS:-16}
+MBS=16
 GBS=128
 SEQ_LEN=4096
 TRAIN_SAMPLES=3662109
@@ -100,7 +100,7 @@ NETWORK_SIZE_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size $MBS
     --global-batch-size $GBS
-    --train-samples ${SWEEP_TRAIN_SAMPLES:-$TRAIN_SAMPLES}
+    --train-samples $TRAIN_SAMPLES
     --exit-duration-in-mins 595
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
@@ -176,19 +176,12 @@ TOKENIZER_ARGS=(
     --merge-file $WORKDIR/_research/data/gpt2-merges.txt
 )
 
-if [ "${SWEEP_MOCK:-0}" = "1" ]; then
-  DATA_ARGS=(
-      --mock-data
-      --num-workers 2
-  )
-else
-  DATA_ARGS=(
-      --data-path /capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
-      --data-cache-path $DATASET_CACHE_DIR
-      --split 99,1,0
-      --num-workers 4
-  )
-fi
+DATA_ARGS=(
+    --data-path /capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
+    --data-cache-path $DATASET_CACHE_DIR
+    --split 99,1,0
+    --num-workers 4
+)
 
 MEGATRON_ARGS="\
     ${TRANSFORMER_ENGINE_ARGS[@]} \

@@ -16,7 +16,7 @@ leaderboards/
 ```
 
 A self-contained sbatch runs with `sbatch runs/<NN>-<name>.sbatch` — no
-`SWEEP_*` env vars, no harness dependencies. The header of each file
+env-var branching, no harness dependencies. The header of each file
 records the rank at entry time, the git sha the run was executed at,
 the W&B URL, and the final + min training loss.
 
@@ -36,7 +36,7 @@ To reproduce an entry bitwise: `git checkout <sha>` then
 ## Related folders
 
 - `_research/launch/` — launchable sbatches: baseline full-runs
-  (`transformer-pp-<size>-<adamw|muon>.sbatch`) and ablation harnesses
-  (`-ablation.sbatch`) with `SWEEP_*` env-var branching. Once a sweep
-  variant wins, snapshot a self-contained copy into the matching
-  leaderboard under `leaderboards/<size>/runs/`.
+  (`transformer-pp-<size>-<adamw|muon>.sbatch`) plus a 1B-token quick
+  reference (`-ablation.sbatch`). All hparams pinned. To try a variant,
+  copy an existing file and edit; once it wins, snapshot it into the
+  matching leaderboard under `leaderboards/<size>/runs/`.

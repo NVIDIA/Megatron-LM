@@ -14,7 +14,8 @@ and MoE transformers. Upstream is untouched except flag-gated edits in
 
 | path | contents |
 | --- | --- |
-| `_research/launch/` | launchable sbatches: baselines (`transformer-pp-<size>-<adamw\|muon>.sbatch`) and ablation harnesses (`-ablation.sbatch`) with `SWEEP_*` env-var branching |
+| `_research/launch/` | launchable sbatches: baselines (`transformer-pp-<size>-<adamw\|muon>.sbatch`) and a 1B-token quick reference (`-ablation.sbatch`). All hparams pinned; no env-var branching |
+| `_research/launch/alps3.toml` | CSCS Container Engine EDF (loaded via absolute path from the sbatches) |
 | `_research/leaderboards/<size>/README.md` | ranked result table + W&B links for that size |
 | `_research/leaderboards/<size>/runs/NN-*.sbatch` | frozen, self-contained sbatches (no env vars, hparams pinned) |
 | `_research/logging_patch/` | JSONL + wandb telemetry, activated by a two-line hook in `pretrain_gpt.py` |
@@ -33,7 +34,7 @@ you're adding a flag-gated code path.
 ## How experiments flow
 
 ```
-launch/<size>-ablation.sbatch (with SWEEP_* env vars)
+copy an existing sbatch in launch/, edit the optimizer/LR/schedule block
         ↓  a config wins
 snapshot a self-contained sbatch into
 leaderboards/<size>/runs/NN-*.sbatch  +  add a row to that README.md

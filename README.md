@@ -34,15 +34,19 @@ export WANDB_API_KEY=<your-key>
 sbatch _research/launch/transformer-pp-350m-adamw.sbatch
 # or the NorMuon variant:
 sbatch _research/launch/transformer-pp-350m-muon.sbatch
-# or the 1B-token ablation harness (overrides via SWEEP_*):
-SWEEP_OPTIMIZER=adaptive_muon SWEEP_LR=3.6e-4 \
-    sbatch _research/launch/transformer-pp-350m-ablation.sbatch
+# or a 1B-token quick reference (AdamW, ~30 min):
+sbatch _research/launch/transformer-pp-350m-ablation.sbatch
 ```
 
+To try a variant (different optimizer, LR, schedule, etc.), copy an
+existing sbatch and edit it; we don't use env-var-driven sweep harnesses.
+Frozen ablation runs live under `_research/leaderboards/<size>/runs/`.
+
 Each sbatch hardcodes CSCS-specific `--reservation`, `--account`, storage
-paths, `--environment=alps3`, and the dataset path. To adapt to a
-different site, edit the `#SBATCH` header and `--data-path` lines; the
-model / optimizer / schedule args are portable.
+paths, the CSCS enroot image (via `_research/launch/alps3.toml`), and
+the dataset path. To adapt to a different site, edit the `#SBATCH`
+header, swap in your own EDF, and update `--data-path`; the model /
+optimizer / schedule args are portable.
 
 Python dependencies (`transformers`, `wandb`, `emerging-optimizers`) are
 installed into `_research/packages/` inside the container on first run
@@ -102,12 +106,12 @@ plus a W&B link and the git sha it was executed at. Current leaderboards:
 
 | folder | purpose |
 | --- | --- |
-| `_research/launch/` | launchable sbatches: baseline full-run per size (`-adamw`, `-muon`) plus `-ablation` harnesses for quick hypothesis testing with `SWEEP_*` env vars. |
+| `_research/launch/` | launchable sbatches: baseline full-run per size (`-adamw`, `-muon`) plus a short `-ablation` 1B-token reference. All hparams pinned. |
 | `_research/leaderboards/` | historical ranked runs. Each entry is a frozen, reproducible sbatch + W&B link. |
 
-Workflow: iterate in `launch/<size>-ablation.sbatch` with `SWEEP_*` vars →
-once a variant wins, snapshot a self-contained sbatch into
-`leaderboards/<size>/runs/` and add a row to its `README.md`.
+Workflow for a new ablation: copy an existing sbatch, edit the optimizer
+/ LR / schedule, run it, and if it wins snapshot the file into
+`leaderboards/<size>/runs/` and add a row to that `README.md`.
 
 ## Changes from upstream
 

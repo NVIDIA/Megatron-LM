@@ -5,6 +5,12 @@
 # SwiGLU, RMSNorm, RoPE, AdamW, WSD schedule, bf16.
 # 1B tokens on ClimbMix, ~1908 steps at 524K tokens/step (~30 min).
 #
+# Short, single-node sibling of transformer-pp-350m-adamw.sbatch — same
+# optimizer and model, 1/15th the training. Useful as a 30-min smoke test
+# of the full pipeline. To try a variant (different optimizer, LR,
+# scale mode, etc.), copy this file and edit; do not re-introduce
+# env-var branching.
+#
 #SBATCH --account=infra01
 #SBATCH --job-name=transformer-pp-350m-ablation
 #SBATCH --time=01:00:00
@@ -51,30 +57,19 @@ FFN_HIDDEN=2560
 NUM_HEADS=16
 NUM_KV_HEADS=4
 
-MBS=${SWEEP_MBS:-16}
-GBS=${SWEEP_GBS:-128}
+MBS=16
+GBS=128
 SEQ_LEN=4096
 TRAIN_SAMPLES=244141    # 1B tokens / 4096 seq_len
-LR=${SWEEP_LR:-3e-4}
-MIN_LR=$(python3 -c "print(f'{float(\"$LR\")*0.1:.1e}')")
+LR=3e-4
+MIN_LR=3e-5
 
 TP=1
 PP=1
 CP=1
 
-OPTIMIZER=${SWEEP_OPTIMIZER:-adam}
-MUON_SCALE_MODE=${SWEEP_MUON_SCALE_MODE:-spectral}
-
 PROJECT=megatron-lm-research-baseline
-OPT_TAG=$OPTIMIZER
-if [ "$OPTIMIZER" = "adam" ]; then
-    OPT_TAG=adamw   # Megatron's "adam" is decoupled WD = AdamW
-fi
-if [ "$OPTIMIZER" = "adaptive_muon" ] && [ -n "${SWEEP_ADAPTIVE_MUON_M2:-}" ]; then
-    OPT_TAG=${SWEEP_ADAPTIVE_MUON_M2}
-fi
-FLAG_TAG=${SWEEP_FLAG_TAG:-}
-EXP_NAME=transformer-pp-350m-abl-${OPT_TAG}-lr${LR}-gbs${GBS}${FLAG_TAG:+-$FLAG_TAG}-$(git rev-parse --short HEAD)
+EXP_NAME=transformer-pp-350m-ablation-$(git rev-parse --short HEAD)
 
 export APERTUS_LOG_DIR=$WORKDIR/_research/results/performance
 export APERTUS_FEATURE=transformer-pp
@@ -109,12 +104,12 @@ NETWORK_SIZE_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size $MBS
     --global-batch-size $GBS
-    --train-samples ${SWEEP_TRAIN_SAMPLES:-$TRAIN_SAMPLES}
+    --train-samples $TRAIN_SAMPLES
     --exit-duration-in-mins 55
     --log-interval 1
     --eval-interval $TRAIN_SAMPLES
     --eval-iters 0
-    --optimizer $OPTIMIZER
+    --optimizer adam
     --dataloader-type single
     --manual-gc
     --manual-gc-interval 50
@@ -131,28 +126,6 @@ REGULARIZATION_ARGS=(
     --adam-beta1 0.9
     --adam-beta2 0.95
 )
-
-# Muon-specific args (ignored by adam/sgd).
-MUON_ARGS=()
-if [[ "$OPTIMIZER" == *muon* ]]; then
-    MUON_ARGS=(
-        --muon-scale-mode $MUON_SCALE_MODE
-        --muon-nesterov
-        --muon-momentum 0.95
-    )
-    if [ "${SWEEP_MUON_NO_SPLIT_QKV:-0}" = "1" ]; then
-        MUON_ARGS+=(--muon-no-split-qkv)
-    fi
-    if [ -n "${SWEEP_MUON_SCALAR_LR:-}" ]; then
-        MUON_ARGS+=(--muon-scalar-lr $SWEEP_MUON_SCALAR_LR)
-    fi
-    if [ -n "${SWEEP_MUON_SCALAR_WD:-}" ]; then
-        MUON_ARGS+=(--muon-scalar-weight-decay $SWEEP_MUON_SCALAR_WD)
-    fi
-    if [ "$OPTIMIZER" = "adaptive_muon" ] && [ -n "${SWEEP_ADAPTIVE_MUON_M2:-}" ]; then
-        MUON_ARGS+=(--adaptive-muon-moment2-method $SWEEP_ADAPTIVE_MUON_M2)
-    fi
-fi
 
 LEARNING_RATE_ARGS=(
     --lr $LR
@@ -177,26 +150,10 @@ DISTRIBUTED_ARGS=(
     --pipeline-model-parallel-size $PP
     --context-parallel-size $CP
     --sequence-parallel
+    --use-distributed-optimizer
+    --overlap-grad-reduce
+    --overlap-param-gather
 )
-if [ "${SWEEP_DISTOPT:-1}" = "1" ]; then
-    DISTRIBUTED_ARGS+=(--use-distributed-optimizer)
-fi
-if [ "${SWEEP_OVERLAP_GRAD:-1}" = "1" ]; then
-    DISTRIBUTED_ARGS+=(--overlap-grad-reduce)
-fi
-# --overlap-param-gather breaks Muon's Newton-Schulz (per-bucket async
-# gather feeds NS5 a cross-shard-inconsistent matrix, see README).
-# Default off for muon/adaptive_muon, on otherwise.
-if [ -z "${SWEEP_OVERLAP_PARAM:-}" ]; then
-    if [[ "$OPTIMIZER" == *muon* ]]; then
-        SWEEP_OVERLAP_PARAM=0
-    else
-        SWEEP_OVERLAP_PARAM=1
-    fi
-fi
-if [ "$SWEEP_OVERLAP_PARAM" = "1" ]; then
-    DISTRIBUTED_ARGS+=(--overlap-param-gather)
-fi
 
 LOGGING_ARGS=(
     --log-throughput
@@ -214,26 +171,18 @@ TOKENIZER_ARGS=(
     --merge-file $WORKDIR/_research/data/gpt2-merges.txt
 )
 
-if [ "${SWEEP_MOCK:-0}" = "1" ]; then
-  DATA_ARGS=(
-      --mock-data
-      --num-workers 2
-  )
-else
-  DATA_ARGS=(
-      --data-path /capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
-      --data-cache-path $DATASET_CACHE_DIR
-      --split 99,1,0
-      --num-workers 4
-  )
-fi
+DATA_ARGS=(
+    --data-path /capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
+    --data-cache-path $DATASET_CACHE_DIR
+    --split 99,1,0
+    --num-workers 4
+)
 
 MEGATRON_ARGS="\
     ${TRANSFORMER_ENGINE_ARGS[@]} \
     ${NETWORK_SIZE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
-    ${MUON_ARGS[@]} \
     ${LEARNING_RATE_ARGS[@]} \
     ${INITIALIZATION_ARGS[@]} \
     ${MIXED_PRECISION_ARGS[@]} \
