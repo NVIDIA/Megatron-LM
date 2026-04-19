@@ -22,6 +22,7 @@ from megatron.core.optimizer import (
 )
 from megatron.core.optimizer.emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
+    _default_betas_for_eopt,
     _default_adam_based_eopt_config_to_kwargs,
     _muon_default_param_overrides,
 )
@@ -111,10 +112,7 @@ class TestLionOptimizerConfig:
 
         def fake_create(_config, _groups, eopt_name, _model_chunks, _pg_collection):
             if eopt_name == "lion":
-                kwargs = _default_adam_based_eopt_config_to_kwargs(
-                    eopt_name, _config, _model_chunks, _pg_collection
-                )
-                recorded.append((eopt_name, kwargs["betas"]))
+                recorded.append((eopt_name, _default_betas_for_eopt(eopt_name, _config)))
             else:
                 recorded.append((eopt_name, None))
             return SimpleNamespace(param_groups=[]), (lambda *_args, **_kwargs: None)
@@ -160,6 +158,19 @@ class TestLionOptimizerConfig:
 
         assert set(recorded) == {("muon", None), ("lion", (0.91, 0.97))}
         assert len(results) == 2
+
+    def test_default_emerging_lion_betas_use_lion_betas(self):
+        """Shared beta selection must keep Lion on lion_beta{1,2}."""
+        config = OptimizerConfig(
+            optimizer="muon",
+            lr=1e-4,
+            adam_beta1=0.81,
+            adam_beta2=0.88,
+            lion_beta1=0.91,
+            lion_beta2=0.97,
+        )
+
+        assert _default_betas_for_eopt("lion", config) == (0.91, 0.97)
 
     @patch("torch.distributed.get_world_size", return_value=1)
     @patch(

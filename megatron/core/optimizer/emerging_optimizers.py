@@ -419,11 +419,15 @@ def _default_adam_based_eopt_config_to_kwargs(
 ) -> Dict[str, Any]:
     """Convert OptimizerConfig to default emerging optimizer constructor kwargs."""
     kwargs = _kwargs_from_config(registry.get_optimizer_cls(eopt_name), eopt_name, config)
-    if eopt_name == "lion":
-        kwargs["betas"] = (config.lion_beta1, config.lion_beta2)
-    else:
-        kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
+    kwargs["betas"] = _default_betas_for_eopt(eopt_name, config)
     return kwargs
+
+
+def _default_betas_for_eopt(eopt_name, config) -> tuple[float, float]:
+    """Return the default beta pair for an emerging optimizer."""
+    if eopt_name == "lion":
+        return (config.lion_beta1, config.lion_beta2)
+    return (config.adam_beta1, config.adam_beta2)
 
 
 # -----------------------------------------------------------------------
