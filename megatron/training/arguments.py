@@ -482,7 +482,7 @@ def validate_args(args, defaults={}):
         else:
             if args.rl_generation_batch_size is None:
                 args.rl_generation_batch_size = 1
-            args.rl_parallel_generation_tasks = 512
+            args.rl_parallel_generation_tasks = args.grpo_prompts_per_step
 
         # Derive enforce_order after all resolution is complete.
         args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)

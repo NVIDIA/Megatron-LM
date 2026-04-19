@@ -1,6 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+from fractions import Fraction
+from functools import reduce
+from math import gcd, lcm
 from typing import Any, Optional, Type
 
 import numpy as np
@@ -111,7 +114,8 @@ class WeightedMultiTask(
 
         Args:
             total_count: Total number of items to distribute
-            distribute_remainder: Whether to distribute the remainder of the counts to the agents with the largest fractional parts
+            distribute_remainder: Whether to distribute the remainder of the counts to the
+                agents with the largest fractional parts
 
         Returns:
             List of counts for each agent, summing to total_count
@@ -185,10 +189,32 @@ class WeightedMultiTask(
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
-        agent_groups = self._distribute_counts(request.num_groups)
+        if not request.enforce_order:
+            # With non-forced lag, we can freely generate rollouts from all agents.
+            agent_groups = [0 if c.evaluation_only else 1 for c in self.agent_configs]
+        else:
+            # Check that every agent gets at least 1 group from the base count (no remainder).
+            # This guarantees every agent appears in every batch regardless of remainder handling.
+            rollout_weights = [
+                w for w, c in zip(self.weights, self.agent_configs) if not c.evaluation_only
+            ]
+            if any(int(request.num_groups * w) < 1 for w in rollout_weights):
+                raise ValueError(
+                    f"Generation batch size ({request.num_groups}) is too small for the "
+                    f"configured weights. Some non-evaluation environments would not appear "
+                    f"in every batch. Increase the batch size or adjust environment weights."
+                )
+            agent_groups = self._distribute_counts(request.num_groups)
         agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
-        agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
-        agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
+        weight_fracs = [
+            Fraction(str(c.weight)) if not c.evaluation_only else Fraction(0)
+            for c in self.agent_configs
+        ]
+        non_zero = [f for f in weight_fracs if f > 0]
+        common_denom = reduce(lcm, [f.denominator for f in non_zero])
+        int_weights = [int(f * common_denom) for f in weight_fracs]
+        weight_gcd = reduce(gcd, [w for w in int_weights if w > 0])
+        agent_slots = np.array([w // weight_gcd for w in int_weights])
 
         # Create tasks for each agent with non-zero groups
         generators = []
@@ -201,7 +227,6 @@ class WeightedMultiTask(
                 agent.parallel_generation_tasks = pgt
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
-                    streaming=request.streaming,
                     enforce_order=request.enforce_order,
                     rollouts_per_group=request.rollouts_per_group,
                     inference_interface=request.inference_interface,
