@@ -39,6 +39,7 @@ from typing import List
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0
@@ -151,7 +152,7 @@ def generate_dynamic(
 def main():
     """Main program."""
 
-    initialize_megatron(
+    parse_and_validate_args(
         extra_args_provider=add_inference_benchmarking_args,
         args_defaults={
             'no_load_rng': True,
@@ -160,6 +161,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_megatron()
 
     args = get_args()
 
