@@ -18,6 +18,10 @@ import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.training.arguments import (
+    validate_depth_mup_optimizer_support,
+    validate_muon_scalar_optimizer_support,
+)
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -255,6 +259,8 @@ def validate_yaml(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
+    validate_depth_mup_optimizer_support(args)
+    validate_muon_scalar_optimizer_support(args)
     if args.save is not None:
         assert args.save_interval is not None
     # Mixed precision checks.

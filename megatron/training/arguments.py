@@ -323,6 +323,46 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def _resolve_validation_attr(args, attr_name):
+    """Resolve validation fields from either flat argparse args or nested YAML namespaces."""
+    if hasattr(args, attr_name):
+        value = getattr(args, attr_name)
+        if value is not None:
+            return value
+    language_model = getattr(args, 'language_model', None)
+    if language_model is not None and hasattr(language_model, attr_name):
+        return getattr(language_model, attr_name)
+    return None
+
+
+def validate_depth_mup_optimizer_support(args) -> None:
+    """Enforce the public optimizer support surface for depth_mup."""
+    if _resolve_validation_attr(args, 'scaling_recipe') == 'depth_mup' and _resolve_validation_attr(
+        args, 'optimizer'
+    ) not in (
+        'adam',
+        'adamw',
+    ):
+        raise ValueError(
+            "scaling_recipe='depth_mup' currently supports Adam/AdamW only. "
+            "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
+            "and input/output-bias rules and is intentionally out of scope for v1."
+        )
+
+
+def validate_muon_scalar_optimizer_support(args) -> None:
+    """Keep YAML and CLI validation aligned for Muon scalar optimizer selection."""
+    muon_scalar_optimizer = _resolve_validation_attr(args, 'muon_scalar_optimizer')
+    if muon_scalar_optimizer is None:
+        return
+    if muon_scalar_optimizer not in ('adam', 'lion'):
+        raise ValueError(
+            "muon_scalar_optimizer must be one of ('adam', 'lion'). "
+            f"Got {muon_scalar_optimizer!r}."
+        )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -1190,12 +1230,8 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
-    if args.scaling_recipe == 'depth_mup' and args.optimizer not in ('adam', 'adamw'):
-        raise ValueError(
-            "scaling_recipe='depth_mup' currently supports Adam/AdamW only. "
-            "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
-            "and input/output-bias rules and is intentionally out of scope for v1."
-        )
+    validate_depth_mup_optimizer_support(args)
+    validate_muon_scalar_optimizer_support(args)
     if args.save is not None:
         assert args.save_interval is not None
         assert args.save_interval > 0

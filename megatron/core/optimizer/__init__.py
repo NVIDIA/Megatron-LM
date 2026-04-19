@@ -796,8 +796,12 @@ def _get_megatron_emerging_optimizer(
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
 
-    # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
-    config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    # Apply optimizer-specific param overrides (e.g. muon: non-linear -> scalar optimizer).
+    entry = _EMERGING_OPTIMIZERS[eopt_name]
+    if entry.config_to_param_overrides is not None:
+        config_overrides.update(entry.config_to_param_overrides(config))
+    else:
+        config_overrides.update(entry.default_param_overrides)
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
@@ -818,7 +822,7 @@ def _get_megatron_emerging_optimizer(
 
         if opt_name in _EMERGING_OPTIMIZERS:
             optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
+                config, groups, opt_name, model_chunks, pg_collection
             )
             if use_layer_wise:
                 result = (optimizer, init_state_fn)

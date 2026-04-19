@@ -20,6 +20,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import megatron.training.arguments as training_args_module
+import megatron.training.yaml_arguments as yaml_args_module
 from megatron.core.optimizer import (
     _get_megatron_optimizer_based_on_param_groups,
     get_mup_config_overrides,
@@ -40,9 +42,18 @@ from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
-from megatron.training.arguments import add_megatron_arguments, core_transformer_config_from_args
+from megatron.training.arguments import (
+    add_megatron_arguments,
+    core_transformer_config_from_args,
+    validate_args,
+    validate_depth_mup_optimizer_support,
+    validate_muon_scalar_optimizer_support,
+)
 from megatron.training.checkpointing import check_checkpoint_args, load_args_from_checkpoint
-from megatron.training.yaml_arguments import core_config_from_args as core_config_from_yaml_args
+from megatron.training.yaml_arguments import (
+    core_config_from_args as core_config_from_yaml_args,
+    validate_yaml,
+)
 
 
 def _build_transformer_namespace(**overrides):
@@ -63,6 +74,65 @@ def _prepare_parsed_args_for_core_config(args):
     # parse_args() populates CLI-backed fields only; validate_args() normally derives params_dtype.
     args.params_dtype = torch.float32
     return args
+
+
+def _build_minimal_validate_yaml_namespace(**overrides):
+    values = dict(
+        data_path=None,
+        world_size=1,
+        rank=0,
+        micro_batch_size=1,
+        global_batch_size=1,
+        num_layers_per_virtual_pipeline_stage=None,
+        overlap_param_gather=False,
+        overlap_grad_reduce=False,
+        use_distributed_optimizer=False,
+        accumulate_allreduce_grads_in_fp32=False,
+        dataloader_type=None,
+        lr_decay_samples=None,
+        rampup_batch_size=None,
+        train_iters=None,
+        train_samples=None,
+        lr_decay_iters=None,
+        lr_warmup_iters=0,
+        lr_warmup_fraction=None,
+        lr_warmup_samples=0,
+        encoder_num_layers=None,
+        seq_length=128,
+        encoder_seq_length=None,
+        max_position_embeddings=128,
+        decoder_seq_length=None,
+        lr=1e-3,
+        min_lr=1e-5,
+        save=None,
+        save_interval=None,
+        fp16_lm_cross_entropy=False,
+        account_for_embedding_in_pipeline_split=False,
+        overlap_p2p_comm=False,
+        model_parallel=SimpleNamespace(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            tp_comm_overlap=False,
+            sequence_parallel=False,
+            fp16=False,
+            bf16=False,
+            params_dtype=torch.float32,
+        ),
+        language_model=SimpleNamespace(
+            num_layers=12,
+            hidden_size=1024,
+            num_attention_heads=16,
+            ffn_hidden_size=None,
+            activation_func='gelu',
+            kv_channels=None,
+            scaling_recipe='none',
+            fp32_residual_connection=False,
+            moe_grouped_gemm=False,
+        ),
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def _combined_override_for_param(overrides, param, param_name):
@@ -358,6 +428,58 @@ class TestMuPConfigValidation:
         assert legacy_config.use_mup is True
         assert legacy_config.mup_width_mult == pytest.approx(4.0)
 
+    def test_validate_args_calls_depth_mup_hook(self):
+        parser = ArgumentParser(allow_abbrev=False)
+        parser = add_megatron_arguments(parser)
+        args = parser.parse_args(
+            [
+                '--num-layers', '12',
+                '--hidden-size', '1024',
+                '--num-attention-heads', '16',
+                '--seq-length', '128',
+                '--max-position-embeddings', '128',
+                '--no-rope-fusion',
+                '--optimizer', 'adamw',
+                '--scaling-recipe', 'depth_mup',
+            ]
+        )
+
+        with patch.object(
+            training_args_module,
+            'validate_depth_mup_optimizer_support',
+            side_effect=RuntimeError('depth-hook'),
+        ), patch.object(
+            training_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
+        ):
+            with pytest.raises(RuntimeError, match='depth-hook'):
+                validate_args(args)
+
+    def test_validate_args_calls_muon_scalar_optimizer_hook(self):
+        parser = ArgumentParser(allow_abbrev=False)
+        parser = add_megatron_arguments(parser)
+        args = parser.parse_args(
+            [
+                '--num-layers', '12',
+                '--hidden-size', '1024',
+                '--num-attention-heads', '16',
+                '--seq-length', '128',
+                '--max-position-embeddings', '128',
+                '--no-rope-fusion',
+                '--optimizer', 'muon',
+                '--muon-scalar-optimizer', 'lion',
+            ]
+        )
+
+        with patch.object(
+            training_args_module, 'validate_depth_mup_optimizer_support', return_value=None
+        ), patch.object(
+            training_args_module,
+            'validate_muon_scalar_optimizer_support',
+            side_effect=RuntimeError('muon-hook'),
+        ):
+            with pytest.raises(RuntimeError, match='muon-hook'):
+                validate_args(args)
+
     def test_yaml_namespace_without_scaling_fields_still_builds_transformer_config(self):
         args = _build_transformer_namespace(
             hidden_size=1024,
@@ -404,6 +526,84 @@ class TestMuPConfigValidation:
         assert context.residual_branch_depth_power == pytest.approx(-1.0)
         assert context.hidden_lr_depth_power == pytest.approx(0.0)
         assert context.block_out_proj_init_depth_power == pytest.approx(0.5)
+
+    def test_depth_mup_optimizer_gate_rejects_non_adam_yaml_namespace(self):
+        args = SimpleNamespace(scaling_recipe='depth_mup', optimizer='sgd')
+
+        with pytest.raises(ValueError, match='Adam/AdamW only'):
+            validate_depth_mup_optimizer_support(args)
+
+    def test_depth_mup_optimizer_gate_allows_adamw_yaml_namespace(self):
+        args = SimpleNamespace(scaling_recipe='depth_mup', optimizer='adamw')
+
+        validate_depth_mup_optimizer_support(args)
+
+    def test_depth_mup_optimizer_gate_rejects_nested_yaml_namespace(self):
+        args = SimpleNamespace(
+            optimizer='sgd', language_model=SimpleNamespace(scaling_recipe='depth_mup')
+        )
+
+        with pytest.raises(ValueError, match='Adam/AdamW only'):
+            validate_depth_mup_optimizer_support(args)
+
+    def test_depth_mup_optimizer_gate_tolerates_yaml_namespace_without_scaling_fields(self):
+        validate_depth_mup_optimizer_support(SimpleNamespace())
+
+    def test_muon_scalar_optimizer_gate_rejects_invalid_nested_yaml_namespace(self):
+        args = SimpleNamespace(
+            muon_scalar_optimizer='soap',
+            language_model=SimpleNamespace(scaling_recipe='none'),
+        )
+
+        with pytest.raises(ValueError, match="muon_scalar_optimizer must be one of"):
+            validate_muon_scalar_optimizer_support(args)
+
+    def test_muon_scalar_optimizer_gate_allows_lion_nested_yaml_namespace(self):
+        args = SimpleNamespace(muon_scalar_optimizer='lion')
+
+        validate_muon_scalar_optimizer_support(args)
+
+    def test_validate_yaml_calls_depth_mup_hook(self):
+        args = _build_minimal_validate_yaml_namespace(
+            optimizer='adamw',
+            language_model=SimpleNamespace(
+                num_layers=12,
+                hidden_size=1024,
+                num_attention_heads=16,
+                ffn_hidden_size=None,
+                activation_func='gelu',
+                kv_channels=None,
+                scaling_recipe='depth_mup',
+                fp32_residual_connection=False,
+                moe_grouped_gemm=False,
+            ),
+        )
+
+        with patch.object(
+            yaml_args_module,
+            'validate_depth_mup_optimizer_support',
+            side_effect=RuntimeError('yaml-depth-hook'),
+        ), patch.object(
+            yaml_args_module, 'validate_muon_scalar_optimizer_support', return_value=None
+        ):
+            with pytest.raises(RuntimeError, match='yaml-depth-hook'):
+                validate_yaml(args)
+
+    def test_validate_yaml_calls_muon_scalar_optimizer_hook(self):
+        args = _build_minimal_validate_yaml_namespace(
+            optimizer='adam',
+            muon_scalar_optimizer='lion',
+        )
+
+        with patch.object(
+            yaml_args_module, 'validate_depth_mup_optimizer_support', return_value=None
+        ), patch.object(
+            yaml_args_module,
+            'validate_muon_scalar_optimizer_support',
+            side_effect=RuntimeError('yaml-muon-hook'),
+        ):
+            with pytest.raises(RuntimeError, match='yaml-muon-hook'):
+                validate_yaml(args)
 
     def test_config_logger_serializes_canonical_depth_mup_surface(self, tmp_path):
         config = TransformerConfig(
@@ -1880,6 +2080,8 @@ class TestMuPOptimizerTypeHandling:
         muon_managed_param.is_embedding_or_output_parameter = False
         output_param = torch.nn.Parameter(torch.zeros(10, 10))
         output_param.is_embedding_or_output_parameter = True
+        output_param.is_output_parameter = True
+        output_param.is_embedding_parameter = True
         bias_param = torch.nn.Parameter(torch.zeros(10))
 
         muon_managed_matches = [
@@ -1909,9 +2111,9 @@ class TestMuPOptimizerTypeHandling:
         assert 'min_lr' not in muon_managed_override
         assert 'eps' not in muon_managed_override
 
-        # Output params remain in the MuP override path (handled by chained Adam optimizer).
-        assert output_override['max_lr'] == pytest.approx(1e-3 / width_mult)
-        assert output_override['min_lr'] == pytest.approx(1e-5 / width_mult)
+        # Output params remain on the scalar optimizer path at base LR/eps.
+        assert 'max_lr' not in output_override
+        assert 'min_lr' not in output_override
         assert 'eps' not in output_override
 
         # Vector-like params stay unscaled.
