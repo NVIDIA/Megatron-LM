@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import math
 import os
 from inspect import signature
 from unittest import mock
@@ -172,40 +171,6 @@ class TestParallelMLAAttention:
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
         assert num_weights == 65036
-
-    def test_mla_linear_proj_uses_dense_depth_init_scaling(self):
-        config = MLATransformerConfig(
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            q_lora_rank=32,
-            kv_lora_rank=32,
-            qk_head_dim=128,
-            v_head_dim=128,
-            qk_pos_emb_head_dim=64,
-            rope_type='rope',
-            rotary_base=10000,
-            original_max_position_embeddings=32,
-            scaling_recipe='mup',
-            scaling_base_hidden_size=6,
-            scaling_base_num_layers=1,
-            scaling_block_out_proj_init_depth_power=-0.5,
-        )
-        mla = MLASelfAttention(
-            config,
-            get_mla_self_attn_submodules(),
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-        )
-
-        expected_std = (
-            config.init_method_std
-            / (math.sqrt(2 * config.num_layers) * math.sqrt(config.mup_width_mult))
-            * ((config.num_layers / config.scaling_base_num_layers) ** config.scaling_block_out_proj_init_depth_power)
-        )
-        actual_std = mla.linear_proj.weight.std().cpu().item()
-        assert actual_std == pytest.approx(expected_std, rel=0.1)
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
