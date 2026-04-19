@@ -1800,12 +1800,12 @@ class TransformerConfig(ModelParallelConfig):
         if scaling_context.is_depth_mup:
             if self.multi_latent_attention:
                 raise NotImplementedError(
-                    "scaling_recipe='depth_mup' currently supports dense residual Transformer "
+                    "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
                     "self-attention only. multi_latent_attention is out of scope for v1."
                 )
             if self.experimental_attention_variant is not None:
                 raise NotImplementedError(
-                    "scaling_recipe='depth_mup' currently supports dense residual Transformer "
+                    "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
                     "self-attention only. experimental attention variants are out of scope for v1."
                 )
             if self.num_moe_experts is not None:
