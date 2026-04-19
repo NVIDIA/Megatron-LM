@@ -173,7 +173,3 @@ confined to `_research/`, `megatron/core/optimizer/ademamix.py`,
 `arguments.py`, `optimizer/__init__.py`, `optimizer_config.py`, `mlp.py`,
 `gpt_dataset.py`, and `pretrain_gpt.py`. Upstream merges should be
 low-conflict.
-
-## License
-
-Same as upstream NVIDIA Megatron-LM. See [LICENSE](LICENSE).
