@@ -157,6 +157,11 @@ def get_scaling_config_overrides(
     dense GPT-style residual Transformer depth recipe candidate.
 
     Scaling optimizer rules (as implemented here):
+    ``depth_mup`` v1 uses only the Adam/AdamW path below; unsupported optimizers are
+    rejected by public validation or, for direct library callers, during training-policy
+    construction. The remaining entries describe the generic resolved scaling-policy
+    machinery that still backs ``mup`` and future recipes.
+
     - Adam/AdamW:
       - hidden (matrix-like) lr = base_lr / width_mult * depth_mult^hidden_lr_depth_power
       - hidden (matrix-like) eps = base_eps / width_mult * depth_mult^hidden_eps_depth_power
