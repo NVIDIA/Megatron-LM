@@ -5,7 +5,6 @@
 # SwiGLU, RMSNorm, RoPE, AdamW, WSD schedule, bf16.
 # 100B tokens on ClimbMix, ~190735 steps at 524K tokens/step.
 #
-#SBATCH --account=infra01
 #SBATCH --job-name=transformer-pp-1.3b-adamw
 #SBATCH --time=24:00:00
 # 8 nodes (32 GPUs), TP=1, DP=32. MBS=2 at DP=32: num_microbatches = 128/(2*32) = 2.
@@ -17,9 +16,9 @@
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=460000
 #SBATCH --no-requeue
-#SBATCH --reservation=SD-69241-apertus-1-5
 
 set -euo pipefail
+: "${MEGATRON_DATA_PATH:?please set MEGATRON_DATA_PATH to the Megatron-binary dataset prefix (without .bin/.idx), e.g. /path/to/climbmix_small}"
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
@@ -166,7 +165,7 @@ TOKENIZER_ARGS=(
 )
 
 DATA_ARGS=(
-    --data-path /capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
+    --data-path $MEGATRON_DATA_PATH
     --data-cache-path $DATASET_CACHE_DIR
     --split 99,1,0
     --num-workers 4

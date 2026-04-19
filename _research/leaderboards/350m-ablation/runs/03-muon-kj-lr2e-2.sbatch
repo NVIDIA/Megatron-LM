@@ -11,7 +11,6 @@
 #   git checkout 885cdbb0d
 #   sbatch _research/leaderboards/350m-ablation/runs/03-muon-kj-lr2e-2.sbatch
 #
-#SBATCH --account=infra01
 #SBATCH --job-name=350m-abl-muon-kj-lr2e-2
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -22,9 +21,9 @@
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=460000
 #SBATCH --no-requeue
-#SBATCH --reservation=SD-69241-apertus-1-5
 
 set -euo pipefail
+: "${MEGATRON_DATA_PATH:?please set MEGATRON_DATA_PATH to the Megatron-binary dataset prefix (without .bin/.idx), e.g. /path/to/climbmix_small}"
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
@@ -139,7 +138,7 @@ MEGATRON_ARGS=(
     --tokenizer-type GPT2BPETokenizer
     --vocab-file $WORKDIR/_research/data/gpt2-vocab.json
     --merge-file $WORKDIR/_research/data/gpt2-merges.txt
-    --data-path /capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
+    --data-path $MEGATRON_DATA_PATH
     --data-cache-path $DATASET_CACHE_DIR
     --split 99,1,0
     --num-workers 4

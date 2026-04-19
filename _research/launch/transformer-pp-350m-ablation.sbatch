@@ -11,7 +11,6 @@
 # scale mode, etc.), copy this file and edit; do not re-introduce
 # env-var branching.
 #
-#SBATCH --account=infra01
 #SBATCH --job-name=transformer-pp-350m-ablation
 #SBATCH --time=01:00:00
 #SBATCH --output=/iopsstor/scratch/cscs/%u/megatron-lm-research-baseline/_research/results/runs/%x-%j.log
@@ -22,9 +21,9 @@
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=460000
 #SBATCH --no-requeue
-#SBATCH --reservation=SD-69241-apertus-1-5
 
 set -euo pipefail
+: "${MEGATRON_DATA_PATH:?please set MEGATRON_DATA_PATH to the Megatron-binary dataset prefix (without .bin/.idx), e.g. /path/to/climbmix_small}"
 echo "START TIME: $(date)"
 export APERTUS_PHASE_SBATCH_START=$(date +%s.%N)
 
@@ -172,7 +171,7 @@ TOKENIZER_ARGS=(
 )
 
 DATA_ARGS=(
-    --data-path /capstor/store/cscs/swissai/infra01/datasets/nvidia/Nemotron-ClimbMix/climbmix_small_megatron/climbmix_small
+    --data-path $MEGATRON_DATA_PATH
     --data-cache-path $DATASET_CACHE_DIR
     --split 99,1,0
     --num-workers 4

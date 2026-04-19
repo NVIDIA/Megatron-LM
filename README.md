@@ -21,22 +21,39 @@ Ranked run lists per model size; each entry is a self-contained sbatch + W&B lin
 
 ## Quick start
 
-**On Clariden (Swiss AI Alps, infra01 project):**
+Intended environment: Clariden (Swiss AI Alps, GH200 nodes, SLURM +
+enroot container runtime). Everything below assumes that cluster; to
+adapt to a different site, swap the EDF and dataset path and rewrite
+the `#SBATCH` headers to fit your scheduler.
+
+**First-time setup** — add to your `~/.bashrc` (or source once per
+shell) so `sbatch` picks up sane defaults and the sbatches can find
+your dataset:
 
 ```bash
-# 1. Clone into the expected path. The sbatches write the Python
-#    package dir, caches, and SLURM logs to this exact location;
-#    cloning elsewhere will scatter outputs across two directories.
+export SBATCH_ACCOUNT=<your-slurm-account>        # required
+export SBATCH_RESERVATION=<your-reservation>      # optional; omit for normal queue
+export WANDB_API_KEY=<your-wandb-key>             # optional; omit to log locally only
+export MEGATRON_DATA_PATH=/path/to/climbmix_small # required; Megatron-binary prefix without .bin/.idx
+```
+
+`sbatch` reads `SBATCH_ACCOUNT` / `SBATCH_RESERVATION` natively — no
+wrapper needed. The sbatches abort with a clear error at submit time
+if `MEGATRON_DATA_PATH` is unset.
+
+**Running a job:**
+
+```bash
+# Clone into the expected path. The sbatches write the Python package
+# dir, caches, and SLURM logs to this exact location; cloning elsewhere
+# will scatter outputs across two directories.
 cd /iopsstor/scratch/cscs/$USER
 git clone https://github.com/ischlag/megatron-lm-research-baseline.git
 cd megatron-lm-research-baseline
 
-# 2. Export secrets once (wandb optional; without it logging is disabled).
-export WANDB_API_KEY=<your-key>
-
-# 3. Submit a run. The alps3 enroot container +
-#    _research/launch/install_python_deps.sh handle the Python
-#    environment inside the job; no local install required.
+# Submit. The alps3 enroot container +
+# _research/launch/install_python_deps.sh handle the Python environment
+# inside the job; no local install required.
 sbatch _research/launch/transformer-pp-350m-adamw.sbatch
 # or the NorMuon variant:
 sbatch _research/launch/transformer-pp-350m-muon.sbatch
@@ -45,14 +62,8 @@ sbatch _research/launch/transformer-pp-350m-ablation.sbatch
 ```
 
 To try a variant (different optimizer, LR, schedule, etc.), copy an
-existing sbatch and edit it; we don't use env-var-driven sweep harnesses.
-Frozen ablation runs live under `_research/leaderboards/<size>/runs/`.
-
-Each sbatch hardcodes CSCS-specific `--reservation`, `--account`, storage
-paths, the CSCS enroot image (via `_research/launch/alps3.toml`), and
-the dataset path. To adapt to a different site, edit the `#SBATCH`
-header, swap in your own EDF, and update `--data-path`; the model /
-optimizer / schedule args are portable.
+existing sbatch and edit it. Frozen ablation runs live under
+`_research/leaderboards/<size>/runs/`.
 
 Python dependencies (`transformers`, `wandb`, `emerging-optimizers`) are
 installed into `_research/packages/` inside the container on first run
