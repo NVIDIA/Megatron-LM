@@ -245,10 +245,10 @@ class GPTModel(LanguageModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=(
-                    config.embedding_init_method
-                    if config.use_mup and not self.share_embeddings_and_output_weights
-                    else config.init_method
+                init_method=self.model_scaling_policy.output_layer_init_method(
+                    share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
+                    default_init_method=config.init_method,
+                    embedding_init_method=config.embedding_init_method,
                 ),
                 bias=False,
                 skip_bias_add=False,
@@ -651,7 +651,7 @@ class GPTModel(LanguageModule):
                     config=self.config,
                     cp_group=self.pg_collection.cp,
                     packed_seq_params=packed_seq_params,
-                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    scale_logits_fn=self._scale_logits if self.model_scaling_policy.enabled else None,
                 )
         sequence_parallel_override = False
 

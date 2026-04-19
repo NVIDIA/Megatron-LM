@@ -53,7 +53,11 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
+from .optimizer import (
+    MixedPrecisionOptimizer,
+    _zero_grad_group_helper,
+    get_param_group_identifier_tuple,
+)
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
@@ -752,21 +756,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   the ordering of parameters within its flattened parameter state
         #   list.
         def make_needed_groups(param_group):
-            needed_groups = []
-            for key in param_group_identifier_keys:
-                # NeMo changes these variable names from `lr_mult` and `wd_mult`
-                # to `pre_lr_mult` and `pre_wd_mult`, so we need to check both.
-                if key in param_group:
-                    pass
-                elif f"pre_{key}" in param_group:
-                    key = f"pre_{key}"
-                else:
-                    raise ValueError(
-                        f"Key {key} (or pre_{key}) not found in param_group {param_group}."
-                    )
-                needed_groups.append(param_group[key])
-            needed_groups = tuple(needed_groups)
-            return needed_groups
+            return get_param_group_identifier_tuple(param_group)
 
         param_groups_map = {}
         for param_group in state_dict["optimizer"]["param_groups"]:

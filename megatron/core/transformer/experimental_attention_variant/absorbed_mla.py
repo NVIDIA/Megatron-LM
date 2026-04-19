@@ -168,7 +168,6 @@ class AbsorbedMLASelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
-
         # Output.
         self.linear_proj = build_module(
             submodules.linear_proj,

@@ -36,6 +36,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
+from megatron.core.parameterization import build_resolved_scaling_context
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, get_torch_version, is_torch_min_version
@@ -186,6 +187,14 @@ def check_checkpoint_args(checkpoint_args):
     if get_checkpoint_version() >= 3.0 and not args.use_dist_ckpt:
         _compare('tensor_model_parallel_size')
         _compare('pipeline_model_parallel_size')
+
+    checkpoint_scaling = build_resolved_scaling_context(checkpoint_args)
+    args_scaling = build_resolved_scaling_context(args)
+    error_message = (
+        "Resolved scaling context from checkpoint "
+        f"({checkpoint_scaling}) is not equal to the input argument value ({args_scaling})."
+    )
+    assert checkpoint_scaling == args_scaling, error_message
 
 
 def isfile(filename) -> bool:
@@ -1549,6 +1558,20 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+    _set_arg('use_mup', force=True)
+    _set_arg('mup_width_mult', force=True)
+    _set_arg('mup_base_hidden_size', force=True)
+    _set_arg('mup_embedding_mult', force=True)
+    _set_arg('mup_output_mult', force=True)
+    _set_arg('mup_base_head_dim', force=True)
+    _set_arg('mup_attn_scale_power', force=True)
+    _set_arg('scaling_recipe', force=True)
+    _set_arg('scaling_base_hidden_size', force=True)
+    _set_arg('scaling_base_num_layers', force=True)
+    _set_arg('scaling_base_head_dim', force=True)
+    _set_arg('scaling_residual_branch_depth_power', force=True)
+    _set_arg('scaling_hidden_lr_depth_power', force=True)
+    _set_arg('scaling_block_out_proj_init_depth_power', force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)

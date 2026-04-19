@@ -2,6 +2,7 @@
 
 import inspect
 import os
+from types import SimpleNamespace
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +18,13 @@ from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.parameterization import (
+    ROLE_EMBEDDING,
+    ROLE_OUTPUT,
+    ROLE_SHARED_EMBEDDING_OUTPUT,
+    build_resolved_model_policy,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
@@ -28,6 +36,13 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def _is_fa_min_version_or_false(version: str) -> bool:
+    try:
+        return is_fa_min_version(version)
+    except ModuleNotFoundError:
+        return False
 
 
 class TestGPTModel:
@@ -88,6 +103,107 @@ class TestGPTModel:
         assert self.gpt_model.embedding.word_embeddings.weight.mean().cpu().item() == approx(
             0.0, abs=1e-1
         )
+
+    def test_mup_setup_embeddings_and_output_layer_marks_real_model_parameters(self):
+        untied_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=6,
+        )
+        untied_model = GPTModel(
+            config=untied_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+            share_embeddings_and_output_weights=False,
+        )
+        assert (
+            untied_model.embedding.word_embeddings.weight.is_embedding_or_output_parameter is True
+        )
+        assert untied_model.embedding.word_embeddings.weight.is_embedding_parameter is True
+        assert untied_model.embedding.word_embeddings.weight.parameterization_role == ROLE_EMBEDDING
+        assert untied_model.output_layer.weight.is_embedding_or_output_parameter is True
+        assert untied_model.output_layer.weight.is_output_parameter is True
+        assert untied_model.output_layer.weight.is_embedding_parameter is True
+        assert untied_model.output_layer.weight.parameterization_role == ROLE_OUTPUT
+
+        shared_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=6,
+        )
+        shared_model = GPTModel(
+            config=shared_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+            share_embeddings_and_output_weights=True,
+        )
+        shared_weight = shared_model.shared_embedding_or_output_weight()
+        assert shared_weight.is_embedding_or_output_parameter is True
+        assert shared_weight.is_output_parameter is True
+        assert shared_weight.is_embedding_parameter is True
+        assert shared_weight.parameterization_role == ROLE_SHARED_EMBEDDING_OUTPUT
+
+    def test_mtp_shared_embedding_copy_keeps_embedding_output_metadata(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            pipeline_dtype=torch.float32,
+            scaling_recipe='mup',
+            scaling_base_hidden_size=6,
+            pipeline_model_parallel_size=2,
+            mtp_num_layers=1,
+        )
+
+        class DummyEmbedding:
+            def __init__(self, weight):
+                self.word_embeddings = SimpleNamespace(weight=weight)
+
+            def parameters(self):
+                return [self.word_embeddings.weight]
+
+        weight = torch.nn.Parameter(torch.zeros(12, 12))
+        embedding = DummyEmbedding(weight)
+        dummy = SimpleNamespace(
+            pre_process=False,
+            post_process=False,
+            mtp_process=True,
+            share_embeddings_and_output_weights=False,
+            vp_stage=None,
+            vp_size=None,
+            pp_group=MagicMock(name='pp_group'),
+            embd_group=None,
+            config=config,
+            embedding=embedding,
+            model_scaling_policy=build_resolved_model_policy(config),
+        )
+        dummy.shared_embedding_or_output_weight = lambda: LanguageModule.shared_embedding_or_output_weight(
+            dummy
+        )
+
+        with patch(
+            'megatron.core.models.common.language_module.language_module.is_pp_first_stage',
+            return_value=False,
+        ), patch(
+            'megatron.core.models.common.language_module.language_module.is_vp_first_stage',
+            return_value=False,
+        ), patch('torch.distributed.is_initialized', return_value=False):
+            LanguageModule.setup_embeddings_and_output_layer(dummy)
+
+        assert weight.is_embedding_or_output_parameter is True
+        assert weight.is_output_parameter is True
+        assert weight.is_embedding_parameter is True
+        assert weight.shared_embedding is True
+        assert weight.parameterization_role == ROLE_SHARED_EMBEDDING_OUTPUT
 
     @pytest.mark.internal
     def test_post_process_forward(self):
@@ -275,6 +391,12 @@ class TestGPTModelWithCustomPG:
         "tp_size, dp_size, cp_size", [(1, 8, 1), (2, 4, 1)]  # TP 1, DP 8, CP 1  # TP 2, DP 4, CP 1
     )
     def test_gpt_model_with_custom_pg(self, tp_size, dp_size, cp_size):
+        required_world_size = tp_size * dp_size * cp_size
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < required_world_size:
+            pytest.skip(
+                f"requires WORLD_SIZE >= {required_world_size} for custom process-group coverage"
+            )
 
         # Create HyperCommGrid with dimensions tp, cp, ep, pp, dp (reversed from device mesh order)
         grid = HyperCommGrid([tp_size, cp_size, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
@@ -380,7 +502,8 @@ class TestGPTWithDynamicInference:
 
     @pytest.mark.internal
     @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+        not _is_fa_min_version_or_false("2.7.3"),
+        reason="need latest flash attn for dynamic batching",
     )
     @torch.inference_mode()
     def test_dynamic_inference_padding_with_fp8(self):

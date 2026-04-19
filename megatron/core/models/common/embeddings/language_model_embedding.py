@@ -5,6 +5,7 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
+from megatron.core.parameterization import build_resolved_model_policy
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -45,6 +46,7 @@ class LanguageModelEmbedding(MegatronModule):
         self.num_tokentypes = num_tokentypes
         self.scatter_to_sequence_parallel = scatter_to_sequence_parallel
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+        self.model_scaling_policy = build_resolved_model_policy(config)
         self.reduce_scatter_embeddings = (
             (not self.add_position_embedding)
             and self.num_tokentypes <= 0
@@ -127,9 +129,7 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             assert self.tokentype_embeddings is None
 
-        # MuP: scale embeddings by alpha_input.
-        if self.config.use_mup and self.config.mup_embedding_mult != 1.0:
-            embeddings = embeddings * self.config.mup_embedding_mult
+        embeddings = self.model_scaling_policy.scale_embedding_activations(embeddings)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:

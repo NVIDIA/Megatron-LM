@@ -47,11 +47,13 @@ from megatron.core.quantization.utils import (
 
 from megatron.training.argument_utils import ArgumentGroupFactory
 
+
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
+    parser = _add_scaling_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
     parser = _add_rl_args(parser)
@@ -320,6 +322,46 @@ def tuple_type(x):
         return x
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
+
+
+def _resolve_validation_attr(args, attr_name):
+    """Resolve validation fields from either flat argparse args or nested YAML namespaces."""
+    if hasattr(args, attr_name):
+        value = getattr(args, attr_name)
+        if value is not None:
+            return value
+    language_model = getattr(args, 'language_model', None)
+    if language_model is not None and hasattr(language_model, attr_name):
+        return getattr(language_model, attr_name)
+    return None
+
+
+def validate_depth_mup_optimizer_support(args) -> None:
+    """Enforce the public optimizer support surface for depth_mup."""
+    if _resolve_validation_attr(args, 'scaling_recipe') == 'depth_mup' and _resolve_validation_attr(
+        args, 'optimizer'
+    ) not in (
+        'adam',
+        'adamw',
+    ):
+        raise ValueError(
+            "scaling_recipe='depth_mup' currently supports Adam/AdamW only. "
+            "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
+            "and input/output-bias rules and is intentionally out of scope for v1."
+        )
+
+
+def validate_muon_scalar_optimizer_support(args) -> None:
+    """Keep YAML and CLI validation aligned for Muon scalar optimizer selection."""
+    muon_scalar_optimizer = _resolve_validation_attr(args, 'muon_scalar_optimizer')
+    if muon_scalar_optimizer is None:
+        return
+    if muon_scalar_optimizer not in ('adam', 'lion'):
+        raise ValueError(
+            "muon_scalar_optimizer must be one of ('adam', 'lion'). "
+            f"Got {muon_scalar_optimizer!r}."
+        )
+
 
 def validate_args(args, defaults={}):
 
@@ -1015,7 +1057,7 @@ def validate_args(args, defaults={}):
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
+        assert args.optimizer in ('sgd', 'adam', 'adamw'), \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
@@ -1188,6 +1230,8 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
+    validate_depth_mup_optimizer_support(args)
+    validate_muon_scalar_optimizer_support(args)
     if args.save is not None:
         assert args.save_interval is not None
         assert args.save_interval > 0
@@ -1448,7 +1492,7 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    if args.optimizer not in ('sgd', 'adam', 'adamw'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -1685,6 +1729,10 @@ def validate_args(args, defaults={}):
             "`include_special_tokens` is set to True by default for HF tokenizers."
             "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
         )
+
+    from megatron.core.parameterization import build_resolved_scaling_context, sync_legacy_mup_fields
+
+    sync_legacy_mup_fields(args, build_resolved_scaling_context(args))
 
     # Print arguments.
     _print_args("arguments", args)
@@ -2025,6 +2073,20 @@ def _add_network_size_args(parser):
         "moe_aux_loss_coeff",
         "cp_comm_type",
         "cuda_graph_scope",
+        "use_mup",
+        "mup_width_mult",
+        "mup_base_hidden_size",
+        "mup_embedding_mult",
+        "mup_output_mult",
+        "mup_base_head_dim",
+        "mup_attn_scale_power",
+        "scaling_recipe",
+        "scaling_base_hidden_size",
+        "scaling_base_num_layers",
+        "scaling_base_head_dim",
+        "scaling_residual_branch_depth_power",
+        "scaling_hidden_lr_depth_power",
+        "scaling_block_out_proj_init_depth_power",
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",
         "params_dtype",
@@ -2165,6 +2227,45 @@ def _add_network_size_args(parser):
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
     return parser
+
+
+def _add_scaling_args(parser):
+    group = parser.add_argument_group(title='scaling')
+
+    group.add_argument('--scaling-recipe', type=str, default=None,
+                       choices=['none', 'mup', 'depth_mup'],
+                       help='Canonical scaling recipe. `mup` preserves current Megatron MuP; '
+                       '`depth_mup` is the initial Adam/AdamW-scoped dense GPT-style residual '
+                       'Transformer Depth-MuP candidate.')
+    group.add_argument('--scaling-base-hidden-size', type=int, default=None,
+                       help='Reference hidden size for width-based scaling recipes.')
+    group.add_argument('--scaling-base-num-layers', type=int, default=None,
+                       help='Reference number of transformer layers for depth-based scaling recipes.')
+    group.add_argument('--scaling-base-head-dim', type=float, default=None,
+                       help='Reference attention head dimension for scaling recipes.')
+    group.add_argument('--scaling-residual-branch-depth-power', type=float, default=None,
+                       help='Relative depth exponent for residual branch outputs.')
+    group.add_argument('--scaling-hidden-lr-depth-power', type=float, default=None,
+                       help='Relative depth exponent for hidden matrix-like LR scaling.')
+    group.add_argument('--scaling-block-out-proj-init-depth-power', type=float, default=None,
+                       help='Relative depth exponent for block output projection initialization.')
+
+    group.add_argument('--use-mup', action='store_true',
+                       help='Backward-compatible alias for `--scaling-recipe mup`.')
+    group.add_argument('--mup-width-mult', type=float, default=1.0,
+                       help='Backward-compatible compatibility field. Preserved for existing CLI/YAML surfaces.')
+    group.add_argument('--mup-base-hidden-size', type=int, default=None,
+                       help='Backward-compatible alias for `--scaling-base-hidden-size`.')
+    group.add_argument('--mup-embedding-mult', type=float, default=1.0,
+                       help='MuP embedding output multiplier. Preserved for compatibility.')
+    group.add_argument('--mup-output-mult', type=float, default=1.0,
+                       help='MuP output/logit multiplier. Preserved for compatibility.')
+    group.add_argument('--mup-base-head-dim', type=float, default=None,
+                       help='Backward-compatible alias for `--scaling-base-head-dim`.')
+    group.add_argument('--mup-attn-scale-power', type=float, default=1.0,
+                       help='MuP attention scaling power. Preserved for compatibility.')
+    return parser
+
 
 def _add_straggler_detector_args(parser):
     from megatron.training.config import StragglerDetectionConfig
@@ -2556,7 +2657,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'adamw', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')

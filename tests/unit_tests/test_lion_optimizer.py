@@ -13,11 +13,18 @@ import pytest
 import torch
 import torch.nn as nn
 
+import megatron.core.optimizer as opt_module
 from megatron.core.optimizer import (
     HAVE_EMERGING_OPTIMIZERS,
     OptimizerConfig,
     _get_megatron_optimizer_based_on_param_groups,
     _get_param_groups,
+)
+from megatron.core.optimizer.emerging_optimizers import (
+    _EMERGING_OPTIMIZERS,
+    _default_betas_for_eopt,
+    _default_adam_based_eopt_config_to_kwargs,
+    _muon_default_param_overrides,
 )
 from megatron.core.optimizer.optimizer import FP32Optimizer
 
@@ -78,6 +85,92 @@ class TestLionOptimizerConfig:
         assert config.lion_beta1 == 0.95
         assert config.lion_beta2 == 0.98
         assert config.muon_scalar_optimizer == "adam"
+
+    def test_muon_scalar_optimizer_controls_nonlinear_param_override(self):
+        """Muon scalar optimizer selection should flow into default nonlinear param overrides."""
+        entry = _EMERGING_OPTIMIZERS["muon"]
+        config = OptimizerConfig(muon_scalar_optimizer="lion")
+
+        overrides = entry.config_to_param_overrides(config)
+        assert len(overrides) == 1
+        (_, override), = overrides.items()
+        assert override["optimizer"] == "lion"
+
+    def test_muon_scalar_optimizer_routes_lion_groups_to_lion_entry(self):
+        """Muon scalar-optimizer overrides must create a real Lion bucket via param overrides."""
+        model = SimpleModel()
+        config = OptimizerConfig(
+            optimizer="muon",
+            lr=1e-4,
+            muon_scalar_optimizer="lion",
+            adam_beta1=0.81,
+            adam_beta2=0.88,
+            lion_beta1=0.91,
+            lion_beta2=0.97,
+        )
+        recorded = []
+
+        def fake_create(_config, _groups, eopt_name, _model_chunks, _pg_collection):
+            if eopt_name == "lion":
+                recorded.append((eopt_name, _default_betas_for_eopt(eopt_name, _config)))
+            else:
+                recorded.append((eopt_name, None))
+            return SimpleNamespace(param_groups=[]), (lambda *_args, **_kwargs: None)
+
+        fake_pg_collection = SimpleNamespace(mp=None, tp=None, tp_ep_pp=None)
+        fake_muon_entry = SimpleNamespace(
+            config_to_param_overrides=_muon_default_param_overrides,
+            default_param_overrides={},
+            optimizer_cls=object,
+            init_state_fn=lambda *_args, **_kwargs: None,
+            config_to_kwargs=None,
+        )
+        fake_lion_entry = SimpleNamespace(
+            config_to_param_overrides=None,
+            default_param_overrides={},
+            optimizer_cls=object,
+            init_state_fn=lambda *_args, **_kwargs: None,
+            config_to_kwargs=None,
+        )
+
+        with patch("torch.distributed.get_world_size", return_value=1), patch(
+            "torch.distributed.all_gather_object",
+            lambda output_list, obj: output_list.__setitem__(0, obj),
+        ), patch.object(
+            opt_module, "HAVE_EMERGING_OPTIMIZERS", True
+        ), patch.dict(
+            opt_module._EMERGING_OPTIMIZERS,
+            {"muon": fake_muon_entry, "lion": fake_lion_entry},
+            clear=False,
+        ), patch.object(
+            opt_module, "_create_emerging_optimizer", side_effect=fake_create
+        ), patch.object(
+            opt_module, "FP32Optimizer", side_effect=lambda optimizer, *_args, **_kwargs: optimizer
+        ), patch.object(
+            opt_module, "ChainedOptimizer", side_effect=lambda optimizers: optimizers
+        ):
+            results = opt_module._get_megatron_emerging_optimizer(
+                config=config,
+                model_chunks=[model],
+                config_overrides={},
+                pg_collection=fake_pg_collection,
+            )
+
+        assert set(recorded) == {("muon", None), ("lion", (0.91, 0.97))}
+        assert len(results) == 2
+
+    def test_default_emerging_lion_betas_use_lion_betas(self):
+        """Shared beta selection must keep Lion on lion_beta{1,2}."""
+        config = OptimizerConfig(
+            optimizer="muon",
+            lr=1e-4,
+            adam_beta1=0.81,
+            adam_beta2=0.88,
+            lion_beta1=0.91,
+            lion_beta2=0.97,
+        )
+
+        assert _default_betas_for_eopt("lion", config) == (0.91, 0.97)
 
     @patch("torch.distributed.get_world_size", return_value=1)
     @patch(
@@ -140,6 +233,21 @@ class TestLionOptimizerExactness:
             assert group["betas"] == (0.93, 0.99)
             assert group["lr"] == 3e-4
             assert group["weight_decay"] == 0.01
+
+    def test_default_emerging_lion_kwargs_use_lion_betas(self):
+        """Shared emerging-optimizer kwargs must keep Lion on lion_beta{1,2}."""
+        config = OptimizerConfig(
+            optimizer="muon",
+            lr=1e-4,
+            adam_beta1=0.81,
+            adam_beta2=0.88,
+            lion_beta1=0.91,
+            lion_beta2=0.97,
+        )
+
+        kwargs = _default_adam_based_eopt_config_to_kwargs("lion", config, [], None)
+
+        assert kwargs["betas"] == (0.91, 0.97)
 
     def test_lion_init_state_fn_creates_exp_avg(self):
         """init_state_fn should pre-initialize exp_avg state for all params."""
