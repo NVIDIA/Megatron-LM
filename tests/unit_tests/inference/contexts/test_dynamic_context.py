@@ -731,26 +731,40 @@ class TestDynamicContext:
         assert dynamic_context.total_request_count == 7
         assert dynamic_context.active_token_count == 7
 
-        # All 7 surviving request IDs should be present in [0, total).
-        surviving_ids = set(
-            dynamic_context.request_ids[: dynamic_context.total_request_count].cpu().tolist()
+        # Layout invariant: [active | paused | dead].
+        active_count = dynamic_context.total_request_count - dynamic_context.paused_request_count
+        active_ids = set(dynamic_context.request_ids[:active_count].cpu().tolist())
+        paused_ids = set(
+            dynamic_context.request_ids[active_count : dynamic_context.total_request_count]
+            .cpu()
+            .tolist()
         )
-        assert surviving_ids == {0, 1, 2, 4, 5, 6, 9}  # IDs 3, 7, 8 finished
+        assert active_ids == {0, 1, 2, 4, 5, 6, 9}  # IDs 3, 7, 8 finished
+        assert paused_ids == set()  # no paused requests
+        # Dead zone should not contain any surviving IDs (stale data cleared).
+        dead_ids = set(
+            dynamic_context.request_ids[dynamic_context.total_request_count : 10].cpu().tolist()
+        )
+        assert dead_ids.isdisjoint(active_ids)
 
-        # IDs 2,9,4 stayed active (offset 10+1=11); IDs 5,6,0,1 got new blocks (offset (127+1)%128=0).
-        # Indices 7-9 are stale.
-        assert dynamic_context.request_last_kv_block_offset[0:10].cpu().numpy().tolist() == [
-            11,
-            11,
-            11,
-            0,
-            0,
-            0,
-            0,
-            10,
-            127,
-            127,
-        ]
+        # IDs that stayed active have offset 10+1=11; IDs that got new blocks
+        # have offset (127+1)%128=0. Check only the live region [0:total).
+        live_offsets = (
+            dynamic_context.request_last_kv_block_offset[: dynamic_context.total_request_count]
+            .cpu()
+            .tolist()
+        )
+        for i, rid in enumerate(
+            dynamic_context.request_ids[: dynamic_context.total_request_count].cpu().tolist()
+        ):
+            if rid in {2, 4, 9}:
+                assert (
+                    live_offsets[i] == 11
+                ), f"request {rid} at index {i}: expected offset 11, got {live_offsets[i]}"
+            else:
+                assert (
+                    live_offsets[i] == 0
+                ), f"request {rid} at index {i}: expected offset 0, got {live_offsets[i]}"
         assert dynamic_context.token_to_input_ids[
             : dynamic_context.active_token_count
         ].cpu().numpy().tolist() == [2, 9, 4, 5, 6, 0, 1]
