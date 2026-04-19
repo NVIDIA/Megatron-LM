@@ -99,6 +99,25 @@ class TestMuPConfigValidation:
         assert recipe.softmax_scale == legacy.softmax_scale
         assert recipe.mup_output_mult == legacy.mup_output_mult
 
+    def test_scaling_recipe_depth_mup_preserves_distinct_recipe_identity(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=12,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=6,
+            scaling_base_head_dim=64,
+        )
+        context = build_resolved_scaling_context(config)
+
+        assert config.scaling_recipe == 'depth_mup'
+        assert config.use_mup is False
+        assert context.recipe == 'depth_mup'
+        assert context.references.base_hidden_size == 256
+        assert context.references.base_num_layers == 6
+        assert context.references.base_head_dim == 64
+
     def test_conflicting_legacy_and_canonical_scaling_args_error(self):
         with pytest.raises(ValueError, match='conflicts with'):
             TransformerConfig(
@@ -209,6 +228,7 @@ class TestMuPConfigValidation:
                 '--num-layers', '12',
                 '--hidden-size', '1024',
                 '--num-attention-heads', '16',
+                '--no-rope-fusion',
                 '--scaling-recipe', 'mup',
                 '--scaling-base-hidden-size', '256',
                 '--scaling-base-head-dim', '64',
@@ -218,6 +238,23 @@ class TestMuPConfigValidation:
         canonical_config = core_transformer_config_from_args(canonical_args)
         assert canonical_config.use_mup is True
         assert canonical_config.scaling_recipe == 'mup'
+
+        depth_args = parser.parse_args(
+            [
+                '--num-layers', '12',
+                '--hidden-size', '1024',
+                '--num-attention-heads', '16',
+                '--no-rope-fusion',
+                '--scaling-recipe', 'depth_mup',
+                '--scaling-base-hidden-size', '256',
+                '--scaling-base-num-layers', '6',
+                '--scaling-base-head-dim', '64',
+            ]
+        )
+        depth_args = _prepare_parsed_args_for_core_config(depth_args)
+        depth_config = core_transformer_config_from_args(depth_args)
+        assert depth_config.use_mup is False
+        assert depth_config.scaling_recipe == 'depth_mup'
         assert canonical_config.mup_width_mult == pytest.approx(4.0)
 
         legacy_args = parser.parse_args(
@@ -225,6 +262,7 @@ class TestMuPConfigValidation:
                 '--num-layers', '12',
                 '--hidden-size', '1024',
                 '--num-attention-heads', '16',
+                '--no-rope-fusion',
                 '--use-mup',
                 '--mup-base-hidden-size', '256',
                 '--mup-base-head-dim', '64',

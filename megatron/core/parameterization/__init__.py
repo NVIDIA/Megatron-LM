@@ -22,6 +22,7 @@ from .roles import (
     set_parameterization_metadata,
 )
 from .spec import (
+    SCALING_RECIPE_DEPTH_MUP,
     SCALING_RECIPE_MUP,
     SCALING_RECIPE_NONE,
     CanonicalScalingSpec,
@@ -55,6 +56,7 @@ __all__ = [
     'ResolvedModelPolicy',
     'ResolvedScalingContext',
     'ResolvedTrainingPolicy',
+    'SCALING_RECIPE_DEPTH_MUP',
     'SCALING_RECIPE_MUP',
     'SCALING_RECIPE_NONE',
     'ScalingReferences',
