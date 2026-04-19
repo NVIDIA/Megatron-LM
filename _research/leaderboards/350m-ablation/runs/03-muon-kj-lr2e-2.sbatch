@@ -3,12 +3,12 @@
 # 350M ablation leaderboard — rank 3
 # Optimizer: Plain Muon, shape_scaling (Keller Jordan recipe), matrix LR 2e-2,
 #            scalar LR 1.5e-3, scalar WD 0, Nesterov, momentum 0.95.
-# Final loss: 2.232   Min loss: 2.069
-# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/5kmiazba
-# Executed at git sha: 52dafcfd6
+# Final loss: 2.226   Min loss: 2.068
+# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/f7uvsbai
+# Executed at git sha: 885cdbb0d
 #
 # To reproduce bitwise:
-#   git checkout 52dafcfd6
+#   git checkout 885cdbb0d
 #   sbatch _research/leaderboards/350m-ablation/runs/03-muon-kj-lr2e-2.sbatch
 #
 #SBATCH --account=infra01

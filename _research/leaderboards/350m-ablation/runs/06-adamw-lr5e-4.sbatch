@@ -3,12 +3,12 @@
 # 350M ablation leaderboard — rank 6
 # Optimizer: AdamW (Megatron --optimizer adam = decoupled WD), LR 5e-4,
 #            beta1=0.9, beta2=0.95, WD=0.1.
-# Final loss: 2.366   Min loss: 2.204
-# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/qstcfiz9
-# Executed at git sha: e36bd6f62
+# Final loss: 2.363   Min loss: 2.199
+# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m
+# Executed at git sha: 885cdbb0d
 #
 # To reproduce bitwise:
-#   git checkout e36bd6f62
+#   git checkout 885cdbb0d
 #   sbatch _research/leaderboards/350m-ablation/runs/06-adamw-lr5e-4.sbatch
 #
 #SBATCH --account=infra01

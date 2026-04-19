@@ -8,16 +8,14 @@ All entries share architecture, data, schedule, seed (42); only the
 optimizer block differs. W&B project:
 [megatron-lm-research-baseline](https://wandb.ai/ischlag/megatron-lm-research-baseline).
 
-| rank | optimizer | matrix LR | final loss | min loss | sbatch |
-| ---: | --- | ---: | ---: | ---: | --- |
-| 1 | NorMuon | 3.6e-4 | **2.225** | **2.061** | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) |
-| 2 | NorMuon | 2e-4 | 2.226 | 2.063 | [`02-normuon-lr2e-4.sbatch`](runs/02-normuon-lr2e-4.sbatch) |
-| 3 | Muon (shape_scaling) | 2e-2 | 2.232 | 2.069 | [`03-muon-kj-lr2e-2.sbatch`](runs/03-muon-kj-lr2e-2.sbatch) |
-| 4 | NorMuon | 6e-4 | 2.244 | 2.082 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) |
-| 5 | AdamW | 1e-3 | 2.314 | 2.148 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) |
-| 6 | AdamW | 5e-4 | 2.366 | 2.204 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) |
-
-*W&B links pending — will be added once the currently running repro jobs finish.*
+| rank | optimizer | matrix LR | final loss | min loss | sbatch | wandb |
+| ---: | --- | ---: | ---: | ---: | --- | --- |
+| 1 | NorMuon | 3.6e-4 | **2.221** | **2.058** | [`01-normuon-lr3.6e-4.sbatch`](runs/01-normuon-lr3.6e-4.sbatch) | [ispegm6g](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/ispegm6g) |
+| 2 | Muon (shape_scaling) | 2e-2 | 2.226 | 2.068 | [`03-muon-kj-lr2e-2.sbatch`](runs/03-muon-kj-lr2e-2.sbatch) | [f7uvsbai](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/f7uvsbai) |
+| 3 | NorMuon | 2e-4 | 2.227 | 2.063 | [`02-normuon-lr2e-4.sbatch`](runs/02-normuon-lr2e-4.sbatch) | [heevf919](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/heevf919) |
+| 4 | NorMuon | 6e-4 | 2.244 | 2.081 | [`04-normuon-lr6e-4.sbatch`](runs/04-normuon-lr6e-4.sbatch) | [zu96uyts](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts) |
+| 5 | AdamW | 1e-3 | 2.316 | 2.154 | [`05-adamw-lr1e-3.sbatch`](runs/05-adamw-lr1e-3.sbatch) | [6qecfvwc](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/6qecfvwc) |
+| 6 | AdamW | 5e-4 | 2.363 | 2.199 | [`06-adamw-lr5e-4.sbatch`](runs/06-adamw-lr5e-4.sbatch) | [zzywif5m](https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zzywif5m) |
 
 ## Notes on entries
 

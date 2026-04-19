@@ -3,12 +3,12 @@
 # 350M ablation leaderboard — rank 4
 # Optimizer: NorMuon (adaptive_muon + normuon moment2), matrix LR 6e-4,
 #            scalar LR 1.5e-3, scalar WD 0, spectral scale, Nesterov, mom 0.95.
-# Final loss: 2.244   Min loss: 2.082
-# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/taefn8ax
-# Executed at git sha: 52dafcfd6
+# Final loss: 2.244   Min loss: 2.081
+# W&B: https://wandb.ai/ischlag/megatron-lm-research-baseline/runs/zu96uyts
+# Executed at git sha: 885cdbb0d
 #
 # To reproduce bitwise:
-#   git checkout 52dafcfd6
+#   git checkout 885cdbb0d
 #   sbatch _research/leaderboards/350m-ablation/runs/04-normuon-lr6e-4.sbatch
 #
 #SBATCH --account=infra01
