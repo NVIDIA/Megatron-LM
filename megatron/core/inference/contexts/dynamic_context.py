@@ -2544,12 +2544,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_kv_block_counts[row_idx] += 1
                 self.request_last_kv_block_id[row_idx] = block_ids
 
-        # Remove resumed requests from newly_paused_request_ids. In the
-        # [active | paused] layout, resume takes from the LEFT of the paused
-        # region (LIFO: most recently paused are leftmost), so we truncate the
-        # BEGINNING of newly_paused_request_ids. If resume_request_count >
-        # len(newly_paused_request_ids), this means that none of the paused
-        # requests are newly paused during this update.
+        # Remove resumed IDs from newly_paused_request_ids.  The list was built
+        # in positional order (leftmost paused first), and resume takes from the
+        # left of the paused region, so slicing off the first `resume_request_count`
+        # entries removes exactly the resumed IDs.
         if newly_paused_request_ids is not None and resume_request_count > 0:
             newly_paused_request_ids = newly_paused_request_ids[resume_request_count:]
 
@@ -2713,7 +2711,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Note that this requires no pending chunked prefill request
         if (
             active_request_count + self.paused_request_count == 0
-            and self.get_index_of_chunked_prefill_request(safe=False) == -1
+            and self.chunked_prefill_request_id == -1
         ):
             if finished_request_count > 0:
                 # In [active | paused] layout, active requests start at index 0.
@@ -2830,11 +2828,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (active_requests_requiring_new_block == 1).sum().item()
             )
 
-            if active_requests_requiring_new_block_count > 0:
-                newly_paused_request_ids = self.request_ids[
-                    torch.nonzero(active_requests_requiring_new_block)
-                ]
-
             # Partition active region: staying-active on the left, pausing on the right.
             # Boundary = staying_active_count = active - pausing.
             staying_active_count = active_request_count - active_requests_requiring_new_block_count
@@ -2865,6 +2858,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             self.paused_request_count += active_requests_requiring_new_block_count
             active_request_count -= active_requests_requiring_new_block_count
+
+            # Capture newly paused IDs AFTER the partition swap, in positional
+            # order. This ensures resume_paused_requests truncates the correct
+            # entries: the leftmost paused positions are resumed first (LIFO),
+            # so slicing off the first N entries removes exactly the resumed IDs.
+            if active_requests_requiring_new_block_count > 0:
+                newly_paused_request_ids = self.request_ids[
+                    active_request_count : active_request_count
+                    + active_requests_requiring_new_block_count
+                ].clone()
 
         # 6. Now that we have the requests in following order [Active, Paused, Finished]
         # We determine how many requests we can resume and resume them
