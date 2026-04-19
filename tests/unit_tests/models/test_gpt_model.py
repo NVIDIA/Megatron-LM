@@ -157,6 +157,7 @@ class TestGPTModel:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            pipeline_dtype=torch.float32,
             scaling_recipe='mup',
             scaling_base_hidden_size=6,
             pipeline_model_parallel_size=2,
@@ -390,6 +391,12 @@ class TestGPTModelWithCustomPG:
         "tp_size, dp_size, cp_size", [(1, 8, 1), (2, 4, 1)]  # TP 1, DP 8, CP 1  # TP 2, DP 4, CP 1
     )
     def test_gpt_model_with_custom_pg(self, tp_size, dp_size, cp_size):
+        required_world_size = tp_size * dp_size * cp_size
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < required_world_size:
+            pytest.skip(
+                f"requires WORLD_SIZE >= {required_world_size} for custom process-group coverage"
+            )
 
         # Create HyperCommGrid with dimensions tp, cp, ep, pp, dp (reversed from device mesh order)
         grid = HyperCommGrid([tp_size, cp_size, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
