@@ -1110,49 +1110,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count
 
     def build_active_slices(self):
-        """Copy source tensors into active buffers."""
+        """Copy tensors into active buffers, and pad them with `torch.where`"""
         n = self.padded_active_request_count
         self.active_request_ids[:n].copy_(self.request_ids[:n])
         self.active_request_query_lengths[:n].copy_(self.request_query_lengths[:n])
         self.active_request_to_kv_block_ids[:n].copy_(self.request_to_kv_block_ids[:n])
-
-        torch.cumsum(
-            self.active_request_query_lengths[:n],
-            dim=0,
-            out=self.cu_active_request_query_lengths[1 : n + 1],
-        )
-        self.active_request_last_token_idxs[:n].copy_(
-            self.cu_active_request_query_lengths[1 : n + 1]
-        )
-        self.active_request_last_token_idxs[:n] -= 1
 
         if self.is_hybrid_model:
             self.active_mamba_indices[:n].copy_(
                 self.mamba_metadata.request_to_mamba_state_idx[:n]
             )
 
-        self.build_active_kv_slices()
-
-    def build_active_kv_slices(self):
-        """Build active slices of tensors mutated by `_rewind_kv_cache`.
-
-        Must be re-run after KV-cache rewind so that `active_sequence_lengths`
-        reflects post-rewind offsets rather than the pre-forward snapshot.
-        """
-        n = self.padded_active_request_count
-        torch.add(
-            self.active_request_query_lengths[:n],
-            self.request_kv_length_offsets[:n],
-            out=self.active_sequence_lengths[:n],
+        # Request-level padding.
+        req_pad_mask = self._arange_requests[:n] >= self._real_request_count_gpu
+        self.active_request_query_lengths[:n] = torch.where(
+            req_pad_mask, 0, self.active_request_query_lengths[:n]
         )
-        torch.cumsum(
-            self.active_sequence_lengths[:n],
-            dim=0,
-            out=self.cu_active_sequence_lengths[1 : n + 1],
+        self.active_request_to_kv_block_ids[:n] = torch.where(
+            req_pad_mask.unsqueeze(1), -1, self.active_request_to_kv_block_ids[:n]
         )
 
-    def pad_active_slices(self):
-        """Pad active buffers using `torch.where` with GPU-scalar boundaries."""
         # Token-level padding.
         padded_token_count = self.padded_active_token_count
         tok_pad_mask = self._arange_tokens[:padded_token_count] >= self._real_token_count_gpu
@@ -1168,24 +1145,58 @@ class DynamicInferenceContext(BaseInferenceContext):
             tok_pad_mask, 0, self.token_to_position_in_request[:padded_token_count]
         )
 
-        # Request-level padding.
-        n = self.padded_active_request_count
-        req_pad_mask = self._arange_requests[:n] >= self._real_request_count_gpu
-        self.active_request_query_lengths[:n] = torch.where(
-            req_pad_mask, 0, self.active_request_query_lengths[:n]
+        # Cumsums and derived values must be computed after padding.
+        torch.cumsum(
+            self.active_request_query_lengths[:n],
+            dim=0,
+            out=self.cu_active_request_query_lengths[1 : n + 1],
         )
-        self.active_request_to_kv_block_ids[:n] = torch.where(
-            req_pad_mask.unsqueeze(1), -1, self.active_request_to_kv_block_ids[:n]
+        self.active_request_last_token_idxs[:n].copy_(
+            self.cu_active_request_query_lengths[1 : n + 1]
+        )
+        self.active_request_last_token_idxs[:n] -= 1
+
+        # query_lengths is already padded, but request_kv_length_offsets is not.
+        torch.add(
+            self.active_request_query_lengths[:n],
+            self.request_kv_length_offsets[:n],
+            out=self.active_sequence_lengths[:n],
         )
         self.active_sequence_lengths[:n] = torch.where(
             req_pad_mask, 0, self.active_sequence_lengths[:n]
         )
+        torch.cumsum(
+            self.active_sequence_lengths[:n],
+            dim=0,
+            out=self.cu_active_sequence_lengths[1 : n + 1],
+        )
 
+    def build_active_kv_slices(self):
+        """Build active slices of tensors mutated by `_rewind_kv_cache`.
+
+        Must be re-run after KV-cache rewind so that `active_sequence_lengths`
+        reflects post-rewind offsets rather than the pre-forward snapshot.
+        """
+        n = self.padded_active_request_count
+        torch.add(
+            self.active_request_query_lengths[:n],
+            self.request_kv_length_offsets[:n],
+            out=self.active_sequence_lengths[:n],
+        )
+        # request_kv_length_offsets may have stale values at padding positions.
+        req_pad_mask = self._arange_requests[:n] >= self._real_request_count_gpu
+        self.active_sequence_lengths[:n] = torch.where(
+            req_pad_mask, 0, self.active_sequence_lengths[:n]
+        )
+        torch.cumsum(
+            self.active_sequence_lengths[:n],
+            dim=0,
+            out=self.cu_active_sequence_lengths[1 : n + 1],
+        )
 
     def run_attn_init_graph_body(self) -> None:
         """Graphable portion of `initialize_attention_state`."""
         self.build_active_slices()
-        self.pad_active_slices()
 
         self.active_attn_metadata["mha_metadata"].update(
             batch_dimensions=self.batch_dimensions,
