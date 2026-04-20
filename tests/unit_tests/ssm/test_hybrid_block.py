@@ -1,13 +1,13 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
 import torch
 
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-from megatron.core.ssm.mamba_block import MambaStack
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -21,7 +21,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.internal
-class TestMambaBlock:
+class TestHybridBlock:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -40,8 +40,8 @@ class TestMambaBlock:
             num_attention_heads=4,
             use_cpu_initialization=True,
         )
-        modules = mamba_stack_spec.submodules
-        return MambaStack(
+        modules = hybrid_stack_spec.submodules
+        return HybridStack(
             transformer_config,
             modules,
             layer_type_list=layer_type_list,
@@ -72,8 +72,8 @@ class TestMambaBlock:
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
         )
-        modules = mamba_stack_spec.submodules
-        return MambaStack(
+        modules = hybrid_stack_spec.submodules
+        return HybridStack(
             transformer_config,
             modules,
             layer_type_list=layer_type_list,
@@ -122,7 +122,7 @@ class TestMambaBlock:
         invalid_symbol = '+'
         assert invalid_symbol not in Symbols.VALID_LAYERS  # sanity check.
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
-        # validate_segment_layers() in mamba_hybrid_layer_allocation.py throws a ValueError.
+        # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):
             block = self.get_mamba_block(layer_pattern)
 
@@ -151,8 +151,8 @@ class TestMambaBlock:
             use_cpu_initialization=True,
             activation_func=torch.nn.functional.silu,
         )
-        modules = mamba_stack_spec.submodules
-        block = MambaStack(
+        modules = hybrid_stack_spec.submodules
+        block = HybridStack(
             transformer_config,
             modules,
             layer_type_list=layer_type_list,

@@ -83,7 +83,11 @@ runs:
           echo "apt attempt $i failed, retrying..."
           sleep 10
         done
-        curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+        for i in 1 2 3; do
+          curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh && break
+          echo "uv install attempt $i failed, retrying..."
+          sleep 10
+        done
 
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
