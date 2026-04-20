@@ -128,12 +128,6 @@ def initialize_megatron(
         print_rank_0("Enabling batch invariant mode globally")
         enable_batch_invariant_mode()
 
-    # Enable NVTX range profiling when profiling is active.
-    # Must be done before model modules with @nvtx_decorator are imported,
-    # since the decorator captures _nvtx_enabled at decoration (import) time.
-    if args.profile:
-        configure_nvtx_profiling(True)
-
     # torch.distributed initialization
     def finish_mpu_init():
         args = get_args()
