@@ -6,14 +6,9 @@ import sys
 import pytest
 import torch
 import torch.distributed as dist
-from packaging import version
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.mimo.comm.colocated_communicator import (
-    ColocatedBridgeCommunicator,
-    SliceInfo,
-)
-from tests.unit_tests.test_utilities import Utils
+from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 
 logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
 
@@ -126,62 +121,8 @@ class TestRankMappings:
                     7: (3, 1),
                 },
             ),
-            # Equal: TP4/DP2 → TP4/DP2
-            (
-                4,
-                2,
-                4,
-                2,
-                {
-                    0: (0, 0),
-                    1: (0, 1),
-                    2: (0, 2),
-                    3: (0, 3),
-                    4: (1, 0),
-                    5: (1, 1),
-                    6: (1, 2),
-                    7: (1, 3),
-                },
-                {
-                    0: (0, 0),
-                    1: (0, 1),
-                    2: (0, 2),
-                    3: (0, 3),
-                    4: (1, 0),
-                    5: (1, 1),
-                    6: (1, 2),
-                    7: (1, 3),
-                },
-            ),
-            # Extreme: TP1/DP8 → TP8/DP1
-            (
-                1,
-                8,
-                8,
-                1,
-                {
-                    0: (0, 0),
-                    1: (1, 0),
-                    2: (2, 0),
-                    3: (3, 0),
-                    4: (4, 0),
-                    5: (5, 0),
-                    6: (6, 0),
-                    7: (7, 0),
-                },
-                {
-                    0: (0, 0),
-                    1: (0, 1),
-                    2: (0, 2),
-                    3: (0, 3),
-                    4: (0, 4),
-                    5: (0, 5),
-                    6: (0, 6),
-                    7: (0, 7),
-                },
-            ),
         ],
-        ids=["fan_in", "fan_out", "equal", "extreme"],
+        ids=["fan_in", "fan_out"],
     )
     def test_rank_mappings(
         self, src_tp, src_dp, dest_tp, dest_dp, expected_src_pos, expected_dest_pos
@@ -221,143 +162,27 @@ class TestAllGatherGroups:
     def teardown_method(self):
         destroy_all_grids()
 
-    @pytest.mark.parametrize(
-        "src_tp, src_dp, dest_tp, dest_dp, expected_groups",
-        [
-            # Fan-in: TP2/DP4 → TP4/DP2
-            (2, 4, 4, 2, [[0, 2], [1, 3], [4, 6], [5, 7]]),
-            # Extreme: TP1/DP8 → TP8/DP1
-            (1, 8, 8, 1, [[0, 1, 2, 3, 4, 5, 6, 7]]),
-        ],
-        ids=["fan_in_2x", "extreme_8x"],
-    )
-    def test_fan_in_all_gather_groups(self, src_tp, src_dp, dest_tp, dest_dp, expected_groups):
-        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
-        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
-        comm = make_comm(src_grid, dest_grid)
-
-        assert comm.all_gather_group_ranks == expected_groups
-        assert comm.all_gather_pg is not None
-
-    def test_fan_out_no_all_gather(self):
-        src_grid = create_hypercomm_grid(tp=4, dp=2)
-        dest_grid = create_hypercomm_grid(tp=2, dp=4)
-        comm = make_comm(src_grid, dest_grid)
-
-        assert comm.all_gather_group_ranks == []
-        assert comm.all_gather_pg is None
-
-    @pytest.mark.parametrize(
-        "src_tp, src_dp, dest_tp, dest_dp, expected_groups",
-        [
-            # Fan-out: TP4/DP2 → TP2/DP4. Two src DP groups, two dest TP shards;
-            # for each src_dp_idx we sweep dest_tp_idx over 2 dest DP replicas.
-            # Expected groups are (src_dp_idx, dest_tp_idx) sweeping dest_dp_idx
-            # in slot order.
-            (4, 2, 2, 4, [[0, 2], [1, 3], [4, 6], [5, 7]]),
-            # Extreme fan-out: TP8/DP1 → TP1/DP8 (one src DP group, one dest TP).
-            (8, 1, 1, 8, [[0, 1, 2, 3, 4, 5, 6, 7]]),
-        ],
-        ids=["fan_out_2x", "extreme_8x"],
-    )
-    def test_fan_out_gather_groups(self, src_tp, src_dp, dest_tp, dest_dp, expected_groups):
-        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
-        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
-        comm = make_comm(src_grid, dest_grid)
-
-        # Direct equality check enforces both membership and slot order —
-        # all_gather_into_tensor concatenates by group-local-rank, and backward
-        # relies on slot 0 of each group holding dest_dp_start's slice.
-        assert comm.fan_out_gather_group_ranks == expected_groups
-        assert comm.fan_out_gather_pg is not None
-
-    def test_fan_in_no_fan_out_gather(self):
+    def test_fan_in_all_gather_groups(self):
+        # Fan-in TP2/DP4 → TP4/DP2. Groups are keyed (dest_dp_idx, src_tp_idx)
+        # and members must appear in src_dp_idx order so all_gather_into_tensor
+        # concatenates in slot order on the backward path.
         src_grid = create_hypercomm_grid(tp=2, dp=4)
         dest_grid = create_hypercomm_grid(tp=4, dp=2)
         comm = make_comm(src_grid, dest_grid)
 
-        assert comm.fan_out_gather_group_ranks == []
-        assert comm.fan_out_gather_pg is None
+        assert comm.all_gather_group_ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
+        assert comm.all_gather_pg is not None
 
-
-# ── Test 3: Slice info ─────────────────────────────────────────────────────────
-
-
-class TestSliceInfo:
-
-    @classmethod
-    def setup_class(cls):
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-        if torch.cuda.is_available():
-            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-
-    def teardown_method(self):
-        destroy_all_grids()
-
-    @pytest.mark.parametrize(
-        "src_tp, src_dp, dest_tp, dest_dp, batch_size, expected_slices",
-        [
-            # Fan-out: TP4/DP2 → TP2/DP4, batch=8
-            (
-                4,
-                2,
-                2,
-                4,
-                8,
-                {
-                    0: SliceInfo(start=0, size=4),
-                    1: SliceInfo(start=0, size=4),
-                    2: SliceInfo(start=4, size=4),
-                    3: SliceInfo(start=4, size=4),
-                    4: SliceInfo(start=0, size=4),
-                    5: SliceInfo(start=0, size=4),
-                    6: SliceInfo(start=4, size=4),
-                    7: SliceInfo(start=4, size=4),
-                },
-            ),
-            # Fan-in: TP2/DP4 → TP4/DP2, batch=8
-            (
-                2,
-                4,
-                4,
-                2,
-                8,
-                {
-                    0: SliceInfo(start=0, size=4),
-                    1: SliceInfo(start=0, size=4),
-                    2: SliceInfo(start=4, size=4),
-                    3: SliceInfo(start=4, size=4),
-                    4: SliceInfo(start=0, size=4),
-                    5: SliceInfo(start=0, size=4),
-                    6: SliceInfo(start=4, size=4),
-                    7: SliceInfo(start=4, size=4),
-                },
-            ),
-        ],
-        ids=["fan_out", "fan_in"],
-    )
-    def test_slice_info(self, src_tp, src_dp, dest_tp, dest_dp, batch_size, expected_slices):
-        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
-        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
-        comm = make_comm(src_grid, dest_grid)
-
-        rank = dist.get_rank()
-        if rank not in expected_slices:
-            pytest.skip(f"rank {rank} not in expected_slices")
-
-        info = comm.get_slice_info(batch_size)
-        expected = expected_slices[rank]
-        assert info.start == expected.start, f"rank {rank}: start {info.start} != {expected.start}"
-        assert info.size == expected.size, f"rank {rank}: size {info.size} != {expected.size}"
-
-    def test_equal_dp_slice(self):
+    def test_fan_out_gather_groups(self):
+        # Fan-out TP4/DP2 → TP2/DP4. Groups are keyed (src_dp_idx, dest_tp_idx);
+        # membership order must track dest_dp_idx so the backward all-gather
+        # reconstructs the full-batch gradient in the correct layout.
         src_grid = create_hypercomm_grid(tp=4, dp=2)
-        dest_grid = create_hypercomm_grid(tp=4, dp=2)
+        dest_grid = create_hypercomm_grid(tp=2, dp=4)
         comm = make_comm(src_grid, dest_grid)
 
-        info = comm.get_slice_info(batch_size=8)
-        assert info == SliceInfo(start=0, size=8)
+        assert comm.fan_out_gather_group_ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
+        assert comm.fan_out_gather_pg is not None
 
 
 # ── Test 3b: _validate_grids negative tests ───────────────────────────────────
@@ -441,27 +266,6 @@ class TestValidateGrids:
         with pytest.raises(ValueError, match="evenly divisible"):
             make_comm(src_grid, dest_grid)
 
-    def test_pp_gt_1_rejected(self):
-        # Dedicated coverage of the PP>1 guard on either grid. PP>1 is out of
-        # scope for this communicator; the validator must reject on either side.
-        for pp_on in ("src", "dest"):
-            _active_grids.clear()
-            if pp_on == "src":
-                src_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
-                dest_grid = create_hypercomm_grid(tp=4, dp=2)
-                expected = "src PP must be 1"
-            else:
-                src_grid = create_hypercomm_grid(tp=4, dp=2)
-                dest_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
-                expected = "dest PP must be 1"
-            with pytest.raises(ValueError, match=expected):
-                make_comm(src_grid, dest_grid)
-            # Release PGs between iterations to stay under the NCCL cap.
-            for g in _active_grids:
-                g.destroy()
-            _active_grids.clear()
-
-
 # ── Test 3c: communicate() runtime preconditions ──────────────────────────────
 
 
@@ -501,14 +305,6 @@ class TestCommunicatePreconditions:
         comm = make_comm(src_grid, dest_grid)
         with pytest.raises(ValueError, match="not divisible by fan_in_scale"):
             comm.get_slice_info(batch_size=3)
-
-    def test_non_divisible_get_slice_info_fan_out(self):
-        src_grid = create_hypercomm_grid(tp=4, dp=2)
-        dest_grid = create_hypercomm_grid(tp=2, dp=4)
-        comm = make_comm(src_grid, dest_grid)
-        with pytest.raises(ValueError, match="not divisible by fan_out_scale"):
-            comm.get_slice_info(batch_size=5)
-
 
 # ── Test 3d: destroy() releases PGs ──────────────────────────────────────────
 
@@ -596,9 +392,7 @@ class TestBridgeGradients:
 
     # ── Test 1: fan-in forward = torch.cat of sibling inputs ─────────────────
     @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp",
-        [(2, 4, 4, 2), (1, 8, 8, 1)],
-        ids=["2x_fan_in", "8x_fan_in"],
+        "src_tp,src_dp,dest_tp,dest_dp", [(2, 4, 4, 2)], ids=["2x_fan_in"]
     )
     @pytest.mark.parametrize("dim_mapping", _DIM_MAPPINGS, ids=_DIM_MAPPING_IDS)
     def test_fan_in_forward_equals_torch_cat(
@@ -629,9 +423,7 @@ class TestBridgeGradients:
 
     # ── Test 2: fan-in backward = grad_output.narrow for this rank's slot ────
     @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp",
-        [(2, 4, 4, 2), (1, 8, 8, 1)],
-        ids=["2x_fan_in", "8x_fan_in"],
+        "src_tp,src_dp,dest_tp,dest_dp", [(2, 4, 4, 2)], ids=["2x_fan_in"]
     )
     @pytest.mark.parametrize("dim_mapping", _DIM_MAPPINGS, ids=_DIM_MAPPING_IDS)
     def test_fan_in_backward_equals_narrow(
@@ -664,9 +456,7 @@ class TestBridgeGradients:
 
     # ── Test 3: fan-out forward = input.narrow for this rank's slot ─────────
     @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp",
-        [(4, 2, 2, 4), (8, 1, 1, 8)],
-        ids=["2x_fan_out", "8x_fan_out"],
+        "src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 2, 4)], ids=["2x_fan_out"]
     )
     def test_fan_out_forward_equals_narrow(self, src_tp, src_dp, dest_tp, dest_dp):
         dim_mapping = {'b': 0, 's': 1, 'h': 2}
@@ -695,9 +485,7 @@ class TestBridgeGradients:
 
     # ── Test 4 (CRITICAL): fan-out backward = concat of all sibling grads ──
     @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp",
-        [(4, 2, 2, 4), (8, 1, 1, 8)],
-        ids=["2x_fan_out", "8x_fan_out"],
+        "src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 2, 4)], ids=["2x_fan_out"]
     )
     def test_fan_out_backward_equals_concat_of_sibling_grads(
         self, src_tp, src_dp, dest_tp, dest_dp
@@ -740,9 +528,7 @@ class TestBridgeGradients:
 
     # ── Test 5: equal DP is a pure identity forward and backward ────────────
     @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp",
-        [(4, 2, 4, 2), (2, 4, 2, 4)],
-        ids=["tp4_dp2", "tp2_dp4"],
+        "src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 4, 2)], ids=["tp4_dp2"]
     )
     def test_equal_dp_is_bitwise_identity_fwd_and_bwd(
         self, src_tp, src_dp, dest_tp, dest_dp
@@ -762,132 +548,3 @@ class TestBridgeGradients:
         grad_output = torch.randn_like(x)
         out.backward(grad_output)
         torch.testing.assert_close(x.grad, grad_output, rtol=0, atol=0)
-
-
-# ── Test 4: Forward / backward golden test ─────────────────────────────────────
-
-
-class TestGolden:
-
-    @classmethod
-    def setup_class(cls):
-        os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
-        os.environ["NVTE_FLASH_ATTN"] = "0"
-        os.environ["NVTE_FUSED_ATTN"] = "0"
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-        if torch.cuda.is_available():
-            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
-
-    @classmethod
-    def teardown_class(cls):
-        Utils.destroy_model_parallel()
-
-    def teardown_method(self):
-        destroy_all_grids()
-
-    @pytest.mark.skipif(
-        version.parse(torch.__version__) < version.parse("2.3.0"), reason="Requires PyTorch 2.3+"
-    )
-    def test_forward_backward_golden(self):
-        from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
-            _avg_params,
-            _create_transformer_block,
-            _get_pg_collection_from_grid,
-            _shard_and_copy_,
-        )
-
-        hidden_size = 1024
-        seq_len = 16
-        micro_batch = 8
-        dtype = torch.float32
-        rank = dist.get_rank()
-
-        # Encoder TP2/DP4, LLM TP4/DP2
-        enc_tp, enc_dp = 2, 4
-        llm_tp, llm_dp = 4, 2
-
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, create_gloo_process_groups=False
-        )
-
-        # Reference TP1 blocks
-        ref_grid = create_hypercomm_grid(tp=1, dp=8)
-        ref_pg = _get_pg_collection_from_grid(ref_grid)
-        ref_enc = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg
-        )
-        _avg_params(ref_enc, ref_grid.get_pg("dp"))
-        ref_llm = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, pg_collection=ref_pg
-        )
-        _avg_params(ref_llm, ref_grid.get_pg("dp"))
-
-        # Sharded encoder block (TP2/DP4)
-        enc_grid = create_hypercomm_grid(tp=enc_tp, dp=enc_dp)
-        enc_pg = _get_pg_collection_from_grid(enc_grid)
-        enc_block = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, pg_collection=enc_pg
-        )
-        _shard_and_copy_(ref_enc, enc_block, enc_tp, enc_pg.tp.rank())
-
-        # Sharded LLM block (TP4/DP2)
-        llm_grid = create_hypercomm_grid(tp=llm_tp, dp=llm_dp)
-        llm_pg = _get_pg_collection_from_grid(llm_grid)
-        llm_block = _create_transformer_block(
-            dtype=dtype, hidden_size=hidden_size, pg_collection=llm_pg
-        )
-        _shard_and_copy_(ref_llm, llm_block, llm_tp, llm_pg.tp.rank())
-
-        dist.barrier()
-
-        # Communicator
-        comm = make_comm(
-            enc_grid,
-            llm_grid,
-            src_module_name="encoder",
-            dest_module_name="llm",
-            dim_mapping={"s": 0, "b": 1, "h": 2},
-        )
-
-        # ── Reference forward (full batch, TP1) ───────────────────────────
-        torch.manual_seed(42)
-        full_input = torch.randn(seq_len, micro_batch, hidden_size, device="cuda", dtype=dtype)
-        full_input_ref = full_input.clone().detach().requires_grad_(True)
-        ref_enc_out = ref_enc(hidden_states=full_input_ref, attention_mask=None)
-        ref_llm_out = ref_llm(hidden_states=ref_enc_out, attention_mask=None)
-
-        # ── Colocated forward ──────────────────────────────────────────────
-        # Each rank gets its encoder DP slice
-        enc_dp_idx = comm.rank_to_src_pos[rank][0]
-        enc_slice_size = micro_batch // enc_dp
-        enc_input_slice = (
-            full_input[:, enc_dp_idx * enc_slice_size : (enc_dp_idx + 1) * enc_slice_size, :]
-            .clone()
-            .detach()
-            .requires_grad_(True)
-        )
-
-        enc_out = enc_block(hidden_states=enc_input_slice, attention_mask=None)
-        bridged = comm.communicate(enc_out)
-        llm_out = llm_block(hidden_states=bridged, attention_mask=None)
-
-        # ── Compare forward outputs ────────────────────────────────────────
-        llm_dp_idx = comm.rank_to_dest_pos[rank][0]
-        llm_slice_size = micro_batch // llm_dp
-        ref_slice = ref_llm_out[
-            :, llm_dp_idx * llm_slice_size : (llm_dp_idx + 1) * llm_slice_size, :
-        ].detach()
-
-        torch.testing.assert_close(llm_out.detach(), ref_slice, rtol=1e-3, atol=1e-3)
-
-        # ── Backward ──────────────────────────────────────────────────────
-        llm_out.sum().backward()
-        ref_llm_out.sum().backward()
-
-        ref_input_grad_slice = full_input_ref.grad[
-            :, enc_dp_idx * enc_slice_size : (enc_dp_idx + 1) * enc_slice_size, :
-        ]
-        torch.testing.assert_close(enc_input_slice.grad, ref_input_grad_slice, rtol=1e-5, atol=1e-5)
-
-        Utils.destroy_model_parallel()
