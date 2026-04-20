@@ -236,8 +236,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
         self.deterministic_mode = config.deterministic_mode
 
-        self.use_inference_optimized_reduce_scatter = getattr(
-            config, 'use_inference_optimized_layers', False
+        self.use_inference_optimized_reduce_scatter = (
+            getattr(config, 'transformer_impl', None) == 'inference_optimized'
         )
         self.triton_nvls_kernels_allowed = (
             self.use_inference_optimized_reduce_scatter
