@@ -443,6 +443,11 @@ class MambaMixer(MegatronModule):
                     out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
+        # Dynamic CP group support
+        _orig_cp_group = self.cp.cp_group
+        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+            self.cp.set_context_parallel_group(packed_seq_params.cp_group)
+
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
@@ -460,6 +465,7 @@ class MambaMixer(MegatronModule):
 
         out, out_bias = self.out_proj(y)
 
+        self.cp.set_context_parallel_group(_orig_cp_group)
         return out, out_bias
 
     def _dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
@@ -579,14 +585,19 @@ class MambaMixer(MegatronModule):
         MambaMetadata.update() to avoid .item() calls and data-dependent
         control flow, enabling CUDA graph compatibility.
 
+        When padded_prefill_count > 0 but real_prefill_count == 0 (e.g. a
+        decode-only rank in expert parallelism that must match a mixed CUDA
+        graph), this function still executes the full kernel path.
+        The metadata reflects zero-length sequences (cu_seqlens all equal,
+        batch_indices all -1) so kernels produce a zero output tensor of the
+        correct padded shape, which is required by the merge logic in
+        _dynamic_inference.
+
         Intermediate state extraction (for Mamba prefix caching) is performed
         inside _ssm_prefill via pre-allocated output buffers, making it fully
         CUDA graph compatible.
         """
         metadata = context.mamba_metadata
-        real_prefill_count = context.batch_dimensions.prefill_req_count
-        if real_prefill_count <= 0:
-            return None
 
         # Use precomputed metadata (no .item() calls, no stripping).
         cu_seqlens = metadata.cu_seqlens

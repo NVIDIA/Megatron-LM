@@ -399,7 +399,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = apply_module(self.core_attention)(
+            output_ = self._run_core_attention(
                 query,
                 key,
                 value,
@@ -418,6 +418,29 @@ class Attention(MegatronModule, ABC):
         )
 
         return hidden_states
+
+    def _run_core_attention(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        **extra_kwargs,
+    ):
+        """Run the configured core attention module."""
+        return apply_module(self.core_attention)(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            **extra_kwargs,
+        )
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -617,8 +640,10 @@ class Attention(MegatronModule, ABC):
                 self.layer_number - pp_layer_offset, key, value
             )
 
-            _, max_seqlen_q = inference_context.cu_query_lengths()
-            if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
+            if (
+                getattr(self.config, "cache_mla_latents", None)
+                and not inference_context.is_decode_only()
+            ):
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
@@ -797,7 +822,7 @@ class Attention(MegatronModule, ABC):
         assert block_table is not None
 
         # Flash attn kernel.
-        if max_seqlen_q > 1:
+        if not is_decode_only:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
@@ -835,12 +860,19 @@ class Attention(MegatronModule, ABC):
                 )
             output_total = output_total.unsqueeze(1)
         else:  # decode only
+            # For speculative decoding, q arrives as (B*S, 1, H, D) where S is
+            # the number of tokens per request. Reshape to (B, S, H, D) so the
+            # decode kernel sees batch=num_requests and seqlen_q=tokens_per_request.
+            num_requests = seqlens_k.shape[0]
+            tokens_per_request = q.shape[0] // num_requests
+            q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
+
             # If using MLA we use the FlashMLA kernel
             if isinstance(self.config, MLATransformerConfig):
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
-                seq_len_q = 1  # Sequence length is 1 for decode
+                seq_len_q = tokens_per_request
                 num_heads_q = self.num_attention_heads_per_partition
                 num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
 
@@ -880,6 +912,12 @@ class Attention(MegatronModule, ABC):
                         not self.batch_invariant_mode
                     ), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
+
+            # Reshape back to (B*S, 1, H, D) for consistent output shape.
+            output_total = output_total.reshape(
+                num_requests * tokens_per_request, 1, *output_total.shape[2:]
+            )
+
         return output_total
 
     def forward(
@@ -1056,6 +1094,7 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = self.linear_proj(context_layer)
+            self.pg_collection.cp = _orig_cp_group
             return output, bias
 
         if (

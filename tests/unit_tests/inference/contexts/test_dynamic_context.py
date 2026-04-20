@@ -1400,6 +1400,100 @@ class TestDynamicContext:
         assert context.is_hybrid_model is True
 
     @pytest.mark.internal
+    @rounder_override(1)
+    @pytest.mark.parametrize("max_requests", [1, 4, 64])
+    def test_hybrid_max_requests_auto_derives_mamba_split(self, max_requests):
+        """
+        When max_requests is set on a hybrid model without mamba_memory_ratio,
+        mamba memory should be allocated for exactly max_requests slots, with
+        the remaining memory going to KV cache blocks.
+        """
+
+        buffer_gb = 0.05
+        paused_gb = 0.01
+        block_size = 256
+        num_attention_heads = 8
+        kv_channels = 64
+        params_dtype = torch.float32
+
+        layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
+        mamba_conv_states_shape = (544, 4)
+        mamba_ssm_states_shape = (8, 64, 16)
+        mamba_config = MambaInferenceStateConfig(
+            layer_type_list,
+            mamba_conv_states_shape,
+            mamba_ssm_states_shape,
+            params_dtype,
+            params_dtype,
+        )
+
+        context = DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=2,
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=buffer_gb,
+                paused_buffer_size_gb=paused_gb,
+                block_size_tokens=block_size,
+                max_tokens=2048,
+                mamba_inference_state_config=mamba_config,
+                max_requests=max_requests,
+                unified_memory_level=0,
+            ),
+        )
+
+        dtype_size = torch.tensor([], dtype=params_dtype).element_size()
+
+        mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
+        mamba_mem_per_req *= dtype_size
+
+        kv_buffer_bytes = int(buffer_gb * 1024**3)
+        kv_paused_bytes = int(paused_gb * 1024**3)
+        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
+
+        # Auto-derived ratio from max_requests.
+        mamba_memory_needed = max_requests * mamba_mem_per_req
+        ratio = mamba_memory_needed / total_mem_bytes
+
+        kv_buffer_bytes = int(kv_buffer_bytes * (1.0 - ratio))
+        kv_paused_bytes = int(kv_paused_bytes * (1.0 - ratio))
+
+        kv_block_size_bytes = dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels
+        expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
+
+        assert context.kv_block_allocator.total_count == expected_active_blocks
+        assert context.max_requests == max_requests
+
+        # With max_requests=1, more memory goes to KV blocks than with max_requests=64.
+        # Verify we get more blocks with fewer requests.
+        if max_requests == 1:
+            context_many = DynamicInferenceContext(
+                model_config=TransformerConfig(
+                    params_dtype=params_dtype,
+                    num_layers=2,
+                    kv_channels=kv_channels,
+                    num_attention_heads=num_attention_heads,
+                ),
+                inference_config=InferenceConfig(
+                    max_sequence_length=512,
+                    buffer_size_gb=buffer_gb,
+                    paused_buffer_size_gb=paused_gb,
+                    block_size_tokens=block_size,
+                    max_tokens=2048,
+                    mamba_inference_state_config=mamba_config,
+                    max_requests=64,
+                    unified_memory_level=0,
+                ),
+            )
+            assert (
+                context.kv_block_allocator.total_count > context_many.kv_block_allocator.total_count
+            )
+
+    @pytest.mark.internal
     @rounder_override(64)
     def test_max_requests_less_than_tp_size(self):
         tp_size = 2
@@ -1476,7 +1570,7 @@ class TestDynamicContext:
 
         # --- reset and run fast path ---
         ctx.reset()
-        ctx.add_dummy_requests_for_expert_parallel_step()
+        ctx.add_dummy_requests_for_expert_parallel_step(smallest)
 
         # 1. Scalar counts
         assert ctx.total_request_count == slow_total_request_count
@@ -2189,7 +2283,11 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 3, device='cuda')
+        # Use bs * 3 + 5 tokens so the prompt extends past the last full block.
+        # This avoids the single-token-chunk clamp (effective_prefill >= 2) and
+        # verifies that the prefix skip actually works.
+        tail = 5
+        prompt = torch.arange(bs * 3 + tail, device='cuda')
 
         # First request registers blocks.
         req1 = DynamicInferenceRequest(
@@ -2200,10 +2298,11 @@ class TestDynamicContext:
             enable_prefix_caching=True,
         )
         ctx.add_request(req1)
-        first_blocks = [ctx.request_to_kv_block_ids[0][i].item() for i in range(3)]
+        # 3 full blocks are prefix-cacheable; the 4th (partial) block is not.
+        first_full_blocks = [ctx.request_to_kv_block_ids[0][i].item() for i in range(3)]
         avail_after_first = ctx.kv_block_allocator.total_avail
 
-        # Second request with same prefix should share all blocks.
+        # Second request with same prefix should share the 3 full blocks.
         req2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt.clone(),
@@ -2212,18 +2311,21 @@ class TestDynamicContext:
             enable_prefix_caching=True,
         )
         ctx.add_request(req2)
-        second_blocks = [ctx.request_to_kv_block_ids[1][i].item() for i in range(3)]
+        second_full_blocks = [ctx.request_to_kv_block_ids[1][i].item() for i in range(3)]
 
-        # Blocks should be shared (same IDs, no pool consumption).
-        assert first_blocks == second_blocks
-        assert ctx.kv_block_allocator.total_avail == avail_after_first
+        # The 3 full blocks should be shared (same IDs).
+        assert first_full_blocks == second_full_blocks
 
-        # Ref counts should be 2.
-        for bid in first_blocks:
+        # Only 1 new block allocated for the partial tail of the second request.
+        assert ctx.kv_block_allocator.total_avail == avail_after_first - 1
+
+        # Ref counts on the shared full blocks should be 2.
+        for bid in first_full_blocks:
             assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
 
-        # Second request should skip prefix tokens (query_length == 1 for full match).
-        assert ctx.request_query_lengths[1].item() == 1
+        # Second request should skip the 3 full cached blocks (96 tokens),
+        # leaving only the trailing tokens as the query.
+        assert ctx.request_query_lengths[1].item() == tail
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2244,7 +2346,10 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
+        # Use bs * 2 + 5 tokens so the prompt extends past the last full block,
+        # avoiding the single-token-chunk clamp while still testing the skip.
+        tail = 5
+        prompt = torch.arange(bs * 2 + tail, device='cuda')
 
         # First request.
         req1 = DynamicInferenceRequest(
@@ -2266,10 +2371,10 @@ class TestDynamicContext:
         )
         ctx.add_request(req2)
 
-        # Full match: prefix_skip = min(2 * bs, 2*bs - 1) = 2*bs - 1
-        expected_skip = 2 * bs - 1
+        # 2 full blocks match → prefix_skip = 2 * bs = 64, query_length = tail.
+        expected_skip = 2 * bs
         assert ctx.request_kv_length_offsets[1].item() == expected_skip
-        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_query_lengths[1].item() == tail
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2733,6 +2838,67 @@ class TestDynamicContext:
         assert ctx.paused_speculative_tokens is not None
         assert ctx.paused_speculative_tokens[0, 0].item() == 100
         assert ctx.paused_speculative_tokens[1, 0].item() == 101
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_speculative_boundary_crossing_at_max_kv_block_count(self):
+        """Test that speculative pre-allocation works when a request has already
+        filled all ceil(max_seq_len / block_size) KV blocks.
+        """
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=32,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            num_speculative_tokens=2,
+            unified_memory_level=0,
+            max_tokens=512,
+            max_requests=512,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+        bs = ctx.block_size_tokens
+
+        # Setup 1 active decode request that has already filled all
+        # ceil(32/16) = 2 blocks, with the last block at offset 13.
+        # needs_new_block triggers at offset >= block_size - 1 - num_spec = 13.
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.active_token_count = 1
+
+        ctx.request_ids[0] = 10
+        ctx.request_query_lengths[0] = 1
+        ctx.request_kv_block_counts[0] = 2
+        ctx.request_kv_length_offsets[0] = bs + 14  # 16 + 14 = 30 tokens total
+        ctx.request_last_kv_block_offset[0] = 13  # 0-indexed, 14 tokens in last block
+
+        # Allocate 2 blocks manually.
+        blocks = ctx.kv_block_allocator.allocate_memory_blocks(2)
+        ctx.request_to_kv_block_ids[0, 0] = blocks[0]
+        ctx.request_to_kv_block_ids[0, 1] = blocks[1]
+        ctx.request_last_kv_block_id[0] = blocks[1]
+
+        active_requests_mask = torch.tensor([1], device='cuda')
+        new_tokens = torch.tensor([50], device='cuda')
+        new_speculative_tokens = torch.tensor([[51], [52]], device='cuda')
+
+        # This will pause the request (offset 13 >= 13), then resume it by
+        # allocating a 3rd block at col_idx=2. Without the fix, this raises
+        # an IndexError because request_to_kv_block_ids only has 2 columns.
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # Verify the 3rd block was allocated and assigned.
+        assert ctx.request_kv_block_counts[0] == 3
+        third_block = ctx.request_to_kv_block_ids[0, 2]
+        assert third_block != -1
+        assert third_block != blocks[0]
+        assert third_block != blocks[1]
 
     @pytest.mark.internal
     @rounder_override(64)

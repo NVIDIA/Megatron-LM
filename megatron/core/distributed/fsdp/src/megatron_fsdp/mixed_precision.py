@@ -275,9 +275,22 @@ def fp8_quantize(
     fsdp_shard_model_params = [x[0] if x[1] is None else x for x in fsdp_shard_model_params]
 
     if HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
-        cast_master_weights_to_fp8(
-            model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
-        )
+        args = [
+            model_params,
+            main_params,
+            start_offsets,
+            data_parallel_group,
+            fsdp_shard_model_params,
+        ]
+
+        # For newer TE versions (i.e., have post_all_gather_processing function), we keep the
+        # columnwise data and manually call post_all_gather_processing after all-gather, this
+        # makes fp8 params compatible with CUDA graph.
+        kwargs = {}
+        if HAVE_TE_POST_ALL_GATHER_PROCESSING:
+            kwargs["manual_post_all_gather_processing"] = True
+
+        cast_master_weights_to_fp8(*args, **kwargs)
     else:
         _fp8_quantize_fallback(
             model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params

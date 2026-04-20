@@ -708,8 +708,8 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
-    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+    moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+    """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
@@ -738,11 +738,33 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
+    dense_grouped_gemm: bool = False
+    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
+    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
+    """
+
+    log_moe_overload_factor: bool = False
+    """When True, log MoE overload metrics (avg/max vs balanced token count per step; max cum
+    overload = peak cumulative actual tokens / peak cumulative balanced count over interleaved
+    fwd/bwd) to TensorBoard/W&B and console. Records tokens_per_expert.sum() after dispatch;
+    use for debugging."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
+
+    moe_single_grouped_weight: bool = False
+    """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``.
+    """
+
+    moe_single_grouped_bias: bool = False
+    """When using TE GroupedLinear for MoE experts, store expert biases as a single grouped
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
+    and ``add_bias_linear=True``."""
 
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
@@ -771,6 +793,9 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
+
+    moe_permute_fusion_into_hybridep: bool = False
+    """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -816,18 +841,32 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
-    moe_hybridep_num_sms: int = 16
-    """Number of SMs to use for HybridEP. In pure NVL scenarios,
-    16 SMs can generally achieve good bandwidth."""
+    moe_hybridep_num_sms: Optional[int] = None
+    """Number of SMs to use for HybridEP. None uses the default from DeepEP.
+    In pure NVL scenarios, 16 SMs can generally achieve good bandwidth."""
+
+    moe_hybridep_num_blocks_permute: Optional[int] = None
+    """Number of cuda threads blocks to use for permute part in HybridEP. 
+    If permute_fusion_into_hybridep is True, this is the number of sms 
+    to use for the permute part."""
+
+    moe_hybridep_num_blocks_unpermute: Optional[int] = None
+    """Number of cuda threads blocks to use for unpermute part in HybridEP. 
+    If permute_fusion_into_hybridep is True, this is the number of sms to 
+    use for the unpermute part."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
     block interleaved format. Instead of interpreting the input tensor
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
-
     This data format is experimental and primarily intended to enable
     advanced fused kernels."""
+
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
+    exceeding this budget will be dropped. None means no token will be dropped. 
+    The default is None."""
 
     ##################
     # Context Parallel
@@ -1090,6 +1129,24 @@ class TransformerConfig(ModelParallelConfig):
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
 
+    moe_paged_stash: bool = False
+    """If True, enable paged stash for all routed-expert activations needed for backward"""
+
+    moe_paged_stash_page_size: int = 64
+    """Number of tokens per page for paged stash memory management."""
+
+    moe_paged_stash_buffer_size_factor_cuda: float = 1.10
+    """Scale factor for paged stash CUDA buffer allocation.
+
+    Sign selects sizing: positive = avg-based, negative = actual-max. Magnitude is headroom
+    (e.g. 1.10 = 10%)."""
+
+    moe_paged_stash_buffer_size_factor_cpu: float = 0.0
+    """Scale factor for paged stash host buffer. 0 disables host buffer.
+
+    Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
+    negative = actual-max; scale = abs(factor)."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1178,21 +1235,18 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_num_key_heads ({self.linear_num_key_heads})."
                 )
 
-                # Check tensor parallelism compatibility
-                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-                assert self.linear_num_key_heads % tp_cp_size == 0, (
-                    f"{self.linear_num_key_heads=} must be a multiple of "
-                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-                )
-                assert self.linear_num_value_heads % tp_cp_size == 0, (
-                    f"{self.linear_num_value_heads=} must be a multiple of "
-                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
-                )
+            # Check tensor parallelism compatibility
+            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            assert self.linear_num_key_heads % tp_cp_size == 0, (
+                f"{self.linear_num_key_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+            )
+            assert self.linear_num_value_heads % tp_cp_size == 0, (
+                f"{self.linear_num_value_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+            )
         elif self.experimental_attention_variant == "dsa":
-            assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            pass
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1284,6 +1338,14 @@ class TransformerConfig(ModelParallelConfig):
                     "(e.g. squared_relu)."
                 )
 
+            if self.fp8 == "mxfp8":
+                if not self.fp8_param:
+                    raise ValueError(
+                        "fp8_param must be enabled when using "
+                        "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
+                        "Please set --fp8-param-gather."
+                    )
+
             assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
                 f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
                 f"got '{self.inference_grouped_gemm_backend}'"
@@ -1304,10 +1366,37 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
 
-        if self.num_moe_experts is None:
-            assert (
-                self.moe_ffn_hidden_size is None
-            ), "moe_ffn_hidden_size must be None when num_experts is not set."
+        if self.num_moe_experts is None and self.moe_ffn_hidden_size is not None:
+            is_mixed_model = (
+                isinstance(self.moe_layer_freq, list) and 0 in self.moe_layer_freq
+            ) or (isinstance(self.moe_layer_freq, int) and self.moe_layer_freq > 1)
+            if is_mixed_model:
+                warnings.warn(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "This is expected for dense layers in a mixed dense/MoE model "
+                    "(moe_layer_freq indicates some layers remain dense). "
+                    "moe_ffn_hidden_size will be ignored for this layer."
+                )
+                self.moe_ffn_hidden_size = None
+            else:
+                raise ValueError(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "Please set num_moe_experts or remove moe_ffn_hidden_size."
+                )
+
+        if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+            if not self.moe_grouped_gemm:
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias require "
+                    "moe_grouped_gemm=True."
+                )
+            if not is_te_min_version("2.14.0"):
+                raise ValueError(
+                    "moe_single_grouped_weight and moe_single_grouped_bias require "
+                    f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
+                )
+        if self.moe_single_grouped_bias and not self.add_bias_linear:
+            raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
@@ -1381,6 +1470,18 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_expert_capacity_factor is None:
                 raise ValueError(
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
+                )
+
+        if self.moe_expert_rank_capacity_factor is not None:
+            if not self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires use_transformer_engine_op_fuser to "
+                    "be enabled."
+                )
+            if self.moe_flex_dispatcher_backend != "hybridep":
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
+                    "'hybridep'."
                 )
 
         if self.cpu_offloading and (
@@ -1535,13 +1636,25 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_layer_num must be a positive integer when "
                     "'mhc' is in recompute_modules."
                 )
-            if self.fine_grained_activation_offloading:
-                raise ValueError(
-                    "'mhc' in recompute_modules is incompatible with "
-                    "fine_grained_activation_offloading. The mHC recompute hook fires "
-                    "before the offloading backward chunk is initialized, causing "
-                    "tensor_pop on a None chunk. Disable one of them."
-                )
+            if self.fine_grained_activation_offloading and self.offload_modules:
+                # mHC checkpoints wrap input_layernorm (inside attn_norm offload context)
+                # and pre_mlp_layernorm (inside mlp_norm offload context). The unified
+                # recompute hook fires before GroupCommitFunction.backward() initializes
+                # the backward chunk, so tensor_pop hits a None chunk for these modules.
+                # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
+                # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
+                # checkpoints, so they are safe to use with mHC recompute.
+                _MHC_CONFLICTING_OFFLOAD_MODULES = {"attn_norm", "mlp_norm"}
+                conflicting = _MHC_CONFLICTING_OFFLOAD_MODULES & set(self.offload_modules)
+                if conflicting:
+                    raise ValueError(
+                        f"'mhc' in recompute_modules is incompatible with "
+                        f"offload_modules {conflicting}. The mHC recompute hook fires "
+                        f"before the offloading backward chunk is initialized for these "
+                        f"modules, causing tensor_pop on a None chunk. Remove "
+                        f"{conflicting} from offload_modules or remove 'mhc' from "
+                        f"recompute_modules."
+                    )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
@@ -1624,6 +1737,18 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
+        if self.moe_paged_stash:
+            assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
+            assert self.moe_expert_rank_capacity_factor is not None, (
+                "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
+                "there is no need to use paged stashing without it."
+            )
+            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            assert not moe_offload_conflict, (
+                "When moe_paged_stash is enabled, offload_modules must not include "
+                f"expert_fc1 or moe_act (paged stash covers those activations). "
+                f"Remove: {moe_offload_conflict}"
+            )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -1986,10 +2111,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
+            "sigmoid",
+            "sqrtsoftplus",
+        ):
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+                "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
+                "score functions. Please set --moe-router-score-function to 'sigmoid' or "
+                "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
 
         if self.num_moe_experts and self.fp8:
@@ -2115,7 +2244,7 @@ class TransformerConfig(ModelParallelConfig):
                 "local",
             ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
-            if self.cpu_offloading:
+            if self.cpu_offloading and self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
             if self.cuda_graph_impl == "local":
@@ -2221,9 +2350,13 @@ class TransformerConfig(ModelParallelConfig):
                         )
 
             if self.fine_grained_activation_offloading:
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                ), "fine_grained_activation_offloading must be used with TE impl of cuda_graph."
+                assert self.cuda_graph_impl == "transformer_engine" or (
+                    self.cuda_graph_impl == "local" and self.cuda_graph_scope == "full_iteration"
+                ), (
+                    "fine-grained activation offloading is only supported with "
+                    "transformer_engine CUDA graph implementation or local CUDA graph "
+                    "implementation with full_iteration scope."
+                )
                 assert (
                     CudaGraphScope.moe not in self.cuda_graph_scope
                 ), "Token-drop MoE is temporarily not supported with activation offloading."
@@ -2307,14 +2440,15 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if self.cuda_graph_impl != "none":
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                    and CudaGraphScope.moe not in self.cuda_graph_scope
-                    and CudaGraphScope.mlp not in self.cuda_graph_scope
-                ), (
-                    'CUDA graph scope on moe and mlp is not '
-                    'supported with overlap_moe_expert_parallel_comm'
-                )
+                if self.cuda_graph_impl == "transformer_engine":
+                    assert (
+                        self.cuda_graph_impl == "transformer_engine"
+                        and CudaGraphScope.moe not in self.cuda_graph_scope
+                        and CudaGraphScope.mlp not in self.cuda_graph_scope
+                    ), (
+                        'CUDA graph scope on moe and mlp is not '
+                        'supported with overlap_moe_expert_parallel_comm'
+                    )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
@@ -2326,6 +2460,19 @@ class TransformerConfig(ModelParallelConfig):
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
                 )
+
+        if self.overlap_dispatch_backward_with_experts_wgrad:
+            assert not self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be disabled when enabling '
+                'overlap_dispatch_backward_with_experts_wgrad.'
+            )
+            assert is_te_min_version(
+                "2.3.0"
+            ), 'TE version >= 2.3.0 is required for overlap_dispatch_backward_with_experts_wgrad'
+            assert not self.delay_wgrad_compute, (
+                'delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad '
+                'are mutually exclusive; use only one'
+            )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
@@ -2455,7 +2602,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"got '{self.moe_token_dispatcher_type}'"
             )
 
-            supported_schedulers = ['dp_balanced']
+            supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
             if (
                 self.sequence_packing_scheduler is not None
                 and self.sequence_packing_scheduler not in supported_schedulers

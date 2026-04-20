@@ -19,7 +19,10 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metrics_tracker,
+    get_moe_overload_factor_tracker,
+)
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
@@ -303,7 +306,7 @@ def permute(
     fused: bool = False,
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
-    align_size: int = -1,
+    align_size: int = 0,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -365,7 +368,11 @@ def permute(
                 "fused_permute_with_probs typically requires TE >= 2.1.0, and "
                 "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
+        if (
+            fused_permute_and_pad_with_probs is not None
+            and tokens_per_expert is not None
+            and align_size > 0
+        ):
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
@@ -688,8 +695,8 @@ def topk_routing_with_score_function(
         group_topk (int, optional): Number of selected groups for each token. Defaults to None.
         scaling_factor (float, optional): Scaling factor of routing score in top-k selection.
                                          Defaults to None.
-        score_function (str, optional): The score function to use. Can be either "softmax" or
-                                        "sigmoid". Defaults to "softmax".
+        score_function (str, optional): The score function to use. Can be "softmax", "sigmoid"
+                                        or "sqrtsoftplus". Defaults to "softmax".
         expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
                                               Defaults to None.
         fused (bool, optional): Whether to use the fused version. Defaults to False.
@@ -722,6 +729,11 @@ def topk_routing_with_score_function(
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
                 "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
+            )
+        if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
+            raise ValueError(
+                "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
         return fused_topk_with_score_function(
             logits=logits,
@@ -775,19 +787,26 @@ def topk_routing_with_score_function(
                 scores, topk, num_groups, group_topk, _compute_topk
             )
 
+    # Precision notes:
+    # - Logits are converted to fp32 for score functions.
+    # - All the intermediate calculations are in fp32.
+    # - The final probs are casted to the same dtype as the logits.
     if score_function == "softmax":
         if use_pre_softmax:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         else:
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
-    elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits.float()).type_as(logits)
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
+    elif score_function in ("sigmoid", "sqrtsoftplus"):
+        if score_function == "sigmoid":
+            scores = torch.sigmoid(logits.float())
+        else:
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
         if expert_bias is not None:
-            scores_for_routing = scores + expert_bias
+            scores_for_routing = scores + expert_bias.float()
             _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
-            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            scores = torch.gather(scores, dim=1, index=top_indices)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
@@ -796,6 +815,8 @@ def topk_routing_with_score_function(
 
     if scaling_factor:
         probs = probs * scaling_factor
+
+    probs = probs.type_as(logits)
 
     if dense_output:
         return probs, top_indices
@@ -831,7 +852,8 @@ def compute_routing_scores_for_aux_loss(
     Args:
         logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
         topk (int): The number of top-k indices to compute.
-        score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
+        score_function (str): The score function to use. Can be "softmax", "sigmoid"
+                              or "sqrtsoftplus".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
@@ -845,6 +867,11 @@ def compute_routing_scores_for_aux_loss(
             raise ValueError(
                 "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
             )
+        if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
+            raise ValueError(
+                "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
+                "Please upgrade Transformer Engine or disable moe_router_fusion."
+            )
         routing_map, scores = fused_compute_score_for_moe_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
@@ -852,8 +879,10 @@ def compute_routing_scores_for_aux_loss(
         if score_function == "softmax":
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif score_function == "sigmoid":
-            # Cast logits to float32 before sigmoid for stability
-            scores = torch.sigmoid(logits.to(torch.float32))
+            scores = torch.sigmoid(logits.float())
+            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+        elif score_function == "sqrtsoftplus":
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
@@ -976,6 +1005,82 @@ def save_to_aux_losses_tracker(
 def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
     get_moe_metrics_tracker().clear()
+
+
+class RecordDispatchTokenCountsFunction(torch.autograd.Function):
+    """Autograd hook: post-dispatch token totals for overload reporting (see report())."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        local_balanced_token_count: torch.Tensor,
+        layer_number: Optional[int],
+    ):
+        """Record actual token total and balanced count on forward; pass tensor through.
+
+        Args:
+            tensor: Tensor in the autograd graph (e.g. dispatched_input) — pass-through.
+            tokens_per_expert: Per-local-expert counts from dispatch_postprocess (any
+                device).
+            local_balanced_token_count: Scalar float, num_local_tokens * topk (token
+                rows from forward hidden_states).
+            layer_number: Layer index (1-based).
+
+        Returns:
+            tensor unchanged.
+        """
+        if layer_number is None:
+            return tensor
+
+        tokens_on_rank = (
+            tokens_per_expert.detach().sum().to(device=tensor.device, dtype=torch.float32)
+        )
+
+        balanced = local_balanced_token_count.detach().to(device=tensor.device, dtype=torch.float32)
+
+        tracker = get_moe_overload_factor_tracker()
+        tracker.record_fwd(layer_number, tokens_on_rank, balanced)
+
+        ctx.save_for_backward(tokens_on_rank, balanced)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: append negated actual and balanced count for paired cumsums."""
+        if ctx.saved_tensors:
+            tokens_on_rank, balanced = ctx.saved_tensors
+            get_moe_overload_factor_tracker().record_bwd(tokens_on_rank, balanced)
+        return grad_output, None, None, None
+
+
+def record_dispatch_token_counts(
+    tensor: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    local_balanced_token_count: torch.Tensor,
+    layer_number: Optional[int],
+) -> torch.Tensor:
+    """Wrap tensor with an autograd hook for dispatch token counts (overload metrics).
+
+    Records tokens_per_expert.sum() on this rank and the balanced token count scalar.
+    Overload factors are computed later in MoEOverloadFactorTracker.report(). Process groups
+    must already be registered on the global tracker (MoELayer does this in __init__
+    when log_moe_overload_factor is enabled).
+
+    Args:
+        tensor: Tensor in the autograd graph (typically dispatched_input).
+        tokens_per_expert: Output of dispatch_postprocess (per-expert counts).
+        local_balanced_token_count: Scalar float, num_local_tokens * moe_router_topk
+            (num_local_tokens from MoE forward hidden_states shape).
+        layer_number: Layer index (1-based).
+
+    Returns:
+        tensor unchanged.
+    """
+    return RecordDispatchTokenCountsFunction.apply(
+        tensor, tokens_per_expert, local_balanced_token_count, layer_number
+    )
 
 
 @deprecated(
@@ -1318,7 +1423,8 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    return 16
+    # Only FP8 or FP4 requires padding. Defaults to 0.
+    return 0
 
 
 def skip_routed_expert_padding(config: TransformerConfig) -> bool:

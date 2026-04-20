@@ -23,6 +23,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser = add_inference_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces).",
+    )
+    parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
     )
     return parser
@@ -30,7 +36,10 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
 
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine, coordinator_port: int, server_port: int
+    engine: DynamicInferenceEngine,
+    coordinator_port: int,
+    server_port: int,
+    hostname: str | None = None,
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -45,7 +54,9 @@ async def run_text_generation_server(
     rank = torch.distributed.get_rank()
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=coordinator_port, launch_inference_coordinator=True
+        inference_coordinator_port=coordinator_port,
+        launch_inference_coordinator=True,
+        hostname=hostname,
     )
 
     try:
@@ -57,6 +68,7 @@ async def run_text_generation_server(
                 rank=rank,
                 server_port=server_port,
                 verbose=args.inference_text_gen_server_logging,
+                hostname=hostname,
             )
 
         # Await the engine loop directly since the server is running in a separate process
@@ -85,7 +97,9 @@ if __name__ == "__main__":
 
         try:
             asyncio.run(
-                run_text_generation_server(engine, args.inference_coordinator_port, args.port)
+                run_text_generation_server(
+                    engine, args.inference_coordinator_port, args.port, args.host
+                )
             )
         except KeyboardInterrupt:
             # Catching at the top level ensures clean stdout without spamming the traceback

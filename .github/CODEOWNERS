@@ -1,10 +1,8 @@
 * @NVIDIA/core-nemo @NVIDIA/core-devtech
 
-megatron/training/ @NVIDIA/training-adlr @NVIDIA/training-nemo
-megatron/training/arguments.py
-
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
+.github/oncall_schedule.json @NVIDIA/mcore-oncall-rotation
 .gitlab-ci.yml @NVIDIA/ci
 docker/  @NVIDIA/ci
 tests/unit_tests/run_ci_test.sh @NVIDIA/ci
