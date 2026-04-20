@@ -26,6 +26,10 @@ class DeferredReleaseRegistry:
 
     **WARNING**: due to the lack of "pytorch allocation stream" detection,
     we only assume a 2-stream (comm vs. comp) setup
+    
+    TODO: currently DeepEP's internal record_stream (on its own streams) might still get leaked
+    Need further testing and consider adding this protection inside DeepEP too. 
+    Hybrid EP currently should work fine
 
     During CUDA graph capture, record_stream() causes deferred frees in PyTorch's caching
     allocator that never resolve (because cudaEventQuery never returns True during capture),
