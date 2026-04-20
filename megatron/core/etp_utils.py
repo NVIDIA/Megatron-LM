@@ -6,6 +6,11 @@
 
 import torch
 
+try:
+    from transformer_engine.pytorch.module.extended_tensor_parallelism import wrap_module_params_etp
+except ImportError:
+    wrap_module_params_etp = None
+
 
 class ETPEmbeddingWeight(torch.autograd.Function):
     """All-gather embedding weight across the ETP group in the forward pass,

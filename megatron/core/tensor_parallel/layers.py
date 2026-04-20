@@ -42,7 +42,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility
-from megatron.core.etp_utils import ETPEmbeddingWeight
+from megatron.core.etp_utils import ETPEmbeddingWeight, wrap_module_params_etp
 
 _grad_accum_fusion_available = True
 try:
@@ -53,7 +53,6 @@ except ImportError:
 try:
     import transformer_engine  # pylint: disable=unused-import
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
-    from transformer_engine.pytorch.module.extended_tensor_parallelism import wrap_module_params_etp
 
     HAVE_TE = True
 except ImportError:
@@ -271,7 +270,12 @@ class VocabParallelEmbedding(torch.nn.Module):
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
         self.ps_size = 1
-        if ps_group is not None:
+        if ps_group is not None and ps_group.size() > 1:
+            assert wrap_module_params_etp is not None, (
+                "parameter_sharding_size > 1 requires a transformer_engine "
+                "version that exports wrap_module_params_etp "
+                "(transformer_engine.pytorch.module.extended_tensor_parallelism)"
+            )
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()
             # Nothing prefetches embedding — it is head of the UNGRAPHED
@@ -905,7 +909,12 @@ class ColumnParallelLinear(torch.nn.Module):
             self.weight = None
 
         self.ps_size = 1
-        if ps_group is not None:
+        if ps_group is not None and ps_group.size() > 1:
+            assert wrap_module_params_etp is not None, (
+                "parameter_sharding_size > 1 requires a transformer_engine "
+                "version that exports wrap_module_params_etp "
+                "(transformer_engine.pytorch.module.extended_tensor_parallelism)"
+            )
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()
 
@@ -1237,7 +1246,12 @@ class RowParallelLinear(torch.nn.Module):
         setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
         
         self.ps_size = 1
-        if ps_group is not None:
+        if ps_group is not None and ps_group.size() > 1:
+            assert wrap_module_params_etp is not None, (
+                "parameter_sharding_size > 1 requires a transformer_engine "
+                "version that exports wrap_module_params_etp "
+                "(transformer_engine.pytorch.module.extended_tensor_parallelism)"
+            )
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()
 
