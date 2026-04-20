@@ -249,7 +249,6 @@ def _multimem_reduce_scatter_v_kernel(
             (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
             st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
-
 def multimem_reduce_scatter_v(
     output_tensor: torch.Tensor,
     input_tensor: torch.Tensor,
