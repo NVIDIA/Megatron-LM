@@ -41,6 +41,12 @@ elif HAVE_TRITON:
         return tl.math.log1p(tl.exp(dt))
 
 
+@triton.jit
+def fast_exp(x):
+    LOG2E = tl.constexpr(1.4426950408889634)
+    return tl.math.exp2(LOG2E * x)
+
+
 @triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
 @triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
 @triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
@@ -49,7 +55,7 @@ elif HAVE_TRITON:
 )
 @triton.heuristics({"HAS_INT_STATE": lambda args: args["int_state_ptr"] is not None})
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
-@triton.jit
+@triton.jit(do_not_specialize=["batch"])
 def _selective_scan_update_kernel(
     # Pointers to matrices
     state_ptr,
@@ -223,14 +229,14 @@ def _selective_scan_update_kernel(
                 dt += tl.load(dt_bias_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
             if DT_SOFTPLUS:
                 dt = tl.where(dt <= 20.0, softplus(dt), dt)
-            dA = tl.exp(A * dt[:, None])
+            dA = fast_exp(A * dt[:, None])
         else:
             dt = tl.load(dt_ptr + s * stride_dt_seq).to(tl.float32)
             if HAS_DT_BIAS:
                 dt += tl.load(dt_bias_ptr).to(tl.float32)
             if DT_SOFTPLUS:
                 dt = tl.where(dt <= 20.0, softplus(dt), dt)
-            dA = tl.exp(A * dt)
+            dA = fast_exp(A * dt)
 
         # Load B and C
         B = tl.load(B_s_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
@@ -368,15 +374,23 @@ def selective_state_update(
         (z.stride(0), z.stride(1), z.stride(2), z.stride(3)) if z is not None else (0, 0, 0, 0)
     )
 
-    BLOCK_SIZE_M, num_warps = (
-        (32, 4)
-        if dstate <= 16
-        else (
-            (16, 4)
-            if dstate <= 32
-            else ((8, 4) if dstate <= 64 else ((4, 4) if dstate <= 128 else ((4, 8))))
-        )
-    )
+    is_blackwell = torch.cuda.get_device_capability(x.device)[0] >= 10
+    
+    # Default
+    BLOCK_SIZE_M, num_warps = 4, 8
+    if dstate <= 16:
+        BLOCK_SIZE_M, num_warps = 32, 4
+    elif dstate <= 32:
+        BLOCK_SIZE_M, num_warps = 16, 4
+    elif dstate <= 64:
+        BLOCK_SIZE_M, num_warps = 8, 4
+    else:
+        # dstate > 64
+        if is_blackwell:
+            # Optimized for B200 with dstate>64
+            BLOCK_SIZE_M, num_warps = 32, 8
+        elif dstate <= 128:
+            BLOCK_SIZE_M, num_warps = 4, 4
 
     tie_hdim = (
         A.stride(-1) == 0
