@@ -80,16 +80,18 @@ def inprocess_restart(train, args):
     )
 
     class AbortCheckpoint(inprocess.abort.Abort):
+        def __init__(self, async_strategy):
+            self.async_strategy = async_strategy
         def __call__(
             self, state: inprocess.state.FrozenState
         ) -> inprocess.state.FrozenState:
-            reset_persistent_async_worker()
+            reset_persistent_async_worker(self.async_strategy)
             return state
 
     abort = inprocess.Compose(
         inprocess.abort.AbortTransformerEngine(),
         inprocess.abort.AbortTorchDistributed(),
-        AbortCheckpoint(),
+        AbortCheckpoint(args.async_strategy),
         inprocess.nested_restarter.NestedRestarterHandlingStarting(),
     )
     completion = inprocess.nested_restarter.NestedRestarterFinalized()

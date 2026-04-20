@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -12,6 +12,7 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -36,7 +37,7 @@ from megatron.core.utils import (
 )
 
 if TYPE_CHECKING:
-    from megatron.core.ssm.mamba_block import MambaStackSubmodules
+    from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
@@ -50,14 +51,10 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.padding_causal,
 ]
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TESpecProvider = None
 
 
 def tie_word_embeddings_state_dict(
@@ -612,44 +609,6 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
-def compute_mtp_inference_logits(
-    hidden_states: Tensor,
-    mtp_num_layers: int,
-    output_layer: Callable,
-    output_weight: Optional[Tensor],
-    runtime_gather_output: Optional[bool],
-) -> tuple:
-    """Compute MTP logits for inference mode.
-
-    Splits the concatenated hidden states and generates logits for each MTP layer.
-
-    Args:
-        hidden_states (Tensor): Concatenated hidden states from main + MTP layers.
-        mtp_num_layers (int): Number of MTP layers.
-        output_layer (Callable): Output layer method to compute logits.
-        output_weight (Optional[Tensor]): Optional output weight for shared embeddings.
-        runtime_gather_output (Optional[bool]): Whether to gather output at runtime.
-
-    Returns:
-        tuple: (hidden_states, mtp_logits_cache) where hidden_states is the main hidden
-            states and mtp_logits_cache is a tensor of shape
-            [mtp_num_layers, batch_size, vocab_size].
-    """
-    hidden_states_list = torch.chunk(hidden_states, 1 + mtp_num_layers, dim=0)
-    hidden_states = hidden_states_list[0]
-    mtp_inference_logits = []
-    for mtp_layer_number in range(mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        # mtp logits shape [b, 1, vocab size]
-        mtp_inference_logits.append(mtp_logits.squeeze(1).unsqueeze(0))
-    mtp_logits_cache = torch.cat(mtp_inference_logits, dim=0)
-    return hidden_states, mtp_logits_cache
-
-
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -777,27 +736,41 @@ class MultiTokenPredictionLayer(MegatronModule):
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # For Mamba path - pattern and submodules to build inner layers directly
+        # For hybrid path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
-        mamba_submodules: Optional[MambaStackSubmodules] = None,
+        hybrid_submodules: Optional[HybridStackSubmodules] = None,
+        mamba_submodules: Optional[HybridStackSubmodules] = None,
     ):
         super().__init__(config=config)
+        if mamba_submodules is not None:
+            if hybrid_submodules is not None:
+                raise ValueError(
+                    "Cannot specify both hybrid_submodules and mamba_submodules. "
+                    "mamba_submodules has been deprecated; use hybrid_submodules instead."
+                )
+            warnings.warn(
+                "mamba_submodules has been deprecated. Use hybrid_submodules instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            hybrid_submodules = mamba_submodules
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
+        self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
 
         # Validate attention mask type if using transformer-based inner layers
         if self.submodules.mtp_model_layer is not None and hasattr(
             self.submodules.mtp_model_layer, 'submodules'
         ):
-            from megatron.core.ssm.mamba_block import MambaStackSubmodules
+            from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
             from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 
             layer_submodules = None
-            if isinstance(self.submodules.mtp_model_layer.submodules, MambaStackSubmodules):
+            if isinstance(self.submodules.mtp_model_layer.submodules, HybridStackSubmodules):
                 attention_layer_spec = self.submodules.mtp_model_layer.submodules.attention_layer
                 if hasattr(attention_layer_spec, 'submodules'):
                     assert isinstance(attention_layer_spec.submodules, TransformerLayerSubmodules)
@@ -845,18 +818,19 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
+            tp_group=pg_collection.tp if pg_collection is not None else None,
         )
 
         # Build inner layers: two possible paths
-        # 1. Mamba path: use MambaStack for hybrid pattern support
+        # 1. Hybrid path: use HybridStack for hybrid pattern support
         # 2. GPT path: single TransformerLayer
-        if mtp_layer_pattern is not None and mamba_submodules is not None:
-            from megatron.core.ssm.mamba_block import MambaStack
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
+        if mtp_layer_pattern is not None and hybrid_submodules is not None:
+            from megatron.core.models.hybrid.hybrid_block import HybridStack
+            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 
-            self.mtp_model_layer = MambaStack(
+            self.mtp_model_layer = HybridStack(
                 config=self.config,
-                submodules=mamba_submodules,
+                submodules=hybrid_submodules,
                 layer_type_list=validate_segment_layers(mtp_layer_pattern),
                 pp_layer_offset=0,
                 pre_process=True,  # Always receives input from eh_proj
@@ -876,6 +850,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 vp_stage=self.vp_stage,
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
+                pg_collection=pg_collection,
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -947,10 +922,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
         # the gradient in backward pass and was therefore incorrect in this context.
         # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-        hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
+        hidden_states = gather_from_tensor_model_parallel_region(hidden_states, group=self.tp_group)
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
-            hidden_states = scatter_to_sequence_parallel_region(hidden_states)
+            hidden_states = scatter_to_sequence_parallel_region(hidden_states, group=self.tp_group)
         return hidden_states
 
     def _proj_and_transformer_layer(
@@ -1307,18 +1282,31 @@ class MultiTokenPredictionBlock(MegatronModule):
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # New: For Mamba path with unified pattern syntax
+        # New: For hybrid path with unified pattern syntax
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
-        mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        hybrid_submodules: Optional["HybridStackSubmodules"] = None,
+        mamba_submodules: Optional["HybridStackSubmodules"] = None,
     ):
         super().__init__(config=config)
+        if mamba_submodules is not None:
+            if hybrid_submodules is not None:
+                raise ValueError(
+                    "Cannot specify both hybrid_submodules and mamba_submodules. "
+                    "mamba_submodules has been deprecated; use hybrid_submodules instead."
+                )
+            warnings.warn(
+                "mamba_submodules has been deprecated. Use hybrid_submodules instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            hybrid_submodules = mamba_submodules
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
-        self.mamba_submodules = mamba_submodules
+        self.hybrid_submodules = hybrid_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
 
         vp_size = config.virtual_pipeline_model_parallel_size
@@ -1333,7 +1321,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             # Use default MPU process groups if not provided
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp'])
         else:
             # Ensure the provided process groups include CP
             assert hasattr(
@@ -1365,7 +1353,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                 )
             return module
 
-        def build_layer_with_pattern(layer_spec, layer_number, mtp_layer_pattern, mamba_submodules):
+        def build_layer_with_pattern(
+            layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
+        ):
             """Build layer using pattern-based approach (new Mamba path)."""
             fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
@@ -1376,12 +1366,12 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
-                    mamba_submodules=mamba_submodules,
+                    hybrid_submodules=hybrid_submodules,
                 )
             return module
 
-        # New Mamba path: use mtp_layer_pattern and mamba_submodules
-        if self.mtp_layer_pattern is not None and self.mamba_submodules is not None:
+        # New Mamba path: use mtp_layer_pattern and hybrid_submodules
+        if self.mtp_layer_pattern is not None and self.hybrid_submodules is not None:
             if self.mtp_use_repeated_layer:
                 # Shared/repeated layer: build one layer, use it for all depths
                 layer_spec = self.submodules.layer_specs[0]
@@ -1389,7 +1379,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_spec,
                     layer_number=1,
                     mtp_layer_pattern=self.mtp_layer_pattern,
-                    mamba_submodules=self.mamba_submodules,
+                    hybrid_submodules=self.hybrid_submodules,
                 )
                 self.layers = torch.nn.ModuleList([shared_layer])
             else:
@@ -1402,7 +1392,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                             ],
                             layer_number=i + 1,
                             mtp_layer_pattern=self.mtp_layer_pattern,
-                            mamba_submodules=self.mamba_submodules,
+                            hybrid_submodules=self.hybrid_submodules,
                         )
                         for i in range(num_depths)
                     ]
@@ -1501,7 +1491,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction module.
         """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
             offset = get_mtp_layer_offset(self.config, self.vp_stage)

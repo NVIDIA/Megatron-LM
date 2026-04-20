@@ -75,10 +75,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             raw_text=choice.raw_text,
             token_ids=choice.prompt_token_ids + choice.generation_token_ids,
             logprobs=choice.generation_log_probs,
+            finish_reason=choice.finish_reason,
             prompt_length=len(choice.prompt_token_ids),
-            policy_staleness=choice.policy_staleness,
-            kv_cache_staleness=choice.kv_cache_staleness,
-            completed_at_step=args.curr_iteration,
+            policy_epoch=choice.policy_epoch,
+            kv_cache_epoch=choice.kv_cache_epoch,
             num_evictions=getattr(choice, 'num_evictions', 0),
         )
 
@@ -166,9 +166,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
             stop_text_gen_server()
 
-    def increment_staleness(self):
+    def set_generation_epoch(self, generation_epoch: int):
         if dist.get_rank() == 0:
-            self._client.increment_staleness()
+            self._client.set_generation_epoch(generation_epoch)
 
     async def suspend(self):
         if dist.get_rank() == 0:

@@ -8,6 +8,7 @@ ENV_VARS:
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   USE_MNNVL: 1
 TEST_TYPE: "release"
+LAUNCHER: ft_launcher
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -93,6 +94,8 @@ MODEL_ARGS:
   --bf16: true
   --exit-interval: 13000
   --wandb-save-dir: ${WANDB_SAVE_PATH}
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 METRICS:
   - "iteration-time"
   - "lm loss"
