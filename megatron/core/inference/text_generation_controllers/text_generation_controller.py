@@ -929,11 +929,12 @@ class TextGenerationController:
             mtp_logits_2d = None
             if has_mtp:
                 nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/forward")
+                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
                 current_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=current_hidden,
                     next_token_ids=token_ids_buf,
                     position_ids=position_ids_buf,
-                    depth=depth,
+                    depth=mtp_depth,
                 )
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
@@ -1690,11 +1691,12 @@ class TextGenerationController:
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
+                mtp_depth = None if unwrapped_model.mtp.mtp_use_repeated_layer else depth
                 dummy_hidden, mtp_logits = unwrapped_model.compute_mtp_single_step(
                     hidden_states=dummy_hidden,
                     next_token_ids=dummy_token_ids,
                     position_ids=dummy_position_ids,
-                    depth=depth,
+                    depth=mtp_depth,
                 )
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 

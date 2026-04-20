@@ -1528,7 +1528,7 @@ class CudaGraphManager(torch.nn.Module):
                     padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
                     runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
             elif is_mtp_inference:
-                mtp_key = ('mtp', kwargs['hidden_states'].shape)
+                mtp_key = ('mtp', kwargs['hidden_states'].shape, kwargs.get('depth'))
                 runner = self.inference_cudagraphs_lookup_table.get(mtp_key)
             else:
                 # Todo: For training, we could also cache runners based on input shape.

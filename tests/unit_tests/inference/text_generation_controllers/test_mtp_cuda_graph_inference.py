@@ -170,7 +170,6 @@ class TestMTPCudaGraphInference:
                 hidden_states=dummy_hidden,
                 next_token_ids=dummy_token_ids,
                 position_ids=dummy_position_ids,
-                depth=0,
             )
         _set_capture_end()
 
@@ -208,7 +207,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
         # Clone immediately — CUDA graph output buffers are reused on next call.
         h_graph = h_graph.clone()
@@ -220,7 +218,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
 
         torch.testing.assert_close(h_graph, h_eager)
@@ -257,7 +254,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden_sp.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
         h_graph = h_graph.clone()
         logits_graph = logits_graph.clone()
@@ -268,7 +264,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden_sp.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
 
         torch.testing.assert_close(h_graph, h_eager)
@@ -485,7 +480,6 @@ class TestMTPCudaGraphInference:
                 hidden_states=current_hidden,
                 next_token_ids=token_ids.clone(),
                 position_ids=position_ids.clone(),
-                depth=depth,
             )
             # Clone — graph output buffers are reused.
             current_hidden = current_hidden.clone()
@@ -528,7 +522,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -696,7 +689,6 @@ class TestMTPCudaGraphExpertParallel:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -730,7 +722,7 @@ class TestMTPCudaGraphExpertParallel:
 
         # All ranks must complete without hanging.
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids, depth=0
+            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -847,7 +839,6 @@ class TestMTPCudaGraphExpertParallel:
             hidden_states=dummy_hidden,
             next_token_ids=dummy_tokens,
             position_ids=dummy_positions,
-            depth=0,
         )
 
         assert h_out.shape == (tp_size, 1, self.HIDDEN_SIZE)

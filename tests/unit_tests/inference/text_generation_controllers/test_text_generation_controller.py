@@ -1539,7 +1539,7 @@ class TestTextGenerationController:
 
         captured_position_ids = []
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
             captured_position_ids.append(position_ids.clone())
             return hidden_states, torch.randn(2, 1, self.vocab_size, device='cuda')
 
@@ -1681,7 +1681,6 @@ class TestTextGenerationController:
             hidden_states=dummy_hidden,
             next_token_ids=dummy_tokens,
             position_ids=dummy_positions,
-            depth=0,
         )
 
         # Hidden output is in SP format: [padded_count/tp_size, 1, H] = [1, 1, H].
@@ -1724,7 +1723,6 @@ class TestTextGenerationController:
                 hidden_states=current_hidden,
                 next_token_ids=dummy_tokens,
                 position_ids=dummy_positions,
-                depth=depth,
             )
 
             # Hidden stays in SP format across all depths.

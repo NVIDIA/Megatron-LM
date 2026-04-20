@@ -342,41 +342,40 @@ class LanguageModule(MegatronModule):
 
     @torch.inference_mode()
     def compute_mtp_single_step(
-        self, hidden_states: Tensor, next_token_ids: Tensor, position_ids: Tensor, depth: int
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: Optional[int] = None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
-
-        This is called after speculative token verification to compute MTP
-        predictions conditioned on verified tokens only.
 
         Args:
             hidden_states (Tensor): Hidden states at last accepted positions.
             next_token_ids (Tensor): Correct next token IDs [1, N].
             position_ids (Tensor): Position IDs for the next tokens [1, N].
-            depth (int): MTP depth index (0-indexed).
+            depth (int, optional): MTP depth index. Only needed when
+                ``mtp_use_repeated_layer`` is False (each depth uses a
+                distinct layer). Omit for repeated-layer models so that a
+                single CUDA graph can serve all depths.
 
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
         """
-        layer_idx = 0 if self.mtp.mtp_use_repeated_layer else depth
-
-        nvtx_range_push(f"mtp-single-step/depth-{depth}/mtp-layer")
+        layer_idx = 0 if depth is None else depth
         mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
             hidden_states=hidden_states,
             next_token_ids=next_token_ids,
             position_ids=position_ids,
             embedding=self.embedding,
         )
-        nvtx_range_pop(f"mtp-single-step/depth-{depth}/mtp-layer")
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        nvtx_range_push(f"mtp-single-step/depth-{depth}/output-layer")
         logits, _ = self.output_layer(mtp_hidden, weight=output_weight, runtime_gather_output=True)
         logits = self._scale_logits(logits)
-        nvtx_range_pop(f"mtp-single-step/depth-{depth}/output-layer")
 
         return mtp_hidden, logits
 
