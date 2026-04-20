@@ -214,7 +214,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker, get_moe_overload_factor_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, unwrap_model
 from megatron.training.config import FaultInjectorConfig
@@ -2574,6 +2574,14 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
+        if getattr(args, 'log_moe_overload_factor', False):
+            overload_log_string = get_moe_overload_factor_tracker().report(
+                iteration=iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+                per_layer_logging=args.moe_per_layer_logging,
+            )
+            moe_log_string = moe_log_string + overload_log_string
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
@@ -3741,6 +3749,8 @@ def train(
                 energy_monitor.resume()
             if args.num_experts is not None:
                 get_moe_metrics_tracker().clear()
+                if getattr(args, 'log_moe_overload_factor', False):
+                    get_moe_overload_factor_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
