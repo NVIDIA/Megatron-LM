@@ -10,8 +10,7 @@ logger = logging.getLogger(__name__)
 
 # TODO: global_var merge into mcore?
 _GLOBAL_NUM_MICROBATCHES_CALCULATOR: Union[
-    'ConstantNumMicroBatchesCalculator',
-    'StepBatchsizeNumMicroBatchesCalculator',
+    'ConstantNumMicroBatchesCalculator', 'StepBatchsizeNumMicroBatchesCalculator'
 ] = None  # type: ignore[assignment]
 
 
@@ -217,10 +216,7 @@ def _build_num_microbatches_calculator(
     decrease_batch_size_if_needed: bool,
     step_batch_size_schedule: Optional[str] = None,
     seq_length: Optional[int] = None,
-) -> Union[
-    'ConstantNumMicroBatchesCalculator',
-    'StepBatchsizeNumMicroBatchesCalculator',
-]:
+) -> Union['ConstantNumMicroBatchesCalculator', 'StepBatchsizeNumMicroBatchesCalculator']:
     """Build number of microbatches calculator. Internal helper method.
 
     Args:
@@ -245,8 +241,7 @@ def _build_num_microbatches_calculator(
     """
 
     num_microbatches_calculator: Union[
-        'ConstantNumMicroBatchesCalculator',
-        'StepBatchsizeNumMicroBatchesCalculator',
+        'ConstantNumMicroBatchesCalculator', 'StepBatchsizeNumMicroBatchesCalculator'
     ]
 
     # Step batch size schedule

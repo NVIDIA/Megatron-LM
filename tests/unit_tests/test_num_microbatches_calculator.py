@@ -72,7 +72,6 @@ def test_build_num_microbatches_calculator():
         )
 
 
-
 class TestConstantNumMicroBatchesCalculator:
     def setup_method(self, method):
         self.mb_calculator = mb_calculator.ConstantNumMicroBatchesCalculator(32, 8, 2, False, 0)
