@@ -1437,15 +1437,12 @@ class CudaGraphManager(torch.nn.Module):
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
         """
-        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
-        # MTP is only cuda-graphed for inference (forward_single_position).
-        self.is_mtp = isinstance(base_module, MultiTokenPredictionLayer)
+        self.is_mtp = function_name == "compute_mtp_single_step"
 
         if function_name is not None:
             func = getattr(base_module, function_name)
@@ -1531,7 +1528,6 @@ class CudaGraphManager(torch.nn.Module):
                     padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
                     runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
             elif is_mtp_inference:
-                # MTP layers have no inference_context; key by hidden_states shape.
                 mtp_key = ('mtp', kwargs['hidden_states'].shape)
                 runner = self.inference_cudagraphs_lookup_table.get(mtp_key)
             else:

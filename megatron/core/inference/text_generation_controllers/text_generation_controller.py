@@ -621,15 +621,12 @@ class TextGenerationController:
         else:
             self._mtp_resolved_padded_count = None
 
-        # Tell MTP layers whether to use CUDA graphs this step. When the main
-        # model falls back to eager mode, MTP must also run eagerly across all
-        # EP ranks — otherwise some ranks may replay a captured graph while
+        # Tell the model whether to use MTP CUDA graphs this step. When the
+        # main model falls back to eager mode, MTP must also run eagerly across
+        # all EP ranks — otherwise some ranks may replay a captured graph while
         # others run eagerly, causing EP collectives to hang.
         if getattr(self, '_has_mtp_cuda_graphs', False):
-            use_mtp_graphs = context.using_cuda_graph_this_step()
-            if hasattr(unwrapped_model, 'mtp'):
-                for layer in unwrapped_model.mtp.layers:
-                    layer.use_mtp_cuda_graphs = use_mtp_graphs
+            unwrapped_model.use_mtp_cuda_graphs = context.using_cuda_graph_this_step()
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
