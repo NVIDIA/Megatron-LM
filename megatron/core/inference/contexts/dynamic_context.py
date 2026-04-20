@@ -39,7 +39,7 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
 
-from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.mamba_metadata import MambaMetadata, PrefixCachedMambaMetadata
 from .attention_context.mha_metadata import MHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .kv_block_allocator import KVBlockAllocator
@@ -863,7 +863,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(
+            mamba_metadata_cls = MambaMetadata
+            if (
+                self.config.prefix_caching_mamba_gb is not None
+                and self.config.prefix_caching_mamba_gb > 0
+                and self.config.enable_prefix_caching
+            ):
+                mamba_metadata_cls = PrefixCachedMambaMetadata
+            self.mamba_metadata = mamba_metadata_cls(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 mamba_chunk_size=self.mamba_chunk_size,
