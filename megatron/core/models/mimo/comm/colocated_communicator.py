@@ -19,7 +19,17 @@ class SliceInfo:
 
 
 class ColocatedBridgeCommunicator:
-    """Handles tensor communication between colocated modules with different TP/DP layouts."""
+    """Handles tensor communication between colocated modules with different TP/DP layouts.
+
+    Scope: PP=1 only on both src and dest grids.
+
+    The default ``dim_mapping`` assumes 3D ``(b, s, h)`` tensors. When wired up
+    through ``MimoModel`` the encoder output has already been flattened to
+    ``(total_tokens, hidden)`` (i.e. ``(s*b, h)``); in that case callers should
+    pass ``dim_mapping={'b': 0, 'h': 1}`` so dim 0 is treated as the batch/sample
+    dimension. This relies on a uniform token count per sample (per image in a
+    sample), which lets dim 0 be sliced evenly by the DP scale factor.
+    """
 
     def __init__(
         self,
@@ -45,16 +55,16 @@ class ColocatedBridgeCommunicator:
         self.fan_out_gather_pg: Optional[dist.ProcessGroup] = None
         self.fan_out_gather_group_ranks: List[List[int]] = []
 
-        if self.dp_scale_factor > 1:
+        if self.fan_in_scale > 1:
             self._build_all_gather_groups()
-        elif self.dp_scale_factor < 1:
+        elif self.fan_out_scale > 1:
             self._build_fan_out_gather_groups()
 
         logging.info(
             f"[Rank {self.current_rank}] ColocatedBridgeCommunicator: "
             f"{src_module_name}({self.src_tp_size}TP/{self.src_dp_size}DP) -> "
             f"{dest_module_name}({self.dest_tp_size}TP/{self.dest_dp_size}DP), "
-            f"scale_factor={self.dp_scale_factor}"
+            f"fan_in_scale={self.fan_in_scale}, fan_out_scale={self.fan_out_scale}"
         )
 
     def _validate_grids(self):
@@ -78,23 +88,24 @@ class ColocatedBridgeCommunicator:
                 f"src={self.src_grid.rank_offset}, dest={self.dest_grid.rank_offset}"
             )
 
-        # Source (encoder) must have PP=1. Dest (LLM) may have PP>1 —
-        # the communicator only maps to dest's first PP stage.
-        if 'pp' in self.src_grid.dim_names:
-            pp_size = self.src_grid.shape[self.src_grid.dim_names.index('pp')]
-            if pp_size != 1:
-                raise ValueError(f"Source PP must be 1 for colocated, got {pp_size}")
+        # PP>1 is out of scope. Both src and dest grids must have PP=1.
+        for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
+            if 'pp' in grid.dim_names:
+                pp_size = grid.shape[grid.dim_names.index('pp')]
+                if pp_size != 1:
+                    raise ValueError(
+                        f"{name} PP must be 1 for ColocatedBridgeCommunicator, got {pp_size}"
+                    )
 
-        # CP>1 on either grid is not yet supported. See NMFW-17 task #1:
-        # _build_rank_mappings uses _gen_rank_enum(['tp']) which returns
-        # cp*pp*dp groups, so enumerating them directly corrupts dp_idx
-        # when CP>1. Reject explicitly until the fix lands.
+        # CP>1 on either grid is not yet supported. _build_rank_mappings uses
+        # get_rank_enum(['tp']) which returns cp*pp*dp groups, so enumerating
+        # them directly corrupts dp_idx when CP>1.
         for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
             if 'cp' in grid.dim_names:
                 cp_size = grid.shape[grid.dim_names.index('cp')]
                 if cp_size != 1:
                     raise ValueError(
-                        f"{name} CP must be 1 for ColocatedBridgeCommunicator, " f"got {cp_size}"
+                        f"{name} CP must be 1 for ColocatedBridgeCommunicator, got {cp_size}"
                     )
 
         src_dp = self.src_grid.shape[self.src_grid.dim_names.index('dp')]
@@ -109,40 +120,27 @@ class ColocatedBridgeCommunicator:
         self.src_dp_size = self.src_grid.shape[self.src_grid.dim_names.index('dp')]
         self.dest_tp_size = self.dest_grid.shape[self.dest_grid.dim_names.index('tp')]
         self.dest_dp_size = self.dest_grid.shape[self.dest_grid.dim_names.index('dp')]
-        self.dp_scale_factor = self.src_dp_size / self.dest_dp_size
-
-    @staticmethod
-    def _get_rank_dim_coord(rank, grid, dim_name):
-        """Extract a rank's coordinate for a specific grid dimension."""
-        dim_idx = grid.dim_names.index(dim_name)
-        temp = rank - grid.rank_offset
-        for i in range(dim_idx):
-            temp //= grid.shape[i]
-        return temp % grid.shape[dim_idx]
+        # Integer fan-in / fan-out scales. At most one is > 1; the other is 1.
+        self.fan_in_scale = (
+            self.src_dp_size // self.dest_dp_size if self.src_dp_size > self.dest_dp_size else 1
+        )
+        self.fan_out_scale = (
+            self.dest_dp_size // self.src_dp_size if self.dest_dp_size > self.src_dp_size else 1
+        )
 
     def _build_rank_mappings(self):
         self.rank_to_src_pos: Dict[int, Tuple[int, int]] = {}
         self.rank_to_dest_pos: Dict[int, Tuple[int, int]] = {}
 
-        src_tp_groups = self.src_grid._gen_rank_enum(['tp'])
+        src_tp_groups = self.src_grid.get_rank_enum(['tp'])
         for dp_idx, tp_group in enumerate(src_tp_groups):
             for tp_idx, rank in enumerate(tp_group):
                 self.rank_to_src_pos[rank] = (dp_idx, tp_idx)
 
-        # For dest, only map ranks at PP stage 0 (first pipeline stage).
-        # When dest has PP>1, _gen_rank_enum(['tp']) returns dp*pp groups.
-        # We filter to PP=0 so dp_idx correctly indexes the DP dimension only.
-        dest_has_pp = 'pp' in self.dest_grid.dim_names
-        dest_tp_groups = self.dest_grid._gen_rank_enum(['tp'])
-        dp_idx = 0
-        for tp_group in dest_tp_groups:
-            if dest_has_pp:
-                pp_coord = self._get_rank_dim_coord(tp_group[0], self.dest_grid, 'pp')
-                if pp_coord != 0:
-                    continue
+        dest_tp_groups = self.dest_grid.get_rank_enum(['tp'])
+        for dp_idx, tp_group in enumerate(dest_tp_groups):
             for tp_idx, rank in enumerate(tp_group):
                 self.rank_to_dest_pos[rank] = (dp_idx, tp_idx)
-            dp_idx += 1
 
     def _build_all_gather_groups(self):
         # Ranks are appended in (src_dp_idx, src_tp_idx) slot order so that the
@@ -151,12 +149,11 @@ class ColocatedBridgeCommunicator:
         # ranks by list position, and ``all_gather_into_tensor`` concatenates
         # outputs in group-local-rank order — so preserving append order is
         # load-bearing. Do not sort.
-        scale = int(self.dp_scale_factor)
         all_groups: List[List[int]] = []
 
         for dest_dp_idx in range(self.dest_dp_size):
-            src_dp_start = dest_dp_idx * scale
-            src_dp_indices = range(src_dp_start, src_dp_start + scale)
+            src_dp_start = dest_dp_idx * self.fan_in_scale
+            src_dp_indices = range(src_dp_start, src_dp_start + self.fan_in_scale)
 
             for src_tp_idx in range(self.src_tp_size):
                 group_ranks = []
@@ -172,16 +169,6 @@ class ColocatedBridgeCommunicator:
 
         logging.debug(f"[Rank {self.current_rank}] All-gather groups: {all_groups}")
 
-    def get_all_gather_group(self) -> Optional[dist.ProcessGroup]:
-        """Return the all-gather process group for fan-in communication."""
-        return self.all_gather_pg
-
-    def get_all_gather_world_size(self) -> int:
-        """Return the world size of the all-gather group."""
-        if self.all_gather_pg is None:
-            return 1
-        return dist.get_world_size(self.all_gather_pg)
-
     def _build_fan_out_gather_groups(self):
         """Build all-gather groups used by the fan-out backward.
 
@@ -189,19 +176,18 @@ class ColocatedBridgeCommunicator:
         batch. The src rank's full-batch gradient is the concatenation of the
         slice gradients produced by every dest rank that consumed one of its
         slices. We build a group per (src_dp_idx, dest_tp_idx) containing the
-        ``scale = dest_dp / src_dp`` dest ranks that cover consecutive
+        ``fan_out_scale = dest_dp / src_dp`` dest ranks that cover consecutive
         dest_dp_idx values mapping to this src_dp_idx. Ranks are appended in
         slot order (increasing dest_dp_idx), which equals group-local-rank
         order inside ``new_subgroups_by_enumeration`` — so the subsequent
         ``all_gather_into_tensor`` reconstructs the full-batch gradient in the
         correct layout. Do not sort this list.
         """
-        scale = int(1 / self.dp_scale_factor)
         all_groups: List[List[int]] = []
 
         for src_dp_idx in range(self.src_dp_size):
-            dest_dp_start = src_dp_idx * scale
-            dest_dp_indices = range(dest_dp_start, dest_dp_start + scale)
+            dest_dp_start = src_dp_idx * self.fan_out_scale
+            dest_dp_indices = range(dest_dp_start, dest_dp_start + self.fan_out_scale)
 
             for dest_tp_idx in range(self.dest_tp_size):
                 group_ranks = []
@@ -215,43 +201,28 @@ class ColocatedBridgeCommunicator:
         self.fan_out_gather_group_ranks = all_groups
         self.fan_out_gather_pg, _ = dist.new_subgroups_by_enumeration(all_groups, backend='nccl')
 
-    def get_fan_out_gather_group(self) -> Optional[dist.ProcessGroup]:
-        """Return the all-gather process group for fan-out backward."""
-        return self.fan_out_gather_pg
-
-    def get_fan_out_gather_world_size(self) -> int:
-        """Return the world size of the fan-out backward all-gather group."""
-        if self.fan_out_gather_pg is None:
-            return 1
-        return dist.get_world_size(self.fan_out_gather_pg)
-
     def get_slice_info(self, batch_size: int) -> SliceInfo:
         """Compute batch slice info for the current rank given the full batch size."""
-        if self.dp_scale_factor < 1:
+        if self.fan_out_scale > 1:
             return self._get_fan_out_slice_info(batch_size)
-        elif self.dp_scale_factor > 1:
+        if self.fan_in_scale > 1:
             return self._get_fan_in_slice_info(batch_size)
-        else:
-            return SliceInfo(start=0, size=batch_size)
+        return SliceInfo(start=0, size=batch_size)
 
     def _get_fan_out_slice_info(self, batch_size: int) -> SliceInfo:
-        # For PP>1 dest, only PP stage 0 ranks are in rank_to_dest_pos.
-        # PP stage 1+ ranks still call communicate() but the result is unused.
         if self.current_rank not in self.rank_to_dest_pos:
             return SliceInfo(start=0, size=batch_size)
         dest_dp_idx = self.rank_to_dest_pos[self.current_rank][0]
-        scale = int(1 / self.dp_scale_factor)
-        slot = dest_dp_idx % scale
-        slice_size = batch_size // scale
+        slot = dest_dp_idx % self.fan_out_scale
+        slice_size = batch_size // self.fan_out_scale
         return SliceInfo(start=slot * slice_size, size=slice_size)
 
     def _get_fan_in_slice_info(self, batch_size: int) -> SliceInfo:
         if self.current_rank not in self.rank_to_src_pos:
             return SliceInfo(start=0, size=batch_size)
         src_dp_idx = self.rank_to_src_pos[self.current_rank][0]
-        scale = int(self.dp_scale_factor)
-        slot = src_dp_idx % scale
-        slice_size = batch_size // scale
+        slot = src_dp_idx % self.fan_in_scale
+        slice_size = batch_size // self.fan_in_scale
         return SliceInfo(start=slot * slice_size, size=slice_size)
 
     def is_fan_out(self) -> bool:
@@ -261,10 +232,6 @@ class ColocatedBridgeCommunicator:
     def is_fan_in(self) -> bool:
         """Return True if src DP > dest DP (encoder has more replicas)."""
         return self.src_dp_size > self.dest_dp_size
-
-    def is_equal_dp(self) -> bool:
-        """Return True if src and dest have same DP size."""
-        return self.src_dp_size == self.dest_dp_size
 
     def communicate(self, tensor: torch.Tensor) -> torch.Tensor:
         """Transform tensor from src TP/DP layout to dest TP/DP layout."""
@@ -299,8 +266,8 @@ class _ColocatedCommunicate(torch.autograd.Function):
             return tensor.narrow(ctx.batch_dim, slice_info.start, slice_info.size).contiguous()
 
         elif comm.is_fan_in():
-            group = comm.get_all_gather_group()
-            world_size = comm.get_all_gather_world_size()
+            group = comm.all_gather_pg
+            world_size = dist.get_world_size(group)
             batch_dim = ctx.batch_dim
 
             # Use all_gather_into_tensor to write directly into a pre-allocated
@@ -341,8 +308,8 @@ class _ColocatedCommunicate(torch.autograd.Function):
         batch_dim = ctx.batch_dim
 
         if comm.is_fan_out():
-            group = comm.get_fan_out_gather_group()
-            world_size = comm.get_fan_out_gather_world_size()
+            group = comm.fan_out_gather_pg
+            world_size = dist.get_world_size(group)
 
             input_contig = grad_output.contiguous()
             if batch_dim != 0:

@@ -513,20 +513,25 @@ class MimoModel(MegatronModule):
         return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
 
     def _build_colocated_communicators(self):
-        """Build communicators for each encoder → language edge."""
+        """Build communicators for each encoder → language edge.
+
+        Encoder outputs reach the communicator after ``VisionModalitySubmodules``
+        has flattened them to ``(total_tokens, hidden)``; dim 0 is the
+        batch/sample dimension for slicing and all-gathering.
+        """
         grid_map = self.mimo_config.module_to_grid_map
         lang_key = MIMO_LANGUAGE_MODULE_KEY
         lang_grid = grid_map[lang_key]
         for mod_name in self.mimo_config.modality_submodules_spec:
-            if mod_name in grid_map and mod_name != lang_key:
-                src_grid = grid_map[mod_name]
-                if src_grid.size == lang_grid.size:
-                    self.colocated_comms[(mod_name, lang_key)] = ColocatedBridgeCommunicator(
-                        src_grid=src_grid,
-                        dest_grid=lang_grid,
-                        src_module_name=mod_name,
-                        dest_module_name=lang_key,
-                    )
+            if mod_name == lang_key:
+                continue
+            self.colocated_comms[(mod_name, lang_key)] = ColocatedBridgeCommunicator(
+                src_grid=grid_map[mod_name],
+                dest_grid=lang_grid,
+                src_module_name=mod_name,
+                dest_module_name=lang_key,
+                dim_mapping={'b': 0, 'h': 1},
+            )
 
     def _apply_colocated_comms(self, modality_embeddings):
         """Transform encoder embeddings from encoder TP/DP to LLM TP/DP layout."""

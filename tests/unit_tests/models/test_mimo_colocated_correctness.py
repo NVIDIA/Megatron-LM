@@ -25,6 +25,7 @@ from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
 from tests.unit_tests.test_utilities import Utils
 
 _active_grids: list = []
+_active_comms: list = []
 
 H, NHEADS, SEQ, GBS = 1024, 8, 8, 8
 
@@ -109,6 +110,12 @@ class TestColocatedCorrectness:
 
     def teardown_method(self):
         torch.use_deterministic_algorithms(False)
+        # Destroy communicators first so their NCCL subgroups are released
+        # before we tear down the parent grids — keeps us well under NCCL's
+        # concurrent-communicator cap across the parametrized runs.
+        for c in _active_comms:
+            c.destroy()
+        _active_comms.clear()
         for g in _active_grids:
             g.destroy()
         _active_grids.clear()
@@ -159,6 +166,7 @@ class TestColocatedCorrectness:
             dest_module_name="llm",
             dim_mapping={'s': 0, 'b': 1, 'h': 2},
         )
+        _active_comms.append(comm)
         ref_opt = torch.optim.SGD(list(ref_enc.parameters()) + list(ref_llm.parameters()), lr=lr)
         col_opt = torch.optim.SGD(list(col_enc.parameters()) + list(col_llm.parameters()), lr=lr)
         e_di, l_di = enc_g.get_pg("dp").rank(), llm_g.get_pg("dp").rank()

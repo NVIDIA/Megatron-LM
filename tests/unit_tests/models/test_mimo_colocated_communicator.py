@@ -18,6 +18,7 @@ from tests.unit_tests.test_utilities import Utils
 logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
 
 _active_grids: list = []
+_active_comms: list = []
 
 
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
@@ -35,7 +36,19 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     return grid
 
 
+def make_comm(*args, **kwargs):
+    comm = ColocatedBridgeCommunicator(*args, **kwargs)
+    _active_comms.append(comm)
+    return comm
+
+
 def destroy_all_grids():
+    # Destroy communicators first so their NCCL subgroups are freed before we
+    # tear down the parent grids. NCCL caps concurrent communicators at ~500;
+    # leaked PGs from per-test fixtures blow that budget quickly.
+    for comm in _active_comms:
+        comm.destroy()
+    _active_comms.clear()
     for grid in _active_grids:
         grid.destroy()
     _active_grids.clear()
@@ -175,10 +188,22 @@ class TestRankMappings:
     ):
         src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
         dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
-        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        comm = make_comm(src_grid, dest_grid)
 
         assert comm.rank_to_src_pos == expected_src_pos
         assert comm.rank_to_dest_pos == expected_dest_pos
+
+    def test_rank_mappings_with_rank_offset(self):
+        # 4-rank grids at offset=4 (covering ranks 4-7). Exercises the
+        # rank_offset propagation that previously only ran with offset=0.
+        if dist.get_world_size() < 8:
+            pytest.skip("requires at least 8 ranks")
+        src_grid = create_hypercomm_grid(offset=4, tp=2, dp=2)
+        dest_grid = create_hypercomm_grid(offset=4, tp=1, dp=4)
+        comm = make_comm(src_grid, dest_grid)
+
+        assert comm.rank_to_src_pos == {4: (0, 0), 5: (0, 1), 6: (1, 0), 7: (1, 1)}
+        assert comm.rank_to_dest_pos == {4: (0, 0), 5: (1, 0), 6: (2, 0), 7: (3, 0)}
 
 
 # ── Test 2: All-gather groups ──────────────────────────────────────────────────
@@ -209,7 +234,7 @@ class TestAllGatherGroups:
     def test_fan_in_all_gather_groups(self, src_tp, src_dp, dest_tp, dest_dp, expected_groups):
         src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
         dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
-        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        comm = make_comm(src_grid, dest_grid)
 
         assert comm.all_gather_group_ranks == expected_groups
         assert comm.all_gather_pg is not None
@@ -217,7 +242,7 @@ class TestAllGatherGroups:
     def test_fan_out_no_all_gather(self):
         src_grid = create_hypercomm_grid(tp=4, dp=2)
         dest_grid = create_hypercomm_grid(tp=2, dp=4)
-        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        comm = make_comm(src_grid, dest_grid)
 
         assert comm.all_gather_group_ranks == []
         assert comm.all_gather_pg is None
@@ -238,7 +263,7 @@ class TestAllGatherGroups:
     def test_fan_out_gather_groups(self, src_tp, src_dp, dest_tp, dest_dp, expected_groups):
         src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
         dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
-        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        comm = make_comm(src_grid, dest_grid)
 
         # Direct equality check enforces both membership and slot order —
         # all_gather_into_tensor concatenates by group-local-rank, and backward
@@ -249,7 +274,7 @@ class TestAllGatherGroups:
     def test_fan_in_no_fan_out_gather(self):
         src_grid = create_hypercomm_grid(tp=2, dp=4)
         dest_grid = create_hypercomm_grid(tp=4, dp=2)
-        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        comm = make_comm(src_grid, dest_grid)
 
         assert comm.fan_out_gather_group_ranks == []
         assert comm.fan_out_gather_pg is None
@@ -315,7 +340,7 @@ class TestSliceInfo:
     def test_slice_info(self, src_tp, src_dp, dest_tp, dest_dp, batch_size, expected_slices):
         src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
         dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
-        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        comm = make_comm(src_grid, dest_grid)
 
         rank = dist.get_rank()
         if rank not in expected_slices:
@@ -329,10 +354,92 @@ class TestSliceInfo:
     def test_equal_dp_slice(self):
         src_grid = create_hypercomm_grid(tp=4, dp=2)
         dest_grid = create_hypercomm_grid(tp=4, dp=2)
-        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        comm = make_comm(src_grid, dest_grid)
 
         info = comm.get_slice_info(batch_size=8)
         assert info == SliceInfo(start=0, size=8)
+
+
+# ── Test 3b: _validate_grids negative tests ───────────────────────────────────
+
+
+class TestValidateGrids:
+    """One negative test per raise path in ColocatedBridgeCommunicator._validate_grids.
+
+    Each case builds a pair of grids that violates exactly one invariant and
+    asserts that the constructor raises ValueError.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+
+    def teardown_method(self):
+        destroy_all_grids()
+
+    def _grid_missing_tp(self, offset=0, dp=1):
+        # Build a grid without a 'tp' dim to exercise the "missing 'tp'" raise.
+        grid = HyperCommGrid(
+            shape=[dp], dim_names=["dp"], rank_offset=offset, backend="nccl"
+        )
+        grid.create_pg(["dp"])
+        _active_grids.append(grid)
+        return grid
+
+    def test_missing_tp_dim(self):
+        src_grid = self._grid_missing_tp(dp=8)
+        dest_grid = create_hypercomm_grid(tp=4, dp=2)
+        with pytest.raises(ValueError, match="must have 'tp' dimension"):
+            make_comm(src_grid, dest_grid)
+
+    def test_size_mismatch(self):
+        src_grid = create_hypercomm_grid(tp=2, dp=4)  # 8 ranks
+        dest_grid = create_hypercomm_grid(offset=4, tp=2, dp=2)  # 4 ranks
+        with pytest.raises(ValueError, match="span same number of ranks"):
+            make_comm(src_grid, dest_grid)
+
+    def test_rank_offset_mismatch(self):
+        src_grid = create_hypercomm_grid(offset=0, tp=2, dp=2)
+        dest_grid = create_hypercomm_grid(offset=4, tp=2, dp=2)
+        with pytest.raises(ValueError, match="same rank offset"):
+            make_comm(src_grid, dest_grid)
+
+    def test_src_pp_gt_one_rejected(self):
+        src_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
+        dest_grid = create_hypercomm_grid(tp=4, dp=2)
+        with pytest.raises(ValueError, match="src PP must be 1"):
+            make_comm(src_grid, dest_grid)
+
+    def test_dest_pp_gt_one_rejected(self):
+        src_grid = create_hypercomm_grid(tp=4, dp=2)
+        dest_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
+        with pytest.raises(ValueError, match="dest PP must be 1"):
+            make_comm(src_grid, dest_grid)
+
+    def test_cp_gt_one_rejected(self):
+        src_grid = create_hypercomm_grid(tp=2, cp=2, dp=2)
+        dest_grid = create_hypercomm_grid(tp=4, dp=2)
+        with pytest.raises(ValueError, match="CP must be 1"):
+            make_comm(src_grid, dest_grid)
+
+    def test_dp_not_divisible(self):
+        # 6-rank grids with DP sizes (3 vs 2) that neither divides the other.
+        # Fits inside an 8-rank world (HyperCommGrid enforces size <= world - offset).
+        if dist.get_world_size() < 6:
+            pytest.skip("requires at least 6 ranks")
+        src_grid = HyperCommGrid(
+            shape=[2, 1, 1, 3], dim_names=["tp", "cp", "pp", "dp"], backend="nccl"
+        )
+        dest_grid = HyperCommGrid(
+            shape=[3, 1, 1, 2], dim_names=["tp", "cp", "pp", "dp"], backend="nccl"
+        )
+        for g in (src_grid, dest_grid):
+            _active_grids.append(g)
+        with pytest.raises(ValueError, match="evenly divisible"):
+            make_comm(src_grid, dest_grid)
 
 
 # ── Test 4: Forward / backward golden test ─────────────────────────────────────
@@ -413,7 +520,7 @@ class TestGolden:
         dist.barrier()
 
         # Communicator
-        comm = ColocatedBridgeCommunicator(
+        comm = make_comm(
             enc_grid,
             llm_grid,
             src_module_name="encoder",

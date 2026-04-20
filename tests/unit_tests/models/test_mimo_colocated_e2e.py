@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 _active_grids: list = []
+_active_mimo_models: list = []
 _embedding_pg_cache: dict = {}
 
 
@@ -87,7 +88,14 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
 
 
 def destroy_all_grids():
-    """Destroy all tracked grids and bridge communicator PGs."""
+    """Destroy all tracked grids, bridge communicator PGs, and colocated comm PGs."""
+    # Tear down each MimoModel's colocated_comms first so their NCCL subgroups
+    # are released before the parent grids — NCCL caps concurrent communicators
+    # at ~500 and per-test fixtures leak without this.
+    for model in _active_mimo_models:
+        for comm in getattr(model, 'colocated_comms', {}).values():
+            comm.destroy()
+    _active_mimo_models.clear()
     for grid in _active_grids:
         grid.destroy()
     _active_grids.clear()
@@ -388,6 +396,7 @@ def get_mimo_model_colocated(
     )
 
     mimo_model = MimoModel(mimo_config)
+    _active_mimo_models.append(mimo_model)
     mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
 
     # Set model_type so forward_backward_no_pipelining's get_model_type() works
