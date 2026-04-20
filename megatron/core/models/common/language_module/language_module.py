@@ -65,6 +65,21 @@ class LanguageModule(MegatronModule):
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
 
+    def _setup_mtp_cuda_graphs(self):
+        """Wrap ``compute_mtp_single_step`` with a CudaGraphManager.
+
+        Must be called by subclasses after ``self.mtp`` is created.
+        """
+        if self.config.cuda_graph_impl == "local" and not self.config.cuda_graph_scope:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+            self._mtp_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_single_step",
+                need_backward=False,
+            )
+
     def _is_in_embd_group(self):
         if self.embd_group is None:
             return False

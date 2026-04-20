@@ -223,15 +223,7 @@ class GPTModel(LanguageModule):
                 pg_collection=self.pg_collection,
             )
 
-            if self.config.cuda_graph_impl == "local" and not self.config.cuda_graph_scope:
-                from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-                self._mtp_cudagraph_manager = CudaGraphManager(
-                    self.config,
-                    base_module=self,
-                    function_name="compute_mtp_single_step",
-                    need_backward=False,
-                )
+            self._setup_mtp_cuda_graphs()
 
         # Output
         if self.post_process:
