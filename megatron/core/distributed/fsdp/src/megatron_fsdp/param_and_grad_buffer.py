@@ -32,12 +32,14 @@ from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from .allocators import (
+    NCCL_ALLOCATOR,
     Bucket,
     FixedPoolAllocator,
     MultiGroupUBRAllocator,
     RotaryBucketAllocator,
     StorageResizeBasedBucketAllocator,
     TemporaryBucketAllocator,
+    nccl_allocator,
 )
 from .mixed_precision import (
     MixedPrecisionPolicy,
@@ -91,22 +93,6 @@ try:
     HAVE_TE = True
 except Exception:
     HAVE_TE = False
-
-NCCL_ALLOCATOR = None
-
-try:
-    # Try to import the MCore NCCL nccl_allocator first.
-    # If it fails, try to import the APEX NCCL nccl_allocator.
-    import megatron.core.nccl_allocator as nccl_allocator
-
-    NCCL_ALLOCATOR = "MCORE"
-except ImportError:
-    try:
-        import apex.contrib.nccl_allocator as nccl_allocator
-
-        NCCL_ALLOCATOR = "APEX"
-    except ImportError:
-        nccl_allocator = None
 
 NCCL_MEMORY_POOL = None
 

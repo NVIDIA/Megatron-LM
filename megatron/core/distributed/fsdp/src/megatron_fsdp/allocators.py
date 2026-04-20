@@ -28,6 +28,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+NCCL_ALLOCATOR = None
+
+try:
+    # Try to import the MCore NCCL nccl_allocator first.
+    # If it fails, try to import the APEX NCCL nccl_allocator.
+    import megatron.core.nccl_allocator as nccl_allocator
+
+    NCCL_ALLOCATOR = "MCORE"
+except ImportError:
+    try:
+        import apex.contrib.nccl_allocator as nccl_allocator
+
+        NCCL_ALLOCATOR = "APEX"
+    except ImportError:
+        nccl_allocator = None
+
 
 def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
     """Alternate to ``assert`` when in the backward context to print the error
@@ -113,10 +129,6 @@ class MultiGroupUBRAllocator:
     """
 
     def __init__(self, pool, groups):  # torch.cuda.MemPool  # torch.distributed.ProcessGroup
-        # Deferred import: nccl_allocator shim lives in param_and_grad_buffer to avoid
-        # a module-level cycle (param_and_grad_buffer imports the allocator classes from here).
-        from .param_and_grad_buffer import nccl_allocator
-
         self.pool = pool
         self.groups = groups
         self.mem_allocator = nccl_allocator.nccl_mem(self.pool, group=self.groups[0])
