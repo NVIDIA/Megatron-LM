@@ -261,9 +261,6 @@ class DynamicInferenceEngine(AbstractEngine):
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
-        # Routing replay config.
-        self._routing_replay_enabled = model_config.moe_enable_routing_replay
-
         # Routing indices dtype for numpy storage.
         _num_experts = model_config.num_moe_experts or 0
         self._routing_indices_dtype = np.int16 if _num_experts <= 32768 else np.int32
@@ -1043,7 +1040,6 @@ class DynamicInferenceEngine(AbstractEngine):
         accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
-        routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
@@ -1061,10 +1057,6 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
-            routing_indices_per_request: (Dict[int, Tensor]): MoE routing indices
-                pre-mapped by request_id. Each value is a tensor of shape
-                [num_tokens_this_step, num_layers, topk]. Unused when per-block
-                routing is active (routing_indices_per_request will be None).
             finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
                 finished requests, saved before update_requests released them.
                 Used for per-block routing reconstruction.
@@ -1318,18 +1310,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
-
-            # Process routing indices if available (keyed by request_id)
-            # Each step's routing is a numpy array of shape [num_tokens_this_step, num_layers, topk]
-            # Stored as numpy on CPU to avoid GPU memory pressure at long sequences.
-            if (
-                routing_indices_per_request is not None
-                and request_id in routing_indices_per_request
-            ):
-                step_routing = routing_indices_per_request[
-                    request_id
-                ]  # [num_tokens, num_layers, topk]
-                request.add_routing_indices(step_routing)
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1750,7 +1730,6 @@ class DynamicInferenceEngine(AbstractEngine):
             accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
-            routing_indices_per_request = step_result.get("routing_indices_per_request", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
@@ -1769,7 +1748,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 accepted_tokens,
                 log_probs,
                 top_n_logprobs,
-                routing_indices_per_request,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,
@@ -1810,12 +1788,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
             nvtx_range_pop("detokenization")
-
-        # Finalize routing chunks on all sub-requests before merge/serialize.
-        if self._routing_replay_enabled and finished_request_records:
-            for record in finished_request_records:
-                for req in record.requests:
-                    req.finalize_routing_chunks()
 
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,

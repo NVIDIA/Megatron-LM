@@ -1870,8 +1870,6 @@ class TextGenerationController:
             # Must be done before update_requests while token-to-block mappings are valid.
             # Reconstruction happens from blocks at request completion.
             context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
-            # Per-step routing is no longer needed; reconstruction happens from blocks at completion.
-            routing_indices_per_request = None
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -1937,7 +1935,6 @@ class TextGenerationController:
                 ),
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
-                "routing_indices_per_request": routing_indices_per_request,
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
             if self.num_speculative_tokens > 0:
