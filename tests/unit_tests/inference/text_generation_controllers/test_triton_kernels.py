@@ -19,7 +19,6 @@ from megatron.core.inference.text_generation_controllers.triton_kernels import (
     verify_speculative_tokens,
 )
 
-
 # ---------------------------------------------------------------------------
 # PyTorch reference implementations
 # ---------------------------------------------------------------------------
@@ -231,7 +230,9 @@ class TestRewindKvCache:
         prefill_status = torch.zeros(N, dtype=torch.int32, device=DEVICE)
 
         last_kv_block_offset = torch.randint(0, block_size_tokens, (N,), device=DEVICE)
-        kv_length_offsets = torch.randint(block_size_tokens, block_size_tokens * 4, (N,), device=DEVICE)
+        kv_length_offsets = torch.randint(
+            block_size_tokens, block_size_tokens * 4, (N,), device=DEVICE
+        )
         kv_block_counts = torch.randint(2, max_blocks, (N,), device=DEVICE)
         last_kv_block_id = torch.randint(0, 100, (N,), device=DEVICE)
         kv_block_ids = torch.randint(0, 100, (N, max_blocks), device=DEVICE)
@@ -244,15 +245,27 @@ class TestRewindKvCache:
         )
 
         ref_release, ref_mask = rewind_kv_cache_pytorch(
-            accepted_counts.clone(), prefill_status.clone(),
-            ref_offset, ref_kv_len, ref_block_counts, ref_last_block, ref_block_ids,
-            num_speculative_tokens, block_size_tokens,
+            accepted_counts.clone(),
+            prefill_status.clone(),
+            ref_offset,
+            ref_kv_len,
+            ref_block_counts,
+            ref_last_block,
+            ref_block_ids,
+            num_speculative_tokens,
+            block_size_tokens,
         )
 
         tri_release, tri_mask = rewind_kv_cache(
-            accepted_counts.clone(), prefill_status.clone(),
-            tri_offset, tri_kv_len, tri_block_counts, tri_last_block, tri_block_ids,
-            num_speculative_tokens, block_size_tokens,
+            accepted_counts.clone(),
+            prefill_status.clone(),
+            tri_offset,
+            tri_kv_len,
+            tri_block_counts,
+            tri_last_block,
+            tri_block_ids,
+            num_speculative_tokens,
+            block_size_tokens,
         )
 
         torch.testing.assert_close(tri_offset, ref_offset)
@@ -284,14 +297,26 @@ class TestRewindKvCache:
         )
 
         ref_release, ref_mask = rewind_kv_cache_pytorch(
-            accepted_counts.clone(), prefill_status.clone(),
-            ref_offset, ref_kv_len, ref_block_counts, ref_last_block, ref_block_ids,
-            num_spec, block_size,
+            accepted_counts.clone(),
+            prefill_status.clone(),
+            ref_offset,
+            ref_kv_len,
+            ref_block_counts,
+            ref_last_block,
+            ref_block_ids,
+            num_spec,
+            block_size,
         )
         tri_release, tri_mask = rewind_kv_cache(
-            accepted_counts.clone(), prefill_status.clone(),
-            tri_offset, tri_kv_len, tri_block_counts, tri_last_block, tri_block_ids,
-            num_spec, block_size,
+            accepted_counts.clone(),
+            prefill_status.clone(),
+            tri_offset,
+            tri_kv_len,
+            tri_block_counts,
+            tri_last_block,
+            tri_block_ids,
+            num_spec,
+            block_size,
         )
 
         # Prefill requests (indices 1, 3) should be unchanged.
@@ -330,14 +355,26 @@ class TestRewindKvCache:
         )
 
         rewind_kv_cache_pytorch(
-            accepted_counts.clone(), prefill_status.clone(),
-            ref_offset, ref_kv_len, ref_block_counts, ref_last_block, ref_block_ids,
-            num_spec, block_size,
+            accepted_counts.clone(),
+            prefill_status.clone(),
+            ref_offset,
+            ref_kv_len,
+            ref_block_counts,
+            ref_last_block,
+            ref_block_ids,
+            num_spec,
+            block_size,
         )
         rewind_kv_cache(
-            accepted_counts.clone(), prefill_status.clone(),
-            tri_offset, tri_kv_len, tri_block_counts, tri_last_block, tri_block_ids,
-            num_spec, block_size,
+            accepted_counts.clone(),
+            prefill_status.clone(),
+            tri_offset,
+            tri_kv_len,
+            tri_block_counts,
+            tri_last_block,
+            tri_block_ids,
+            num_spec,
+            block_size,
         )
 
         # Request 0: offset 1 - 3 = -2 → crosses boundary.
@@ -377,14 +414,28 @@ class TestRewindKvCache:
         )
 
         rewind_kv_cache_pytorch(
-            accepted_counts.clone(), prefill_status.clone(),
-            ref_offset, ref_kv_len, ref_block_counts, ref_last_block, ref_block_ids,
-            num_spec, block_size, num_active_requests=active,
+            accepted_counts.clone(),
+            prefill_status.clone(),
+            ref_offset,
+            ref_kv_len,
+            ref_block_counts,
+            ref_last_block,
+            ref_block_ids,
+            num_spec,
+            block_size,
+            num_active_requests=active,
         )
         tri_release, tri_mask = rewind_kv_cache(
-            accepted_counts.clone(), prefill_status.clone(),
-            tri_offset, tri_kv_len, tri_block_counts, tri_last_block, tri_block_ids,
-            num_spec, block_size, num_active_requests=active,
+            accepted_counts.clone(),
+            prefill_status.clone(),
+            tri_offset,
+            tri_kv_len,
+            tri_block_counts,
+            tri_last_block,
+            tri_block_ids,
+            num_spec,
+            block_size,
+            num_active_requests=active,
         )
 
         # Active slots should match.
@@ -442,13 +493,9 @@ class TestVerifySpeculativeTokens:
 
         return input_tokens, output_tokens
 
-    @pytest.mark.parametrize("num_decode,num_prefill,num_spec", [
-        (1, 0, 2),
-        (3, 0, 2),
-        (3, 2, 2),
-        (0, 3, 2),
-        (5, 3, 4),
-    ])
+    @pytest.mark.parametrize(
+        "num_decode,num_prefill,num_spec", [(1, 0, 2), (3, 0, 2), (3, 2, 2), (0, 3, 2), (5, 3, 4)]
+    )
     def test_basic(self, num_decode, num_prefill, num_spec):
         input_tokens, output_tokens = self._make_scenario(num_decode, num_prefill, num_spec)
 
@@ -568,18 +615,13 @@ class TestPrepareNextForwardPass:
 
         return output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices
 
-    @pytest.mark.parametrize("num_decode,num_prefill,num_spec", [
-        (1, 0, 2),
-        (3, 0, 2),
-        (3, 2, 2),
-        (0, 3, 2),
-        (5, 3, 4),
-    ])
+    @pytest.mark.parametrize(
+        "num_decode,num_prefill,num_spec", [(1, 0, 2), (3, 0, 2), (3, 2, 2), (0, 3, 2), (5, 3, 4)]
+    )
     def test_basic(self, num_decode, num_prefill, num_spec):
-        (
-            output_tokens, required_logit_indices, input_tokens,
-            accepted_mask, last_one_indices,
-        ) = self._setup(num_decode, num_prefill, num_spec)
+        (output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices) = (
+            self._setup(num_decode, num_prefill, num_spec)
+        )
 
         active = num_decode + num_prefill
 
@@ -590,19 +632,37 @@ class TestPrepareNextForwardPass:
 
         tri_sampled = torch.zeros(active, device=DEVICE, dtype=torch.int64)
         tri_last_seq = torch.zeros(active, device=DEVICE, dtype=torch.int64)
-        tri_accepted = torch.full((max(num_decode, 1), num_spec), -1, device=DEVICE, dtype=torch.int64)
+        tri_accepted = torch.full(
+            (max(num_decode, 1), num_spec), -1, device=DEVICE, dtype=torch.int64
+        )
         tri_counts = torch.zeros(max(num_decode, 1), device=DEVICE, dtype=torch.int64)
 
         prepare_next_forward_pass_pytorch(
-            num_decode, output_tokens, required_logit_indices,
-            last_one_indices, accepted_mask, input_tokens,
-            ref_sampled, ref_last_seq, ref_accepted, ref_counts, num_spec,
+            num_decode,
+            output_tokens,
+            required_logit_indices,
+            last_one_indices,
+            accepted_mask,
+            input_tokens,
+            ref_sampled,
+            ref_last_seq,
+            ref_accepted,
+            ref_counts,
+            num_spec,
         )
 
         prepare_next_forward_pass(
-            num_decode, output_tokens, required_logit_indices,
-            last_one_indices, accepted_mask, input_tokens,
-            tri_sampled, tri_last_seq, tri_accepted, tri_counts, num_spec,
+            num_decode,
+            output_tokens,
+            required_logit_indices,
+            last_one_indices,
+            accepted_mask,
+            input_tokens,
+            tri_sampled,
+            tri_last_seq,
+            tri_accepted,
+            tri_counts,
+            num_spec,
         )
 
         torch.testing.assert_close(tri_sampled, ref_sampled)
@@ -722,7 +782,8 @@ class TestMambaStateSelectiveCopy:
         current_before = current.clone()
 
         mamba_state_selective_copy(
-            intermediate, current,
+            intermediate,
+            current,
             torch.empty(0, dtype=torch.int32, device=DEVICE),
             torch.empty(0, dtype=torch.int64, device=DEVICE),
             torch.empty(0, dtype=torch.int64, device=DEVICE),
@@ -759,12 +820,10 @@ class TestStressRandom:
         )
 
         ref_release, ref_mask = rewind_kv_cache_pytorch(
-            accepted_counts.clone(), prefill_status.clone(), *ref_args,
-            num_spec, block_size,
+            accepted_counts.clone(), prefill_status.clone(), *ref_args, num_spec, block_size
         )
         tri_release, tri_mask = rewind_kv_cache(
-            accepted_counts.clone(), prefill_status.clone(), *tri_args,
-            num_spec, block_size,
+            accepted_counts.clone(), prefill_status.clone(), *tri_args, num_spec, block_size
         )
 
         for r, t in zip(ref_args, tri_args):
