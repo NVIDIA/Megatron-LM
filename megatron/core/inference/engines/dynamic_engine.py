@@ -407,7 +407,9 @@ class DynamicInferenceEngine(AbstractEngine):
             active_request_count = context.total_request_count - context.paused_request_count
             context.active_request_metadata["return_log_probs"][:active_request_count] = True
 
-            controller._dynamic_step_log_probs_bookkeeping()
+            controller._pre_init_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(controller._pre_init_bookkeeping_stream):
+                controller._dynamic_step_log_probs_bookkeeping()
             controller._dynamic_step_log_probs_indexing()
 
             # Enable routing recording during warmup if routing replay is enabled.

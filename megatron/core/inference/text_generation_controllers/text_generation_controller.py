@@ -162,9 +162,11 @@ class TextGenerationController:
             self._all_logits_cuda = None
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
+        # Side stream with pre-init bookkeeping.
+        # Runs concurrently with attention mask initialization.
+        self._pre_init_bookkeeping_stream = torch.cuda.Stream(device=device)
         # Side stream for pre-forward bookkeeping.
         # Runs concurrently with the forward pass; post-forward consumers wait for the sync.
-        # with the forward pass; post-forward consumers synchronize on the event.
         self._pre_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
         # Side stream for post-forward bookkeeping (e.g. speculative softmax).
         # Runs concurrently with verification/sampling on the main stream.
@@ -175,10 +177,10 @@ class TextGenerationController:
         self._post_forward_bookkeeping_event = torch.cuda.Event()
 
         # CPU-blocking events.
-        self._log_prob_reduction_event = torch.cuda.Event()
+        self._pre_init_bookkeeping_event = torch.cuda.Event()
 
         # Pinned CPU tensors for non-blocking D2H copy of log-prob reduction results.
-        # Filled on the bookkeeping stream; guaranteed ready after _pre_forward_bookkeeping_event.
+        # Filled on the bookkeeping stream; guaranteed ready after _pre_init_bookkeeping_event.
         self._log_prob_count_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
         self._top_n_max_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
 
@@ -1224,12 +1226,12 @@ class TextGenerationController:
         self._log_prob_count_pinned.copy_(log_prob_count, non_blocking=True)
         self._top_n_max_pinned.copy_(top_n_max_gpu, non_blocking=True)
 
-        self._log_prob_reduction_event.record()
+        self._pre_init_bookkeeping_event.record()
 
     def _dynamic_step_log_probs_indexing(self):
         """Conditionally launch log-prob indexing kernels on the bookkeeping stream."""
         # CPU-side sync: must read pinned count before deciding whether to launch.
-        self._log_prob_reduction_event.synchronize()
+        self._pre_init_bookkeeping_event.synchronize()
         if self._log_prob_count_pinned.item() == 0 and self._top_n_max_pinned.item() == 0:
             return
 
@@ -1246,7 +1248,7 @@ class TextGenerationController:
         else:
             self._log_probs_prefill.indexing(context, eager=eager)
 
-    def _dynamic_step_log_probs_softmax(self):
+    def _dynamic_step_logprobs_spec_softmax(self):
         """Conditionally launch the speculative softmax kernel on the bookkeeping stream."""
         if self._log_prob_count_pinned.item() == 0 and self._top_n_max_pinned.item() == 0:
             return
@@ -1617,6 +1619,12 @@ class TextGenerationController:
             return None
 
         with torch.inference_mode():
+            # Launch log-prob reduction + D2H copy early so the pinned counts
+            # are ready by the time indexing needs them (after context init).
+            self._pre_init_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._pre_init_bookkeeping_stream):
+                self._dynamic_step_log_probs_bookkeeping()
+
             input_ids, position_ids = self._dynamic_step_context_init()
 
             cuda_graph_request_count = (
@@ -1630,10 +1638,9 @@ class TextGenerationController:
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Launch bookkeeping on a side stream so it overlaps with forward.
+            # Launch indexing on the pre-forward side stream so it overlaps with the forward pass.
             self._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
-                self._dynamic_step_log_probs_bookkeeping()
                 self._dynamic_step_log_probs_indexing()
                 self._pre_forward_bookkeeping_event.record()
 
@@ -1641,12 +1648,13 @@ class TextGenerationController:
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             self._dynamic_step_forward_logits(input_ids, position_ids)
+            self._post_forward_bookkeeping_stream.wait_event(self._pre_forward_bookkeeping_event)
 
-            # Launch speculative softmax on the post-forward stream — it only
-            # needs logits and overlaps with verification/sampling on the main stream.
+            # Launch speculative softmax on the post-forward stream;
+            # it only needs logits and overlaps with verification/sampling on the main stream.
             self._post_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._post_forward_bookkeeping_stream):
-                self._dynamic_step_log_probs_softmax()
+                self._dynamic_step_logprobs_spec_softmax()
                 self._post_forward_bookkeeping_event.record()
 
             # Commit Mamba intermediate states before update_requests, which
@@ -1671,8 +1679,6 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         with torch.inference_mode():
-            # GPU-side ordering: main stream waits for pre-forward bookkeeping stream.
-            torch.cuda.current_stream().wait_event(self._pre_forward_bookkeeping_event)
             self._dynamic_step_sample_bookkeeping()
 
             if self.num_speculative_tokens > 0:
