@@ -2734,9 +2734,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         if self.ddp_config.use_megatron_fsdp:
-            raise NotImplementedError(
-                "Megatron-FSDP does not implement a model-to-main parameter update."
-            )
+            # For FSDP, DCP loads checkpoint data directly into main_weight_buffer
+            # (fp32 main params), and a post-load hook copies main → model weights.
+            # Both main params and model params are already correct at this point.
+            return
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
