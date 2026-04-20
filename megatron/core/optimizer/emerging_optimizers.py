@@ -17,9 +17,17 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from .optimizer_config import ParamKey, ParamPredicate
+
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+
+    _HAVE_DTENSOR = True
+except ImportError:
+    _DTensor = None  # type: ignore[assignment,misc]
+    _HAVE_DTENSOR = False
 
 try:
     from emerging_optimizers import registry
@@ -335,6 +343,147 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
+
+
+class FSDPZeROTensorParallelMuon(TensorParallelMuon):
+    """`TensorParallelMuon` extended for Megatron-FSDP ZeRO-1/2/3.
+
+    Supports all three sharded strategies:
+
+    * `optim` (ZeRO-1): optimizer state sharded; grads reduce-scattered.
+    * `optim_grads` (ZeRO-2): optimizer state + grads sharded.
+    * `optim_grads_params` (ZeRO-3): optimizer state + grads + params sharded.
+
+    For all three, `finish_grad_sync()` reduce-scatters gradients so each DP
+    rank holds only a contiguous `Shard(0)` row-shard of the full TP-local 2D
+    gradient. Newton-Schulz needs the full matrix, so this class:
+
+      1. Extracts the local shard via `.to_local()` for any Shard(0) DTensor.
+      2. Allgathers the DP row-shards across the DP group to reconstruct the
+         TP-local, DP-full gradient matrix.
+      3. Trims FSDP bucket-padding rows using the declared global shape from the
+         DTensor.
+      4. Delegates to `TensorParallelMuon.orthogonalize` which handles the
+         remaining TP dimension via `newton_schulz_tp`.
+      5. Extracts the local DP row-shard of the orthogonalized result, padding
+         the last rank with zeros when FSDP bucket padding is present so the
+         per-rank shard size stays uniform.
+      6. Re-wraps the result as a DTensor matching the input's placements so
+         `OrthogonalizedOptimizer.step` can apply the in-place update without
+         placement promotion.
+
+    Memory note for ZeRO-3: each Muon step allocates a temporary `full_grad`
+    of shape `(tp_local_rows, C)` per Muon parameter for the allgather, plus
+    the NS output. Peak extra memory is roughly
+    `3 * (m * n) * sizeof(float32)` per linear layer; momentum stays sharded.
+
+    For "no_shard" or single-rank DP this falls back transparently to the
+    parent implementation.
+    """
+
+    def __init__(
+        self,
+        params: ParamsT,
+        dp_group: Optional[torch.distributed.ProcessGroup] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.dp_group = dp_group
+        super().__init__(params, **kwargs)
+
+    def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Orthogonalize with DP-shard allgather for FSDP ZeRO >= 1."""
+        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
+            return super().orthogonalize(p, grad, **kwargs)
+
+        dp_size = get_pg_size(self.dp_group)
+        dp_rank = get_pg_rank(self.dp_group)
+
+        # The momentum buffer (grad) and param (p) may be Shard(0) DTensors whose
+        # `.shape[0]` is the global row count. Always extract the local shard so
+        # "shard_rows" reflects the per-rank row count.
+        grad_local = grad.to_local() if (_HAVE_DTENSOR and isinstance(grad, _DTensor)) else grad
+        shard_rows = grad_local.shape[0]
+
+        # Allgather DP row-shards to reconstruct the TP-local, DP-full grad.
+        # FSDP guarantees equal shard sizes across DP ranks (buckets are padded
+        # to `dp_size * inner_dim`), so a single all_gather_into_tensor works.
+        full_grad = torch.empty(
+            shard_rows * dp_size,
+            *grad_local.shape[1:],
+            device=grad_local.device,
+            dtype=grad_local.dtype,
+        )
+        torch.distributed.all_gather_into_tensor(
+            full_grad, grad_local.contiguous(), group=self.dp_group
+        )
+
+        # Trim FSDP bucket-padding rows back to the param's TP-local row count.
+        tp_group = (
+            (
+                self.pg_collection.expt_tp
+                if getattr(p, "expert_tp", False)
+                else self.pg_collection.tp
+            )
+            if self.pg_collection
+            else None
+        )
+        partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
+        if partition_dim == -1:
+            partition_dim = None
+
+        tp_size_dim0 = get_pg_size(tp_group) if (partition_dim == 0 and tp_group is not None) else 1
+
+        if _HAVE_DTENSOR and isinstance(p, _DTensor):
+            # Production: `p.shape[0]` is the FSDP-declared global row count
+            # (already includes bucket padding); divide by `tp_size_dim0`
+            # to get the TP-local row count.
+            tp_local_rows = p.shape[0] // max(tp_size_dim0, 1)
+        else:
+            # Plain-tensor unit-test path: `p` is treated as the per-rank
+            # shard (`p.shape[0] == shard_rows`), so the TP-local row count
+            # must be reconstructed from the allgather, not read from `p`.
+            tp_local_rows = shard_rows * dp_size
+
+        full_grad = full_grad[:tp_local_rows]
+
+        # Apply NS to the TP-local, DP-full gradient. `super().orthogonalize`
+        # re-derives `tp_group` / `partition_dim` internally; the TP
+        # dimension of the reconstructed `full_grad` is unchanged.
+        orth_full_grad = super().orthogonalize(p, full_grad, **kwargs)
+
+        # Extract this rank's DP row-shard. If the last rank held fewer real
+        # rows than `shard_rows` (FSDP padding), zero-fill the extra rows so
+        # padded slots get a no-op update.
+        start_row = dp_rank * shard_rows
+        end_row = min(start_row + shard_rows, tp_local_rows)
+        orth_shard = orth_full_grad[start_row:end_row]
+
+        if orth_shard.shape[0] < shard_rows:
+            pad_rows = shard_rows - orth_shard.shape[0]
+            pad = torch.zeros(
+                pad_rows, *grad_local.shape[1:], device=grad_local.device, dtype=grad_local.dtype
+            )
+            orth_shard = torch.cat([orth_shard, pad], dim=0)
+
+        # Wrap the plain result back into a DTensor if the input was a DTensor.
+        # `OrthogonalizedOptimizer.step` does `p.add_(grad, alpha=-lr)`; for
+        # a Shard(0) DTensor `p` the update tensor must also be a DTensor with
+        # matching placements, otherwise PyTorch promotes it to `Replicate`
+        # and fails the global-shape check. Recent PyTorch versions require
+        # `shape` and `stride` to be passed together; for a Shard(0)
+        # contiguous local the global stride matches the local stride.
+        if _HAVE_DTENSOR and isinstance(grad, _DTensor):
+            local_contig = orth_shard.contiguous()
+            orth_shard = _DTensor.from_local(
+                local_contig,
+                device_mesh=grad.device_mesh,
+                placements=grad.placements,
+                shape=grad.shape,
+                stride=local_contig.stride(),
+                run_check=False,
+            )
+
+        return orth_shard
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):

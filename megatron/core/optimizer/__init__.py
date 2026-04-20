@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     FSDPMuonChainedOptimizer,
+    FSDPZeROTensorParallelMuon,
     _create_emerging_optimizer,
     _get_mfsdp_models,
 )
@@ -738,22 +739,31 @@ def _build_megatron_fsdp_emerging_optimizer(
     DTensor parameters, which makes `Float16OptimizerWithFloat16Params`
     incompatible. This helper:
 
-      1. Builds the linear-only `TensorParallelMuon` over a frozen-grad view of
-         the model so `_get_param_groups` only emits Muon-managed params.
+      1. Builds the linear-only Muon optimizer (plain `TensorParallelMuon` for
+         `no_shard`; `FSDPZeROTensorParallelMuon` for sharded strategies, which
+         allgathers DP row-shards before NS) over a frozen-grad view of the
+         model so `_get_param_groups` only emits Muon-managed params.
       2. Falls back to `get_megatron_optimizer` for the non-linear params,
          which routes through the standard Megatron-FSDP path for Adam.
       3. Wraps the chained result with `FSDPMuonChainedOptimizer`, which drives
          `finish_grad_sync` and `install_optimized_model_weights`.
-
-    Only the inner `no_shard` (ZeRO-0) sharding strategy is fully supported in
-    the initial implementation. Other strategies route through the same factory
-    but require `FSDPZeROTensorParallelMuon` for correctness (added later).
     """
     # Lazy import to avoid pulling Muon-specific symbols when emerging_optimizers
     # is unavailable; entry already validated upstream.
     entry = _EMERGING_OPTIMIZERS[eopt_name]
-    optimizer_cls = entry.optimizer_cls
     init_state_fn = entry.init_state_fn
+
+    # Choose Muon variant based on the inner-DP sharding strategy.
+    # - "no_shard" (ZeRO-0): params/grads are full Replicate DTensors, so the
+    #   plain TensorParallelMuon works without any DP communication.
+    # - Sharded strategies (ZeRO-1/2/3): finish_grad_sync() reduce-scatters
+    #   gradients into Shard(0) row-shards. FSDPZeROTensorParallelMuon
+    #   allgathers across the DP group before NS and re-shards the result.
+    fsdp_strategy = getattr(
+        model_chunks[0].ddp_config, "data_parallel_sharding_strategy", "no_shard"
+    )
+    use_fsdp_zero_muon = fsdp_strategy != "no_shard"
+    optimizer_cls = FSDPZeROTensorParallelMuon if use_fsdp_zero_muon else entry.optimizer_cls
 
     log_single_rank(
         logger,
@@ -803,7 +813,12 @@ def _build_megatron_fsdp_emerging_optimizer(
     optimizers: List[Any] = []
     init_fns: List[Callable] = []
     if linear_param_groups:
-        muon_base = optimizer_cls(linear_param_groups, **eopt_kwargs)
+        # ZeRO-1/2/3: gradients are reduce-scattered over `dp_cp` for dense
+        # params, so the FSDPZero variant must allgather over the same group.
+        dense_kwargs = dict(eopt_kwargs)
+        if use_fsdp_zero_muon:
+            dense_kwargs["dp_group"] = pg_collection.dp_cp
+        muon_base = optimizer_cls(linear_param_groups, **dense_kwargs)
         muon_opt = FP32Optimizer(muon_base, config, init_state_fn)
         setattr(muon_opt, "grad_stats_parallel_group", pg_collection.mp)
         setattr(muon_opt, "tp_group", pg_collection.tp)
@@ -811,7 +826,11 @@ def _build_megatron_fsdp_emerging_optimizer(
         init_fns.append(init_state_fn)
 
     if expert_param_groups:
+        # Expert params reduce-scatter over `expt_dp` (the expert
+        # data-parallel group), not `dp_cp`.
         expert_kwargs = dict(eopt_kwargs)
+        if use_fsdp_zero_muon:
+            expert_kwargs["dp_group"] = pg_collection.expt_dp
         expert_muon_base = optimizer_cls(expert_param_groups, **expert_kwargs)
         expert_muon_opt = FP32Optimizer(expert_muon_base, config, init_state_fn)
         setattr(expert_muon_opt, "grad_stats_parallel_group", pg_collection.tp_ep_pp)
