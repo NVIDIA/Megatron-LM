@@ -29,7 +29,25 @@ class ColocatedBridgeCommunicator:
     pass ``dim_mapping={'b': 0, 'h': 1}`` so dim 0 is treated as the batch/sample
     dimension. This relies on a uniform token count per sample (per image in a
     sample), which lets dim 0 be sliced evenly by the DP scale factor.
+
+    Input precondition (TP replication): ``communicate()`` assumes the input
+    tensor is already TP-replicated within each src DP group — i.e. all TP
+    ranks inside a given src DP replica hold the same tensor on the batch
+    dimension being bridged. Standard Megatron encoders produce TP-replicated
+    output at the bridge point (post-all-reduce/gather on the hidden dim), so
+    callers wiring this up through ``MimoModel`` get this for free. If you
+    bridge a point where the tensor is TP-sharded on the batch dim, results
+    are undefined — the communicator neither gathers along TP nor validates
+    this invariant on the fast path. Set ``ColocatedBridgeCommunicator
+    .CHECK_TP_REPLICATION = True`` (or pass ``check_tp_replication=True``) to
+    enable a collective equality check on every forward; it is slow and
+    intended only for debugging.
     """
+
+    # Debug flag: when True, every communicate() call all-gathers across the
+    # src TP group and verifies bitwise equality of the input tensor. Off by
+    # default because the check is collective and expensive.
+    CHECK_TP_REPLICATION: bool = False
 
     def __init__(
         self,
@@ -38,12 +56,17 @@ class ColocatedBridgeCommunicator:
         src_module_name: str = "src",
         dest_module_name: str = "dest",
         dim_mapping: Optional[Dict[str, int]] = None,
+        check_tp_replication: Optional[bool] = None,
     ):
         self.src_grid = src_grid
         self.dest_grid = dest_grid
         self.src_module_name = src_module_name
         self.dest_module_name = dest_module_name
         self.dim_mapping = dim_mapping or {'b': 0, 's': 1, 'h': 2}
+        # Per-instance override wins over the class-level default.
+        self.check_tp_replication = (
+            self.CHECK_TP_REPLICATION if check_tp_replication is None else check_tp_replication
+        )
         self.current_rank = dist.get_rank()
 
         self._validate_grids()
@@ -202,12 +225,29 @@ class ColocatedBridgeCommunicator:
         self.fan_out_gather_pg, _ = dist.new_subgroups_by_enumeration(all_groups, backend='nccl')
 
     def get_slice_info(self, batch_size: int) -> SliceInfo:
-        """Compute batch slice info for the current rank given the full batch size."""
+        """Compute batch slice info for the current rank given the full batch size.
+
+        Raises:
+            ValueError: if ``batch_size`` is not divisible by the active scale
+                factor (``fan_out_scale`` or ``fan_in_scale``). Silent
+                truncation on non-divisible batches is a correctness bug that
+                produced one-off mis-slicing in early versions.
+        """
         if self.fan_out_scale > 1:
+            self._check_divisible(batch_size, self.fan_out_scale, "fan_out_scale")
             return self._get_fan_out_slice_info(batch_size)
         if self.fan_in_scale > 1:
+            self._check_divisible(batch_size, self.fan_in_scale, "fan_in_scale")
             return self._get_fan_in_slice_info(batch_size)
         return SliceInfo(start=0, size=batch_size)
+
+    def _check_divisible(self, batch_size: int, scale: int, scale_name: str) -> None:
+        if batch_size % scale != 0:
+            raise ValueError(
+                f"ColocatedBridgeCommunicator: batch dim size {batch_size} is not "
+                f"divisible by {scale_name}={scale}. Non-divisible batches would "
+                f"silently drop samples on the narrow/all-gather path."
+            )
 
     def _get_fan_out_slice_info(self, batch_size: int) -> SliceInfo:
         if self.current_rank not in self.rank_to_dest_pos:
@@ -233,8 +273,56 @@ class ColocatedBridgeCommunicator:
         """Return True if src DP > dest DP (encoder has more replicas)."""
         return self.src_dp_size > self.dest_dp_size
 
+    def _assert_tp_replicated(self, tensor: torch.Tensor) -> None:
+        """Collective debug check that ``tensor`` is identical across src TP ranks.
+
+        Off by default (see ``CHECK_TP_REPLICATION``). When enabled, runs an
+        all-gather on the src TP group and raises if any TP peer's tensor
+        differs from the local one. Expensive — debug-only.
+        """
+        if not self.check_tp_replication:
+            return
+        if self.src_tp_size <= 1:
+            return
+        if self.current_rank not in self.rank_to_src_pos:
+            return
+        tp_group = self.src_grid.get_pg('tp')
+        local = tensor.contiguous()
+        gathered = [torch.empty_like(local) for _ in range(self.src_tp_size)]
+        dist.all_gather(gathered, local, group=tp_group)
+        for peer_idx, peer in enumerate(gathered):
+            if not torch.equal(peer, local):
+                raise RuntimeError(
+                    f"ColocatedBridgeCommunicator: TP-replication precondition "
+                    f"violated at rank {self.current_rank}: input tensor differs "
+                    f"from src TP peer slot {peer_idx}. The bridge requires the "
+                    f"encoder output to be TP-replicated on the batch dim."
+                )
+
     def communicate(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Transform tensor from src TP/DP layout to dest TP/DP layout."""
+        """Transform tensor from src TP/DP layout to dest TP/DP layout.
+
+        Precondition: ``tensor`` must be TP-replicated within each src DP
+        group (see class docstring). The communicator does not gather along
+        TP; feeding a TP-sharded tensor silently produces wrong results.
+
+        Raises:
+            ValueError: if the batch dim size is not divisible by the active
+                fan-in or fan-out scale factor.
+            RuntimeError: only when ``check_tp_replication`` is enabled and
+                the precondition is violated.
+        """
+        # Fan-out forward narrows dim[b] by fan_out_scale; non-divisibility
+        # there would silently truncate the batch. Fan-in forward all-gathers
+        # (no slice), and the backward narrow runs against the post-gather
+        # size which is always divisible — so only fan-out needs a
+        # forward-side divisibility guard. get_slice_info() re-checks on the
+        # backward path for fan-in and fan-out both.
+        if self.fan_out_scale > 1:
+            batch_dim = self.dim_mapping['b']
+            batch_size = tensor.shape[batch_dim]
+            self._check_divisible(batch_size, self.fan_out_scale, "fan_out_scale")
+        self._assert_tp_replicated(tensor)
         return _ColocatedCommunicate.apply(tensor, self)
 
     def destroy(self) -> None:

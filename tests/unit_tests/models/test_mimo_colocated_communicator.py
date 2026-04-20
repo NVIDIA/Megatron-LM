@@ -441,6 +441,328 @@ class TestValidateGrids:
         with pytest.raises(ValueError, match="evenly divisible"):
             make_comm(src_grid, dest_grid)
 
+    def test_pp_gt_1_rejected(self):
+        # Dedicated coverage of the PP>1 guard on either grid. PP>1 is out of
+        # scope for this communicator; the validator must reject on either side.
+        for pp_on in ("src", "dest"):
+            _active_grids.clear()
+            if pp_on == "src":
+                src_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
+                dest_grid = create_hypercomm_grid(tp=4, dp=2)
+                expected = "src PP must be 1"
+            else:
+                src_grid = create_hypercomm_grid(tp=4, dp=2)
+                dest_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
+                expected = "dest PP must be 1"
+            with pytest.raises(ValueError, match=expected):
+                make_comm(src_grid, dest_grid)
+            # Release PGs between iterations to stay under the NCCL cap.
+            for g in _active_grids:
+                g.destroy()
+            _active_grids.clear()
+
+
+# ── Test 3c: communicate() runtime preconditions ──────────────────────────────
+
+
+class TestCommunicatePreconditions:
+    """Runtime-input checks enforced by ``communicate()``."""
+
+    @classmethod
+    def setup_class(cls):
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+
+    def teardown_method(self):
+        destroy_all_grids()
+
+    def test_non_divisible_batch_raises_fan_out(self):
+        # Fan-out: dest_dp=4, src_dp=2 → fan_out_scale=2. Pass a batch dim of
+        # size 3 so 3 % 2 != 0 and we should raise before any slicing runs.
+        src_grid = create_hypercomm_grid(tp=4, dp=2)
+        dest_grid = create_hypercomm_grid(tp=2, dp=4)
+        comm = make_comm(
+            src_grid, dest_grid, dim_mapping={'b': 0, 'h': 1}
+        )
+        tensor = torch.zeros(3, 8, device='cuda')
+        with pytest.raises(ValueError, match="not divisible by fan_out_scale"):
+            comm.communicate(tensor)
+
+    def test_non_divisible_batch_raises_fan_in_backward_narrow(self):
+        # Fan-in: fan_in_scale=2. Fan-in forward all-gathers (no slice), so
+        # the forward path never divides. The backward path narrows the
+        # post-gather output via get_slice_info, which raises on a non-
+        # divisible size. Call get_slice_info directly with an odd size to
+        # exercise that raise path without a full backward.
+        src_grid = create_hypercomm_grid(tp=2, dp=4)
+        dest_grid = create_hypercomm_grid(tp=4, dp=2)
+        comm = make_comm(src_grid, dest_grid)
+        with pytest.raises(ValueError, match="not divisible by fan_in_scale"):
+            comm.get_slice_info(batch_size=3)
+
+    def test_non_divisible_get_slice_info_fan_out(self):
+        src_grid = create_hypercomm_grid(tp=4, dp=2)
+        dest_grid = create_hypercomm_grid(tp=2, dp=4)
+        comm = make_comm(src_grid, dest_grid)
+        with pytest.raises(ValueError, match="not divisible by fan_out_scale"):
+            comm.get_slice_info(batch_size=5)
+
+
+# ── Test 3d: destroy() releases PGs ──────────────────────────────────────────
+
+
+class TestDestroy:
+    """``destroy()`` must null out both PG attributes."""
+
+    @classmethod
+    def setup_class(cls):
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+
+    def teardown_method(self):
+        destroy_all_grids()
+
+    def test_destroy_releases_fan_in_pg(self):
+        src_grid = create_hypercomm_grid(tp=2, dp=4)
+        dest_grid = create_hypercomm_grid(tp=4, dp=2)
+        # Don't track via make_comm — destroy() is exactly what we're testing.
+        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        assert comm.all_gather_pg is not None
+        assert comm.fan_out_gather_pg is None
+        comm.destroy()
+        assert comm.all_gather_pg is None
+        assert comm.fan_out_gather_pg is None
+
+    def test_destroy_releases_fan_out_pg(self):
+        src_grid = create_hypercomm_grid(tp=4, dp=2)
+        dest_grid = create_hypercomm_grid(tp=2, dp=4)
+        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        assert comm.fan_out_gather_pg is not None
+        assert comm.all_gather_pg is None
+        comm.destroy()
+        assert comm.fan_out_gather_pg is None
+
+    def test_destroy_is_idempotent(self):
+        # Calling destroy twice must not raise — leftover test fixtures often
+        # double-destroy during exception cleanup.
+        src_grid = create_hypercomm_grid(tp=2, dp=4)
+        dest_grid = create_hypercomm_grid(tp=4, dp=2)
+        comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
+        comm.destroy()
+        comm.destroy()
+
+
+# ── Test 3e: Bridge gradient correctness (bitwise exact) ─────────────────────
+
+
+def _shape_for_dim_mapping(dim_mapping, B, S, H):
+    s = [0, 0, 0]
+    s[dim_mapping['b']] = B
+    s[dim_mapping['s']] = S
+    s[dim_mapping['h']] = H
+    return s
+
+
+# Parametrize dim_mapping for the fan-in tests (tests 1 & 2 per AXIOM spec).
+_DIM_MAPPINGS = [{'s': 0, 'b': 1, 'h': 2}, {'b': 0, 's': 1, 'h': 2}]
+_DIM_MAPPING_IDS = ["sbh", "bsh"]
+
+
+class TestBridgeGradients:
+    """Gradient correctness for ColocatedBridgeCommunicator.
+
+    All assertions use ``rtol=0, atol=0`` — the bridge is pure data movement
+    (narrow / all-gather), so both forward output and the adjoint backward are
+    exact functions of the inputs. Any deviation is a logic bug.
+    """
+
+    S = 8
+    B_PER_RANK = 2
+    H = 128
+
+    @classmethod
+    def setup_class(cls):
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+
+    def teardown_method(self):
+        destroy_all_grids()
+
+    # ── Test 1: fan-in forward = torch.cat of sibling inputs ─────────────────
+    @pytest.mark.parametrize(
+        "src_tp,src_dp,dest_tp,dest_dp",
+        [(2, 4, 4, 2), (1, 8, 8, 1)],
+        ids=["2x_fan_in", "8x_fan_in"],
+    )
+    @pytest.mark.parametrize("dim_mapping", _DIM_MAPPINGS, ids=_DIM_MAPPING_IDS)
+    def test_fan_in_forward_equals_torch_cat(
+        self, src_tp, src_dp, dest_tp, dest_dp, dim_mapping
+    ):
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
+        comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
+
+        rank = dist.get_rank()
+        shape = _shape_for_dim_mapping(dim_mapping, self.B_PER_RANK, self.S, self.H)
+
+        # Distinct inputs per rank so the cat reveals ordering bugs.
+        torch.manual_seed(1000 + rank)
+        local_input = torch.randn(*shape, device='cuda')
+
+        actual = comm.communicate(local_input)
+
+        # Expected: manual all_gather over the communicator's fan-in group,
+        # then cat along batch_dim. all_gather preserves group-local-rank
+        # order, which is the same order the communicator uses.
+        group = comm.all_gather_pg
+        gathered = [torch.empty_like(local_input) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(gathered, local_input, group=group)
+        expected = torch.cat(gathered, dim=dim_mapping['b'])
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # ── Test 2: fan-in backward = grad_output.narrow for this rank's slot ────
+    @pytest.mark.parametrize(
+        "src_tp,src_dp,dest_tp,dest_dp",
+        [(2, 4, 4, 2), (1, 8, 8, 1)],
+        ids=["2x_fan_in", "8x_fan_in"],
+    )
+    @pytest.mark.parametrize("dim_mapping", _DIM_MAPPINGS, ids=_DIM_MAPPING_IDS)
+    def test_fan_in_backward_equals_narrow(
+        self, src_tp, src_dp, dest_tp, dest_dp, dim_mapping
+    ):
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
+        comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
+
+        rank = dist.get_rank()
+        batch_dim = dim_mapping['b']
+        b_local = self.B_PER_RANK
+        shape = _shape_for_dim_mapping(dim_mapping, b_local, self.S, self.H)
+
+        torch.manual_seed(1000 + rank)
+        local_input = torch.randn(*shape, device='cuda', requires_grad=True)
+        out = comm.communicate(local_input)
+
+        # grad_output is TP-replicated within the dest DP group: seed the same
+        # on every rank so every rank in the fan-in group backward-narrows the
+        # same upstream gradient. out shape is identical across group members,
+        # so seeded randn produces the same tensor on each.
+        torch.manual_seed(42)
+        grad_output = torch.randn_like(out)
+        out.backward(grad_output)
+
+        slot = comm.rank_to_src_pos[rank][0] % comm.fan_in_scale
+        expected = grad_output.narrow(batch_dim, slot * b_local, b_local).contiguous()
+        torch.testing.assert_close(local_input.grad, expected, rtol=0, atol=0)
+
+    # ── Test 3: fan-out forward = input.narrow for this rank's slot ─────────
+    @pytest.mark.parametrize(
+        "src_tp,src_dp,dest_tp,dest_dp",
+        [(4, 2, 2, 4), (8, 1, 1, 8)],
+        ids=["2x_fan_out", "8x_fan_out"],
+    )
+    def test_fan_out_forward_equals_narrow(self, src_tp, src_dp, dest_tp, dest_dp):
+        dim_mapping = {'b': 0, 's': 1, 'h': 2}
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
+        comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
+
+        rank = dist.get_rank()
+        batch_dim = dim_mapping['b']
+        b_per_dest = self.B_PER_RANK
+        b_full = b_per_dest * comm.fan_out_scale
+        shape = _shape_for_dim_mapping(dim_mapping, b_full, self.S, self.H)
+
+        # Input is TP-replicated on the batch dim (bridge contract). Seed
+        # identically across all ranks to satisfy it.
+        torch.manual_seed(42)
+        input_tensor = torch.randn(*shape, device='cuda')
+
+        actual = comm.communicate(input_tensor)
+
+        slot = comm.rank_to_dest_pos[rank][0] % comm.fan_out_scale
+        expected = input_tensor.narrow(
+            batch_dim, slot * b_per_dest, b_per_dest
+        ).contiguous()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # ── Test 4 (CRITICAL): fan-out backward = concat of all sibling grads ──
+    @pytest.mark.parametrize(
+        "src_tp,src_dp,dest_tp,dest_dp",
+        [(4, 2, 2, 4), (8, 1, 1, 8)],
+        ids=["2x_fan_out", "8x_fan_out"],
+    )
+    def test_fan_out_backward_equals_concat_of_sibling_grads(
+        self, src_tp, src_dp, dest_tp, dest_dp
+    ):
+        """Fan-out backward must all-gather sibling grads in slot order.
+
+        Catches four distinct regressions with a single assertion:
+          * zero-pad-without-gather (other slots would be zero),
+          * wrong slot order (values would be scrambled),
+          * double-counting (values would be multiplied),
+          * missing siblings (shape or zeros would diverge).
+        """
+        dim_mapping = {'b': 0, 's': 1, 'h': 2}
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
+        comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
+
+        rank = dist.get_rank()
+        batch_dim = dim_mapping['b']
+        scale = comm.fan_out_scale
+        b_per_dest = self.B_PER_RANK
+        b_full = b_per_dest * scale
+        shape = _shape_for_dim_mapping(dim_mapping, b_full, self.S, self.H)
+
+        torch.manual_seed(42)  # identical input across ranks (TP-replicated)
+        input_tensor = torch.randn(*shape, device='cuda', requires_grad=True)
+        out = comm.communicate(input_tensor)  # narrowed to (b_per_dest, S, H)
+
+        # Distinct grad per slot so the cat reveals both membership and order.
+        slot = comm.rank_to_dest_pos[rank][0] % scale
+        grad_output = (slot + 1) * torch.ones_like(out)
+        out.backward(grad_output)
+
+        slot_shape = _shape_for_dim_mapping(dim_mapping, b_per_dest, self.S, self.H)
+        expected = torch.cat(
+            [(i + 1) * torch.ones(*slot_shape, device='cuda') for i in range(scale)],
+            dim=batch_dim,
+        )
+        torch.testing.assert_close(input_tensor.grad, expected, rtol=0, atol=0)
+
+    # ── Test 5: equal DP is a pure identity forward and backward ────────────
+    @pytest.mark.parametrize(
+        "src_tp,src_dp,dest_tp,dest_dp",
+        [(4, 2, 4, 2), (2, 4, 2, 4)],
+        ids=["tp4_dp2", "tp2_dp4"],
+    )
+    def test_equal_dp_is_bitwise_identity_fwd_and_bwd(
+        self, src_tp, src_dp, dest_tp, dest_dp
+    ):
+        dim_mapping = {'b': 0, 's': 1, 'h': 2}
+        src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
+        dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
+        comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
+
+        shape = _shape_for_dim_mapping(dim_mapping, self.B_PER_RANK, self.S, self.H)
+        torch.manual_seed(1000 + dist.get_rank())
+        x = torch.randn(*shape, device='cuda', requires_grad=True)
+
+        out = comm.communicate(x)
+        torch.testing.assert_close(out, x, rtol=0, atol=0)
+
+        grad_output = torch.randn_like(x)
+        out.backward(grad_output)
+        torch.testing.assert_close(x.grad, grad_output, rtol=0, atol=0)
+
 
 # ── Test 4: Forward / backward golden test ─────────────────────────────────────
 

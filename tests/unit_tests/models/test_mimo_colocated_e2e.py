@@ -710,3 +710,27 @@ class TestMimoColocatedE2E:
             micro_batch_size=2,
             num_microbatches=2,
         )
+
+    def test_colocated_fan_out_8gpu(self):
+        """Encoder TP4/DP2, LLM TP2/DP4 -- fan-out case.
+
+        Mirror of the fan-in test but with encoder DP smaller than LLM DP, so
+        the bridge's forward narrows the encoder output and its backward
+        all-gathers the slice gradients across sibling LLM DP ranks. Exercises
+        the fan-out forward/backward path end-to-end through
+        ``forward_backward_no_pipelining``.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        run_colocated_test(
+            encoder_tp=4,
+            encoder_dp=2,
+            llm_tp=2,
+            llm_dp=4,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=2,
+        )
