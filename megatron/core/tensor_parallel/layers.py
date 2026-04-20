@@ -236,6 +236,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
         self.deterministic_mode = config.deterministic_mode
 
+        self.use_inference_optimized_reduce_scatter = getattr(
+            config, 'use_inference_optimized_layers', False
+        )
+        self.triton_nvls_kernels_allowed = (
+            self.use_inference_optimized_reduce_scatter
+            and not getattr(config, 'inference_disable_triton_nvls_kernels', False)
+        )
+
         # Allocate weights and initialize.
         if config.use_cpu_initialization:
             self.weight = Parameter(
@@ -302,13 +310,44 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.reduce_scatter_embeddings:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             output_parallel = output_parallel.transpose(0, 1).contiguous()
-            output = reduce_scatter_to_sequence_parallel_region(
-                output_parallel, group=self.tp_group
-            )
+            if self.use_inference_optimized_reduce_scatter and not self.training:
+                output = self._inference_reduce_scatter(output_parallel)
+            else:
+                output = reduce_scatter_to_sequence_parallel_region(
+                    output_parallel, group=self.tp_group
+                )
         else:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
         return output
+
+    def _inference_reduce_scatter(self, input_: torch.Tensor) -> torch.Tensor:
+        """NVLS-optimized reduce scatter with NCCL fallback for inference."""
+        from megatron.core.inference.communication.torch_symm_triton import (
+            are_tensors_nvls_eligible,
+            multimem_reduce_scatter,
+        )
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(list(input_.size()), dtype=input_.dtype)
+
+        can_use_nvls = (
+            self.triton_nvls_kernels_allowed
+            and input_.dtype == torch.bfloat16
+            and are_tensors_nvls_eligible(input_)
+            and symm_mem_buffer["handle"] is not None
+        )
+
+        if can_use_nvls:
+            symm_mem_buffer["tensor"].copy_(input_)
+            output_dims = list(input_.size())
+            output_dims[0] = input_.size(0) // self.tp_group.size()
+            output = torch.empty(output_dims, dtype=input_.dtype, device=input_.device)
+            multimem_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
+            return output
+        else:
+            return reduce_scatter_to_sequence_parallel_region(input_, group=self.tp_group)
 
     def sharded_state_dict(
         self,
