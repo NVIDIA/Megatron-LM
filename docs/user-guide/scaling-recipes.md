@@ -15,8 +15,9 @@ The current named recipes are:
 
 - `none`: standard Megatron parameterization.
 - `mup`: current Megatron width MuP behavior.
-- `depth_mup`: a spectral width-depth μP Adam/AdamW recipe for dense GPT-style
-  residual Transformer blocks within Megatron's current support surface.
+- `depth_mup`: a spectral width-depth μP recipe for dense GPT-style residual
+  Transformer blocks using `--optimizer adam`; AdamW semantics remain
+  controlled by `decoupled_weight_decay`.
 
 `depth_mup` remains a narrow public recipe rather than a broad public
 depth-transfer claim. Megatron enforces the intended surface and explicitly
@@ -63,8 +64,9 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 ## `depth_mup`
 
 `depth_mup` extends MuP-family width behavior with the spectral width-depth μP
-paper's AdamW-style optimizer table adapted to Megatron's current dense
-GPT-style residual Transformer support surface.
+paper's AdamW-style optimizer table adapted onto Megatron's existing
+`--optimizer adam` path, where `decoupled_weight_decay` controls AdamW
+semantics.
 
 The resolved recipe defaults are:
 
@@ -89,7 +91,7 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
     --num-layers 24 \
     --hidden-size 2048 \
     --num-attention-heads 16 \
-    --optimizer adamw \
+    --optimizer adam \
     --scaling-recipe depth_mup \
     --scaling-base-hidden-size 1024 \
     --scaling-base-num-layers 12 \
@@ -103,7 +105,7 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 - dense GPT-style residual Transformer blocks
 - dense self-attention residual branches
 - dense MLP residual branches
-- Adam and AdamW optimizers
+- `--optimizer adam`, with AdamW semantics via `decoupled_weight_decay`
 
 `depth_mup` currently rejects unsupported paths instead of silently applying
 unvalidated rules. The rejected surface includes:

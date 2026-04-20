@@ -416,10 +416,10 @@ class OptimizerConfig:
                 )
 
         if self.use_precision_aware_optimizer:
-            assert self.optimizer in (
-                'adam',
-                'adamw',
-            ), '--use-precision-aware-optimizer only supported with adam/adamw'
+            assert self.optimizer == 'adam', (
+                '--use-precision-aware-optimizer only supported with optimizer=adam; '
+                'AdamW semantics should continue to use decoupled_weight_decay'
+            )
             assert (
                 self.use_distributed_optimizer
             ), '--use-precision-aware-optimizer only supported with distributed optimizer'
