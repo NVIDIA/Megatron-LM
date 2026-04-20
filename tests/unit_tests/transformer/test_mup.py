@@ -1740,8 +1740,8 @@ class TestMuPLRScaling:
         assert 'min_lr' not in bias_override
         assert 'eps' not in bias_override
 
-    def test_depth_mup_applies_adam_epsilon_depth_power(self):
-        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
+    def test_depth_mup_applies_spectral_adam_role_specific_overrides(self):
+        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, weight_decay=0.1)
         model_config = TransformerConfig(
             hidden_size=1024,
             num_layers=16,
@@ -1751,11 +1751,31 @@ class TestMuPLRScaling:
             scaling_base_num_layers=4,
         )
         scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
-        overrides = get_scaling_config_overrides(optimizer_config, scaling_policy)
+        standard_overrides = get_standard_config_overrides(
+            optimizer_config, scaling_policy=scaling_policy
+        )
+        scaling_overrides = get_scaling_config_overrides(optimizer_config, scaling_policy)
+        overrides = {**standard_overrides, **scaling_overrides}
 
         hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+        hidden_vector_param = torch.nn.Parameter(torch.zeros(10))
+        embedding_param = torch.nn.Parameter(torch.zeros(10, 10))
+        embedding_param.is_embedding_parameter = True
+        embedding_param.is_embedding_or_output_parameter = True
+        output_param = torch.nn.Parameter(torch.zeros(10, 10))
+        output_param.is_embedding_parameter = True
+        output_param.is_embedding_or_output_parameter = True
         hidden_override = _combined_override_for_param(
             overrides, hidden_param, 'decoder.layers.0.self_attention.linear_qkv.weight'
+        )
+        hidden_vector_override = _combined_override_for_param(
+            overrides, hidden_vector_param, 'decoder.layers.0.mlp.linear_fc1.bias'
+        )
+        embedding_override = _combined_override_for_param(
+            overrides, embedding_param, 'embedding.word_embeddings.weight'
+        )
+        output_override = _combined_override_for_param(
+            overrides, output_param, 'output_layer.weight'
         )
 
         expected_lr_mult = 1.0 / scaling_policy.context.width_mult
@@ -1770,8 +1790,27 @@ class TestMuPLRScaling:
         assert hidden_override['eps'] == pytest.approx(
             optimizer_config.adam_eps * expected_eps_mult
         )
+        assert hidden_override['wd_mult'] == pytest.approx(scaling_policy.context.width_mult)
+        assert 'max_lr' not in hidden_vector_override
+        assert 'min_lr' not in hidden_vector_override
+        assert hidden_vector_override['eps'] == pytest.approx(
+            optimizer_config.adam_eps * expected_eps_mult
+        )
+        assert 'wd_mult' not in hidden_vector_override
+        assert 'max_lr' not in embedding_override
+        assert 'min_lr' not in embedding_override
+        assert embedding_override['eps'] == pytest.approx(
+            optimizer_config.adam_eps / scaling_policy.context.width_mult
+        )
+        assert 'wd_mult' not in embedding_override
+        assert 'max_lr' not in output_override
+        assert 'min_lr' not in output_override
+        assert output_override['eps'] == pytest.approx(
+            optimizer_config.adam_eps / scaling_policy.context.width_mult
+        )
+        assert 'wd_mult' not in output_override
 
-    def test_depth_mup_applies_adamw_epsilon_depth_power(self):
+    def test_depth_mup_applies_spectral_adamw_policy_defaults(self):
         model_config = TransformerConfig(
             hidden_size=1024,
             num_layers=16,
@@ -1785,6 +1824,9 @@ class TestMuPLRScaling:
         assert scaling_policy.hidden_lr_multiplier == pytest.approx(1.0 / 4.0)
         assert scaling_policy.hidden_eps_depth_power == pytest.approx(-1.0)
         assert scaling_policy.hidden_eps_multiplier == pytest.approx(1.0 / 16.0)
+        assert scaling_policy.hidden_vector_eps_multiplier == pytest.approx(1.0 / 16.0)
+        assert scaling_policy.embedding_class_eps_multiplier == pytest.approx(1.0 / 4.0)
+        assert scaling_policy.hidden_matrix_wd_multiplier == pytest.approx(4.0)
 
     def test_depth_mup_residual_multiplier_exact_depth_factors(self):
         base_depth_config = TransformerConfig(
@@ -1808,7 +1850,7 @@ class TestMuPLRScaling:
         assert build_resolved_model_policy(double_depth_config).residual_branch_multiplier == pytest.approx(0.5)
 
     @pytest.mark.parametrize('optimizer_type', ['adam', 'adamw'])
-    def test_depth_mup_hidden_eps_depth_factor_isolated_at_double_depth(self, optimizer_type):
+    def test_depth_mup_hidden_depth_factor_excludes_embedding_class_eps(self, optimizer_type):
         config = TransformerConfig(
             hidden_size=512,
             num_layers=24,
@@ -1820,6 +1862,60 @@ class TestMuPLRScaling:
         policy = build_resolved_training_policy(config, optimizer_type=optimizer_type)
 
         assert policy.hidden_eps_multiplier == pytest.approx(0.5)
+        assert policy.hidden_vector_eps_multiplier == pytest.approx(0.5)
+        assert policy.embedding_class_eps_multiplier == pytest.approx(1.0)
+
+    def test_depth_mup_disables_default_vector_like_weight_decay_skip(self):
+        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5, weight_decay=0.1)
+        model_config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=16,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=4,
+        )
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adamw')
+        standard_overrides = get_standard_config_overrides(
+            optimizer_config, scaling_policy=scaling_policy
+        )
+
+        bias_param = torch.nn.Parameter(torch.zeros(10))
+        assert _combined_override_for_param(
+            standard_overrides, bias_param, 'decoder.layers.0.mlp.linear_fc1.bias'
+        ) == {}
+
+    def test_depth_mup_with_decoupled_lr_preserves_embedding_output_lr_and_scales_eps(self):
+        optimizer_config = OptimizerConfig(
+            lr=1e-3, min_lr=1e-5, decoupled_lr=2e-4, decoupled_min_lr=2e-6, weight_decay=0.1
+        )
+        model_config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=16,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=4,
+        )
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adamw')
+        standard_overrides = get_standard_config_overrides(
+            optimizer_config, scaling_policy=scaling_policy
+        )
+        scaling_overrides = get_scaling_config_overrides(optimizer_config, scaling_policy)
+        overrides = {**standard_overrides, **scaling_overrides}
+
+        output_param = torch.nn.Parameter(torch.zeros(10, 10))
+        output_param.is_embedding_parameter = True
+        output_param.is_embedding_or_output_parameter = True
+        output_override = _combined_override_for_param(
+            overrides, output_param, 'output_layer.weight'
+        )
+
+        assert output_override['max_lr'] == pytest.approx(2e-4)
+        assert output_override['min_lr'] == pytest.approx(2e-6)
+        assert output_override['eps'] == pytest.approx(
+            optimizer_config.adam_eps / scaling_policy.context.width_mult
+        )
 
     def test_depth_mup_rejects_sgd(self):
         model_config = TransformerConfig(

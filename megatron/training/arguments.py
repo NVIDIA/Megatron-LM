@@ -2235,8 +2235,9 @@ def _add_scaling_args(parser):
     group.add_argument('--scaling-recipe', type=str, default=None,
                        choices=['none', 'mup', 'depth_mup'],
                        help='Canonical scaling recipe. `mup` preserves current Megatron MuP; '
-                       '`depth_mup` is the initial Adam/AdamW-scoped dense GPT-style residual '
-                       'Transformer Depth-MuP candidate.')
+                       '`depth_mup` is the spectral width-depth μP Adam/AdamW recipe for '
+                       'dense GPT-style residual Transformer blocks within Megatron\'s '
+                       'current support surface.')
     group.add_argument('--scaling-base-hidden-size', type=int, default=None,
                        help='Reference hidden size for width-based scaling recipes.')
     group.add_argument('--scaling-base-num-layers', type=int, default=None,

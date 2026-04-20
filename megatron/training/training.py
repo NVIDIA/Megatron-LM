@@ -1649,6 +1649,10 @@ def setup_model_and_optimizer(
             model_config, optimizer_type=config.optimizer
         )
         if scaling_policy.enabled:
+            config_overrides = get_standard_config_overrides(
+                config=config,
+                scaling_policy=scaling_policy,
+            )
             scaling_overrides = get_scaling_config_overrides(
                 config=config,
                 scaling_policy=scaling_policy,
