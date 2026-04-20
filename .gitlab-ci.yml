@@ -1,12 +1,12 @@
 .merge_train_rule: &merge_train_rule
   UNIT_TEST: "yes"
   UNIT_TEST_REPEAT: 1
-  UNIT_TEST_TIMEOUT: 15
-  INTEGRATION_TEST: "yes"
+  UNIT_TEST_TIMEOUT: 30
+  INTEGRATION_TEST: "no"
   INTEGRATION_TEST_SCOPE: mr
   FUNCTIONAL_TEST: "yes"
   FUNCTIONAL_TEST_SCOPE: mr-slim
-  FUNCTIONAL_TEST_REPEAT: 5
+  FUNCTIONAL_TEST_REPEAT: 1
   FUNCTIONAL_TEST_TIME_LIMIT: 2700
   CLUSTER_A100: ""
   CLUSTER_H100: ""
@@ -15,8 +15,10 @@
 workflow:
   rules:
     # Do not trigger for forks
-    - if: $CI_PROJECT_NAMESPACE != "ADLR"
+    - if: $CI_PROJECT_NAMESPACE != "ADLR" || ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_PROJECT_PATH != "ADLR/megatron-lm")
       when: never
+
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
 
     # ci-branches only for schedule
     - if: $CI_COMMIT_BRANCH =~ /ci-/ && $CI_PIPELINE_SOURCE != "schedule"
@@ -27,11 +29,17 @@ workflow:
       auto_cancel:
         on_new_commit: none
 
-    # For manual pipelines
+    # For manual pipelines (GitLab UI)
     - if: $CI_PIPELINE_SOURCE == "web"
 
+    # For pipelines created via the REST API (personal access token)
+    - if: $CI_PIPELINE_SOURCE == "api"
+
+    # For trigger pipelines
+    - if: $CI_PIPELINE_SOURCE == "trigger"
+
     # For push to main
-    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_REF_PROTECTED == "true"
+    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH =~ /^core_/)
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -39,19 +47,19 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
-        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        FUNCTIONAL_TEST_TIME_LIMIT: 3600
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
       auto_cancel:
-        on_new_commit: none
+        on_new_commit: interruptible
 
     # For merge-trains that need to be fast-tracked
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
         CLUSTER_A100: ""
@@ -62,18 +70,28 @@ workflow:
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train'
       variables: *merge_train_rule
 
-    # Prevent running on merge-conflicts
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA == ''
-      when: never
-
     # For MRs with integration suite
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
-      variables: *merge_train_rule
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
+      variables:
+        UNIT_TEST: "yes"
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 30
+        INTEGRATION_TEST: "yes"
+        INTEGRATION_TEST_SCOPE: mr
+        FUNCTIONAL_TEST: "no"
+        FUNCTIONAL_TEST_SCOPE: mr-slim
+        FUNCTIONAL_TEST_REPEAT: 1
+        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        CLUSTER_A100: ""
+        CLUSTER_H100: ""
+        PUBLISH: "no"
 
     # For MRs with nightly
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
       variables:
-        UNIT_TEST: "no"
+        UNIT_TEST: "yes"
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
@@ -85,9 +103,11 @@ workflow:
         PUBLISH: "no"
 
     # For MRs with weekly
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
       variables:
-        UNIT_TEST: "no"
+        UNIT_TEST: "yes"
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
@@ -99,26 +119,26 @@ workflow:
         PUBLISH: "no"
 
     # For MRs with heavy suite
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
-        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
     # Default MRs
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result'
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
         PUBLISH: "no"
@@ -142,6 +162,8 @@ default:
     when: runner_system_failure
 
 variables:
+  BUILD:
+    value: "yes"
   UNIT_TEST:
     value: "yes"
     options:
@@ -215,10 +237,15 @@ variables:
       - "dgxa100_dracooci-ord"
     description: "Cluster for A100 workloads"
   CLUSTER_H100:
-    value: "dgxh100_eos"
+    value: "dgxh100_coreweave"
     options:
       - "dgxh100_coreweave"
       - "dgxh100_eos"
+    description: "Cluster for H100 workloads"
+  CLUSTER_GB200:
+    value: "dgxgb200_oci-hsg"
+    options:
+      - "dgxgb200_oci-hsg"
     description: "Cluster for H100 workloads"
   PUBLISH:
     value: "no"
@@ -238,6 +265,7 @@ variables:
       - "code-freeze"
       - "release"
       - "review-reminder"
+      - "upgrade-dependencies"
     description: Type of publish (freeze or final release)
 
   # CI wide variables
@@ -245,6 +273,7 @@ variables:
   CI_MCORE_DEV_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_dev
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
   UTILITY_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_utility
+  TE_GIT_REF: ""
 
 include:
   - .gitlab/stages/00.pre.yml

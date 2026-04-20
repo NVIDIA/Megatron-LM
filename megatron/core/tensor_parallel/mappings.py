@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import torch
 
@@ -7,10 +7,14 @@ from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torc
 
 from .utils import split_tensor_along_last_dim
 
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+        dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
@@ -341,7 +345,7 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
             )
         else:
             assert ctx.output_split_sizes is None
-            return _split_along_first_dim(grad_output, ctx.group), None, None, None, None
+            return (_split_along_first_dim(grad_output, ctx.group), None, None, None, None)
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
@@ -415,11 +419,12 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes, use_nccl_stream=False):
         """Forward function."""
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
+        ctx.use_nccl_stream = use_nccl_stream
 
         world_size = group.size()
         # Bypass the function if we are using only 1 GPU.
@@ -437,13 +442,24 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        torch.distributed.all_to_all_single(
-            output,
-            input,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=group,
-        )
+        if use_nccl_stream:
+            handle = torch.distributed.all_to_all_single(
+                output,
+                input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+                async_op=True,
+            )
+            handle.wait()
+        else:
+            torch.distributed.all_to_all_single(
+                output,
+                input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+            )
         return output
 
     @staticmethod
@@ -451,7 +467,14 @@ class _AllToAll(torch.autograd.Function):
         """Backward function."""
         return (
             None,
-            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
+            _AllToAll.apply(
+                ctx.group,
+                *grad_output,
+                ctx.input_split_sizes,
+                ctx.output_split_sizes,
+                ctx.use_nccl_stream,
+            ),
+            None,
             None,
             None,
         )
@@ -528,10 +551,12 @@ def reduce_scatter_last_dim_to_tensor_parallel_region(input_, group=None):
     return _ReduceScatterToTensorParallelRegion.apply(input_, group)
 
 
-def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
+def all_to_all(
+    group, input_, output_split_sizes_=None, input_split_sizes=None, use_nccl_stream=False
+):
     """Wrapper for autograd function"""
     assert group is not None, "group should not be None"
-    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes)
+    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, use_nccl_stream)
 
 
 def all_to_all_sp2hp(input_, group=None):

@@ -2,7 +2,7 @@
 
 
 def add_modelopt_args(parser):
-    """Add additional arguments for using TensorRT Model Optimizer (modelopt) features."""
+    """Add additional arguments for using Model Optimizer (modelopt) features."""
     group = parser.add_argument_group(title="modelopt-generic")
 
     # Model and Checkpoint Compatibility
@@ -21,19 +21,29 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
-        help="Export a megatron-core transformer-engine checkpoint.",
+        help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "
+        "(where layernorms are fused into linear layers). Enables state_dict key remapping so the "
+        "TE checkpoint can be loaded into the local ModelOpt spec for PTQ/export, and saved back "
+        "in TE-compatible format. Mutually exclusive with --export-default-te-spec.",
+    )
+    group.add_argument(
+        "--export-default-te-spec",
+        action="store_true",
+        help="Use the full Transformer-Engine layer spec for model building. "
+        "This builds the model with TELayerNormColumnParallelLinear, TERowParallelLinear, "
+        "TEGroupedMLP, TEDotProductAttention, etc., matching the canonical TE specs.",
     )
     group.add_argument(
         "--export-force-local-attention",
         action="store_true",
         help="Forcing local DotProductAttention; otherwise TEDotProductAttention is used.",
     )
-
     # Quantization
     group.add_argument(
         "--export-kv-cache-quant",
-        action="store_true",
-        help="Whether or not to perform KV-cache quantization.",
+        help="Type of KV cache quantization to perform.",
+        choices=["none", "fp8", "fp8_affine", "nvfp4", "nvfp4_affine", "nvfp4_rotate"],
+        default="none",
     )
     group.add_argument(
         "--export-real-quant-cfg",
@@ -46,57 +56,75 @@ def add_modelopt_args(parser):
         "--export-quant-cfg",
         type=str,
         default=None,
-        choices=[
-            "int8",
-            "int8_sq",
-            "fp8",
-            "fp8_real_quant",
-            "fp8_blockwise",
-            "fp8_blockwise_real_quant",
-            "int4_awq",
-            "w4a8_awq",
-            "int4",
-            "fp4",
-            "None",
-        ],
-        help="Specify a quantization config from the supported choices.",
+        # TODO replace choices with mtq.config.choices after deprecating the shorter aliases
+        help="Specify a quantization config from mtq.config.choices.",
     )
-
     # Knowledge Distillation
+    group.add_argument(
+        '--export-kd-teacher-load',
+        type=str,
+        help='Path to checkpoint to load as distillation teacher. (Enables distillation mode automatically)',
+    )
+    group.add_argument(
+        '--export-kd-teacher-model-config',
+        type=str,
+        default=None,
+        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+    )
+    group.add_argument(
+        '--export-kd-teacher-ckpt-format',
+        type=str,
+        default=None,
+        choices=['torch', 'torch_dist', 'torch_dcp'],
+        help="Checkpoint format of teacher model, if different from student's.",
+    )
     group.add_argument(
         '--export-kd-cfg',
         type=str,
         default=None,
-        help='Path to distillation configuration yaml file.',
-    )
-    group.add_argument(
-        '--export-kd-teacher-load',
-        type=str,
-        help='Path to checkpoint to load as distillation teacher.',
-    )
-    group.add_argument(
-        '--export-kd-finalize',
-        action="store_true",
-        help='Export original student class back from a loaded distillation model.',
-    )
-
-    # Speculative decoding
-    group.add_argument(
-        '--export-num-medusa-heads',
-        type=int,
-        default=0,
-        help='Number of Medusa heads for speculative decoding.',
-    )
-    group.add_argument(
-        '--export-num-eagle-layers',
-        type=int,
-        default=0,
-        help='Number of EAGLE layers for speculative decoding.',
+        help='Path to distillation configuration yaml file, in order to use non-default settings.',
     )
 
     # Finetuning
     group.add_argument(
         "--finetune-hf-dataset", type=str, default=None, help="HF dataset used for finetuning."
+    )
+    group.add_argument(
+        "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
+    )
+
+    # Special model architecture option
+    group.add_argument(
+        '--export-qk-l2-norm',
+        action="store_true",
+        help='Use Llama-4 L2Norm instead of normal LayerNorm/RMSNorm for QK normalization.',
+    )
+    group.add_argument(
+        '--export-moe-apply-probs-on-input',
+        action="store_true",
+        help='Use Llama-4 expert scaling on input instead of output.',
+    )
+
+    # Speculative decoding
+    group.add_argument(
+        '--export-offline-model',
+        action="store_true",
+        help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
+    )
+
+    # Global state
+    group.add_argument(
+        '--modelopt-enabled',
+        action="store_true",
+        help='Will be set automatically when loading a ModelOpt checkpoint.',
+    )
+
+    # GPT-OSS YaRN RoPE support
+    group.add_argument(
+        '--enable-gpt-oss',
+        action="store_true",
+        help='Enable GPT-OSS mode with YaRN RoPE configuration. When enabled, automatically '
+             'configures all YaRN parameters with GPT-OSS defaults.',
     )
 
     return parser

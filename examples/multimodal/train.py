@@ -17,6 +17,7 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
@@ -48,12 +49,12 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     # Dataloader doesn't run on the middle stages in a pipeline parallel model.
     pp_size = get_pipeline_model_parallel_world_size()
-    if not is_first_or_last_stage(pp_size, args.encoder_pipeline_model_parallel_size):
+    if not is_first_or_last_stage(pp_size):
         # Note these are all set to None above.
         return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
 
     # Broadcast data.
-    torch.cuda.nvtx.range_push("get_data")
+    nvtx_range_push("get_data")
     if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
         data = next(data_iterator)
     else:
@@ -102,22 +103,22 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
             max_seqlen_kv=max_lengths,
         )
 
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("get_data")
 
     tokens_ = data_text.long()
 
-    torch.cuda.nvtx.range_push("index tokens")
+    nvtx_range_push("index tokens")
     tokenizer = get_tokenizer()
     text_length = tokens_.shape[1]
     tokens = tokens_[:, :text_length].contiguous()
     labels = labels[:, 1 : text_length + 1].contiguous()
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("index tokens")
 
-    torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
+    nvtx_range_push("get_ltor_masks_and_position_ids")
     loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("get_ltor_masks_and_position_ids")
 
     # If context parallel is enabled, must shard inputs to CP ranks.
     if args.context_parallel_size > 1 or args.sequence_parallel:
@@ -232,53 +233,23 @@ def scaled_loss_func(loss_mask, output_tensor):
     else:
         raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
 
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+    num_tokens = total_tokens.clone().detach().to(torch.int)
+    reporting_loss = torch.cat([total_loss.clone().detach().view(1), num_tokens.view(1)])
 
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
-    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
-    # on loss[0] fixes this
-    return (
-        loss[0].clone(),
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
-    )
+    return (total_loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def loss_func(loss_mask, output_tensor):
     args = get_args()
 
-    losses = output_tensor.float()
-
+    losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.contiguous().view(-1).float()
+    loss = torch.sum(losses * loss_mask)
 
-    total_tokens = loss_mask.sum()
-    total_loss = torch.sum(losses.view(-1) * loss_mask)
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
-    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
-    # on loss[0] fixes this
-    return (
-        loss[0].clone(),
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])}
-    )
+    return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -332,16 +303,12 @@ def llava_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
     last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1 or pp_ranks[epp] == last_rank:
+    if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[epp], last_rank]
+        return [pp_ranks[0], last_rank]
 
 
 def llava_position_embedding_ranks(pp_ranks):
@@ -349,16 +316,12 @@ def llava_position_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
     last_rank = pp_ranks[-1]
     if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[epp]]
+        return [pp_ranks[0]]
 
 
 def run_online_eval(model):
@@ -370,34 +333,20 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
-    from run_text_generation import generate_and_write_samples
+    # Import the common evaluation functions
+    from run_text_generation import get_evaluation_configs, run_evaluation_loop
 
-    with open(args.online_evaluation_config, "r") as f:
-        config_dict = yaml.safe_load(f)['datasets']
+    # Use the common config loading function
+    configs = get_evaluation_configs(config_path=args.online_evaluation_config)
 
-    scores = {}
-
-    for key, value in config_dict.items():
-        config = EvaluationConfig(**value)
-
-        # The inference code assumes the first rank is the leader.
-        # Tensorboard writer is on the last rank.
-        # We must write to a storage space that all ranks see.
-        output_dir = os.path.join(args.save, "online_eval")
-        os.makedirs(output_dir, exist_ok=True)
-        config.output_path = os.path.join(output_dir, args.language_model_type + '-' + key)
-
-        # The actual generation.
-        generate_and_write_samples(model[0].module, config, print_output=False)
-
-        # Make sure the first rank is done writing so that the last rank can run eval.
-        torch.distributed.barrier()
-
-        if is_last_rank():
-            from run_text_generation import run_eval
-            scores.update(run_eval(config))
-
-        torch.distributed.barrier()
+    # The inference code assumes the first rank is the leader.
+    # Tensorboard writer is on the last rank.
+    # We must write to a storage space that all ranks see.
+    output_dir = os.path.join(args.save, "online_eval")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Use the common evaluation loop
+    scores = run_evaluation_loop(model[0].module, configs, output_dir_override=output_dir, print_output=False)
 
     return [scores]
 
@@ -436,7 +385,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_dataloaders_provider,
         model_provider,
-        ModelType.encoder_and_decoder,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_multimodal_extra_args,

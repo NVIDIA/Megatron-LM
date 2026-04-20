@@ -1,0 +1,583 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+import logging
+import warnings
+from typing import Any, Dict, Optional
+
+import torch
+
+from megatron.core.distributed import DistributedDataParallel
+from megatron.core.models.mimo.config import MimoModelConfig
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
+from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.utils import unwrap_model
+
+logger = logging.getLogger(__name__)
+
+
+class MimoModel(MegatronModule):
+    """Multimodal In/Out Model supporting arbitrary combinations of modalities.
+
+    .. warning::
+        **EXPERIMENTAL**: This class is experimental, still under active development,
+        and the API is subject to change without notice. Use at your own risk.
+
+    .. note::
+        This implementation is in development and may undergo API changes.
+
+
+    This model processes multiple modalities (e.g., vision, audio) alongside text,
+    combining their embeddings before passing them through a language model.
+
+    Args:
+        mimo_config (MimoModelConfig):
+            Configuration for the model, including language model and modality submodules
+    """
+
+    def __init__(self, mimo_config: MimoModelConfig, cp_group=None, tp_group=None) -> None:
+        """Initialize the multimodal model.
+
+        Example:
+            ```python
+            # Create a model with default configuration
+            model = MimoModel(mimo_config)
+            ```
+        """
+        # Initialize with language model's transformer config for MegatronModule compatibility
+        super().__init__(mimo_config.language_model_spec.params['config'])
+
+        warnings.warn(
+            "MimoModel is experimental and still under active development. "
+            "The API may change without notice in future releases.",
+            category=UserWarning,
+            stacklevel=2,
+        )
+
+        self.mimo_config = mimo_config
+        modality_names = list(mimo_config.modality_submodules_spec.keys())
+        if mimo_config.module_to_grid_map:
+            self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
+        else:
+            self.role = RankRole.unified(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
+
+        # Use special token IDs from the config
+        self.special_token_ids = (
+            mimo_config.special_token_ids.copy() if mimo_config.special_token_ids else {}
+        )
+
+        # Extract language model config for partition adapter
+        language_config = mimo_config.language_model_spec.params['config']
+        max_seq_len = mimo_config.language_model_spec.params.get('max_sequence_length', 4096)
+
+        self.partition_adapter: Optional[PartitionAdapter] = None
+        # Create partition adapter only if parallelism is enabled
+        if language_config.context_parallel_size > 1 or language_config.sequence_parallel:
+            partition_config = PartitionConfig.from_mp_config(
+                mp=language_config,
+                max_seq_len=max_seq_len,
+                kv_format=mimo_config.kv_format,
+                cp_group=cp_group,
+                tp_group=tp_group,
+            )
+            self.partition_adapter = PartitionAdapter(partition_config)
+
+        # Initialize modality submodules from specifications
+        self.modality_submodules = torch.nn.ModuleDict()
+        self._initialize_submodules()
+        self._initialize_language_model()
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Build sharded state dict, bypassing parallel_state global fallbacks.
+
+        Iterates modality_submodules manually (ModuleDict lacks sharded_state_dict)
+        and injects dp_cp_group from each module's pg_collection.
+        """
+        sharded_sd = {}
+        for name, module in self.named_children():
+            if name == 'modality_submodules':
+                # Unwrap DDP, call ModalitySubmodules.sharded_state_dict directly
+                # (which injects dp_cp_group from its pg_collection)
+                for mod_name, mod in module.items():
+                    is_ddp = isinstance(mod, DistributedDataParallel)
+                    inner = mod.module if is_ddp else mod
+                    child_prefix = f'{prefix}{name}.{mod_name}.'
+                    if is_ddp:
+                        child_prefix += 'module.'
+                    sharded_sd.update(
+                        inner.sharded_state_dict(child_prefix, sharded_offsets, metadata)
+                    )
+            else:
+                # Inject dp_cp_group from pg_collection for language_model
+                inner = module.module if isinstance(module, DistributedDataParallel) else module
+                pg = getattr(inner, 'pg_collection', None)
+                mod_metadata = metadata
+                if pg is not None:
+                    assert (
+                        hasattr(pg, 'dp_cp') and pg.dp_cp is not None
+                    ), f"pg_collection on '{name}' is missing dp_cp group"
+                    mod_metadata = dict(metadata) if metadata else {}
+                    mod_metadata['dp_cp_group'] = pg.dp_cp
+                sharded_sd.update(
+                    sharded_state_dict_default(
+                        module, f'{prefix}{name}.', sharded_offsets, mod_metadata
+                    )
+                )
+        return sharded_sd
+
+    def align_embeddings_by_token_positions(
+        self,
+        modality_embeddings: Dict[str, torch.Tensor],  # [num_embeddings, hidden_dim]
+        input_ids: torch.Tensor,  # [bs, seq_len]
+        special_token_ids: Dict[str, int],
+    ) -> torch.Tensor:
+        """Align embeddings from different modalities based on special token positions in input_ids.
+
+        Args:
+            modality_embeddings: Dictionary mapping modality names to their embeddings.
+                For all modalities: tensor of shape (N, H).
+                Shape: (num_tokens_for_modality, hidden_dim)
+            input_ids: Input token IDs. Shape: (B, S) or (S,)
+                Contains special tokens that mark where each modality's embeddings should go.
+                The number of special tokens for each modality should exactly match the number
+                of embeddings for that modality.
+            special_token_ids: Dictionary mapping modality names to their special token IDs
+
+        Returns:
+            Combined embeddings tensor. Shape: (S, B, H)
+        """
+        # Ensure we have at least one modality
+        if not modality_embeddings:
+            raise ValueError("No modality embeddings provided. At least one modality is required.")
+
+        logger.debug(f"Merging embeddings for modalities: {list(modality_embeddings.keys())}")
+
+        # Use text embeddings if available, otherwise use any modality
+        reference_embeddings = modality_embeddings.get(
+            "text", next(iter(modality_embeddings.values()))
+        )
+        hidden_dim = reference_embeddings.size(-1)
+        device = reference_embeddings.device
+        dtype = reference_embeddings.dtype
+
+        batch_size, seq_length = input_ids.size()  # input_ids is [B, S]
+        logger.debug(
+            f"Combined output tensor will have shape: [{seq_length}, {batch_size}, {hidden_dim}]"
+        )
+
+        combined_embeddings = torch.zeros(
+            (batch_size, seq_length, hidden_dim), dtype=dtype, device=device
+        )
+
+        # Process each modality in modality_embeddings
+        for modality_name, modality_emb in modality_embeddings.items():
+            if modality_name == "text":
+                mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
+                for token_id in special_token_ids.values():
+                    mask &= input_ids != token_id
+            elif modality_name in special_token_ids:
+                token_id = special_token_ids[modality_name]
+                mask = input_ids == token_id
+            else:
+                raise ValueError(f"No special token ID defined for modality {modality_name}")
+
+            num_tokens = mask.sum().item()
+            if num_tokens != modality_emb.size(0):
+                raise ValueError(
+                    f"Number of {modality_name} tokens ({num_tokens}) does not match "
+                    f"number of {modality_name} embeddings ({modality_emb.size(0)})"
+                )
+
+            expanded_mask = mask.unsqueeze(-1).expand_as(combined_embeddings)
+            combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())
+
+        return combined_embeddings.transpose(0, 1).contiguous()  # [S, B, H]
+
+    def _initialize_submodules(self) -> None:
+        """Initialize modality submodules from the ModuleSpec configurations.
+
+        When role is set, only initializes submodules this rank participates in.
+        Stage info is passed to from_spec() to conditionally skip projection.
+        """
+        for modality_name, submodule_spec in self.mimo_config.modality_submodules_spec.items():
+            if modality_name not in self.role.modules:
+                logger.debug(f"Skipping {modality_name} submodule (not in role)")
+                continue
+
+            stage_info = self.role.modules[modality_name]
+            is_first_stage = stage_info.is_first_stage
+            is_last_stage = stage_info.is_last_stage
+
+            submodule_class = submodule_spec.module
+            logger.debug(
+                f"Building {modality_name} submodule using {submodule_class.__name__} "
+                f"(is_first_stage={is_first_stage}, is_last_stage={is_last_stage})"
+            )
+
+            # Pass stage info to from_spec so projections are only built when needed
+            submodule = submodule_class.from_spec(
+                submodule_spec, is_first_stage=is_first_stage, is_last_stage=is_last_stage
+            )
+
+            self.modality_submodules[modality_name] = submodule
+
+    def _initialize_language_model(self) -> None:
+        """Initialize the language model.
+
+        When role is set, only initializes if this rank participates in language module.
+        """
+        if not self.role.has_language_module:
+            logger.debug("Skipping language model initialization (not in role)")
+            self.language_model = None
+            return
+
+        logger.debug(
+            f"Building language model using {self.mimo_config.language_model_spec.module.__name__}"
+        )
+        self.language_model = build_module(self.mimo_config.language_model_spec)
+
+    def set_input_tensor(self, input_tensor):
+        """Set input tensor for pipeline parallelism.
+
+        This method is required by Megatron's pipeline parallel mechanism.
+        It passes the output tensor from the previous stage as input to this stage.
+
+        Args:
+            input_tensor: Either:
+                - Dict[str, Tensor]: Maps module names to their input tensors (for multi-module PP)
+                - Tensor or List[Tensor]: Single tensor for language model (backward compat)
+
+        Returns:
+            None
+        """
+        # The schedule wraps input_tensor in a list (schedules.py:415-416),
+        # so unwrap first before checking type.
+        if isinstance(input_tensor, list):
+            input_tensor = input_tensor[0]
+
+        # Store dict input for multi-module PP
+        if isinstance(input_tensor, dict):
+            # P2P recv may return [tensor] (list) for VPP compat — unwrap to tensor
+            self.input_tensors = {
+                k: v[0] if isinstance(v, list) and len(v) == 1 else v
+                for k, v in input_tensor.items()
+            }
+            return
+
+        self.input_tensors = input_tensor
+
+        if self.language_model is not None and hasattr(self.language_model, 'set_input_tensor'):
+            self.language_model.set_input_tensor(input_tensor)
+
+    def get_text_embeddings(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor, special_token_ids: Dict[str, int]
+    ) -> torch.Tensor:
+        """Get embeddings for text tokens in the input.
+        Args:
+            input_ids: Input token IDs. Shape: (B, S)
+                Contains text tokens and potentially special tokens for other modalities.
+            position_ids: Position IDs corresponding to input tokens, used for positional encoding.
+                Shape: (B, S)
+            special_token_ids: Dictionary mapping modality names to their special token IDs.
+                Used to identify non-text tokens in the input_ids.
+
+        Returns:
+            torch.Tensor: Embeddings for text tokens.
+            Shape: (N, H), where N is the number of text tokens.
+        """
+        text_mask = torch.ones_like(input_ids, dtype=torch.bool)  # [b, s]
+        for special_token_id in special_token_ids.values():
+            text_mask &= input_ids != special_token_id
+
+        batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
+        input_ids_text = input_ids[batch_idx, seq_idx].unsqueeze(0)
+
+        position_ids_text = (
+            position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
+        )
+
+        text_embeddings = (
+            unwrap_model(self.language_model)
+            .embedding(input_ids=input_ids_text, position_ids=position_ids_text)
+            .squeeze(1)
+        )  # Shape: [num_text_tokens, hidden_dim]
+        return text_embeddings
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
+        packing_kwargs: Optional[dict] = None,
+    ):
+        """Forward pass through the multimodal model.
+
+        Args:
+            input_ids: Input token IDs. Shape: (B, S)
+            position_ids: Position IDs. Shape: (B, S)
+            attention_mask: Attention mask. Shape: (B, S)
+            loss_mask: Loss mask. Shape: (B, S)
+            labels: Labels for training. Shape: (B, S)
+            modality_inputs: Dictionary mapping modality names to encoder inputs. For example:
+                {
+                    "images": {
+                        "clip_encoder": {"pixel_values": clip_images},
+                        "vit_encoder": {"images": vit_images}
+                    },
+                    "audio": {
+                        "whisper_encoder": {"input_features": whisper_features}
+                    }
+                }
+            packing_kwargs: Optional dictionary of kwargs to construct PackedSeqParams
+                            if packed_seq_params is not provided. For example:
+                                {
+                                    "cu_seqlens_q": cu_seqlens,
+                                    "cu_seqlens_kv": cu_seqlens,
+                                    "cu_seqlens_q_padded": cu_seqlens_padded,
+                                    "cu_seqlens_kv_padded": cu_seqlens_padded,
+                                    "max_seqlen_q": torch.tensor(
+                                        max(seqlens_padded), dtype=torch.int32
+                                    ),
+                                    "max_seqlen_kv": torch.tensor(
+                                        max(seqlens_padded), dtype=torch.int32
+                                    ),
+                                }
+
+        Returns:
+            tuple: (output, loss_mask) where output semantics depend on role:
+                - Encoder-only ranks: Dict[str, Tensor] of encoder outputs
+                - Language module ranks: language model output (logits or loss)
+                - No role (all modules colocated): language model output
+        """
+        # Get any tensors passed via set_input_tensor
+        input_tensors = getattr(self, 'input_tensors', None)
+
+        if self.role.mode == ModuleLayout.UNIFIED:
+            return self._forward_all_modules(
+                input_ids,
+                position_ids,
+                attention_mask,
+                loss_mask,
+                labels,
+                modality_inputs,
+                packing_kwargs,
+            )
+
+        if self.role.mode == ModuleLayout.NON_COLOCATED:
+            if self.role.has_modality_modules:
+                return self._forward_encoders(modality_inputs, input_tensors), loss_mask
+
+            if self.role.has_language_module:
+                return (
+                    self._forward_language_module(
+                        input_ids, position_ids, attention_mask, labels, input_tensors
+                    ),
+                    loss_mask,
+                )
+
+            raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
+
+        raise NotImplementedError(f"Pipeline mode {self.role.mode} is not yet supported")
+
+    def _forward_encoders(
+        self,
+        modality_inputs: Optional[Dict[str, Dict[str, Any]]],
+        input_tensors: Optional[Dict[str, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass for encoder modules on this rank.
+
+        Args:
+            modality_inputs: Raw inputs for each modality (images, audio, etc.)
+            input_tensors: Hidden states from previous pipeline stages
+
+        Returns:
+            Dict mapping encoder names to their output tensors
+        """
+        outputs = {}
+
+        for encoder_name in self.role.modality_module_names:
+            if encoder_name not in self.modality_submodules:
+                continue
+
+            submodule = self.modality_submodules[encoder_name]
+            output = submodule.forward(
+                encoder_inputs=modality_inputs.get(encoder_name) if modality_inputs else None,
+                hidden_states=input_tensors.get(encoder_name) if input_tensors else None,
+            )
+
+            if output is not None:
+                outputs[encoder_name] = output
+
+        return outputs
+
+    def _forward_language_module(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        input_tensors: Optional[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Forward pass for language module on this rank.
+
+        Args:
+            input_ids: Token IDs
+            position_ids: Position IDs
+            attention_mask: Attention mask
+            labels: Labels for loss computation
+            input_tensors: Hidden states or embeddings from previous stage
+
+        Returns:
+            Language model output (hidden states, logits, or loss depending on stage)
+        """
+        lang_name = MIMO_LANGUAGE_MODULE_KEY
+
+        if self.role.is_first_stage(lang_name):
+            # First stage: receive encoder embeddings, combine with text, pass to LM
+            # Build modality embeddings dict from encoder outputs
+            modality_embeddings = {}
+            if input_tensors:
+                for name, tensor in input_tensors.items():
+                    if name != lang_name:
+                        modality_embeddings[name] = tensor
+
+            # Get text embeddings
+            text_embeddings = self.get_text_embeddings(
+                input_ids, position_ids, self.special_token_ids
+            )
+            modality_embeddings["text"] = text_embeddings
+
+            # Combine all embeddings
+            combined_embeddings = self.align_embeddings_by_token_positions(
+                modality_embeddings=modality_embeddings,
+                input_ids=input_ids,
+                special_token_ids=self.special_token_ids,
+            )
+
+            lm_output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                decoder_input=combined_embeddings,
+                labels=labels,
+                attention_mask=attention_mask,
+            )
+        else:
+            # Non-first stage: receive hidden states from previous LM stage
+            hidden_states = input_tensors.get(lang_name) if input_tensors else None
+
+            # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
+            if hidden_states is not None:
+                underlying_lm = unwrap_model(self.language_model)
+                if hasattr(underlying_lm, 'set_input_tensor'):
+                    underlying_lm.set_input_tensor(hidden_states)
+
+            lm_output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                decoder_input=None,
+                labels=labels,
+                attention_mask=attention_mask,
+            )
+
+        # Key output for non-last stages so schedule can route to next LM stage
+        if not self.role.is_last_stage(lang_name):
+            return {lang_name: lm_output}
+
+        return lm_output
+
+    def _forward_all_modules(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        modality_inputs: Optional[Dict[str, Dict[str, Any]]],
+        packing_kwargs: Optional[dict] = None,
+    ):
+        """Forward pass when all modules are on all ranks (no multi-module PP).
+
+        This is the original behavior, preserved for backward compatibility.
+        """
+        # If packing_kwargs is provided, construct PackedSeqParams
+        packed_seq_params = None
+        if packing_kwargs is not None:
+            # Ensure correct dtype for seqlens tensors
+            for key in packing_kwargs:
+                if 'cu_seqlens' in key and packing_kwargs[key] is not None:
+                    packing_kwargs[key] = packing_kwargs[key].to(dtype=torch.int32)
+            packed_seq_params = PackedSeqParams(**packing_kwargs)
+            packed_seq_params.qkv_format = 'thd'
+            logger.debug(f"Packed sequence parameters: {packed_seq_params}")
+
+        # 1. Process each modality to get embeddings
+        modality_embeddings = {}
+
+        for modality_name, submodule in self.modality_submodules.items():
+            if (
+                modality_inputs
+                and modality_name in modality_inputs
+                and modality_inputs[modality_name] is not None
+            ):
+                logger.debug(f"Processing {modality_name} modality")
+                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
+                if embeddings is not None:
+                    modality_embeddings[modality_name] = embeddings
+                    logger.debug(
+                        f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
+                    )
+
+        # Get text embeddings
+        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+        logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
+
+        modality_embeddings["text"] = text_embeddings
+
+        # 2. Merge embeddings from different modalities
+        logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
+        combined_embeddings = self.align_embeddings_by_token_positions(
+            modality_embeddings=modality_embeddings,
+            input_ids=input_ids,
+            special_token_ids=self.special_token_ids,
+        )
+        logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
+
+        # 3. If sharding is needed, apply PartitionAdapter.
+        # combined_embeddings is [S, B, H]; transpose to [B, S, H] for shard() which expects
+        # batch-first layout (required by get_batch_on_this_cp_rank). After CP sharding each
+        # rank holds [B, S/cp, H]; transpose back to [S/cp, B, H] for the language model.
+        if self.partition_adapter is not None:
+            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [B, S, H]
+            combined_embeddings, labels, loss_mask, _, packed_seq_params = (
+                self.partition_adapter.shard(
+                    embeddings=combined_embeddings,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    attention_mask=attention_mask,
+                    packed_seq_params=packed_seq_params,
+                )
+            )
+            # shard() returns embeddings in [B, S/cp, H]; transpose to [S/cp, B, H]
+            # which is what the language model expects.
+            if combined_embeddings is not None:
+                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
+        # 5. Forward pass through language model
+        lm_output = self.language_model(
+            input_ids=None,
+            position_ids=None,
+            decoder_input=combined_embeddings,
+            labels=labels,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+        )
+
+        logger.debug(f"Language model output shape: {lm_output.shape}")
+
+        return lm_output, loss_mask

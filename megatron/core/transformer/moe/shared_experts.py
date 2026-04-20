@@ -1,13 +1,16 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from copy import deepcopy
+from enum import Enum
+from functools import wraps
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -18,9 +21,76 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.moe.moe_utils import ModelCommProcessGroups
+from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_torch_min_version, make_sharded_tensor_for_checkpoint
+from megatron.core.typed_torch import apply_module
+from megatron.core.utils import (
+    is_te_min_version,
+    is_torch_min_version,
+    make_sharded_tensor_for_checkpoint,
+)
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
+else:
+    TELinear, set_save_original_input = None, None
+
+
+class SharedExpertState(Enum):
+    """State machine states for SharedExpertMLP overlapped forward pass."""
+
+    IDLE = 0
+    PRE_FORWARD_COMM_DONE = 1
+    FC1_FORWARD_DONE = 2
+    FC2_FORWARD_DONE = 3
+    POST_FORWARD_COMM_DONE = 4
+
+
+def overlap_state_check(required_state: "SharedExpertState", next_state: "SharedExpertState"):
+    """
+    Decorator to validate overlap state and cached variables before method execution,
+    and update state after method execution.
+
+    Args:
+        required_state: The expected SharedExpertState before this method runs.
+        next_state: The SharedExpertState to transition to after method execution.
+    """
+
+    def decorator(method):
+        @wraps(method)
+        def wrapper(self, *args, **kwargs):
+            # Check overlap is enabled
+            assert (
+                self.config.moe_shared_expert_overlap
+            ), f"{method.__name__} requires --moe-shared-expert-overlap to be set"
+            # Check state machine
+            assert self._overlap_state == required_state, (
+                f"{method.__name__} must be called from {required_state.name} state, "
+                f"but current state is {self._overlap_state.name}"
+            )
+            # Execute method
+            result = method(self, *args, **kwargs)
+            # Update state after method execution
+            self._overlap_state = next_state
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+class _BackwardStreamWait(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, stream):
+        """forward"""
+        ctx.stream = stream
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """backward with stream wait"""
+        ctx.stream.wait_stream(torch.cuda.current_stream())
+        return grad_output, None
 
 
 class SharedExpertMLP(MLP):
@@ -37,15 +107,15 @@ class SharedExpertMLP(MLP):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         gate: bool,
-        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
-        # TODO(Hepteract): pass model_comm_pgs to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules)
+        # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
+        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
@@ -58,12 +128,32 @@ class SharedExpertMLP(MLP):
         else:
             self.gate_weight = None
 
+        if (
+            self.config.fp8
+            and self.config.fp8_recipe != 'delayed'
+            and is_te_min_version("2.6.0dev0")
+        ) or (self.config.fp4 and is_te_min_version("2.7.0.dev0")):
+            # For fp8/fp4 training, the output of pre_mlp_layernorm is saved by router, and
+            # the shared expert linear_fc1 also saves the quantized tensor of this output.
+            # Here we set the linear_fc1 to save the original input tensors to avoid the extra
+            # memory usage of the quantized tensor.
+            shared_experts_recompute = (
+                config.recompute_granularity == 'selective'
+                and "shared_experts" in config.recompute_modules
+            )
+            if not shared_experts_recompute and HAVE_TE and isinstance(self.linear_fc1, TELinear):
+                set_save_original_input(self.linear_fc1)
+
         if self.config.moe_shared_expert_overlap:
             # disable TP related AG/RS communications in the linear module
             for linear in [self.linear_fc1, self.linear_fc2]:
                 if hasattr(linear, 'parallel_mode'):
                     # TELinear
                     linear.parallel_mode = None
+                    linear.ub_overlap_rs_fprop = False
+                    linear.ub_overlap_ag_dgrad = False
+                    linear.ub_overlap_ag_fprop = False
+                    linear.ub_overlap_rs_dgrad = False
                 else:
                     # MCore legacy Linear
                     linear.explicit_expert_comm = True
@@ -84,10 +174,14 @@ class SharedExpertMLP(MLP):
             self.cached_output = None
             self.gate_score = None
 
-            if self.stream is None:
-                self.stream = torch.cuda.Stream()
+            # State machine to ensure correct calling order of overlapped forward methods
+            self._overlap_state = SharedExpertState.IDLE
 
-    def forward(self, hidden_states):
+            if self.__class__.stream is None:
+                self.__class__.stream = torch.cuda.Stream()
+            self.stream = self.__class__.stream
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
@@ -106,21 +200,29 @@ class SharedExpertMLP(MLP):
             state_dict = self.state_dict(prefix='', keep_vars=True)
             sub_sd = {
                 f'{prefix}{name}': make_sharded_tensor_for_checkpoint(
-                    state_dict[name], f'{prefix}{name}', prepend_offsets=sharded_offsets
+                    state_dict[name],
+                    f'{prefix}{name}',
+                    prepend_offsets=sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
                 )
             }
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
-    def pre_forward_comm(self, input):
+    def wait_current_stream(self):
+        """Wait for the current stream to complete."""
+        self.stream.wait_stream(torch.cuda.current_stream())
+
+    @overlap_state_check(SharedExpertState.IDLE, SharedExpertState.PRE_FORWARD_COMM_DONE)
+    def pre_forward_comm(self, input, wait_current_stream=True):
         """
         All Gather for SP before forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_output is None
-        self.stream.wait_stream(torch.cuda.current_stream())
+        if wait_current_stream:
+            self.wait_current_stream()
         with torch.cuda.stream(self.stream):
             if self.use_shared_expert_gate:
                 logits = torch.nn.functional.linear(input, self.gate_weight)
@@ -133,22 +235,27 @@ class SharedExpertMLP(MLP):
                 self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
             set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
 
+    @overlap_state_check(
+        SharedExpertState.PRE_FORWARD_COMM_DONE, SharedExpertState.FC1_FORWARD_DONE
+    )
     def linear_fc1_forward_and_act(self, overlapped_comm_output=None):
         """
         Do Linear FC1 and activation function forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_fc1_input is not None
-        if overlapped_comm_output is not None:
-            set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with torch.cuda.stream(self.stream):
             # [s, b, 4 * h/p]
-            intermediate_parallel, bias_parallel = self.linear_fc1(self.cached_fc1_input)
+            intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
+                self.cached_fc1_input
+            )
             self.cached_fc1_input = None
 
-            if self.config.bias_activation_fusion:
+            if self.config.use_te_activation_func:
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+            elif self.config.bias_activation_fusion:
                 if self.activation_func == F.gelu:
                     if self.config.gated_linear_unit:
                         intermediate_parallel = bias_geglu_impl(
@@ -179,30 +286,38 @@ class SharedExpertMLP(MLP):
                     intermediate_parallel = self.activation_func(intermediate_parallel)
 
             self.cached_fc2_input = intermediate_parallel
+        # Tensor sequence number is used to control the backward order.
+        # Decrease the sequence number of the expert output to make the comm launched first
+        # in the backward order.
+        if overlapped_comm_output is not None and overlapped_comm_output.grad_fn is not None:
+            target_sequence_nr = overlapped_comm_output.grad_fn._sequence_nr() - 1
+            set_tensor_grad_fn_sequence_sr(intermediate_parallel, target_sequence_nr)
+            # Make sure the shared expert fc1 backward is launched after the routed fc1 backward
+            self.cached_fc2_input = _BackwardStreamWait.apply(intermediate_parallel, self.stream)
 
+    @overlap_state_check(SharedExpertState.FC1_FORWARD_DONE, SharedExpertState.FC2_FORWARD_DONE)
     def linear_fc2_forward(self, overlapped_comm_output=None):
         """
         Do Linear FC2 forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_fc2_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with torch.cuda.stream(self.stream):
             # [s, b, h]
-            self.cached_fc2_output, _ = self.linear_fc2(self.cached_fc2_input)
+            self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
             self.cached_fc2_input = None
 
+    @overlap_state_check(
+        SharedExpertState.FC2_FORWARD_DONE, SharedExpertState.POST_FORWARD_COMM_DONE
+    )
     def post_forward_comm(self):
         """
         Reduce scatter for SP after forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_fc2_output is not None
         with torch.cuda.stream(self.stream):
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
@@ -215,14 +330,13 @@ class SharedExpertMLP(MLP):
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)
 
+    @overlap_state_check(SharedExpertState.POST_FORWARD_COMM_DONE, SharedExpertState.IDLE)
     def get_output(self):
         """
         Gets the module forward output.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_output is not None
         with torch.cuda.stream(self.stream):
             if self.use_shared_expert_gate:
                 assert self.gate_score is not None

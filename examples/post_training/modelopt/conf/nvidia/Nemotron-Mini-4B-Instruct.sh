@@ -1,12 +1,14 @@
 #!/bin/bash
 
-DECODER_TYPE="gptnext"
-
-if [ -z ${TOKENIZER_MODEL} ]; then
+if [ -z ${HF_MODEL_CKPT} ]; then
+    HF_MODEL_CKPT=nvidia/Nemotron-Mini-4B-Instruct
     TOKENIZER_MODEL=nvidia/Nemotron-Mini-4B-Instruct
+else
+    TOKENIZER_MODEL=${HF_MODEL_CKPT}
 fi
 
 MODEL_ARGS=" \
+    --trust-remote-code \
     --save-interval 100000 \
     --micro-batch-size 1 \
     --bf16 \

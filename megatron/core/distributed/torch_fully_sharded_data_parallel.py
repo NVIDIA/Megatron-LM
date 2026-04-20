@@ -6,7 +6,7 @@ import torch
 
 try:
     from torch.distributed import DeviceMesh
-    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.fsdp import fully_shard
 
     HAVE_FSDP = True
 except ImportError:
@@ -34,7 +34,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
     Args:
         config: Transformer config object.
-        ddp_config: DistributedDataParallel config object.
+        ddp_config: TorchDistributedDataParallel config object.
         module: Underlying model.
         sub_modules_to_wrap: Set of sub_modules to shard with FSDP.
             Parameters within each sub_module will be all-gathered just-in-time.
@@ -63,6 +63,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
         },
+        disable_bucketing: bool = False,
         process_group: Optional[ProcessGroup] = None,
     ):
 
@@ -78,7 +79,12 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             self.process_group = process_group
 
         self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
-        kwargs = {"mesh": self.device_mesh}
+        kwargs = {
+            "mesh": self.device_mesh,
+            "reshard_after_forward": getattr(ddp_config, "reshard_after_forward", True),
+        }
+
+        self.ddp_config = ddp_config
 
         def save_custom_attrs(module):
             custom_attrs = {}
@@ -103,6 +109,13 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         # See https://github.com/pytorch/pytorch/issues/136929.
         attrs = save_custom_attrs(self.module)
 
+        # Local transformer implementation does not support ColumnParallelLinear.
+        if config.transformer_impl == "local":
+            sub_modules_to_wrap = [
+                sub_module
+                for sub_module in sub_modules_to_wrap
+                if sub_module != tensor_parallel.ColumnParallelLinear
+            ]
         sub_modules_to_wrap = set(sub_modules_to_wrap)
         for sub_module in self.module.modules():
             fsdp_modules = getattr(sub_module, "_fsdp_modules", [])

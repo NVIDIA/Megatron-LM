@@ -6,6 +6,8 @@ a checkpoint save process in the background.
 """
 import gc
 import logging
+import os
+import subprocess
 from abc import ABC, abstractmethod
 from collections import deque
 from contextlib import contextmanager
@@ -16,9 +18,68 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch import multiprocessing as mp
 
+from megatron.core._rank_utils import safe_get_rank
+from megatron.core.utils import log_single_rank
+
 from ..utils import debug_time
 
 logger = logging.getLogger(__name__)
+
+
+def _set_process_qos(cpu_priority: int, io_priority: Optional[int]) -> None:
+    """
+    Set QoS (Quality of Service) for the current checkpoint writer process.
+    This ensures checkpoint writing doesn't interfere with training.
+
+    Args:
+        cpu_priority: Nice value for CPU scheduling (0-19, higher = lower priority).
+                     Default 10 is moderately deprioritized.
+        io_priority: I/O scheduling class and priority. If None, uses best-effort class.
+                    Format: class_id (0-3) where 3 = idle (lowest priority).
+
+    Note: Requires appropriate permissions. Failures are logged but not fatal.
+    """
+    pid = os.getpid()
+
+    # Set CPU priority (nice value). os.nice(increment) adds to current;
+    # get current with os.nice(0). Only increase nice (deprioritize);
+    # decreasing requires superuser.
+    if cpu_priority is not None and cpu_priority >= 0 and cpu_priority <= 19:
+        try:
+            current_nice = os.nice(0)  # 0 = no change, returns current nice value
+            increment = cpu_priority - current_nice
+            if increment <= 0:
+                logger.warning(
+                    "PID %s: Skipping CPU nice (current %s already <= target %s; "
+                    "lowering requires superuser",
+                    pid,
+                    current_nice,
+                    cpu_priority,
+                )
+            else:
+                new_nice = os.nice(increment)
+                logger.debug(
+                    "PID %s: Set CPU nice from %s to %s (target %s)",
+                    pid,
+                    current_nice,
+                    new_nice,
+                    cpu_priority,
+                )
+        except (OSError, PermissionError) as e:
+            logger.warning(f"PID {pid}: Failed to set CPU priority: {e}")
+
+    # Set I/O priority (ionice) - Linux only
+    if io_priority is not None:
+        try:
+            # ionice -c <class> -p <pid>
+            # class 3 = idle (only when no other process needs I/O)
+            # class 2 = best-effort (default, can set priority 0-7)
+            subprocess.run(
+                ["ionice", "-c", str(io_priority), "-p", str(pid)], check=True, capture_output=True
+            )
+            logger.debug(f"PID {pid}: Set I/O priority class to {io_priority}")
+        except (subprocess.CalledProcessError, FileNotFoundError, PermissionError) as e:
+            logger.warning(f"PID {pid}: Failed to set I/O priority: {e}")
 
 
 @contextmanager
@@ -56,7 +117,7 @@ class AsyncRequest(NamedTuple):
     async_fn_args: Tuple
     finalize_fns: List[Callable]
     async_fn_kwargs: Dict = {}
-    preload_fn: Callable = None
+    preload_fn: Optional[Callable] = None
     is_frozen: bool = False
     call_idx: int = 0
 
@@ -79,9 +140,24 @@ class AsyncRequest(NamedTuple):
 
         This logic is equivalent to what should happen in case of the async call.
         """
+        # preload tensors.
+        async_fn_args = list(self.async_fn_args)
+        if self.preload_fn is not None:
+            assert len(async_fn_args) == 3, "Expected 3 args to be passed to async function"
+            # The async_fn is passed as a partial functool with pre-determined args
+            # In the async_fn_args we pass the remaining positional args required by the async_fn
+            # async_fn_args[1] refers to the write_buckets
+            # To ensure we stage the write_buckets to CPU memory for sync CP,
+            # we replace it with preload_fn callable that returns the CPU staged tensors
+            async_fn_args[1] = self.preload_fn()
+        # persist the state
         if self.async_fn is not None:
-            self.async_fn(*self.async_fn_args)
+            self.async_fn(*async_fn_args, **self.async_fn_kwargs)
+
+        # This utility implements a sync cp save. Hence the barrier.
         torch.distributed.barrier()
+
+        # Finalize the CP state
         for finalize_fn in self.finalize_fns:
             finalize_fn()
 
@@ -150,12 +226,12 @@ class AsyncCaller(ABC):
         return ten[0] == 0
 
     @abstractmethod
-    def close(self):
+    def close(self, abort=False):
         """Terminate the async caller at exit of an application or some termination conditions"""
-        logger.info(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
+        raise NotImplementedError
 
     def __del__(self):
-        self.close()
+        raise NotImplementedError("This should be implemented")
 
 
 class TemporalAsyncCaller(AsyncCaller):
@@ -167,6 +243,7 @@ class TemporalAsyncCaller(AsyncCaller):
     def __init__(self):
         self.process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
+        self.preloaded_holder = None
 
     @_disable_gc()
     def schedule_async_call(self, async_req: AsyncRequest) -> None:
@@ -184,11 +261,12 @@ class TemporalAsyncCaller(AsyncCaller):
             return  # nothing to do
 
         async_fn_args = list(async_req.async_fn_args)
-        if async_req.preload_fn:
+        if async_req.preload_fn is not None:
             # If there's a preload_fn in `async_req`, we call this func
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
             async_fn_args[1] = async_req.preload_fn()
+            self.preloaded_holder = async_fn_args[1]
 
         rank = torch.distributed.get_rank()
         start_sync = time()
@@ -227,21 +305,45 @@ class TemporalAsyncCaller(AsyncCaller):
         is_alive = int(self.process.is_alive()) if self.process is not None else 0
         is_done = not is_alive if no_dist else self.sync_all_async_calls(is_alive)
 
-        if not is_done and blocking:
+        if is_done or blocking:
+            # Process join is called in the following cases
+            # 1. blocking == True -> regardless of is_done
+            # 2. blocking == False (non-blocking)
+            #    -> is_done == True: async requests on all ranks are identified to be finished
+            #    `self.close()` makes sure the async callers terminated
             self.close()
             is_done = True
         return is_done
 
-    def close(self):
+    def close(self, abort=False):
+        """For TemporalAsyncCaller, this method is called explictly in `is_current_async_calls_done`
+
+        This method make sure the TemporalAsyncCaller terminated
+        with all its assigned async request completed
+
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
+        """
         if self.process:
-            logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
-            self.process.join()
+            logger.debug(f"rank: {safe_get_rank()}, joining self.process")
+            if abort:
+                log_single_rank(
+                    logger, logging.WARNING, f"Temporal worker aborted in rank {safe_get_rank()}"
+                )
+                self.process.kill()
+            else:
+                self.process.join()
             self.process = None
             logger.debug(
                 "TemporalAsyncCaller: Async process join finished "
                 f"after {time() - self.start_time:.2f}s from forking"
             )
             self.start_time = None
+            self.preloaded_holder = None
+
+    def __del__(self):
+        pass
 
 
 class PersistentAsyncCaller(AsyncCaller):
@@ -250,19 +352,47 @@ class PersistentAsyncCaller(AsyncCaller):
     Starts process asynchronously and allows checking if all processes on all ranks are done.
     """
 
+    _persistent_process: mp.Process = None
+    _persistent_queue: mp.JoinableQueue = None
+    _persistent_preload_q: mp.JoinableQueue = None
+    _persistent_comp_q: mp.Queue = None
+
     def __init__(self):
-        self.process: mp.Process = None
+        self.process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
-        ctx = mp.get_context('spawn')
-        # main queue to deliver `AsyncRequest` from host to the ckpt worker
-        self.queue: mp.JoinableQueue = ctx.JoinableQueue()
-        # Queue used to synchronize for the completion of preloading tensors to host
-        # between a trainer and ckpt worker
-        self.preload_q: mp.JoinableQueue = ctx.JoinableQueue()
-        # Queue used to inform trainer when the saving is completed
-        self.comp_q: mp.Queue = ctx.Queue()
-        self.cur_item: int = None
+        self.cur_item: Optional[int] = None
         self.cur_idx: int = -1
+
+    @classmethod
+    def _get_process(
+        cls,
+        rank: int,
+        mp_mode: str = 'spawn',
+        cpu_priority: int = 10,
+        io_priority: Optional[int] = None,
+    ):
+        if cls._persistent_process is None:
+            ctx = mp.get_context(mp_mode)
+            logger.debug(f"PersistentAsyncCaller: {rank}, Starting Async Caller")
+            cls._persistent_queue = ctx.JoinableQueue()
+            cls._persistent_preload_q = ctx.JoinableQueue()
+            cls._persistent_comp_q = ctx.Queue()
+            cls._persistent_process = ctx.Process(
+                target=PersistentAsyncCaller.async_loop,
+                args=(
+                    rank,
+                    cls._persistent_queue,
+                    cls._persistent_preload_q,
+                    cls._persistent_comp_q,
+                    logger.getEffectiveLevel(),
+                    cpu_priority,
+                    io_priority,
+                ),
+            )
+            cls._persistent_process.daemon = True
+            cls._persistent_process.start()
+            logger.debug(f"PersistentAsyncCaller: {rank}, Started Async Caller")
+        return cls._persistent_process
 
     def schedule_async_call(self, async_req: AsyncRequest) -> None:
         """Put `AsyncRequest` to the Persistent Async Caller
@@ -282,34 +412,16 @@ class PersistentAsyncCaller(AsyncCaller):
 
         self.start_time = time()
         if self.process is None:
-            ctx = mp.get_context('spawn')
-            logger.info(
-                f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Starting Async Caller"
-            )
-            self.process: mp.Process = ctx.Process(
-                target=PersistentAsyncCaller.async_loop,
-                args=(
-                    torch.distributed.get_rank(),
-                    self.queue,
-                    self.preload_q,
-                    self.comp_q,
-                    logger.getEffectiveLevel(),
-                ),
-            )
-            self.process.start()
-            logger.info(
-                f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Started Async Caller"
-            )
-
-        if async_req.preload_fn:
-            self.preload_q.put(async_req.call_idx)
-        self.queue.put(async_req)
+            self.process = PersistentAsyncCaller._get_process(torch.distributed.get_rank())
+        if async_req.preload_fn is not None:
+            self._persistent_preload_q.put(async_req.call_idx)
+        self._persistent_queue.put(async_req)
         logger.debug(f"rank: {torch.distributed.get_rank()}, put {async_req.call_idx}")
 
-        if async_req.preload_fn:
+        if async_req.preload_fn is not None:
             start_sync = time()
             # Synchronize for pre-staging tensors
-            self.preload_q.join()
+            self._persistent_preload_q.join()
             end_sync = time()
             logger.debug(
                 f"rank: {torch.distributed.get_rank()}, "
@@ -346,7 +458,7 @@ class PersistentAsyncCaller(AsyncCaller):
             while self.cur_item is None:
                 try:
                     # Retrieve comp call_idx without waiting
-                    self.cur_item = self.comp_q.get_nowait()
+                    self.cur_item = self._persistent_comp_q.get_nowait()
                 except Empty:
                     # This method is called after any `AsyncRequest` is pushed to the main loop
                     # So, the background writing is still active
@@ -375,15 +487,33 @@ class PersistentAsyncCaller(AsyncCaller):
 
         return is_done
 
-    def close(self):
-        logger.info(
-            f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
-        )
+    def close(self, abort=False):
+        """Wait on the left async requests and terminate the PersistentAsyncCaller
+
+        Signals the PersistentAsyncCaller by sending a 'DONE' message to make it terminated
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
+        """
+        logger.debug(f"PersistentAsyncCaller: {safe_get_rank()}, Destroying Async Caller")
         if self.process:
-            self.queue.put('DONE')
-            self.queue.join()
-            self.process.join()
+            if abort:
+                log_single_rank(
+                    logger, logging.WARNING, f"Persistent worker aborted in rank {safe_get_rank()}"
+                )
+                self.process.kill()
+            else:
+                self._persistent_queue.put('DONE')
+                self._persistent_queue.join()
+                self._persistent_process.join()
             self.process = None
+            PersistentAsyncCaller._persistent_process = None
+            PersistentAsyncCaller._persistent_queue = None
+            PersistentAsyncCaller._persistent_preload_q = None
+            PersistentAsyncCaller._persistent_comp_q = None
+
+    def __del__(self):
+        self.close()
 
     @staticmethod
     @_disable_gc()
@@ -393,6 +523,8 @@ class PersistentAsyncCaller(AsyncCaller):
         preload_q: mp.JoinableQueue,
         comp_q: mp.Queue,
         log_level: int = logging.INFO,
+        cpu_priority: int = 10,
+        io_priority: Optional[int] = None,
     ):
         """Main function for the persistent checkpoint worker
 
@@ -414,11 +546,29 @@ class PersistentAsyncCaller(AsyncCaller):
                                async checkpoint request
             log_level (int, Optional): an integer to set log-level in this spawned process
                                        to get aligned with the training rank's logging level
+            cpu_priority (int): Nice value for CPU scheduling (0-19, higher = lower priority).
+                               Default 10 deprioritizes checkpoint writing vs training.
+            io_priority (int, Optional): I/O scheduling class (0-3, where 3=idle).
+                                        Default 3 ensures checkpoints don't block data loading.
 
         """
+        # Set logger.
+        # Set root logger level to affect all modules in this process
+        logging.getLogger().setLevel(log_level)
         logger = logging.getLogger(__name__)
-        logger.setLevel(log_level)
-        logger.info(f"PersistentAsyncCaller: persistent ckpt worker for {rank} has started")
+        logger.debug(f"PersistentAsyncCaller: persistent ckpt worker for {rank} has started")
+
+        # Set CUDA device to appropriate local_rank to ensure allocations / CUDA contexts
+        # in this new process are on the right device, and device 0 on the node does not
+        # take on undue memory burden from other devices on node (default behavior without
+        # this line).
+        torch.cuda.set_device(rank % torch.cuda.device_count())
+
+        # Set QoS to deprioritize checkpoint writing vs training
+        # This prevents checkpoint I/O from interfering with data loader
+        _set_process_qos(cpu_priority=cpu_priority, io_priority=io_priority)
+
+        # Start busy loop waiting for and executing checkpoint saves.
         while True:
             item = queue.get()
             if isinstance(item, str) and item == 'DONE':
@@ -426,18 +576,22 @@ class PersistentAsyncCaller(AsyncCaller):
                 break
             elif isinstance(item, AsyncRequest):
                 async_fn_args = list(item.async_fn_args)
-                if item.preload_fn:
+                if item.preload_fn is not None:
                     call_idx = preload_q.get()
                     # the 2nd arg is state dict
                     async_fn_args[1] = item.preload_fn()
                     logger.debug(f"{rank} has completed D2H of {call_idx}")
                     preload_q.task_done()
-                item.async_fn(*async_fn_args, **item.async_fn_kwargs)
+                if item.async_fn is not None:
+                    item.async_fn(*async_fn_args, **item.async_fn_kwargs)
                 logger.debug(f"{rank} has completed saving {item.call_idx}")
                 comp_q.put(item.call_idx)
                 queue.task_done()
+                del async_fn_args
+            del item
+            gc.collect()
 
-        logger.info(f"PersistentAsyncCaller: persistent ckpt worker for {rank}  has terminated")
+        logger.debug(f"PersistentAsyncCaller: persistent ckpt worker for {rank}  has terminated")
 
 
 class _ActiveAsyncRequest(NamedTuple):
@@ -462,18 +616,30 @@ class AsyncCallsQueue:
     active calls with `maybe_finalize_async_calls`.
     """
 
+    _persistent_caller: Optional[PersistentAsyncCaller] = None
+
     def __init__(self, persistent: bool = False):
         self.async_calls: deque[_ActiveAsyncRequest] = deque([])
         self.call_idx: int = -1
         self.persistent: bool = persistent
-        self.persistent_caller: AsyncCaller = None
 
     def _get_async_caller(self):
         if not self.persistent:
             return TemporalAsyncCaller()
-        if self.persistent_caller is None:
-            self.persistent_caller = PersistentAsyncCaller()
-        return self.persistent_caller
+        if AsyncCallsQueue._persistent_caller is None:
+            AsyncCallsQueue._persistent_caller = PersistentAsyncCaller()
+        return AsyncCallsQueue._persistent_caller
+
+    @classmethod
+    def warmup_persistent_caller(
+        cls,
+        rank: int,
+        mp_mode: str = 'spawn',
+        cpu_priority: int = 10,
+        io_priority: Optional[int] = None,
+    ):
+        """Warmup the persistent caller to avoid the overhead of creating it on the first call."""
+        PersistentAsyncCaller._get_process(rank, mp_mode, cpu_priority, io_priority)
 
     def schedule_async_request(self, async_request: AsyncRequest) -> int:
         """Start a new async call and add it to a queue of active async calls.
@@ -492,13 +658,11 @@ class AsyncCallsQueue:
         # Backward compatibility for local checkpointing built with the old AsyncRequest
         if len(async_request._fields) != len(AsyncRequest._fields):
             async_request = AsyncRequest(**async_request._asdict())
-
-        async_request = async_request._replace(call_idx=self.call_idx)
-        finalize_fns = async_request.finalize_fns
-        async_request = async_request._replace(finalize_fns=None)
         async_request = async_request.freeze()
-        async_caller.schedule_async_call(async_request)
-        self.async_calls.append(_ActiveAsyncRequest(self.call_idx, async_caller, finalize_fns))
+        async_caller.schedule_async_call(
+            async_request._replace(call_idx=self.call_idx, finalize_fns=[])
+        )
+        self.async_calls.append(_ActiveAsyncRequest(self.call_idx, async_caller, async_request))
         return self.call_idx
 
     def maybe_finalize_async_calls(self, blocking=False, no_dist=False) -> List[int]:
@@ -510,9 +674,15 @@ class AsyncCallsQueue:
             blocking (bool, optional): if True, will wait until all active requests
                 are done. Otherwise, finalizes only the async request that already
                 finished. Defaults to False.
+
+            no_dist (bool, Optional): if True, training ranks simply check its
+                asynchronous checkpoint writer without synchronization.
         Returns:
             List[int]: list of indices (as returned by `schedule_async_request`)
                 of async calls that have been successfully finalized.
+        Raises:
+            CheckpointException: if any rank(s) raised an exception during checkpoint
+                writing, the exceptions are wrapped and raised on all ranks.
         """
         call_idx_finalized = []
         while self.async_calls:
@@ -522,13 +692,13 @@ class AsyncCallsQueue:
             if not next_async_done:
                 break
             with debug_time("finalize", logger):
-                call_idx, _, finalize_fns = self.async_calls.popleft()
+                call_idx, _, async_request = self.async_calls.popleft()
+                for finalize_fn in async_request.finalize_fns:
+                    finalize_fn()
                 ten = torch.tensor([call_idx], dtype=torch.int, device=torch.cuda.current_device())
                 torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
-                assert ten.item() == call_idx, 'Unmatched async calls. '
-                'That probably means not all ranks are participating in async finalization'
-                for finalize_fn in finalize_fns:
-                    finalize_fn()
+                assert ten.item() == call_idx, "Unmatched async calls. "
+                "That probably means not all ranks are participating in async finalization"
                 call_idx_finalized.append(call_idx)
         return call_idx_finalized
 
@@ -536,8 +706,14 @@ class AsyncCallsQueue:
         """Get the number of active async calls."""
         return len(self.async_calls)
 
-    def close(self):
-        """Finalize all calls upon closing."""
-        self.maybe_finalize_async_calls(blocking=True)
-        if self.persistent and self.persistent_caller:
-            self.persistent_caller.close()
+    def close(self, abort=False):
+        """Finalize all calls upon closing.
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
+        """
+        if not abort:
+            self.maybe_finalize_async_calls(blocking=True)
+        if self.persistent and AsyncCallsQueue._persistent_caller:
+            AsyncCallsQueue._persistent_caller.close(abort=abort)
+            AsyncCallsQueue._persistent_caller = None

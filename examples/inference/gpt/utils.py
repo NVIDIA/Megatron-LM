@@ -1,72 +1,41 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
+import itertools
+import json
 import random
-import simpy
 import time
-import torch
 from argparse import ArgumentParser, Namespace
-from typing import Any, List
+from functools import partial
+from typing import Any, List, Optional
+
+import torch
+from tqdm import tqdm
+
+from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import get_mem_size_str
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer.module import MegatronModule
+from megatron.training import get_args
 
 
-def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
-    """Common inference arguments."""
+def get_default_sampling_params(termination_id: int = None):
+    return SamplingParams(
+        temperature=1.0,
+        top_k=1,
+        top_p=0.0,
+        return_log_probs=False,
+        num_tokens_to_generate=30,
+        termination_id=termination_id,
+    )
 
-    group = parser.add_argument_group(title='Common inference')
-
-    group.add_argument("--temperature", type=float, default=1.0, help='Sampling temperature.')
-    group.add_argument("--top_k", type=int, default=1, help='Top k sampling.')
-    group.add_argument("--top_p", type=float, default=0.0, help='Top p sampling.')
-    group.add_argument(
-        "--return-log-probs",
-        action='store_true',
-        default=False,
-        help='Return the log probabilities of the final output tokens',
-    )
-    group.add_argument(
-        "--prompts",
-        metavar='N',
-        type=str,
-        nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
-    )
-    group.add_argument(
-        "--num-tokens-to-prompt",
-        type=int,
-        nargs="+",
-        default=[64, 1024],
-        help='Number of tokens to use for simulated prompts. This should be a '
-        'space-separated pair of integers, and the generated prompt lengths will '
-        'be uniformly sampled within this range.',
-    )
-    group.add_argument(
-        "--num-tokens-to-generate",
-        type=int,
-        default=30,
-        help='Number of tokens to generate for each prompt',
-    )
-    group.add_argument(
-        "--top-n-logprobs",
-        type=int,
-        default=0,
-        help='Return the top n logprobs for the generated tokens and their corresponding token as a dictionary',
-    )
-    group.add_argument("--incoming-requests-per-sec", type=float, default=100.,
-                       help="Simulated number of requests per second.")
-    group.add_argument("--incoming-requests-duration", type=float, default=10.,
-                       help="Total amount of time to simulate that requests are "
-                       "arriving. Multiply this value with "
-                       "`--incoming-requests-per-sec` to get the approximate "
-                       "total number of requests.")
-
-    return parser
 
 def get_curr_time() -> float:
     """Get synchronized time across ranks."""
     curr_time = torch.cuda.LongTensor([time.time_ns()])
     if torch.distributed.is_initialized():
-        torch.distributed.broadcast(
-            curr_time,
-            src=0)
+        torch.distributed.broadcast(curr_time, src=0)
     return curr_time.item() / 10**9
 
 
@@ -90,6 +59,7 @@ class Request:
         prompt_text: str,
         time_offset: float,
         tokenizer: Any,
+        sampling_params: SamplingParams = None,
     ):
         self.prompt_text = prompt_text
         self.prompt_tokens = tokenizer.tokenize(prompt_text)
@@ -99,26 +69,44 @@ class Request:
         self.time_arrival = None
         self.time_start = None
         self.time_end = None
+        self.ttft = None  # Time-to-first-token in seconds
         self.state = "not-started"
+        self.sampling_params: SamplingParams = (
+            sampling_params
+            if sampling_params is not None
+            else get_default_sampling_params(tokenizer.eod)
+        )
+        self.sampling_params = copy.deepcopy(self.sampling_params)
 
     def __str__(self) -> str:
-        return "state '%s'; prompt len %d; output len %d; '%s'" % (
+        return "state '%s'; toffset %.1e; prompt len %d; output len %d; '%s'" % (
             self.state,
+            self.time_offset,
             len(self.prompt_tokens),
             len(self.output_tokens),
             self.prompt_text,
         )
 
 
-def get_user_requests(args: Namespace, tokenizer: Any) -> List[Request]:
-    requests = [ Request(p, -1., tokenizer) for p in args.prompts ]
-    return requests
+def get_time_offsets(
+    seed: int | None,
+    incoming_requests_per_step: int,
+    incoming_requests_per_sec: float,
+    num_requests: int,
+) -> list[float]:
+    """Get example time offsets."""
 
+    # Time offsets to add all requests at once.
+    if incoming_requests_per_step is not None or incoming_requests_per_sec <= 0:
+        return [-1] * num_requests
 
-def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
-    """Get example requests."""
+    # if num_requests is not None:
+    incoming_requests_duration = num_requests / incoming_requests_per_sec
+    incoming_requests_duration *= 2  # extra margin, to accomodate time sampling
 
-    random.seed(args.seed)
+    random.seed(seed)
+
+    import simpy  # Guard against this import in test case
 
     # Generate random time offsets.
     def arrival(r):
@@ -128,32 +116,211 @@ def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
 
     time_offsets = []
     env = simpy.Environment()
-    env.process(arrival(args.incoming_requests_per_sec))
-    env.run(args.incoming_requests_duration)
+    env.process(arrival(incoming_requests_per_sec))
+    env.run(incoming_requests_duration)
 
     # Ensure at least a single request.
     if len(time_offsets) == 0:
-        time_offsets = [ 0. ]
+        time_offsets = [0.0]
 
-    # Initialize requests.
-    requests = [ Request(
-        "hi " * random.randint(*args.num_tokens_to_prompt),
-        t,
-        tokenizer,
-    ) for t in time_offsets ]
+    # Ensure first time is 0.
+    time_offsets = [to - time_offsets[0] for to in time_offsets]
 
-    # Round down to multiple of --inference-max-requests, until cuda graphs are
-    # fixed with static inference batching.
-    # todo: @lmcafee, remove following lines after fix.
-    factor = getattr(args, "inference_max_requests", 8)
-    rounded_len = factor * (len(requests) // factor)
-    requests = requests[:rounded_len]
+    # Truncate to num_requests.
+    assert len(time_offsets) >= num_requests
+    time_offsets = time_offsets[:num_requests]
+
+    return time_offsets
+
+
+def get_cli_requests(
+    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+) -> list[Request]:
+
+    # Get time offsets.
+    t_offsets = get_time_offsets(
+        args.seed,
+        args.incoming_requests_per_step,
+        args.incoming_requests_per_sec,
+        len(args.prompts),
+    )
+
+    # Init requests.
+    requests = [Request(p, t, tokenizer, sampling_params) for p, t in zip(args.prompts, t_offsets)]
+    return requests
+
+
+def get_synthetic_requests(
+    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+) -> list[Request]:
+    """Get example requests."""
+
+    # Get time offsets.
+    time_offsets = get_time_offsets(
+        args.seed,
+        args.incoming_requests_per_step,
+        args.incoming_requests_per_sec,
+        int(args.incoming_requests_per_sec * args.incoming_requests_duration),
+    )
+
+    # Build prompts with expected lengths.
+    assert (
+        len(args.num_tokens_to_prompt) == 2
+        and args.num_tokens_to_prompt[1] >= args.num_tokens_to_prompt[0]
+    )
+    max_prompt_length = args.num_tokens_to_prompt[1]
+    max_prompt_text = "hi " * max_prompt_length
+    max_prompt_tokens = tokenizer.tokenize(max_prompt_text)
+    prompt_lengths = [random.randint(*args.num_tokens_to_prompt) for _ in time_offsets]
+    prompt_tokens_list = [max_prompt_tokens[:l] for l in prompt_lengths]
+    prompt_texts = [tokenizer.detokenize(tt) for tt in prompt_tokens_list]
+
+    # Init requests.
+    assert len(prompt_texts) == len(time_offsets)
+    requests = [
+        Request(t, o, tokenizer, sampling_params=sampling_params)
+        for t, o in zip(prompt_texts, time_offsets)
+    ]
 
     return requests
 
 
-def build_requests(args: Namespace, tokenizer: Any) -> List[Request]:
+def get_requests_from_file(
+    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+) -> list[Request]:
+    """Get requests from a file."""
+    if not args.prompt_file:
+        raise ValueError("Prompt file is required to read requests from a file.")
+
+    # Load prompts.
+    n_prompts = sum(1 for _ in open(args.prompt_file))
+    prompts = []
+    if sampling_params is None:
+        sampling_params = get_default_sampling_params(tokenizer.eod)
+    sampling_params_list = []
+    with open(args.prompt_file) as f:
+        for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
+            line_dict = json.loads(line)
+            prompts.append(line_dict["text"])
+
+            sp = copy.deepcopy(sampling_params)
+            if args.num_tokens_from_file:
+                sp.num_tokens_to_generate = line_dict["chatgpt_output_token_length"]
+            sampling_params_list.append(sp)
+
+            if len(prompts) == args.prompt_file_num_truncate:
+                break
+
+    # Get time offsets.
+    time_offsets: list[float] = get_time_offsets(
+        args.seed, args.incoming_requests_per_step, args.incoming_requests_per_sec, len(prompts)
+    )
+
+    # Init requests.
+    requests = [
+        Request(p, t, tokenizer, sp)
+        for p, t, sp in tqdm(
+            zip(prompts, time_offsets, sampling_params_list), "init requests", total=len(prompts)
+        )
+    ]
+
+    return requests
+
+
+def build_requests(
+    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+) -> list[Request]:
+    # Check if we have any prompts (from command line or JSONL)
     if args.prompts:
-        return get_user_requests(args, tokenizer)
+        if args.prompt_file:
+            raise ValueError("Cannot use both --prompts and --prompt-file")
+        return get_cli_requests(args, tokenizer, sampling_params)
+    elif args.prompt_file:
+        return get_requests_from_file(args, tokenizer, sampling_params)
     else:
-        return get_auto_requests(args, tokenizer)
+        return get_synthetic_requests(args, tokenizer, sampling_params)
+
+
+def get_model_size_str(model):
+    n = sum(p.numel() for p in model.parameters())
+    for exp, suffix in ((12, "t"), (9, "b"), (6, "m"), (3, "k"), (0, "")):
+        nquery = int(10**exp)
+        if n > nquery:
+            return "%d%s" % (n // nquery, suffix)
+    raise Exception("something went wrong.")
+
+
+def build_dynamic_engine_setup_prefix(
+    args: Namespace,
+    model: MegatronModule,
+    context: DynamicInferenceContext,
+    requests: list[DynamicInferenceRequest],
+):
+    """
+    Returns a compact, pipe-separated summary of the dynamic-batching setup.
+
+    Example output:
+
+    `dynamic | cg True | prompts: synth(16 256), n 1024, g 512, t 1.0e+02 5.0e-01 | bf 4, 1.2 [r 1024, t 8192] | gtd 0.50 [r 512] | reqs 100` # pylint: disable=line-too-long
+
+    Args:
+        args (Namespace): Command-line arguments for this run.
+        context (DynamicInferenceContext): Stores limits such as `max_requests`,
+            `max_tokens`, and `gtd_request_count`.
+        requests (List[DynamicInferenceRequest]): List of inference requests.
+
+    Returns:
+        A configuration string for logging.
+    """
+    # CUDA graph config
+    if args.cuda_graph_impl == "local":
+        cg_str = f"graphs {len(context.cuda_graph_batch_dimensions_list)}"
+    else:
+        cg_str = "--"
+
+    # Unified memory (UVM).
+    uvm_str = f"uvm {int(context.unified_memory_level)}"
+
+    # Prompt description
+    prompt_src_str = (
+        "cli"
+        if args.prompts
+        else (
+            "file"
+            if args.prompt_file
+            else f"synth({', '.join(map(str, args.num_tokens_to_prompt))})"
+        )
+    )
+    request_str = (
+        f"requests: {prompt_src_str}, " f"n {len(requests):d}, g {args.num_tokens_to_generate:d}, "
+    )
+    request_str += (
+        f"dur {args.incoming_requests_duration:.1e} " f"r/sec {args.incoming_requests_per_sec:.1e}"
+        if args.incoming_requests_per_step is None
+        else f"r/step {args.incoming_requests_per_step}"
+    )
+
+    # Buffer limits config
+    buffer_limits_str = (
+        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
+        f"{context.kv_block_allocator.active_count} chunks "
+        f"[r {context.max_requests}, t {context.max_tokens}]"
+    )
+
+    parts = [get_model_size_str(model), "dynamic", cg_str, uvm_str, request_str, buffer_limits_str]
+
+    return " | ".join(parts)
+
+
+def get_global_peak_memory_stats_bytes() -> dict:
+    """Peak allocated CUDA memory aggregated across ranks (MAX), in bytes.
+
+    Uses `torch.cuda.max_memory_allocated()` and assumes peak stats were reset
+    before the benchmark run.
+    """
+    peak_alloc = int(torch.cuda.max_memory_allocated())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        peak_alloc = int(t[0].item())
+    return {"mem-max-allocated-bytes": peak_alloc}

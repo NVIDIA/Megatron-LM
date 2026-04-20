@@ -1,8 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
+from megatron.core.inference.config import InferenceConfig
 
 from .base_context import BaseInferenceContext
 
@@ -16,23 +14,17 @@ class StaticInferenceContext(BaseInferenceContext):
         max_sequence_length (int): Max supported sequence length.
     """
 
-    def __init__(self, max_batch_size: int, max_sequence_length: int):
-        super().__init__()
+    def __init__(
+        self, max_batch_size: int, max_sequence_length: int, use_flashinfer_fused_rope: bool = None
+    ):
+        config = InferenceConfig(materialize_only_last_token_logits=True)
+        super().__init__(inference_config=config)
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
-        self.current_batch_size = max_batch_size  # Required for bookkeeping variable-sized batches
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
         self.key_value_memory_dict = {}
         self.decode_mode = False
-        self.materialize_only_last_token_logits = False
-
-    @classmethod
-    def from_config(cls, config: InferenceWrapperConfig) -> "StaticInferenceContext":
-        """Initialize context from a config."""
-        max_batch_size = config.inference_max_requests
-        max_sequence_length = config.inference_max_seq_length
-        return cls(max_batch_size, max_sequence_length)
 
     def swap_key_value_dict(self, batch_idx):
         "swap between batches"
@@ -73,7 +65,6 @@ class StaticInferenceContext(BaseInferenceContext):
 
     def reset(self):
         """Resets the inference state for a new batch."""
-        self.current_batch_size = self.max_batch_size
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
         self.enable_prefill_mode()
@@ -82,7 +73,6 @@ class StaticInferenceContext(BaseInferenceContext):
         return (
             f"StaticInferenceContext(max_seq_len = {self.max_sequence_length}, "
             f"max_batch_size = {self.max_batch_size}, "
-            f"current_batch_size = {self.current_batch_size}, "
             f"sequence_len_offset = {self.sequence_len_offset}, "
             f"batch_size_offset = {self.batch_size_offset}, "
             f"key_value_memory_dict = {self.key_value_memory_dict.keys()})"
@@ -102,7 +92,6 @@ class StaticInferenceContext(BaseInferenceContext):
         basic_attrs = [
             'max_sequence_length',
             'max_batch_size',
-            'current_batch_size',
             'sequence_len_offset',
             'batch_size_offset',
             'decode_mode',

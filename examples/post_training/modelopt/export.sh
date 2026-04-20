@@ -5,6 +5,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 # Common arguments and base model specific arguments
 source "${SCRIPT_DIR}/conf/arguments.sh"
 
+# Default arguments of this script
+MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model --use-cpu-initialization"
+
 if [ -z ${HF_MODEL_CKPT} ]; then
     HF_MODEL_CKPT=${1}
 fi
@@ -23,8 +26,6 @@ if [ "${TP}" != "1" ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} is forced to be 1 during export!!\n"
 fi
 
-# Default arguments of this script
-MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model --use-cpu-initialization"
 
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/export.py \
     ${MODEL_ARGS} \

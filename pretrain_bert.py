@@ -8,61 +8,53 @@ import torch
 import torch.nn.functional as F
 
 from megatron.training import get_args
-from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
-import megatron.legacy.model
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
 
 
-def model_provider(pre_process=True, post_process=True):
+def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
     """Build the model."""
 
     print_rank_0('building BERT model ...')
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    if config is None:
+        config = core_transformer_config_from_args(args)
     num_tokentypes = 2 if args.bert_binary_head else 0
 
-    if args.use_legacy_models:
-        model = megatron.legacy.model.BertModel(
-            config=config,
-            num_tokentypes=num_tokentypes,
-            add_binary_head=args.bert_binary_head,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process)
-    else:
-        if args.spec is None:
-            transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
-        elif args.spec[0] == 'local':
-            print_rank_0('Using Local spec for transformer layers')
-            transformer_layer_spec = bert_layer_local_spec
-        else :
-            transformer_layer_spec = import_module(args.spec)
+    if args.spec is None:
+        transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
+    elif args.spec[0] == 'local':
+        print_rank_0('Using Local spec for transformer layers')
+        transformer_layer_spec = bert_layer_local_spec
+    else :
+        transformer_layer_spec = import_module(args.spec)
 
-        model = BertModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            num_tokentypes=num_tokentypes,
-            add_binary_head=args.bert_binary_head,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process)
+    model = BertModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        num_tokentypes=num_tokentypes,
+        add_binary_head=args.bert_binary_head,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        parallel_output=True,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=vp_stage)
 
     return model
 
@@ -139,11 +131,11 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask, sentence_order)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    tokenizer = get_tokenizer()
+    tokenizer = build_tokenizer(args)
 
     config = BERTMaskedWordPieceDatasetConfig(
         random_seed=args.seed,
@@ -166,6 +158,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         masking_use_geometric_distribution=False,
         classification_head=args.bert_binary_head,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
     print_rank_0('> building train, validation, and test datasets '
@@ -188,6 +181,7 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
+    parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     pretrain(train_valid_test_datasets_provider, model_provider,
              ModelType.encoder_or_decoder,
-             forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+             forward_step)

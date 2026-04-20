@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import logging
 from collections import namedtuple
 from functools import partial
@@ -8,34 +8,36 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.mamba import MambaModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
-    from megatron.core.utils import is_te_min_version
 
-    HAVE_TE = True
     try:
         import transformer_engine_torch as tex
 
         HAVE_TEX = True
-    except:
+    except ImportError:
+        tex = None
         HAVE_TEX = False
-except:
-    HAVE_TE = False
+else:
+    TEDotProductAttention = None
+    tex = None
+    HAVE_TEX = False
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
@@ -82,7 +84,8 @@ class LLaVAModel(MegatronModule):
         image_token_index (int): Token ID for image token such as <image>.
         pixel_shuffle (bool): Enable pixel shuffle.
         tile_tags (list): Optional tile tags.
-        cp_group (torch.distributed.ProcessGroup): Process group for context parallelism.
+        pg_collection (ProcessGroupCollection): Model communication process groups.
+        vp_stage (int): Virtual pipeline stage.
     """
 
     def __init__(
@@ -112,16 +115,16 @@ class LLaVAModel(MegatronModule):
         language_rotary_base: int = 10000,
         language_rope_scaling: bool = False,
         language_rope_scaling_factor: float = 8.0,
-        hybrid_attention_ratio: float = 1.0,
-        hybrid_mlp_ratio: float = 1.0,
-        hybrid_override_pattern: str = None,
+        hybrid_layer_pattern: str = None,
         fp16_lm_cross_entropy: bool = False,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
         tile_tags: Optional[list] = None,
-        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         max_num_tiles: int = 0,
         tokenizer_type: str = "",
+        vp_stage: Optional[int] = None,
+        use_vision_backbone_fp8_arch: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -138,11 +141,16 @@ class LLaVAModel(MegatronModule):
         self.post_process = post_process
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
+        self.vp_stage = vp_stage
 
         self.encoder_hidden_state = None
         self.vision_model = None
         self.vision_projection = None
         self.language_model = None
+
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
 
         language_model_type = getattr(language_transformer_config, "language_model_type", "")
         self.sequence_parallel_lm = language_transformer_config.sequence_parallel
@@ -150,14 +158,23 @@ class LLaVAModel(MegatronModule):
         self.context_parallel_lm = language_transformer_config.context_parallel_size
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
             if not language_model_type.startswith('nemotron5-hybrid'):
-                attn_module = language_transformer_layer_spec.submodules.self_attention
+                assert isinstance(
+                    language_transformer_layer_spec.submodules, TransformerLayerSubmodules
+                )
+                assert isinstance(
+                    language_transformer_layer_spec.submodules.self_attention.submodules,
+                    SelfAttentionSubmodules,
+                )
+                attn_submodules = (
+                    language_transformer_layer_spec.submodules.self_attention.submodules
+                )
                 assert (
-                    attn_module.submodules.core_attention == TEDotProductAttention and HAVE_TE
+                    attn_submodules.core_attention == TEDotProductAttention and HAVE_TE
                 ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
             if self.context_parallel_lm > 1:
-                self.cp_group = get_context_parallel_group() if cp_group is None else cp_group
+                self.cp_group = self.pg_collection.cp
                 assert (
-                    torch.distributed.get_world_size(self.cp_group) == self.context_parallel_lm
+                    self.cp_group.size() == self.context_parallel_lm
                 ), "CP Group size should match the Language Model CP size"
                 assert is_te_min_version(
                     "1.10.0"
@@ -179,22 +196,21 @@ class LLaVAModel(MegatronModule):
                 )
                 self.language_model = build_hf_model(language_transformer_config)
             elif language_model_type.startswith('nemotron5-hybrid'):
-                self.language_model = MambaModel(
+                self.language_model = HybridModel(
                     config=language_transformer_config,
-                    mamba_stack_spec=language_transformer_layer_spec,
+                    hybrid_stack_spec=language_transformer_layer_spec,
                     vocab_size=language_vocab_size,
                     max_sequence_length=language_max_sequence_length,
                     parallel_output=parallel_output,
                     position_embedding_type=language_position_embedding_type,
                     pre_process=self.pre_process,
-                    hybrid_attention_ratio=hybrid_attention_ratio,
-                    hybrid_mlp_ratio=hybrid_mlp_ratio,
-                    hybrid_override_pattern=hybrid_override_pattern,
+                    hybrid_layer_pattern=hybrid_layer_pattern,
                     post_process=self.post_process,
                     rotary_percent=language_rotary_percent,
                     rotary_base=language_rotary_base,
                     fp16_lm_cross_entropy=fp16_lm_cross_entropy,
                     scatter_embedding_sequence_parallel=False,
+                    pg_collection=self.pg_collection,
                 )
             else:
                 self.language_model = GPTModel(
@@ -211,10 +227,9 @@ class LLaVAModel(MegatronModule):
                     rope_scaling=language_rope_scaling,
                     rope_scaling_factor=language_rope_scaling_factor,
                     scatter_embedding_sequence_parallel=False,
-                )
-
-                self.share_embeddings_and_output_weights = (
-                    self.language_model.share_embeddings_and_output_weights
+                    share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                    pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
                 )
 
             self._language_max_sequence_length = language_max_sequence_length
@@ -252,8 +267,10 @@ class LLaVAModel(MegatronModule):
                     patch_dim=patch_dim,
                     model_subtype=vision_transformer_config.vision_model_type,
                     add_class_token=add_class_token,
+                    pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
                 )
-            elif vision_transformer_config.vision_model_type in ("radio", "radio-g"):
+            elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
                 # TODO: should refactor into model code itself?
                 class_token_len = 0
                 max_img_h = 0
@@ -278,6 +295,18 @@ class LLaVAModel(MegatronModule):
 
                     ln_post_impl = TENorm
                     use_mask_token = True
+                elif vision_transformer_config.vision_model_type == "cradio-g":
+                    class_token_len = 8
+                    max_img_h = 2048
+                    max_img_w = 2048
+                    embedder_bias = False
+                    ln_post_impl = None
+                    use_mask_token = False
+
+                if vision_transformer_config.fp8 or use_vision_backbone_fp8_arch:
+                    # FP8 padding for final sequence length to be a multiple of 16 or 32.
+                    class_token_len = 32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
+
                 self.vision_model = RADIOViTModel(
                     vision_transformer_config,
                     vision_transformer_layer_spec,
@@ -291,6 +320,8 @@ class LLaVAModel(MegatronModule):
                     add_class_token=add_class_token,
                     embedder_bias=embedder_bias,
                     use_mask_token=use_mask_token,
+                    pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
                 )
             elif vision_transformer_config.vision_model_type.startswith("hf://"):
                 from megatron.core.models.huggingface.module import build_hf_model
@@ -318,6 +349,7 @@ class LLaVAModel(MegatronModule):
                 vision_projection_layer_spec,
                 vision_projection_type,
                 vision_projection_input_size,
+                tp_group=self.pg_collection.tp,
             )
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains
@@ -447,7 +479,8 @@ class LLaVAModel(MegatronModule):
         Currently, we assume the language model uses a causal mask.
 
         Returns:
-            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h].
+            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h] if
+                context_parallel_lm == 1 else [b, combined_seq_len, h].
             final_labels (torch.Tensor): labels for image and text positions [b, combined_seq_len].
             final_loss_mask (torch.Tensor): loss mask [b, combined_seq_len].
         """
@@ -702,12 +735,13 @@ class LLaVAModel(MegatronModule):
                     "1.10.0"
                 ), "Please update Transformer Engine to >= 1.10 to use \
                     Context Parallel with THD format data"
-                cp_size = self.cp_group.size()
-                cp_rank = self.cp_group.rank()
+                index = tex.thd_get_partitioned_indices(
+                    packed_seq_params.cu_seqlens_q_padded,
+                    batch[next(iter(batch))].size(1),
+                    self.cp_group.size(),
+                    self.cp_group.rank(),
+                )
                 for key, data in batch.items():
-                    index = tex.thd_get_partitioned_indices(
-                        packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
-                    )
                     batch[key] = data.index_select(1, index)
 
             if self.pre_process:
@@ -880,6 +914,10 @@ class LLaVAModel(MegatronModule):
         if num_image_tiles is None and images is not None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
+        # if context_parallel_lm == 1:
+        #   [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        # else:
+        #   [b, combined_seq_len, h_language], [b, combined_seq_len], [b, combined_seq_len]
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
             image_embeddings,
             language_embeddings,
@@ -890,7 +928,7 @@ class LLaVAModel(MegatronModule):
             inference_context,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
-        )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        )
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
             combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
@@ -899,27 +937,16 @@ class LLaVAModel(MegatronModule):
                 )
             )
 
-        if isinstance(self.language_model, MambaModel):
-            output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                attention_mask=attention_mask,
-                decoder_input=combined_embeddings,
-                labels=new_labels,
-                inference_context=inference_context,
-                runtime_gather_output=runtime_gather_output,
-            )
-        else:
-            output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                attention_mask=attention_mask,
-                decoder_input=combined_embeddings,
-                labels=new_labels,
-                inference_context=inference_context,
-                runtime_gather_output=runtime_gather_output,
-                packed_seq_params=packed_seq_params,
-            )
+        output = self.language_model(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=attention_mask,
+            decoder_input=combined_embeddings,
+            labels=new_labels,
+            inference_context=inference_context,
+            runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
+        )
 
         return output, new_loss_mask
 

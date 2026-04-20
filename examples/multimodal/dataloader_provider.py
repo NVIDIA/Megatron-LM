@@ -5,6 +5,12 @@ import torch
 from dataset_helpers import TaskEncoder, print_error_handler
 
 from megatron.core import parallel_state
+from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.parallel_state import (
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+)
 from megatron.energon import (
     LimitDataset,
     RepeatDataset,
@@ -14,13 +20,11 @@ from megatron.energon import (
     get_train_dataset,
     get_val_datasets,
 )
-from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.parallel_state import get_tensor_model_parallel_rank, get_pipeline_model_parallel_world_size, get_pipeline_model_parallel_rank
 from megatron.training import get_args
 from megatron.training.checkpointing import get_checkpoint_name
 
 
-def datasets_provider(worker_config=None):
+def datasets_provider(task_encoder,worker_config=None):
     """Create multimodal train, validation and test datasets."""
     args = get_args()
 
@@ -28,7 +32,7 @@ def datasets_provider(worker_config=None):
     train_dataset = get_train_dataset(
         dname,
         batch_size=args.micro_batch_size,
-        task_encoder=TaskEncoder(),
+        task_encoder=task_encoder,
         virtual_epoch_length=1000,
         max_samples_per_sequence=100,
         shuffle_buffer_size=100,
@@ -43,7 +47,7 @@ def datasets_provider(worker_config=None):
         batch_size=args.micro_batch_size,
         # This is the total number over all workers
         # limit=args.eval_iters * get_num_microbatches(),
-        task_encoder=TaskEncoder(),
+        task_encoder=task_encoder,
         worker_config=worker_config,
         packing_buffer_size=args.packing_buffer_size,
         handler=print_error_handler,
@@ -64,42 +68,39 @@ def datasets_provider(worker_config=None):
     return train_dataset, val_datasets_without_source_datasets, None
 
 
-def is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size):
+def is_first_or_last_stage(pp_size):
     """Check if the current pipeline parallel stage is the first or last stage."""
     if pp_size == 1:    # No pipeline parallelism.
         return True
 
-    is_valid_rank = False
+    # With no separate pipeline stage for the vision model (epp=0), 
+    # run the dataloader on the first and last pipeline stage.
     pp_rank = get_pipeline_model_parallel_rank()
-    if encoder_pipeline_model_parallel_size == 0:
-        # No separate pipeline stage for the vision model. Run the dataloader on the first and last pipeline stage.
-        is_valid_rank = pp_rank in (0, pp_size-1)
-    elif encoder_pipeline_model_parallel_size == 1:
-        # Separate pipeline stage for the vision model. Run the dataloader on the first vision and LM stage and last LM stage.
-        is_valid_rank = pp_rank in (0, 1, pp_size-1)
-    else:
-        raise NotImplementedError("encoder-pipeline-model-parallel-size > 1 is not supported yet")
+    is_valid_rank = pp_rank in (0, pp_size-1)
 
     return is_valid_rank
 
 
-def is_dataloader_rank(encoder_pipeline_model_parallel_size):
+def is_dataloader_rank():
     """Check if we should have the dataloader on this tensor and pipeline parallel rank."""
     # Run dataloader only on the first tensor parallel rank (will be broadcasted to others).
     is_first_rank = get_tensor_model_parallel_rank() == 0
 
     pp_size = get_pipeline_model_parallel_world_size()
-    is_first_rank = is_first_rank and is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size)
+    is_first_rank = is_first_rank and is_first_or_last_stage(pp_size)
 
     return is_first_rank
 
 
-def train_valid_test_dataloaders_provider(train_val_test_num_samples):
+def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encoder=None):
     """Build multimodal train, validation and test dataloaders."""
     args = get_args()
+    
+    if task_encoder is None:
+        task_encoder = TaskEncoder()
 
     # Dataloader is only on specific ranks.
-    if not is_dataloader_rank(args.encoder_pipeline_model_parallel_size):
+    if not is_dataloader_rank():
         return None, None, None
 
     worker_debug_path = None
@@ -117,7 +118,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
         worker_debug_path=worker_debug_path,
         worker_log_level=worker_log_level,
     )
-    train_ds, valid_ds1, test_ds = datasets_provider(worker_config)
+    train_ds, valid_ds1, test_ds = datasets_provider(task_encoder, worker_config)
 
     train_dataloader = get_savable_loader(train_ds, worker_config=worker_config)
     if args.load is not None:

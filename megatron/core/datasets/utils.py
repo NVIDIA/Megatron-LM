@@ -5,7 +5,6 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 import numpy
-import torch
 
 from ..utils import log_single_rank
 
@@ -40,6 +39,7 @@ def normalize(weights: List[float]) -> List[float]:
     Returns:
         List[float]: The normalized weights
     """
+
     w = numpy.array(weights, dtype=numpy.float64)
     w_sum = numpy.sum(w)
     w = (w / w_sum).tolist()
@@ -49,14 +49,19 @@ def normalize(weights: List[float]) -> List[float]:
 def get_blend_from_list(
     blend: Optional[List[str]],
 ) -> Optional[Tuple[List[str], Optional[List[float]]]]:
-    """Get the megatron.core.datasets.blended_megatron_dataset_config.BlendedMegatronDatasetConfig blend from the blend list
+    # pylint: disable=line-too-long
+    """Get the blended_megatron_dataset_config.BlendedMegatronDatasetConfig blend
+    from the blend list
 
     Args:
-        blend (Optional[List[str]]): The blend list, which can be either (1) a list of prefixes, e.g. ["path/to/dataset_1_prefix", "path/to/dataset_2_prefix"], or (2) a flattened, zipped list of weights and prefixes, e.g. ["30", "path/to/dataset_1_prefix", "70", "path/to/dataset_2_prefix"]
+        blend (Optional[List[str]]): The blend list, which can be either
+            (1) a list of prefixes, e.g. ["path/to/dataset_1_prefix", "path/to/dataset_2_prefix"], or
+            (2) a flattened, zipped list of weights and prefixes, e.g. ["30", "path/to/dataset_1_prefix", "70", "path/to/dataset_2_prefix"]
 
     Returns:
         Optional[Tuple[List[str], Optional[List[float]]]]: The blend, consisting of a list of dataset prefixes and optionally a list of dataset weights, e.g. [["path/to/dataset_1_prefix", "path/to/dataset_2_prefix"], [30.0, 70.0]].
     """
+    # pylint: enable=line-too-long
     if blend is None:
         return None
 

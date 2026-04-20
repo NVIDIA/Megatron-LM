@@ -1,0 +1,510 @@
+# Copyright (c) 2020-2021, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Release"
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+on:
+  workflow_call:
+    inputs:
+      release-ref:
+        required: true
+        description: Ref (SHA or branch) to release
+        type: string
+      dry-run:
+        type: boolean
+        required: true
+        description: Do not publish a wheel and GitHub release.
+      version-bump-branch:
+        type: string
+        required: true
+        description: Branch to target for version bump
+      create-gh-release:
+        required: false
+        description: Create a GitHub release
+        type: boolean
+        default: true
+      gh-release-use-changelog-builder:
+        required: false
+        description: Use release-changelog-builder-action to dynamically build changelog
+        type: boolean
+        default: true
+      gh-release-changelog-config:
+        required: false
+        description: Path to changelog builder configuration file
+        type: string
+        default: ".github/workflows/config/changelog-config.json"
+      gh-release-from-tag:
+        required: false
+        description: Starting tag for changelog builder (leave empty for auto-detect)
+        type: string
+        default: ""
+      publish-docs:
+        required: false
+        description: Publish documentation to S3 after release
+        type: boolean
+        default: true
+    secrets:
+      TWINE_PASSWORD:
+        required: true
+      SLACK_WEBHOOK:
+        required: true
+      PAT:
+        required: true
+      AWS_ASSUME_ROLE_ARN:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AKAMAI_HOST:
+        required: true
+      AKAMAI_CLIENT_TOKEN:
+        required: true
+      AKAMAI_CLIENT_SECRET:
+        required: true
+      AKAMAI_ACCESS_TOKEN:
+        required: true
+      S3_BUCKET_NAME:
+        required: true
+
+permissions:
+  contents: write # To read repository content
+  pull-requests: write # To create PR(s)
+
+jobs:
+  build-test-publish-wheels-dry-run:
+    uses: ./.github/workflows/_build_test_publish_wheel.yml
+    with:
+      dry-run: true
+      ref: ${{ inputs.release-ref }}
+      no-publish: true
+    secrets:
+      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+
+  bump-next-version:
+    runs-on: ubuntu-latest
+    needs: build-test-publish-wheels-dry-run
+    if: |
+      (
+        success() || !failure()
+      )
+      && !cancelled()
+    outputs:
+      release-version: ${{ steps.bump-version-mcore.outputs.release-version }}
+    env:
+      IS_DRY_RUN: ${{ inputs.dry-run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          path: ${{ github.run_id }}
+          token: ${{ secrets.PAT }}
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ inputs.release-ref }}
+      - name: Bump version MCore
+        id: bump-version-mcore
+        env:
+          SRC_DIR: ""
+          PYPROJECT_NAME: "megatron.core"
+        run: |
+          set +u
+          cd ${{ github.run_id }}
+
+          PACKAGE_INFO_FILE="$SRC_DIR${PYPROJECT_NAME//.//}/package_info.py"
+
+          MAJOR=$(cat $PACKAGE_INFO_FILE | awk '/^MAJOR = /' | awk -F"= " '{print $2}')
+          MINOR=$(cat $PACKAGE_INFO_FILE | awk '/^MINOR = /' | awk -F"= " '{print $2}')
+          PATCH=$(cat $PACKAGE_INFO_FILE | awk '/^PATCH = /' | awk -F"= " '{print $2}')
+          PRERELEASE=$(cat $PACKAGE_INFO_FILE | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
+
+          echo "release-version=$MAJOR.$MINOR.$PATCH$PRERELEASE" | tee -a "$GITHUB_OUTPUT"
+
+          if [[ "$PRERELEASE" != "" ]]; then
+            if [[ "$PRERELEASE" == *rc* ]]; then
+              NEXT_PATCH=$PATCH
+              NEXT_PRERELEASE=rc$((${PRERELEASE#rc} + 1))
+            elif [[ "$PRERELEASE" == *a* ]]; then
+              NEXT_PATCH=$PATCH
+              NEXT_PRERELEASE=a$((${PRERELEASE#a} + 1))
+            else
+              echo "Unknown pre-release: $PRERELEASE"
+              exit 1
+            fi
+          else
+            NEXT_PATCH=$((${PATCH} + 1))
+            NEXT_PRERELEASE=$PRERELEASE
+          fi
+
+          sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" $PACKAGE_INFO_FILE
+          sed -i "/^PRE_RELEASE/c\PRE_RELEASE = \"$NEXT_PRERELEASE\"" $PACKAGE_INFO_FILE
+
+          echo "version=$MAJOR.$MINOR.$NEXT_PATCH$NEXT_PRERELEASE" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Bump version MFSDP
+        id: bump-version-mfsdp
+        env:
+          SRC_DIR: "megatron/core/distributed/fsdp/src/"
+          PYPROJECT_NAME: "megatron_fsdp"
+        run: |
+          set +u
+
+          cd ${{ github.run_id }}
+
+          PACKAGE_INFO_FILE="$SRC_DIR${PYPROJECT_NAME//.//}/package_info.py"
+
+          MAJOR=$(cat $PACKAGE_INFO_FILE | awk '/^MAJOR = /' | awk -F"= " '{print $2}')
+          MINOR=$(cat $PACKAGE_INFO_FILE | awk '/^MINOR = /' | awk -F"= " '{print $2}')
+          PATCH=$(cat $PACKAGE_INFO_FILE | awk '/^PATCH = /' | awk -F"= " '{print $2}')
+          PRERELEASE=$(cat $PACKAGE_INFO_FILE | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
+
+          if [[ "$PRERELEASE" != "" ]]; then
+            if [[ "$PRERELEASE" == *rc* ]]; then
+              NEXT_PATCH=$PATCH
+              NEXT_PRERELEASE=rc$((${PRERELEASE#rc} + 1))
+            elif [[ "$PRERELEASE" == *a* ]]; then
+              NEXT_PATCH=$PATCH
+              NEXT_PRERELEASE=a$((${PRERELEASE#a} + 1))
+            else
+              echo "Unknown pre-release: $PRERELEASE"
+              exit 1
+            fi
+          else
+            NEXT_PATCH=$((${PATCH} + 1))
+            NEXT_PRERELEASE=$PRERELEASE
+          fi
+
+          sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" $PACKAGE_INFO_FILE
+          sed -i "/^PRE_RELEASE/c\PRE_RELEASE = \"$NEXT_PRERELEASE\"" $PACKAGE_INFO_FILE
+
+          echo "version=$MAJOR.$MINOR.$NEXT_PATCH$NEXT_PRERELEASE" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Create and push deployment branch
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          cd ${{ github.run_id }}
+
+          TMP_BRANCH="deploy-release/$(uuidgen)"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$TMP_BRANCH"
+          git add -A .
+          git commit -m "beep boop 🤖: Bumping versions" || echo "No changes to commit"
+          git push -u origin "$TMP_BRANCH"
+          echo "TMP_BRANCH=$TMP_BRANCH" | tee -a $GITHUB_ENV
+
+          # Create PR to collect app based status checks that run on PRs only
+          # (like DCO check)
+          PR_URL=$(gh pr create \
+            --base ${{ inputs.version-bump-branch }} \
+            --head $TMP_BRANCH \
+            --title "beep boop 🤖: Bumping versions" \
+            --body "This is an automated PR to bump versions.")
+
+          # Extract PR number from URL
+          PR_NUMBER=$(echo $PR_URL | grep -o '[0-9]*$')
+
+      - name: Wait for status checks on tmp branch
+        uses: actions/github-script@v8
+        id: wait-status
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            const branch = process.env.TMP_BRANCH;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // Get latest commit SHA of branch
+            const { data: refData } = await github.rest.git.getRef({
+              owner,
+              repo,
+              ref: `heads/${branch}`,  // note: no 'refs/' prefix here
+            });
+
+            const sha = refData.object.sha;
+
+            console.log(`Polling status for commit SHA: ${sha}`);
+
+            let checksPassed = false;
+            let maxAttempts = 30;
+            let attempt = 0;
+            const delay = ms => new Promise(res => setTimeout(res, ms));
+
+            while (!checksPassed && attempt < maxAttempts) {
+              attempt++;
+
+              // Use commit SHA instead of branch ref
+              const { data: status } = await github.rest.repos.getCombinedStatusForRef({
+                owner,
+                repo,
+                ref: sha,
+              });
+
+              const { data: checks } = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: sha,
+              });
+
+              const allStatuses = status.statuses;
+              const allChecks = checks.check_runs;
+
+              if (allStatuses.length === 0 && allChecks.length === 0) {
+                console.log(`Attempt ${attempt}: No checks or statuses yet. Waiting...`);
+                await delay(10000);
+                continue;
+              }
+
+              const statusesOk = allStatuses.every(s => s.state === 'success');
+              const checksOk = allChecks.every(c => c.status === 'completed');
+
+              if (statusesOk && checksOk) {
+                console.log('✅ All checks passed.');
+                checksPassed = true;
+                break
+              }
+
+              console.log(`Attempt ${attempt}: Checks not complete yet. Waiting...`);
+              await delay(10000);
+            }
+
+            if (!checksPassed) {
+              core.setFailed('❌ Status checks did not pass in time');
+            }
+
+      - name: Merge into ${{ inputs.version-bump-branch }}
+        run: |
+          cd ${{ github.run_id }}
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          CMD=$(echo -E 'git push origin ${{ inputs.version-bump-branch }}')
+
+          if [[ "$IS_DRY_RUN" == "true" ]]; then
+            echo "dry-run enabled, would have run: $CMD"
+          else
+            # Here we account for potential race conditions from multiple concurrent releases.
+            # Those can be legit (operating on different packages within the monorepo, for example)
+            # but the pushes would be still rejected purely because of git's inability to
+            # push non-fast-forward updates to the branch. In this case we would need to let
+            # a retry.
+            git fetch origin ${{ inputs.version-bump-branch }}
+            git checkout ${{ inputs.version-bump-branch }}
+            git merge ${{ env.TMP_BRANCH }}
+
+            for attempt in {1..3}; do
+              if eval "$CMD"; then
+                echo "Git push succeeded on attempt $attempt"
+                break
+              else
+                echo "Git push failed on attempt $attempt"
+                if [[ $attempt -lt 3 ]]; then
+                  sleep $((RANDOM % 3 + 1))
+                  # We refetch, reset and re-merge. Note resetting because the local
+                  # branch is "contaminated" with previous merge attempt.
+                  git fetch origin ${{ inputs.version-bump-branch }}
+                  git reset --hard origin/${{ inputs.version-bump-branch }}
+                  git merge ${{ env.TMP_BRANCH }}
+                else
+                  echo "Git push failed after 3 attempts"
+                  exit 1
+                fi
+              fi
+            done
+          fi
+
+      - name: Delete ${{ env.TMP_BRANCH }} branch
+        if: always()
+        run: |
+          cd ${{ github.run_id }}
+          git push -d origin ${{ env.TMP_BRANCH }}
+
+  build-test-publish-wheels:
+    needs: [bump-next-version]
+    uses: ./.github/workflows/_build_test_publish_wheel.yml
+    with:
+      dry-run: false
+      ref: ${{ inputs.release-ref }}
+      no-publish: false
+    secrets:
+      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+
+  create-gh-release:
+    needs: [build-test-publish-wheels, bump-next-version]
+    runs-on: ubuntu-latest
+    if: |
+      (
+        success() || !failure()
+      )
+      && inputs.create-gh-release == true
+      && !cancelled()
+    outputs:
+      is-release-candidate: ${{ steps.version-number.outputs.is-release-candidate }}
+    env:
+      REPOSITORY: ${{ github.repository }}
+      PROJECT_NAME: Megatron Core
+      VERSION: ${{ needs.bump-next-version.outputs.release-version }}
+      TAG_PREFIX: core_
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          path: ${{ github.run_id }}
+          ref: ${{ inputs.release-ref }}
+          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Determine fromTag for changelog
+        id: determine-from-tag
+        if: inputs.gh-release-use-changelog-builder == true
+        run: |
+          cd ${{ github.run_id }}
+
+          # If gh-release-from-tag is provided, use it
+          if [[ -n "${{ inputs.gh-release-from-tag }}" ]]; then
+            FROM_TAG="${{ inputs.gh-release-from-tag }}"
+            echo "Using provided fromTag: $FROM_TAG"
+          else
+            # Get the most recent tag
+            FROM_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [[ -z "$FROM_TAG" ]]; then
+              echo "No previous tags found, leaving fromTag empty"
+            else
+              echo "Auto-detected most recent tag: $FROM_TAG"
+            fi
+          fi
+
+          echo "from-tag=$FROM_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build Changelog
+        id: build-changelog
+        if: inputs.gh-release-use-changelog-builder == true
+        uses: mikepenz/release-changelog-builder-action@v6.1.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+        with:
+          configuration: ${{ github.run_id }}/${{ inputs.gh-release-changelog-config }}
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          ignorePreReleases: "false"
+          failOnError: "false"
+          fromTag: ${{ steps.determine-from-tag.outputs.from-tag }}
+          toTag: ${{ inputs.release-ref }}
+          mode: ${{ inputs.gh-release-changelog-mode }}
+
+      - name: Create release
+        id: version-number
+        env:
+          SHA: ${{ inputs.release-ref }}
+          GH_TOKEN: ${{ secrets.PAT }}
+          IS_DRY_RUN: ${{ inputs.dry-run }}
+          BUILT_CHANGELOG: ${{ steps.build-changelog.outputs.changelog }}
+        run: |
+          cd ${{ github.run_id }}
+
+          IS_RELEASE_CANDIDATE=$([[ "$VERSION" == *rc* ]] && echo "true" || echo "false")
+          IS_ALPHA=$([[ "$VERSION" == *a* ]] && echo "true" || echo "false")
+          IS_PRERELEASE=$([[ "$IS_RELEASE_CANDIDATE" == "true" || "$IS_ALPHA" == "true" ]] && echo "true" || echo "false")
+          NAME="NVIDIA $PROJECT_NAME ${VERSION}"
+
+          # Use built changelog if available, otherwise fall back to CHANGELOG.md
+          if [[ -n "$BUILT_CHANGELOG" ]]; then
+            CHANGELOG="$BUILT_CHANGELOG"
+          elif [[ "$IS_RELEASE_CANDIDATE" == "true" ]]; then
+            DATE=$(date +"%Y-%m-%d")
+            CHANGELOG="Prerelease: $NAME ($DATE)"
+          else
+            CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
+            CHANGELOG=$(echo "$CHANGELOG" | sed '/./,$!d' | sed ':a;N;$!ba;s/\n$//')
+          fi
+
+          echo "is-release-candidate=$IS_RELEASE_CANDIDATE" | tee -a "$GITHUB_OUTPUT"
+
+          PAYLOAD=$(jq -nc \
+                      --arg TAG_NAME "${TAG_PREFIX}v${VERSION}" \
+                      --arg CI_COMMIT_BRANCH "$SHA" \
+                      --arg NAME "$NAME" \
+                      --arg BODY "$CHANGELOG" \
+                      --argjson PRERELEASE "$IS_PRERELEASE" \
+                      '{
+                        "tag_name": $TAG_NAME,
+                        "target_commitish": $CI_COMMIT_BRANCH,
+                        "name": $NAME,
+                        "body": $BODY,
+                        "draft": false,
+                        "prerelease": $PRERELEASE,
+                        "generate_release_notes": false
+                      }'
+                  )
+          echo -E "$PAYLOAD" > payload.txt
+
+          CMD=$(echo -E 'curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer '"$GH_TOKEN"'" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/'"$REPOSITORY"'/releases \
+            -d @payload.txt
+          ')
+
+          if [[ "$IS_DRY_RUN" == "true" ]]; then
+            echo -E "$CMD"
+          else
+            eval "$CMD"
+          fi
+
+  publish-docs:
+    needs: [bump-next-version, create-gh-release]
+    uses: ./.github/workflows/release-docs.yml
+    if: |
+      (
+        success() || !failure()
+      )
+      && inputs.publish-docs == true
+      && !cancelled()
+    with:
+      dry-run: ${{ inputs.dry-run }}
+      publish-as-latest: true
+      docs-version-override: ${{ needs.bump-next-version.outputs.release-version }}
+      build-docs-ref: ${{ inputs.release-ref }}
+    secrets: inherit
+
+  notify:
+    needs: [build-test-publish-wheels, create-gh-release, bump-next-version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          repository: NVIDIA-NeMo/FW-CI-templates
+          ref: v0.17.0
+          path: send-slack-alert
+
+      - name: Send Slack alert
+        uses: ./send-slack-alert/.github/actions/send-slack-alert
+        env:
+          MESSAGE: |
+            ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ needs.bump-next-version.outputs.release-version }}` of `NVIDIA Megatron Core` 🚀✨🎉
+
+            • <https://github.com/${{ github.repository }}/releases/tag/core_v${{ needs.bump-next-version.outputs.release-version }}|GitHub release>
+            • <https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/megatron-core/${{ needs.bump-next-version.outputs.release-version }}/|PyPi release>
+
+        with:
+          message: ${{ env.MESSAGE }}
+          webhook: ${{ secrets.SLACK_WEBHOOK }}

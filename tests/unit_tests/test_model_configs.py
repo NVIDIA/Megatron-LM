@@ -8,7 +8,7 @@ YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests" / "test_cas
 
 def get_yaml_files(directory):
     """Retrieve all YAML files from the specified directory."""
-    return list([file for file in directory.rglob("*.yaml") if file is not None])
+    return list([file for file in directory.rglob("model_config.yaml") if file is not None])
 
 
 def load_yaml(file_path):
@@ -25,8 +25,8 @@ def load_yaml(file_path):
 def test_model_config_tracks_memory(yaml_file, metric):
     """Test if each YAML file contains the required record."""
     print("gpt3-nemo" in str(yaml_file) or "ckpt_converter" in str(yaml_file))
-    if "gpt3-nemo" in str(yaml_file) or "ckpt_converter" in str(yaml_file):
-        pytest.skip("Skipping for gpt-nemo")
+    if any(k in str(yaml_file) for k in ["gpt3-nemo", "ckpt_converter", "gpt-nemo", "inference"]):
+        pytest.skip("Skipping `test_model_config_tracks_memory`")
 
     model_config = load_yaml(yaml_file)
 

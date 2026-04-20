@@ -6,6 +6,7 @@ import torch
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -34,6 +35,8 @@ class CLIPViTModel(VisionModule):
         patch_dim (int): Image patch size.
         img_h (int): Input image height.
         img_w (int): Input image width.
+        pg_collection (ProcessGroupCollection): Model communication process groups
+        vp_stage (int): Virtual pipeline stage
     """
 
     def __init__(
@@ -48,6 +51,8 @@ class CLIPViTModel(VisionModule):
         img_h: int = 336,
         img_w: int = 336,
         model_subtype: str = "clip",
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
 
         error_msg = f"CLIPViTModel model subtype {model_subtype} is not supported."
@@ -81,6 +86,8 @@ class CLIPViTModel(VisionModule):
 
         self.ln_pre = None
         self.ln_post = None
+        self.pg_collection = pg_collection
+        self.vp_stage = vp_stage
         if model_subtype == "clip":
             self.ln_pre = build_module(
                 ln_pre_impl,
@@ -116,12 +123,19 @@ class CLIPViTModel(VisionModule):
 
         self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
 
-        self.position_embeddings = torch.nn.Embedding(self.seq_length, self.visual_hidden_size)
+        self.position_embeddings = torch.nn.Embedding(
+            self.seq_length, self.visual_hidden_size, dtype=transformer_config.params_dtype
+        )
 
         self.add_class_token = add_class_token
         if self.add_class_token:
             self.class_token = torch.nn.Parameter(
-                torch.randn(1, self.class_token_len, self.visual_hidden_size)
+                torch.randn(
+                    1,
+                    self.class_token_len,
+                    self.visual_hidden_size,
+                    dtype=transformer_config.params_dtype,
+                )
             )
 
         self.model_type = ModelType.encoder_or_decoder
@@ -135,6 +149,8 @@ class CLIPViTModel(VisionModule):
             spec=transformer_layer_spec,
             pre_process=True,
             post_process=False,
+            pg_collection=self.pg_collection,
+            vp_stage=self.vp_stage,
         )
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
@@ -204,6 +220,9 @@ def get_num_image_embeddings(
     elif vision_model_type in ("clip", "internvit", "internvit300M"):
         keep_class_token = not disable_vision_class_token
     elif vision_model_type.startswith("radio"):
+        keep_class_token = not disable_vision_class_token
+    elif vision_model_type == "cradio-g":
+        class_token_len = 8
         keep_class_token = not disable_vision_class_token
     elif vision_model_type.startswith("hf://"):
         from megatron.core.models.huggingface.module import get_hf_model_type

@@ -1,4 +1,5 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import ast
 import sys
 import json
 import requests
@@ -11,7 +12,7 @@ if __name__ == "__main__":
 
     while True:
         sentence = input("Enter prompt: ")
-        tokens_to_generate = int(eval(input("Enter number of tokens to generate: ")))
+        tokens_to_generate = ast.literal_eval(input("Enter number of tokens to generate: "))
 
         data = {"prompts": [sentence], "tokens_to_generate": tokens_to_generate}
         response = requests.put(url, data=json.dumps(data), headers=headers)

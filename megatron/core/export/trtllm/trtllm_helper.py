@@ -1,11 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import json
 from typing import Union
 
-import tensorrt_llm
 import torch
-from tensorrt_llm.functional import non_gated_version
-from tensorrt_llm.layers import MoeConfig
 
 from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
@@ -13,6 +10,7 @@ from megatron.core.export.model_type import ModelType
 from megatron.core.export.trtllm.engine_builder.trtllm_engine_builder import TRTLLMEngineBuilder
 from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict import (
     DEFAULT_CONVERSION_DICT,
+    NEMOTRON_NAS_CONVERSION_DICT,
 )
 from megatron.core.export.trtllm.trt_model_config import TRT_MODEL_CONFIG
 from megatron.core.export.trtllm.trt_model_type import TRT_MODEL_TYPE_STRING
@@ -25,7 +23,17 @@ from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_mod
 from megatron.core.export.trtllm.trtllm_weights_converter.single_device_trtllm_model_weights_converter import (
     SingleDeviceTRTLLMModelWeightsConverter,
 )
+from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    import tensorrt_llm
+    from tensorrt_llm.functional import non_gated_version
+    from tensorrt_llm.layers import MoeConfig
+
+    HAVE_TRTLLM = True
+except ImportError:
+    HAVE_TRTLLM = False
 
 
 class TRTLLMHelper:
@@ -33,13 +41,15 @@ class TRTLLMHelper:
 
     def __init__(
         self,
+        *,
         transformer_config: TransformerConfig,
         model_type: ModelType,
         trtllm_conversion_dict: dict = {},
-        position_embedding_type: str = 'learned_absolute',
+        position_embedding_type: str = "learned_absolute",
         max_position_embeddings: int = None,
         rotary_percentage: int = 1.0,
         rotary_base: int = 10000,
+        rope_scaling_factor: float = 8.0,
         moe_tp_mode: int = 2,
         multi_query_mode: bool = False,
         activation: str = "gelu",
@@ -69,18 +79,26 @@ class TRTLLMHelper:
             share_embeddings_and_output_weights (bool, optional): True if input and output layers share weights. Defaults to False.
         """
 
+        if not HAVE_TRTLLM:
+            raise ImportError(
+                "tensorrt_llm is not installed. Please install it with `pip install tensorrt-llm`"
+            )
+
         self.transformer_config = transformer_config
         self.model_type = model_type
         self.trtllm_conversion_dict = DEFAULT_CONVERSION_DICT.copy()
+        if model_type == ModelType.nemotron_nas:
+            self.trtllm_conversion_dict.update(NEMOTRON_NAS_CONVERSION_DICT)
         self.trtllm_conversion_dict.update(trtllm_conversion_dict)
         assert position_embedding_type in [
-            'learned_absolute',
-            'rope',
+            "learned_absolute",
+            "rope",
         ], f"Position embedding type should be one of learned_absolute, rope. You entered {position_embedding_type}"
         self.position_embedding_type = position_embedding_type
         self.max_position_embeddings = max_position_embeddings
         self.rotary_percentage = rotary_percentage
         self.rotary_base = rotary_base
+        self.rope_scaling_factor = rope_scaling_factor
         self.moe_tp_mode = moe_tp_mode
         self.multi_query_mode = multi_query_mode
         self.activation = activation
@@ -121,50 +139,50 @@ class TRTLLMHelper:
         )
 
         config = {
-            'architecture': TRT_MODEL_TYPE_STRING[self.model_type],
-            'dtype': dtype.name,
-            'num_hidden_layers': self.transformer_config.num_layers,
-            'num_attention_heads': self.transformer_config.num_attention_heads,
-            'num_key_value_heads': (
+            "architecture": TRT_MODEL_TYPE_STRING[self.model_type],
+            "dtype": dtype.name,
+            "num_hidden_layers": self.transformer_config.num_layers,
+            "num_attention_heads": self.transformer_config.num_attention_heads,
+            "num_key_value_heads": (
                 self.transformer_config.num_query_groups
                 if self.transformer_config.num_query_groups
                 else self.transformer_config.num_attention_heads
             ),
-            'head_size': self.transformer_config.kv_channels,
-            'hidden_size': self.transformer_config.hidden_size,
-            'intermediate_size': self.transformer_config.ffn_hidden_size,
-            'norm_epsilon': self.transformer_config.layernorm_epsilon,
-            'vocab_size': vocab_size_padded,
-            'position_embedding_type': (
+            "head_size": self.transformer_config.kv_channels,
+            "hidden_size": self.transformer_config.hidden_size,
+            "intermediate_size": self.transformer_config.ffn_hidden_size,
+            "norm_epsilon": self.transformer_config.layernorm_epsilon,
+            "vocab_size": vocab_size_padded,
+            "position_embedding_type": (
                 "rope_gpt_neox" if self.position_embedding_type == "rope" else "learned_absolute"
             ),
-            'max_position_embeddings': self.max_position_embeddings,
-            'hidden_act': hidden_act,
-            'use_parallel_embedding': export_config.use_parallel_embedding,
-            'embedding_sharding_dim': 0,
-            'share_embedding_table': export_config.use_embedding_sharing,
-            'quantization': {
-                'quant_algo': "FP8" if fp8_quantized else None,
-                'kv_cache_quant_algo': "FP8" if fp8_kvcache else None,
+            "max_position_embeddings": self.max_position_embeddings,
+            "hidden_act": hidden_act,
+            "use_parallel_embedding": export_config.use_parallel_embedding,
+            "embedding_sharding_dim": 0,
+            "share_embedding_table": self.share_embeddings_and_output_weights,
+            "quantization": {
+                "quant_algo": "FP8" if fp8_quantized else None,
+                "kv_cache_quant_algo": "FP8" if fp8_kvcache else None,
             },
-            'bias': self.transformer_config.add_bias_linear,
-            'apply_query_key_layer_scaling': False,
-            'rotary_pct': self.rotary_percentage,
-            'rotary_base': self.rotary_base,
-            'moe_num_experts': (
+            "bias": self.transformer_config.add_bias_linear,
+            "apply_query_key_layer_scaling": False,
+            "rotary_pct": self.rotary_percentage,
+            "rotary_base": self.rotary_base,
+            "moe_num_experts": (
                 0
                 if self.transformer_config.moe_router_topk == 0
                 else (self.transformer_config.num_moe_experts or 1)
             ),
-            'moe_top_k': self.transformer_config.moe_router_topk,
-            'moe_normalization_mode': self.moe_renorm_mode
+            "moe_top_k": self.transformer_config.moe_router_topk,
+            "moe_normalization_mode": self.moe_renorm_mode
             or MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE,
-            'moe_tp_mode': self.moe_tp_mode,
-            'logits_dtype': 'float32',
-            'world_size': world_size,
-            'tp_size': export_config.inference_tp_size,
-            'pp_size': export_config.inference_pp_size,
-            'gpus_per_node': gpus_per_node,
+            "moe_tp_mode": self.moe_tp_mode,
+            "logits_dtype": "float32",
+            "world_size": world_size,
+            "tp_size": export_config.inference_tp_size,
+            "pp_size": export_config.inference_pp_size,
+            "gpus_per_node": gpus_per_node,
         }
 
         if self.model_type == ModelType.falcon:
@@ -179,6 +197,13 @@ class TRTLLMHelper:
                 "factor": float(self.seq_len_interpolation_factor),
             }
 
+        if self.model_type == ModelType.nemotron_nas:
+            hf_config_dict = json.loads(
+                self.transformer_config.heterogeneous_layers_config_encoded_json
+            )
+            config["block_configs"] = hf_config_dict["block_configs"]
+            config["rotary_scaling"] = {"type": "llama3", "factor": self.rope_scaling_factor}
+
         config_cls = TRT_MODEL_CONFIG[self.model_type]
         return config_cls(**config)
 
@@ -190,11 +215,11 @@ class TRTLLMHelper:
         Returns:
             dict: Maps scaling factor key, to its value and the inverse. The inverse is used for casting the quantized weights.
         """
-        weight_scaling_suffix = '.weights_scaling_factor'
-        activation_scaling_suffix = '.activation_scaling_factor'
+        weight_scaling_suffix = ".weights_scaling_factor"
+        activation_scaling_suffix = ".activation_scaling_factor"
         mock_scales_dict = {}
         extra_state_infix = "._extra_state"
-        mock_suffix = '.weight'
+        mock_suffix = ".weight"
 
         for key, val in model_state_dict.items():
             if extra_state_infix in key and not key.endswith("core_attention._extra_state"):
@@ -204,7 +229,7 @@ class TRTLLMHelper:
         mock_scales_dict = TRTLLMLayers.rename_input_layer_names_to_trtllm_layer_names(
             mock_scales_dict, self.trtllm_conversion_dict, False
         )
-        split_gated_activation = self.activation in ["swiglu", "geglu", "fast-swiglu", "fast-geglu"]
+        split_gated_activation = is_gated_activation(self)
 
         scales = {}
         for key, val in mock_scales_dict.items():
@@ -218,13 +243,13 @@ class TRTLLMHelper:
             weight_scaling_factor_key = key.replace(mock_suffix, weight_scaling_suffix)
 
             activation_scales = {
-                'trt_llm_scale': extra_states['scale_inv_fwd'][0].view(1),
-                'weight_multiplier': extra_states['scale_fwd'][0].view(1),
+                "trt_llm_scale": extra_states["scale_inv_fwd"][0].view(1),
+                "weight_multiplier": extra_states["scale_fwd"][0].view(1),
             }
 
             weight_scales = {
-                'trt_llm_scale': extra_states['scale_inv_fwd'][1].view(1),
-                'weight_multiplier': extra_states['scale_fwd'][1].view(1),
+                "trt_llm_scale": extra_states["scale_inv_fwd"][1].view(1),
+                "weight_multiplier": extra_states["scale_fwd"][1].view(1),
             }
 
             scales[activation_scaling_factor_key] = activation_scales
@@ -271,11 +296,16 @@ class TRTLLMHelper:
         assert model_state_dict is not None, "Model state dict is not set"
 
         scales = self._load_scaling_factors(model_state_dict) if fp8_quantized else {}
-        model_state_dict = {k: v for k, v in model_state_dict.items() if 'extra_state' not in k}
+        model_state_dict = {k: v for k, v in model_state_dict.items() if "extra_state" not in k}
 
         if on_device_distributed_conversion:
             assert vocab_size is not None, "Need to pass in vocab_size for on device"
-            supported_model = self.model_type in [ModelType.gpt, ModelType.gptnext, ModelType.llama]
+            supported_model = self.model_type in [
+                ModelType.gpt,
+                ModelType.gptnext,
+                ModelType.llama,
+                ModelType.nemotron_nas,
+            ]
             assert (
                 supported_model
             ), "On device conversion only supported for model types gptnext and llama"
@@ -301,9 +331,6 @@ class TRTLLMHelper:
             return [trtllm_model_weights_on_device], [trtllm_model_config]
 
         else:
-            assert not (
-                self.share_embeddings_and_output_weights and not export_config.use_embedding_sharing
-            ), "Found share_embeddings_and_output_weights is True in the model. So set export_config.use_embedding_sharing to True"
             assert (
                 vocab_size is None
             ), "Vocab size is inferred from the input layer for cpu conversion. So leave it as None"
@@ -337,12 +364,12 @@ class TRTLLMHelper:
             scales (dict): Dictionary holding TRT-LLM scaling factors
             fp8_kvcache (bool): If true, creates scaling factors (equal to 1.0) for kv_cache quantization
         """
-        trt_scales = {key: scale['trt_llm_scale'] for key, scale in scales.items()}
+        trt_scales = {key: scale["trt_llm_scale"] for key, scale in scales.items()}
         kv_scales = {}
         if fp8_kvcache:
             for key in converter.trtllm_model_weights:
-                if '.attention.qkv.weight' in key:
-                    kv_key = key.split('.qkv')[0] + '.kv_cache_scaling_factor'
+                if ".attention.qkv.weight" in key:
+                    kv_key = key.split(".qkv")[0] + ".kv_cache_scaling_factor"
                     kv_scales[kv_key] = torch.tensor([1.0], dtype=torch.float32)
 
         converter.trtllm_model_weights |= trt_scales | kv_scales
@@ -393,7 +420,6 @@ class TRTLLMHelper:
             inference_pp_size=self.weights_converter.inference_pp_size,
             inference_tp_size=self.weights_converter.inference_tp_size,
             use_parallel_embedding=True,
-            use_embedding_sharing=self.share_embeddings_and_output_weights,
         )
 
         world_size = export_config.inference_tp_size * export_config.inference_pp_size

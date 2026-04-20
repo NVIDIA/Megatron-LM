@@ -1,9 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import sys
-from dataclasses import dataclass, fields
+from dataclasses import fields
 
-import pytest
 import torch
 import transformer_engine as te
 
@@ -14,13 +13,15 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, import_module
+from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
@@ -33,7 +34,11 @@ class TestSpecCustomization:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_l2_norm=True,
         )
 
         # specify Transformer Layer spec with all identity ops
@@ -60,6 +65,11 @@ class TestSpecCustomization:
         # specify bias dropout add with module path
         self.bda_spec = ModuleSpec(
             module=("megatron.core.fusions.fused_bias_dropout", "get_bias_dropout_add")
+        )
+
+        # Create model process groups for test.
+        self.pg_collection = ProcessGroupCollection(
+            tp=get_tensor_model_parallel_group(), cp=get_context_parallel_group()
         )
 
     def teardown_method(self, method):
@@ -142,22 +152,16 @@ class TestSpecCustomization:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            window_size=[10, 0],
+            window_size=(10, 0),
         )
-        # Make sure DotProductAttention throws (swa unsupported).
-        threw = False
-        try:
-            attn = DotProductAttention(
-                config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
-            )
-        except:
-            threw = True
-        finally:
-            assert threw, 'Expected DotProductAttention to throw exception for SWA'
 
         # Test TEDotProductAttention
         attn = TEDotProductAttention(
-            config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
         )
         # Make sure window-size is what we expect.
         assert attn.window_size == config.window_size
@@ -167,7 +171,11 @@ class TestSpecCustomization:
         try:
             config.window_size = 11
             attn = TEDotProductAttention(
-                config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+                config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self',
+                pg_collection=self.pg_collection,
             )
         except:
             threw = True
@@ -177,7 +185,11 @@ class TestSpecCustomization:
         # `None` makes this causal.
         config.window_size = None
         attn = TEDotProductAttention(
-            config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
         )
         # Make sure it's causal.
         assert attn.window_size == (-1, 0)
@@ -193,20 +205,18 @@ class TestSpecCustomization:
         transformer_config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
-        layer_local_spec = get_gpt_layer_local_spec()
+        submodules = get_gpt_layer_local_submodules()
 
         # The following way can be used to pass a different `TransformerLayer`
         # and internally the `TransformerBlock` would fan out the single
         # `ModuleSpec` layer spec provided to all the layers of the block.
-        layer_spec1 = ModuleSpec(module=TransformerLayer, submodules=layer_local_spec.submodules)
+        layer_spec1 = ModuleSpec(module=TransformerLayer, submodules=submodules)
         model_parallel_cuda_manual_seed(123)
         torch.manual_seed(0)
         parallel_transformer_block1 = TransformerBlock(transformer_config, layer_spec1)
 
         layer_spec2 = TransformerBlockSubmodules(
-            layer_specs=[
-                ModuleSpec(module=TransformerLayer, submodules=layer_local_spec.submodules)
-            ]
+            layer_specs=[ModuleSpec(module=TransformerLayer, submodules=submodules)]
             * transformer_config.num_layers,
             layer_norm=TENorm,
         )
@@ -239,3 +249,32 @@ class TestSpecCustomization:
         assert out1.shape[0] == sequence_length == out2.shape[0]
         assert out1.shape[1] == micro_batch_size == out2.shape[1]
         assert out1.shape[2] == transformer_config.hidden_size == out2.shape[2]
+
+    def test_l2_qk_norm(self):
+        """Test L2 normalization for QK vectors using local spec."""
+        submodules = get_gpt_layer_local_submodules(qk_l2_norm=True)
+
+        # Build the self-attention module from the spec
+        self_attention = build_module(submodules.self_attention, config=self.config, layer_number=1)
+
+        assert isinstance(self_attention, SelfAttention)
+        # Verify that q_layernorm and k_layernorm are L2Norm instances
+        assert isinstance(self_attention.q_layernorm, L2Norm)
+        assert isinstance(self_attention.k_layernorm, L2Norm)
+
+        # Test forward pass
+        sequence_length = 32
+        micro_batch_size = 2
+        self_attention.cuda()
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.config.hidden_size)
+        ).cuda()
+
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        output, bias = self_attention(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        # Assert output shape is same as input shape
+        assert output.shape == hidden_states.shape

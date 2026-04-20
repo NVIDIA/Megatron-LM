@@ -4,7 +4,10 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.inference.communication_utils import (
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -33,26 +36,21 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         super().prep_model_for_inference()
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
+        # set ignore_virtual=True since vpp is not used in inference
         self.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+            is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
 
         self._recv_only_vision_embeds = False
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_rank = self.pp_group.rank()
         # Checks if the previous stage only has a vision encoder, and that the current stage
         # has part of the LM decoder. In this case, the current stage should only receive
         # vision embeddings.
         if pp_rank > 0:
-            self._recv_only_vision_embeds = (
-                parallel_state.is_inside_encoder(pp_rank - 1)
-                and (not parallel_state.is_inside_decoder(pp_rank - 1))
-                and parallel_state.is_inside_decoder()
-            )
+            self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
 
         # Checks if the current stage only has a vision encoder
-        self._encoder_only = (
-            parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
-        )
+        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
 
     def prep_inference_input(
         self,

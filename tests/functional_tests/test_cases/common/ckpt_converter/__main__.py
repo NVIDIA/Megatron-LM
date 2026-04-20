@@ -8,30 +8,27 @@ import time
 import types
 import typing as T
 from collections import namedtuple
-from copy import deepcopy
+from functools import partial
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
+from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, LLaVAModel
-from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args, get_tokenizer
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
 from megatron.training.global_vars import set_global_variables, unset_global_variables
 from megatron.training.training import get_model
-from pretrain_gpt import model_provider
+from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils
 
 CHECKPOINTS_DIR = "/tmp/ckpt-converter-tests"
@@ -92,7 +89,7 @@ class ModelMeta:
     """Basic information about a model.
 
     Args:
-        format (str): 'core', 'legacy', 'meta', 'hf', or 'llava'.
+        format (str): 'core', 'meta', 'hf', or 'llava'.
         mp (ModelParallelState): Defines TP, PP, EP.
         transformer_impl (str): 'transformer_engine' or 'local'.
     """
@@ -104,7 +101,7 @@ class ModelMeta:
         if transformer_impl is None:
             transformer_impl = "transformer_engine" if format in ("core", "llava") else "local"
 
-        assert format in ("core", "legacy", "meta", "hf", "llava")
+        assert format in ("core", "meta", "hf", "llava")
         assert isinstance(mp, ModelParallelState)
         assert transformer_impl in ("transformer_engine", "local")
 
@@ -206,10 +203,6 @@ class Pipeline:
         if key == "dst":
             sys.argv.append("--exit-on-missing-checkpoint")
 
-        # Use legacy.
-        if meta.format == "legacy":
-            sys.argv.append("--use-legacy-models")
-
         # Parse args.
         args = parse_args()
         validate_args(args)
@@ -229,8 +222,9 @@ class Pipeline:
 
     @staticmethod
     def build_model():
+        model_provider_func = partial(model_provider, gpt_builder)
         models = get_model(
-            model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder
+            model_provider_func=model_provider_func, model_type=ModelType.encoder_or_decoder
         )
         [m.eval() for m in models]
 
@@ -384,6 +378,10 @@ class Pipeline:
 
         meta = self.get_meta(key)
 
+        # The test is only designed to work with single model
+        assert len(models) == 1
+        model = models[0]
+
         with torch.no_grad():
 
             # Randomly initialize all params.
@@ -392,14 +390,11 @@ class Pipeline:
                     p.normal_(0, 0.1)
 
             # Synchronize embeddings.
-            if meta.mp.pp != 1 and parallel_state.is_rank_in_embedding_group():
-                if parallel_state.is_pipeline_first_stage():
-                    emb = models[0].module.module.shared_embedding_or_output_weight()
-                elif parallel_state.is_pipeline_last_stage():
-                    emb = models[-1].module.module.shared_embedding_or_output_weight()
-                else:
-                    raise Exception("should be either first/last pipeline rank.")
-                torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
+            if meta.mp.pp != 1:
+                emb = model.module.module.shared_embedding_or_output_weight()
+                # Make embedding the same on ranks that has is
+                if emb is not None:
+                    torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
 
     def save_checkpoint(self):
         """Initialize params, forward pass data, and save checkpoint."""
@@ -810,10 +805,6 @@ class LLaVAPipeline(Pipeline):
         if key == "dst":
             sys.argv.append("--exit-on-missing-checkpoint")
 
-        # Use legacy.
-        if meta.format == "legacy":
-            sys.argv.append("--use-legacy-models")
-
         # Parse args.
         from examples.multimodal.multimodal_args import add_multimodal_extra_args
 
@@ -842,11 +833,8 @@ def get_gpt_pipelines():
         GPTPipeline(("core", (2, 4)), ("core", (4, 2))),
         GPTPipeline(("core", (1, 8)), ("core", (8, 1))),
         GPTPipeline(("core", (4, 2)), ("core", (2, 4), "local")),
-        GPTPipeline(("legacy", (4, 2)), ("core", (2, 4))),
         GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4), "local")),
         GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4))),
-        # [todo] GPTPipeline(("legacy", (4, 2)), ("legacy", (2, 4))),
-        # [todo] GPTPipeline(("legacy", (4, 2), "te"), ("legacy", (2, 4), "te")),
         # [todo] GPTPipeline("meta", "core", None, (8, 1)),
         # [todo] GPTPipeline("hf", "core", None, (8, 1)),
     ]

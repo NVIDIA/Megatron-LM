@@ -31,16 +31,13 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
     """The BERT dataset that assumes WordPiece tokenization
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset
-
+        indexed_dataset (IndexedDataset): The IndexedDataset around which
+            to build the MegatronDataset
         dataset_path (str): The real path on disk to the dataset, for bookkeeping
-
         indexed_indices (numpy.ndarray): The set of the documents indices to expose
-
-        num_samples (Optional[int]): The number of samples to draw from the indexed dataset. When None, build as many samples as correspond to one epoch.
-
+        num_samples (Optional[int]): The number of samples to draw from the indexed dataset.
+            When None, build as many samples as correspond to one epoch.
         index_split (Split): The indexed_indices Split
-
         config (BERTMaskedWordPieceDatasetConfig): The config
     """
 
@@ -57,7 +54,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
 
-        self.token_lookup = list(self.config.tokenizer.inv_vocab.keys())
+        self.token_lookup = sorted(self.config.tokenizer.inv_vocab.keys())
         # Account for the single <cls> and two <sep> token ids
         self.sample_index = self._build_sample_index(
             self.config.sequence_length - 3, 2 if self.config.classification_head else 1
@@ -81,8 +78,9 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, Union[int, numpy.ndarray]]: The
+            Dict[str, Union[int, numpy.ndarray]]: The sample information wrapped in a dictionary
         """
+
         idx_beg, idx_end, target_sequence_length = self.sample_index[idx]
         sample = [self.dataset[i] for i in range(idx_beg, idx_end)]
         numpy_random_state = numpy.random.RandomState(seed=(self.config.random_seed + idx) % 2**32)
@@ -141,18 +139,14 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
         assert length_pads >= 0
 
         tokens = numpy.array(tokens, dtype=numpy.int64)
-        tokens = numpy.pad(tokens, (0, length_pads), constant_values=self.config.tokenizer.pad)
+        tokens = numpy.pad(tokens, (0, length_pads), constant_values=self._pad_token_id)
 
         assignments = numpy.array(assignments, dtype=numpy.int64)
-        assignments = numpy.pad(
-            assignments, (0, length_pads), constant_values=self.config.tokenizer.pad
-        )
+        assignments = numpy.pad(assignments, (0, length_pads), constant_values=self._pad_token_id)
 
         # Get the padding mask
-        mask_pads = numpy.ones(length_toks, dtype=numpy.int64)
-        mask_pads = numpy.pad(
-            mask_pads, (0, length_pads), constant_values=self.config.tokenizer.pad
-        )
+        mask_pads = numpy.ones(self.config.sequence_length, dtype=numpy.int64)
+        mask_pads[tokens == self._pad_token_id] = self._pad_token_id
 
         # Mask the labels
         labels = numpy.zeros(self.config.sequence_length, dtype=numpy.int64) - 1
@@ -161,6 +155,10 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
         # Get the loss mask
         mask_loss = numpy.zeros(self.config.sequence_length, dtype=numpy.int64)
         mask_loss[masked_positions] = 1
+
+        # For padded sequences, ensure the embedding layer can map the token ID
+        tokens[tokens == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = 0
 
         return {
             "text": tokens,

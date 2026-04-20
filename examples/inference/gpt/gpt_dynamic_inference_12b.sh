@@ -4,28 +4,37 @@
 
 set -u
 
+# Libraries.
 pip install simpy
 pip install sentencepiece
 pip install tiktoken
 
+# Environment variables.
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+# Checkpoint.
 : ${CHECKPOINT_DIR:?"CHECKPOINT_DIR is not set"}
 : ${TOKENIZER_MODEL:?"TOKENIZER_MODEL is not set"}
 
+# Prompts.
 : ${NUM_TOKENS_TO_PROMPT="8 32"}
 : ${NUM_TOKENS_TO_GENERATE=256}
 : ${INCOMING_REQUESTS_DURATION=10.}
 : ${INCOMING_REQUESTS_PER_SEC=100.}
 
-: ${INFERENCE_DYNAMIC_BATCHING_BUFFER_SIZE_GB=50.}
-: ${INFERENCE_DYNAMIC_BATCHING_BUFFER_OVERFLOW_FACTOR=1.}
-: ${INFERENCE_DYNAMIC_BATCHING_BUFFER_GUARANTEED_FRACTION=0.05}
+# Dynamic context.
+: ${BUFFER_SIZE_GB=50.}
 
+# Cuda graphs.
+: ${NUM_CUDA_GRAPHS=16}
+
+# Miscellaneous.
+: ${USE_COORDINATOR=0}
 : ${ENGINE=dynamic}
+: ${EXTRA_ARGS=""}
 # NSIGHT_PREFIX=/path/to/nsight/profile
 
-# --inference-rng-tracker \ # ... re-add after bugfix.
+# Arguments.
 ARGS=" \
     --no-persist-layer-norm \
     --apply-layernorm-1p \
@@ -60,19 +69,38 @@ ARGS=" \
     --tiktoken-pattern v2 \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --distributed-timeout-minutes 2400 \
-    --transformer-impl local \
     --use-flash-attn \
+    --inference-rng-tracker \
     \
     --inference-dynamic-batching \
-    --inference-dynamic-batching-buffer-size-gb ${INFERENCE_DYNAMIC_BATCHING_BUFFER_SIZE_GB} \
-    --inference-dynamic-batching-buffer-overflow-factor ${INFERENCE_DYNAMIC_BATCHING_BUFFER_OVERFLOW_FACTOR} \
-    --inference-dynamic-batching-buffer-guaranteed-fraction ${INFERENCE_DYNAMIC_BATCHING_BUFFER_GUARANTEED_FRACTION} \
+    --inference-dynamic-batching-buffer-size-gb ${BUFFER_SIZE_GB} \
     \
-    --enable-cuda-graph \
+    ${EXTRA_ARGS} \
 "
 
+# Cuda graphs.
+if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
+    ARGS+=" \
+        --cuda-graph-impl local \
+        --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
+    "
+else
+    ARGS+=" \
+        --cuda-graph-impl none \
+    "
+fi
+
+# Prompts.
 if [[ -v PROMPTS ]]; then
-    ARGS+=" --prompts ${PROMPTS}"
+    ARGS+=" \
+        --prompts ${PROMPTS} \
+        --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
+    "
+elif [[ -v PROMPT_FILE ]]; then
+    ARGS+=" \
+        --prompt-file ${PROMPT_FILE} \
+        --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
+    "
 else
     ARGS+=" \
         --num-tokens-to-prompt ${NUM_TOKENS_TO_PROMPT} \
@@ -82,9 +110,18 @@ else
     "
 fi
 
-CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"
-if [[ -v NSIGHT_PREFIX ]]; then
-    CMD="nsys profile -t cuda,nvtx,mpi -s none --wait=primary --show-output=true --force-overwrite=true --export=sqlite -o ${NSIGHT_PREFIX} ${CMD}"
+# Command.
+if [[ "${USE_COORDINATOR}" == "0" ]]; then
+    CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"
+else
+    CMD="python -um examples.inference.gpt.gpt_${ENGINE}_inference_with_coordinator ${ARGS}"
 fi
 
+if [[ -v NSIGHT_PREFIX ]]; then
+    CMD="nsys profile -s none -t nvtx,cuda --cudabacktrace=all --cuda-graph-trace=node --python-backtrace=cuda --wait all -o ${NSIGHT_PREFIX} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop ${CMD}"
+fi
+
+echo "~~~"
+echo "CMD ... ${CMD}."
+echo "~~~"
 eval ${CMD}

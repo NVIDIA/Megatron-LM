@@ -1,6 +1,8 @@
 .integration_tests_rules:
   stage: integration_tests
   rules:
+    - if: $BUILD == "no"
+      when: never
     - if: $INTEGRATION_TEST == "yes"
       when: on_success
     - when: never
@@ -41,14 +43,13 @@ integration:configure:
     - |
       A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
       H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+      GB200_CLUSTER=$([[ "$CLUSTER_GB200" != "" ]] && echo $CLUSTER_GB200 || echo $DEFAULT_GB200_CLUSTER)
     - |
       ARGS=(
         "--scope $INTEGRATION_TEST_SCOPE"
         "--n-repeat 1"
         "--time-limit $INTEGRATION_TEST_TIME_LIMIT"
         "--test-cases $INTEGRATION_TEST_CASES"
-        "--a100-cluster $A100_CLUSTER"
-        "--h100-cluster $H100_CLUSTER"
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
@@ -61,25 +62,69 @@ integration:configure:
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         ${ARGS[@]} \
         --environment dev \
-        --output-path "functional-test-job-dev.yaml"
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-dev-A100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment dev \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-dev-H100.yaml"
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         ${ARGS[@]} \
         --environment lts \
-        --output-path "functional-test-job-lts.yaml"
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-lts-A100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-lts-H100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_gb2100 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-test-job-lts-GB200.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_gb200 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-test-job-lts-GB200.yaml"
   artifacts:
     paths:
-      - functional-test-job-lts.yaml
-      - functional-test-job-dev.yaml
+      - functional-test-job-lts-A100.yaml
+      - functional-test-job-lts-H100.yaml
+      - functional-test-job-dev-H100.yaml
+      - functional-test-job-dev-A100.yaml
+      - functional-test-job-lts-GB200.yaml
+      - functional-test-job-dev-GB200.yaml
       - tests/test_utils/local_recipes
 
 .integration_run:
-  needs: [integration:configure]
+  needs:
+    - integration:configure
+    - test:build_image
+    - job: wait_for_resources
+      optional: true
   extends: [.integration_tests_rules]
   trigger:
     include:
-      - artifact: functional-test-job-$ENVIRONMENT.yaml
+      - artifact: functional-test-job-$ENVIRONMENT-$CLUSTER.yaml
         job: integration:configure
     strategy: depend
   variables:
@@ -88,15 +133,47 @@ integration:configure:
     CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
     GITLAB_ENDPOINT: $GITLAB_ENDPOINT
     PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+    DASHBOARD_ENDPOINT: $DASHBOARD_ENDPOINT
+    MCORE_MR_COMMIT: $MCORE_MR_COMMIT
+    MCORE_BACKWARDS_COMMIT: $MCORE_BACKWARDS_COMMIT
   inherit:
     variables: true
 
-integration:run_lts:
+integration:run_lts_dgx_a100:
   extends: [.integration_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
+    CLUSTER: A100
 
-integration:run_dev:
+integration:run_lts_dgx_h100:
+  extends: [.integration_run]
+  allow_failure: true
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: H100
+
+integration:run_lts_dgx_gb200:
+  extends: [.integration_run]
+  allow_failure: true
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: GB200
+
+integration:run_dev_dgx_a100:
   extends: [.integration_run]
   variables:
     ENVIRONMENT: dev
+    CLUSTER: A100
+
+integration:run_dev_dgx_h100:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: H100
+
+integration:run_dev_dgx_gb200:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: GB200
