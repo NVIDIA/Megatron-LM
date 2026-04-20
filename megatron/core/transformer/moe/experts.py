@@ -1117,7 +1117,6 @@ class TEGroupedMLP(MegatronModule):
             output_bias = None
             return output, output_bias
 
-
         # Apply padding if needed
         unpadded_tokens_per_expert = None
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
