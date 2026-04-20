@@ -6,7 +6,9 @@
 #   ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
 #
 # Environment variables:
-#   MODEL_VARIANT: proxy (default), 9b, 35b_a3b, 35b_a3b_light, 397b_a17b
+#   MODEL_VARIANT: proxy (default), 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
+#   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
+#   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
@@ -51,6 +53,36 @@ PP=${PP:-1}
 # multimodal_dev/models/qwen35_vl/configuration.py, but Megatron also
 # uses these CLI args internally (PP splits, param counting).
 case "$MODEL_VARIANT" in
+    0.8b)
+        NUM_LAYERS=${NUM_LAYERS:-24}
+        NUM_EXPERTS=${NUM_EXPERTS:-0}
+        HIDDEN_SIZE=1024
+        FFN_HIDDEN_SIZE=3584
+        NUM_ATTN_HEADS=8
+        NUM_QUERY_GROUPS=2
+        LINEAR_NUM_VALUE_HEADS=16
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-12}
+        ;;
+    2b)
+        NUM_LAYERS=${NUM_LAYERS:-24}
+        NUM_EXPERTS=${NUM_EXPERTS:-0}
+        HIDDEN_SIZE=2048
+        FFN_HIDDEN_SIZE=6144
+        NUM_ATTN_HEADS=8
+        NUM_QUERY_GROUPS=2
+        LINEAR_NUM_VALUE_HEADS=16
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-24}
+        ;;
+    4b)
+        NUM_LAYERS=${NUM_LAYERS:-32}
+        NUM_EXPERTS=${NUM_EXPERTS:-0}
+        HIDDEN_SIZE=2560
+        FFN_HIDDEN_SIZE=9216
+        NUM_ATTN_HEADS=16
+        NUM_QUERY_GROUPS=4
+        LINEAR_NUM_VALUE_HEADS=32
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-24}
+        ;;
     proxy)
         NUM_LAYERS=${NUM_LAYERS:-4}
         NUM_EXPERTS=${NUM_EXPERTS:-16}
@@ -69,6 +101,16 @@ case "$MODEL_VARIANT" in
         NUM_ATTN_HEADS=16
         NUM_QUERY_GROUPS=4
         LINEAR_NUM_VALUE_HEADS=32
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
+        ;;
+    27b)
+        NUM_LAYERS=${NUM_LAYERS:-64}
+        NUM_EXPERTS=${NUM_EXPERTS:-0}
+        HIDDEN_SIZE=5120
+        FFN_HIDDEN_SIZE=17408
+        NUM_ATTN_HEADS=24
+        NUM_QUERY_GROUPS=4
+        LINEAR_NUM_VALUE_HEADS=48
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
     35b_a3b)
@@ -90,6 +132,16 @@ case "$MODEL_VARIANT" in
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=32
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-7}
+        ;;
+    122b_a10b)
+        NUM_LAYERS=${NUM_LAYERS:-48}
+        NUM_EXPERTS=${NUM_EXPERTS:-256}
+        HIDDEN_SIZE=3072
+        FFN_HIDDEN_SIZE=8192
+        NUM_ATTN_HEADS=32
+        NUM_QUERY_GROUPS=2
+        LINEAR_NUM_VALUE_HEADS=64
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
     397b_a17b)
         NUM_LAYERS=${NUM_LAYERS:-60}
@@ -114,7 +166,7 @@ case "$MODEL_VARIANT" in
 esac
 SEQ_LEN=${SEQ_LEN:-4096}
 
-WANDB_PROJECT='multimodal-v2-qwen35-vl'
+WANDB_PROJECT=${WANDB_PROJECT:-'multimodal-v2-qwen35-vl'}
 EXP_NAME="qwen35vl_${MODEL_VARIANT}_tp${TP}_ep${EP}_pp${PP}"
 
 RECOMPUTE_VISION=${RECOMPUTE_VISION:-0}
@@ -161,7 +213,7 @@ MODEL_PARALLEL_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size "$MBS"
     --global-batch-size "$GBS"
-    --train-iters 100
+    --train-iters "${TRAIN_ITERS:-100}"
     --adam-beta1 0.9
     --adam-beta2 0.95
     --lr 1.2e-4
@@ -209,9 +261,10 @@ if [ "$PROFILE" = "1" ]; then
 fi
 
 # --- Logging & Checkpointing ---
+SAVE_INTERVAL=${SAVE_INTERVAL:-500}
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval 500
+    --save-interval "$SAVE_INTERVAL"
     --eval-interval 500
     --save "$CHECKPOINT_STORE_PATH"
     --eval-iters 10
@@ -223,9 +276,10 @@ EVAL_AND_LOGGING_ARGS=(
 )
 
 # --- Tokenizer ---
+TOKENIZER_MODEL=${TOKENIZER_MODEL:-Qwen/Qwen3.5-397B-A17B}
 TOKENIZER_ARGS=(
-    --tokenizer-type NullTokenizer
-    --vocab-size 248320
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model "$TOKENIZER_MODEL"
 )
 
 # --- Multimodal-specific ---
@@ -257,7 +311,6 @@ GPT_MODEL_ARGS=(
     --norm-epsilon 1e-06
     --swiglu
     --disable-bias-linear
-    --untie-embeddings-and-output-weights
     --position-embedding-type rope
     --rotary-percent 0.25
     --rotary-base 10000000
@@ -277,6 +330,13 @@ GPT_MODEL_ARGS=(
     --moe-router-force-load-balancing
 )
 
+# --- Tied / untied embeddings ---
+# 0.8B, 2B, 4B use tied embeddings; all other variants untie them.
+case "$MODEL_VARIANT" in
+    0.8b|2b|4b) ;;
+    *)           GPT_MODEL_ARGS+=( --untie-embeddings-and-output-weights ) ;;
+esac
+
 # --- MoE args (MoE variants only) ---
 MOE_ARGS=()
 case "$MODEL_VARIANT" in
@@ -286,13 +346,16 @@ case "$MODEL_VARIANT" in
     35b_a3b|35b_a3b_light)
         MOE_TOPK=8; MOE_FFN_HIDDEN=512;  MOE_SHARED_HIDDEN=512
         ;;
+    122b_a10b)
+        MOE_TOPK=8; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
+        ;;
     397b_a17b)
         MOE_TOPK=10; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
         ;;
-    9b)
+    0.8b|2b|4b|9b|27b)
         ;;
 esac
-if [ "$MODEL_VARIANT" != "9b" ]; then
+if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
     MOE_ARGS=(
         --num-experts "$NUM_EXPERTS"
         --moe-ffn-hidden-size "$MOE_FFN_HIDDEN"
@@ -308,8 +371,6 @@ if [ "$MODEL_VARIANT" != "9b" ]; then
 fi
 
 # --- Recompute ---
-RECOMPUTE=${RECOMPUTE:-0}
-RECOMPUTE_VISION=${RECOMPUTE_VISION:-0}
 if [ "$RECOMPUTE" -eq 1 ]; then
     RECOMPUTE_ARGS=(
         --recompute-granularity full
@@ -325,6 +386,25 @@ else
 fi
 if [ "$RECOMPUTE_VISION" -eq 1 ]; then
     RECOMPUTE_ARGS+=( --recompute-vision )
+fi
+
+# --- Checkpoint loading ---
+# CKPT_LOAD: path to checkpoint directory
+# CKPT_FORMAT: override checkpoint format (default: auto-detect)
+# CKPT_RESUME: set to 1 to resume training (keep iteration, optimizer, rng);
+#              default 0 = finetune mode (reset iteration, skip optim/rng)
+CKPT_LOAD=${CKPT_LOAD:-}
+CKPT_FORMAT=${CKPT_FORMAT:-}
+CKPT_RESUME=${CKPT_RESUME:-0}
+CKPT_ARGS=()
+if [ -n "$CKPT_LOAD" ]; then
+    CKPT_ARGS+=( --load "$CKPT_LOAD" )
+    if [ "$CKPT_RESUME" -eq 0 ]; then
+        CKPT_ARGS+=( --finetune --no-load-optim --no-load-rng )
+    fi
+    if [ -n "$CKPT_FORMAT" ]; then
+        CKPT_ARGS+=( --ckpt-format "$CKPT_FORMAT" )
+    fi
 fi
 
 # --- FSDP ---
@@ -352,7 +432,13 @@ echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=$PP  CP=1"
 echo "  MBS=$MBS  GBS=$GBS"
 echo "  Launcher:      $LAUNCHER"
+echo "  FSDP:          $USE_FSDP"
 echo "  PROFILE:       $PROFILE"
+if [ -n "$CKPT_LOAD" ]; then
+    echo "  CKPT_LOAD:     $CKPT_LOAD"
+    echo "  CKPT_FORMAT:   ${CKPT_FORMAT:-auto}"
+    echo "  CKPT_RESUME:   $CKPT_RESUME"
+fi
 if [ "$PROFILE" = "1" ]; then
     echo "  Profile steps: ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
     echo "  Profile ranks: $PROFILE_RANKS"
@@ -378,7 +464,8 @@ cmd=( "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}" \
     "${GPT_MODEL_ARGS[@]}" \
     "${MOE_ARGS[@]}" \
     "${RECOMPUTE_ARGS[@]}" \
-    "${FSDP_ARGS[@]}" )
+    "${FSDP_ARGS[@]}" \
+    "${CKPT_ARGS[@]}" )
 
 echo "${cmd[@]}"
 

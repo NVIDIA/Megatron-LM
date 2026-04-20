@@ -14,7 +14,7 @@ Registry entry fields
     Builds and returns the complete model instance.
 
 ``vision_config_fn``  *(required)*
-    ``(num_layers_override=None) -> TransformerConfig``
+    ``(num_layers_override=None, variant=None) -> TransformerConfig``
     Returns the vision encoder TransformerConfig.
 
 ``post_language_config_fn``  *(optional)*
