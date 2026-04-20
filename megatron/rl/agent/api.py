@@ -247,7 +247,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         @trace_async_exceptions(verbose=True)
         async def generate_task():
             nonlocal submitted_groups
-            while request.streaming or submitted_groups < self.parallel_generation_tasks:
+            while request.streaming or submitted_groups < request.num_groups:
                 await submission_gate.acquire()
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker

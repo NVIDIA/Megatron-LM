@@ -11,6 +11,7 @@ import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
+from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
 
@@ -279,18 +280,17 @@ def run_inference(
 def main():
     """Run dynamic inference."""
     # Initialize Megatron.
-    initialize_megatron(
+    args = parse_and_validate_args(
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    initialize_megatron()
 
     level_str = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_str, logging.INFO)
     logging.basicConfig(level=level, force=True)
 
     configure_nvtx_profiling(True)
-
-    args = get_args()
 
     # Build tokenizer
     tokenizer = build_tokenizer(args)
