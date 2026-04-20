@@ -2,8 +2,10 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
+# and https://github.com/vllm-project/vllm.
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
+
 
 import torch
 from packaging import version
@@ -375,6 +377,7 @@ def selective_state_update(
     )
 
     is_blackwell = torch.cuda.get_device_capability(x.device)[0] >= 10
+    
     
     # Default
     BLOCK_SIZE_M, num_warps = 4, 8
