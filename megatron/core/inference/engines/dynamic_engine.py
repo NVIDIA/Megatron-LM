@@ -420,12 +420,8 @@ class DynamicInferenceEngine(AbstractEngine):
                                 device=device,
                                 dtype=model_config.params_dtype,
                             ),
-                            next_token_ids=torch.empty(
-                                (1, n), device=device, dtype=torch.long,
-                            ),
-                            position_ids=torch.empty(
-                                (1, n), device=device, dtype=torch.int64,
-                            ),
+                            next_token_ids=torch.empty((1, n), device=device, dtype=torch.long),
+                            position_ids=torch.empty((1, n), device=device, dtype=torch.int64),
                             depth=0,
                         )
 
