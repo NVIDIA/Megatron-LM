@@ -634,3 +634,45 @@ class TestCapacityPricedRouter:
             expected = torch.tensor([0.6, 0.0, 0.2, 0.2], device="cuda")
             torch.testing.assert_close(self.router.expert_prices, expected)
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_applies_zloss_and_aux_loss(self):
+        self.router = self.router.cuda()
+        self.router.train()
+        self.router.config.moe_z_loss_coeff = 1.0
+        self.router.config.moe_aux_loss_coeff = 1.0
+        self.router.routing_type = "aux_loss"
+        self.router.config.moe_router_load_balancing_type = "aux_loss"
+
+        hidden_states = torch.randn(
+            (8, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        probs, _ = self.router(hidden_states)
+        self.router.zero_grad()
+        probs.sum().backward()
+
+        assert self.router.weight.grad is not None
+        assert self.router.weight.grad.abs().sum() > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_applies_capacity_dropping(self):
+        self.router = self.router.cuda()
+        self.router.train()
+        self.router.config.moe_aux_loss_coeff = 0.0
+        self.router.routing_type = "none"
+        self.router.config.moe_router_load_balancing_type = "none"
+        self.router.config.moe_expert_capacity_factor = 0.5
+        self.router.config.moe_pad_expert_input_to_capacity = True
+
+        hidden_states = torch.zeros(
+            (4, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        probs, routing_map = self.router(hidden_states)
+
+        assert probs.shape == (8, self.router.config.num_moe_experts)
+        assert routing_map.sum().item() == 4
+
+        # Restore default knobs for test isolation.
+        self.router.config.moe_expert_capacity_factor = None
+        self.router.config.moe_pad_expert_input_to_capacity = False
