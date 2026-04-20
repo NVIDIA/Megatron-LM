@@ -57,7 +57,10 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.parameterization import (
     ResolvedTrainingPolicy,
     build_legacy_mup_training_policy,
+    is_embedding_class_parameter,
     is_embedding_or_output_parameter,
+    is_hidden_matrix_parameter,
+    is_hidden_vector_parameter,
     is_muon_managed_matrix_parameter,
     is_vector_like_parameter,
 )
@@ -95,11 +98,16 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
-def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
+def get_standard_config_overrides(
+    config: OptimizerConfig, scaling_policy: Optional[ResolvedTrainingPolicy] = None
+) -> Dict[ParamKey, ParamGroupOverride]:
     """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
+        scaling_policy (Optional[ResolvedTrainingPolicy]): optional resolved scaling policy.
+            ``depth_mup`` uses the paper-backed Adam/AdamW weight-decay table and therefore
+            disables Megatron's default 1D/bias weight-decay skip.
 
     Returns:
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
@@ -108,20 +116,24 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     # First, figure out how we are going to do wd skipping. The two main approaches are:
     #  1. The classic megatron approach of skipping all len 1 and bias parameters.
     #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
-    if config.apply_wd_to_qk_layernorm:
-        shape_1_not_qkln_param = ParamWithNamePredicate(
-            name="s1_not_qkln",
-            fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
-            and not ("q_layernorm." in name or "k_layernorm." in name),
-        )
-        param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
-    else:
-        param_length_1_match = ParamPredicate(
-            name="param_len_1", fn=lambda param: len(param.shape) == 1
-        )
-        param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
+    disable_default_vector_like_wd_skip = bool(
+        scaling_policy and scaling_policy.context.is_depth_mup and scaling_policy.is_adam_optimizer
+    )
+    if not disable_default_vector_like_wd_skip:
+        if config.apply_wd_to_qk_layernorm:
+            shape_1_not_qkln_param = ParamWithNamePredicate(
+                name="s1_not_qkln",
+                fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
+                and not ("q_layernorm." in name or "k_layernorm." in name),
+            )
+            param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
+        else:
+            param_length_1_match = ParamPredicate(
+                name="param_len_1", fn=lambda param: len(param.shape) == 1
+            )
+            param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
-    config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
+        config_overrides[param_wd_mult_key] = ParamGroupOverride(wd_mult=0.0)
 
     if config.decoupled_lr is not None:
         decoupled_lr_config: ParamGroupOverride = {"max_lr": config.decoupled_lr}
@@ -153,31 +165,27 @@ def get_scaling_config_overrides(
     """Get resolved scaling-policy overrides for per-parameter optimizer settings.
 
     In v1, the named scaling recipes are ``mup`` and ``depth_mup``. ``mup`` preserves
-    current Megatron MuP behavior, while ``depth_mup`` adds the initial Adam/AdamW-scoped
-    dense GPT-style residual Transformer depth recipe candidate.
+    current Megatron MuP behavior. ``depth_mup`` now maps to the spectral width-depth
+    μP paper's AdamW-style dense GPT-style residual Transformer recipe within Megatron's
+    current support surface.
 
     Scaling optimizer rules (as implemented here):
-    ``depth_mup`` v1 uses only the Adam/AdamW path below; unsupported optimizers are
-    rejected by public validation or, for direct library callers, during training-policy
-    construction. The remaining entries describe the generic resolved scaling-policy
-    machinery that still backs ``mup`` and future recipes.
-
-    - Adam/AdamW:
-      - hidden (matrix-like) lr = base_lr / width_mult * depth_mult^hidden_lr_depth_power
-      - hidden (matrix-like) eps = base_eps / width_mult * depth_mult^hidden_eps_depth_power
+    - ``mup``:
+      - Adam/AdamW hidden (matrix-like) lr = base_lr / width_mult * depth_mult^hidden_lr_depth_power
+      - Adam/AdamW hidden (matrix-like) eps = base_eps / width_mult * depth_mult^hidden_eps_depth_power
       - vector-like params keep base lr and eps
-    - SGD:
-      - vector-like lr = base_lr * width_mult
-      - hidden (matrix-like) lr = base_lr * depth_mult^hidden_lr_depth_power
-      - no eps override is applied
-    - Non-Adam optimizers:
-      - hidden (matrix-like) lr = base_lr / width_mult * depth_mult^hidden_lr_depth_power
-      - no eps override is applied.
-      - for Muon optimizers, matrix-like params managed by Muon itself are
-        excluded from these Adam-style MuP overrides.
+      - SGD vector-like lr = base_lr * width_mult
+      - SGD hidden (matrix-like) lr = base_lr * depth_mult^hidden_lr_depth_power
+    - ``depth_mup`` (Adam/AdamW only):
+      - hidden matrix-like lr = base_lr / width_mult
+      - hidden matrix-like eps = base_eps / (width_mult * depth_mult)
+      - hidden matrix-like wd = base_wd * width_mult
+      - hidden-vector eps = base_eps / (width_mult * depth_mult)
+      - embedding/output-class eps = base_eps / width_mult
+      - embedding/output params keep base or decoupled LR
 
     With decoupled_lr enabled, embedding/output params continue using decoupled LR
-    and MuP will not override those explicit decoupled values.
+    and the active scaling recipe will not override those explicit LR values.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
@@ -197,7 +205,10 @@ def get_scaling_config_overrides(
             "override those parameters."
         )
         if scaling_policy.is_adam_optimizer:
-            message += " Adam epsilon scaling remains applied to hidden matrix-like parameters."
+            message += (
+                " Adam epsilon scaling remains applied according to the active recipe's "
+                "parameter-class rules."
+            )
         log_single_rank(logger, logging.WARNING, message)
 
     if scaling_policy.is_muon_optimizer:
@@ -215,30 +226,43 @@ def get_scaling_config_overrides(
     base_lr = config.lr
     base_min_lr = config.min_lr
     hidden_lr_mult = scaling_policy.hidden_lr_multiplier
-    vector_like_lr_mult = scaling_policy.vector_like_lr_multiplier
+    hidden_vector_lr_mult = scaling_policy.hidden_vector_lr_multiplier
     hidden_eps_mult = scaling_policy.hidden_eps_multiplier
+    hidden_vector_eps_mult = scaling_policy.hidden_vector_eps_multiplier
+    embedding_class_eps_mult = scaling_policy.embedding_class_eps_multiplier
+    hidden_matrix_wd_mult = scaling_policy.hidden_matrix_wd_multiplier
+    hidden_vector_wd_mult = scaling_policy.hidden_vector_wd_multiplier
+    embedding_class_wd_mult = scaling_policy.embedding_class_wd_multiplier
 
-    # Hidden matrix-like layers get scaled LR/eps; vector-like params keep base values.
-    def should_scale_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
+    # Hidden matrix-like layers get scaled LR/eps; vector-like params keep base values unless the
+    # active recipe says otherwise.
+    def should_scale_hidden_matrix(param: torch.nn.Parameter, param_name: str) -> bool:
         if decoupled_lr_enabled and is_embedding_or_output_parameter(param):
             return False
         if is_muon_managed_matrix_parameter(param, optimizer_type=scaling_policy.optimizer_type):
             return False
-        return not is_vector_like_parameter(param, param_name)
+        return is_hidden_matrix_parameter(param, param_name)
 
     def should_scale_vector_like_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
         if decoupled_lr_enabled and is_embedding_or_output_parameter(param):
             return False
         return is_vector_like_parameter(param, param_name)
 
-    def should_scale_eps_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
-        if is_vector_like_parameter(param, param_name):
+    def should_scale_hidden_vector(param: torch.nn.Parameter, param_name: str) -> bool:
+        if decoupled_lr_enabled and is_embedding_or_output_parameter(param):
             return False
+        return is_hidden_vector_parameter(param, param_name)
+
+    def should_scale_hidden_matrix_eps(param: torch.nn.Parameter, param_name: str) -> bool:
         if is_muon_managed_matrix_parameter(param, optimizer_type=scaling_policy.optimizer_type):
             return False
-        # MuP Appendix B.3: eps scales with fan_in when non-negligible.
-        # This implementation follows the common denominator form: sqrt(v) + eps.
-        return True
+        return is_hidden_matrix_parameter(param, param_name)
+
+    def should_scale_hidden_vector_eps(param: torch.nn.Parameter, param_name: str) -> bool:
+        return is_hidden_vector_parameter(param, param_name)
+
+    def should_scale_embedding_class_eps(param: torch.nn.Parameter, param_name: str) -> bool:
+        return is_embedding_class_parameter(param, param_name)
 
     scaling_overrides: Dict[ParamKey, ParamGroupOverride] = {}
 
@@ -250,15 +274,15 @@ def get_scaling_config_overrides(
             hidden_lr_override["min_lr"] = base_min_lr * hidden_lr_mult
         if hidden_lr_override:
             hidden_predicate = ParamWithNamePredicate(
-                name="scaling_hidden_only_excluding_embedding_output", fn=should_scale_lr_with_mup
+                name="scaling_hidden_only_excluding_embedding_output", fn=should_scale_hidden_matrix
             )
             scaling_overrides[ParamKey(with_name_predicate=hidden_predicate)] = hidden_lr_override
 
         vector_like_lr_override: ParamGroupOverride = {}
-        if base_lr is not None and vector_like_lr_mult != 1.0:
-            vector_like_lr_override["max_lr"] = base_lr * vector_like_lr_mult
-        if base_min_lr is not None and vector_like_lr_mult != 1.0:
-            vector_like_lr_override["min_lr"] = base_min_lr * vector_like_lr_mult
+        if base_lr is not None and hidden_vector_lr_mult != 1.0:
+            vector_like_lr_override["max_lr"] = base_lr * hidden_vector_lr_mult
+        if base_min_lr is not None and hidden_vector_lr_mult != 1.0:
+            vector_like_lr_override["min_lr"] = base_min_lr * hidden_vector_lr_mult
 
         if vector_like_lr_override:
             vector_like_predicate = ParamWithNamePredicate(
@@ -267,6 +291,52 @@ def get_scaling_config_overrides(
             )
             scaling_overrides[ParamKey(with_name_predicate=vector_like_predicate)] = (
                 vector_like_lr_override
+            )
+
+        return scaling_overrides
+
+    if scaling_policy.context.is_depth_mup and scaling_policy.is_adam_optimizer:
+        hidden_matrix_override: ParamGroupOverride = {}
+        if base_lr is not None and hidden_lr_mult != 1.0:
+            hidden_matrix_override["max_lr"] = base_lr * hidden_lr_mult
+        if base_min_lr is not None and hidden_lr_mult != 1.0:
+            hidden_matrix_override["min_lr"] = base_min_lr * hidden_lr_mult
+        if config.adam_eps is not None and hidden_eps_mult != 1.0:
+            hidden_matrix_override["eps"] = config.adam_eps * hidden_eps_mult
+        if hidden_matrix_wd_mult != 1.0:
+            hidden_matrix_override["wd_mult"] = hidden_matrix_wd_mult
+        if hidden_matrix_override:
+            hidden_matrix_predicate = ParamWithNamePredicate(
+                name="depth_mup_hidden_matrix_adamw", fn=should_scale_hidden_matrix_eps
+            )
+            scaling_overrides[ParamKey(with_name_predicate=hidden_matrix_predicate)] = (
+                hidden_matrix_override
+            )
+
+        hidden_vector_override: ParamGroupOverride = {}
+        if config.adam_eps is not None and hidden_vector_eps_mult != 1.0:
+            hidden_vector_override["eps"] = config.adam_eps * hidden_vector_eps_mult
+        if hidden_vector_wd_mult != 1.0:
+            hidden_vector_override["wd_mult"] = hidden_vector_wd_mult
+        if hidden_vector_override:
+            hidden_vector_predicate = ParamWithNamePredicate(
+                name="depth_mup_hidden_vector_adamw", fn=should_scale_hidden_vector_eps
+            )
+            scaling_overrides[ParamKey(with_name_predicate=hidden_vector_predicate)] = (
+                hidden_vector_override
+            )
+
+        embedding_class_override: ParamGroupOverride = {}
+        if config.adam_eps is not None and embedding_class_eps_mult != 1.0:
+            embedding_class_override["eps"] = config.adam_eps * embedding_class_eps_mult
+        if embedding_class_wd_mult != 1.0:
+            embedding_class_override["wd_mult"] = embedding_class_wd_mult
+        if embedding_class_override:
+            embedding_class_predicate = ParamWithNamePredicate(
+                name="depth_mup_embedding_output_adamw", fn=should_scale_embedding_class_eps
+            )
+            scaling_overrides[ParamKey(with_name_predicate=embedding_class_predicate)] = (
+                embedding_class_override
             )
 
         return scaling_overrides
@@ -284,13 +354,13 @@ def get_scaling_config_overrides(
     if decoupled_lr_enabled:
         if lr_override:
             hidden_predicate = ParamWithNamePredicate(
-                name="mup_hidden_only_excluding_embedding_output", fn=should_scale_lr_with_mup
+                name="mup_hidden_only_excluding_embedding_output", fn=should_scale_hidden_matrix
             )
             scaling_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
 
         if eps_override:
             hidden_output_predicate = ParamWithNamePredicate(
-                name="mup_hidden_only_for_adam_eps", fn=should_scale_eps_with_mup
+                name="mup_hidden_only_for_adam_eps", fn=should_scale_hidden_matrix_eps
             )
             scaling_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
     else:
@@ -299,19 +369,19 @@ def get_scaling_config_overrides(
             combined_override.update(lr_override)
             combined_override.update(eps_override)
             hidden_output_predicate = ParamWithNamePredicate(
-                name="mup_hidden_and_output", fn=should_scale_eps_with_mup
+                name="mup_hidden_and_output", fn=should_scale_hidden_matrix_eps
             )
             scaling_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = (
                 combined_override
             )
         elif lr_override:
             hidden_predicate = ParamWithNamePredicate(
-                name="scaling_hidden_and_output_lr", fn=should_scale_lr_with_mup
+                name="scaling_hidden_and_output_lr", fn=should_scale_hidden_matrix
             )
             scaling_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
         elif eps_override:
             hidden_output_predicate = ParamWithNamePredicate(
-                name="mup_hidden_and_output_eps", fn=should_scale_eps_with_mup
+                name="mup_hidden_and_output_eps", fn=should_scale_hidden_matrix_eps
             )
             scaling_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
 

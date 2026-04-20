@@ -15,12 +15,12 @@ The current named recipes are:
 
 - `none`: standard Megatron parameterization.
 - `mup`: current Megatron width MuP behavior.
-- `depth_mup`: an initial Adam/AdamW-scoped dense GPT-style residual
-  Transformer Depth-MuP recipe candidate.
+- `depth_mup`: a spectral width-depth μP Adam/AdamW recipe for dense GPT-style
+  residual Transformer blocks within Megatron's current support surface.
 
-`depth_mup` is still an experimental candidate rather than a broad public
-depth-transfer claim. The branch enforces a narrow scope and explicitly rejects
-unsupported paths instead of silently inheriting behavior.
+`depth_mup` remains a narrow public recipe rather than a broad public
+depth-transfer claim. Megatron enforces the intended surface and explicitly
+rejects unsupported paths instead of silently inheriting behavior.
 
 ## Legacy MuP Flags
 
@@ -62,14 +62,18 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 
 ## `depth_mup`
 
-`depth_mup` extends MuP-family width behavior with an explicit depth recipe for
-dense GPT-style residual Transformer blocks trained with Adam/AdamW.
+`depth_mup` extends MuP-family width behavior with the spectral width-depth μP
+paper's AdamW-style optimizer table adapted to Megatron's current dense
+GPT-style residual Transformer support surface.
 
 The resolved recipe defaults are:
 
 - residual branch multiplier: `depth_mult^-1`
-- hidden Adam/AdamW LR depth multiplier: `depth_mult^0`
-- hidden Adam/AdamW epsilon depth multiplier: `depth_mult^-1`
+- hidden matrix-like Adam/AdamW LR multiplier: `width_mult^-1`
+- hidden matrix-like Adam/AdamW epsilon multiplier: `(width_mult * depth_mult)^-1`
+- hidden vector Adam/AdamW epsilon multiplier: `(width_mult * depth_mult)^-1`
+- embedding/output-class Adam/AdamW epsilon multiplier: `width_mult^-1`
+- hidden matrix-like Adam/AdamW weight-decay multiplier: `width_mult`
 - dense block output-projection init compensation: `depth_mult^+0.5`
 
 The output-projection init compensation is important because Megatron already
@@ -92,7 +96,7 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
     --scaling-base-head-dim 128
 ```
 
-### Current `depth_mup` Candidate Scope
+### Current `depth_mup` Scope
 
 `depth_mup` v1 is currently intended for:
 
@@ -138,7 +142,9 @@ These recipes do not currently claim:
 - HyperP
 - CompleteP
 - MuonH / AdamH
+- the full Muon-Kimi spectral width-depth training setup
 - token-count LR scaling
+- SqrtGate
 - MoE granularity transfer
 - public SGD depth transfer
 - public Muon depth transfer

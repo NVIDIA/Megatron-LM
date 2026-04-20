@@ -14,6 +14,7 @@ ROLE_OUTPUT = 'output'
 ROLE_SHARED_EMBEDDING_OUTPUT = 'shared_embedding_output'
 ROLE_BLOCK_OUT_PROJ = 'block_out_proj'
 ROLE_HIDDEN_MATRIX = 'hidden_matrix'
+ROLE_HIDDEN_VECTOR = 'hidden_vector'
 ROLE_VECTOR_LIKE = 'vector_like'
 ROLE_MUON_MANAGED_MATRIX = 'muon_managed_matrix'
 
@@ -63,6 +64,24 @@ def is_vector_like_parameter(param: Any, param_name: Optional[str] = None) -> bo
     if is_embedding_class_parameter(param, param_name):
         return True
     return param.dim() <= 1
+
+
+def is_hidden_vector_parameter(param: Any, param_name: Optional[str] = None) -> bool:
+    role = get_parameterization_role(param)
+    if role == ROLE_HIDDEN_VECTOR:
+        return True
+    if role in _EMBEDDING_CLASS_ROLES:
+        return False
+    return param.dim() <= 1 and not is_embedding_class_parameter(param, param_name)
+
+
+def is_hidden_matrix_parameter(param: Any, param_name: Optional[str] = None) -> bool:
+    role = get_parameterization_role(param)
+    if role == ROLE_HIDDEN_MATRIX:
+        return True
+    if role == ROLE_HIDDEN_VECTOR or role in _EMBEDDING_CLASS_ROLES:
+        return False
+    return param.dim() > 1 and not is_embedding_class_parameter(param, param_name)
 
 
 def is_muon_managed_matrix_parameter(param: Any, *, optimizer_type: str) -> bool:

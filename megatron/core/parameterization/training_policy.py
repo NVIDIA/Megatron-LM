@@ -64,7 +64,7 @@ class ResolvedTrainingPolicy:
         )
 
     @property
-    def vector_like_lr_multiplier(self) -> float:
+    def hidden_vector_lr_multiplier(self) -> float:
         if not (self.enabled and self.uses_width_mup and self.is_sgd_optimizer):
             return 1.0
         return self.context.width_mult
@@ -82,6 +82,41 @@ class ResolvedTrainingPolicy:
         return (1.0 / self.context.width_mult) * (
             self.context.depth_mult**self.hidden_eps_depth_power
         )
+
+    @property
+    def hidden_vector_eps_multiplier(self) -> float:
+        if not (self.enabled and self.uses_width_mup and self.is_adam_optimizer):
+            return 1.0
+        if not self.context.is_depth_mup:
+            return 1.0
+        return self.hidden_eps_multiplier
+
+    @property
+    def embedding_class_eps_multiplier(self) -> float:
+        if not (self.enabled and self.uses_width_mup and self.is_adam_optimizer):
+            return 1.0
+        if not self.context.is_depth_mup:
+            return 1.0
+        return 1.0 / self.context.width_mult
+
+    @property
+    def hidden_matrix_wd_multiplier(self) -> float:
+        if not (self.enabled and self.context.is_depth_mup and self.is_adam_optimizer):
+            return 1.0
+        return self.context.width_mult
+
+    @property
+    def hidden_vector_wd_multiplier(self) -> float:
+        return 1.0
+
+    @property
+    def embedding_class_wd_multiplier(self) -> float:
+        return 1.0
+
+    @property
+    def vector_like_lr_multiplier(self) -> float:
+        # Backward-compatible alias for the old generic vector-like MuP path.
+        return self.hidden_vector_lr_multiplier
 
 
 def build_resolved_training_policy(config, optimizer_type: str = 'adam') -> ResolvedTrainingPolicy:
