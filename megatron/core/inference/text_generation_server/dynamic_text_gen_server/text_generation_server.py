@@ -2,214 +2,283 @@
 
 import asyncio
 import logging
-import multiprocessing as mp
-import socket
-from contextlib import contextmanager
-from typing import List, Optional
+import time
+import uuid
 
-try:
-    from hypercorn.asyncio import serve
-    from hypercorn.config import Config
-    from quart import Quart
-
-    HAS_BACKEND = True
-except ImportError as e:
-    HAS_BACKEND = False
-
-import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
-from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.utils import trace_async_exceptions
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.sampling_params import SamplingParams
 
 logger = logging.getLogger(__name__)
 
-# Global reference to manage the background server processes
-_SERVER_PROCESSES: List[mp.Process] = []
-_SHARED_SOCKET = None
 
+try:
+    from quart import Blueprint, current_app, jsonify, request
 
-@contextmanager
-def temp_log_level(level, logger=None):
-    """Enables temporarily overriding the logging level."""
-    logger = logger or logging.getLogger()
-    old_level = logger.level
-    logger.setLevel(level)
-    try:
-        yield
-    finally:
-        logger.setLevel(old_level)
+    bp = Blueprint('completions_api', __name__)
 
+    @bp.route('/completions', methods=['POST'])
+    @bp.route('/v1/completions', methods=['POST'])
+    async def completions():
+        """Handles async POST requests for completions."""
+        client = current_app.config['client']
+        tokenizer = current_app.config['tokenizer']
 
-@trace_async_exceptions
-async def _run_text_gen_server(
-    coordinator_addr: str,
-    tokenizer,
-    rank: int,
-    server_port: int,
-    parsers: Optional[List[str]] = None,
-    verbose: bool = False,
-    fd: Optional[int] = None,
-    hostname: Optional[str] = None,
-):
-    """
-    Initializes and runs the async web server. Automatically starts and
-    manages its own InferenceClient connected to the provided coordinator address.
-    """
-    if not HAS_BACKEND:
-        raise RuntimeError(f"Web backend framework (Quart) not available")
+        req = await request.get_json(force=True)
+        if req is None:
+            return "Invalid or missing JSON body", 400
 
-    # Create and start the client locally inside this process
-    inference_client = InferenceClient(coordinator_addr, deserialize=False)
-    inference_client.start()
-    logger.info(f"Rank {rank}: InferenceClient connected.")
+        # --- 1. Parse Prompt ---
+        prompt_data = req.get("prompt")
+        if not prompt_data:
+            return "Missing 'prompt' field", 400
 
-    try:
-        if hostname is None:
-            try:
-                hostname = socket.gethostname()
-            except Exception as e:
-                logger.warning(f"Could not get hostname: {e}")
-                hostname = "0.0.0.0"
-
-        app = Quart(__name__)
-
-        # Quart native way to handle max body size (1 GB; needed for large prompts)
-        app.config['MAX_CONTENT_LENGTH'] = 2**30
-
-        # Store client and tokenizer in app config for Blueprints to use
-        app.config['client'] = inference_client
-        app.config['tokenizer'] = tokenizer
-        app.config['parsers'] = parsers
-        app.config['verbose'] = verbose
-
-        # Register all blueprints from the 'endpoints' package
-        for endpoint in endpoints.__all__:
-            app.register_blueprint(endpoint)
-
-        config = Config()
-        config.keep_alive_timeout = 30.0  # Keep connection alive between long-running requests.
-        config.backlog = 2**14  # Expect high load; ensure we do not drop connections.
-        config.h2_max_concurrent_streams = (
-            2**14
-        )  # Allow many concurrent streams for HTTP/2 clients.
-
-        if fd is not None:
-            config.bind = [f"fd://{fd}"]
-        else:
-            config.bind = [f"{hostname}:{server_port}"]
-
-        with temp_log_level(logging.INFO, logger):
-            logger.info(f"Starting text generation server on http://{hostname}:{server_port}")
-            logger.info(f"Using tokenizer: {type(tokenizer)}")
-            logger.info(f"Using parsers: {parsers}")
-
-        # Quart is natively ASGI, so we can serve the app directly
-        await serve(app, config)
-
-    finally:
-        # Gracefully shut down the client when the server stops
-        inference_client.stop()
-        logger.info(f"Rank {rank}: Web server and client shut down.")
-
-
-def _server_process_worker(
-    coordinator_addr: str,
-    tokenizer,
-    rank: int,
-    server_port: int,
-    parsers: Optional[List[str]] = None,
-    verbose: bool = False,
-    fd: Optional[int] = None,
-    hostname: Optional[str] = None,
-):
-    """Synchronous worker function that sets up a new event loop for the separate process."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(
-            _run_text_gen_server(
-                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname
-            )
-        )
-    except KeyboardInterrupt:
-        logger.info(f"Rank {rank}: text gen server process interrupted.")
-    finally:
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        loop.close()
-
-
-def start_text_gen_server(
-    coordinator_addr: str,
-    tokenizer,
-    rank: int,
-    server_port: int,
-    parsers: Optional[List[str]] = None,
-    verbose: bool = False,
-    num_replicas: int = 4,
-    hostname: Optional[str] = None,
-):
-    """Start the text generation server."""
-    global _SERVER_PROCESSES
-    global _SHARED_SOCKET
-
-    if _SERVER_PROCESSES:
-        logger.warning("Text gen server processes are already running.")
-        return
-
-    _SHARED_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    if hasattr(socket, 'SO_REUSEPORT'):
         try:
-            _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except OSError:
-            pass
+            if isinstance(prompt_data, str):
+                prompts_as_tokens = [tokenizer.tokenize(prompt_data)]
+                prompts_as_strings = [prompt_data]
+            elif isinstance(prompt_data, list):
+                if not prompt_data:
+                    return "'prompt' list is empty", 400
+                if all(isinstance(p, str) for p in prompt_data):
+                    prompts_as_tokens = [tokenizer.tokenize(p) for p in prompt_data]
+                    prompts_as_strings = prompt_data
+                elif all(isinstance(p, int) for p in prompt_data):
+                    prompts_as_tokens = [prompt_data]
+                    prompts_as_strings = [tokenizer.detokenize(prompt_data)]
+                elif all(
+                    isinstance(p, list) and all(isinstance(t, int) for t in p) for p in prompt_data
+                ):
+                    prompts_as_tokens = prompt_data
+                    prompts_as_strings = [tokenizer.detokenize(p) for p in prompt_data]
+                else:
+                    return (
+                        (
+                            "Invalid 'prompt' format. Must be str, list[str], "
+                            "list[int], or list[list[int]]"
+                        ),
+                        400,
+                    )
+            else:
+                return "Invalid 'prompt' type. Must be str or list", 400
+        except Exception as e:
+            return f"Error tokenizing prompt: {e}", 500
 
-    bind_address = hostname if hostname is not None else "0.0.0.0"
-    _SHARED_SOCKET.bind((bind_address, server_port))
-    _SHARED_SOCKET.setblocking(False)
+        # --- 2. Parse Sampling Params ---
+        try:
+            temperature = float(req.get("temperature", 1.0))
+            top_p = float(req.get("top_p", 1.0))
+            top_k = int(req.get("top_k", 0))
+            echo = bool(req.get("echo", False))
 
-    _SHARED_SOCKET.set_inheritable(True)
-    fd = _SHARED_SOCKET.fileno()
+            if temperature == 0.0:
+                top_k = 1
+                top_p = 0.0
 
-    for i in range(num_replicas):
-        p = mp.Process(
-            target=_server_process_worker,
-            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname),
-            daemon=True,
-        )
-        p.start()
-        _SERVER_PROCESSES.append(p)
-        logger.info(f"Started text gen frontend replica {i+1}/{num_replicas} (PID: {p.pid})")
+            # Parse logprobs - can be an integer (number of top logprobs to return) or None
+            logprobs_param = req.get("logprobs", None)
 
+            if logprobs_param is not None:
+                top_n_logprobs = int(logprobs_param)
+                return_log_probs = True
+            else:
+                top_n_logprobs = 0
+                return_log_probs = False
 
-def stop_text_gen_server():
-    """Stop the text generation server."""
-    global _SERVER_PROCESSES
-    global _SHARED_SOCKET
+            # When echo=True and logprobs are requested, we need prompt logprobs
+            # skip_prompt_log_probs=False ensures the engine computes logprobs for prompt tokens
+            skip_prompt_log_probs = not (echo and return_log_probs)
 
-    if not _SERVER_PROCESSES:
-        return
+            # Parse stop sequences
+            stop = req.get("stop", None)
+            if isinstance(stop, str):
+                stop = [stop]
 
-    logger.info(f"Terminating {len(_SERVER_PROCESSES)} Text Gen frontend processes...")
+            ignore_eos = bool(req.get("ignore_eos", False))
 
-    for p in _SERVER_PROCESSES:
-        if p.is_alive():
-            p.terminate()
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                return_log_probs=return_log_probs,
+                top_n_logprobs=top_n_logprobs,
+                skip_prompt_log_probs=skip_prompt_log_probs,
+                num_tokens_to_generate=int(req.get("max_tokens", 16)),
+                stop_words=stop,
+                termination_id=-1 if ignore_eos else None,
+            )
+        except ValueError as e:
+            return f"Invalid sampling parameter: {e}", 400
 
-    for p in _SERVER_PROCESSES:
-        p.join(timeout=3)
-        if p.is_alive():
-            p.kill()
-            p.join()
+        # --- 3. Send Requests to Engine ---
+        tasks = []
+        for prompt_tokens in prompts_as_tokens:
+            per_req_params = SamplingParams(
+                temperature=sampling_params.temperature,
+                top_k=sampling_params.top_k,
+                top_p=sampling_params.top_p,
+                return_log_probs=sampling_params.return_log_probs,
+                top_n_logprobs=sampling_params.top_n_logprobs,
+                skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
+                num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                stop_words=sampling_params.stop_words,
+                termination_id=sampling_params.termination_id,
+            )
+            tasks.append(client.add_request(prompt_tokens, per_req_params))
 
-    # Clean up the master socket
-    if _SHARED_SOCKET is not None:
-        _SHARED_SOCKET.close()
-        _SHARED_SOCKET = None
+        if current_app.config['verbose']:
+            start_time = time.perf_counter()
 
-    _SERVER_PROCESSES = []
-    logger.info("All text gen frontend processes terminated.")
+        try:
+            batch_results = await asyncio.gather(*tasks)
+        except Exception as e:
+            return f"Error during inference: {e}", 500
+
+        if current_app.config['verbose']:
+            logging.info(
+                f"Batch of {len(tasks)} requests processed in "
+                f"{time.perf_counter() - start_time:.2f}s"
+            )
+
+        # --- 4. Check for failed requests ---
+        failed_errors = []
+        has_nontransient_error = False
+        for i, record in enumerate(batch_results):
+            if record.get("status") == "FAILED":
+                events = record.get("events", [])
+                error_events = [
+                    e for e in events if e.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+                ]
+                if any(e.get("type") == "ERROR_NONTRANSIENT" for e in error_events):
+                    has_nontransient_error = True
+                error_msg = (
+                    str(error_events[-1].get("payload", "Unknown error"))
+                    if error_events
+                    else "Unknown error"
+                )
+                failed_errors.append(f"Request {i}: {error_msg}")
+
+        if failed_errors:
+            error_detail = "; ".join(failed_errors)
+            status = 400 if has_nontransient_error else 500
+            logger.error(f"Inference request(s) failed: {error_detail}")
+            return f"Inference request(s) failed: {error_detail}", status
+
+        # --- 5. Format Response (matching old_completions.py) ---
+        choices = []
+        total_completion_tokens = 0
+        prompt_tokens_counts = []
+
+        request_idx = 0
+        for completed_request in batch_results:
+            result = unwrap_serialized_tensors(completed_request)
+            full_text = result["generated_text"] or ""
+            text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
+
+            generated_tokens = result.get("generated_tokens") or []
+            prompt_tokens_list = result.get("prompt_tokens") or []
+            total_completion_tokens += len(generated_tokens)
+            prompt_tokens_counts.append(len(prompt_tokens_list))
+
+            finish_reason = "length"
+            sampling_params_result = result.get("sampling_params") or {}
+            num_tokens_requested = sampling_params_result.get("num_tokens_to_generate")
+            if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
+                finish_reason = "stop"
+
+            logprobs_data = None
+            if sampling_params.return_log_probs:
+                # Get prompt tokens and logprobs
+                prompt_tokens_list = result["prompt_tokens"] or []
+
+                prompt_log_probs = result.get('prompt_log_probs') or []
+                prompt_top_n_logprobs = result.get('prompt_top_n_logprobs') or []
+
+                # Get generated tokens and logprobs
+                generated_tokens_list = result["generated_tokens"] or []
+                generated_log_probs = result.get('generated_log_probs') or []
+                generated_top_n_logprobs = result.get('generated_top_n_logprobs') or []
+
+                if echo:
+                    # When echo=True, include prompt tokens and their logprobs
+                    # Prompt logprobs are for tokens [1:] (first token has no logprob)
+                    all_token_ids = prompt_tokens_list + generated_tokens_list
+                    tokens = [tokenizer.detokenize([tok]) for tok in all_token_ids]
+
+                    # Build token_logprobs: [None] for first token, then prompt logprobs,
+                    # then generated logprobs
+                    token_logprobs = [None] + list(prompt_log_probs) + list(generated_log_probs)
+
+                    # Build top_logprobs: [None] for first token, then prompt top_n,
+                    # then generated top_n
+                    top_logprobs = None
+                    if prompt_top_n_logprobs or generated_top_n_logprobs:
+                        top_logprobs = (
+                            [None] + list(prompt_top_n_logprobs) + list(generated_top_n_logprobs)
+                        )
+
+                    # Calculate text_offset: cumulative character positions starting from 0
+                    text_offset = []
+                    current_offset = 0
+                    for tok_str in tokens:
+                        text_offset.append(current_offset)
+                        current_offset += len(tok_str)
+                else:
+                    # When echo=False, only return generated tokens and their logprobs
+                    tokens = [tokenizer.detokenize([tok]) for tok in generated_tokens_list]
+
+                    # Prepend [None] to match OpenAI format
+                    token_logprobs = [None] + list(generated_log_probs)
+
+                    # Build top_logprobs
+                    top_logprobs = None
+                    if generated_top_n_logprobs:
+                        top_logprobs = [None] + list(generated_top_n_logprobs)
+
+                    # Calculate text_offset for generated tokens only
+                    text_offset = []
+                    current_offset = 0
+                    for tok_str in tokens:
+                        text_offset.append(current_offset)
+                        current_offset += len(tok_str)
+
+                logprobs_data = {
+                    "token_logprobs": token_logprobs,
+                    "tokens": tokens,
+                    "text_offset": text_offset,
+                    "top_logprobs": top_logprobs,
+                }
+
+            choices.append({
+                "index": request_idx,
+                "text": text_output,
+                "logprobs": logprobs_data,
+                "finish_reason": finish_reason,
+            })
+            if result["routing_indices"] is not None:
+                choices[-1]["moe_topk_indices"] = result["routing_indices"]
+                prompt_length = (
+                    len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
+                )
+                if prompt_length:
+                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                        :prompt_length
+                    ]
+
+            request_idx += 1
+
+        prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        return jsonify({
+            "id": str(uuid.uuid4()),
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": "EMPTY",
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": prompt_token_count,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": prompt_token_count + total_completion_tokens,
+            },
+        })
+
+except ImportError as e:
+    logger.warning(f"Could not import quart: {e}")
