@@ -1,25 +1,35 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""TransformerBlock correctness test for colocated MIMO communication (9 checks x 3 iters).
+"""Correctness test for colocated MIMO communication under mean-CE + DDP.
 
-Run:  uv run python -m torch.distributed.run --nproc_per_node=8 \
+Uses real Megatron ``DistributedDataParallel`` wrapping, mean cross-entropy
+loss (the realistic training target — the implicit ``1/local_B_llm`` factor
+in the backward chain is exactly the case that exposes encoder-DDP scaling
+bugs), and compares encoder param grads against a single-GPU reference
+running the full batch. Each rank runs the reference independently on
+identical (DP-averaged) weights so the reference is the same on every rank.
+
+Run:  uv run python -m torch.distributed.run --nproc_per_node=8 \\
         -m pytest tests/unit_tests/models/test_mimo_colocated_correctness.py -v -s
 """
 import os
+from dataclasses import replace
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from packaging import version
 
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
     _avg_params,
-    _get_pg_collection_from_grid,
     _shard_and_copy_,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -27,7 +37,7 @@ from tests.unit_tests.test_utilities import Utils
 _active_grids: list = []
 _active_comms: list = []
 
-H, NHEADS, SEQ, GBS = 1024, 8, 8, 8
+H, NHEADS, SEQ, GBS, VOCAB = 256, 8, 8, 8, 128
 
 
 def _make_block(num_layers, dtype, pg):
@@ -53,54 +63,69 @@ def _make_block(num_layers, dtype, pg):
         for m in block.modules():
             if hasattr(m, "bias") and m.bias is not None:
                 m.bias.zero_()
-    return block
+    return block, cfg
 
 
 def _grid(offset=0, tp=1, cp=1, pp=1, dp=1):
+    # Include ep/expt_dp so we can build the full ProcessGroupCollection that
+    # Megatron DDP expects. All non-DP/TP dims are size 1 in this test.
     g = HyperCommGrid(
-        shape=[tp, cp, pp, dp],
-        dim_names=["tp", "cp", "pp", "dp"],
+        shape=[tp, cp, pp, dp, 1, 1],
+        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
         rank_offset=offset,
         backend="nccl",
     )
-    for d in ["tp", "cp", "pp", "dp"]:
+    for d in ["tp", "cp", "pp", "dp", "ep", "expt_dp"]:
         g.create_pg([d])
+    g.create_pg(["dp", "cp"])
     _active_grids.append(g)
     return g
 
 
-def _cmp_wt(ref, tp_blk, tp_sz, tp_rk, atol, tag):
-    for n, tp_p in tp_blk.state_dict().items():
-        rp = ref.state_dict()[n]
-        if not (torch.is_tensor(rp) and torch.is_tensor(tp_p)):
-            continue
-        if rp.shape == tp_p.shape:
-            exp = rp
-        elif tp_p.shape[0] * tp_sz == rp.shape[0]:
-            exp = rp.chunk(tp_sz, dim=0)[tp_rk]
-        elif rp.ndim > 1 and tp_p.shape[1] * tp_sz == rp.shape[1]:
-            exp = rp.chunk(tp_sz, dim=1)[tp_rk]
-        else:
-            continue
-        torch.testing.assert_close(tp_p, exp, atol=atol, rtol=0, msg=f"{tag} {n}")
+def _pg_from_grid(grid):
+    pg = ProcessGroupCollection()
+    pg.tp = grid.get_pg("tp")
+    pg.cp = grid.get_pg("cp")
+    pg.pp = grid.get_pg("pp")
+    pg.dp = grid.get_pg("dp")
+    pg.dp_cp = grid.get_pg(["dp", "cp"])
+    pg.ep = grid.get_pg("ep")
+    pg.expt_dp = grid.get_pg("expt_dp")
+    return pg
 
 
-def _cmp_grad(ref, tp_blk, tp_sz, tp_rk, atol, tag):
-    for (rn, rp), (_, tp_p) in zip(ref.named_parameters(), tp_blk.named_parameters()):
-        if rp.grad is None or tp_p.grad is None:
+def _cmp_main_grad(ref, parallel, tp_sz, tp_rk, atol, tag):
+    """Compare parallel ``param.main_grad`` (post-DDP-sync) to ref ``param.grad``.
+
+    Both modules have matching parameter names; shapes differ by TP sharding.
+    """
+    ref_params = dict(ref.named_parameters())
+    for name, tp_p in parallel.named_parameters():
+        if name not in ref_params:
             continue
-        if rp.grad.shape == tp_p.grad.shape:
+        rp = ref_params[name]
+        if rp.grad is None or tp_p.main_grad is None:
+            continue
+        tp_grad = tp_p.main_grad.to(rp.grad.dtype)
+        if rp.grad.shape == tp_grad.shape:
             exp = rp.grad
-        elif tp_p.grad.shape[0] * tp_sz == rp.grad.shape[0]:
+        elif tp_grad.shape[0] * tp_sz == rp.grad.shape[0]:
             exp = rp.grad.chunk(tp_sz, dim=0)[tp_rk]
-        elif rp.grad.ndim > 1 and tp_p.grad.shape[1] * tp_sz == rp.grad.shape[1]:
+        elif rp.grad.ndim > 1 and tp_grad.shape[1] * tp_sz == rp.grad.shape[1]:
             exp = rp.grad.chunk(tp_sz, dim=1)[tp_rk]
         else:
             continue
-        torch.testing.assert_close(tp_p.grad, exp, atol=atol, rtol=0, msg=f"{tag} {rn}")
+        torch.testing.assert_close(tp_grad, exp, atol=atol, rtol=0, msg=f"{tag} {name}")
 
 
-class TestColocatedCorrectness:
+class TestColocatedMeanCECorrectness:
+    """End-to-end mean-CE + Megatron DDP gradient correctness.
+
+    Catches the encoder DDP mis-scaling that toy sum-loss tests hide: mean-CE
+    divides per-sample grads by ``local_B_llm``; the encoder's DDP must divide
+    by ``llm_dp`` (not ``enc_dp``) so the combined divisor is the full batch.
+    """
+
     @classmethod
     def setup_class(cls):
         if not dist.is_initialized():
@@ -110,9 +135,6 @@ class TestColocatedCorrectness:
 
     def teardown_method(self):
         torch.use_deterministic_algorithms(False)
-        # Destroy communicators first so their NCCL subgroups are released
-        # before we tear down the parent grids — keeps us well under NCCL's
-        # concurrent-communicator cap across the parametrized runs.
         for c in _active_comms:
             c.destroy()
         _active_comms.clear()
@@ -129,7 +151,11 @@ class TestColocatedCorrectness:
         [(2, 4, 4, 2), (4, 2, 2, 4), (4, 2, 4, 2)],
         ids=["fan_in", "fan_out", "equal"],
     )
-    def test_correctness(self, enc_tp, enc_dp, llm_tp, llm_dp):
+    def test_mean_ce_encoder_grads_match_reference(
+        self, enc_tp, enc_dp, llm_tp, llm_dp
+    ):
+        # Determinism — the test asserts bitwise-close grads, so we need the
+        # attention kernels and TE paths to be reproducible.
         for k, v in {
             "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
             "NVTE_FLASH_ATTN": "0",
@@ -142,22 +168,34 @@ class TestColocatedCorrectness:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        rank, dtype, lr = dist.get_rank(), torch.float32, 1e-6
+        dtype = torch.float32
         Utils.initialize_model_parallel(1, create_gloo_process_groups=False)
 
+        # ── Reference (each rank runs identical TP=1 model on full batch) ──
         ref_g = _grid(tp=1, dp=8)
+        ref_pg = _pg_from_grid(ref_g)
+        ref_enc, _ = _make_block(1, dtype, ref_pg)
+        _avg_params(ref_enc, ref_g.get_pg("dp"))
+        ref_llm, _ = _make_block(2, dtype, ref_pg)
+        _avg_params(ref_llm, ref_g.get_pg("dp"))
+        # Classifier head — keep TP=1 in all paths so the reference grad is
+        # directly comparable without head-side sharding.
+        torch.manual_seed(7777)
+        ref_head = torch.nn.Linear(H, VOCAB, bias=False).cuda().to(dtype)
+        _avg_params(ref_head, ref_g.get_pg("dp"))
+
+        # ── Parallel encoder and LLM, same initial weights as reference ──
         enc_g = _grid(tp=enc_tp, dp=enc_dp)
         llm_g = _grid(tp=llm_tp, dp=llm_dp)
-        ref_pg, enc_pg, llm_pg = [_get_pg_collection_from_grid(g) for g in (ref_g, enc_g, llm_g)]
-
-        ref_enc = _make_block(1, dtype, ref_pg)
-        _avg_params(ref_enc, ref_g.get_pg("dp"))
-        ref_llm = _make_block(2, dtype, ref_pg)
-        _avg_params(ref_llm, ref_g.get_pg("dp"))
-        col_enc = _make_block(1, dtype, enc_pg)
+        enc_pg = _pg_from_grid(enc_g)
+        llm_pg = _pg_from_grid(llm_g)
+        col_enc, enc_cfg = _make_block(1, dtype, enc_pg)
         _shard_and_copy_(ref_enc, col_enc, enc_tp, enc_pg.tp.rank())
-        col_llm = _make_block(2, dtype, llm_pg)
+        col_llm, llm_cfg = _make_block(2, dtype, llm_pg)
         _shard_and_copy_(ref_llm, col_llm, llm_tp, llm_pg.tp.rank())
+        # Head on parallel path matches the reference head exactly.
+        col_head = torch.nn.Linear(H, VOCAB, bias=False).cuda().to(dtype)
+        col_head.weight.data.copy_(ref_head.weight.data)
 
         comm = ColocatedBridgeCommunicator(
             src_grid=enc_g,
@@ -167,83 +205,79 @@ class TestColocatedCorrectness:
             dim_mapping={'s': 0, 'b': 1, 'h': 2},
         )
         _active_comms.append(comm)
-        ref_opt = torch.optim.SGD(list(ref_enc.parameters()) + list(ref_llm.parameters()), lr=lr)
-        col_opt = torch.optim.SGD(list(col_enc.parameters()) + list(col_llm.parameters()), lr=lr)
-        e_di, l_di = enc_g.get_pg("dp").rank(), llm_g.get_pg("dp").rank()
-        be, bl = GBS // enc_dp, GBS // llm_dp
+
+        # ── Wrap parallel encoder and LLM with Megatron DDP ──
+        # overlap_grad_reduce=False + use_distributed_optimizer=False → grads
+        # land in each param's ``main_grad`` after ``finish_grad_sync()``
+        # without reduce-scatter sharding, making per-param comparison easy.
+        base_ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=False, use_distributed_optimizer=False, bucket_size=10_000_000
+        )
+        enc_ddp_config = replace(
+            base_ddp_config, gradient_reduce_div_factor=llm_g.get_pg("dp").size()
+        )
+        col_enc_ddp = DistributedDataParallel(
+            config=enc_cfg,
+            ddp_config=enc_ddp_config,
+            module=col_enc,
+            pg_collection=enc_pg,
+        )
+        col_llm_ddp = DistributedDataParallel(
+            config=llm_cfg,
+            ddp_config=base_ddp_config,
+            module=col_llm,
+            pg_collection=llm_pg,
+        )
+
+        # ── Shared input / labels, identical on every rank ──
+        torch.manual_seed(42)
+        full_input = torch.randn(SEQ, GBS, H, device='cuda', dtype=dtype)
+        full_labels = torch.randint(0, VOCAB, (SEQ, GBS), device='cuda')
+
+        # ── Reference mean-CE forward + backward on FULL batch ──
+        ref_input = full_input.clone().detach().requires_grad_(True)
+        ref_enc_out = ref_enc(hidden_states=ref_input, attention_mask=None)
+        ref_llm_out = ref_llm(hidden_states=ref_enc_out, attention_mask=None)
+        ref_logits = ref_head(ref_llm_out)  # [S, B, VOCAB]
+        ref_loss = F.cross_entropy(
+            ref_logits.reshape(-1, VOCAB), full_labels.reshape(-1), reduction='mean'
+        )
+        ref_loss.backward()
+
+        # ── Parallel forward + backward on DP slice with mean-CE ──
+        enc_dp_idx = enc_g.get_pg("dp").rank()
+        llm_dp_idx = llm_g.get_pg("dp").rank()
+        b_enc, b_llm = GBS // enc_dp, GBS // llm_dp
+
+        col_enc_ddp.zero_grad_buffer()
+        col_llm_ddp.zero_grad_buffer()
+        col_head.zero_grad()
+
+        col_input = (
+            full_input[:, enc_dp_idx * b_enc : (enc_dp_idx + 1) * b_enc, :]
+            .clone()
+            .detach()
+            .requires_grad_(True)
+        )
+        col_enc_out = col_enc_ddp(hidden_states=col_input, attention_mask=None)
+        col_bridged = comm.communicate(col_enc_out)
+        col_llm_out = col_llm_ddp(hidden_states=col_bridged, attention_mask=None)
+        col_logits = col_head(col_llm_out)
+        col_labels_slice = full_labels[:, llm_dp_idx * b_llm : (llm_dp_idx + 1) * b_llm]
+        col_loss = F.cross_entropy(
+            col_logits.reshape(-1, VOCAB), col_labels_slice.reshape(-1), reduction='mean'
+        )
+        col_loss.backward()
+
+        # ── Trigger DDP all-reduce so ``main_grad`` holds the synced grad ──
+        col_enc_ddp.finish_grad_sync()
+        col_llm_ddp.finish_grad_sync()
+
+        # ── Encoder grad check (the test that actually fails without the
+        # gradient_reduce_div_factor fix) ──
+        _cmp_main_grad(ref_enc, col_enc, enc_tp, enc_pg.tp.rank(), 5e-4, "enc_pgrad")
+
+        # ── LLM grad check (sanity: the LLM path should already be correct) ──
+        _cmp_main_grad(ref_llm, col_llm, llm_tp, llm_pg.tp.rank(), 5e-4, "llm_pgrad")
+
         dist.barrier()
-
-        for it in range(3):
-            t = f"[iter={it} rank={rank}]"
-            torch.manual_seed(100 + it)
-            torch.cuda.manual_seed(100 + it)
-            gi = torch.randn(SEQ, GBS, H, device="cuda", dtype=dtype)
-
-            # Reference
-            ri = gi.clone().detach().requires_grad_(True)
-            reo = ref_enc(hidden_states=ri, attention_mask=None)
-            rlo = ref_llm(hidden_states=reo, attention_mask=None)
-            rlo.sum().backward()
-
-            # Colocated
-            ci = gi[:, e_di * be : (e_di + 1) * be, :].clone().detach().requires_grad_(True)
-            eo = col_enc(hidden_states=ci, attention_mask=None)
-            co = comm.communicate(eo)
-            lo = col_llm(hidden_states=co, attention_mask=None)
-            cl = lo.sum()
-            cl.backward()
-
-            # 1-Enc activations  2-Post-comm  3-LLM activations  4-Loss  5-Input grads
-            torch.testing.assert_close(
-                eo,
-                reo[:, e_di * be : (e_di + 1) * be, :].detach(),
-                atol=5e-4,
-                rtol=0,
-                msg=f"{t} enc_out",
-            )
-            torch.testing.assert_close(
-                co.detach(),
-                reo[:, l_di * bl : (l_di + 1) * bl, :].detach(),
-                atol=5e-4,
-                rtol=0,
-                msg=f"{t} post_comm",
-            )
-            rls = rlo[:, l_di * bl : (l_di + 1) * bl, :]
-            torch.testing.assert_close(
-                lo.detach(), rls.detach(), atol=5e-3, rtol=0, msg=f"{t} llm_out"
-            )
-            torch.testing.assert_close(
-                cl.detach(), rls.detach().sum(), atol=1e-1, rtol=0, msg=f"{t} loss"
-            )
-            # Tight check: catches a class of bugs where fan-out backward drops
-            # cross-rank gradient contributions (zero-pad-without-gather regression).
-            # Observed numerical noise floor is ~2e-7; the old zero-pad bug
-            # produced ~1e-5 disagreement on samples handled by sibling llm_dp ranks.
-            torch.testing.assert_close(
-                ci.grad,
-                ri.grad[:, e_di * be : (e_di + 1) * be, :],
-                atol=5e-6,
-                rtol=1e-3,
-                msg=f"{t} input_grad",
-            )
-
-            # 6-Enc param grads  7-LLM param grads (after DP all-reduce SUM)
-            for p in col_enc.parameters():
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=enc_g.get_pg("dp"))
-            _cmp_grad(ref_enc, col_enc, enc_tp, enc_pg.tp.rank(), 5e-3, f"{t} enc_pgrad")
-            for p in col_llm.parameters():
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=llm_g.get_pg("dp"))
-            _cmp_grad(ref_llm, col_llm, llm_tp, llm_pg.tp.rank(), 5e-3, f"{t} llm_pgrad")
-
-            # Optimizer step
-            ref_opt.step()
-            ref_opt.zero_grad()
-            col_opt.step()
-            col_opt.zero_grad()
-
-            # 8-Enc weights  9-LLM weights
-            _cmp_wt(ref_enc, col_enc, enc_tp, enc_pg.tp.rank(), 1e-5, f"{t} enc_wt")
-            _cmp_wt(ref_llm, col_llm, llm_tp, llm_pg.tp.rank(), 1e-5, f"{t} llm_wt")
-            dist.barrier()

@@ -12,6 +12,7 @@ Run with:
 
 import logging
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from functools import partial
 
 import pytest
@@ -418,9 +419,16 @@ def get_mimo_model_colocated(
     if encoder_name in mimo_model.modality_submodules:
         submodule = mimo_model.modality_submodules[encoder_name]
         if submodule is not None:
+            # Heterogeneous-DP grad scaling: mean-CE loss on the LLM implicitly
+            # divides per-sample encoder grads by local_B_llm=B_full/llm_dp. The
+            # encoder's DDP must therefore divide by llm_dp (not enc_dp) so the
+            # final scaling is 1/B_full. Override on a copy of the shared config.
+            enc_ddp_config = replace(
+                ddp_config, gradient_reduce_div_factor=llm_grid.get_pg('dp').size()
+            )
             submodule = DistributedDataParallel(
                 config=submodule.encoders['clip_encoder'].config,
-                ddp_config=ddp_config,
+                ddp_config=enc_ddp_config,
                 module=submodule,
                 pg_collection=vision_pg,
             )

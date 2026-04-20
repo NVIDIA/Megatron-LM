@@ -68,6 +68,15 @@ class DistributedDataParallelConfig:
     """If true, compute average in collective directly, as opposed to dividing by the
        dp_size first and then computing sum in the collective."""
 
+    gradient_reduce_div_factor: Optional[int] = None
+    """If set, override the divisor used to scale gradients before the DP reduction.
+       By default the divisor is the size of the actual reduction group
+       (``dp_cp_group.size()``). When this module's DP group size does not match the
+       loss's implicit batch divisor — e.g. a colocated encoder whose per-sample loss
+       was divided by a peer LLM's DP batch, not the encoder's — set this to the
+       divisor you actually want (typically the peer module's DP size). The reduction
+       group itself is unchanged; only the scaling math uses the override."""
+
     fp8_param_gather: bool = False
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
