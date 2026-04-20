@@ -14,7 +14,7 @@
 
 import logging
 import random
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 try:
     import einops
@@ -26,6 +26,7 @@ except ImportError:
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch import nn
 
 try:
     from torch.distributed import DeviceMesh
@@ -38,7 +39,6 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -64,6 +64,32 @@ class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
     """
+
+    # Module type registry (forked from Megatron-Bridge param_mapping utilities).
+    _MODULE_TYPE_REGISTRY: Dict[str, set] = {
+        "column": {
+            "ColumnParallelLinear",
+            "TEColumnParallelLinear",
+            "TELayerNormColumnParallelLinear",
+            "TEColumnParallelGroupedLinear",
+            "VocabParallelEmbedding",
+            "DotProductAttention",  # for attention sink only
+            "TEDotProductAttention",  # for attention sink only
+        },
+        "row": {"RowParallelLinear", "TERowParallelLinear", "TERowParallelGroupedLinear"},
+        "replicated": {
+            # Normalization layers
+            "TENorm",
+            "FusedLayerNorm",
+            "WrappedTorchNorm",
+            "LayerNorm",
+            "RMSNorm",
+            "L2Norm",
+            # Other non-parallel modules
+            "IdentityOp",
+            "TopKRouter",
+        },
+    }
 
     def __init__(
         self,
@@ -130,7 +156,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             else:
                 self.fsdp_unit_modules = []
 
-        self._fix_tensor_parallel_attributes(module)
+        self._annotate_tensor_parallelism(module)
 
         if config.overlap_moe_expert_parallel_comm:
             assert not ddp_config.fsdp_double_buffer, (
@@ -190,6 +216,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.scale_gradients = self.module.scale_gradients
         self.zero_grad_buffer = self.module.zero_grad_buffer
         self.broadcast_params = self.module.broadcast_params
+        self.synchronize_param_gather = self.module.synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
@@ -218,43 +245,75 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module.load_state_dict(custom_state_dict, strict=strict)
 
-    def _fix_tensor_parallel_attributes(self, module):
-        is_expert_param = lambda n, p: ".experts." in n
-        is_router_param = lambda n, p: ".router.weight" in n
+    def _detect_parallelism_type(self, param_name: str, module: nn.Module) -> Optional[str]:
+        """
+        Infer tensor-parallelism type for a parameter under a given module
+        (forked from Megatron-Bridge).
 
-        if parallel_state.get_tensor_model_parallel_group():
-            tp_size = parallel_state.get_tensor_model_parallel_group().size()
-        else:
-            tp_size = 1
+        Returns:
+            "column", "row", or "replicated" if a type can be inferred, else None.
+        """
+        module_type = type(module).__name__
 
-        if parallel_state.get_expert_tensor_parallel_group():
-            expt_tp_size = parallel_state.get_expert_tensor_parallel_group().size()
-        else:
-            expt_tp_size = 1
+        # Handle fused modules like TELayerNormColumnParallelLinear
+        # These modules have both column-parallel weights (weight, bias)
+        # and replicated layer norm weights (layer_norm_weight, layer_norm_bias)
+        if module_type == "TELayerNormColumnParallelLinear":
+            # Check the actual parameter name to determine the correct parallelism type
+            if param_name.endswith("layer_norm_weight") or param_name.endswith("layer_norm_bias"):
+                return "replicated"
+            # All other parameters (weight, bias) are column-parallel
+            return "column"
 
-        param_to_direct_module = {}
-        for name, m in module.named_modules():
-            for p in m.parameters(recurse=False):
-                param_to_direct_module[p] = (name, m)
+        # Check registry first
+        for parallelism, types in self._MODULE_TYPE_REGISTRY.items():
+            if module_type in types:
+                if parallelism == "row" and "bias" in param_name:
+                    return "replicated"
+                return parallelism
 
-        for name, param in module.named_parameters():
-            if is_expert_param(name, param) and expt_tp_size > 1:
-                setattr(param, "_mcore_tp", True)
-                if "linear_fc1.weight" in name:
-                    setattr(param, "_tp_partition_dim", 0)
-                elif "linear_fc2.weight" in name:
-                    setattr(param, "_tp_partition_dim", 1)
+        # Fallback to inspecting module attributes
+        if hasattr(module, "tensor_model_parallel"):
+            if not module.tensor_model_parallel:
+                return "replicated"
 
-            if not is_expert_param(name, param) and tp_size > 1:
-                m_name, direct_module = param_to_direct_module[param]
-                if isinstance(direct_module, (TELinear,)):
-                    parallel_mode = getattr(direct_module, "parallel_mode", None)
-                    if parallel_mode is None:
-                        setattr(param, "_mcore_tp", True)
-                        setattr(param, "_tp_duplicated", True)
-                elif is_router_param(name, param):
-                    setattr(param, "_mcore_tp", True)
-                    setattr(param, "_tp_duplicated", True)
+            # Check partition dimension
+            partition_dim = getattr(module, "partition_dim", None)
+            if partition_dim == 0:
+                return "column"
+            elif partition_dim == 1:
+                if "bias" in param_name:
+                    return "replicated"
+                return "row"
+
+        # Fallback for normalization layers
+        if any(norm in module_type for norm in ["Norm", "Normalization"]):
+            return "replicated"
+
+        # Check parallel_mode for TELinear
+        if module_type == "TELinear":
+            if module.parallel_mode == "column":
+                return "column"
+            elif module.parallel_mode == "row":
+                if "bias" in param_name:
+                    return "replicated"
+                return "row"
+            else:
+                return "replicated"
+
+        return None
+
+    def _annotate_tensor_parallelism(self, root_module: nn.Module) -> None:
+        """Annotate parameters under root_module with inferred tensor-parallel metadata.
+
+        Each parameter that can be classified will get a `_tensor_parallel_mode` attribute
+        set to one of: "column", "row", or "replicated".
+        """
+        for submodule in root_module.modules():
+            for name, param in submodule.named_parameters(recurse=False):
+                detected_type = self._detect_parallelism_type(name, submodule)
+                if detected_type is not None:
+                    setattr(param, "_tensor_parallel_mode", detected_type)
 
     def _init_dist_index(self, pg_collection):
         """
@@ -319,6 +378,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
             expt_tp_group = single_rank_group
 
+        # Extract AG groups from pg_collection for explicit passing
+        dp_cp_ag = getattr(pg_collection, 'dp_cp_ag', None) if pg_collection is not None else None
+        expt_dp_ag = (
+            getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
+        )
+
         if enable_hsdp:
             if self.num_moe_experts is not None:
                 expt_mesh = _get_hsdp_tp_mesh(
@@ -347,6 +412,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 hybrid_fsdp_group=hybrid_fsdp_group,
                 hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
                 expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
         else:
             if self.num_moe_experts is not None:
@@ -371,6 +438,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
                 expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
 
         self.tp_group = tp_group
