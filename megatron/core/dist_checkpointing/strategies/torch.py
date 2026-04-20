@@ -1040,8 +1040,15 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
             from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
                 FileSystemWriterAsync,
                 _results_queue,
-                get_write_results_queue,
             )
+            try:
+                from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+                    get_write_results_queue,
+                )
+            except ImportError:
+                from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+                    _get_write_results_queue as get_write_results_queue,
+                )
             from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
                 CheckpointMetadataCache,
                 save_state_dict_async_finalize,
