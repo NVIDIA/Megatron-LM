@@ -6,13 +6,25 @@ Both encoder and LLM share the same ranks (offset=0) but use different TP/DP
 configurations. Communication between heterogeneous TP/DP layouts is handled by
 ColocatedBridgeCommunicator.
 
+Loss formulation (important for grad scaling):
+    We build the scalar loss as
+    ``loss = all_reduce(local_num) / all_reduce(local_den)`` over the LLM DP
+    group, where ``local_num`` is the masked sum of per-token CE values and
+    ``local_den`` is the valid-token count. This is the exact distributed
+    equivalent of full-batch ``F.cross_entropy(..., reduction='mean')``. The
+    resulting per-token grad scalar is ``1/global_den`` on every rank, so the
+    DP reduction must be a pure SUM — both encoder and LLM DDP configs set
+    ``gradient_reduce_div_factor=1``. (Exact reference-vs-distributed
+    comparison at the tighter transformer-block + vocab-head level lives in
+    ``test_mimo_colocated_correctness.py``; this file integration-tests the
+    real MimoModel + forward_backward_no_pipelining + DDP path.)
+
 Run with:
     uv run python -m torch.distributed.run --nproc_per_node=8 -m pytest tests/unit_tests/models/test_mimo_colocated_e2e.py -v
 """
 
 import logging
 from contextlib import ExitStack, contextmanager
-from dataclasses import replace
 from functools import partial
 
 import pytest
@@ -403,9 +415,16 @@ def get_mimo_model_colocated(
     # Set model_type so forward_backward_no_pipelining's get_model_type() works
     mimo_model.model_type = ModelType.encoder_or_decoder
 
-    # Wrap with DDP
+    # Wrap with DDP. The loss is a global-mean CE built via all-reduced
+    # ``(local_num, local_den)`` (see module docstring), so the per-token grad
+    # scalar is already ``1/global_den`` on every rank. Both encoder and LLM
+    # DDPs therefore set ``gradient_reduce_div_factor=1`` so the DP reduction
+    # is a pure SUM — dividing further by ``dp_size`` would drop a factor.
     ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+        overlap_grad_reduce=True,
+        bucket_size=10000,
+        use_distributed_optimizer=True,
+        gradient_reduce_div_factor=1,
     )
 
     if mimo_model.language_model is not None:
@@ -419,16 +438,9 @@ def get_mimo_model_colocated(
     if encoder_name in mimo_model.modality_submodules:
         submodule = mimo_model.modality_submodules[encoder_name]
         if submodule is not None:
-            # Heterogeneous-DP grad scaling: mean-CE loss on the LLM implicitly
-            # divides per-sample encoder grads by local_B_llm=B_full/llm_dp. The
-            # encoder's DDP must therefore divide by llm_dp (not enc_dp) so the
-            # final scaling is 1/B_full. Override on a copy of the shared config.
-            enc_ddp_config = replace(
-                ddp_config, gradient_reduce_div_factor=llm_grid.get_pg('dp').size()
-            )
             submodule = DistributedDataParallel(
                 config=submodule.encoders['clip_encoder'].config,
-                ddp_config=enc_ddp_config,
+                ddp_config=ddp_config,
                 module=submodule,
                 pg_collection=vision_pg,
             )
@@ -442,22 +454,38 @@ def get_mimo_model_colocated(
 # ============================================================================
 
 
-def loss_func(loss_mask, output_tensor):
-    """Compute loss from model output."""
+def loss_func(loss_mask, llm_dp_pg, output_tensor):
+    """Global-mean CE across the LLM DP group via all-reduced ``(num, den)``.
+
+    ``output_tensor`` is per-token CE from ``GPTModel.compute_language_model_loss``
+    with shape ``[b, s]``. We mask out ignored tokens (image positions etc.)
+    using ``loss_mask``, sum the numerator and the valid-token count locally,
+    all-reduce both across the LLM DP group, then divide. This is the exact
+    distributed equivalent of full-batch mean CE and keeps the per-token grad
+    scalar at ``1/global_den`` on every rank — the DDP reduction below must
+    therefore be a pure SUM (``gradient_reduce_div_factor=1`` in the DDP
+    config) rather than the usual ``1/dp_size`` mean.
+    """
     if output_tensor is None:
         return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
 
-    loss = output_tensor.float().sum()
+    masked = output_tensor.float() * loss_mask.float()
+    local_num = masked.sum()
+    local_den = loss_mask.float().sum()
+    dist.all_reduce(local_num, group=llm_dp_pg)
+    dist.all_reduce(local_den, group=llm_dp_pg)
+    loss = local_num / local_den.clamp_min(1.0)
     return loss, {'loss_reduced': loss.detach().item()}
 
 
 def forward_step(data_iterator, model, encoder_grid, llm_grid, encoder_name):
     """Forward step with data slicing for heterogeneous DP."""
     batch = next(data_iterator) if data_iterator is not None else {'input_ids': None}
+    llm_dp_pg = llm_grid.get_pg("dp")
 
     if batch.get('input_ids') is None:
         output_tensor, loss_mask = model(**batch)
-        return output_tensor, partial(loss_func, loss_mask)
+        return output_tensor, partial(loss_func, loss_mask, llm_dp_pg)
 
     encoder_dp = encoder_grid.get_pg("dp").size()
     llm_dp = llm_grid.get_pg("dp").size()
@@ -495,7 +523,7 @@ def forward_step(data_iterator, model, encoder_grid, llm_grid, encoder_name):
                 batch[key] = batch[key][start : start + slice_size].contiguous()
 
     output_tensor, loss_mask = model(**batch)
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask, llm_dp_pg)
 
 
 def run_colocated_test(
