@@ -613,6 +613,10 @@ class TransformerConfig(ModelParallelConfig):
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp4_recipe is custom."""
 
+    high_priority_a2a_comm_stream: bool = False
+    """If True, the communication stream created by set_streams for combined 1f1b
+    a2a overlap is created with CUDA high priority."""
+
     ####################
     # MoE related
     ####################
@@ -854,6 +858,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of cuda threads blocks to use for unpermute part in HybridEP. 
     If permute_fusion_into_hybridep is True, this is the number of sms to 
     use for the unpermute part."""
+
+    moe_hybridep_num_sms_preprocessing: int = 108
+    """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
