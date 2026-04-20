@@ -2525,8 +2525,193 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             return out, bias
 
+    class TEFusedDenseMLP(TEFusedMLP):
+        """Dense MLP using GroupedLinear(num_groups=1) to trigger
+        ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+
+        Subclass of TEFusedMLP -> does not modify TEFusedMLP or TEGroupedMLP.
+        The fused kernel fires automatically via the TE op fuser when it detects
+        the GroupedLinear -> ScaledSwiGLU -> GroupedLinear pattern with MXFP8 recipe.
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._norm_seq: Optional[Tuple[te.pytorch.ops.Sequential]] = None
+            if not is_te_min_version("2.14.0"):
+                raise RuntimeError(
+                    f"{self.__class__.__name__} requires Transformer Engine >= 2.14.0 "
+                    "(needs pytorch.ops.GroupedLinear and pytorch.ops.ScaledSwiGLU)"
+                )
+            if self.config.add_bias_linear:
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support add_bias_linear=True; "
+                    "the CuTeGEMM fused kernel requires bias-free linear layers."
+                )
+            if self.config.activation_func != F.silu or not self.config.gated_linear_unit:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires SwiGLU activation "
+                    "(activation_func=F.silu, gated_linear_unit=True) "
+                    "for the CuTeGEMM fused kernel, but got "
+                    f"activation_func={self.config.activation_func}, "
+                    f"gated_linear_unit={self.config.gated_linear_unit}."
+                )
+
+        def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
+            """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
+
+            fused_impl = te.pytorch.ops.Sequential()
+
+            # Tensor parallelism configuration
+            tp_world_size = get_tensor_model_parallel_world_size()
+            tp_group = None
+            if tp_world_size > 1:
+                tp_group = get_tensor_model_parallel_group()
+
+            # RNG state
+            rng_state_tracker_function = None
+            if get_cuda_rng_tracker().is_initialized():
+                rng_state_tracker_function = get_cuda_rng_tracker
+
+            # Check submodule types (same as TEFusedMLP)
+            if not isinstance(self.linear_fc1, te.pytorch.LayerNormLinear):
+                raise ValueError(
+                    f"{self.__class__.__name__} expects FC1 to be "
+                    "Transformer Engine LayerNormLinear, but found "
+                    f"{self.linear_fc1.__class__.__name__}."
+                )
+            if not isinstance(self.linear_fc2, te.pytorch.Linear):
+                raise ValueError(
+                    f"{self.__class__.__name__} expects FC2 to be "
+                    "Transformer Engine Linear, but found "
+                    f"{self.linear_fc2.__class__.__name__}."
+                )
+
+            # Norm op (same as TEFusedMLP)
+            norm_type = self.linear_fc1.normalization
+            norm_shape = self.linear_fc1.weight.size(1)
+            kwargs = {
+                "eps": self.linear_fc1.eps,
+                "device": "meta",
+                "dtype": self.linear_fc1.layer_norm_weight.dtype,
+                "zero_centered_gamma": self.linear_fc1.zero_centered_gamma,
+            }
+            op = None
+            if norm_type == "LayerNorm":
+                op = te.pytorch.ops.LayerNorm(norm_shape, **kwargs)
+                op.weight = self.linear_fc1.layer_norm_weight
+                op.bias = self.linear_fc1.layer_norm_bias
+            elif norm_type == "RMSNorm":
+                op = te.pytorch.ops.RMSNorm(norm_shape, **kwargs)
+                op.weight = self.linear_fc1.layer_norm_weight
+            else:
+                raise ValueError(f"Unsupported normalization ({norm_type})")
+            # Store norm in a separate Sequential applied OUTSIDE the MXFP8 autocast
+            # in forward(). Running norm inside MXFP8 context corrupts the saved rstd
+            # used in RMSNorm backward, causing gradient amplification up to 10^6.
+            # Wrapped in tuple to avoid nn.Module submodule registration (which would
+            # duplicate the shared norm weight in state_dict/parameters).
+            norm_seq = te.pytorch.ops.Sequential()
+            norm_seq.append(op)
+            self._norm_seq = (norm_seq,)
+
+            # GLU interleave size must match ScaledSwiGLU and the CuTe kernel.
+            _GLU_INTERLEAVE_SIZE = 32
+
+            # FC1: GroupedLinear(num_groups=1) instead of BasicLinear
+            weight = self.linear_fc1.weight
+            op = te.pytorch.ops.GroupedLinear(
+                num_groups=1,
+                in_features=weight.size(1),
+                out_features=weight.size(0) * tp_world_size,
+                device="meta",
+                dtype=weight.dtype,
+                bias=False,
+                rng_state_tracker_function=rng_state_tracker_function,
+                accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+            )
+            op.weight0 = weight
+            op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
+            fused_impl.append(op)
+
+            # ScaledSwiGLU with glu_interleave_size=32
+            # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
+            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
+
+            # FC2: GroupedLinear(num_groups=1) instead of BasicLinear
+            weight = self.linear_fc2.weight
+            op = te.pytorch.ops.GroupedLinear(
+                num_groups=1,
+                in_features=weight.size(1),
+                out_features=weight.size(0),
+                device="meta",
+                dtype=weight.dtype,
+                bias=False,
+                rng_state_tracker_function=rng_state_tracker_function,
+                accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+            )
+            op.weight0 = weight
+            # FC2 has no SwiGLU — MXFP8 quantization done on-the-fly in fuser_forward.
+            # No _mxfp8_weight0 pre-computation to avoid ~28 GB persistent FP8 tensors.
+            fused_impl.append(op)
+
+            if tp_world_size > 1:
+                if self.linear_fc2.sequence_parallel:
+                    fused_impl.append(te.pytorch.ops.ReduceScatter(tp_group))
+                else:
+                    fused_impl.append(te.pytorch.ops.AllReduce(tp_group))
+
+            self._register_hooks_on_fused_impl(fused_impl)
+            return fused_impl
+
+        def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
+            """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
+
+            orig_shape = hidden_states.shape
+            hidden_size = hidden_states.size(-1)
+            hidden_states_2d = hidden_states.view(-1, hidden_size)
+            total_tokens = hidden_states_2d.size(0)
+
+            tokens_per_expert = torch.full(
+                (1,), total_tokens, dtype=torch.long, device=hidden_states.device
+            )
+            scales = torch.ones(
+                total_tokens, device=hidden_states.device, dtype=hidden_states.dtype
+            )
+
+            # Build fused impl and cache recipe lazily on first forward pass.
+            # Both are created once and reused — avoids object creation every call.
+            if not hasattr(self, '_recipe'):
+                if os.getenv("FP4_RECIPE", "") == "nvfp4":
+                    self._recipe = te.common.recipe.NVFP4BlockScaling()
+                else:
+                    self._recipe = te.common.recipe.MXFP8BlockScaling()
+            recipe = self._recipe
+
+            if self._fused_impl is None:
+                with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                    self._fused_impl = (self._make_fused_impl(),)
+
+            # Apply norm in BF16 OUTSIDE the MXFP8 autocast to preserve the rstd
+            # tensor used by RMSNorm backward (running it inside causes up to 10^6
+            # gradient amplification, and causes convergence issues).
+            normed = self._norm_seq[0](hidden_states_2d)
+
+            with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                out = self._fused_impl[0](normed, tokens_per_expert, scales, tokens_per_expert)
+
+            out = out.view(*orig_shape[:-1], out.size(-1))
+
+            bias = None
+            if self.linear_fc2.te_return_bias:
+                bias = self.linear_fc2.bias
+                if isinstance(bias, torch.Tensor) and bias.numel() == 0:
+                    bias = None
+
+            return out, bias
+
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
+    TEFusedDenseMLP = None  # type: ignore[assignment, misc]
 
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
