@@ -708,6 +708,21 @@ class TransformerConfig(ModelParallelConfig):
     The routing decision is based on the sum of the routing scores and the expert bias.
     See https://arxiv.org/abs/2408.15664 for details."""
 
+    moe_capacity_priced_routing: bool = False
+    """Enable capacity-priced routing for MoE (top-1 only)."""
+
+    moe_cp_price_learning_rate: float = 0.01
+    """Tatonnement step size used to update expert prices."""
+
+    moe_cp_slack_capacity: float = 0.9
+    """Target expert utilization factor in [0, 1]."""
+
+    moe_cp_expert_capacity: Optional[int] = None
+    """Per-expert target capacity. If None, uses tokens_per_batch/num_experts."""
+
+    moe_cp_price_update_frequency: int = 1
+    """Update expert prices every N routing steps."""
+
     moe_router_bias_update_rate: float = 1e-3
     """The expert bias is updated based on the number of assigned tokens to each expert
     in a global batch, where the bias is increased for the experts with less assigned tokens
@@ -1825,6 +1840,20 @@ class TransformerConfig(ModelParallelConfig):
                 "Please set --moe-router-score-function sigmoid for sigmoid score function."
             )
 
+        if self.moe_capacity_priced_routing:
+            if self.num_moe_experts is None:
+                raise ValueError("moe_capacity_priced_routing requires num_moe_experts to be set.")
+            if self.moe_router_topk != 1:
+                raise ValueError("moe_capacity_priced_routing currently supports only top-1 routing.")
+            if self.moe_cp_price_learning_rate <= 0:
+                raise ValueError("moe_cp_price_learning_rate must be > 0.")
+            if not 0.0 <= self.moe_cp_slack_capacity <= 1.0:
+                raise ValueError("moe_cp_slack_capacity must be in [0, 1].")
+            if self.moe_cp_expert_capacity is not None and self.moe_cp_expert_capacity <= 0:
+                raise ValueError("moe_cp_expert_capacity must be > 0 when provided.")
+            if self.moe_cp_price_update_frequency <= 0:
+                raise ValueError("moe_cp_price_update_frequency must be > 0.")
+
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
             if not is_te_min_version("1.7.0.dev0"):
@@ -1864,6 +1893,7 @@ class TransformerConfig(ModelParallelConfig):
             and self.moe_router_score_function == "softmax"
             and not self.moe_router_pre_softmax
             and self.moe_router_load_balancing_type != "sinkhorn"
+            and not self.moe_capacity_priced_routing
         ):
             # Requires applying softmax before selecting the top-k when k is 1,
             # since softmax on a [num_tokens, 1] would yield a zero gradient.

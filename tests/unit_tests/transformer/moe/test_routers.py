@@ -9,7 +9,7 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
-from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.moe.router import CapacityPricedRouter, Router
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -563,3 +563,116 @@ def test_router_gating_linear_bias(router_dtype):
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
     assert torch.allclose(bias.grad, ref_bias.grad, **tols)
+
+
+class TestCapacityPricedRouter:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        num_moe_experts = 4
+        self.transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            num_moe_experts=num_moe_experts,
+            use_cpu_initialization=True,
+            moe_capacity_priced_routing=True,
+            moe_router_topk=1,
+            moe_router_load_balancing_type="none",
+            moe_cp_price_learning_rate=0.1,
+            moe_cp_slack_capacity=0.5,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
+        )
+        self.moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules)
+        self.router = cast(Router, self.moe_layer.router)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_router_builder_selects_capacity_priced_router(self):
+        self.router = self.router.cuda()
+        assert isinstance(self.router, CapacityPricedRouter)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_routing_prefers_low_price_expert(self):
+        self.router = self.router.cuda()
+        with torch.no_grad():
+            self.router.weight.zero_()
+            if self.router.bias is not None:
+                self.router.bias.zero_()
+            self.router.expert_prices.copy_(
+                torch.tensor([3.0, 0.0, 2.0, 1.0], device=self.router.expert_prices.device)
+            )
+            hidden_states = torch.zeros((4, 2, self.router.config.hidden_size), device="cuda")
+            probs, routing_map = self.router(hidden_states)
+
+        # Lowest price is expert 1, so every token should route there under zero logits.
+        assert routing_map.shape == (8, self.router.config.num_moe_experts)
+        assert torch.all(routing_map[:, 1])
+        assert torch.allclose(probs.sum(dim=-1), probs.new_ones(probs.shape[0]))
+        assert torch.all(probs[routing_map] > 0)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_price_update_tatonnement(self):
+        self.router = self.router.cuda()
+        with torch.no_grad():
+            self.router.expert_prices.zero_()
+            usage = torch.tensor([8.0, 0.0, 4.0, 4.0], device="cuda")
+            self.router.update_prices(usage)
+
+            # target = alpha * (sum(usage)/num_experts) = 0.5 * 4 = 2
+            # new price = clamp(0 + lr * (usage - 2), min=0)
+            expected = torch.tensor([0.6, 0.0, 0.2, 0.2], device="cuda")
+            torch.testing.assert_close(self.router.expert_prices, expected)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_applies_zloss_and_aux_loss(self):
+        self.router = self.router.cuda()
+        self.router.train()
+        self.router.config.moe_z_loss_coeff = 1.0
+        self.router.config.moe_aux_loss_coeff = 1.0
+        self.router.routing_type = "aux_loss"
+        self.router.config.moe_router_load_balancing_type = "aux_loss"
+
+        hidden_states = torch.randn(
+            (8, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        probs, _ = self.router(hidden_states)
+        self.router.zero_grad()
+        probs.sum().backward()
+
+        assert self.router.weight.grad is not None
+        assert self.router.weight.grad.abs().sum() > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_applies_capacity_dropping(self):
+        self.router = self.router.cuda()
+        self.router.train()
+        self.router.config.moe_aux_loss_coeff = 0.0
+        self.router.routing_type = "none"
+        self.router.config.moe_router_load_balancing_type = "none"
+        self.router.config.moe_expert_capacity_factor = 0.5
+        self.router.config.moe_pad_expert_input_to_capacity = True
+
+        hidden_states = torch.zeros(
+            (4, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        probs, routing_map = self.router(hidden_states)
+
+        assert probs.shape == (8, self.router.config.num_moe_experts)
+        assert routing_map.sum().item() == 4
+
+        # Restore default knobs for test isolation.
+        self.router.config.moe_expert_capacity_factor = None
+        self.router.config.moe_pad_expert_input_to_capacity = False
