@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from .eval_runtime import depth_mup_eval_context, is_depth_mup_eval_enabled
 from .model_policy import ResolvedModelPolicy, build_resolved_model_policy
 from .roles import (
     IS_OUTPUT_PARAMETER_ATTR,
@@ -71,7 +72,9 @@ __all__ = [
     'build_resolved_training_policy',
     'build_scaling_user_config',
     'canonicalize_scaling_user_config',
+    'depth_mup_eval_context',
     'get_parameterization_role',
+    'is_depth_mup_eval_enabled',
     'is_embedding_class_parameter',
     'is_embedding_or_output_parameter',
     'is_hidden_matrix_parameter',
