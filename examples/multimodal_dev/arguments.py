@@ -61,6 +61,15 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--hf-processor-path",
+        type=str,
+        default=None,
+        help=(
+            "HuggingFace processor path for real VLM datasets "
+            "(e.g. Qwen/Qwen2.5-VL-7B-Instruct)"
+        ),
+    )
+    group.add_argument(
         "--recompute-vision",
         action="store_true",
         default=False,
