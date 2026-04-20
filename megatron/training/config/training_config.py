@@ -103,6 +103,23 @@ class ValidationConfig:
     during training.
     """
 
+    start_eval_at_iter: int | None = None
+    """If set, evaluation will only start after this iteration number. Useful for skipping
+    evaluation during early training iterations when the model is not yet meaningful.
+    If not set, evaluation starts from the first eval_interval.
+    """
+
+    eval_global_batch_size: int | None = None
+    """Global batch size to use during evaluation. If not set, defaults to global_batch_size.
+    Must be divisible by (eval_micro_batch_size * data_parallel_size).
+    """
+
+    eval_micro_batch_size: int | None = None
+    """Micro batch size to use during evaluation. If not set, defaults to micro_batch_size.
+    Changing this affects per-device memory usage during eval and the number of microbatches per
+    eval step.
+    """
+
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
 
@@ -335,6 +352,15 @@ class CheckpointConfig:
     save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
     """Number of iterations between persistent checkpoint saves."""
 
+    save_params_interval: int | None = None
+    """Number of iterations between param.name->param.data mapping saves."""
+
+    save_activations_interval: int | None = None
+    """Number of iterations between act.name->act.data mapping saves."""
+
+    save_tokens_per_expert_interval: int | None = None
+    """Number of iterations between tokens-per-expert routing metadata saves."""
+
     save_wgrads_interval: int | None = None
     """Number of iterations between wgrad (main_grad) saves."""
 
@@ -459,6 +485,12 @@ class CheckpointConfig:
 
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
+
+    async_ckpt_use_cpu_shm: bool = False
+    """Copy GPU tensors to CPU shared-memory in the training process before handing off to
+    the async checkpoint worker. Avoids CUDA IPC / NVLink fabric handles in the worker
+    subprocess. Useful on MNNVL systems where fabric resources are exhausted.
+    Only applies with the nvrx async strategy."""
 
     fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""
