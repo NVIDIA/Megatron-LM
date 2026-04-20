@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -96,6 +96,16 @@ def _set_capture_end():
     """Set graph capture has ended."""
     global _IS_GRAPH_CAPTURING
     _IS_GRAPH_CAPTURING = False
+
+
+@contextmanager
+def graph_capture():
+    """Context manager that brackets a graph-capture region."""
+    _set_capture_start()
+    try:
+        yield
+    finally:
+        _set_capture_end()
 
 
 def is_graph_warmup():

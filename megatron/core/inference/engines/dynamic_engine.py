@@ -50,7 +50,7 @@ from megatron.core.inference.utils import (
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs, graph_capture
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -366,6 +366,19 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
+        # MTP warmup preparation: capture MTP CUDA graphs alongside the
+        # decoder graphs within the same loop rather than in a separate pass.
+        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        mtp_warmup_enabled = (
+            controller.num_mtp_heads > 0
+            and (controller.num_speculative_tokens or 0) > 0
+            and hasattr(unwrapped, 'mtp')
+        )
+        if mtp_warmup_enabled:
+            tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
+            sp_enabled = model_config.sequence_parallel and tp_size > 1
+            mtp_seen_batch_sizes = set()
+
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -391,16 +404,40 @@ class DynamicInferenceEngine(AbstractEngine):
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
+            # MTP CUDA graph warmup for this batch dimension.
+            if mtp_warmup_enabled:
+                n = cuda_graph_batch_dimension.req_count
+                if sp_enabled:
+                    n += (tp_size - n % tp_size) % tp_size
+                if n > 0 and n not in mtp_seen_batch_sizes:
+                    mtp_seen_batch_sizes.add(n)
+                    device = torch.cuda.current_device()
+                    batch_dim = n // tp_size if sp_enabled else n
+                    with graph_capture():
+                        unwrapped.compute_mtp_single_step(
+                            hidden_states=torch.empty(
+                                (batch_dim, 1, model_config.hidden_size),
+                                device=device,
+                                dtype=model_config.params_dtype,
+                            ),
+                            next_token_ids=torch.empty(
+                                (1, n), device=device, dtype=torch.long,
+                            ),
+                            position_ids=torch.empty(
+                                (1, n), device=device, dtype=torch.int64,
+                            ),
+                            depth=0,
+                        )
+
             context.reset()
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-        # MTP CUDA graph warmup: capture graphs for the MTP TransformerLayers
-        # used during speculative decoding. This must happen after decoder graph
-        # warmup so that the MTP graphs are captured independently.
-        self._create_mtp_cuda_graphs(controller, context)
+        if mtp_warmup_enabled and mtp_seen_batch_sizes:
+            controller._has_mtp_cuda_graphs = True
+            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
         time_end = time.time()
@@ -425,94 +462,6 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
-
-    def _create_mtp_cuda_graphs(self, controller, context):
-        """Capture CUDA graphs for MTP layers used in speculative decoding.
-
-        Derives the set of MTP batch sizes from the decoder CUDA graph batch
-        dimensions, then runs ``compute_mtp_single_step`` per batch size to
-        trigger graph capture. With ``mtp_use_repeated_layer`` one call covers
-        every depth; with unique layers the remaining depths capture lazily.
-        """
-        num_mtp_heads = controller.num_mtp_heads
-        num_spec_tokens = controller.num_speculative_tokens or 0
-        if num_mtp_heads == 0 or num_spec_tokens == 0:
-            return
-
-        model = controller.inference_wrapped_model.model
-        unwrapped = unwrap_model(model)
-        if not hasattr(unwrapped, 'mtp'):
-            return
-
-        model_config = model.config
-
-        # Only proceed when local CUDA graphs are enabled.
-        if model_config.cuda_graph_impl != "local":
-            return
-
-        # Collect batch sizes from all graph dimensions. MTP serial forward
-        # runs on all active requests (decode + prefill), so we need graphs
-        # for total request counts, not just decode-only counts.
-        tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
-        sp_enabled = model_config.sequence_parallel and tp_size > 1
-        mtp_batch_sizes = set()
-        for dim in context.cuda_graph_batch_dimensions_list:
-            n = dim.req_count
-            if n > 0:
-                if sp_enabled:
-                    n += (tp_size - n % tp_size) % tp_size
-                mtp_batch_sizes.add(n)
-        if not mtp_batch_sizes:
-            return
-
-        # Flag that MTP CUDA graphs are available. The actual padded count is
-        # re-derived at runtime from padded_batch_dimensions.req_count.
-        controller._has_mtp_cuda_graphs = True
-
-        device = torch.cuda.current_device()
-        dtype = model_config.params_dtype
-        hidden_size = model_config.hidden_size
-
-        # Enable inference dispatcher for EP during MTP graph capture.
-        is_inference_optimized_ep = (
-            model_config.transformer_impl == "inference_optimized"
-            and model_config.expert_model_parallel_size > 1
-        )
-        if is_inference_optimized_ep:
-            set_inference_cuda_graphed_iteration_for_ep_inference(model)
-
-        logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_batch_sizes))
-
-        from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
-
-        _set_capture_start()
-        for batch_size in sorted(mtp_batch_sizes):
-            dummy_hidden = torch.zeros((batch_size, 1, hidden_size), device=device, dtype=dtype)
-            if sp_enabled:
-                from megatron.core.tensor_parallel.mappings import (
-                    scatter_to_sequence_parallel_region,
-                )
-
-                dummy_hidden = scatter_to_sequence_parallel_region(
-                    dummy_hidden, group=controller.inference_wrapped_model.tp_group
-                )
-            dummy_token_ids = torch.zeros((1, batch_size), device=device, dtype=torch.long)
-            dummy_position_ids = torch.zeros((1, batch_size), device=device, dtype=torch.int64)
-
-            # One call per batch size; depth=0 warms the shared layer (repeated
-            # mode) or the first unique layer (non-repeated mode).
-            unwrapped.compute_mtp_single_step(
-                hidden_states=dummy_hidden,
-                next_token_ids=dummy_token_ids,
-                position_ids=dummy_position_ids,
-                depth=0,
-            )
-        _set_capture_end()
-
-        if is_inference_optimized_ep:
-            unset_inference_cuda_graphed_iteration_for_ep_inference(model)
-
-        logging.info("> MTP CUDA graph warmup complete")
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
