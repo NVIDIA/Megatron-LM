@@ -255,12 +255,14 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
+        # TEColumnParallelLinear rejects gather_output=True, so always pass
+        # False and handle output gathering ourselves in forward().
         super().__init__(
             input_size,
             output_size,
             config=config,
             init_method=init_method,
-            gather_output=gather_output,
+            gather_output=False,
             bias=bias,
             skip_bias_add=skip_bias_add,
             is_expert=is_expert,
@@ -269,6 +271,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
         )
+        self.gather_output = gather_output
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
 
@@ -339,9 +342,6 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         runtime_gather_output: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, None]:
         """Forward pass."""
-        if self.training:
-            return super().forward(x, weight=weight, runtime_gather_output=runtime_gather_output)
-
         if weight is None:
             weight = self.weight
 
