@@ -68,12 +68,19 @@ class RankRole:
     mode: ModuleLayout = ModuleLayout.COLOCATED
 
     @classmethod
-    def colocated(cls, module_names: List[str]) -> 'RankRole':
-        """Create a role for colocated: every module on every rank, PP=1."""
+    def colocated(cls, modality_module_names: List[str]) -> 'RankRole':
+        """Create a role for colocated layout: every module on every rank, PP=1.
+
+        Args:
+            modality_module_names: Modality module names (e.g. ``["images",
+                "audio"]``). The language model key is appended automatically
+                so the arg shape matches ``from_grid_map``.
+        """
+        all_module_names = list(modality_module_names) + [MIMO_LANGUAGE_MODULE_KEY]
         return cls(
             modules={
                 name: ModuleStageInfo(is_first_stage=True, is_last_stage=True)
-                for name in module_names
+                for name in all_module_names
             },
             mode=ModuleLayout.COLOCATED,
         )

@@ -19,35 +19,18 @@ class SliceInfo:
 
 
 class ColocatedBridgeCommunicator:
-    """Handles tensor communication between colocated modules with different TP/DP layouts.
+    """Bridges tensors between colocated modules with different TP/DP layouts.
 
-    Scope: PP=1 only on both src and dest grids.
+    Default ``dim_mapping`` assumes 3D ``(b, s, h)``. Callers bridging
+    ``MimoModel``'s pre-flattened ``(s*b, h)`` encoder output should pass
+    ``dim_mapping={'b': 0, 'h': 1}``; this relies on a uniform token count per
+    sample so dim 0 divides evenly by the DP scale.
 
-    The default ``dim_mapping`` assumes 3D ``(b, s, h)`` tensors. When wired up
-    through ``MimoModel`` the encoder output has already been flattened to
-    ``(total_tokens, hidden)`` (i.e. ``(s*b, h)``); in that case callers should
-    pass ``dim_mapping={'b': 0, 'h': 1}`` so dim 0 is treated as the batch/sample
-    dimension. This relies on a uniform token count per sample (per image in a
-    sample), which lets dim 0 be sliced evenly by the DP scale factor.
-
-    Input precondition (TP replication): ``communicate()`` assumes the input
-    tensor is already TP-replicated within each src DP group — i.e. all TP
-    ranks inside a given src DP replica hold the same tensor on the batch
-    dimension being bridged. Standard Megatron encoders produce TP-replicated
-    output at the bridge point (post-all-reduce/gather on the hidden dim), so
-    callers wiring this up through ``MimoModel`` get this for free. If you
-    bridge a point where the tensor is TP-sharded on the batch dim, results
-    are undefined — the communicator neither gathers along TP nor validates
-    this invariant on the fast path. Set ``ColocatedBridgeCommunicator
-    .CHECK_TP_REPLICATION = True`` (or pass ``check_tp_replication=True``) to
-    enable a collective equality check on every forward; it is slow and
-    intended only for debugging.
+    Precondition: the input must be TP-replicated across the src TP group —
+    i.e. all TP ranks inside a src DP replica hold the same tensor on the
+    batch dim. The bridge never gathers along TP; violating this silently
+    produces wrong results.
     """
-
-    # Debug flag: when True, every communicate() call all-gathers across the
-    # src TP group and verifies bitwise equality of the input tensor. Off by
-    # default because the check is collective and expensive.
-    CHECK_TP_REPLICATION: bool = False
 
     def __init__(
         self,
@@ -56,17 +39,12 @@ class ColocatedBridgeCommunicator:
         src_module_name: str = "src",
         dest_module_name: str = "dest",
         dim_mapping: Optional[Dict[str, int]] = None,
-        check_tp_replication: Optional[bool] = None,
     ):
         self.src_grid = src_grid
         self.dest_grid = dest_grid
         self.src_module_name = src_module_name
         self.dest_module_name = dest_module_name
         self.dim_mapping = dim_mapping or {'b': 0, 's': 1, 'h': 2}
-        # Per-instance override wins over the class-level default.
-        self.check_tp_replication = (
-            self.CHECK_TP_REPLICATION if check_tp_replication is None else check_tp_replication
-        )
         self.current_rank = dist.get_rank()
 
         self._validate_grids()
@@ -78,10 +56,31 @@ class ColocatedBridgeCommunicator:
         self.fan_out_gather_pg: Optional[dist.ProcessGroup] = None
         self.fan_out_gather_group_ranks: List[List[int]] = []
 
+        # Fan-in forward and fan-out backward both build "gather sibling" groups:
+        # each group contains the `scale` ranks on the *opposite* side of the
+        # bridge whose DP indices map into one DP slot on the iterating side.
+        # Fan-in: iterate dest DP, gather src ranks; fan-out: iterate src DP,
+        # gather dest ranks. Same shape, different endpoints — share a builder.
         if self.fan_in_scale > 1:
-            self._build_all_gather_groups()
+            self.all_gather_group_ranks = self._build_gather_groups(
+                iter_size=self.dest_dp_size,
+                sibling_tp_size=self.src_tp_size,
+                scale=self.fan_in_scale,
+                rank_to_pos=self.rank_to_src_pos,
+            )
+            self.all_gather_pg, _ = dist.new_subgroups_by_enumeration(
+                self.all_gather_group_ranks, backend='nccl'
+            )
         elif self.fan_out_scale > 1:
-            self._build_fan_out_gather_groups()
+            self.fan_out_gather_group_ranks = self._build_gather_groups(
+                iter_size=self.src_dp_size,
+                sibling_tp_size=self.dest_tp_size,
+                scale=self.fan_out_scale,
+                rank_to_pos=self.rank_to_dest_pos,
+            )
+            self.fan_out_gather_pg, _ = dist.new_subgroups_by_enumeration(
+                self.fan_out_gather_group_ranks, backend='nccl'
+            )
 
         logging.info(
             f"[Rank {self.current_rank}] ColocatedBridgeCommunicator: "
@@ -165,64 +164,33 @@ class ColocatedBridgeCommunicator:
             for tp_idx, rank in enumerate(tp_group):
                 self.rank_to_dest_pos[rank] = (dp_idx, tp_idx)
 
-    def _build_all_gather_groups(self):
-        # Ranks are appended in (src_dp_idx, src_tp_idx) slot order so that the
-        # position inside ``group_ranks`` equals each participant's slot in the
-        # gathered output. ``new_subgroups_by_enumeration`` assigns group-local
-        # ranks by list position, and ``all_gather_into_tensor`` concatenates
-        # outputs in group-local-rank order — so preserving append order is
-        # load-bearing. Do not sort.
-        all_groups: List[List[int]] = []
+    @staticmethod
+    def _build_gather_groups(
+        iter_size: int,
+        sibling_tp_size: int,
+        scale: int,
+        rank_to_pos: Dict[int, Tuple[int, int]],
+    ) -> List[List[int]]:
+        """Build ``iter_size * sibling_tp_size`` gather groups of ``scale`` ranks.
 
-        for dest_dp_idx in range(self.dest_dp_size):
-            src_dp_start = dest_dp_idx * self.fan_in_scale
-            src_dp_indices = range(src_dp_start, src_dp_start + self.fan_in_scale)
-
-            for src_tp_idx in range(self.src_tp_size):
-                group_ranks = []
-                for src_dp_idx in src_dp_indices:
-                    for rank, (dp, tp) in self.rank_to_src_pos.items():
-                        if dp == src_dp_idx and tp == src_tp_idx:
-                            group_ranks.append(rank)
-                            break
-                all_groups.append(group_ranks)
-
-        self.all_gather_group_ranks = all_groups
-        self.all_gather_pg, _ = dist.new_subgroups_by_enumeration(all_groups, backend='nccl')
-
-        logging.debug(f"[Rank {self.current_rank}] All-gather groups: {all_groups}")
-
-    def _build_fan_out_gather_groups(self):
-        """Build all-gather groups used by the fan-out backward.
-
-        In fan-out forward, each dest rank takes a local slice of its src rank's
-        batch. The src rank's full-batch gradient is the concatenation of the
-        slice gradients produced by every dest rank that consumed one of its
-        slices. We build a group per (src_dp_idx, dest_tp_idx) containing the
-        ``fan_out_scale = dest_dp / src_dp`` dest ranks that cover consecutive
-        dest_dp_idx values mapping to this src_dp_idx. Ranks are appended in
-        slot order (increasing dest_dp_idx), which equals group-local-rank
-        order inside ``new_subgroups_by_enumeration`` — so the subsequent
-        ``all_gather_into_tensor`` reconstructs the full-batch gradient in the
-        correct layout. Do not sort this list.
+        For each slot on the "iterating" side and each TP shard on the
+        sibling side, collect the ``scale`` sibling ranks whose DP indices map
+        into that slot. Append order matches group-local-rank order, which is
+        what ``all_gather_into_tensor`` uses to concatenate outputs — do not
+        sort.
         """
-        all_groups: List[List[int]] = []
-
-        for src_dp_idx in range(self.src_dp_size):
-            dest_dp_start = src_dp_idx * self.fan_out_scale
-            dest_dp_indices = range(dest_dp_start, dest_dp_start + self.fan_out_scale)
-
-            for dest_tp_idx in range(self.dest_tp_size):
+        groups: List[List[int]] = []
+        for iter_idx in range(iter_size):
+            sibling_dp_indices = range(iter_idx * scale, (iter_idx + 1) * scale)
+            for sibling_tp_idx in range(sibling_tp_size):
                 group_ranks = []
-                for dest_dp_idx in dest_dp_indices:
-                    for rank, (dp, tp) in self.rank_to_dest_pos.items():
-                        if dp == dest_dp_idx and tp == dest_tp_idx:
+                for sibling_dp_idx in sibling_dp_indices:
+                    for rank, (dp, tp) in rank_to_pos.items():
+                        if dp == sibling_dp_idx and tp == sibling_tp_idx:
                             group_ranks.append(rank)
                             break
-                all_groups.append(group_ranks)
-
-        self.fan_out_gather_group_ranks = all_groups
-        self.fan_out_gather_pg, _ = dist.new_subgroups_by_enumeration(all_groups, backend='nccl')
+                groups.append(group_ranks)
+        return groups
 
     def get_slice_info(self, batch_size: int) -> SliceInfo:
         """Compute batch slice info for the current rank given the full batch size.
@@ -250,16 +218,12 @@ class ColocatedBridgeCommunicator:
             )
 
     def _get_fan_out_slice_info(self, batch_size: int) -> SliceInfo:
-        if self.current_rank not in self.rank_to_dest_pos:
-            return SliceInfo(start=0, size=batch_size)
         dest_dp_idx = self.rank_to_dest_pos[self.current_rank][0]
         slot = dest_dp_idx % self.fan_out_scale
         slice_size = batch_size // self.fan_out_scale
         return SliceInfo(start=slot * slice_size, size=slice_size)
 
     def _get_fan_in_slice_info(self, batch_size: int) -> SliceInfo:
-        if self.current_rank not in self.rank_to_src_pos:
-            return SliceInfo(start=0, size=batch_size)
         src_dp_idx = self.rank_to_src_pos[self.current_rank][0]
         slot = src_dp_idx % self.fan_in_scale
         slice_size = batch_size // self.fan_in_scale
@@ -273,56 +237,19 @@ class ColocatedBridgeCommunicator:
         """Return True if src DP > dest DP (encoder has more replicas)."""
         return self.src_dp_size > self.dest_dp_size
 
-    def _assert_tp_replicated(self, tensor: torch.Tensor) -> None:
-        """Collective debug check that ``tensor`` is identical across src TP ranks.
-
-        Off by default (see ``CHECK_TP_REPLICATION``). When enabled, runs an
-        all-gather on the src TP group and raises if any TP peer's tensor
-        differs from the local one. Expensive — debug-only.
-        """
-        if not self.check_tp_replication:
-            return
-        if self.src_tp_size <= 1:
-            return
-        if self.current_rank not in self.rank_to_src_pos:
-            return
-        tp_group = self.src_grid.get_pg('tp')
-        local = tensor.contiguous()
-        gathered = [torch.empty_like(local) for _ in range(self.src_tp_size)]
-        dist.all_gather(gathered, local, group=tp_group)
-        for peer_idx, peer in enumerate(gathered):
-            if not torch.equal(peer, local):
-                raise RuntimeError(
-                    f"ColocatedBridgeCommunicator: TP-replication precondition "
-                    f"violated at rank {self.current_rank}: input tensor differs "
-                    f"from src TP peer slot {peer_idx}. The bridge requires the "
-                    f"encoder output to be TP-replicated on the batch dim."
-                )
-
     def communicate(self, tensor: torch.Tensor) -> torch.Tensor:
         """Transform tensor from src TP/DP layout to dest TP/DP layout.
 
-        Precondition: ``tensor`` must be TP-replicated within each src DP
-        group (see class docstring). The communicator does not gather along
-        TP; feeding a TP-sharded tensor silently produces wrong results.
-
-        Raises:
-            ValueError: if the batch dim size is not divisible by the active
-                fan-in or fan-out scale factor.
-            RuntimeError: only when ``check_tp_replication`` is enabled and
-                the precondition is violated.
+        Raises ``ValueError`` if the batch dim size is not divisible by the
+        active fan-out scale (fan-in backward re-checks via get_slice_info).
         """
         # Fan-out forward narrows dim[b] by fan_out_scale; non-divisibility
-        # there would silently truncate the batch. Fan-in forward all-gathers
-        # (no slice), and the backward narrow runs against the post-gather
-        # size which is always divisible — so only fan-out needs a
-        # forward-side divisibility guard. get_slice_info() re-checks on the
-        # backward path for fan-in and fan-out both.
+        # here would silently truncate the batch. Fan-in forward all-gathers
+        # (no slice), so it doesn't need a forward-side guard.
         if self.fan_out_scale > 1:
             batch_dim = self.dim_mapping['b']
             batch_size = tensor.shape[batch_dim]
             self._check_divisible(batch_size, self.fan_out_scale, "fan_out_scale")
-        self._assert_tp_replicated(tensor)
         return _ColocatedCommunicate.apply(tensor, self)
 
     def destroy(self) -> None:

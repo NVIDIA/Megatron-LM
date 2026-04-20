@@ -61,22 +61,14 @@ class MimoModel(MegatronModule):
         self.mimo_config = mimo_config
         modality_names = list(mimo_config.modality_submodules_spec.keys())
         self.colocated_comms = {}
-        if mimo_config.module_to_grid_map:
-            expected_keys = set(modality_names) | {MIMO_LANGUAGE_MODULE_KEY}
-            grid_keys = set(mimo_config.module_to_grid_map.keys())
-            if grid_keys != expected_keys:
-                raise ValueError(
-                    f"module_to_grid_map keys must match modality module names + "
-                    f"'{MIMO_LANGUAGE_MODULE_KEY}'. Missing: {expected_keys - grid_keys}, "
-                    f"Extra: {grid_keys - expected_keys}"
-                )
-            if self._is_colocated(mimo_config.module_to_grid_map):
-                self.role = RankRole.colocated(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
-                self._build_colocated_communicators()
-            else:
-                self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
+        if mimo_config.module_to_grid_map and not self._is_colocated(
+            mimo_config.module_to_grid_map
+        ):
+            self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
         else:
-            self.role = RankRole.colocated(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
+            self.role = RankRole.colocated(modality_names)
+            if mimo_config.module_to_grid_map:
+                self._build_colocated_communicators()
 
         # Use special token IDs from the config
         self.special_token_ids = (
@@ -513,12 +505,6 @@ class MimoModel(MegatronModule):
         return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
 
     def _build_colocated_communicators(self):
-        """Build communicators for each encoder → language edge.
-
-        Encoder outputs reach the communicator after ``VisionModalitySubmodules``
-        has flattened them to ``(total_tokens, hidden)``; dim 0 is the
-        batch/sample dimension for slicing and all-gathering.
-        """
         grid_map = self.mimo_config.module_to_grid_map
         lang_key = MIMO_LANGUAGE_MODULE_KEY
         lang_grid = grid_map[lang_key]

@@ -45,3 +45,18 @@ class MimoModelConfig:
     special_token_ids: Dict[str, int] = field(default_factory=dict)
     module_to_grid_map: Optional[Dict[str, HyperCommGrid]] = None
     kv_format: str = "sbhd"
+
+    def __post_init__(self):
+        if not self.module_to_grid_map:
+            return
+        # Local import avoids circular imports at dataclass-module import time.
+        from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+
+        expected_keys = set(self.modality_submodules_spec.keys()) | {MIMO_LANGUAGE_MODULE_KEY}
+        grid_keys = set(self.module_to_grid_map.keys())
+        if grid_keys != expected_keys:
+            raise ValueError(
+                f"module_to_grid_map keys must match modality module names + "
+                f"'{MIMO_LANGUAGE_MODULE_KEY}'. Missing: {expected_keys - grid_keys}, "
+                f"Extra: {grid_keys - expected_keys}"
+            )
