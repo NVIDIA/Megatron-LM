@@ -13,6 +13,9 @@ try:
 except ImportError:
     HAVE_DEEP_EP = False
 
+import math
+import os
+
 import torch
 
 _buffer = None
@@ -267,12 +270,50 @@ else:
 
 try:
     from deep_ep import HybridEPBuffer
+    import hybrid_ep_cpp as _hybrid_ep_cpp
 
     HAVE_HYBRIDEP = True
 except ImportError:
+    _hybrid_ep_cpp = None
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
+
+_HYBRID_EP_COMBINE_CHUNK_FALLBACK = 64
+
+
+def _get_hybrid_ep_buffer_alignment() -> int:
+    '''
+    Return the per-rank token-count alignment required by HybridEP's combine kernel.
+
+    HybridEP's ``combine_kernel`` contains the ``static_assert``::
+
+        static_assert(MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK == 0,
+                      "MAX_NUM_OF_TOKENS_PER_RANK must be multiple of NUM_OF_TOKENS_PER_CHUNK.");
+
+    (``csrc/hybrid_ep/backend/hybrid_ep_backend.cuh``). deep_ep's Python layer
+    (``HybridEPBuffer.__init__``) only aligns ``max_num_of_tokens_per_rank``
+    to 16 (for TMA), so a per-rank token count that is not a multiple of the
+    combine-API chunk size triggers a JIT compilation failure inside the
+    combine kernel.
+    '''
+    if _hybrid_ep_cpp is not None:
+        try:
+            probe = _hybrid_ep_cpp.Configurer(
+                hidden_dim=16,
+                max_num_of_tokens_per_rank=1,
+                num_local_experts=4,
+                num_of_ranks_per_node=1,
+                num_of_nodes=1,
+                use_fp8=False,
+            )
+            return int(probe.buffer_config.num_of_tokens_per_chunk_combine_api)
+        except Exception:
+            pass
+
+    return int(
+        os.getenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", str(_HYBRID_EP_COMBINE_CHUNK_FALLBACK))
+    )
 
 
 def init_hybrid_ep_buffer(
@@ -298,7 +339,12 @@ def init_hybrid_ep_buffer(
         hidden_dim (int):
             Hidden dimension of the input tensor.
         seq_len (int):
-            Maximum sequence length of the input tensor.
+            Maximum sequence length of the input tensor. The value is
+            rounded up to a multiple of HybridEP's combine-API chunk size
+            (queried directly from deep_ep) to satisfy the
+            ``combine_kernel``'s ``static_assert`` on
+            ``MAX_NUM_OF_TOKENS_PER_RANK``; see
+            :func:`_get_hybrid_ep_buffer_alignment` for details.
         num_local_experts (int):
             Number of local experts.
         num_sms_dispatch_api (int):
@@ -309,11 +355,15 @@ def init_hybrid_ep_buffer(
             Whether to use FP8 communication during the dispatch phase.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
+
+    chunk_size = _get_hybrid_ep_buffer_alignment()
+    aligned_seq_len = math.ceil(seq_len / chunk_size) * chunk_size
+
     global _hybrid_ep_buffer
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
-        max_num_of_tokens_per_rank=seq_len,
+        max_num_of_tokens_per_rank=aligned_seq_len,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
@@ -516,3 +566,4 @@ if HAVE_HYBRIDEP:
 else:
     hybrid_ep_dispatch = None
     hybrid_ep_combine = None
+
