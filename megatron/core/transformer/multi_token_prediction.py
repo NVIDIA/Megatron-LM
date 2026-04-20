@@ -22,6 +22,7 @@ from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.tensor_parallel.inference_layers import inference_all_gather_last_dim
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -932,11 +933,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
         hidden_states, _ = self.eh_proj(hidden_states)
         # For tensor parallel we need to gather the tensor across the model-parallel
-        # ranks after the linear projection. This used to call
-        # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
-        # the gradient in backward pass and was therefore incorrect in this context.
-        # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-        hidden_states = gather_from_tensor_model_parallel_region(hidden_states, group=self.tp_group)
+        # ranks after the linear projection.
+        if not self.training:
+            hidden_states = inference_all_gather_last_dim(
+                hidden_states, self.tp_group, self.config
+            )
+        else:
+            hidden_states = gather_from_tensor_model_parallel_region(
+                hidden_states, group=self.tp_group
+            )
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
             hidden_states = scatter_to_sequence_parallel_region(hidden_states, group=self.tp_group)

@@ -21,6 +21,7 @@ from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 try:
@@ -312,20 +313,53 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
-        """
-        Forward pass.
-        """
+    def _nvls_gather_last_dim(self, x: torch.Tensor) -> torch.Tensor:
+        """NVLS all-gather along last dim, with NCCL fallback."""
+        ag_buffer_dims = list(x.size())
+        ag_buffer_dims[0] *= self.tp_size
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(ag_buffer_dims, dtype=x.dtype)
+
+        can_use_nvls = (
+            self.triton_nvls_kernels_allowed
+            and are_tensors_nvls_eligible(x)
+            and symm_mem_buffer["handle"] is not None
+        )
+        if can_use_nvls:
+            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            tensor_list = symm_mem_buffer["tensor"].chunk(self.tp_size, dim=0)
+            return torch.cat(tensor_list, dim=-1).contiguous()
+
+        return gather_from_tensor_model_parallel_region(x, group=self.tp_group)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        weight: Optional[torch.Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, None]:
+        """Forward pass."""
         if self.training:
-            return super().forward(x)
+            return super().forward(x, weight=weight, runtime_gather_output=runtime_gather_output)
+
+        if weight is None:
+            weight = self.weight
 
         if self.tp_size == 1:
-            x = _apply_linear(x, self.weight, self.config)
+            x = _apply_linear(x, weight, self.config)
             return x, None
 
-        symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
-        x = self._all_gather(x, symm_mem_buffer)
-        x = _apply_linear(x, self.weight, self.config)
+        if self.sequence_parallel:
+            symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
+            x = self._all_gather(x, symm_mem_buffer)
+
+        x = _apply_linear(x, weight, self.config)
+
+        gather_output = self.gather_output
+        if runtime_gather_output is not None:
+            gather_output = runtime_gather_output
+        if gather_output:
+            x = self._nvls_gather_last_dim(x)
 
         return x, None
 
@@ -473,3 +507,40 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         else:
             x = self._matmul_reduce_scatter(x)
             return x, None
+
+
+def inference_all_gather_last_dim(
+    x: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup,
+    config: TransformerConfig,
+) -> torch.Tensor:
+    """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
+
+    Replaces ``gather_from_tensor_model_parallel_region`` in inference paths
+    where autograd is not needed and NVLS symmetric-memory is available.
+
+    The NVLS path performs a flat all-gather into symmetric memory (concatenating
+    along dim-0), then rearranges the result to the last dimension — the same
+    semantics as ``_gather_along_last_dim`` but using hardware multicast when
+    possible.
+    """
+    tp_size = dist.get_world_size(tp_group)
+    if tp_size == 1:
+        return x
+
+    triton_nvls_kernels_allowed = not getattr(
+        config, 'inference_disable_triton_nvls_kernels', False
+    )
+
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+        ag_buffer_dims = list(x.size())
+        ag_buffer_dims[0] *= tp_size
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(ag_buffer_dims, dtype=x.dtype)
+
+        if are_tensors_nvls_eligible(x) and symm_mem_buffer["handle"] is not None:
+            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            tensor_list = symm_mem_buffer["tensor"].chunk(tp_size, dim=0)
+            return torch.cat(tensor_list, dim=-1).contiguous()
+
+    return gather_from_tensor_model_parallel_region(x, group=tp_group)
