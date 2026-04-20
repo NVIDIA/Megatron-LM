@@ -479,7 +479,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         total_split = sum(split_sizes)
         elems_per_unit = data_size // total_split
 
-        local_tensor = data.to_local()
+        local_tensor = data.to_local() if isinstance(data, DTensor) else data
         view_shape = list(data.shape)
 
         per_tp_rank_shape = list(data.shape)
@@ -555,7 +555,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key)
+                    dist_param = model.get_parameter(_strip_wrappers(key))
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor

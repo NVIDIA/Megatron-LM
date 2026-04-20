@@ -396,6 +396,7 @@ fi
 CKPT_LOAD=${CKPT_LOAD:-}
 CKPT_FORMAT=${CKPT_FORMAT:-}
 CKPT_RESUME=${CKPT_RESUME:-0}
+CKPT_OVERRIDE_SCHEDULER=${CKPT_OVERRIDE_SCHEDULER:-0}
 CKPT_ARGS=()
 if [ -n "$CKPT_LOAD" ]; then
     CKPT_ARGS+=( --load "$CKPT_LOAD" )
@@ -404,6 +405,9 @@ if [ -n "$CKPT_LOAD" ]; then
     fi
     if [ -n "$CKPT_FORMAT" ]; then
         CKPT_ARGS+=( --ckpt-format "$CKPT_FORMAT" )
+    fi
+    if [ "$CKPT_OVERRIDE_SCHEDULER" -eq 1 ]; then
+        CKPT_ARGS+=( --override-opt-param-scheduler )
     fi
 fi
 
