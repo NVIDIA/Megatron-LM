@@ -398,7 +398,7 @@ class TestMuPConfigValidation:
                 '--num-attention-heads', '16',
                 '--no-rope-fusion',
                 '--scaling-recipe', 'depth_mup',
-                '--optimizer', 'adamw',
+                '--optimizer', 'adam',
                 '--scaling-base-hidden-size', '256',
                 '--scaling-base-num-layers', '6',
                 '--scaling-base-head-dim', '64',
@@ -408,7 +408,7 @@ class TestMuPConfigValidation:
         depth_config = core_transformer_config_from_args(depth_args)
         assert depth_config.use_mup is False
         assert depth_config.scaling_recipe == 'depth_mup'
-        assert depth_args.optimizer == 'adamw'
+        assert depth_args.optimizer == 'adam'
         assert canonical_config.mup_width_mult == pytest.approx(4.0)
 
         legacy_args = parser.parse_args(
@@ -441,7 +441,7 @@ class TestMuPConfigValidation:
                 '--micro-batch-size', '1',
                 '--max-position-embeddings', '128',
                 '--no-rope-fusion',
-                '--optimizer', 'adamw',
+                '--optimizer', 'adam',
                 '--scaling-recipe', 'depth_mup',
             ]
         )
@@ -520,7 +520,7 @@ class TestMuPConfigValidation:
             scaling_base_hidden_size=256,
             scaling_base_num_layers=6,
             scaling_base_head_dim=64,
-            optimizer='adamw',
+            optimizer='adam',
         )
 
         kw_args = core_config_from_yaml_args(args, TransformerConfig)
@@ -537,11 +537,11 @@ class TestMuPConfigValidation:
     def test_depth_mup_optimizer_gate_rejects_non_adam_yaml_namespace(self):
         args = SimpleNamespace(scaling_recipe='depth_mup', optimizer='sgd')
 
-        with pytest.raises(ValueError, match='Adam/AdamW only'):
+        with pytest.raises(ValueError, match="supports optimizer='adam' only"):
             validate_depth_mup_optimizer_support(args)
 
-    def test_depth_mup_optimizer_gate_allows_adamw_yaml_namespace(self):
-        args = SimpleNamespace(scaling_recipe='depth_mup', optimizer='adamw')
+    def test_depth_mup_optimizer_gate_allows_adam_yaml_namespace(self):
+        args = SimpleNamespace(scaling_recipe='depth_mup', optimizer='adam')
 
         validate_depth_mup_optimizer_support(args)
 
@@ -550,7 +550,7 @@ class TestMuPConfigValidation:
             optimizer='sgd', language_model=SimpleNamespace(scaling_recipe='depth_mup')
         )
 
-        with pytest.raises(ValueError, match='Adam/AdamW only'):
+        with pytest.raises(ValueError, match="supports optimizer='adam' only"):
             validate_depth_mup_optimizer_support(args)
 
     def test_depth_mup_optimizer_gate_tolerates_yaml_namespace_without_scaling_fields(self):
@@ -572,7 +572,7 @@ class TestMuPConfigValidation:
 
     def test_validate_yaml_calls_depth_mup_hook(self):
         args = _build_minimal_validate_yaml_namespace(
-            optimizer='adamw',
+            optimizer='adam',
             language_model=SimpleNamespace(
                 num_layers=12,
                 hidden_size=1024,
@@ -688,7 +688,7 @@ class TestMuPConfigValidation:
             scaling_base_hidden_size=256,
             scaling_base_num_layers=6,
             scaling_base_head_dim=64,
-            optimizer='adamw',
+            optimizer='adam',
             add_position_embedding=True,
             vocab_file=None,
             data_parallel_random_init=False,
@@ -705,7 +705,7 @@ class TestMuPConfigValidation:
             scaling_base_hidden_size=256,
             scaling_base_num_layers=6,
             scaling_base_head_dim=64,
-            optimizer='adamw',
+            optimizer='adam',
             add_position_embedding=True,
             vocab_file=None,
             data_parallel_random_init=False,
@@ -1810,7 +1810,7 @@ class TestMuPLRScaling:
         )
         assert 'wd_mult' not in output_override
 
-    def test_depth_mup_applies_spectral_adamw_policy_defaults(self):
+    def test_depth_mup_applies_spectral_adam_policy_defaults(self):
         model_config = TransformerConfig(
             hidden_size=1024,
             num_layers=16,
@@ -1819,7 +1819,7 @@ class TestMuPLRScaling:
             scaling_base_hidden_size=256,
             scaling_base_num_layers=4,
         )
-        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adamw')
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
 
         assert scaling_policy.hidden_lr_multiplier == pytest.approx(1.0 / 4.0)
         assert scaling_policy.hidden_eps_depth_power == pytest.approx(-1.0)
@@ -1849,8 +1849,7 @@ class TestMuPLRScaling:
         assert build_resolved_model_policy(base_depth_config).residual_branch_multiplier == pytest.approx(1.0)
         assert build_resolved_model_policy(double_depth_config).residual_branch_multiplier == pytest.approx(0.5)
 
-    @pytest.mark.parametrize('optimizer_type', ['adam', 'adamw'])
-    def test_depth_mup_hidden_depth_factor_excludes_embedding_class_eps(self, optimizer_type):
+    def test_depth_mup_hidden_depth_factor_excludes_embedding_class_eps(self):
         config = TransformerConfig(
             hidden_size=512,
             num_layers=24,
@@ -1859,7 +1858,7 @@ class TestMuPLRScaling:
             scaling_base_hidden_size=512,
             scaling_base_num_layers=12,
         )
-        policy = build_resolved_training_policy(config, optimizer_type=optimizer_type)
+        policy = build_resolved_training_policy(config, optimizer_type='adam')
 
         assert policy.hidden_eps_multiplier == pytest.approx(0.5)
         assert policy.hidden_vector_eps_multiplier == pytest.approx(0.5)
@@ -1875,7 +1874,7 @@ class TestMuPLRScaling:
             scaling_base_hidden_size=256,
             scaling_base_num_layers=4,
         )
-        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adamw')
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
         standard_overrides = get_standard_config_overrides(
             optimizer_config, scaling_policy=scaling_policy
         )
@@ -1897,7 +1896,7 @@ class TestMuPLRScaling:
             scaling_base_hidden_size=256,
             scaling_base_num_layers=4,
         )
-        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adamw')
+        scaling_policy = build_resolved_training_policy(model_config, optimizer_type='adam')
         standard_overrides = get_standard_config_overrides(
             optimizer_config, scaling_policy=scaling_policy
         )
@@ -1927,7 +1926,7 @@ class TestMuPLRScaling:
             scaling_base_num_layers=4,
         )
 
-        with pytest.raises(ValueError, match="supports Adam/AdamW only"):
+        with pytest.raises(ValueError, match="supports optimizer='adam' only"):
             build_resolved_training_policy(model_config, optimizer_type='sgd')
 
     def test_depth_mup_rejects_muon(self):
@@ -1940,7 +1939,7 @@ class TestMuPLRScaling:
             scaling_base_num_layers=4,
         )
 
-        with pytest.raises(ValueError, match="supports Adam/AdamW only"):
+        with pytest.raises(ValueError, match="supports optimizer='adam' only"):
             build_resolved_training_policy(model_config, optimizer_type='muon')
 
     def test_scaling_policy_applies_hidden_lr_depth_power_for_sgd(self):
@@ -2011,10 +2010,10 @@ class TestMuPConfigIntegration:
 class TestMuPOptimizerTypeHandling:
     """Tests for MuP optimizer-specific override behavior."""
 
-    def test_adamw_uses_standard_optimizer_path(self):
+    def test_adam_with_decoupled_weight_decay_uses_standard_optimizer_path(self):
         param = torch.nn.Parameter(torch.ones(1))
         optimizer_config = OptimizerConfig(
-            optimizer='adamw',
+            optimizer='adam',
             lr=1e-3,
             weight_decay=0.1,
             decoupled_weight_decay=True,

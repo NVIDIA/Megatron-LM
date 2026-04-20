@@ -176,7 +176,7 @@ def get_scaling_config_overrides(
       - vector-like params keep base lr and eps
       - SGD vector-like lr = base_lr * width_mult
       - SGD hidden (matrix-like) lr = base_lr * depth_mult^hidden_lr_depth_power
-    - ``depth_mup`` (Adam/AdamW only):
+    - ``depth_mup`` (`optimizer='adam'` only):
       - hidden matrix-like lr = base_lr / width_mult
       - hidden matrix-like eps = base_eps / (width_mult * depth_mult)
       - hidden matrix-like wd = base_wd * width_mult
@@ -600,7 +600,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             assert (
                 config.decoupled_weight_decay
             ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
-            is_adam_optimizer = config.optimizer in ('adam', 'adamw')
+            is_adam_optimizer = config.optimizer == 'adam'
             gpu_optimizer_cls = Adam if is_adam_optimizer else SGD
             cpu_optimizer_cls = CPUAdam if is_adam_optimizer else CPUSGD
             if config.use_torch_optimizer_for_cpu_offload:
@@ -634,7 +634,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 **optimizer_defaults,
             )
             init_state_fn = None
-        elif config.optimizer in ('adam', 'adamw'):
+        elif config.optimizer == 'adam':
             kwargs = {
                 "params": param_groups,
                 "lr": config.lr,
@@ -992,7 +992,7 @@ def get_megatron_optimizer(
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'adamw', 'sgd'):
+    if config.optimizer not in ('adam', 'sgd'):
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,

@@ -20,7 +20,8 @@ class ResolvedTrainingPolicy:
     def __post_init__(self) -> None:
         if self.context.is_depth_mup and not self.is_adam_optimizer:
             raise ValueError(
-                "scaling_recipe='depth_mup' currently supports Adam/AdamW only. "
+                "scaling_recipe='depth_mup' currently supports optimizer='adam' only. "
+                "AdamW semantics should continue to use decoupled_weight_decay. "
                 "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
                 "and input/output-bias rules and is intentionally out of scope for v1."
             )
@@ -43,7 +44,7 @@ class ResolvedTrainingPolicy:
 
     @property
     def is_adam_optimizer(self) -> bool:
-        return self.optimizer_type_lower in ('adam', 'adamw')
+        return self.optimizer_type_lower == 'adam'
 
     @property
     def is_muon_optimizer(self) -> bool:

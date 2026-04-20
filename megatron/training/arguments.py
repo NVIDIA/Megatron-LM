@@ -342,10 +342,10 @@ def validate_depth_mup_optimizer_support(args) -> None:
         args, 'optimizer'
     ) not in (
         'adam',
-        'adamw',
     ):
         raise ValueError(
-            "scaling_recipe='depth_mup' currently supports Adam/AdamW only. "
+            "scaling_recipe='depth_mup' currently supports optimizer='adam' only. "
+            "AdamW semantics should continue to use decoupled_weight_decay. "
             "SGD depth-mup requires explicit hidden-weight, hidden-bias, norm/vector, "
             "and input/output-bias rules and is intentionally out of scope for v1."
         )
@@ -1057,7 +1057,7 @@ def validate_args(args, defaults={}):
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam', 'adamw'), \
+        assert args.optimizer in ('sgd', 'adam'), \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
@@ -1492,7 +1492,7 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam', 'adamw'):
+    if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -2235,9 +2235,9 @@ def _add_scaling_args(parser):
     group.add_argument('--scaling-recipe', type=str, default=None,
                        choices=['none', 'mup', 'depth_mup'],
                        help='Canonical scaling recipe. `mup` preserves current Megatron MuP; '
-                       '`depth_mup` is the spectral width-depth μP Adam/AdamW recipe for '
-                       'dense GPT-style residual Transformer blocks within Megatron\'s '
-                       'current support surface.')
+                       '`depth_mup` is the spectral width-depth μP recipe for dense GPT-style '
+                       'residual Transformer blocks using `--optimizer adam`; AdamW semantics '
+                       'remain controlled by `decoupled_weight_decay`.')
     group.add_argument('--scaling-base-hidden-size', type=int, default=None,
                        help='Reference hidden size for width-based scaling recipes.')
     group.add_argument('--scaling-base-num-layers', type=int, default=None,
@@ -2658,7 +2658,7 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'adamw', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'lion', 'soap', 'adaptive_muon'],
                        help='Optimizer function. '
                             'Note: dist_muon is deprecated; use --optimizer muon '
                             'with --use-distributed-optimizer instead.')

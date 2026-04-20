@@ -359,8 +359,9 @@ class TransformerConfig(ModelParallelConfig):
     scaling_recipe: Optional[Literal['none', 'mup', 'depth_mup']] = None
     """
     Canonical scaling recipe. `mup` preserves the current Megatron MuP semantics,
-    `depth_mup` is the spectral width-depth μP Adam/AdamW recipe for dense
-    GPT-style residual Transformer blocks within Megatron's current support surface,
+    `depth_mup` is the spectral width-depth μP recipe for dense GPT-style
+    residual Transformer blocks using `optimizer='adam'`; AdamW semantics
+    remain controlled by `decoupled_weight_decay`,
     `none` keeps the standard parameterization, and `None` means unspecified so
     legacy alias resolution can decide the recipe.
     """
@@ -392,7 +393,7 @@ class TransformerConfig(ModelParallelConfig):
     scaling_hidden_lr_depth_power: Optional[float] = None
     """
     Relative depth exponent for hidden matrix-like LR overrides. Under
-    `depth_mup`, the default remains `0.0` for Adam/AdamW.
+    `depth_mup`, the default remains `0.0` for `optimizer='adam'`.
     """
 
     scaling_block_out_proj_init_depth_power: Optional[float] = None
