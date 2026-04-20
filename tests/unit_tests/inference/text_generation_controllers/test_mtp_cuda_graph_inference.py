@@ -62,16 +62,21 @@ class TestMTPCudaGraphInference:
     NUM_ATTN_HEADS = 4
     TP_SIZE = 2
 
-    def setup_method(self, method):
-        if Utils.world_size < self.TP_SIZE:
-            pytest.skip(f"Need at least {self.TP_SIZE} GPUs")
+    @classmethod
+    def setup_class(cls):
+        if Utils.world_size < cls.TP_SIZE:
+            pytest.skip(f"Need at least {cls.TP_SIZE} GPUs")
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=self.TP_SIZE, pipeline_model_parallel_size=1
+            tensor_model_parallel_size=cls.TP_SIZE, pipeline_model_parallel_size=1
         )
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         delete_cuda_graphs()
         Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        delete_cuda_graphs()
 
     # ---- helpers ---------------------------------------------------------- #
 
@@ -590,7 +595,8 @@ class TestMTPCudaGraphExpertParallel:
     NUM_ATTN_HEADS = 4
     NUM_MOE_EXPERTS = 2
 
-    def setup_method(self, method):
+    @classmethod
+    def setup_class(cls):
         if Utils.world_size < _EP_SIZE:
             pytest.skip(f"EP test requires at least {_EP_SIZE} GPUs")
         if Utils.world_size % _EP_SIZE != 0:
@@ -603,9 +609,13 @@ class TestMTPCudaGraphExpertParallel:
             expert_model_parallel_size=_EP_SIZE,
         )
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         delete_cuda_graphs()
         Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        delete_cuda_graphs()
 
     # ---- helpers ---------------------------------------------------------- #
 

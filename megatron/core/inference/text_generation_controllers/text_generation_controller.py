@@ -791,6 +791,7 @@ class TextGenerationController:
             kv_block_ids=request_to_kv_block_ids,
             num_speculative_tokens=self.num_speculative_tokens,
             block_size_tokens=context.block_size_tokens,
+            num_active_requests=active_request_count,
         )
 
         # Mamba speculative rewind: copy accepted intermediate states in-place.

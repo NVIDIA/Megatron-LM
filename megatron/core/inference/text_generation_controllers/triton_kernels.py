@@ -41,16 +41,24 @@ def _rewind_kv_cache_kernel(
     # Strides / limits
     kv_block_ids_stride,
     max_blocks_minus_1,
+    num_active_requests,
     # Compile-time constants
     NUM_SPEC_TOKENS: tl.constexpr,
     BLOCK_SIZE_TOKENS: tl.constexpr,
 ):
     """Rewind KV-cache bookkeeping for one request after speculative verification.
 
-    Grid: (active_request_count,)
-    Each program handles exactly one request.
+    Grid: may be padded beyond active requests for CUDA-graph compatibility.
+    Each program handles exactly one request.  Programs with
+    ``pid >= num_active_requests`` are padding and produce safe no-op outputs.
     """
     pid = tl.program_id(0)
+
+    # Padding programs: write safe defaults and skip all state mutation.
+    if pid >= num_active_requests:
+        tl.store(BLOCKS_TO_RELEASE_PTR + pid, 0)
+        tl.store(REMOVE_MASK_PTR + pid, False)
+        return
 
     # --- Load per-request scalars ---
     accepted = tl.load(ACCEPTED_COUNTS_PTR + pid)
@@ -104,8 +112,16 @@ def rewind_kv_cache(
     kv_block_ids,
     num_speculative_tokens,
     block_size_tokens,
+    num_active_requests=None,
 ):
     """Launch the KV-cache rewind Triton kernel.
+
+    Args:
+        num_active_requests: Number of real (non-padding) requests. When the
+            grid is padded beyond this count, the kernel skips padding
+            programs so stale data in padding slots cannot corrupt
+            bookkeeping.  Defaults to ``accepted_counts.shape[0]`` (no
+            padding).
 
     Returns:
         (blocks_to_release, remove_mask) — same semantics as the original
@@ -113,6 +129,8 @@ def rewind_kv_cache(
         state updates are handled separately by the caller).
     """
     N = accepted_counts.shape[0]
+    if num_active_requests is None:
+        num_active_requests = N
     if N == 0:
         return (
             torch.empty(0, device=accepted_counts.device, dtype=last_kv_block_id.dtype),
@@ -134,6 +152,7 @@ def rewind_kv_cache(
         remove_mask,
         kv_block_ids_stride=kv_block_ids.stride(0),
         max_blocks_minus_1=kv_block_ids.shape[1] - 1,
+        num_active_requests=num_active_requests,
         NUM_SPEC_TOKENS=num_speculative_tokens,
         BLOCK_SIZE_TOKENS=block_size_tokens,
     )

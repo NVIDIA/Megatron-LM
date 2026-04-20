@@ -1251,6 +1251,108 @@ class TestTextGenerationController:
             assert torch.all(ctx.mamba_conv_states[:, 1] == 77)  # Req 1 accepted 0, loaded index 0
 
     @pytest.mark.internal
+    def test_rewind_kv_cache_stale_padding_is_safe(self):
+        """Padding slots with stale data must not corrupt active requests or
+        release junk blocks when the rewind kernel grid is padded beyond the
+        active request count.
+
+        Without the num_active_requests guard in the kernel, padding slots
+        whose stale request_last_kv_block_offset < num_speculative_tokens
+        would produce remove_mask=True, causing the block allocator to free
+        block IDs that belong to other active requests.
+        """
+        from megatron.core.inference.text_generation_controllers.triton_kernels import (
+            rewind_kv_cache,
+        )
+
+        num_spec = 3
+        block_size = 4
+        active = 2
+        padded = 4
+        max_blocks = 10
+        dev = 'cuda'
+
+        # --- Active requests (slots 0-1): identical to test_rewind_kv_cache ---
+        # Req 0: accepted 1, last_offset 2 → rewind 2 → offset 0, no release
+        # Req 1: accepted 0, last_offset 1 → rewind 3 → crosses block, release block 60
+        accepted = torch.zeros(padded, device=dev, dtype=torch.int64)
+        accepted[0] = 1
+        accepted[1] = 0
+
+        prefill = torch.zeros(padded, device=dev, dtype=torch.int64)
+
+        last_offset = torch.zeros(padded, device=dev, dtype=torch.int64)
+        last_offset[0] = 2
+        last_offset[1] = 1
+
+        kv_length = torch.zeros(padded, device=dev, dtype=torch.int64)
+        kv_length[0] = 10
+        kv_length[1] = 15
+
+        block_counts = torch.zeros(padded, device=dev, dtype=torch.int64)
+        block_counts[0] = 3
+        block_counts[1] = 4
+
+        last_block_id = torch.zeros(padded, device=dev, dtype=torch.int64)
+        last_block_id[0] = 50
+        last_block_id[1] = 60
+
+        block_ids = torch.full((padded, max_blocks), -1, device=dev, dtype=torch.int64)
+        block_ids[0, :3] = torch.tensor([48, 49, 50])
+        block_ids[1, :4] = torch.tensor([57, 58, 59, 60])
+
+        # --- Padding slots (2-3): stale data from completed requests ---
+        # Crucially, last_offset values < num_spec would trigger remove=True
+        # without the kernel guard, releasing stale block IDs.
+        last_offset[2] = 1
+        last_offset[3] = 2
+        kv_length[2] = 9999
+        kv_length[3] = 9999
+        block_counts[2] = 5
+        block_counts[3] = 7
+        last_block_id[2] = 777
+        last_block_id[3] = 888
+        block_ids[2, :5] = torch.arange(100, 105, device=dev)
+        block_ids[3, :5] = torch.arange(200, 205, device=dev)
+
+        blocks_to_release, remove_mask = rewind_kv_cache(
+            accepted_counts=accepted,
+            prefill_status=prefill,
+            last_kv_block_offset=last_offset,
+            kv_length_offsets=kv_length,
+            kv_block_counts=block_counts,
+            last_kv_block_id=last_block_id,
+            kv_block_ids=block_ids,
+            num_speculative_tokens=num_spec,
+            block_size_tokens=block_size,
+            num_active_requests=active,
+        )
+
+        # --- Active request 0: rewind 2, no block release ---
+        assert remove_mask[0].item() is False
+        assert last_offset[0].item() == 0
+        assert kv_length[0].item() == 8
+        assert block_counts[0].item() == 3
+        assert last_block_id[0].item() == 50
+
+        # --- Active request 1: rewind 3, crosses block boundary ---
+        assert remove_mask[1].item() is True
+        assert last_offset[1].item() == 2  # (1 - 3) % 4 = 2
+        assert kv_length[1].item() == 12
+        assert block_counts[1].item() == 3
+        assert last_block_id[1].item() == 59
+        assert blocks_to_release[1].item() == 60
+
+        # --- Padding slots 2-3: must be no-ops, no blocks released ---
+        assert remove_mask[2].item() is False
+        assert remove_mask[3].item() is False
+        # Stale state must be untouched (kernel skipped these programs).
+        assert kv_length[2].item() == 9999
+        assert kv_length[3].item() == 9999
+        assert block_counts[2].item() == 5
+        assert block_counts[3].item() == 7
+
+    @pytest.mark.internal
     def test_speculative_multinomial_sampling(self):
         """Test that speculative decoding can successfully use non-greedy sampling
         (top_k > 1, top_p > 0) by flattening 3D MTP logits for torch.multinomial."""
