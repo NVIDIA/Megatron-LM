@@ -126,7 +126,6 @@ def set_global_variables(args, build_tokenizer=True):
 
     init_num_microbatches_calculator(
         args.rank,
-        args.rampup_batch_size,
         args.global_batch_size,
         args.micro_batch_size,
         args.data_parallel_size,
