@@ -38,6 +38,7 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
+    from megatron.core.transformer.attention_residuals import AttnResState
 
 logger = logging.getLogger(__name__)
 
@@ -401,6 +402,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
+        self.attn_res = None
+        self.mlp_attn_res = None
+        if self.config.attention_residuals:
+            from megatron.core.transformer.attention_residuals import FullAttnRes
+
+            self.attn_res = FullAttnRes(
+                self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                use_rmsnorm=self.config.attention_residual_rmsnorm,
+                implementation=self.config.attention_residual_implementation,
+            )
+            self.mlp_attn_res = FullAttnRes(
+                self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                use_rmsnorm=self.config.attention_residual_rmsnorm,
+                implementation=self.config.attention_residual_implementation,
+            )
+
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
@@ -540,6 +559,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        attn_res_state: Optional['AttnResState'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -575,6 +595,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if self.config.attention_residuals:
+            if attn_res_state is None:
+                raise RuntimeError("AttnRes is enabled but no AttnRes state was provided")
+            assert self.attn_res is not None
+            hidden_states = self.attn_res(attn_res_state.values())
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -636,7 +662,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
-        if using_fused_tp_inference_kernel:
+        if self.config.attention_residuals:
+            hidden_states = self._get_attn_res_sublayer_output(
+                attention_output_with_bias, "self_attention"
+            )
+            assert attn_res_state is not None
+            attn_res_state.append(hidden_states)
+        elif using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
             # self attention module.
@@ -656,6 +688,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         # Optional Layer norm after self-attention
+        if self.config.attention_residuals and not isinstance(self.cross_attention, IdentityOp):
+            raise NotImplementedError("AttnRes prototype currently supports decoder-only layers")
+
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
 
         if isinstance(pre_cross_attn_layernorm_output, tuple):
@@ -705,6 +740,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
+            attn_res_state=kwargs.get("attn_res_state", None),
         )
         return output, context
 
@@ -730,6 +766,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
+        attn_res_state: Optional['AttnResState'] = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -745,6 +782,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+
+        if self.config.attention_residuals:
+            if attn_res_state is None:
+                raise RuntimeError("AttnRes is enabled but no AttnRes state was provided")
+            if self.is_moe_layer:
+                raise NotImplementedError("AttnRes prototype currently supports dense MLP layers")
+            assert self.mlp_attn_res is not None
+            hidden_states = self.mlp_attn_res(attn_res_state.values())
 
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
@@ -834,8 +879,37 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 for tensor in mlp_output_with_bias:
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
+        elif self.config.attention_residuals:
+            if self.recompute_pre_mlp_layernorm:
+                self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                    mlp_output_with_bias[0]
+                )
+            hidden_states = self._get_attn_res_sublayer_output(mlp_output_with_bias, "mlp")
+            assert attn_res_state is not None
+            attn_res_state.append(hidden_states)
+            return make_viewless_tensor(
+                inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+            )
         else:
             return self._forward_post_mlp(mlp_output_with_bias, residual)
+
+    def _get_attn_res_sublayer_output(
+        self, output_with_bias: tuple[Tensor, Tensor | None], sublayer_name: str
+    ) -> Tensor:
+        """Extract the transform output to append to Full AttnRes history."""
+
+        if self.hidden_dropout != 0.0:
+            raise NotImplementedError("AttnRes prototype requires hidden_dropout=0.0")
+        if not isinstance(output_with_bias, tuple) or len(output_with_bias) != 2:
+            raise RuntimeError(
+                f"AttnRes expected {sublayer_name} to return (output, bias), "
+                f"got {type(output_with_bias)}"
+            )
+
+        output, bias = output_with_bias
+        if bias is not None:
+            raise NotImplementedError("AttnRes prototype requires bias-free sublayer outputs")
+        return output
 
     def _forward_post_mlp(
         self, mlp_output_with_bias: tuple[Tensor, Tensor | None], residual: Tensor

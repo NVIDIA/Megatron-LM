@@ -119,6 +119,36 @@ class TransformerConfig(ModelParallelConfig):
     hidden_size: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Transformer hidden size."""
 
+    attention_residuals: bool = False
+    """Enable Attention Residuals (AttnRes) in the transformer stack.
+
+    When disabled, the model uses standard residual connections.
+    """
+
+    attention_residual_type: Literal['full', 'block'] = 'full'
+    """Attention Residual variant to use."""
+
+    attention_residual_num_blocks: int = 8
+    """Number of depth blocks for Block AttnRes."""
+
+    attention_residual_rmsnorm: bool = True
+    """Apply RMSNorm to AttnRes keys before depth-wise scoring."""
+
+    attention_residual_implementation: Literal[
+        'torch', 'checkpointed', 'triton', 'triton_bwd'
+    ] = 'torch'
+    """Full AttnRes implementation.
+
+    `torch` is the default eager PyTorch implementation. `checkpointed` uses a
+    custom autograd function that recomputes Full AttnRes internals during
+    backward to reduce saved forward intermediates. `triton` uses Triton kernels
+    for the forward pass and the same checkpointed PyTorch backward recomputation.
+    `triton_bwd` uses Triton kernels for both forward and backward recomputation.
+    """
+
+    attention_residual_log_weights: bool = False
+    """Log AttnRes depth-attention weight diagnostics when instrumentation is wired."""
+
     num_attention_heads: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer attention heads."""
 

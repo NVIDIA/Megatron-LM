@@ -1776,6 +1776,74 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def _log_attention_residual_grad_stats(model, iteration):
+    """Log local AttnRes query gradient statistics for smoke validation."""
+
+    args = get_args()
+    if not getattr(args, 'attention_residuals', False):
+        return
+    if not getattr(args, 'attention_residual_log_weights', False):
+        return
+
+    attn_sq_sum = 0.0
+    mlp_sq_sum = 0.0
+    final_sq_sum = 0.0
+    attn_nonzero = 0
+    mlp_nonzero = 0
+    final_nonzero = 0
+    attn_params = 0
+    mlp_params = 0
+    final_params = 0
+
+    for model_chunk in model:
+        unwrapped_model_chunk = unwrap_model(model_chunk)
+        for name, param in unwrapped_model_chunk.named_parameters():
+            if not name.endswith('.query'):
+                continue
+            if (
+                '.attn_res.' not in name
+                and '.mlp_attn_res.' not in name
+                and '.final_attn_res.' not in name
+            ):
+                continue
+
+            grad = getattr(param, 'main_grad', None)
+            if grad is None:
+                grad = param.grad
+            if grad is None:
+                continue
+
+            grad_float = grad.detach().float()
+            grad_sq_sum = grad_float.pow(2).sum().item()
+            grad_nonzero = torch.count_nonzero(grad_float).item()
+
+            if '.final_attn_res.' in name:
+                final_sq_sum += grad_sq_sum
+                final_nonzero += grad_nonzero
+                final_params += grad.numel()
+            elif '.mlp_attn_res.' in name:
+                mlp_sq_sum += grad_sq_sum
+                mlp_nonzero += grad_nonzero
+                mlp_params += grad.numel()
+            else:
+                attn_sq_sum += grad_sq_sum
+                attn_nonzero += grad_nonzero
+                attn_params += grad.numel()
+
+    attn_norm = math.sqrt(attn_sq_sum)
+    mlp_norm = math.sqrt(mlp_sq_sum)
+    final_norm = math.sqrt(final_sq_sum)
+    print_rank_0(
+        f' [AttnRes grad stats] iteration {iteration + 1} | '
+        f'attn query grad norm: {attn_norm:.6E} '
+        f'nonzero: {attn_nonzero}/{attn_params} | '
+        f'mlp query grad norm: {mlp_norm:.6E} '
+        f'nonzero: {mlp_nonzero}/{mlp_params} | '
+        f'final query grad norm: {final_norm:.6E} '
+        f'nonzero: {final_nonzero}/{final_params} |'
+    )
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -1872,6 +1940,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+
+    _log_attention_residual_grad_stats(model, iteration)
 
     # Update parameters.
 
@@ -3288,11 +3358,6 @@ def evaluate(
     timers = get_timers()
 
     timers('evaluate', log_level=0).start(barrier=True)
-
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
-        from megatron.legacy.model.vision.knn_monitor import compute_feature_bank
-
-        compute_feature_bank(model)
 
     # Turn on evaluation mode which disables dropout.
     for model_module in model:

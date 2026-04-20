@@ -19,6 +19,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.attention_residuals import AttnResState, FullAttnRes
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -367,6 +368,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+
+        if self.config.attention_residuals and len(self.layers) > 0:
+            self.final_attn_res = FullAttnRes(
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                use_rmsnorm=self.config.attention_residual_rmsnorm,
+                implementation=self.config.attention_residual_implementation,
+            )
+        else:
+            self.final_attn_res = None
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
@@ -750,6 +761,24 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        attn_res_state = None
+        if self.config.attention_residuals:
+            if self.config.recompute_granularity == 'full' and self.training:
+                raise NotImplementedError(
+                    "AttnRes prototype is not wired into full-layer activation recomputation"
+                )
+            if self.config.attention_residual_type == 'full':
+                attn_res_state = AttnResState.full(hidden_states)
+            elif self.config.attention_residual_type == 'block':
+                attn_res_state = AttnResState.block(
+                    hidden_states,
+                    num_sublayers=len(self.layers) * 2,
+                    num_blocks=self.config.attention_residual_num_blocks,
+                )
+            else:
+                raise ValueError(
+                    f"unsupported attention_residual_type: {self.config.attention_residual_type}"
+                )
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -833,6 +862,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            attn_res_state=attn_res_state,
                         )
 
                     if (
@@ -845,6 +875,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
+
+        if attn_res_state is not None and self.final_attn_res is not None:
+            hidden_states = self.final_attn_res(attn_res_state.values())
 
         # Final layer norm.
         if self.final_layernorm is not None:

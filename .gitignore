@@ -16,6 +16,21 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
+checkpoints/
+tensorboard_logs/
+benchmark_cache*/
+.triton_libcuda/
+tea_debug.log
+*.log
+
+# Local Attention Residuals experiment artifacts.
+examples/attention_residuals/data/
+examples/attention_residuals/logs/
+examples/attention_residuals/cache/
+examples/attention_residuals/checkpoints/
+examples/attention_residuals/*_venv/
+examples/attention_residuals/preprocess_deps/
+examples/attention_residuals/wandb_deps/
 
 # Sphinx documentation
 docs/_build
