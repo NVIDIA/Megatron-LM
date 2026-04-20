@@ -47,10 +47,10 @@ from megatron.core.typed_torch import copy_signature, not_none
 from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
+    from megatron.core.extensions.transformer_engine import TEFusedDenseMLP, TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 else:
-    TEFusedMLP, TENorm, TESpecProvider = None, None, None
+    TEFusedDenseMLP, TEFusedMLP, TENorm, TESpecProvider = None, None, None, None
 
 try:
     from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
@@ -545,6 +545,7 @@ def get_mlp_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
     use_te_activation_func: bool = False,
+    dense_grouped_gemm: bool = False,
 ) -> MlpBuilder:
     """Helper function to get module spec for MLP/MoE"""
 
@@ -553,7 +554,12 @@ def get_mlp_module_spec_for_backend(
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        module = not_none(TEFusedMLP).as_mlp_submodule if use_te_op_fuser else MLP.as_mlp_submodule
+        if dense_grouped_gemm and use_te_op_fuser:
+            module = TEFusedDenseMLP
+        elif use_te_op_fuser:
+            module = not_none(TEFusedMLP).as_mlp_submodule
+        else:
+            module = MLP.as_mlp_submodule
         if backend.fuse_layernorm_and_linear():
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
