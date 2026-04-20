@@ -85,6 +85,10 @@ class InferenceBatchDimensions:
         Returns:
             True if the config is valid, False otherwise
         """
+        # A zero-token batch is never valid
+        if self.token_count == 0:
+            return False
+
         # Check if total requests exceed maximum
         if self.prefill_req_count + self.decode_req_count > max_requests:
             return False
@@ -436,6 +440,12 @@ class CUDAGraphBatchDimensionBuilder:
                 decode_req_count = min(size // (num_speculative_tokens + 1), max_requests)
                 token_count = decode_req_count * (num_speculative_tokens + 1)
                 token_count = token_count // tp_size * tp_size
+                # Skip zero-token graphs: when size < (num_speculative_tokens + 1),
+                # decode_req_count rounds down to 0, producing a zero-token batch.
+                # CUDA graph warmup clones these as empty tensors, causing TE's
+                # CheckInputTensor to fail with "Input x is not allocated".
+                if token_count == 0:
+                    continue
                 add_if_valid(
                     token_count=token_count, prefill_req_count=0, decode_req_count=decode_req_count
                 )
