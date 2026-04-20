@@ -1203,15 +1203,14 @@ def pretrain(
         print_datetime('after training is done')
 
         if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
-            save_checkpoint(
+            save_checkpoint_and_time(
                 iteration,
                 model,
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
-                preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                train_data_iterator=train_data_iterator
             )
 
         one_logger and one_logger.log_metrics(
@@ -2426,6 +2425,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    
+    # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
+    timers(timer_key).stop(barrier=True)
+    save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
+    
     if should_report_memory:
         # Track memory after checkpoint save.
         report_memory(f"(after save_checkpoint for iteration {iteration})")
@@ -2436,12 +2440,12 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
-    timers(timer_key).stop(barrier=True)
+
     timers.log([timer_key])
 
     # Log E2E metrics after save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    save_checkpoint_duration = timers(timer_key).elapsed()
+
     one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
     if args.log_progress and not non_persistent_ckpt:
