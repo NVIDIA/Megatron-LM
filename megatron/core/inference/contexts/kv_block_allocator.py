@@ -374,22 +374,19 @@ class KVBlockAllocator:
     # Per-block routing storage methods (for MoE routing replay)
     # =========================================================================
 
-    def store_routing_per_block(
-        self, routing_indices_per_request: Optional[Dict[int, np.ndarray]]
-    ) -> None:
-        """Distribute per-request routing indices into per-block storage.
+    def store_routing_per_block(self, flat_routing: Optional[np.ndarray]) -> None:
+        """Scatter flat routing indices into per-block storage.
 
-        Uses the context's token-to-block mapping to scatter each token's
-        routing data into the appropriate block in the allocator. Matched
-        (prefix-cached) blocks already have routing from the original request
-        and are not overwritten here since their tokens are not in the active
-        token layout.
+        Uses the context's token-to-block mapping to distribute each token's
+        routing data into the appropriate block. Matched (prefix-cached) blocks
+        already have routing from the original request and are not overwritten
+        here since their tokens are not in the active token layout.
 
         Args:
-            routing_indices_per_request: Dict mapping request_id to routing
-                ndarray [num_tokens, num_layers, topk], or None.
+            flat_routing: ndarray of shape [active_token_count, num_layers, topk]
+                aligned with the context's active-token layout, or None.
         """
-        if routing_indices_per_request is None:
+        if flat_routing is None:
             return
 
         context = self.context
@@ -397,28 +394,13 @@ class KVBlockAllocator:
         if token_count == 0:
             return
 
-        # Get token-to-block mapping for all active tokens
-        block_ids = context.token_to_block_idx[:token_count]
-        positions = context.token_to_local_position_within_kv_block[:token_count]
-
-        # Reconstruct flat routing in active-request order
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
-        active_request_ids = context.request_ids[active_request_slice].tolist()
-        routing_parts = [
-            routing_indices_per_request[rid]
-            for rid in active_request_ids
-            if rid in routing_indices_per_request
-        ]
-        if not routing_parts:
-            return
-        flat_routing = np.concatenate(routing_parts, axis=0)  # [token_count, num_layers, topk]
         assert flat_routing.shape[0] == token_count, (
             f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
         )
 
-        # Convert GPU tensors to numpy for dict-based storage
-        block_ids_np = block_ids.cpu().numpy()
-        positions_np = positions.cpu().numpy()
+        # Token-to-block mapping for all active tokens
+        block_ids_np = context.token_to_block_idx[:token_count].cpu().numpy()
+        positions_np = context.token_to_local_position_within_kv_block[:token_count].cpu().numpy()
 
         dummy = self.dummy_block_idx
 

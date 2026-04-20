@@ -1228,18 +1228,20 @@ class TextGenerationController:
 
         return return_log_probs.any(), top_n_log_probs.any()
 
-    def _router_record_bookkeeping(self) -> Optional[Dict[int, Tensor]]:
-        """Collect and map routing indices per request for MoE router recording.
+    def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
+        """Collect flat routing indices for MoE router recording.
 
-        This method retrieves recorded routing decisions and maps them to individual
-        requests using the context's request_ids and query_lengths. Uses the context's
-        routing_metadata when available (which handles CUDA graph static buffers automatically).
-        Must be called while context attributes are still valid (before request transitions).
+        Retrieves recorded routing decisions via the context's routing_metadata
+        (which handles CUDA graph static buffers), performs the TP all-gather
+        when sequence parallelism is active, strips CUDA padding, and returns
+        a flat CPU numpy array aligned with the context's active-token layout.
+        Must be called while context attributes are still valid (before request
+        transitions).
 
         Returns:
-            Optional[Dict[int, Tensor]]: A dictionary mapping request_id to a tensor of
-                shape [num_tokens, num_layers, topk]. Returns None if routing replay is
-                disabled or no routing data was recorded.
+            Optional[np.ndarray]: Flat routing array of shape
+                [active_token_count, num_layers, topk], or None if routing
+                replay is disabled or no routing data was recorded.
         """
         config = self.inference_wrapped_model.model.config
         if not config.moe_enable_routing_replay:
@@ -1255,10 +1257,6 @@ class TextGenerationController:
         if stacked_routing is None:
             return None
 
-        # Get active request info from context
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
-        active_request_ids = context.request_ids[active_request_slice].tolist()
-        active_query_lengths = context.request_query_lengths[active_request_slice].tolist()
         active_token_count = context.active_token_count
 
         # Get TP group for all-gather if using sequence parallelism
@@ -1287,18 +1285,7 @@ class TextGenerationController:
 
         # Slice to real tokens (remove CUDA padding), move to CPU as numpy with target dtype
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
-        stacked_routing = stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
-
-        # Split by request along token dimension
-        # stacked_routing has shape [active_token_count, num_layers, topk]
-        routing_splits = np.split(
-            stacked_routing,
-            np.cumsum(active_query_lengths[:-1]),
-            axis=0,
-        )
-
-        # Map to request IDs
-        return dict(zip(active_request_ids, routing_splits))
+        return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
@@ -1879,12 +1866,10 @@ class TextGenerationController:
             if context.is_hybrid_model and context.mamba_slot_allocator is not None:
                 context.mamba_slot_allocator.commit_intermediate_states()
 
-            # Collect routing indices per request (must be done before context transitions)
-            routing_indices_per_request = self._router_record_bookkeeping()
-
-            # Store routing per-block for MoE routing replay reconstruction.
-            # Must be done while token-to-block mappings are still valid (before update_requests).
-            context.kv_block_allocator.store_routing_per_block(routing_indices_per_request)
+            # Collect flat routing indices and scatter them into per-block storage.
+            # Must be done before update_requests while token-to-block mappings are valid.
+            # Reconstruction happens from blocks at request completion.
+            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
             # Per-step routing is no longer needed; reconstruction happens from blocks at completion.
             routing_indices_per_request = None
 
