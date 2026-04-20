@@ -2250,6 +2250,9 @@ def _add_scaling_args(parser):
                        help='Relative depth exponent for hidden matrix-like LR scaling.')
     group.add_argument('--scaling-block-out-proj-init-depth-power', type=float, default=None,
                        help='Relative depth exponent for block output projection initialization.')
+    group.add_argument('--allow-depth-mup-eval', action='store_true',
+                       help='Allow validation/eval loss for `depth_mup` by entering a validation-only '
+                       'runtime context. This does not enable general inference support.')
 
     group.add_argument('--use-mup', action='store_true',
                        help='Backward-compatible alias for `--scaling-recipe mup`.')

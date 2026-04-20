@@ -15,7 +15,10 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.parameterization import build_resolved_model_policy
+from megatron.core.parameterization import (
+    build_resolved_model_policy,
+    is_depth_mup_eval_enabled,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -729,9 +732,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 raise NotImplementedError(
                     f"Residual-branch scaling is not supported with fused TP inference for {branch_name}."
                 )
-            raise NotImplementedError(
-                f"Residual-branch scaling is not supported during inference for {branch_name}."
-            )
+            if not is_depth_mup_eval_enabled():
+                raise NotImplementedError(
+                    f"Residual-branch scaling is not supported during inference for {branch_name}. "
+                    "Validation loss requires explicitly enabling depth_mup evaluation."
+                )
         if self.model_scaling_policy.residual_branch_multiplier == 1.0:
             return output_with_bias
         if using_fused_tp_inference_kernel:

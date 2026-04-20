@@ -37,6 +37,7 @@ from megatron.core.parameterization import (
     build_resolved_model_policy,
     build_resolved_scaling_context,
     build_resolved_training_policy,
+    depth_mup_eval_context,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
@@ -1139,6 +1140,33 @@ class TestMuPModelPolicy:
                 branch_name='self attention',
                 using_fused_tp_inference_kernel=False,
             )
+
+    def test_depth_mup_eval_context_allows_unfused_validation_scaling(self):
+        config = TransformerConfig(
+            hidden_size=1024,
+            num_layers=24,
+            num_attention_heads=16,
+            scaling_recipe='depth_mup',
+            scaling_base_hidden_size=256,
+            scaling_base_num_layers=12,
+        )
+        layer = object.__new__(TransformerLayer)
+        layer.model_scaling_policy = build_resolved_model_policy(config)
+        layer.training = False
+
+        output = torch.ones(2, 2)
+        bias = torch.full((2, 2), 3.0)
+        expected_mult = config.num_layers / config.scaling_base_num_layers
+
+        with depth_mup_eval_context(True):
+            scaled_output, scaled_bias = layer._scale_dense_residual_branch_output(
+                (output, bias),
+                branch_name='self attention',
+                using_fused_tp_inference_kernel=False,
+            )
+
+        assert torch.equal(scaled_output, output / expected_mult)
+        assert torch.equal(scaled_bias, bias / expected_mult)
 
     def test_depth_mup_rejects_fused_tp_inference_specifically(self):
         config = TransformerConfig(

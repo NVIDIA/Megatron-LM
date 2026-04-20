@@ -49,6 +49,7 @@ from typing import Any, Optional, Dict
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.parameterization import depth_mup_eval_context
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from .log_handler import CustomHandler
 
@@ -3361,7 +3362,10 @@ def evaluate(
     if eval_iters is None:
         eval_iters = args.eval_iters
 
-    with torch.no_grad():
+    depth_mup_eval_enabled = (
+        args.allow_depth_mup_eval and getattr(args, 'scaling_recipe', None) == 'depth_mup'
+    )
+    with depth_mup_eval_context(depth_mup_eval_enabled), torch.no_grad():
         iteration = 0
         if verbose:
             print_rank_0(f'Evaluating on {eval_iters * eval_batch_size} samples')
