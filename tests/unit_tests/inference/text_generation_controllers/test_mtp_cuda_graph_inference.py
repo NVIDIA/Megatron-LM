@@ -176,10 +176,9 @@ class TestMTPCudaGraphInference:
 
     @staticmethod
     def _set_mtp_cuda_graph_flag(model, enabled):
-        """Set ``use_mtp_cuda_graphs`` on all MTP layers."""
+        """Set ``use_mtp_cuda_graphs`` on the model."""
         unwrapped = unwrap_model(model)
-        for layer in unwrapped.mtp.layers:
-            layer.use_mtp_cuda_graphs = enabled
+        unwrapped.use_mtp_cuda_graphs = enabled
 
     # ---- Test 1: graph output matches eager (no additional padding) ------- #
 
@@ -540,19 +539,15 @@ class TestMTPCudaGraphInference:
 
     @torch.inference_mode()
     def test_mtp_graph_flag_propagation(self):
-        """``use_mtp_cuda_graphs`` is correctly toggled via the helper and
-        every MTP layer sees the same value.
-        """
+        """``use_mtp_cuda_graphs`` is correctly toggled via the helper."""
         model = self._build_model(mtp_num_layers=2)
         unwrapped = unwrap_model(model)
 
         self._set_mtp_cuda_graph_flag(model, True)
-        for layer in unwrapped.mtp.layers:
-            assert layer.use_mtp_cuda_graphs is True
+        assert unwrapped.use_mtp_cuda_graphs is True
 
         self._set_mtp_cuda_graph_flag(model, False)
-        for layer in unwrapped.mtp.layers:
-            assert layer.use_mtp_cuda_graphs is False
+        assert unwrapped.use_mtp_cuda_graphs is False
 
 
 # --------------------------------------------------------------------------- #
