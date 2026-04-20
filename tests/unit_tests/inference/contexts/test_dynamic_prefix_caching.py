@@ -1173,8 +1173,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # Store routing for both blocks
         for bid in [b0, b1]:
             alloc.store_block_routing(
-                bid, np.arange(bs),
-                np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16),
+                bid, np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
             )
 
         # Release blocks (REF_ZERO deregisters immediately)
@@ -1203,9 +1202,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
             alloc.store_block_routing(
                 bid,
                 np.arange(bs),
-                np.arange(bs * num_layers * topk, dtype=np.int16).reshape(
-                    bs, num_layers, topk
-                )
+                np.arange(bs * num_layers * topk, dtype=np.int16).reshape(bs, num_layers, topk)
                 + bid,
             )
 
@@ -1257,8 +1254,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
 
         # Only store routing for the first block
         alloc.store_block_routing(
-            bids[0], np.arange(bs),
-            np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16),
+            bids[0], np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
         )
 
         result = alloc.reconstruct_routing_from_blocks(bids, 2 * bs)

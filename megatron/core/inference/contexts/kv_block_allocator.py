@@ -394,9 +394,9 @@ class KVBlockAllocator:
         if token_count == 0:
             return
 
-        assert flat_routing.shape[0] == token_count, (
-            f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
-        )
+        assert (
+            flat_routing.shape[0] == token_count
+        ), f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
 
         # Token-to-block mapping for all active tokens
         block_ids_np = context.token_to_block_idx[:token_count].cpu().numpy()
@@ -462,7 +462,9 @@ class KVBlockAllocator:
 
         return np.concatenate(routing_parts, axis=0)
 
-    def store_block_routing(self, block_id: int, positions: np.ndarray, routing: np.ndarray) -> None:
+    def store_block_routing(
+        self, block_id: int, positions: np.ndarray, routing: np.ndarray
+    ) -> None:
         """Store routing indices for specific token positions in a block.
 
         Args:

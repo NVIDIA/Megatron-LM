@@ -194,9 +194,9 @@ class InferenceRequest:
         # Serialize tensors and numpy arrays.
         obj = {
             k: (
-                ("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor)
-                else ("ndarray", serialize_ndarray(v)) if isinstance(v, np.ndarray)
-                else v
+                ("tensor", serialize_tensor(v))
+                if isinstance(v, torch.Tensor)
+                else ("ndarray", serialize_ndarray(v)) if isinstance(v, np.ndarray) else v
             )
             for k, v in obj.items()
         }
