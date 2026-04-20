@@ -1668,10 +1668,14 @@ class CudaGraphManager(torch.nn.Module):
                     runner.cudagraph_created = True
                     runner = runner.eval()
 
-                    # Record this to the global execution record
-                    _CudagraphGlobalRecord.cudagraph_inference_record.append(
-                        (runner, "fwd", args, kwargs)
-                    )
+                    # Record this to the global execution record.
+                    # MTP runners are self-contained and don't chain with
+                    # decoder layers, so skip the record to avoid polluting
+                    # the previous-layer lookup (which expects layer_number).
+                    if not self.is_mtp:
+                        _CudagraphGlobalRecord.cudagraph_inference_record.append(
+                            (runner, "fwd", args, kwargs)
+                        )
 
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
