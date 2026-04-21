@@ -190,6 +190,59 @@ def measure_allreduce_bandwidth(group, device=None, iters=50):
     return bandwidth
 
 
+def measure_reduce_scatter_bandwidth(group, device=None, iters=50):
+    """Measure NCCL reduce-scatter bandwidth for a given process group.
+
+    Uses a large tensor to amortize launch overhead and measure sustained
+    reduce-scatter throughput. Returns *algorithm bandwidth*
+    (full_message_bytes / time), matching the NCCL-tests convention where the
+    reported size is the input (pre-scatter) size.
+
+    Args:
+        group: ``torch.distributed.ProcessGroup`` (e.g. the TP group).
+        device: CUDA device (defaults to current device).
+        iters: Number of reduce-scatter iterations for timing.
+
+    Returns:
+        Measured reduce-scatter algorithm bandwidth in bytes per second, or 0
+        if the group has only one rank.
+    """
+    world = group.size()
+    if world <= 1:
+        return 0
+
+    if device is None:
+        device = torch.cuda.current_device()
+
+    # 64 M float32 elements = 256 MB, rounded to a multiple of world.
+    n = 64 * 1024 * 1024
+    n = (n // world) * world
+    tensor_bytes = n * 4
+    input_buf = torch.randn(n, dtype=torch.float32, device=device)
+    output_buf = torch.empty(n // world, dtype=torch.float32, device=device)
+
+    # Warmup.
+    for _ in range(3):
+        torch.distributed.reduce_scatter_tensor(output_buf, input_buf, group=group)
+    torch.cuda.synchronize(device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        torch.distributed.reduce_scatter_tensor(output_buf, input_buf, group=group)
+    end.record()
+    torch.cuda.synchronize(device)
+
+    elapsed_s = start.elapsed_time(end) / 1000.0
+    bandwidth = iters * tensor_bytes / elapsed_s
+
+    del input_buf, output_buf
+    torch.cuda.empty_cache()
+    return bandwidth
+
+
 def measure_alltoall_bandwidth(group, device=None, iters=50):
     """Measure NCCL all-to-all bandwidth for a given process group.
 

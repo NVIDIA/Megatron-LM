@@ -50,6 +50,7 @@ from megatron.core.inference.utils import (
     measure_allreduce_bandwidth,
     measure_alltoall_bandwidth,
     measure_hbm_bandwidth,
+    measure_reduce_scatter_bandwidth,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
@@ -66,6 +67,7 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    is_column_parallel_linear,
     is_row_parallel_linear,
     nvtx_range_pop,
     nvtx_range_push,
@@ -280,20 +282,40 @@ class DynamicInferenceEngine(AbstractEngine):
         unwrapped_model = controller.inference_wrapped_model.model
         tp_size = get_pg_size(self.pg_collection.tp) if self.pg_collection.tp else 1
         ep_size = self._model_config.expert_model_parallel_size
+        self._tp_sequence_parallel = self._model_config.sequence_parallel
 
-        # Count TP allreduces and MoE layers by inspecting the model directly.
-        self._num_tp_allreduces = len(
+        # Count TP communication ops and MoE layers by inspecting the model.
+        # With sequence_parallel: RowParallel does reduce-scatter, ColumnParallel does all-gather.
+        # Without sequence_parallel: RowParallel does all-reduce, ColumnParallel has no fwd collective.
+        num_row_parallel = len(
             [m for m in unwrapped_model.modules() if is_row_parallel_linear(m)]
         )
+        num_col_parallel = len(
+            [m for m in unwrapped_model.modules() if is_column_parallel_linear(m)]
+        )
+        if self._tp_sequence_parallel:
+            self._num_tp_reduce_scatters = num_row_parallel
+            self._num_tp_all_gathers = num_col_parallel
+            self._num_tp_allreduces = 0
+        else:
+            self._num_tp_allreduces = num_row_parallel
+            self._num_tp_reduce_scatters = 0
+            self._num_tp_all_gathers = 0
         self._num_moe_layers = len(
             [m for m in unwrapped_model.modules() if isinstance(m, MoELayer)]
         )
 
-        # Measure TP allreduce bandwidth.
+        # Measure TP bandwidth with the collective that the model actually uses.
         if tp_size > 1 and self.pg_collection.tp is not None:
-            self._measured_tp_allreduce_bw = measure_allreduce_bandwidth(self.pg_collection.tp)
+            if self._tp_sequence_parallel:
+                self._measured_tp_rs_bw = measure_reduce_scatter_bandwidth(self.pg_collection.tp)
+                self._measured_tp_allreduce_bw = 0
+            else:
+                self._measured_tp_allreduce_bw = measure_allreduce_bandwidth(self.pg_collection.tp)
+                self._measured_tp_rs_bw = 0
         else:
             self._measured_tp_allreduce_bw = 0
+            self._measured_tp_rs_bw = 0
 
         # Measure EP all-to-all bandwidth.
         if ep_size > 1 and self.context.expert_model_parallel_group is not None:
@@ -308,7 +330,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 f"model weights = {self._model_weight_bytes / 1e9:.2f} GB",
                 f"measured HBM bandwidth = {self._measured_hbm_bandwidth / 1e9:.0f} GB/s",
             ]
-            if self._measured_tp_allreduce_bw > 0:
+            if self._tp_sequence_parallel and self._measured_tp_rs_bw > 0:
+                sol_parts.append(
+                    f"TP reduce-scatter bandwidth = {self._measured_tp_rs_bw / 1e9:.1f} GB/s "
+                    f"(tp={tp_size}, {self._num_tp_reduce_scatters} RS + "
+                    f"{self._num_tp_all_gathers} AG per step)"
+                )
+            elif self._measured_tp_allreduce_bw > 0:
                 sol_parts.append(
                     f"TP allreduce bandwidth = {self._measured_tp_allreduce_bw / 1e9:.1f} GB/s "
                     f"(tp={tp_size}, {self._num_tp_allreduces} allreduces/step)"
@@ -1764,12 +1792,21 @@ class DynamicInferenceEngine(AbstractEngine):
         batch_tokens = context_state["active_token_count"]
         hidden_bytes = self._model_config.hidden_size * self._model_config.params_dtype.itemsize
         msg_bytes = batch_tokens * hidden_bytes
-        num_allreduces = self._num_tp_allreduces
-        sol_tp_comm_s = (
-            (num_allreduces * msg_bytes / self._measured_tp_allreduce_bw)
-            if self._measured_tp_allreduce_bw > 0
-            else 0
-        )
+        if self._tp_sequence_parallel:
+            # RS and AG have symmetric bandwidth; use RS measurement for both.
+            num_tp_ops = self._num_tp_reduce_scatters + self._num_tp_all_gathers
+            sol_tp_comm_s = (
+                (num_tp_ops * msg_bytes / self._measured_tp_rs_bw)
+                if self._measured_tp_rs_bw > 0
+                else 0
+            )
+        else:
+            num_tp_ops = self._num_tp_allreduces
+            sol_tp_comm_s = (
+                (num_tp_ops * msg_bytes / self._measured_tp_allreduce_bw)
+                if self._measured_tp_allreduce_bw > 0
+                else 0
+            )
         moe_topk = self._model_config.moe_router_topk if self._model_config.num_moe_experts else 0
         a2a_dim = self._model_config.moe_latent_size or self._model_config.hidden_size
         a2a_token_bytes = a2a_dim * self._model_config.params_dtype.itemsize
@@ -1789,7 +1826,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "sol_ep_comm_s": sol_ep_comm_s,
             "sol_latency_s": sol_latency_s,
             "sol_pct": sol_pct,
-            "num_allreduces": num_allreduces,
+            "num_tp_ops": num_tp_ops,
             "msg_bytes": msg_bytes,
             "a2a_vol": a2a_vol,
         }
@@ -1812,12 +1849,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
         comm_parts = []
         if sol["sol_tp_comm_s"] > 0:
-            tp_ar_total_bytes = sol["num_allreduces"] * sol["msg_bytes"]
-            comm_parts.append(
-                f"tp_ar {sol['sol_tp_comm_s'] * 1000:.3f} ms "
-                f"({tp_ar_total_bytes / 1e6:.2f} MB / "
-                f"{self._measured_tp_allreduce_bw / 1e9:.1f} GB/s)"
-            )
+            tp_total_bytes = sol["num_tp_ops"] * sol["msg_bytes"]
+            if self._tp_sequence_parallel:
+                comm_parts.append(
+                    f"tp_rs_ag {sol['sol_tp_comm_s'] * 1000:.3f} ms "
+                    f"({tp_total_bytes / 1e6:.2f} MB / "
+                    f"{self._measured_tp_rs_bw / 1e9:.1f} GB/s)"
+                )
+            else:
+                comm_parts.append(
+                    f"tp_ar {sol['sol_tp_comm_s'] * 1000:.3f} ms "
+                    f"({tp_total_bytes / 1e6:.2f} MB / "
+                    f"{self._measured_tp_allreduce_bw / 1e9:.1f} GB/s)"
+                )
         if sol["sol_ep_comm_s"] > 0:
             comm_parts.append(
                 f"ep_a2a {sol['sol_ep_comm_s'] * 1000:.3f} ms "
