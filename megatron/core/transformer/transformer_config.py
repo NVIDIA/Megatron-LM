@@ -695,8 +695,8 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
-    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+    moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+    """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
@@ -717,6 +717,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
+
+    moe_router_force_biased: Optional[float] = None
+    """Apply random expert bias in normal distribution with specified std
+    to router logits. Shared seed across all ranks ensures identical bias.
+    If positive, generates new random bias each forward pass.
+    If negative, generates bias once per layer and reuses it (abs value is std).
+    This is an experimental feature for benchmarking purposes."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -916,9 +923,23 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_disable_torch_grouped_mm: bool = False
-    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, 
-    falling back to TE GroupedGEMM. """
+    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
+    """Specifies the backend to use for grouped GEMM operations during inference.
+    Options:
+    - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
+      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
+      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
+      in future releases.
+    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
+      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
+    - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
+    """
+
+    inference_moe_disable_fused_quant_kernels: bool = False
+    """When False (default), use fused kernels that combine permute/activation with
+    MXFP8 quantization + swizzle into a single kernel launch. Only applies when
+    fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
+    launches (useful for debugging)."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1070,18 +1091,17 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             # Check tensor parallelism compatibility
-            assert (
-                self.linear_num_key_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
-            assert (
-                self.linear_num_value_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
-
-            # Do not support yet, but coming soon.
-            assert self.context_parallel_size == 1, (
-                f"Gated delta net does not support context parallel for now,"
-                f" but got {self.context_parallel_size=}."
+            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            assert self.linear_num_key_heads % tp_cp_size == 0, (
+                f"{self.linear_num_key_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
+            assert self.linear_num_value_heads % tp_cp_size == 0, (
+                f"{self.linear_num_value_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+            )
+        elif self.experimental_attention_variant == "dsa":
+            pass
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1160,16 +1180,39 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_router_dtype != "fp32":
                 raise ValueError(
-                    "Inference-optimized MoE requires --moe-router-dtype=fp32 "
+                    "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
                     "to avoid costly dtype conversions during decode."
                 )
-            if self.gated_linear_unit and self.cuda_graph_impl != "none":
+
+            if self.gated_linear_unit and self.cuda_graph_impl == "local":
                 raise ValueError(
-                    "Inference-optimized MoE does not yet support CUDA graphs with gated "
-                    "linear units (SwiGLU/GeGLU) due to differences in weight layouts "
-                    "between the FlashInfer kernel and mcore. Either disable CUDA graphs "
-                    "(--cuda-graph-impl=none) or use a non-gated activation (e.g. squared_relu)."
+                    "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
+                    "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
+                    "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
+                    "graphs (--cuda-graph-impl=none) or use a non-gated activation "
+                    "(e.g. squared_relu)."
                 )
+
+            if self.fp8 == "mxfp8":
+                if not self.fp8_param:
+                    raise ValueError(
+                        "fp8_param must be enabled when using "
+                        "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
+                        "Please set --fp8-param-gather."
+                    )
+
+            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
+                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
+                f"got '{self.inference_grouped_gemm_backend}'"
+            )
+
+            if self.cuda_graph_impl == "local":
+                if self.inference_grouped_gemm_backend == "te":
+                    raise ValueError(
+                        "TE GroupedGEMM is not supported with CUDA graphs. Please set "
+                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
+                        "CUDA graphs (--cuda-graph-impl=none)."
+                    )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
@@ -1178,10 +1221,23 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
 
-        if self.num_moe_experts is None:
-            assert (
-                self.moe_ffn_hidden_size is None
-            ), "moe_ffn_hidden_size must be None when num_experts is not set."
+        if self.num_moe_experts is None and self.moe_ffn_hidden_size is not None:
+            is_mixed_model = (
+                isinstance(self.moe_layer_freq, list) and 0 in self.moe_layer_freq
+            ) or (isinstance(self.moe_layer_freq, int) and self.moe_layer_freq > 1)
+            if is_mixed_model:
+                warnings.warn(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "This is expected for dense layers in a mixed dense/MoE model "
+                    "(moe_layer_freq indicates some layers remain dense). "
+                    "moe_ffn_hidden_size will be ignored for this layer."
+                )
+                self.moe_ffn_hidden_size = None
+            else:
+                raise ValueError(
+                    "moe_ffn_hidden_size is set but num_moe_experts is None. "
+                    "Please set num_moe_experts or remove moe_ffn_hidden_size."
+                )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
@@ -1211,10 +1267,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"but got {self.moe_shared_expert_intermediate_size}"
                 )
             if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
-                "alltoall"
+                "alltoall",
+                "flex",
             ]:
                 raise ValueError(
-                    f"moe_shared_expert_overlap only works with alltoall token dispatcher."
+                    f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
@@ -1775,10 +1832,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
+            "sigmoid",
+            "sqrtsoftplus",
+        ):
             raise ValueError(
-                "Expert bias for aux-loss-free routing only supports sigmoid score function."
-                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+                "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
+                "score functions. Please set --moe-router-score-function to 'sigmoid' or "
+                "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
 
         if self.num_moe_experts and self.fp8:
@@ -1904,7 +1965,7 @@ class TransformerConfig(ModelParallelConfig):
                 "local",
             ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
-            if self.cpu_offloading:
+            if self.cpu_offloading and self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
             if self.cuda_graph_impl == "local":
@@ -2062,6 +2123,9 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.recompute_num_layers is None
             ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                "moe" not in self.recompute_modules
+            ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
 
             # Check if bf16 or fp16 is used
             assert (
@@ -2100,6 +2164,19 @@ class TransformerConfig(ModelParallelConfig):
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
                 )
+
+        if self.overlap_dispatch_backward_with_experts_wgrad:
+            assert not self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be disabled when enabling '
+                'overlap_dispatch_backward_with_experts_wgrad.'
+            )
+            assert is_te_min_version(
+                "2.3.0"
+            ), 'TE version >= 2.3.0 is required for overlap_dispatch_backward_with_experts_wgrad'
+            assert not self.delay_wgrad_compute, (
+                'delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad '
+                'are mutually exclusive; use only one'
+            )
 
         if self.ep_overlap_early_attn_memory_release:
             assert self.overlap_moe_expert_parallel_comm, (
@@ -2184,12 +2261,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.inference_disable_triton_nvls_kernels:
             assert self.transformer_impl == "inference_optimized", (
                 "inference_disable_triton_nvls_kernels is only supported "
-                "for inference_optimized transformer implementation."
-            )
-
-        if self.inference_disable_torch_grouped_mm:
-            assert self.transformer_impl == "inference_optimized", (
-                "inference_disable_torch_grouped_mm is only supported "
                 "for inference_optimized transformer implementation."
             )
 

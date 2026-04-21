@@ -22,9 +22,9 @@ MODEL_ARGS:
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.00015
@@ -59,9 +59,11 @@ MODEL_ARGS:
   --bf16: true
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
-  --optimizer: dist_muon
+  --optimizer: muon
   --muon-momentum: 0.9
   --muon-extra-scale-factor: 0.2
   --muon-scale-mode: spectral
   --async-save: true
+  --use-persistent-ckpt-worker: true
+  --use-distributed-optimizer: true
 TEST_TYPE: ckpt-resume

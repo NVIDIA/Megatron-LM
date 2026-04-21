@@ -498,10 +498,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             backward_post_hooks = []
 
             for submodule in self.modules():
-                for hook in submodule._forward_pre_hooks.values():
-                    forward_pre_hooks.append((submodule, hook))
-                for hook in submodule._forward_hooks.values():
-                    forward_post_hooks.append((submodule, hook))
+                for hook_id, hook in submodule._forward_pre_hooks.items():
+                    with_kwargs = hook_id in submodule._forward_pre_hooks_with_kwargs
+                    forward_pre_hooks.append((submodule, hook, with_kwargs))
+                for hook_id, hook in submodule._forward_hooks.items():
+                    with_kwargs = hook_id in submodule._forward_hooks_with_kwargs
+                    forward_post_hooks.append((submodule, hook, with_kwargs))
                 for hook in submodule._backward_pre_hooks.values():
                     backward_pre_hooks.append((submodule, hook))
                 for hook in submodule._backward_hooks.values():
@@ -515,7 +517,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
                 if any(
                     inspect.getmodule(hook) != distributed_data_parallel
-                    for _, hook in forward_pre_hooks
+                    for _, hook, _ in forward_pre_hooks
                 ):
                     warnings.warn(
                         "TEFusedResidualRMSNorm module has a submodule with a pre-forward hook. "
@@ -525,9 +527,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     )
 
                 def forward_pre_hook(module, *_) -> None:
-                    for submodule, hook in forward_pre_hooks:
-                        # Assume that hook does not interact with input
-                        ret = hook(submodule, None)
+                    for submodule, hook, with_kwargs in forward_pre_hooks:
+                        if with_kwargs:
+                            ret = hook(submodule, (), {})
+                        else:
+                            ret = hook(submodule, ())
                         if ret is not None:
                             raise RuntimeError(
                                 "TEFusedResidualRMSNorm module does not expose "
@@ -547,9 +551,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 )
 
                 def forward_post_hook(module, *_) -> None:
-                    for submodule, hook in forward_post_hooks:
-                        # Assume that hook does not interact with input or output
-                        ret = hook(submodule, None, None)
+                    for submodule, hook, with_kwargs in forward_post_hooks:
+                        if with_kwargs:
+                            ret = hook(submodule, (), {}, None)
+                        else:
+                            ret = hook(submodule, (), None)
                         if ret is not None:
                             raise RuntimeError(
                                 "TEFusedResidualRMSNorm module does not expose "
@@ -1701,10 +1707,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
 
             extra_kwargs = _get_extra_te_kwargs(config)
+            self.delay_wgrad_compute = (
+                self.config.delay_wgrad_compute
+                or self.config.overlap_dispatch_backward_with_experts_wgrad
+            )
 
-            if self.config.delay_wgrad_compute:
+            if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
-                    extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+                    extra_kwargs["delay_wgrad_compute"] = True
                 else:
                     raise RuntimeError(
                         "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
@@ -1728,6 +1738,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_group_for_te = tp_group
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
+
+            # Save original parallel_mode before clearing it for explicit_expert_comm.
+            # When explicit_expert_comm is True, Megatron handles TP communication externally
+            # and passes parallel_mode=None to TE. This causes TE to set partition_dim=0 on
+            # all weights (its default for non-parallel mode). We need to fix this after init
+            # so that refit/resharding can correctly identify which dimension is TP-partitioned.
+            original_parallel_mode = parallel_mode
 
             if self.explicit_expert_comm:
                 if parallel_mode == "column":
@@ -1758,6 +1775,21 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.te_quant_params: Optional[TEQuantizationParams] = None
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
+
+            # Explicitly stamp partition_dim and partition_stride on expert weight
+            # tensors when explicit_expert_comm cleared parallel_mode.  TE ≤2.12
+            # set these internally; TE ≥2.13 no longer does (parallel_mode=None
+            # is passed due to explicit_expert_comm).  The resharding/refit planner
+            # relies on partition_dim to correctly plan TP gather/scatter operations.
+            # NOTE: we intentionally do NOT stamp tensor_model_parallel here —
+            # doing so would change num-zeros gradient counting.
+            if self.explicit_expert_comm and original_parallel_mode in ("column", "row"):
+                part_dim = 0 if original_parallel_mode == "column" else 1
+                for i in range(num_gemms):
+                    weight = getattr(self, f"weight{i}", None)
+                    if weight is not None:
+                        setattr(weight, "partition_dim", part_dim)
+                        setattr(weight, "partition_stride", 1)
 
             def merge_extra_states(
                 self,
@@ -2012,7 +2044,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             Compute weight gradients during the backward pass
             if delay_wgrad_compute is enabled.
             """
-            if self.config.delay_wgrad_compute:
+            if self.delay_wgrad_compute:
                 super().backward_dw()
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
@@ -2302,10 +2334,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             backward_pre_hooks = []
             backward_post_hooks = []
             for submodule in self.modules():
-                for hook in submodule._forward_pre_hooks.values():
-                    forward_pre_hooks.append((submodule, hook))
-                for hook in submodule._forward_hooks.values():
-                    forward_post_hooks.append((submodule, hook))
+                for hook_id, hook in submodule._forward_pre_hooks.items():
+                    with_kwargs = hook_id in submodule._forward_pre_hooks_with_kwargs
+                    forward_pre_hooks.append((submodule, hook, with_kwargs))
+                for hook_id, hook in submodule._forward_hooks.items():
+                    with_kwargs = hook_id in submodule._forward_hooks_with_kwargs
+                    forward_post_hooks.append((submodule, hook, with_kwargs))
                 for hook in submodule._backward_pre_hooks.values():
                     backward_pre_hooks.append((submodule, hook))
                 for hook in submodule._backward_hooks.values():
@@ -2319,7 +2353,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
                 if any(
                     inspect.getmodule(hook) != distributed_data_parallel
-                    for _, hook in forward_pre_hooks
+                    for _, hook, _ in forward_pre_hooks
                 ):
                     warnings.warn(
                         "TEFusedMLP module has a submodule with a pre-forward hook. "
@@ -2329,9 +2363,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     )
 
                 def forward_pre_hook(module, *_) -> None:
-                    for submodule, hook in forward_pre_hooks:
-                        # Assume that hook does not interact with input
-                        ret = hook(submodule, None)
+                    for submodule, hook, with_kwargs in forward_pre_hooks:
+                        if with_kwargs:
+                            ret = hook(submodule, (), {})
+                        else:
+                            ret = hook(submodule, ())
                         if ret is not None:
                             raise RuntimeError(
                                 "TEFusedMLP module does not expose intermediate tensors, but "
@@ -2350,9 +2386,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 )
 
                 def forward_post_hook(module, *_) -> None:
-                    for submodule, hook in forward_post_hooks:
-                        # Assume that hook does not interact with input or output
-                        ret = hook(submodule, None, None)
+                    for submodule, hook, with_kwargs in forward_post_hooks:
+                        if with_kwargs:
+                            ret = hook(submodule, (), {}, None)
+                        else:
+                            ret = hook(submodule, (), None)
                         if ret is not None:
                             raise RuntimeError(
                                 "TEFusedMLP module does not expose intermediate tensors, but "
@@ -2516,10 +2554,22 @@ try:
         activation_offloading,
         weight_offloading,
         double_buffering,
+        retain_pinned_cpu_buffers,
     ):
         """Get CPU offload context and sync function."""
-        if is_te_min_version("2.5.0"):
-            # Enables the additional double buffering switch for activations during LLM training
+        if is_te_min_version("2.10.0"):
+            # TE 2.10+ supports retain_pinned_cpu_buffers
+            context, sync_func = _get_cpu_offload_context(
+                enabled,
+                num_layers,
+                model_layers,
+                activation_offloading,
+                weight_offloading,
+                double_buffering,
+                retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
+            )
+        elif is_te_min_version("2.5.0"):
+            # TE 2.5-2.9 supports double_buffering but not retain_pinned_cpu_buffers
             context, sync_func = _get_cpu_offload_context(
                 enabled,
                 num_layers,

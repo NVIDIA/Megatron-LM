@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -24,7 +24,7 @@ class MambaInferenceStateConfig:
     layer_type_list: List[str]
     """
     A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
-    See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list of symbols.
+    See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
@@ -39,6 +39,9 @@ class MambaInferenceStateConfig:
     ssm_states_dtype: torch.dtype
     """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
 
+    mamba_chunk_size: int = 128
+    """The chunk size used by the Mamba SSM Triton kernels."""
+
     @classmethod
     def from_model(
         cls,
@@ -47,7 +50,7 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -59,12 +62,18 @@ class MambaInferenceStateConfig:
                 conv_states_dtype = model.config.params_dtype
             if ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
+            mamba_chunk_size = 128
+            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+                    mamba_chunk_size = layer.mixer.chunk_size
+                    break
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
+                mamba_chunk_size=mamba_chunk_size,
             )
         return None
 
@@ -251,6 +260,18 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
+    prefix_caching_routing_alpha: float = 0.5
+    """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
+    Higher alpha favors prefix cache hits; lower alpha favors load balance.
+    Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    prefix_caching_mamba_gb: Optional[float] = None
+    """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
+    on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
+    at a single block boundary. When set, Mamba states at KV divergence and last-aligned
+    block boundaries are cached and reused across requests with matching prefixes."""
+
     # =================================
     # Logging config
     # =================================
@@ -281,3 +302,21 @@ class InferenceConfig:
     A list of the per-request metadata types to track. Each entry is a tuple
     consisting of the string label, the target dtype, and whether to store the data on GPU.
     """
+
+    use_synchronous_zmq_collectives: bool = False
+    """Whether to use synchronous ZMQ collectives for inference. If True, the
+    all_reduce_max operation will be performed synchronously, which can help reduce
+    performance variability for MoEs.
+    """
+
+    verbose: InitVar[bool] = False
+    """Whether to log detailed context configuration at initialization.
+    This is an InitVar and is not stored as a field on the config."""
+
+    def __post_init__(self, verbose: bool):
+        self._verbose = verbose
+        if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
+            raise ValueError(
+                f"prefix_caching_routing_alpha must be in [0, 1], "
+                f"got {self.prefix_caching_routing_alpha}"
+            )
