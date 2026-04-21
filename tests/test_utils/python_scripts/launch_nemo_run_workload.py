@@ -157,6 +157,10 @@ def main(
                 all_logs = f.readlines()
             all_ranks_all_logs.extend(all_logs)
         all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
+        if not all_ranks_all_logs_string:
+            logger.warning("No log files found after failure (infrastructure/startup issue), attempt restart.")
+            n_attempts += 1
+            continue
         if is_flaky_failure(all_ranks_all_logs_string):
             logger.warning("Detected flaky failure, attempt restart.")
             n_attempts += 1
