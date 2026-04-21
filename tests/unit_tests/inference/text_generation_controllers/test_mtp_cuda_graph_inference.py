@@ -179,6 +179,39 @@ class TestMTPCudaGraphInference:
         unwrapped = unwrap_model(model)
         unwrapped.use_mtp_cuda_graphs = enabled
 
+    @staticmethod
+    def _assert_mtp_cuda_graphs_were_replayed(model, expect_replayed):
+        """Assert that MTP CUDA graphs were (or were not) replayed.
+
+        MTP runners are stored in the CudaGraphManager's lookup table
+        rather than the global inference record.  A runner with
+        ``fwd_graph_recorded=True`` confirms the graph was captured and
+        replayed.
+        """
+        unwrapped = unwrap_model(model)
+        manager = getattr(unwrapped, '_mtp_cudagraph_manager', None)
+        if manager is None:
+            assert not expect_replayed, "No MTP CudaGraphManager found on the model"
+            return
+        table = manager.inference_cudagraphs_lookup_table
+        mtp_runners = [v for k, v in table.items() if isinstance(k, tuple) and k[0] == 'mtp']
+        if expect_replayed:
+            assert len(mtp_runners) > 0, (
+                "Expected MTP CUDA graphs to be replayed, but no MTP runners found"
+            )
+            for runner in mtp_runners:
+                assert runner.fwd_graph_recorded, (
+                    "Expected MTP CUDA graph to be recorded and replayed, "
+                    f"but runner for {runner.base_module.__class__.__name__} "
+                    "has fwd_graph_recorded=False"
+                )
+        else:
+            recorded = [r for r in mtp_runners if r.fwd_graph_recorded]
+            assert len(recorded) == 0, (
+                f"Expected no MTP CUDA graph replay, but {len(recorded)} "
+                "runners have fwd_graph_recorded=True"
+            )
+
     # ---- Test 1: graph output matches eager (no additional padding) ------- #
 
     @pytest.mark.parametrize("batch_size", [2, 4, 8])
@@ -222,6 +255,7 @@ class TestMTPCudaGraphInference:
 
         torch.testing.assert_close(h_graph, h_eager)
         torch.testing.assert_close(logits_graph, logits_eager)
+        self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
     # ---- Test 2: graph matches eager with sequence parallelism ------------ #
 
@@ -268,6 +302,7 @@ class TestMTPCudaGraphInference:
 
         torch.testing.assert_close(h_graph, h_eager)
         torch.testing.assert_close(logits_graph, logits_eager)
+        self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
     # ---- Test 3: end-to-end _compute_serial_mtp_and_sample with SP ------- #
 
@@ -358,6 +393,7 @@ class TestMTPCudaGraphInference:
 
         # Verify decoder hidden states cache was cleaned up.
         assert not hasattr(unwrapped, '_decoder_hidden_states_cache')
+        self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
     # ---- Test 4: SP padding graph vs eager produces same MTP tokens ------- #
 
@@ -436,6 +472,7 @@ class TestMTPCudaGraphInference:
             ]
 
             ctrl._compute_serial_mtp_and_sample()
+            self._assert_mtp_cuda_graphs_were_replayed(model, use_cuda_graph)
 
             return [
                 ctrl._sampled_mtp_tokens_cuda[d, :active_request_count].clone()
@@ -495,6 +532,8 @@ class TestMTPCudaGraphInference:
             assert torch.all(
                 torch.isfinite(logits)
             ), f"Depth {depth}: logits contain non-finite values"
+
+        self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
     # ---- Test 6: eager fallback when no matching graph exists ------------- #
 
