@@ -740,8 +740,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
+                mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
+            # Bind the unified CPU/GPU buffers so the 9 per-step Mamba fields
+            # ride along with the single coalesced H2D in
+            # transfer_bookkeeping_to_gpu().
+            self.mamba_metadata.bind_cpu_buffers(
+                {
+                    "batch_indices_decode": self._cpu_mamba_batch_indices_decode,
+                    "batch_indices_prefill": self._cpu_mamba_batch_indices_prefill,
+                    "seq_idx": self._cpu_mamba_seq_idx,
+                    "cu_seqlens": self._cpu_mamba_cu_seqlens,
+                    "cu_chunk_seqlens": self._cpu_mamba_cu_chunk_seqlens,
+                    "last_chunk_indices": self._cpu_mamba_last_chunk_indices,
+                    "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
+                    "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
+                    "conv_seq_start": self._cpu_mamba_conv_seq_start,
+                }
+            )
+            self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
@@ -895,6 +913,32 @@ class DynamicInferenceContext(BaseInferenceContext):
         _mha_kv_seq_lengths_bytes = self.max_requests * 4
         _mha_cu_kv_seq_lengths_bytes = (self.max_requests + 1) * 4
         _mha_block_table_bytes = self.max_requests * self.max_kv_block_count * 4
+        # Mamba section: 9 int32 fields (hybrid models only). Must match the
+        # MambaMetadata shapes (mirrors the layout documented in ContextGPUView).
+        if self.is_hybrid_model:
+            self._max_mamba_chunks = (
+                self.max_tokens // self.mamba_chunk_size + self.max_requests
+            )
+            _mamba_batch_indices_decode_bytes = self.max_requests * 4
+            _mamba_batch_indices_prefill_bytes = self.max_requests * 4
+            _mamba_seq_idx_bytes = self.max_tokens * 4
+            _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
+            _mamba_cu_chunk_seqlens_bytes = (self._max_mamba_chunks + 1) * 4
+            _mamba_last_chunk_indices_bytes = self.max_requests * 4
+            _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
+            _mamba_conv_seq_idx_bytes = self.max_tokens * 4
+            _mamba_conv_seq_start_bytes = self.max_tokens * 4
+        else:
+            self._max_mamba_chunks = 0
+            _mamba_batch_indices_decode_bytes = 0
+            _mamba_batch_indices_prefill_bytes = 0
+            _mamba_seq_idx_bytes = 0
+            _mamba_cu_seqlens_bytes = 0
+            _mamba_cu_chunk_seqlens_bytes = 0
+            _mamba_last_chunk_indices_bytes = 0
+            _mamba_seq_idx_for_varlen_bytes = 0
+            _mamba_conv_seq_idx_bytes = 0
+            _mamba_conv_seq_start_bytes = 0
         _total_bytes = (
             2 * _tok_int64_bytes
             + 4 * _tok_int32_bytes
@@ -904,6 +948,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mha_kv_seq_lengths_bytes
             + _mha_cu_kv_seq_lengths_bytes
             + _mha_block_table_bytes
+            + _mamba_batch_indices_decode_bytes
+            + _mamba_batch_indices_prefill_bytes
+            + _mamba_seq_idx_bytes
+            + _mamba_cu_seqlens_bytes
+            + _mamba_cu_chunk_seqlens_bytes
+            + _mamba_last_chunk_indices_bytes
+            + _mamba_seq_idx_for_varlen_bytes
+            + _mamba_conv_seq_idx_bytes
+            + _mamba_conv_seq_start_bytes
         )
         self._cpu_bookkeeping_buf = torch.empty(
             _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True,
@@ -988,6 +1041,49 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         _off += _mha_block_table_bytes
 
+        # Mamba varlen metadata views (hybrid models only). Populated per step
+        # by MambaMetadata.compute_cpu_metadata(); transferred as part of the
+        # single coalesced H2D in transfer_bookkeeping_to_gpu().
+        if self.is_hybrid_model:
+            self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_batch_indices_decode_bytes
+            ].view(torch.int32)
+            _off += _mamba_batch_indices_decode_bytes
+            self._cpu_mamba_batch_indices_prefill = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_batch_indices_prefill_bytes
+            ].view(torch.int32)
+            _off += _mamba_batch_indices_prefill_bytes
+            self._cpu_mamba_seq_idx = (
+                self._cpu_bookkeeping_buf[_off : _off + _mamba_seq_idx_bytes]
+                .view(torch.int32)
+                .view(1, self.max_tokens)
+            )
+            _off += _mamba_seq_idx_bytes
+            self._cpu_mamba_cu_seqlens = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_cu_seqlens_bytes
+            ].view(torch.int32)
+            _off += _mamba_cu_seqlens_bytes
+            self._cpu_mamba_cu_chunk_seqlens = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_cu_chunk_seqlens_bytes
+            ].view(torch.int32)
+            _off += _mamba_cu_chunk_seqlens_bytes
+            self._cpu_mamba_last_chunk_indices = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_last_chunk_indices_bytes
+            ].view(torch.int32)
+            _off += _mamba_last_chunk_indices_bytes
+            self._cpu_mamba_seq_idx_for_varlen = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_seq_idx_for_varlen_bytes
+            ].view(torch.int32)
+            _off += _mamba_seq_idx_for_varlen_bytes
+            self._cpu_mamba_conv_seq_idx = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_conv_seq_idx_bytes
+            ].view(torch.int32)
+            _off += _mamba_conv_seq_idx_bytes
+            self._cpu_mamba_conv_seq_start = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_conv_seq_start_bytes
+            ].view(torch.int32)
+            _off += _mamba_conv_seq_start_bytes
+
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
         # GPU view: the single interface for GPU code to read context state.
@@ -997,6 +1093,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_tokens=self.max_tokens,
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
+            max_mamba_chunks=self._max_mamba_chunks,
         )
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
@@ -1008,15 +1105,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
-
-        # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
-        if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(
-                max_requests=self.max_requests,
-                max_tokens=self.max_tokens,
-                mamba_chunk_size=self.mamba_chunk_size,
-                d_conv=self.mamba_conv_states_shape[-1],
-            )
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
