@@ -120,6 +120,8 @@ def main(
         shm_size="30g",
         env_vars={
             "PYTHONUNBUFFERED": "1",
+                "FORCE_COLOR": "1",
+                "TERM": "xterm-256color",
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": str(n_repeat),
