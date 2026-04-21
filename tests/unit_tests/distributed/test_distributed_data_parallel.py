@@ -116,3 +116,63 @@ class TestDistributedDataParallel:
         for p1, p2 in zip(ddp_model1.parameters(), ddp_model2.parameters()):
             if hasattr(p1, 'main_grad') and hasattr(p2, 'main_grad'):
                 testing.assert_close(p1.main_grad, p2.main_grad, rtol=0, atol=0)
+
+
+class TestGradientReduceDivFactorValidation:
+    """Fail-fast guards on ``ddp_config.gradient_reduce_div_factor``.
+
+    The override is used by MIMO colocated bridges to re-scale grads to a peer
+    module's DP divisor. Bad values (non-int, non-positive) or the combination
+    with ``calculate_per_token_loss=True`` (which pins scaling_factor=1.0 and
+    divides externally) must be rejected at DDP construction, not silently
+    propagate into mis-scaled grads.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def _build_ddp(self, div_factor, calculate_per_token_loss=False):
+        transformer_config = TransformerConfig(
+            num_attention_heads=1,
+            num_layers=1,
+            context_parallel_size=1,
+            calculate_per_token_loss=calculate_per_token_loss,
+        )
+        ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=False,
+            bucket_size=10000,
+            gradient_reduce_div_factor=div_factor,
+        )
+        module = TestModel(input_dim=4, output_dim=4).cuda()
+        return DistributedDataParallel(transformer_config, ddp_config=ddp_config, module=module)
+
+    @pytest.mark.parametrize("bad_value", [0, -1, -100])
+    def test_non_positive_int_rejected(self, bad_value):
+        with pytest.raises(ValueError, match="must be a positive int"):
+            self._build_ddp(bad_value)
+
+    @pytest.mark.parametrize("bad_value", [1.0, 2.5, "2"])
+    def test_non_int_rejected(self, bad_value):
+        with pytest.raises(ValueError, match="must be a positive int"):
+            self._build_ddp(bad_value)
+
+    def test_conflicts_with_calculate_per_token_loss(self):
+        with pytest.raises(
+            ValueError, match="cannot be combined with.*calculate_per_token_loss=True"
+        ):
+            self._build_ddp(div_factor=2, calculate_per_token_loss=True)
+
+    def test_none_is_accepted(self):
+        """Sanity check: div_factor=None (the default) must not trip the guard."""
+        ddp = self._build_ddp(div_factor=None)
+        assert ddp.ddp_config.gradient_reduce_div_factor is None
+
+    def test_positive_int_is_accepted(self):
+        """Sanity check: a valid positive int passes the guard."""
+        ddp = self._build_ddp(div_factor=4)
+        assert ddp.ddp_config.gradient_reduce_div_factor == 4
