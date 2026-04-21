@@ -136,11 +136,9 @@ class TestMTPCudaGraphInference:
         context = DynamicInferenceContext(
             model_config=config,
             inference_config=InferenceConfig(
-                max_sequence_length=self.MAX_SEQ_LEN * 2,
-                buffer_size_gb=0.2,
+                max_sequence_length=self.MAX_SEQ_LEN,
+                buffer_size_gb=0.5,
                 materialize_only_last_token_logits=False,
-                use_flashinfer_fused_rope=None,
-                unified_memory_level=0,
                 num_speculative_tokens=num_speculative_tokens,
                 block_size_tokens=256,
                 max_requests=max_requests,
