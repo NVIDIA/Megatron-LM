@@ -233,7 +233,7 @@ class TestMTPCudaGraphInference:
         assert len(batch_sizes) > 0, "Engine did not warm up any MTP CUDA graphs"
 
         for batch_size in batch_sizes[:3]:
-            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda')
+            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
             dist.broadcast(hidden, src=0)
             token_ids = torch.randint(0, self.VOCAB_SIZE, (1, batch_size), device='cuda')
             dist.broadcast(token_ids, src=0)
@@ -282,7 +282,7 @@ class TestMTPCudaGraphInference:
         assert len(batch_sizes) > 0, "Engine did not warm up any MTP CUDA graphs"
 
         for batch_size in batch_sizes[:3]:
-            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda')
+            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
             dist.broadcast(hidden, src=0)
             hidden_sp = scatter_to_sequence_parallel_region(hidden, group=tp_group)
 
@@ -538,7 +538,7 @@ class TestMTPCudaGraphInference:
         batch_size = batch_sizes[0]
         self._set_mtp_cuda_graph_flag(model, True)
 
-        hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda')
+        hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
         dist.broadcast(hidden, src=0)
         token_ids = torch.randint(0, self.VOCAB_SIZE, (1, batch_size), device='cuda')
         dist.broadcast(token_ids, src=0)
@@ -589,7 +589,7 @@ class TestMTPCudaGraphInference:
         assert fallback_size is not None, "Could not find a non-warmed batch size"
 
         self._set_mtp_cuda_graph_flag(model, True)
-        hidden = torch.randn(fallback_size, 1, self.HIDDEN_SIZE, device='cuda')
+        hidden = torch.randn(fallback_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
         dist.broadcast(hidden, src=0)
         token_ids = torch.randint(0, self.VOCAB_SIZE, (1, fallback_size), device='cuda')
         dist.broadcast(token_ids, src=0)
@@ -758,7 +758,7 @@ class TestMTPCudaGraphExpertParallel:
         unwrapped = unwrap_model(model)
 
         # Broadcast identical inputs so all EP ranks see the same data.
-        hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda')
+        hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
         dist.broadcast(hidden, src=0)
         token_ids = torch.randint(0, self.VOCAB_SIZE, (1, batch_size), device='cuda')
         dist.broadcast(token_ids, src=0)
@@ -792,10 +792,10 @@ class TestMTPCudaGraphExpertParallel:
         is_dummy = ep_rank % 2 == 0
 
         if is_dummy:
-            hidden = torch.zeros(batch_size, 1, self.HIDDEN_SIZE, device='cuda')
+            hidden = torch.zeros(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
             token_ids = torch.zeros(1, batch_size, device='cuda', dtype=torch.long)
         else:
-            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda')
+            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
             token_ids = torch.randint(0, self.VOCAB_SIZE, (1, batch_size), device='cuda')
         position_ids = torch.arange(batch_size, device='cuda', dtype=torch.int64).unsqueeze(0)
 
@@ -910,7 +910,7 @@ class TestMTPCudaGraphExpertParallel:
         unwrapped = unwrap_model(model)
 
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        dummy_hidden = torch.zeros((tp_size, 1, self.HIDDEN_SIZE), device='cuda')
+        dummy_hidden = torch.zeros((tp_size, 1, self.HIDDEN_SIZE), device='cuda', dtype=torch.bfloat16)
         dummy_tokens = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
         dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
