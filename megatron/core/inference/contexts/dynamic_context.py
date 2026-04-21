@@ -320,6 +320,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.expert_model_parallel_group = None
 
+        # Optional CPU-side collective for EP batch-dimension sync. Populated by
+        # the engine via set_ep_zmq_communicator() when available. When set,
+        # match_graph_config() uses this to perform the MAX reduction on the
+        # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
+        self._ep_zmq_communicator = None
+
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -1338,6 +1344,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         return key
 
+    def set_ep_zmq_communicator(self, communicator) -> None:
+        """Attach an EP-group ZMQ communicator for CPU-side sync collectives.
+
+        When set, match_graph_config() uses this communicator's
+        sync_all_reduce_max() to perform the EP batch-dimension MAX reduction on
+        the CPU instead of launching a NCCL AllReduce kernel on the compute
+        stream. Expected to be called once by the inference engine after both
+        the context and the communicator have been created.
+
+        Args:
+            communicator: AsyncZMQCommunicator over the EP process group.
+        """
+        self._ep_zmq_communicator = communicator
+
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
         # Attention metadata reset is now handled by MHAMetadata.reset()
@@ -1681,6 +1701,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             ep_group=self.expert_model_parallel_group,
             num_speculative_tokens=self.num_speculative_tokens,
+            ep_zmq_communicator=self._ep_zmq_communicator,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
