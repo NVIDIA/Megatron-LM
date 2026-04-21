@@ -56,6 +56,8 @@ except ImportError as import_megatron_fsdp_error:
     IMPORT_MEGATRON_FSDP_ERROR = import_megatron_fsdp_error
     HAVE_MEGATRON_FSDP = False
 
+from megatron.core.transformer.moe.experts import GroupedMLP, TEGroupedMLP
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +104,18 @@ class FullyShardedDataParallel(_BaseDataParallel):
     ):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
+
+        if ddp_config.use_fully_shard_api:
+            self._init_with_fully_shard(
+                config,
+                ddp_config,
+                module,
+                fsdp_unit_modules,
+                disable_bucketing,
+                device,
+                pg_collection,
+            )
+            return
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -188,6 +202,36 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.config = config
 
         self.sync_rng_states_across_tp_group()
+
+    def _init_with_fully_shard(
+        self,
+        config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
+        module: torch.nn.Module,
+        fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
+        disable_bucketing: bool = False,
+        device: Optional[torch.device] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        if ddp_config.use_megatron_fsdp:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+                fully_shard_v2 as fully_shard,
+            )
+        else:
+            from torch.distributed.fsdp import fully_shard
+
+        edp_mesh = _init_dp_mesh(pg_collection, edp=True)
+        dp_mesh = _init_dp_mesh(pg_collection, edp=False)
+
+        for m in module.modules():
+            if isinstance(m, (GroupedMLP, TEGroupedMLP)):
+                fully_shard(m, edp_mesh)
+        for m in module.modules():
+            if isinstance(m, tuple(fsdp_unit_modules)):
+                fully_shard(m, dp_mesh)
+        fully_shard(module, dp_mesh)
+
+        super().__init__(config=config, module=module)
 
     def load_state_dict(self, state_dict, strict=True):
         """
@@ -432,6 +476,32 @@ class FullyShardedDataParallel(_BaseDataParallel):
             broadcast_list = [None]
         torch.distributed.broadcast_object_list(broadcast_list, group=self.tp_group, group_src=0)
         _load_rng_state_dict(broadcast_list[0])
+
+
+def _init_dp_mesh(pg_collection, edp=False):
+    assert HAVE_DTENSOR, (
+        "DTensor support is required to initialize the device mesh. "
+        "Please install a compatible version of PyTorch."
+    )
+
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    if edp:
+        mesh = DeviceMesh.from_group(
+            device_type="cuda",
+            group=pg_collection.expt_dp_group,
+            mesh_ranks=dist.get_process_group_ranks(pg_collection.expt_dp_group),
+            mesh_dim_names=("edp",),
+        )
+    else:
+        mesh = DeviceMesh.from_group(
+            device_type="cuda",
+            group=pg_collection.dp_cp,
+            mesh_ranks=dist.get_process_group_ranks(pg_collection.dp_cp),
+            mesh_dim_names=("dp",),
+        )
+
+    return mesh
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
