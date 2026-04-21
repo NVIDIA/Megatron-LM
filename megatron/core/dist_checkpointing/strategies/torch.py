@@ -53,6 +53,8 @@ from .async_utils import AsyncRequest
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 
 try:
+    if os.environ.get("DISABLE_NVRX"):
+        raise ImportError("NVRX disabled by DISABLE_NVRX env var")
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         CheckpointMetadataCache,
