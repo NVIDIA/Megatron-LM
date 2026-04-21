@@ -379,9 +379,6 @@ class TestCoordinatorProtocolRobustness:
     def test_submit_request_invalid_prompt_list_contents_logs_client_error_and_no_state_leak(self):
         coordinator = self._make_minimal_coordinator()
         known_clients = {b"client_0"}
-        coordinator.compute_request_hashes = unittest.mock.MagicMock(
-            side_effect=ValueError("bad prompt list contents")
-        )
 
         should_stop = coordinator._process_valid_message(
             [Headers.SUBMIT_REQUEST.value, 18, ["valid", None], {}],
@@ -395,7 +392,7 @@ class TestCoordinatorProtocolRobustness:
         coordinator._log_protocol_error.assert_called()
         args = coordinator._log_protocol_error.call_args[0]
         assert args[0] == "client_error"
-        assert "invalid SUBMIT_REQUEST payload" in args[1]
+        assert "invalid SUBMIT_REQUEST prompt list contents" in args[1]
 
     @pytest.mark.unit
     def test_submit_request_invalid_sampling_params_rejected_as_client_error(self):
@@ -435,6 +432,28 @@ class TestCoordinatorProtocolRobustness:
         args = coordinator._log_protocol_error.call_args[0]
         assert args[0] == "internal_error"
         assert "explode while hashing" in args[1]
+
+    @pytest.mark.unit
+    def test_submit_request_internal_value_error_classified_as_internal_error(self):
+        coordinator = self._make_minimal_coordinator()
+        coordinator.compute_request_hashes = unittest.mock.MagicMock(
+            side_effect=ValueError("internal hashing value error")
+        )
+
+        should_stop = DataParallelInferenceCoordinator.handle_message(
+            coordinator,
+            [Headers.SUBMIT_REQUEST.value, 20, [1, 2, 3, 4], {}],
+            b"client_0",
+            {b"client_0"},
+        )
+
+        assert should_stop is False
+        assert coordinator.request_id_to_client_id == {}
+        assert coordinator.request_id_to_client_request_id == {}
+        coordinator._log_protocol_error.assert_called_once()
+        args = coordinator._log_protocol_error.call_args[0]
+        assert args[0] == "internal_error"
+        assert "internal hashing value error" in args[1]
 
     @pytest.mark.unit
     @pytest.mark.parametrize("bad_frames", [[], [b"only_identity"], [b"a", b"b", b"c"]])

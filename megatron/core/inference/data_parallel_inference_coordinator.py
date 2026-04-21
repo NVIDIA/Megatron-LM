@@ -481,12 +481,20 @@ class DataParallelInferenceCoordinator:
                         )
                         return False
 
+                    if isinstance(prompt, list) and any(
+                        not isinstance(token, int) or isinstance(token, bool) for token in prompt
+                    ):
+                        self._log_protocol_error(
+                            "client_error",
+                            "invalid SUBMIT_REQUEST prompt list contents",
+                            header.name,
+                        )
+                        return False
+
                     payload = msgpack.packb(
                         [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
                         use_bin_type=True,
                     )
-
-                    request_hashes = self.compute_request_hashes(prompt)
                 except (TypeError, ValueError) as e:
                     self._log_protocol_error(
                         "client_error",
@@ -494,6 +502,8 @@ class DataParallelInferenceCoordinator:
                         header.name,
                     )
                     return False
+
+                request_hashes = self.compute_request_hashes(prompt)
 
                 if (
                     self.prefix_caching_coordinator_policy
