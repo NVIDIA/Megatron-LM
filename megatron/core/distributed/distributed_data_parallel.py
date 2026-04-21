@@ -69,29 +69,6 @@ class DistributedDataParallel(_BaseDataParallel):
             ddp_config.bucket_size = None
 
         self.ddp_config = ddp_config
-
-        # Validate the gradient_reduce_div_factor override upfront so bad
-        # values fail fast at DDP construction instead of silently producing
-        # wrong-scaled grads downstream.
-        div_override = ddp_config.gradient_reduce_div_factor
-        if div_override is not None:
-            if type(div_override) is not int or div_override < 1:
-                raise ValueError(
-                    "DistributedDataParallelConfig.gradient_reduce_div_factor "
-                    f"must be a positive int, got {div_override!r} "
-                    f"(type={type(div_override).__name__})."
-                )
-            if config.calculate_per_token_loss:
-                # Per-token loss forces scaling_factor=1.0 and does the
-                # final division externally via ``finalize_model_grads``.
-                # Layering an explicit div factor on top is ambiguous and
-                # almost certainly a bug — refuse the combination.
-                raise ValueError(
-                    "gradient_reduce_div_factor cannot be combined with "
-                    "config.calculate_per_token_loss=True; the per-token "
-                    "loss path pins scaling_factor=1.0 and divides externally."
-                )
-
         log_single_rank(
             logger,
             logging.INFO,
@@ -196,10 +173,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)] = indices
 
             if not config.calculate_per_token_loss:
-                effective_dp_size = (
-                    self.ddp_config.gradient_reduce_div_factor or self.dp_cp_group.size()
-                )
-                target_gradient_scaling_factor = 1.0 / effective_dp_size
+                target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.
@@ -208,13 +182,11 @@ class DistributedDataParallel(_BaseDataParallel):
                             == target_gradient_scaling_factor
                         )
                     else:
-                        # For non-expert parameters, gradient_scaling_factor is
-                        # dp_cp_group.size() / effective_dp_size (==1 by default).
-                        # For expert parameters, it is expt_dp_group.size() /
-                        # effective_dp_size (==expt/dp_cp by default).
+                        # For non-expert parameters, gradient_scaling_factor is 1.0.
+                        # For expert parameters, it is expt_dp_group.size() / dp_cp_group.size().
                         assert gradient_scaling_factor in (
-                            self.dp_cp_group.size() / effective_dp_size,
-                            self.expt_dp_group.size() / effective_dp_size,
+                            1.0,
+                            self.expt_dp_group.size() / self.dp_cp_group.size(),
                         )
                 else:
                     assert gradient_scaling_factor == target_gradient_scaling_factor
@@ -310,21 +282,14 @@ class DistributedDataParallel(_BaseDataParallel):
             #   1. Scale gradients by 1/dp_size before reduction
             #   2. Do sum reduction across data parallel ranks
             #   3. Final result is scaled by 1/dp_size as desired
-            # Effective batch divisor. Defaults to the actual DP group size; a
-            # caller whose loss was implicitly divided by a peer module's DP
-            # size (e.g. a colocated encoder sharing a bridge with a differently
-            # sharded LLM) can override via ``gradient_reduce_div_factor``.
-            effective_dp_size = (
-                self.ddp_config.gradient_reduce_div_factor or self.dp_cp_group.size()
-            )
             if self.ddp_config.average_in_collective:
-                # Avg reduction divides by the actual group size; pre-scale so
-                # the effective divisor becomes ``effective_dp_size``.
-                gradient_scaling_factor = self.dp_cp_group.size() / effective_dp_size
-                expert_gradient_scaling_factor = self.expt_dp_group.size() / effective_dp_size
+                gradient_scaling_factor = 1.0
+                expert_gradient_scaling_factor = (
+                    self.expt_dp_group.size() / self.dp_cp_group.size()
+                )
             else:
-                gradient_scaling_factor = 1.0 / effective_dp_size
-                expert_gradient_scaling_factor = 1.0 / effective_dp_size
+                gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
+                expert_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(

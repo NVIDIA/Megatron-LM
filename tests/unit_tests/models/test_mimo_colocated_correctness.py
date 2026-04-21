@@ -1,14 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 """Gradient-scaling correctness for colocated MimoModel under heterogeneous DP.
 
-Verifies that a heterogeneous-DP MimoModel configured with
-``gradient_reduce_div_factor=1`` produces the same post-step encoder
-weights as an **equal-DP** reference built on the SAME encoder TP/DP
-layout as the dist model (so the bridge is the identity passthrough —
-``BridgeDirection.EQUAL`` in ``ColocatedBridgeCommunicator``). Under
-correct grad scaling, both configs yield the DP=1 gradient on every
-encoder shard, so the Adam update lands on identical values and the
-sharded post-step weights compare directly.
+Verifies that a heterogeneous-DP MimoModel produces the same post-step
+encoder weights as an **equal-DP** reference built on the SAME encoder
+TP/DP layout as the dist model (so the bridge is the identity
+passthrough — ``BridgeDirection.EQUAL`` in
+``ColocatedBridgeCommunicator``). Under correct grad scaling, both
+configs yield the DP=1 gradient on every encoder shard, so the Adam
+update lands on identical values and the sharded post-step weights
+compare directly.
 
 Why an equal-DP reference is the right oracle:
   * Encoder sharding matches exactly — ref and dist both use
@@ -18,10 +18,14 @@ Why an equal-DP reference is the right oracle:
   * ``enc_dp == llm_dp`` on the ref side → the bridge is identity and
     every encoder rank feeds its colocated LLM rank with no
     redistribution collective.
-  * Loss is the num+den global-mean CE all-reduced on the LLM DP group
-    (see ``loss_func`` below). With
-    ``gradient_reduce_div_factor=1``, summing local grads across DP
-    recovers the DP=1 gradient on both sides.
+  * Both sides set ``calculate_per_token_loss=True`` on their
+    TransformerConfigs, which pins DDP's ``gradient_scaling_factor=1.0``
+    — pure SUM across DP. The custom
+    ``finalize_grads_func`` in ``_wire_training_hooks`` all-reduces
+    ``total_num_tokens`` over the LLM DP group, then calls
+    ``scale_gradients(1/N_global)`` on both encoder and LLM. This lands
+    the true global per-token mean on every shard without touching
+    ``DistributedDataParallel``.
 
 LLM TP differs between ref (``llm_tp=dist_enc_tp``) and dist
 (``llm_tp=dist_llm_tp``), so ref's LLM weights are copied into dist via
@@ -35,8 +39,10 @@ post-bridge hidden states bit-exact and surfaces only TP-shape drift
 in the logits oracle.
 
 If the heterogeneous-DP scaling is wrong (e.g. dividing by encoder_dp
-when it should be 1), the dist encoder's post-step weights diverge from
-the ref encoder's weights — a single Adam step is enough to detect.
+when it should be 1, or letting either DDP apply its default ``1/dp_size``
+on top of the per-token mean already delivered by the finalize hook),
+the dist encoder's post-step weights diverge from the ref encoder's
+weights — a single Adam step is enough to detect.
 
 Run with::
 
@@ -69,42 +75,43 @@ from tests.unit_tests.models.test_mimo_1f1b_schedule import (
 from tests.unit_tests.test_utilities import Utils
 
 
-def loss_func(loss_mask, llm_dp_pg, output_tensor):
-    """Global-mean CE across the LLM DP group via all-reduced ``(num, den)``.
+def loss_func(loss_mask, output_tensor):
+    """Per-token-loss 3-tuple: raw local sum + local valid-token count.
+
+    Returns ``(local_sum, local_num_tokens, log_dict)`` — the contract the
+    schedule expects when ``calculate_per_token_loss=True`` is set on the
+    TransformerConfig. No ``1/num_tokens`` or ``1/num_microbatches``
+    division is applied here; the schedule skips the per-microbatch
+    division (see ``schedules.py:270-274``) and aggregates ``num_tokens``
+    across microbatches for the finalize step.
+
+    Paired with ``mimo_finalize_grads_func`` below, which all-reduces
+    ``total_num_tokens`` over the LLM DP group to obtain ``N_global`` and
+    then divides both encoder and LLM grads by ``1/N_global`` directly via
+    ``scale_gradients`` — landing the true global per-token mean on every
+    shard without touching DDP.
 
     ``output_tensor`` is per-token CE from
     ``GPTModel.compute_language_model_loss`` with shape ``[b, s]``.
-    Masking ignored tokens, all-reducing numerator and valid-token count
-    across the **LLM DP group only** (TP peers already hold the identical
-    per-token loss so including them would double-count), and dividing is
-    the exact distributed equivalent of full-batch
-    ``F.cross_entropy(..., reduction='mean')``.
-
-    Every rank therefore sees the same scalar and every token's grad
-    scalar is ``1/global_den`` — which pairs with
-    ``gradient_reduce_div_factor=1`` on DDP so the reduction is a pure
-    SUM without any further ``1/dp_size`` division.
     """
     if output_tensor is None:
-        return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
+        zero_loss = torch.tensor(0.0, device='cuda', requires_grad=True)
+        zero_count = torch.tensor(0, device='cuda', dtype=torch.int)
+        return zero_loss, zero_count, {'loss_reduced': 0.0}
 
     masked = output_tensor.float() * loss_mask.float()
-    local_num = masked.sum()
-    local_den = loss_mask.float().sum()
-    dist.all_reduce(local_num, group=llm_dp_pg)
-    dist.all_reduce(local_den, group=llm_dp_pg)
-    loss = local_num / local_den.clamp_min(1.0)
-    return loss, {'loss_reduced': loss.detach().item()}
+    local_sum = masked.sum()
+    local_num_tokens = loss_mask.float().sum().to(torch.int)
+    return local_sum, local_num_tokens, {'loss_reduced': local_sum.detach().item()}
 
 
 def forward_step(data_iterator, model, encoder_grid, llm_grid, encoder_name):
     """Forward step with per-rank data slicing for heterogeneous DP."""
     batch = next(data_iterator) if data_iterator is not None else {'input_ids': None}
-    llm_dp_pg = llm_grid.get_pg("dp")
 
     if batch.get('input_ids') is None:
         output_tensor, loss_mask = model(**batch)
-        return output_tensor, partial(loss_func, loss_mask, llm_dp_pg)
+        return output_tensor, partial(loss_func, loss_mask)
 
     encoder_dp = encoder_grid.get_pg("dp").size()
     llm_dp = llm_grid.get_pg("dp").size()
@@ -142,7 +149,7 @@ def forward_step(data_iterator, model, encoder_grid, llm_grid, encoder_name):
                 batch[key] = batch[key][start : start + slice_size].contiguous()
 
     output_tensor, loss_mask = model(**batch)
-    return output_tensor, partial(loss_func, loss_mask, llm_dp_pg)
+    return output_tensor, partial(loss_func, loss_mask)
 
 
 def _set_deterministic_env():
@@ -160,8 +167,29 @@ def _set_deterministic_env():
 def _wire_training_hooks(mimo_model, language_pg, vision_pg):
     """Attach no_sync / finalize_grads / grad_scale hooks to a MimoModel.
 
-    Mirrors the wiring in ``run_colocated_test`` so both dist and ref
-    models drive the same DDP/optimizer path through the schedule.
+    The finalize hook implements the heterogeneous-DP grad-scaling story
+    without touching ``DistributedDataParallel``. Both sub-model configs
+    set ``calculate_per_token_loss=True``, so both DDPs pure-SUM across
+    their own DP group (``gradient_scaling_factor=1.0``). After backward
+    and DDP reduce, every rank's ``main_grad`` holds the un-normalized
+    full-batch sum of per-token gradients.
+
+    This hook then:
+      1. all-reduces the schedule's ``total_num_tokens`` across the LLM
+         DP group to obtain ``N_global`` (total valid tokens in the global
+         batch). Since ranks are colocated, every rank now knows
+         ``N_global``.
+      2. Calls ``finalize_model_grads(num_tokens=None)`` per side — runs
+         the usual DDP grad finish + layernorm/embedding AR work without
+         letting the built-in divisor path fire.
+      3. Calls ``scale_gradients(1/N_global)`` on each side — lands the
+         true global per-token mean uniformly on encoder and LLM grads.
+
+    Note: encoder has no loss_func (so nothing emits a per-encoder-DP
+    ``num_tokens`` to feed ``finalize_model_grads``' internal all-reduce).
+    Doing the all-reduce once ourselves and calling ``scale_gradients``
+    directly avoids engineering a fictitious per-encoder-rank count whose
+    sum happens to equal ``N_global``.
     """
 
     @contextmanager
@@ -174,7 +202,23 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
                     stack.enter_context(submodule.no_sync())
             yield
 
-    def finalize_grads_func(*args, **kwargs):
+    def finalize_grads_func(model_list, num_tokens, **kwargs):
+        # Schedule passes the per-rank sum-across-microbatches of what the
+        # loss_func returned. Because loss_func runs only on the LLM side,
+        # this is the LLM-local token count.
+        assert num_tokens is not None, (
+            "finalize_grads_func expects calculate_per_token_loss=True on the "
+            "TransformerConfig so the schedule forwards total_num_tokens; got None."
+        )
+
+        # Phase 1: lift the all-reduce. After this, every rank (including
+        # encoder-only replicas) has N_global = total non-padded tokens in
+        # the global batch.
+        llm_dp_pg = language_pg.dp_cp if language_pg.dp_cp is not None else language_pg.dp
+        dist.all_reduce(num_tokens, group=llm_dp_pg, op=dist.ReduceOp.SUM)
+        n_global = num_tokens.item()
+
+        # Phase 2: per-side DDP finish without built-in num_tokens scaling.
         if mimo_model.language_model is not None:
             finalize_model_grads(
                 [mimo_model.language_model], num_tokens=None, pg_collection=language_pg
@@ -182,6 +226,16 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
         for submodule in mimo_model.modality_submodules.values():
             if submodule is not None:
                 finalize_model_grads([submodule], num_tokens=None, pg_collection=vision_pg)
+
+        # Phase 3: uniform divide by N_global. Guard div-by-zero for the
+        # degenerate fully-masked batch.
+        if n_global > 0:
+            inv = 1.0 / n_global
+            if mimo_model.language_model is not None:
+                mimo_model.language_model.scale_gradients(inv)
+            for submodule in mimo_model.modality_submodules.values():
+                if submodule is not None:
+                    submodule.scale_gradients(inv)
 
     mimo_model.config.no_sync_func = no_sync_func
     mimo_model.config.finalize_model_grads_func = finalize_grads_func
@@ -718,10 +772,10 @@ def _assert_llm_logits_match(
 def _snapshot_first_layer_encoder_grads(mimo_model, encoder_name):
     """Clone ``param.main_grad`` for every ``.layers.0.`` encoder param.
 
-    ``main_grad`` holds the post-DDP-reduction gradient (SUM across encoder
-    DP when ``gradient_reduce_div_factor=1``), populated by the backward
-    pass and consumed by ``optimizer.step()``. Snapshot between backward
-    and step so the values aren't yet zeroed.
+    ``main_grad`` holds the post-DDP-reduction gradient (reduced across
+    encoder DP), populated by the backward pass and consumed by
+    ``optimizer.step()``. Snapshot between backward and step so the values
+    aren't yet zeroed.
     """
     encoder = mimo_model.modality_submodules[encoder_name].module
     snap = {}
@@ -875,18 +929,23 @@ def _run_forward_backward(
 class TestColocatedGradientScalingCorrectness:
     """Verify heterogeneous-DP encoder grad scaling against an equal-DP reference.
 
-    The critical invariant: with ``gradient_reduce_div_factor=1`` and a
-    num+den global-mean CE, both encoder and LLM DDP reductions are pure
-    SUMs. The aggregate gradient on every encoder shard equals the DP=1
+    The critical invariant: with ``calculate_per_token_loss=True`` on both
+    sub-model configs, DDP's ``gradient_scaling_factor`` is pinned to
+    1.0 and each side's DDP reduction is a pure SUM. The custom
+    ``finalize_grads_func`` then divides both encoder and LLM grads by
+    ``1/N_global`` (true global valid-token count), so the aggregate
+    gradient on every encoder shard equals the DP=1 per-token-mean
     gradient. The reference uses the same encoder TP/DP as dist but with
     ``enc_tp == llm_tp`` and ``enc_dp == llm_dp`` (identity bridge), so
     after one Adam step the dist model's sharded weights match the ref
     model's sharded weights within fp32 precision.
 
-    If the scaling factor were wrong (e.g., dividing by encoder_dp when
-    it should be 1), the encoder's reduced grad would be skewed and
-    post-step weights would diverge — a single optimizer step is
-    sufficient to detect.
+    If the scaling were wrong (e.g., if either DDP applied its default
+    ``1/dp_size`` on top of the per-token mean, or if the custom finalize
+    used the encoder DP group's sum-of-local-counts instead of the
+    globally lifted ``N_global``), the encoder's reduced grad would be
+    skewed and post-step weights would diverge — a single optimizer step
+    is sufficient to detect.
     """
 
     @classmethod
@@ -922,8 +981,9 @@ class TestColocatedGradientScalingCorrectness:
 
         Builds two MimoModels on every rank:
 
-        * Dist: the heterogeneous TP/DP config under test, using
-          ``gradient_reduce_div_factor=1`` to pure-SUM the DDP reductions.
+        * Dist: the heterogeneous TP/DP config under test, with
+          ``calculate_per_token_loss=True`` + custom finalize hook that
+          pure-SUMs DDP and externally divides by ``N_global``.
         * Ref: equal-DP uniform with ``enc_tp=dist_enc_tp``,
           ``enc_dp=dist_enc_dp``, ``llm_tp=dist_enc_tp``,
           ``llm_dp=dist_enc_dp`` — bridge is
@@ -931,12 +991,12 @@ class TestColocatedGradientScalingCorrectness:
           encoder TP sharding matches dist's exactly so shards line up
           1:1 for comparison.
 
-        Both models use ``gradient_reduce_div_factor=1``, so the
-        num+den mean-CE summed across DP yields the DP=1 gradient on
-        every encoder shard. LLM TP differs between the two models,
-        which introduces fp32 TP accumulation-order drift in the gradient
-        flowing back to the encoder but does not change the DP=1
-        invariant that the post-step encoder oracle checks.
+        Both models run the same finalize wiring; both DDPs pure-SUM
+        across their own DP group, then divide uniformly by ``N_global``.
+        LLM TP differs between the two models, which introduces fp32 TP
+        accumulation-order drift in the gradient flowing back to the
+        encoder but does not change the per-token-mean invariant that the
+        post-step encoder oracle checks.
 
         Reference weights are copied into the distributed model so both
         start from identical state. One Adam step later, the dist shards
@@ -969,14 +1029,16 @@ class TestColocatedGradientScalingCorrectness:
             [dist_enc_grid, dist_llm_grid, ref_enc_grid, ref_llm_grid]
         )
 
-        # Both configs use gradient_reduce_div_factor=1: under num+den mean CE,
-        # DDP must pure-SUM regardless of dp_size for the reduced grad to
-        # equal the DP=1 gradient on every rank.
+        # Both sub-model TransformerConfigs set calculate_per_token_loss=True
+        # (via per_token_loss=True on get_mimo_model), which pins DDP's
+        # gradient_scaling_factor to 1.0 — pure SUM across DP on both sides.
+        # Under the 3-tuple loss_func + custom finalize_grads_func in
+        # _wire_training_hooks, grads are divided uniformly by N_global,
+        # which is the true global per-token mean on every shard.
         ddp_config = DistributedDataParallelConfig(
             overlap_grad_reduce=True,
             bucket_size=10000,
             use_distributed_optimizer=True,
-            gradient_reduce_div_factor=1,
         )
 
         # Build dist first (heterogeneous TP/DP).
@@ -993,6 +1055,7 @@ class TestColocatedGradientScalingCorrectness:
             bf16=False,
             bias=False,
             dropout=False,
+            per_token_loss=True,
         )
         dist_mimo.model_type = ModelType.encoder_or_decoder
 
@@ -1010,6 +1073,7 @@ class TestColocatedGradientScalingCorrectness:
             bf16=False,
             bias=False,
             dropout=False,
+            per_token_loss=True,
         )
         ref_mimo.model_type = ModelType.encoder_or_decoder
 

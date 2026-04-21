@@ -192,12 +192,18 @@ def get_language_model_spec(
     bf16=True,
     bias=True,
     dropout=True,
+    per_token_loss=False,
 ):
     """Get the language model spec.
 
     ``bf16=False`` switches pipeline dtype and autocast to fp32. Correctness
     tests also pass ``bias=False, dropout=False`` to remove bias-update and
     stochastic noise from the cross-config diff signal.
+
+    ``per_token_loss=True`` sets ``calculate_per_token_loss=True`` on the
+    TransformerConfig, which pins DDP's gradient_scaling_factor to 1.0
+    (pure SUM reduction). Callers that flip this must supply a 3-tuple
+    loss_func and drive the external divide in their finalize hook.
     """
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
@@ -224,6 +230,7 @@ def get_language_model_spec(
         bf16=bf16,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='te',
+        calculate_per_token_loss=per_token_loss,
         **extra_kwargs,
     )
     return ModuleSpec(
@@ -269,11 +276,15 @@ def get_vision_submodules_spec(
     bf16=True,
     bias=True,
     dropout=True,
+    per_token_loss=False,
 ):
     """Get the submodule spec for the vision modality.
 
     ``bias=False`` / ``dropout=False`` mirror the LM-spec kwargs for
-    correctness tests.
+    correctness tests. ``per_token_loss=True`` sets
+    ``calculate_per_token_loss=True`` on the encoder's TransformerConfig so
+    the encoder DDP also pure-SUMs across DP (needed for the heterogeneous-DP
+    colocated path).
     """
     from megatron.core.transformer.transformer_block import TransformerBlock
 
@@ -300,6 +311,7 @@ def get_vision_submodules_spec(
         pipeline_model_parallel_size=pp_size,
         pipeline_dtype=pipeline_dtype,
         bf16=bf16,
+        calculate_per_token_loss=per_token_loss,
         **extra_kwargs,
     )
     vision_encoder_spec = ModuleSpec(
@@ -346,20 +358,26 @@ def get_mimo_model(
     bf16=True,
     bias=True,
     dropout=True,
+    per_token_loss=False,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
     Args:
-        ddp_config: Optional override for the Megatron DDP config. Colocated
-            heterogeneous-DP callers pass a config with
-            ``gradient_reduce_div_factor=1`` so the encoder and LLM DDP
-            reductions are pure SUMs (required under the num+den mean-CE
-            formulation). Default matches the 1F1B schedule tests' config.
+        ddp_config: Optional override for the Megatron DDP config. Default
+            matches the 1F1B schedule tests' config.
         bf16: If True (default) build the model in bf16; if False build in
             fp32 end-to-end for deterministic numerics in correctness tests.
         bias: If False, disable ``add_bias_linear`` in LM/vision configs and
             the projection MLP — removes bias-update noise from diffs.
         dropout: If False, force attention/hidden dropout to 0.0.
+        per_token_loss: If True, set ``calculate_per_token_loss=True`` on
+            both sub-model configs. This pins the encoder and LLM DDP
+            gradient_scaling_factor to 1.0 (pure SUM across DP). The caller
+            MUST supply a 3-tuple loss_func ``(sum_loss, num_tokens,
+            log_dict)`` and a custom ``finalize_model_grads_func`` that
+            divides grads by the correct global divisor on both sides;
+            hetero-DP callers use this to land ``1/B_full`` on both encoder
+            and LLM without relying on the per-DDP built-in scaling.
     """
     language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
     vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
@@ -374,6 +392,7 @@ def get_mimo_model(
         bf16=bf16,
         bias=bias,
         dropout=dropout,
+        per_token_loss=per_token_loss,
     )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
@@ -384,6 +403,7 @@ def get_mimo_model(
         bf16=bf16,
         bias=bias,
         dropout=dropout,
+        per_token_loss=per_token_loss,
     )
 
     module_to_grid_map = {encoder_name: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid}
