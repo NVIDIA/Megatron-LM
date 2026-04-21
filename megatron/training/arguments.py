@@ -1665,27 +1665,6 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "MoE latent projections are applicable only for MoE models."
         assert not args.use_legacy_models, "MoE latent projections are only supported for mcore models."
 
-    if args.tiktoken_special_tokens and not args.tokenizer_special_tokens:
-        warn_rank_0(
-            "--tiktoken-special-tokens argument is deprecated and will be removed soon. "
-            "Use --tokenizer-special-tokens instead."
-        )
-        args.tokenizer_special_tokens = args.tiktoken_special_tokens
-    
-    if args.tokenizer_hf_use_fast:
-        warn_rank_0(
-            "--tokenizer-hf-use-fast argument is deprecated and will be removed soon. "
-            "`use_fast` is set to True by default for HF tokenizers."
-            "Use --tokenizer-hf-no-use-fast if you want to disable `use_fast`."
-        )
-
-    if args.tokenizer_hf_include_special_tokens:
-        warn_rank_0(
-            "--tokenizer-hf-include-special-tokens argument is deprecated and will be removed soon. "
-            "`include_special_tokens` is set to True by default for HF tokenizers."
-            "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
-        )
-
     # Print arguments.
     _print_args("arguments", args)
 
@@ -2839,61 +2818,11 @@ def _add_validation_args(parser):
 
 
 def _add_tokenizer_args(parser):
-    group = parser.add_argument_group(title='tokenizer')
-    group.add_argument('--vocab-size', type=int, default=None,
-                       help='Size of vocab before EOD or padding.')
-    group.add_argument('--padded-vocab-size', type=int, default=None,
-                       help='Vocabulary size of the model (padded to be divisible by '
-                       'tensor model parallel size). If not provided, it will be '
-                       'automatically calculated from vocab-size.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file.')
-    group.add_argument('--merge-file', type=str, default=None,
-                       help='Path to the BPE merge file.')
-    group.add_argument('--vocab-extra-ids', type=int, default=0,
-                       help='Number of additional vocabulary tokens. '
-                            'They are used for span masking in the T5 model')
-    group.add_argument('--tokenizer-type', type=str,
-                       default=None,
-                       choices=['BertWordPieceLowerCase',
-                                'BertWordPieceCase',
-                                'GPT2BPETokenizer',
-                                'SentencePieceTokenizer',
-                                'GPTSentencePieceTokenizer',
-                                'HuggingFaceTokenizer',
-                                'Llama2Tokenizer',
-                                'TikTokenizer',
-                                'MultimodalTokenizer',
-                                'NullTokenizer',
-                                'NullMultimodalTokenizer',
-                                'SFTTokenizer'],
-                       help='What type of tokenizer to use.')
-    group.add_argument('--tokenizer-model', type=str, default=None,
-                       help='Sentencepiece tokenizer model.')
-    group.add_argument('--tokenizer-metadata', type=str, default=None,
-                       help='Path to tokenizer metadata in json format.')
-    group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
-                       help='List of special tokens. For TikTokenizer needs to have '
-                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--tiktoken-pattern', type=str, default=None,
-                       help='Which tiktoken pattern to use. Options: [v1, v2]')
-    group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
-                       help='Number of special tokens in tiktoken tokenizer')
-    group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
-                       help='List of tiktoken special tokens, needs to have '
-                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
-                       help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
-    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=True,
-                       help='Whether to use fast HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=True,
-                       help='Converting text to ids will include special for HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
-                       help='Whether to use fast HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
-                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
-    group.add_argument("--trust-remote-code", action="store_true", default=False,
-                       help='Whether or not to allow PreTrainedTokenizer to execute remote code')
+    from megatron.training.config import TokenizerConfig
+
+    tokenizer_factory = ArgumentGroupFactory(TokenizerConfig)
+    group = tokenizer_factory.build_group(parser, "tokenizer")
+
     return parser
 
 

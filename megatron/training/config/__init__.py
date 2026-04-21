@@ -11,6 +11,7 @@ from megatron.training.config.training_config import (
     SchedulerConfig,
     LoggerConfig,
     CheckpointConfig,
+    TokenizerConfig,
 )
 from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,

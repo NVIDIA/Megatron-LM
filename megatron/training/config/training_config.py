@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import signal
 from typing import Literal, Optional
 
+
 @dataclass(kw_only=True)
 class TrainingConfig:
     """Configuration settings related to the training loop."""
@@ -573,3 +574,71 @@ class CheckpointConfig:
                 "nvidia-resiliency-ext is not installed. "
                 "Please, install nvidia-resiliency-ext to enable async save."
             )
+
+
+@dataclass(kw_only=True)
+class TokenizerConfig:
+    """Configuration settings for the tokenizers."""
+
+    vocab_size: int = None
+    """Size of vocab before EOD or padding."""
+
+    padded_vocab_size: int = None
+    """Vocabulary size of the model (padded to be divisible by tensor model parallel size). 
+    If not provided, it will be automatically calculated from vocab-size."""
+
+    vocab_file: str = None
+    """Path to the vocab file."""
+
+    merge_file: str = None
+    """Path to the BPE merge file."""
+
+    vocab_extra_ids: int = 0
+    """Number of additional vocabulary tokens. They are used for span masking in the T5 model."""
+
+    tokenizer_type: Literal[
+        "BertWordPieceLowerCase",
+        "BertWordPieceCase",
+        "GPT2BPETokenizer",
+        "SentencePieceTokenizer",
+        "GPTSentencePieceTokenizer",
+        "HuggingFaceTokenizer",
+        "Llama2Tokenizer",
+        "TikTokenizer",
+        "MultimodalTokenizer",
+        "NullTokenizer",
+        "NullMultimodalTokenizer",
+        "SFTTokenizer",
+    ] = None
+    """What type of tokenizer to use."""
+
+    tokenizer_model: str = None
+    """Path to the tokenizer model."""
+
+    tokenizer_metadata: str = None
+    """Path to the tokenizer metadata file in json format."""
+
+    tokenizer_special_tokens: list[str] = field(default_factory=list)
+    """List of special tokens. For TikTokenizer needs to have 
+    ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]"""
+
+    tiktoken_pattern: Literal[
+        "v1",
+        "v2",
+    ] = None
+    """Which tiktoken pattern to use. Options: [v1, v2]"""
+
+    tiktoken_num_special_tokens: int = 1000
+    """Number of special tokens in tiktoken tokenizer."""
+
+    tokenizer_sentencepiece_legacy: bool = False
+    """SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage."""
+
+    tokenizer_hf_no_use_fast: bool = False
+    """Whether to use fast HuggingFace tokenizer."""
+
+    tokenizer_hf_no_include_special_tokens: bool = False
+    """Converting text to ids will not include special for HuggingFace tokenizer."""
+
+    trust_remote_code: bool = False
+    """Whether or not to allow PreTrainedTokenizer to execute remote code."""
