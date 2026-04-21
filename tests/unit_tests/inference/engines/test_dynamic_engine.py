@@ -1146,6 +1146,11 @@ class TestDynamicInferenceEngine:
             transformer_impl=transformer_impl,
         )
 
+        # Free NCCL communicators between parametrized runs to avoid resource exhaustion.
+        del env
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
