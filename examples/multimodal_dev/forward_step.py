@@ -151,20 +151,24 @@ def _build_packed_seq_params(
     Returns:
         A ``PackedSeqParams`` instance with ``qkv_format='thd'``.
     """
+    lengths_t = torch.tensor(
+        seq_lengths, dtype=torch.int32, device=device,
+    )
     cu_seqlens = torch.zeros(
         len(seq_lengths) + 1, dtype=torch.int32, device=device,
     )
-    for i, sl in enumerate(seq_lengths):
-        cu_seqlens[i + 1] = cu_seqlens[i] + sl
+    torch.cumsum(lengths_t, dim=0, out=cu_seqlens[1:])
 
     total_tokens = int(cu_seqlens[-1].item())
     max_seqlen = max(seq_lengths)
 
+    # cu_seqlens_padded mirrors cu_seqlens because _pack_batch strips
+    # padding before packing — there is no per-subsequence padding.
     return PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=None,
-        cu_seqlens_kv_padded=None,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         qkv_format='thd',

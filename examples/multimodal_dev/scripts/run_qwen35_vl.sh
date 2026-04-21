@@ -301,9 +301,6 @@ MULTIMODAL_ARGS=(
 
 if [ "$USE_PACKED_SEQUENCE" -eq 1 ]; then
     MULTIMODAL_ARGS+=( --use-packed-sequence )
-    # THD format requires flash attention backend; TE fused attention has
-    # a known gradient bug with THD qkv_format (grad norms explode).
-    TRAINING_ARGS+=( --attention-backend flash )
 fi
 
 # --- Qwen3.5 Decoder Architecture (variant-specific dims set above) ---
