@@ -289,6 +289,10 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
+    def get_extra_state(self) -> None:
+        """Suppress TE's FP8 extra state; this layer bypasses TE's forward and uses _apply_linear."""
+        return None
+
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
         Attempt to allocate symmetric memory buffer for all-gather.
