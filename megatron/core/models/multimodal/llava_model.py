@@ -8,10 +8,13 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.multimodal.context_parallel import (
+    gather_from_context_parallel_ranks_dynamic_res,
+    split_to_context_parallel_ranks_dynamic_res,
+)
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
@@ -22,29 +25,32 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
+from megatron.core.utils import deprecate_inference_params, log_single_rank
 
-if HAVE_TE:
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
+    from megatron.core.utils import is_te_min_version
 
+    HAVE_TE = True
     try:
         import transformer_engine_torch as tex
 
         HAVE_TEX = True
-    except ImportError:
-        tex = None
+    except:
         HAVE_TEX = False
-else:
-    TEDotProductAttention = None
-    tex = None
-    HAVE_TEX = False
+except:
+    HAVE_TE = False
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
 # Image token index can be tokenizer dependent so the default value does not work in all cases.
 DEFAULT_IMAGE_TOKEN_INDEX = -200
+DEFAULT_SOUND_TOKEN_INDEX = -300
 IMAGE_TOKEN = "<image>"
 VIDEO_TOKEN = "<video>"
+SOUND_TOKEN = "<so_embedding>"
 
 
 # Note: This is under development and may be missing features.
@@ -125,6 +131,18 @@ class LLaVAModel(MegatronModule):
         tokenizer_type: str = "",
         vp_stage: Optional[int] = None,
         use_vision_backbone_fp8_arch: bool = False,
+        dynamic_resolution: bool = False,
+        sound_model: Optional[torch.nn.Module] = None,
+        sound_projection: Optional[torch.nn.Module] = None,
+        sound_token_index: int = DEFAULT_SOUND_TOKEN_INDEX,
+        radio_force_eval_mode: bool = False,
+        radio_force_cpe_eval_mode: bool = False,
+        radio_interpolate_only_cpe: bool = False,
+        radio_cpe_aspect_ratio_select: bool = False,
+        radio_disable_cpe: bool = False,
+        temporal_patch_dim: int = 1,
+        separate_video_embedder: bool = False,
+        temporal_ckpt_compat: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -147,6 +165,18 @@ class LLaVAModel(MegatronModule):
         self.vision_model = None
         self.vision_projection = None
         self.language_model = None
+        self.sound_model = sound_model
+        self.sound_projection = sound_projection
+        self.sound_token_index = sound_token_index
+        self.dynamic_resolution = dynamic_resolution
+        self.radio_force_eval_mode = radio_force_eval_mode
+        self.radio_force_cpe_eval_mode = radio_force_cpe_eval_mode
+        self.radio_interpolate_only_cpe = radio_interpolate_only_cpe
+        self.radio_cpe_aspect_ratio_select = radio_cpe_aspect_ratio_select
+        self.radio_disable_cpe = radio_disable_cpe
+        self.temporal_patch_dim = temporal_patch_dim
+        self.separate_video_embedder = separate_video_embedder
+        self.temporal_ckpt_compat = temporal_ckpt_compat
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -157,7 +187,9 @@ class LLaVAModel(MegatronModule):
         self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
         self.context_parallel_lm = language_transformer_config.context_parallel_size
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
-            if not language_model_type.startswith('nemotron5-hybrid'):
+            if not language_model_type.startswith(
+                'nemotron5-hybrid'
+            ) and not language_model_type.startswith('nemotron6-moe'):
                 assert isinstance(
                     language_transformer_layer_spec.submodules, TransformerLayerSubmodules
                 )
@@ -195,7 +227,9 @@ class LLaVAModel(MegatronModule):
                     language_transformer_config, language_transformer_config.language_model_type
                 )
                 self.language_model = build_hf_model(language_transformer_config)
-            elif language_model_type.startswith('nemotron5-hybrid'):
+            elif language_model_type.startswith(
+                'nemotron5-hybrid'
+            ) or language_model_type.startswith('nemotron6-moe'):
                 self.language_model = HybridModel(
                     config=language_transformer_config,
                     hybrid_stack_spec=language_transformer_layer_spec,
@@ -210,6 +244,7 @@ class LLaVAModel(MegatronModule):
                     rotary_base=language_rotary_base,
                     fp16_lm_cross_entropy=fp16_lm_cross_entropy,
                     scatter_embedding_sequence_parallel=False,
+                    share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
                 )
             else:
@@ -272,7 +307,6 @@ class LLaVAModel(MegatronModule):
                 )
             elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
                 # TODO: should refactor into model code itself?
-                class_token_len = 0
                 max_img_h = 0
                 max_img_w = 0
                 embedder_bias = False
@@ -280,14 +314,9 @@ class LLaVAModel(MegatronModule):
                 use_mask_token = False
 
                 if vision_transformer_config.vision_model_type == "radio":
-                    class_token_len = 8
                     max_img_h = 2048
                     max_img_w = 2048
-                    embedder_bias = False
-                    ln_post_impl = None
-                    use_mask_token = False
                 elif vision_transformer_config.vision_model_type == "radio-g":
-                    class_token_len = 5
                     max_img_h = 1792
                     max_img_w = 1792
                     embedder_bias = True
@@ -296,15 +325,18 @@ class LLaVAModel(MegatronModule):
                     ln_post_impl = TENorm
                     use_mask_token = True
                 elif vision_transformer_config.vision_model_type == "cradio-g":
-                    class_token_len = 8
                     max_img_h = 2048
                     max_img_w = 2048
-                    embedder_bias = False
-                    ln_post_impl = None
-                    use_mask_token = False
+
+                # Use config value if set (e.g. by provider), otherwise model-specific defaults
+                _default_ctl = {"radio": 8, "radio-g": 5, "cradio-g": 8}.get(
+                    vision_transformer_config.vision_model_type, 8
+                )
+                class_token_len = getattr(
+                    vision_transformer_config, "class_token_len", _default_ctl
+                )
 
                 if vision_transformer_config.fp8 or use_vision_backbone_fp8_arch:
-                    # FP8 padding for final sequence length to be a multiple of 16 or 32.
                     class_token_len = 32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
 
                 self.vision_model = RADIOViTModel(
@@ -319,7 +351,16 @@ class LLaVAModel(MegatronModule):
                     patch_dim=patch_dim,
                     add_class_token=add_class_token,
                     embedder_bias=embedder_bias,
+                    dynamic_resolution=dynamic_resolution,
                     use_mask_token=use_mask_token,
+                    force_eval_mode=radio_force_eval_mode,
+                    force_cpe_eval_mode=radio_force_cpe_eval_mode,
+                    interpolate_only_cpe=radio_interpolate_only_cpe,
+                    cpe_aspect_ratio_select=radio_cpe_aspect_ratio_select,
+                    has_cpe=not radio_disable_cpe,
+                    temporal_patch_dim=temporal_patch_dim,
+                    separate_video_embedder=separate_video_embedder,
+                    temporal_ckpt_compat=temporal_ckpt_compat,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
@@ -411,7 +452,12 @@ class LLaVAModel(MegatronModule):
             self.language_model.set_input_tensor(input_tensor[0])
 
     def freeze(
-        self, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool
+        self,
+        freeze_language_model: bool,
+        freeze_vision_model: bool,
+        freeze_vision_projection: bool,
+        freeze_sound_model: bool = False,
+        freeze_sound_projection: bool = False,
     ):
         """Freeze model modules.
 
@@ -421,6 +467,8 @@ class LLaVAModel(MegatronModule):
             freeze_language_model (bool): Freeze the language model module.
             freeze_vision_model (bool): Freeze the vision model module.
             freeze_vision_projection (bool): Freeze the vision projection module.
+            freeze_sound_model (bool): Freeze the sound model module.
+            freeze_sound_projection (bool): Freeze the sound projection module.
         """
         modules = []
         if freeze_language_model and self.language_model is not None:
@@ -429,6 +477,10 @@ class LLaVAModel(MegatronModule):
             modules.append(self.vision_model)
         if freeze_vision_projection and self.vision_projection is not None:
             modules.append(self.vision_projection)
+        if freeze_sound_model and self.sound_model is not None:
+            modules.append(self.sound_model)
+        if freeze_sound_projection and self.sound_projection is not None:
+            modules.append(self.sound_projection)
 
         for module in modules:
             for param in module.parameters():
@@ -447,6 +499,9 @@ class LLaVAModel(MegatronModule):
         num_image_tiles,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        sound_embeddings: Optional[torch.Tensor] = None,
+        sound_embeddings_len: Optional[torch.Tensor] = None,
+        sound_timestamps: Optional[torch.Tensor] = None,
     ):
         """Preprocess input data before input to language model.
 
@@ -603,6 +658,33 @@ class LLaVAModel(MegatronModule):
                     image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
                 )
 
+            # Replace sound token positions with sound embeddings.
+            if sound_embeddings is not None:
+                sound_mask = input_ids == self.sound_token_index
+                if sound_mask.any():
+                    sound_batch_indices, sound_token_indices = torch.where(sound_mask)
+                    sound_new_position_ids = new_position_ids[
+                        sound_batch_indices, sound_token_indices
+                    ]
+                    if (
+                        self.sound_model is not None
+                        and self.sound_model.config.sound_pad_to_clip_duration
+                    ):
+                        flat_sound = sound_embeddings.permute(1, 0, 2).reshape(-1, embed_dim)
+                    else:
+                        flat_sound = torch.cat(
+                            [
+                                se[:sel]
+                                for se, sel in zip(
+                                    sound_embeddings.permute(1, 0, 2), sound_embeddings_len
+                                )
+                            ],
+                            dim=0,
+                        )
+                    final_embedding[sound_batch_indices, sound_new_position_ids] = (
+                        flat_sound.reshape(-1, embed_dim)
+                    )
+
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
         if self.post_process and has_labels:
@@ -708,6 +790,55 @@ class LLaVAModel(MegatronModule):
                 shard_factor = self.tensor_model_parallel_size_lm
                 seq_dim = 0
 
+            # Pad combined sequence to be divisible by shard_factor.
+            # VLM combined embeddings (text + vision tokens) may not align naturally.
+            seq_len = combined_embeddings.shape[seq_dim]
+            remainder = seq_len % shard_factor
+            if remainder != 0:
+                pad_len = shard_factor - remainder
+                if seq_dim == 0:  # [seq, batch, hidden]
+                    pad_shape = (pad_len, *combined_embeddings.shape[1:])
+                    combined_embeddings = torch.cat(
+                        [
+                            combined_embeddings,
+                            torch.zeros(
+                                pad_shape,
+                                dtype=combined_embeddings.dtype,
+                                device=combined_embeddings.device,
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    if new_labels is not None:
+                        new_labels = torch.nn.functional.pad(new_labels, (0, pad_len), value=-100)
+                    if new_loss_mask is not None:
+                        new_loss_mask = torch.nn.functional.pad(
+                            new_loss_mask, (0, pad_len), value=0
+                        )
+                else:  # [batch, seq, hidden]
+                    pad_shape = (
+                        combined_embeddings.shape[0],
+                        pad_len,
+                        *combined_embeddings.shape[2:],
+                    )
+                    combined_embeddings = torch.cat(
+                        [
+                            combined_embeddings,
+                            torch.zeros(
+                                pad_shape,
+                                dtype=combined_embeddings.dtype,
+                                device=combined_embeddings.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    if new_labels is not None:
+                        new_labels = torch.nn.functional.pad(new_labels, (0, pad_len), value=-100)
+                    if new_loss_mask is not None:
+                        new_loss_mask = torch.nn.functional.pad(
+                            new_loss_mask, (0, pad_len), value=0
+                        )
+
             assert (
                 combined_embeddings.shape[seq_dim] % shard_factor == 0
             ), f"Sequence length should be divisible by {shard_factor} for \
@@ -809,6 +940,13 @@ class LLaVAModel(MegatronModule):
         image_token_index: Optional[int] = None,
         runtime_gather_output: Optional[bool] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        vision_packed_seq_params: Optional[PackedSeqParams] = None,
+        sound_clips: Optional[torch.Tensor] = None,
+        sound_length: Optional[torch.Tensor] = None,
+        sound_timestamps: Optional[torch.Tensor] = None,
+        num_sound_clips: Optional[torch.Tensor] = None,
+        imgs_sizes: Optional[torch.Tensor] = None,
+        num_frames: Optional[List[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> torch.Tensor:
@@ -843,9 +981,9 @@ class LLaVAModel(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        use_inference_kv_cache = (
-            inference_context is not None
-            and "image_tokens_count" in inference_context.key_value_memory_dict
+        use_inference_kv_cache = inference_context is not None and (
+            "image_tokens_count" in inference_context.key_value_memory_dict
+            or "sound_tokens_count" in inference_context.key_value_memory_dict
         )
         has_images = images is not None and images.shape[0] > 0
 
@@ -859,9 +997,90 @@ class LLaVAModel(MegatronModule):
                 0, 0, 0
             )
         elif self.add_encoder and has_images:
-            image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
-            if self._drop_vision_class_token:
-                image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
+            use_temporal = (
+                self.temporal_patch_dim > 1 and imgs_sizes is not None and num_frames is not None
+            )
+            if use_temporal:
+                # CP-aware vision split: each rank processes only its share of
+                # frames/tubelets. Embeddings are gathered back to global shape
+                # below so that the text-token merge sees the full image set.
+                num_padded_imgs = 0
+                if self.context_parallel_lm > 1 and vision_packed_seq_params is not None:
+                    (
+                        images,
+                        imgs_sizes,
+                        vision_packed_seq_params,
+                        _has_pad_img,
+                        num_padded_imgs,
+                        local_num_frames,
+                    ) = split_to_context_parallel_ranks_dynamic_res(
+                        images,
+                        imgs_sizes,
+                        vision_packed_seq_params,
+                        fp8_enabled=False,
+                        patch_dim=self.vision_model.patch_dim,
+                        num_frames=num_frames,
+                        temporal_patch_size=self.temporal_patch_dim,
+                    )
+                    if local_num_frames is not None:
+                        num_frames = local_num_frames
+
+                vision_out = self.vision_model(
+                    images,
+                    imgs_sizes=imgs_sizes,
+                    packed_seq_params=vision_packed_seq_params,
+                    num_frames=num_frames,
+                )
+                image_embeddings, post_imgs_sizes, post_num_frames = vision_out
+                # Split packed output back to per-tubelet chunks and stack.
+                # RADIO in dynamic-resolution mode with add_class_token=True interleaves
+                # class_token_len tokens before each image's patches, so per-chunk length
+                # is (patches + class_token_len) until we strip the class tokens below.
+                sizes_iter = (
+                    [tuple(sz) for sz in post_imgs_sizes.tolist()]
+                    if torch.is_tensor(post_imgs_sizes)
+                    else list(post_imgs_sizes)
+                )
+                patch_counts = [
+                    (h // self.vision_model.patch_dim) * (w // self.vision_model.patch_dim)
+                    for h, w in sizes_iter
+                ]
+                ct_len = (
+                    self.vision_model.class_token_len
+                    if getattr(self.vision_model, "add_class_token", False)
+                    else 0
+                )
+                seq_lens = [p + ct_len for p in patch_counts]
+                chunks = torch.split(image_embeddings.squeeze(0), seq_lens, dim=0)
+                if self._drop_vision_class_token and ct_len > 0:
+                    chunks = [c[ct_len:] for c in chunks]
+                image_embeddings = torch.stack(chunks)  # [num_tubelets, patches, h_vision]
+
+                # Gather per-rank tubelet embeddings back to the full set so the
+                # downstream text-token merge (which sees all image tokens) finds a
+                # matching number of tiles on every rank.
+                if self.context_parallel_lm > 1 and vision_packed_seq_params is not None:
+                    image_embeddings = gather_from_context_parallel_ranks_dynamic_res(
+                        image_embeddings, num_padded_imgs
+                    )
+
+                # After temporal grouping each tubelet is one "tile" for LLaVAModel's
+                # _preprocess_data; one entry per post-grouping image (images have 1 frame,
+                # videos contribute ceil(nf/T) tubelets).
+                num_image_tiles = torch.ones(
+                    image_embeddings.shape[0], dtype=torch.int, device=image_embeddings.device
+                )
+            else:
+                if getattr(self, "dynamic_resolution", False) or imgs_sizes is not None:
+                    image_embeddings = self.vision_model(
+                        images, imgs_sizes=imgs_sizes, packed_seq_params=vision_packed_seq_params
+                    )
+                else:
+                    image_embeddings = self.vision_model(
+                        images
+                    )  # [num_tiles, img_seq_len, h_vision]
+                if self._drop_vision_class_token:
+                    image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
 
             if self._pixel_shuffle:
                 image_embeddings = pixel_shuffle(
@@ -891,6 +1110,34 @@ class LLaVAModel(MegatronModule):
                 )
         else:
             image_embeddings = self.encoder_hidden_state
+
+        # Sound processing
+        has_sounds = (
+            sound_clips is not None
+            and sound_clips.numel() > 1
+            and not (sound_clips.shape == torch.Size([1, 1]) and sound_clips[0, 0].item() == 0)
+        )
+
+        if use_inference_kv_cache:
+            sound_embeddings = None
+            sound_embeddings_len = None
+        elif self.add_encoder and not has_sounds:
+            device = sound_clips.device if sound_clips is not None else "cuda"
+            dtype = sound_clips.dtype if sound_clips is not None else torch.float32
+            sound_embeddings = torch.tensor([], dtype=dtype, device=device).reshape(0, 0, 0)
+            sound_embeddings_len = torch.tensor([], dtype=torch.long, device=device).reshape(0)
+        elif self.add_encoder and has_sounds:
+            sound_embeddings, sound_embeddings_len = self.sound_model(sound_clips, sound_length)
+            sound_embeddings = sound_embeddings.permute(1, 0, 2).contiguous()
+            sound_embeddings = self.sound_projection(sound_embeddings).contiguous()
+
+            if inference_context is not None:
+                inference_context.key_value_memory_dict["sound_tokens_count"] = (
+                    sound_embeddings.shape[1]
+                )
+        else:
+            sound_embeddings = self.encoder_hidden_state
+            sound_embeddings_len = None
 
         if not self.add_decoder:
             return image_embeddings, loss_mask
@@ -928,7 +1175,10 @@ class LLaVAModel(MegatronModule):
             inference_context,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
-        )
+            sound_embeddings=sound_embeddings,
+            sound_embeddings_len=sound_embeddings_len,
+            sound_timestamps=sound_timestamps,
+        )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
             combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
