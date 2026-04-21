@@ -251,8 +251,8 @@ def _check_supported_type(meta):
         DynamicInferenceContext,
         ArgMetadata,
     }
-    assert (
-        meta.type in _SUPPORTED_TYPES or is_dataclass(meta.value)
+    assert meta.type in _SUPPORTED_TYPES or is_dataclass(
+        meta.value
     ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
 
 

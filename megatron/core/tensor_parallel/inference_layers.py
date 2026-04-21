@@ -339,10 +339,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         return gather_from_tensor_model_parallel_region(x, group=self.tp_group)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        runtime_gather_output: Optional[bool] = None,
+        self, x: torch.Tensor, weight: torch.Tensor, runtime_gather_output: Optional[bool] = None
     ) -> Tuple[torch.Tensor, None]:
         """Forward pass."""
         if self.tp_size == 1:
