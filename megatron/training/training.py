@@ -1471,6 +1471,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             else:
                 kwargs['bucket_size'] = args.ddp_bucket_size
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
+            kwargs['bucket_size_last_bucket_scale_factor'] = args.ddp_bucket_size_last_bucket_scale_factor
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['param_name_patterns_for_fp32_local_accumulation'] = \
                 tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)

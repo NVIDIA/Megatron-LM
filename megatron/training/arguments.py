@@ -2742,6 +2742,11 @@ def _add_distributed_args(parser):
                        'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
                        'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
                        'apparently needs to be divisible by a power of 2 for high busbw.')
+    group.add_argument('--ddp-bucket-size-last-bucket-scale-factor', type=float, default=1.0,
+                       help='Scale factor in (0.0, 1.0] applied to bucket_size to cap the size of the '
+                       'final (exposed) DP bucket. Shifts params out of the final bucket into the '
+                       'preceding bucket to reduce the exposed reduce-scatter at the end of backward. '
+                       'Defaults to 1.0 (disabled).')
     group.add_argument('--ddp-reduce-scatter-with-fp32-accumulation', action='store_true',
                        default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
                        'values over the wire (using an all-to-all to keep total communication overhead in line '
