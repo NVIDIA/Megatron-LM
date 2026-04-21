@@ -4,7 +4,6 @@ import logging
 import shutil
 from contextlib import nullcontext
 from copy import deepcopy
-from itertools import product
 from pathlib import Path
 
 import pytest
@@ -226,6 +225,8 @@ def build_distributed_environment(mesh_dim_config: tuple):
     return device_mesh
 
 
+
+
 class TestMegatronFsdpFullyShard:
     """
     Test the fully_shard API for Megatron-FSDP.
@@ -233,6 +234,186 @@ class TestMegatronFsdpFullyShard:
     FIXME(@cspades): Megatron-FSDP leaves behind corrupted NCCL state that affects other tests.
     Until this is repaired, this test must be run in a separate bucket / container.
     """
+
+    FULLY_SHARD_CASES = [
+        pytest.param(
+            dict(
+                model_type=CNN,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=None,
+                mesh_dim_config=(2, 2, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="baseline-cnn-zero3-cp2",
+        ),
+        pytest.param(
+            dict(
+                model_type=TRANSFORMER,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=None,
+                mesh_dim_config=(1, 2, 2, 2),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="transformer-zero3-tp2",
+        ),
+        pytest.param(
+            dict(
+                model_type=TE_TRANSFORMER,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=None,
+                mesh_dim_config=(1, 2, 2, 2),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="te-transformer-zero3-tp2",
+        ),
+        pytest.param(
+            dict(
+                model_type=CNN,
+                dp_shard_strategy=OPTIM,
+                dp_outer_strategy=None,
+                mesh_dim_config=(2, 2, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="zero1",
+        ),
+        pytest.param(
+            dict(
+                model_type=CNN,
+                dp_shard_strategy=OPTIM_GRADS,
+                dp_outer_strategy=None,
+                mesh_dim_config=(2, 2, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="zero2",
+        ),
+        pytest.param(
+            dict(
+                model_type=CNN,
+                dp_shard_strategy=NO_SHARD,
+                dp_outer_strategy=None,
+                mesh_dim_config=(2, 2, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="no-shard",
+        ),
+        pytest.param(
+            dict(
+                model_type=CNN,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=NO_SHARD,
+                mesh_dim_config=(2, 2, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="hfsdp-outer-replicated",
+        ),
+        pytest.param(
+            dict(
+                model_type=CNN,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=OPTIM,
+                mesh_dim_config=(2, 2, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="hsdp-outer-sharded",
+        ),
+        pytest.param(
+            dict(
+                model_type=CNN,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=None,
+                mesh_dim_config=(2, 2, 2, 1),
+                preserve_fp32_weights=True,
+                init_model_with_meta_device=True,
+                torch_compile=True,
+            ),
+            id="meta-init-preserve-fp32-compile",
+        ),
+    ]
+
+    DCP_CHECKPOINT_CASES = [
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 2, 1),
+                shard_strategy=OPTIM_GRADS_PARAMS,
+                outer_shard_strategy=NO_SHARD,
+                model_type=CNN,
+            ),
+            id="baseline-cnn-zero3-cp2",
+        ),
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 2, 1),
+                shard_strategy=OPTIM_GRADS,
+                outer_shard_strategy=NO_SHARD,
+                model_type=CNN,
+            ),
+            id="cnn-zero2-cp2",
+        ),
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 2, 1),
+                shard_strategy=OPTIM,
+                outer_shard_strategy=NO_SHARD,
+                model_type=CNN,
+            ),
+            id="cnn-zero1-cp2",
+        ),
+        pytest.param(
+            dict(
+                mesh_dim_config=(2, 2, 2, 1),
+                shard_strategy=OPTIM_GRADS_PARAMS,
+                outer_shard_strategy=OPTIM,
+                model_type=CNN,
+            ),
+            id="cnn-hsdp-zero3",
+        ),
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 2, 1),
+                shard_strategy=OPTIM_GRADS_PARAMS,
+                outer_shard_strategy=NO_SHARD,
+                model_type=TRANSFORMER,
+            ),
+            id="transformer-zero3",
+        ),
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 2, 1),
+                shard_strategy=OPTIM_GRADS_PARAMS,
+                outer_shard_strategy=NO_SHARD,
+                model_type=TE_TRANSFORMER,
+            ),
+            id="te-transformer-zero3",
+        ),
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 2, 1),
+                shard_strategy=NO_SHARD,
+                outer_shard_strategy=NO_SHARD,
+                model_type=CNN,
+            ),
+            id="no-shard-xfail",
+            marks=pytest.mark.xfail(
+                reason="Megatron-FSDP does not support NO_SHARD for checkpointing yet."
+            ),
+        ),
+    ]
 
     @classmethod
     def setup_class(cls):
@@ -246,59 +427,24 @@ class TestMegatronFsdpFullyShard:
         version.parse(torch.__version__) < version.parse('2.4.0'),
         reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",
     )
-    @pytest.mark.parametrize("model_type", [CNN, TRANSFORMER, TE_TRANSFORMER])
-    @pytest.mark.parametrize(
-        # Sharding strategy for optimizer state, gradients, and parameters.
-        "dp_shard_strategy",
-        [NO_SHARD, OPTIM, OPTIM_GRADS, OPTIM_GRADS_PARAMS],
-    )
-    # Test FSDP, HSDP, and HFSDP.
-    @pytest.mark.parametrize("dp_outer_strategy", [None, NO_SHARD, OPTIM])
-    @pytest.mark.parametrize(
-        "mesh_dim_config",
-        [
-            # (DP_OUTER, DP_SHARD, CP, TP)
-            (2, 2, 2, 1),
-            (1, 2, 2, 2),
-            # TODO(@cspades, @boxiangw): Add a DTensor-based TP model
-            # case to test strided sharding when using HSDP + TP.
-            (2, 2, 1, 2),
-        ],
-    )
-    @pytest.mark.parametrize(
-        "common_args",
-        [
-            {
-                "preserve_fp32_weights": True,
-                "init_model_with_meta_device": True,
-                "torch_compile": True,
-            },
-            {
-                "preserve_fp32_weights": False,
-                "init_model_with_meta_device": False,
-                "torch_compile": False,
-            },
-        ],
-    )
-    def test_fully_shard(
-        self, model_type, dp_shard_strategy, dp_outer_strategy, mesh_dim_config, common_args
-    ):
+    @pytest.mark.parametrize("case", FULLY_SHARD_CASES)
+    def test_fully_shard(self, case):
         """
         Test the fully_shard API with different configurations.
         Does NOT test for performance or convergence.
-
-        NOTE(@cspades): This test is combinatorially large,
-        don't add any new parameters unless absolutely necessary,
-        or if some combinations can be flattened or simplified.
         """
         from megatron.core.distributed.fsdp.src.megatron_fsdp import (
             MixedPrecisionPolicy,
             fully_shard,
         )
 
-        preserve_fp32_weights = common_args["preserve_fp32_weights"]
-        init_model_with_meta_device = common_args["init_model_with_meta_device"]
-        torch_compile = common_args["torch_compile"]
+        model_type = case["model_type"]
+        dp_shard_strategy = case["dp_shard_strategy"]
+        dp_outer_strategy = case["dp_outer_strategy"]
+        mesh_dim_config = case["mesh_dim_config"]
+        preserve_fp32_weights = case["preserve_fp32_weights"]
+        init_model_with_meta_device = case["init_model_with_meta_device"]
+        torch_compile = case["torch_compile"]
 
         # Skip due to lack of functionality.
         if init_model_with_meta_device and dp_shard_strategy == NO_SHARD:
@@ -412,13 +558,8 @@ class TestMegatronFsdpFullyShard:
         version.parse(torch.__version__) < version.parse('2.4.0'),
         reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",
     )
-    @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS_PARAMS, OPTIM_GRADS, OPTIM, NO_SHARD])
-    @pytest.mark.parametrize("outer_shard_strategy", [NO_SHARD, OPTIM])
-    @pytest.mark.parametrize("model_type", [CNN, TRANSFORMER, TE_TRANSFORMER])
-    @pytest.mark.parametrize("mesh_dim_config", [(1, 4, 2, 1), (2, 2, 2, 1)])
-    def test_dcp_checkpoint_save_and_load(
-        self, mesh_dim_config, shard_strategy, outer_shard_strategy, model_type
-    ):
+    @pytest.mark.parametrize("case", DCP_CHECKPOINT_CASES)
+    def test_dcp_checkpoint_save_and_load(self, case):
         """
         Test that an Megatron-FSDP model checkpoint can be saved and loaded accurately.
         """
@@ -429,6 +570,11 @@ class TestMegatronFsdpFullyShard:
             fully_shard,
         )
 
+        mesh_dim_config = case["mesh_dim_config"]
+        shard_strategy = case["shard_strategy"]
+        outer_shard_strategy = case["outer_shard_strategy"]
+        model_type = case["model_type"]
+
         # Skip tests.
         if outer_shard_strategy == OPTIM and shard_strategy != OPTIM_GRADS_PARAMS:
             # TODO(@shjwudp, @cspades): Requires various modifications to support.
@@ -436,10 +582,6 @@ class TestMegatronFsdpFullyShard:
                 f"dp_outer sharding strategy {outer_shard_strategy} requires "
                 "zero_dp_strategy to be full-sharded ('optim_grads_params', 3)."
             )
-        if shard_strategy == NO_SHARD:
-            # NOTE: Just directly checkpoint the MegatronFSDP.module.state_dict() using torch.save().
-            # Beyond the scope of this unit test.
-            pytest.xfail(reason="Megatron-FSDP does not support NO_SHARD for checkpointing yet.")
 
         """
         DISTRIBUTED ENVIRONMENT INIT
