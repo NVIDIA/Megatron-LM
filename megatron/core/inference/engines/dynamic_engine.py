@@ -610,6 +610,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
+            # Give the context a CPU-side MAX-reduction primitive so
+            # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
+            if hasattr(self.context, "set_ep_zmq_communicator"):
+                self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()

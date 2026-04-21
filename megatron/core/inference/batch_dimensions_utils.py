@@ -143,6 +143,7 @@ class InferenceBatchDimensions:
         smallest_non_decode_cuda_graph_size: int,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         num_speculative_tokens: int = 0,
+        ep_zmq_communicator=None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
             We take the max token count across expert model parallel group.
@@ -154,6 +155,11 @@ class InferenceBatchDimensions:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            ep_zmq_communicator: Optional AsyncZMQCommunicator over the EP group. When
+                      provided, the cross-rank MAX reduction runs on the CPU via ZMQ
+                      (no GPU kernel, no H2D/D2H), avoiding a per-step NCCL AllReduce
+                      on the compute stream. When absent, falls back to
+                      torch.distributed.all_reduce on a GPU tensor.
 
         Return:
             (InferenceBatchDimensions) A new InferenceBatchDimensions object with
@@ -166,21 +172,41 @@ class InferenceBatchDimensions:
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
 
-        sync_tensor = torch.tensor(
-            [
+        if ep_zmq_communicator is not None:
+            # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
+            # compute stream plus the H2D/D2H pair that sandwiches it.
+            (
+                max_token_count,
+                max_is_non_decode,
+                max_prefill_count,
+                max_decode_count,
+            ) = ep_zmq_communicator.sync_all_reduce_max(
                 local_batch_dims.token_count,
                 int(is_non_decode),
                 local_batch_dims.prefill_req_count,
                 local_batch_dims.decode_req_count,
-            ],
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
-        )
+            )
+        else:
+            sync_tensor = torch.tensor(
+                [
+                    local_batch_dims.token_count,
+                    int(is_non_decode),
+                    local_batch_dims.prefill_req_count,
+                    local_batch_dims.decode_req_count,
+                ],
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(
+                sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
+            )
+            sync_tensor = sync_tensor.cpu()
+            max_token_count = int(sync_tensor[0].item())
+            max_is_non_decode = int(sync_tensor[1].item())
+            max_prefill_count = int(sync_tensor[2].item())
+            max_decode_count = int(sync_tensor[3].item())
 
-        torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group)
-
-        sync_tensor = sync_tensor.cpu()
-        is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
+        is_any_ep_rank_in_non_decode = max_is_non_decode == 1
 
         # We force eager mode for scenarios where some ranks will run with CUDA graphs
         # while others will not. Without this check, communication in the
@@ -191,7 +217,7 @@ class InferenceBatchDimensions:
         if is_any_ep_rank_in_non_decode and decode_only_cuda_graphs:
             return None  # indicate no match, run in eager mode
 
-        adjusted_token_count = int(sync_tensor[0].item())
+        adjusted_token_count = max_token_count
 
         # Sync request counts across EP ranks when strict matching is enabled
         # or when speculative tokens are used.  With speculative tokens,
@@ -203,12 +229,10 @@ class InferenceBatchDimensions:
             is_any_ep_rank_in_non_decode and num_speculative_tokens > 0
         )
         adjusted_prefill_req_count = (
-            int(sync_tensor[2].item())
-            if sync_request_counts
-            else local_batch_dims.prefill_req_count
+            max_prefill_count if sync_request_counts else local_batch_dims.prefill_req_count
         )
         adjusted_decode_req_count = (
-            int(sync_tensor[3].item()) if sync_request_counts else local_batch_dims.decode_req_count
+            max_decode_count if sync_request_counts else local_batch_dims.decode_req_count
         )
 
         # When any EP rank has prefill requests (non-strict mode), elevate
@@ -511,6 +535,7 @@ class CUDAGraphBatchDimensionBuilder:
         decode_only_cuda_graphs: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         num_speculative_tokens: int = 0,
+        ep_zmq_communicator=None,
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -526,6 +551,10 @@ class CUDAGraphBatchDimensionBuilder:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            ep_zmq_communicator: Optional AsyncZMQCommunicator over the EP group. When
+                      provided, batch-dimension MAX reduction uses a CPU-only ZMQ sync
+                      instead of a GPU NCCL AllReduce. Forwarded to
+                      adjust_batch_dims_for_expert_parallelism.
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """
@@ -541,6 +570,7 @@ class CUDAGraphBatchDimensionBuilder:
             ep_group=ep_group,
             smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
             num_speculative_tokens=num_speculative_tokens,
+            ep_zmq_communicator=ep_zmq_communicator,
         )
 
         if adjusted_batch_dim is None:
