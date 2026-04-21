@@ -168,12 +168,13 @@ class MHAMetadata(MetadataBase):
     def reset(self):
         """
         Reset the metadata for the next batch.
+
+        The GPU buffers (query_lengths, cu_query_seq_lengths, cu_kv_seq_lengths,
+        kv_seq_lengths, block_table) are fully overwritten by the next update()
+        or load_from_cpu() call, and state_data slices them to exactly the range
+        that will be re-written. Clearing them here would launch 5 redundant
+        CUDA kernels per step with no correctness benefit.
         """
-        self._query_lengths_buf.fill_(0)
-        self._cu_query_seq_lengths_buf.fill_(0)
-        self._cu_kv_seq_lengths_buf.fill_(0)
-        self._kv_seq_lengths_buf.fill_(0)
-        self._block_table_buf.fill_(0)
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
 
