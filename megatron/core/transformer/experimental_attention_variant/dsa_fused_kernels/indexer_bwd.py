@@ -1,8 +1,11 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+# Referenced from https://github.com/tile-ai/tilelang/blob/main/examples
+
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from einops import einsum as einops_einsum
 
 from .utils import prepare_token_indices
 
@@ -195,7 +198,7 @@ def _ref_indexer_bwd(Q, Weights, K, TopkIndices, AttnScore, offsets):
                 torch.arange(s, device=q.device)[:, None]
                 >= torch.arange(s, device=q.device)[None, :]
             )
-            logits = einops_einsum(q, k, "s1 h k, s2 k -> s1 h s2") * softmax_scale
+            logits = torch.einsum("shk,tk->sht", q, k) * softmax_scale
             logits = F.relu(logits)
             score = (logits * weights.unsqueeze(-1)).sum(dim=-2, dtype=torch.float32)
             score = torch.where(mask, score, float("-inf"))

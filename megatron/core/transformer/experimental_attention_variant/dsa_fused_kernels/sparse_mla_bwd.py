@@ -1,3 +1,7 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+# Referenced from https://github.com/tile-ai/tilelang/blob/main/examples
+
 import torch
 
 from .sparse_mla_fwd import _ref_sparse_mla_fwd
