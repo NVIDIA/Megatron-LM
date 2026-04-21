@@ -54,6 +54,12 @@ class RADIOViTModel(VisionModule):
             input size without cropping. Defaults to False.
         cpe_aspect_ratio_select: (bool): Select position embeddings based
             on aspect ratio. Defaults to False.
+        interpolate_align_corners: (bool): ``align_corners`` to use for
+            ``F.interpolate`` calls when resizing position embeddings.
+            Defaults to False (matches the prior hardcoded behavior).
+        grid_sample_align_corners: (bool): ``align_corners`` to use for the
+            ``F.grid_sample`` call used during CPE training augmentation.
+            Defaults to True (matches the prior hardcoded behavior).
     """
 
     def __init__(
@@ -78,6 +84,8 @@ class RADIOViTModel(VisionModule):
         force_cpe_eval_mode: bool = False,
         interpolate_only_cpe: bool = False,
         cpe_aspect_ratio_select: bool = False,
+        interpolate_align_corners: bool = False,
+        grid_sample_align_corners: bool = True,
         temporal_patch_dim: int = 1,
         temporal_ckpt_compat: bool = False,  # allow_checkpoint_without_temporal_compression
         separate_video_embedder: bool = False,
@@ -145,6 +153,8 @@ class RADIOViTModel(VisionModule):
         self.force_cpe_eval_mode = force_cpe_eval_mode
         self.interpolate_only_cpe = interpolate_only_cpe
         self.cpe_aspect_ratio_select = cpe_aspect_ratio_select
+        self.interpolate_align_corners = interpolate_align_corners
+        self.grid_sample_align_corners = grid_sample_align_corners
 
         orig_sequence_parallel = transformer_config.sequence_parallel
         transformer_config.sequence_parallel = False
@@ -597,7 +607,10 @@ class RADIOViTModel(VisionModule):
             if self.cpe_aspect_ratio_select:
                 pos_embed = aspect_ratio_select(pos_embed)
             pos_embed = F.interpolate(
-                pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
+                pos_embed.float(),
+                size=input_dims,
+                align_corners=self.interpolate_align_corners,
+                mode="bilinear",
             ).to(pos_embed.dtype)
 
         elif self.has_cpe:
@@ -639,7 +652,7 @@ class RADIOViTModel(VisionModule):
                     grid=grid_xy,
                     mode="bilinear",
                     padding_mode="zeros",
-                    align_corners=True,
+                    align_corners=self.grid_sample_align_corners,
                 ).to(pos_embed.dtype)
 
             else:
@@ -650,13 +663,16 @@ class RADIOViTModel(VisionModule):
                 if aspect_ratio_select_required or self.cpe_aspect_ratio_select:
                     pos_embed = aspect_ratio_select(pos_embed)
                     pos_embed = F.interpolate(
-                        pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
+                        pos_embed.float(),
+                        size=input_dims,
+                        align_corners=self.interpolate_align_corners,
+                        mode="bilinear",
                     ).to(pos_embed.dtype)
                 else:
                     pos_embed = F.interpolate(
                         pos_embed.float(),
                         size=(max_dim, max_dim),
-                        align_corners=False,
+                        align_corners=self.interpolate_align_corners,
                         mode="bilinear",
                     ).to(pos_embed.dtype)
                     pos_embed = window_select(pos_embed)
@@ -668,7 +684,10 @@ class RADIOViTModel(VisionModule):
 
         if pos_embed.shape[-2:] != input_dims:
             pos_embed = F.interpolate(
-                pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
+                pos_embed.float(),
+                size=input_dims,
+                align_corners=self.interpolate_align_corners,
+                mode="bilinear",
             ).to(pos_embed.dtype)
 
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)

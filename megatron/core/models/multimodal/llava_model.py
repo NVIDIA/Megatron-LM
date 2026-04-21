@@ -1018,6 +1018,7 @@ class LLaVAModel(MegatronModule):
                         imgs_sizes,
                         vision_packed_seq_params,
                         fp8_enabled=False,
+                        fp8_recipe=getattr(self.config, "fp8_recipe", None),
                         patch_dim=self.vision_model.patch_dim,
                         num_frames=num_frames,
                         temporal_patch_size=self.temporal_patch_dim,

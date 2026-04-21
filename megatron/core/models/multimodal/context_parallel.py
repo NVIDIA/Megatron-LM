@@ -190,18 +190,22 @@ class GatherFromContextParallelRanks(torch.autograd.Function):
 
     @staticmethod
     def symbolic(graph, input_):
+        """Symbolic forward used during ``torch.jit`` tracing."""
         return _gather_along_second_dim(input_)
 
     @staticmethod
     def forward(ctx, input_):
+        """All-gather ``input_`` along its second dimension across CP ranks."""
         return _gather_along_second_dim(input_)
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Reduce-scatter the gradient along the second dimension."""
         return _reduce_scatter_along_second_dim(grad_output)
 
 
 def gather_from_context_parallel_ranks(local_t, global_pad):
+    """Gather ``local_t`` across CP ranks, removing ``global_pad`` trailing pad tokens."""
     global_t = GatherFromContextParallelRanks.apply(local_t)
     if global_pad > 0:
         global_t = global_t[:, :-global_pad]
@@ -291,6 +295,7 @@ def split_to_context_parallel_ranks_dynamic_res(
     global_imgs_sizes,
     global_packed_seq_params,
     fp8_enabled=False,
+    fp8_recipe=None,
     patch_dim=16,
     num_frames=None,
     temporal_patch_size=1,
@@ -300,6 +305,9 @@ def split_to_context_parallel_ranks_dynamic_res(
     ``global_packed_seq_params`` provides per-image seqlens; the split respects them
     so each rank owns an integer number of images. When ``temporal_patch_size > 1``,
     splits also respect tubelet boundaries and ``num_frames`` is required.
+
+    ``fp8_recipe`` is forwarded to :func:`get_padding` so the FP8 padding multiple
+    matches the active recipe (32 for ``mxfp8``, 16 otherwise).
 
     Returns:
         (local_t, local_imgs_sizes, local_packed_seq_params, has_padding,
@@ -412,8 +420,9 @@ def split_to_context_parallel_ranks_dynamic_res(
 
     pad_img = None
     if fp8_enabled:
-        padding_needed = get_padding(final_seqlen, 1, 1, False, fp8_enabled=True)
-        patch_dim = 16
+        padding_needed = get_padding(
+            final_seqlen, 1, 1, False, fp8_enabled=True, fp8_recipe=fp8_recipe
+        )
         if padding_needed > 0:
             pad_img = torch.zeros(
                 [1, padding_needed, patch_dim * patch_dim * 3],
