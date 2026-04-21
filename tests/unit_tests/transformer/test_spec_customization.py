@@ -34,7 +34,11 @@ class TestSpecCustomization:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_l2_norm=True,
         )
 
         # specify Transformer Layer spec with all identity ops

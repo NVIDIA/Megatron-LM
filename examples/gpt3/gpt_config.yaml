@@ -136,7 +136,7 @@ use_legacy_models: False
 spec: null
 micro_batch_size: 2
 global_batch_size: 128
-rampup_batch_size: [32, 32, 65324160] 
+step_batch_size_schedule: "0:32 90B:64 180B:96 270B:128"
 check_for_nan_in_loss_and_grad: True
 num_layers_per_virtual_pipeline_stage: null
 
@@ -218,7 +218,6 @@ overlap_grad_reduce: False
 align_grad_reduce: True
 overlap_param_gather: False
 align_param_gather: False
-scatter_gather_tensors_in_pipeline: True
 local_rank: null
 lazy_mpu_init: null
 empty_unused_memory_level: 0

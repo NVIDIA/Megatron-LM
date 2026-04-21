@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import inspect
 import multiprocessing
 import os
 import random
@@ -16,41 +17,45 @@ from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
 from time import time
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-from typing import Optional, Union, List, Dict, Any
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
+from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
-from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.core.utils import get_pg_rank, get_pg_size, get_torch_version, is_torch_min_version
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
-from .async_utils import is_empty_async_queue, schedule_async_save
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest, _disable_gc
+from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
 
 try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        preprocess_state_dict_for_uneven_dtensor,
+    )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
-        print_diff_in_state_dicts,
+        handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
         handle_swiglu_in_state_dict,
-        handle_experts_in_state_dict,
+        print_diff_in_state_dicts,
     )
     HAVE_MEGATRON_FSDP = True
 except ImportError:
@@ -60,10 +65,25 @@ except ImportError:
 # [ModelOpt]: Import
 try:
     from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
+
     from megatron.post_training.utils import print_distributed_quant_summary
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
+
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+        FileSystemWriterAsync,
+    )
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+        save_state_dict_async_plan,
+    )
+
+    HAVE_NVRX = True
+except (ImportError, ModuleNotFoundError):
+
+    HAVE_NVRX = False
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
@@ -571,7 +591,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+    if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
         ensure_directory_exists(optim_checkpoint_name)
@@ -582,7 +602,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if args.async_save:
         if ckpt_type == CheckpointType.LEGACY:
             raise NotImplementedError('Async checkpoint save not implemented for legacy checkpoints')
-        elif ckpt_type == CheckpointType.GLOBAL and args.ckpt_format != 'torch_dist':
+        elif ckpt_type == CheckpointType.GLOBAL and args.ckpt_format not in ['torch_dist', 'torch_dcp', 'fsdp_dtensor']:
             raise NotImplementedError(f'Async checkpoint save not implemented for {args.ckpt_format} distributed checkpoint format')
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -621,7 +641,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 validate_sharding_integrity = not args.ckpt_assume_constant_structure
             else:
                 validate_sharding_integrity = True
-                save_strategy = TorchDistSaveShardedStrategy()
+                save_strategy = TorchDistSaveShardedStrategy(
+                    cpu_shm_mode=getattr(args, 'async_ckpt_use_cpu_shm', False)
+                )
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
                     if args.async_save:
@@ -655,7 +677,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                          async_sharded_save=args.async_save,
                                                          validate_access_integrity=validate_sharding_integrity,
                                                          preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
-                                                         content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata))
+                                                         content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
+                                                         async_strategy=args.async_strategy)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -667,11 +690,40 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if ckpt_format == "fsdp_dtensor":
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
-            fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
-            torch.distributed.checkpoint.save(
-                state_dict=state_dict,
-                storage_writer=fs_storage_writer,
-            )
+            if args.async_save:
+                planner = torch.distributed.checkpoint.DefaultSavePlanner()
+                coordinator_rank = 0
+                _cpu_shm = getattr(args, 'async_ckpt_use_cpu_shm', False)
+                _writer_kwargs = {}
+                if _cpu_shm:
+                    if (
+                        "use_cpu_shm_for_gpu_tensors"
+                        in inspect.signature(FileSystemWriterAsync.__init__).parameters
+                    ):
+                        _writer_kwargs["use_cpu_shm_for_gpu_tensors"] = True
+                    else:
+                        raise AssertionError(
+                            "Installed nvidia-resiliency-ext does not support "
+                            "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
+                            "to use --async-ckpt-use-cpu-shm."
+                        )
+                fs_storage_writer = FileSystemWriterAsync(
+                    checkpoint_name,
+                    thread_count=args.dist_ckpt_workers,
+                    use_msc=args.enable_msc,
+                    **_writer_kwargs,
+                )
+
+                save_state_dict_ret = save_state_dict_async_plan(
+                    state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
+                )
+                async_save_request = get_save_and_finalize_callbacks(fs_storage_writer, save_state_dict_ret)
+            else:
+                fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
+                torch.distributed.checkpoint.save(
+                    state_dict=state_dict,
+                    storage_writer=fs_storage_writer,
+                )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
@@ -684,7 +736,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             if ckpt_type == CheckpointType.LOCAL:
                 try:
-                    from megatron.core.dist_checkpointing.tensor_aware_state_dict import MCoreTensorAwareStateDict
+                    from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
+                        MCoreTensorAwareStateDict,
+                    )
                 except ModuleNotFoundError:
                     raise RuntimeError("The 'nvidia_resiliency_ext' module is required for local "
                                        "checkpointing but was not found. Please ensure it is installed.")
@@ -1174,7 +1228,7 @@ def _load_global_dist_base_checkpoint(
         )
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    load_strategy = TorchDistLoadShardedStrategy()
+    load_strategy = TorchDistLoadShardedStrategy(cache_metadata=args.ckpt_assume_constant_structure)
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
@@ -1189,7 +1243,12 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
-    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
+    state_dict = dist_checkpointing.load(
+        sharded_state_dict,
+        checkpoint_name,
+        load_strategy,
+        strict=args.dist_ckpt_strictness,
+    )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
@@ -1864,7 +1923,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+            if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
                 dp_rank = mpu.get_data_parallel_rank()
                 optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")

@@ -6,6 +6,10 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_dsa_module_spec_for_backend,
+    get_experimental_attention_variant_module_spec,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -23,6 +27,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_naive,
     rotate_activation,
 )
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -59,7 +64,7 @@ def patch_hadamard_if_needed():
 class TestRotateActivation:
     """Test rotate_activation function."""
 
-    @pytest.fixture(scope='function', autouse=True)
+    @pytest.fixture(scope='class', autouse=True)
     def setup_method(self):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
@@ -91,12 +96,14 @@ class TestRotateActivation:
 class TestComputeDSAIndexerLoss:
     """Test compute_dsa_indexer_loss function."""
 
-    @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self):
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
+        request.cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp']
+        )
         yield
         Utils.destroy_model_parallel()
 
@@ -209,7 +216,7 @@ class TestComputeDSAIndexerLoss:
 class TestDSAIndexerLossAutoScaler:
     """Test DSAIndexerLossAutoScaler autograd function."""
 
-    @pytest.fixture(scope='function', autouse=True)
+    @pytest.fixture(scope='class', autouse=True)
     def setup_method(self):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
@@ -268,28 +275,26 @@ class TestDSAIndexerLossAutoScaler:
         ), f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"
 
 
-@pytest.mark.parametrize("seqlen_and_topk", [[16, 8], [32, 16], [64, 32]])
-@pytest.mark.parametrize("sparse_loss", [False, True])
 class TestFusedDSAIndexerLossGradient:
     """Test that FusedDSAIndexerLoss manual backward matches autograd backward."""
 
-    @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self):
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
+        request.cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp']
+        )
         yield
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_fused_indexer_loss_gradient_matches_autograd(self, seqlen_and_topk, sparse_loss):
+    def test_fused_indexer_loss_gradient_matches_autograd(self):
         """
         Test that the manually written backward in FusedDSAIndexerLoss produces
         the same gradients as PyTorch autograd on the unfused implementation.
         """
-        seqlen = seqlen_and_topk[0]
-        index_topk = seqlen_and_topk[1]
         batch_size = 2
         num_heads = 4
         head_dim = 64
@@ -298,138 +303,118 @@ class TestFusedDSAIndexerLossGradient:
         softmax_scale = head_dim**-0.5
         loss_coeff = 1.0
 
-        torch.manual_seed(42)
+        for seqlen, index_topk in [[16, 8], [32, 16], [64, 32]]:
+            for sparse_loss in [False, True]:
+                tag = f"[seqlen={seqlen}, topk={index_topk}, sparse={sparse_loss}]"
+                torch.manual_seed(42)
 
-        # Create inputs for indexer
-        # q: [seqlen, batch, index_n_heads, index_head_dim]
-        q_ref = (
-            torch.randn(seqlen, batch_size, index_n_heads, index_head_dim, dtype=torch.float32)
-            .cuda()
-            .requires_grad_(True)
-        )
-        # weights: [seqlen, batch, index_n_heads]
-        weights_ref = (
-            torch.randn(seqlen, batch_size, index_n_heads, dtype=torch.float32)
-            .cuda()
-            .requires_grad_(True)
-        )
-        # k: [seqlen, batch, index_head_dim]
-        k_ref = (
-            torch.randn(seqlen, batch_size, index_head_dim, dtype=torch.float32)
-            .cuda()
-            .requires_grad_(True)
-        )
-        # query: [seqlen, batch, num_heads, head_dim] - detached, not trained
-        query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
-        # key: [seqlen, batch, num_heads, head_dim] - detached, not trained
-        key = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16).cuda()
+                q_ref = (
+                    torch.randn(
+                        seqlen, batch_size, index_n_heads, index_head_dim, dtype=torch.float32
+                    )
+                    .cuda()
+                    .requires_grad_(True)
+                )
+                weights_ref = (
+                    torch.randn(seqlen, batch_size, index_n_heads, dtype=torch.float32)
+                    .cuda()
+                    .requires_grad_(True)
+                )
+                k_ref = (
+                    torch.randn(seqlen, batch_size, index_head_dim, dtype=torch.float32)
+                    .cuda()
+                    .requires_grad_(True)
+                )
+                query = torch.randn(
+                    seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                ).cuda()
+                key = torch.randn(
+                    seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                ).cuda()
+                mask = torch.triu(
+                    torch.full((seqlen, seqlen), float('-inf'), dtype=torch.float32).cuda(),
+                    diagonal=1,
+                )
 
-        # Create causal mask
-        mask = torch.triu(
-            torch.full((seqlen, seqlen), float('-inf'), dtype=torch.float32).cuda(), diagonal=1
-        )
+                # Method 1: Autograd (reference)
+                index_scores_ref = _compute_index_scores(q_ref, weights_ref, k_ref)
+                index_scores_masked = index_scores_ref + mask.unsqueeze(0)
+                topk_k = min(index_topk, seqlen)
+                topk_indices = index_scores_masked.topk(topk_k, dim=-1)[1]
 
-        # =============================================
-        # Method 1: Autograd (reference)
-        # =============================================
-        # Compute index scores and apply mask (matches fused_qk_topk_naive behavior)
-        index_scores_ref = _compute_index_scores(q_ref, weights_ref, k_ref)
-        # Apply mask
-        index_scores_masked = index_scores_ref + mask.unsqueeze(0)
-        # Get topk indices from masked scores
-        topk_k = min(index_topk, seqlen)
-        topk_indices = index_scores_masked.topk(topk_k, dim=-1)[1]
+                loss_ref = compute_dsa_indexer_loss(
+                    index_scores=index_scores_masked,
+                    topk_indices=topk_indices,
+                    query=query,
+                    key=key,
+                    softmax_scale=softmax_scale,
+                    loss_coeff=loss_coeff,
+                    sparse_loss=sparse_loss,
+                    pg_collection=self.pg_collection,
+                )
+                loss_ref.backward()
 
-        # Compute loss using autograd
-        loss_ref = compute_dsa_indexer_loss(
-            index_scores=index_scores_masked,
-            topk_indices=topk_indices,
-            query=query,
-            key=key,
-            softmax_scale=softmax_scale,
-            loss_coeff=loss_coeff,
-            sparse_loss=sparse_loss,
-            pg_collection=self.pg_collection,
-        )
+                grad_q_ref = q_ref.grad.clone()
+                grad_weights_ref = weights_ref.grad.clone()
+                grad_k_ref = k_ref.grad.clone()
 
-        # Backward with autograd
-        loss_ref.backward()
+                # Method 2: FusedDSAIndexerLoss (manual backward)
+                q_fused = q_ref.detach().clone().requires_grad_(True)
+                weights_fused = weights_ref.detach().clone().requires_grad_(True)
+                k_fused = k_ref.detach().clone().requires_grad_(True)
 
-        # Save reference gradients
-        grad_q_ref = q_ref.grad.clone()
-        grad_weights_ref = weights_ref.grad.clone()
-        grad_k_ref = k_ref.grad.clone()
+                topk_indices_fused, loss_fused = FusedDSAIndexerLoss.apply(
+                    q_fused,
+                    weights_fused,
+                    k_fused,
+                    query.detach(),
+                    key.detach(),
+                    softmax_scale,
+                    index_topk,
+                    loss_coeff,
+                    mask,
+                    sparse_loss,
+                    self.pg_collection,
+                )
+                loss_fused.backward()
 
-        # =============================================
-        # Method 2: FusedDSAIndexerLoss (manual backward)
-        # =============================================
-        # Clone tensors from ref (detach and require grad again)
-        q_fused = q_ref.detach().clone().requires_grad_(True)
-        weights_fused = weights_ref.detach().clone().requires_grad_(True)
-        k_fused = k_ref.detach().clone().requires_grad_(True)
+                grad_q_fused = q_fused.grad
+                grad_weights_fused = weights_fused.grad
+                grad_k_fused = k_fused.grad
 
-        # Use FusedDSAIndexerLoss
-        topk_indices_fused, loss_fused = FusedDSAIndexerLoss.apply(
-            q_fused,
-            weights_fused,
-            k_fused,
-            query.detach(),
-            key.detach(),
-            softmax_scale,
-            index_topk,
-            loss_coeff,
-            mask,
-            sparse_loss,
-            self.pg_collection,
-        )
+                # Compare
+                assert torch.allclose(
+                    loss_fused, loss_ref, rtol=1e-5, atol=1e-5
+                ), f"{tag} Loss mismatch: fused={loss_fused.item()}, ref={loss_ref.item()}"
 
-        # Backward with manual implementation
-        loss_fused.backward()
+                assert torch.equal(
+                    topk_indices_fused, topk_indices
+                ), f"{tag} Top-k indices mismatch between fused and reference"
 
-        # Get fused gradients
-        grad_q_fused = q_fused.grad
-        grad_weights_fused = weights_fused.grad
-        grad_k_fused = k_fused.grad
+                assert torch.allclose(
+                    grad_q_fused, grad_q_ref, rtol=1e-5, atol=1e-5
+                ), f"{tag} grad_q mismatch: max diff = {(grad_q_fused - grad_q_ref).abs().max().item()}"
 
-        # =============================================
-        # Compare gradients
-        # =============================================
-        # Check loss values match
-        assert torch.allclose(
-            loss_fused, loss_ref, rtol=1e-5, atol=1e-5
-        ), f"Loss mismatch: fused={loss_fused.item()}, ref={loss_ref.item()}"
+                assert torch.allclose(
+                    grad_weights_fused, grad_weights_ref, rtol=1e-5, atol=1e-5
+                ), f"{tag} grad_weights mismatch: max diff = {(grad_weights_fused - grad_weights_ref).abs().max().item()}"
 
-        # Check topk indices match
-        assert torch.equal(
-            topk_indices_fused, topk_indices
-        ), "Top-k indices mismatch between fused and reference"
-
-        # Check gradients match
-        assert torch.allclose(
-            grad_q_fused, grad_q_ref, rtol=1e-5, atol=1e-5
-        ), f"grad_q mismatch: max diff = {(grad_q_fused - grad_q_ref).abs().max().item()}"
-
-        assert torch.allclose(
-            grad_weights_fused, grad_weights_ref, rtol=1e-5, atol=1e-5
-        ), f"grad_weights mismatch: max diff = {(grad_weights_fused - grad_weights_ref).abs().max().item()}"
-
-        assert torch.allclose(
-            grad_k_fused, grad_k_ref, rtol=1e-5, atol=1e-5
-        ), f"grad_k mismatch: max diff = {(grad_k_fused - grad_k_ref).abs().max().item()}"
+                assert torch.allclose(
+                    grad_k_fused, grad_k_ref, rtol=1e-5, atol=1e-5
+                ), f"{tag} grad_k mismatch: max diff = {(grad_k_fused - grad_k_ref).abs().max().item()}"
 
 
-@pytest.mark.parametrize("tensor_model_parallel_size", [2, 4])
-@pytest.mark.parametrize("sparse_loss", [False, True])
 class TestFusedDSAIndexerLossGradientTP:
     """Test FusedDSAIndexerLoss gradient consistency across different TP sizes."""
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_fused_indexer_loss_gradient_tp_consistency(
-        self, tensor_model_parallel_size, sparse_loss
-    ):
+    def test_fused_indexer_loss_gradient_tp_consistency(self):
         """
         Test that FusedDSAIndexerLoss produces consistent gradients across TP ranks
         and matches TP=1 baseline.
+
+        Tests all combinations of sparse_loss=[False, True] and TP=[2, 4] in a
+        single test to minimise process-group init/destroy overhead.
         """
         seqlen = 64
         index_topk = 32
@@ -442,7 +427,7 @@ class TestFusedDSAIndexerLossGradientTP:
         loss_coeff = 1.0
 
         # =============================================
-        # First run with TP=1 to get baseline
+        # Compute TP=1 baselines for both sparse_loss values
         # =============================================
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
@@ -452,7 +437,7 @@ class TestFusedDSAIndexerLossGradientTP:
 
         pg_collection_tp1 = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
 
-        # Create inputs
+        # Create inputs (shared across all variants)
         q_input = torch.randn(
             seqlen, batch_size, index_n_heads, index_head_dim, dtype=torch.float32
         ).cuda()
@@ -468,126 +453,134 @@ class TestFusedDSAIndexerLossGradientTP:
             torch.full((seqlen, seqlen), float('-inf'), dtype=torch.float32).cuda(), diagonal=1
         )
 
-        # Clone for TP=1
-        q_tp1 = q_input.clone().requires_grad_(True)
-        weights_tp1 = weights_input.clone().requires_grad_(True)
-        k_tp1 = k_input.clone().requires_grad_(True)
+        # {sparse_loss: (topk_indices, loss, grad_q, grad_weights, grad_k)}
+        baselines = {}
+        for sparse_loss in [False, True]:
+            q_tp1 = q_input.clone().requires_grad_(True)
+            weights_tp1 = weights_input.clone().requires_grad_(True)
+            k_tp1 = k_input.clone().requires_grad_(True)
 
-        # Forward and backward with TP=1
-        topk_indices_tp1, loss_tp1 = FusedDSAIndexerLoss.apply(
-            q_tp1,
-            weights_tp1,
-            k_tp1,
-            query_input.detach(),
-            key_input.detach(),
-            softmax_scale,
-            index_topk,
-            loss_coeff,
-            mask,
-            sparse_loss,
-            pg_collection_tp1,
-        )
-        loss_tp1.backward()
+            topk_indices_tp1, loss_tp1 = FusedDSAIndexerLoss.apply(
+                q_tp1,
+                weights_tp1,
+                k_tp1,
+                query_input.detach(),
+                key_input.detach(),
+                softmax_scale,
+                index_topk,
+                loss_coeff,
+                mask,
+                sparse_loss,
+                pg_collection_tp1,
+            )
+            loss_tp1.backward()
 
-        # Save TP=1 results
-        grad_q_tp1 = q_tp1.grad.clone()
-        grad_weights_tp1 = weights_tp1.grad.clone()
-        grad_k_tp1 = k_tp1.grad.clone()
-        loss_tp1_value = loss_tp1.detach().clone()
-
-        Utils.destroy_model_parallel()
-
-        # =============================================
-        # Run with target TP size
-        # =============================================
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(42)
-        model_parallel_cuda_manual_seed(42)
-
-        pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-
-        # Clone inputs for TP=N (same values as TP=1)
-        q_tpn = q_input.clone().requires_grad_(True)
-        weights_tpn = weights_input.clone().requires_grad_(True)
-        k_tpn = k_input.clone().requires_grad_(True)
-
-        # query and key need to be split along heads for TP
-        head_per_rank = num_heads // tensor_model_parallel_size
-        start_head = tp_rank * head_per_rank
-        end_head = (tp_rank + 1) * head_per_rank
-        query_tpn = query_input[:, :, start_head:end_head, :].clone()
-        key_tpn = key_input[:, :, start_head:end_head, :].clone()
-
-        # Forward and backward with TP=N
-        topk_indices_tpn, loss_tpn = FusedDSAIndexerLoss.apply(
-            q_tpn,
-            weights_tpn,
-            k_tpn,
-            query_tpn.detach(),
-            key_tpn.detach(),
-            softmax_scale,
-            index_topk,
-            loss_coeff,
-            mask,
-            sparse_loss,
-            pg_collection_tpn,
-        )
-        loss_tpn.backward()
-
-        # =============================================
-        # Compare results
-        # =============================================
-        # Loss should be the same
-        assert torch.allclose(
-            loss_tpn, loss_tp1_value, rtol=1e-5, atol=1e-5
-        ), f"Loss mismatch: TP={tensor_model_parallel_size} got {loss_tpn.item()}, TP=1 got {loss_tp1_value.item()}"
-
-        # Top-k indices should be the same
-        assert torch.equal(
-            topk_indices_tpn, topk_indices_tp1
-        ), "Top-k indices mismatch between TP=1 and TP=N"
-
-        # Gradients should match exactly (indexer params are duplicated across TP)
-        assert torch.allclose(
-            q_tpn.grad, grad_q_tp1, rtol=1e-5, atol=1e-5
-        ), f"grad_q mismatch: max diff = {(q_tpn.grad - grad_q_tp1).abs().max().item()}"
-
-        assert torch.allclose(
-            weights_tpn.grad, grad_weights_tp1, rtol=1e-5, atol=1e-5
-        ), f"grad_weights mismatch: max diff = {(weights_tpn.grad - grad_weights_tp1).abs().max().item()}"
-
-        assert torch.allclose(
-            k_tpn.grad, grad_k_tp1, rtol=1e-5, atol=1e-5
-        ), f"grad_k mismatch: max diff = {(k_tpn.grad - grad_k_tp1).abs().max().item()}"
-
-        # Check gradients are identical across all TP ranks
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        if tp_size > 1:
-            for grad_tensor, name in [
-                (q_tpn.grad, "grad_q"),
-                (weights_tpn.grad, "grad_weights"),
-                (k_tpn.grad, "grad_k"),
-            ]:
-                grad_list = [torch.zeros_like(grad_tensor) for _ in range(tp_size)]
-                torch.distributed.all_gather(grad_list, grad_tensor, group=pg_collection_tpn.tp)
-
-                for i in range(1, tp_size):
-                    assert torch.allclose(
-                        grad_list[0], grad_list[i], rtol=0, atol=0
-                    ), f"{name} differs between TP rank 0 and rank {i}"
+            baselines[sparse_loss] = (
+                topk_indices_tp1.clone(),
+                loss_tp1.detach().clone(),
+                q_tp1.grad.clone(),
+                weights_tp1.grad.clone(),
+                k_tp1.grad.clone(),
+            )
 
         Utils.destroy_model_parallel()
+
+        # =============================================
+        # Test each TP size against baselines
+        # =============================================
+        for tensor_model_parallel_size in [2, 4]:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=1,
+            )
+            torch.manual_seed(42)
+            model_parallel_cuda_manual_seed(42)
+
+            pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+            # query and key split along heads for TP
+            head_per_rank = num_heads // tensor_model_parallel_size
+            start_head = tp_rank * head_per_rank
+            end_head = (tp_rank + 1) * head_per_rank
+            query_tpn = query_input[:, :, start_head:end_head, :].clone()
+            key_tpn = key_input[:, :, start_head:end_head, :].clone()
+
+            for sparse_loss in [False, True]:
+                topk_indices_tp1, loss_tp1_value, grad_q_tp1, grad_weights_tp1, grad_k_tp1 = (
+                    baselines[sparse_loss]
+                )
+                tag = f"[TP={tensor_model_parallel_size}, sparse_loss={sparse_loss}]"
+
+                q_tpn = q_input.clone().requires_grad_(True)
+                weights_tpn = weights_input.clone().requires_grad_(True)
+                k_tpn = k_input.clone().requires_grad_(True)
+
+                topk_indices_tpn, loss_tpn = FusedDSAIndexerLoss.apply(
+                    q_tpn,
+                    weights_tpn,
+                    k_tpn,
+                    query_tpn.detach(),
+                    key_tpn.detach(),
+                    softmax_scale,
+                    index_topk,
+                    loss_coeff,
+                    mask,
+                    sparse_loss,
+                    pg_collection_tpn,
+                )
+                loss_tpn.backward()
+
+                # Loss should be the same
+                assert torch.allclose(
+                    loss_tpn, loss_tp1_value, rtol=1e-5, atol=1e-5
+                ), f"{tag} Loss mismatch: got {loss_tpn.item()}, TP=1 got {loss_tp1_value.item()}"
+
+                # Top-k indices should be the same
+                assert torch.equal(
+                    topk_indices_tpn, topk_indices_tp1
+                ), f"{tag} Top-k indices mismatch between TP=1 and TP=N"
+
+                # Gradients should match (indexer params are duplicated across TP)
+                assert torch.allclose(
+                    q_tpn.grad, grad_q_tp1, rtol=1e-5, atol=1e-5
+                ), f"{tag} grad_q mismatch: max diff = {(q_tpn.grad - grad_q_tp1).abs().max().item()}"
+
+                assert torch.allclose(
+                    weights_tpn.grad, grad_weights_tp1, rtol=1e-5, atol=1e-5
+                ), f"{tag} grad_weights mismatch: max diff = {(weights_tpn.grad - grad_weights_tp1).abs().max().item()}"
+
+                assert torch.allclose(
+                    k_tpn.grad, grad_k_tp1, rtol=1e-5, atol=1e-5
+                ), f"{tag} grad_k mismatch: max diff = {(k_tpn.grad - grad_k_tp1).abs().max().item()}"
+
+                # Check gradients are identical across all TP ranks
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                if tp_size > 1:
+                    for grad_tensor, name in [
+                        (q_tpn.grad, "grad_q"),
+                        (weights_tpn.grad, "grad_weights"),
+                        (k_tpn.grad, "grad_k"),
+                    ]:
+                        grad_list = [torch.zeros_like(grad_tensor) for _ in range(tp_size)]
+                        torch.distributed.all_gather(
+                            grad_list, grad_tensor, group=pg_collection_tpn.tp
+                        )
+
+                        for i in range(1, tp_size):
+                            assert torch.allclose(
+                                grad_list[0], grad_list[i], rtol=0, atol=0
+                            ), f"{tag} {name} differs between TP rank 0 and rank {i}"
+
+            Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("seqlen", [16, 64])
 class TestDSAIndexer:
     """Test DSA Indexer module basic functionality with TP=1."""
 
-    @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self):
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
@@ -595,8 +588,9 @@ class TestDSAIndexer:
         model_parallel_cuda_manual_seed(123)
 
         # Create MLA config with sparse attention parameters
-        self.index_topk = 32
-        self.config = MLATransformerConfig(
+        cls = request.cls
+        cls.index_topk = 32
+        cls.config = MLATransformerConfig(
             num_layers=2,
             hidden_size=256,
             num_attention_heads=16,
@@ -615,7 +609,7 @@ class TestDSAIndexer:
             # Sparse attention specific configs
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
-            dsa_indexer_topk=self.index_topk,
+            dsa_indexer_topk=cls.index_topk,
         )
 
         # Create indexer submodules spec
@@ -629,10 +623,8 @@ class TestDSAIndexer:
             linear_weights_proj=ModuleSpec(module=TELinear),
         )
 
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
-        self.indexer = DSAIndexer(self.config, indexer_submodules, self.pg_collection)
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        cls.indexer = DSAIndexer(cls.config, indexer_submodules, cls.pg_collection)
 
         yield
         Utils.destroy_model_parallel()
@@ -724,16 +716,17 @@ class TestDSAIndexer:
 class TestDSAttention:
     """Test DSAttention module basic functionality with TP=1."""
 
-    @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self):
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         torch.manual_seed(123)
         model_parallel_cuda_manual_seed(123)
 
+        cls = request.cls
         # Create MLA config with sparse attention parameters
-        self.config = MLATransformerConfig(
+        cls.config = MLATransformerConfig(
             num_layers=2,
             hidden_size=256,
             num_attention_heads=16,
@@ -770,17 +763,15 @@ class TestDSAttention:
         indexer_spec = ModuleSpec(module=DSAIndexer, submodules=indexer_submodules)
         sparse_attention_submodules = DSAttentionSubmodules(indexer=indexer_spec)
 
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
-        self.sparse_attention = DSAttention(
-            config=self.config,
+        cls.sparse_attention = DSAttention(
+            config=cls.config,
             submodules=sparse_attention_submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
             attention_type='self',
-            pg_collection=self.pg_collection,
+            pg_collection=cls.pg_collection,
         )
 
         yield
@@ -953,10 +944,11 @@ class TestDSAttention:
 # ======================================================================================
 
 
-@pytest.mark.parametrize("tensor_model_parallel_size", [2, 4, 8])
-@pytest.mark.parametrize("sequence_parallel", [False, True])
 class TestIndexerTensorParallel:
     """Test DSA Indexer with different TP sizes and SP settings, compare with TP=1 baseline."""
+
+    TP_SIZES = [2, 4, 8]
+    SP_VALUES = [False, True]
 
     def _create_config(self, sequence_parallel=False):
         """Helper to create MLA config."""
@@ -1002,54 +994,56 @@ class TestIndexerTensorParallel:
         return DSAIndexer(config, indexer_submodules, pg_collection)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_indexer_weight_consistency(self, tensor_model_parallel_size, sequence_parallel):
+    def test_dsa_indexer_weight_consistency(self):
         """Test that indexer weights are identical across ALL GPUs."""
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
+        for tensor_model_parallel_size in self.TP_SIZES:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=1,
+            )
+            world_size = torch.distributed.get_world_size()
 
-        config = self._create_config(sequence_parallel=sequence_parallel)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        indexer = self._create_indexer(config, pg_collection).cuda()
+            for sequence_parallel in self.SP_VALUES:
+                torch.manual_seed(123)
+                model_parallel_cuda_manual_seed(123)
 
-        # Check that all weights are identical across ALL ranks (not just TP group)
-        world_size = torch.distributed.get_world_size()
-        world_rank = torch.distributed.get_rank()
+                config = self._create_config(sequence_parallel=sequence_parallel)
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=['tp', 'cp']
+                )
+                indexer = self._create_indexer(config, pg_collection).cuda()
+                tag = f"[TP={tensor_model_parallel_size}, SP={sequence_parallel}]"
 
-        if world_size > 1:
-            for name, param in indexer.named_parameters():
-                # Gather weights from ALL ranks in WORLD group
-                param_list = [torch.zeros_like(param.data) for _ in range(world_size)]
-                torch.distributed.all_gather(param_list, param.data)
+                # Check that all weights are identical across ALL ranks
+                if world_size > 1:
+                    for name, param in indexer.named_parameters():
+                        param_list = [torch.zeros_like(param.data) for _ in range(world_size)]
+                        torch.distributed.all_gather(param_list, param.data)
 
-                # All weights should be identical across all GPUs
-                for i in range(1, world_size):
-                    assert torch.allclose(
-                        param_list[0], param_list[i], rtol=0, atol=0
-                    ), f"Parameter {name} differs between rank 0 and rank {i} (world)"
+                        for i in range(1, world_size):
+                            assert torch.allclose(
+                                param_list[0], param_list[i], rtol=0, atol=0
+                            ), f"{tag} Parameter {name} differs between rank 0 and rank {i} (world)"
 
-        Utils.destroy_model_parallel()
+            Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_indexer_forward_consistency(self, tensor_model_parallel_size, sequence_parallel):
+    def test_dsa_indexer_forward_consistency(self):
         """Test that indexer gives consistent results across different TP sizes and SP settings."""
-        # First run with TP=1 to get baseline
+        seq_len = 64
+        batch_size = 2
+
+        # TP=1 baseline (once for all TP sizes; TP=1 doesn't use SP)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         torch.manual_seed(123)
         model_parallel_cuda_manual_seed(123)
 
-        config_tp1 = self._create_config(sequence_parallel=False)  # TP=1 doesn't use SP
+        config_tp1 = self._create_config(sequence_parallel=False)
         pg_collection_tp1 = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         indexer_tp1 = self._create_indexer(config_tp1, pg_collection_tp1).cuda()
 
-        seq_len = 64
-        batch_size = 2
-
-        # Create one common input (all ranks create same input with same seed)
         x_input = torch.randn(
             seq_len, batch_size, config_tp1.hidden_size, dtype=torch.bfloat16
         ).cuda()
@@ -1057,14 +1051,10 @@ class TestIndexerTensorParallel:
             seq_len, batch_size, config_tp1.q_lora_rank, dtype=torch.bfloat16
         ).cuda()
 
-        # Forward pass with gradients enabled
         index_scores_tp1, topk_indices_tp1 = indexer_tp1.forward_with_scores(x_input, qr_input)
-
-        # Backward pass
         loss_tp1 = index_scores_tp1.sum()
         loss_tp1.backward()
 
-        # Save gradients from TP=1
         indexer_tp1_grads = {
             name: param.grad.clone().cpu()
             for name, param in indexer_tp1.named_parameters()
@@ -1073,128 +1063,129 @@ class TestIndexerTensorParallel:
 
         Utils.destroy_model_parallel()
 
-        # Now run with target TP size
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
+        # Test each TP size with both SP values
+        for tensor_model_parallel_size in self.TP_SIZES:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=1,
+            )
 
-        config_tpn = self._create_config(sequence_parallel=sequence_parallel)
-        pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        indexer_tpn = self._create_indexer(config_tpn, pg_collection_tpn).cuda()
+            for sequence_parallel in self.SP_VALUES:
+                torch.manual_seed(123)
+                model_parallel_cuda_manual_seed(123)
 
-        # Prepare input: split along seqlen if SP is enabled
-        if sequence_parallel:
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            seq_per_rank = seq_len // tensor_model_parallel_size
-            start_idx = tp_rank * seq_per_rank
-            end_idx = (tp_rank + 1) * seq_per_rank
-            x_tpn = x_input[start_idx:end_idx]
-            qr_tpn = qr_input[start_idx:end_idx]
-        else:
-            # No SP: all TP ranks see full input
-            x_tpn = x_input
-            qr_tpn = qr_input
+                config_tpn = self._create_config(sequence_parallel=sequence_parallel)
+                pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=['tp', 'cp']
+                )
+                indexer_tpn = self._create_indexer(config_tpn, pg_collection_tpn).cuda()
+                tag = f"[TP={tensor_model_parallel_size}, SP={sequence_parallel}]"
 
-        # Forward pass with gradients enabled
-        index_scores_tpn, topk_indices_tpn = indexer_tpn.forward_with_scores(x_tpn, qr_tpn)
+                if sequence_parallel:
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                    seq_per_rank = seq_len // tensor_model_parallel_size
+                    start_idx = tp_rank * seq_per_rank
+                    end_idx = (tp_rank + 1) * seq_per_rank
+                    x_tpn = x_input[start_idx:end_idx]
+                    qr_tpn = qr_input[start_idx:end_idx]
+                else:
+                    x_tpn = x_input
+                    qr_tpn = qr_input
 
-        # Backward pass
-        loss_tpn = index_scores_tpn.sum()
-        loss_tpn.backward()
+                index_scores_tpn, topk_indices_tpn = indexer_tpn.forward_with_scores(x_tpn, qr_tpn)
+                loss_tpn = index_scores_tpn.sum()
+                loss_tpn.backward()
 
-        # Compare forward outputs
-        assert index_scores_tpn.shape == index_scores_tp1.shape
-        assert topk_indices_tpn.shape == topk_indices_tp1.shape
-
-        # Check that index scores are close (allow for floating point accumulation errors)
-        assert torch.allclose(
-            index_scores_tpn, index_scores_tp1, rtol=0, atol=0
-        ), f"Index scores mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"
-
-        # Check that topk indices are exactly the same
-        assert torch.equal(
-            topk_indices_tpn, topk_indices_tp1
-        ), f"Top-k indices mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"
-
-        # Compare gradients - indexer grads should be identical (duplicated weights)
-        for name, param in indexer_tpn.named_parameters():
-            if param.grad is not None and name in indexer_tp1_grads:
+                assert index_scores_tpn.shape == index_scores_tp1.shape
+                assert topk_indices_tpn.shape == topk_indices_tp1.shape
                 assert torch.allclose(
-                    param.grad.cpu(), indexer_tp1_grads[name], rtol=0, atol=0
-                ), f"Indexer gradient {name} mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"
+                    index_scores_tpn, index_scores_tp1, rtol=0, atol=0
+                ), f"{tag} Index scores mismatch vs TP=1"
+                assert torch.equal(
+                    topk_indices_tpn, topk_indices_tp1
+                ), f"{tag} Top-k indices mismatch vs TP=1"
 
-        Utils.destroy_model_parallel()
+                for name, param in indexer_tpn.named_parameters():
+                    if param.grad is not None and name in indexer_tp1_grads:
+                        assert torch.allclose(
+                            param.grad.cpu(), indexer_tp1_grads[name], rtol=0, atol=0
+                        ), f"{tag} Indexer gradient {name} mismatch vs TP=1"
+
+            Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_indexer_gradient_sync(self, tensor_model_parallel_size, sequence_parallel):
+    def test_dsa_indexer_gradient_sync(self):
         """Test that gradients are properly synchronized within TP group."""
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
-
-        config = self._create_config(sequence_parallel=sequence_parallel)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        indexer = self._create_indexer(config, pg_collection).cuda()
-
         seq_len = 64
         batch_size = 2
 
-        # Create one common input (all ranks create same input with same seed)
-        x_input = torch.randn(seq_len, batch_size, config.hidden_size, dtype=torch.bfloat16).cuda()
-        qr_input = torch.randn(seq_len, batch_size, config.q_lora_rank, dtype=torch.bfloat16).cuda()
+        for tensor_model_parallel_size in self.TP_SIZES:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=1,
+            )
 
-        # Prepare input: split along seqlen if SP is enabled
-        if sequence_parallel:
-            tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            seq_per_rank = seq_len // tp_size
-            start_idx = tp_rank * seq_per_rank
-            end_idx = (tp_rank + 1) * seq_per_rank
-            x = x_input[start_idx:end_idx]
-            qr = qr_input[start_idx:end_idx]
-        else:
-            # No SP: all TP ranks see full input
-            x = x_input
-            qr = qr_input
+            for sequence_parallel in self.SP_VALUES:
+                torch.manual_seed(123)
+                model_parallel_cuda_manual_seed(123)
 
-        # Forward and backward
-        index_scores, topk_indices = indexer.forward_with_scores(x, qr)
-        loss = index_scores.sum()
-        loss.backward()
+                config = self._create_config(sequence_parallel=sequence_parallel)
+                pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=['tp', 'cp']
+                )
+                indexer = self._create_indexer(config, pg_collection).cuda()
+                tag = f"[TP={tensor_model_parallel_size}, SP={sequence_parallel}]"
 
-        # Check that all parameters have gradients
-        for name, param in indexer.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, f"Parameter {name} has no gradient"
+                x_input = torch.randn(
+                    seq_len, batch_size, config.hidden_size, dtype=torch.bfloat16
+                ).cuda()
+                qr_input = torch.randn(
+                    seq_len, batch_size, config.q_lora_rank, dtype=torch.bfloat16
+                ).cuda()
 
-        # After TP sync, check that gradients are identical within TP group
-        # Note: We only check TP group because DDP sync happens separately
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        if tp_size > 1:
-            for name, param in indexer.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    # Gather gradients from all ranks in TP group only
-                    grad_list = [torch.zeros_like(param.grad) for _ in range(tp_size)]
-                    torch.distributed.all_gather(grad_list, param.grad, group=pg_collection.tp)
+                if sequence_parallel:
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                    seq_per_rank = seq_len // tp_size
+                    start_idx = tp_rank * seq_per_rank
+                    end_idx = (tp_rank + 1) * seq_per_rank
+                    x = x_input[start_idx:end_idx]
+                    qr = qr_input[start_idx:end_idx]
+                else:
+                    x = x_input
+                    qr = qr_input
 
-                    # All gradients should be identical within TP group after sync
-                    for i in range(1, tp_size):
-                        assert torch.allclose(
-                            grad_list[0], grad_list[i], rtol=0, atol=0
-                        ), f"Gradient for {name} differs between TP rank 0 and rank {i} after TP sync"
+                index_scores, topk_indices = indexer.forward_with_scores(x, qr)
+                loss = index_scores.sum()
+                loss.backward()
 
-        Utils.destroy_model_parallel()
+                for name, param in indexer.named_parameters():
+                    if param.requires_grad:
+                        assert param.grad is not None, f"{tag} Parameter {name} has no gradient"
+
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                if tp_size > 1:
+                    for name, param in indexer.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            grad_list = [torch.zeros_like(param.grad) for _ in range(tp_size)]
+                            torch.distributed.all_gather(
+                                grad_list, param.grad, group=pg_collection.tp
+                            )
+
+                            for i in range(1, tp_size):
+                                assert torch.allclose(
+                                    grad_list[0], grad_list[i], rtol=0, atol=0
+                                ), f"{tag} Gradient for {name} differs between TP rank 0 and rank {i}"
+
+            Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("tensor_model_parallel_size", [2, 4])
-@pytest.mark.parametrize("sequence_parallel", [False, True])
-@pytest.mark.parametrize("use_sparse_indexer_loss", [False, True])
 class TestDSAttentionTensorParallel:
     """Test DSAttention with different TP sizes, SP settings, and sparse indexer loss."""
+
+    TP_SIZES = [2, 4]
+    SP_VALUES = [False, True]
+    SPARSE_VALUES = [False, True]
 
     def _create_config(self, sequence_parallel=False, use_sparse_indexer_loss=False):
         """Helper to create MLA config."""
@@ -1251,338 +1242,434 @@ class TestDSAttentionTensorParallel:
         )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_weight_consistency(
-        self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
-    ):
+    def test_dsa_weight_consistency(self):
         """Test that sparse attention indexer weights are identical across ALL GPUs."""
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
+        for tensor_model_parallel_size in self.TP_SIZES:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=1,
+            )
+            world_size = torch.distributed.get_world_size()
 
-        config = self._create_config(
-            sequence_parallel=sequence_parallel, use_sparse_indexer_loss=use_sparse_indexer_loss
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        sparse_attention = self._create_sparse_attention(config, pg_collection).cuda()
+            for sequence_parallel in self.SP_VALUES:
+                for use_sparse_indexer_loss in self.SPARSE_VALUES:
+                    torch.manual_seed(123)
+                    model_parallel_cuda_manual_seed(123)
 
-        # Check that all indexer weights are identical across ALL ranks
-        world_size = torch.distributed.get_world_size()
-        world_rank = torch.distributed.get_rank()
+                    config = self._create_config(
+                        sequence_parallel=sequence_parallel,
+                        use_sparse_indexer_loss=use_sparse_indexer_loss,
+                    )
+                    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                        required_pgs=['tp', 'cp']
+                    )
+                    sparse_attention = self._create_sparse_attention(config, pg_collection).cuda()
+                    tag = f"[TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse={use_sparse_indexer_loss}]"
 
-        if world_size > 1:
-            for name, param in sparse_attention.indexer.named_parameters():
-                # Gather weights from ALL ranks in WORLD group
-                param_list = [torch.zeros_like(param.data) for _ in range(world_size)]
-                torch.distributed.all_gather(param_list, param.data)
+                    if world_size > 1:
+                        for name, param in sparse_attention.indexer.named_parameters():
+                            param_list = [torch.zeros_like(param.data) for _ in range(world_size)]
+                            torch.distributed.all_gather(param_list, param.data)
 
-                # All weights should be identical across all GPUs
-                for i in range(1, world_size):
-                    torch.testing.assert_close(param_list[0], param_list[i], rtol=0, atol=0)
+                            for i in range(1, world_size):
+                                torch.testing.assert_close(
+                                    param_list[0], param_list[i], rtol=0, atol=0
+                                )
 
-        Utils.destroy_model_parallel()
+            Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_forward_consistency(
-        self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
-    ):
+    def test_dsa_forward_consistency(self):
         """Test that sparse attention gives consistent results across different TP, SP, and sparse loss settings."""
-        # First run with TP=1 to get baseline
+        from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+
+        seq_len = 64
+        batch_size = 2
+
+        # TP=1 baselines: one per use_sparse_indexer_loss value (SP is always False for TP=1)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
 
-        config_tp1 = self._create_config(
-            sequence_parallel=False, use_sparse_indexer_loss=use_sparse_indexer_loss
-        )  # TP=1 doesn't use SP
-        pg_collection_tp1 = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        sparse_attention_tp1 = self._create_sparse_attention(config_tp1, pg_collection_tp1).cuda()
+        baselines = {}  # {sparse_loss: (output, indexer_grads, q_grad, k_grad, v_grad)}
+        for use_sparse_indexer_loss in self.SPARSE_VALUES:
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(123)
 
-        seq_len = 64
-        batch_size = 2
-        num_heads = config_tp1.num_attention_heads
-        head_dim = config_tp1.hidden_size // num_heads
+            config_tp1 = self._create_config(
+                sequence_parallel=False, use_sparse_indexer_loss=use_sparse_indexer_loss
+            )
+            pg_collection_tp1 = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp']
+            )
+            sparse_attention_tp1 = self._create_sparse_attention(
+                config_tp1, pg_collection_tp1
+            ).cuda()
 
-        # Create one common input (all ranks create same input with same seed)
-        query_input = (
-            torch.randn(seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16)
-            .cuda()
-            .requires_grad_(True)
-        )
-        key_input = (
-            torch.randn(seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16)
-            .cuda()
-            .requires_grad_(True)
-        )
-        value_input = (
-            torch.randn(seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16)
-            .cuda()
-            .requires_grad_(True)
-        )
-        x_input = torch.randn(
-            seq_len, batch_size, config_tp1.hidden_size, dtype=torch.bfloat16
-        ).cuda()
-        qr_input = torch.randn(
-            seq_len, batch_size, config_tp1.q_lora_rank, dtype=torch.bfloat16
-        ).cuda()
-        attention_mask = torch.ones(batch_size, 1, seq_len, seq_len, dtype=torch.bool).cuda()
-        attention_mask = torch.tril(attention_mask)
+            num_heads = config_tp1.num_attention_heads
+            head_dim = config_tp1.hidden_size // num_heads
 
-        # Forward pass with gradients enabled
-        sparse_attention_tp1.train()
-        output_tp1 = sparse_attention_tp1(
-            query=query_input,
-            key=key_input,
-            value=value_input,
-            x=x_input,
-            qr=qr_input,
-            attention_mask=attention_mask,
-            attn_mask_type=AttnMaskType.causal,
-        )
+            query_input = (
+                torch.randn(seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16)
+                .cuda()
+                .requires_grad_(True)
+            )
+            key_input = (
+                torch.randn(seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16)
+                .cuda()
+                .requires_grad_(True)
+            )
+            value_input = (
+                torch.randn(seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16)
+                .cuda()
+                .requires_grad_(True)
+            )
+            x_input = torch.randn(
+                seq_len, batch_size, config_tp1.hidden_size, dtype=torch.bfloat16
+            ).cuda()
+            qr_input = torch.randn(
+                seq_len, batch_size, config_tp1.q_lora_rank, dtype=torch.bfloat16
+            ).cuda()
+            attention_mask = torch.ones(batch_size, 1, seq_len, seq_len, dtype=torch.bool).cuda()
+            attention_mask = torch.tril(attention_mask)
 
-        # Backward pass
-        loss_tp1 = output_tp1.sum()
-        loss_tp1.backward()
+            sparse_attention_tp1.train()
+            output_tp1 = sparse_attention_tp1(
+                query=query_input,
+                key=key_input,
+                value=value_input,
+                x=x_input,
+                qr=qr_input,
+                attention_mask=attention_mask,
+                attn_mask_type=AttnMaskType.causal,
+            )
 
-        # Save gradients from TP=1
-        indexer_tp1_grads = {
-            name: param.grad.clone()
-            for name, param in sparse_attention_tp1.indexer.named_parameters()
-            if param.grad is not None
-        }
-        query_tp1_grad = query_input.grad.clone().cpu()
-        key_tp1_grad = key_input.grad.clone().cpu()
-        value_tp1_grad = value_input.grad.clone().cpu()
+            loss_tp1 = output_tp1.sum()
+            loss_tp1.backward()
 
-        Utils.destroy_model_parallel()
-
-        # Now run with target TP size
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
-
-        config_tpn = self._create_config(
-            sequence_parallel=sequence_parallel, use_sparse_indexer_loss=use_sparse_indexer_loss
-        )
-        pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        sparse_attention_tpn = self._create_sparse_attention(config_tpn, pg_collection_tpn).cuda()
-
-        # Create one common input (all ranks create same input with same seed)
-        query_input = torch.randn(
-            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
-        ).cuda()
-        key_input = torch.randn(
-            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
-        ).cuda()
-        value_input = torch.randn(
-            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
-        ).cuda()
-        x_input = torch.randn(
-            seq_len, batch_size, config_tp1.hidden_size, dtype=torch.bfloat16
-        ).cuda()
-        qr_input = torch.randn(
-            seq_len, batch_size, config_tp1.q_lora_rank, dtype=torch.bfloat16
-        ).cuda()
-        attention_mask = torch.ones(batch_size, 1, seq_len, seq_len, dtype=torch.bool).cuda()
-        attention_mask = torch.tril(attention_mask)
-
-        # Prepare input: split along seqlen if SP is enabled
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        if sequence_parallel:
-            seq_per_rank = seq_len // tensor_model_parallel_size
-            start_idx = tp_rank * seq_per_rank
-            end_idx = (tp_rank + 1) * seq_per_rank
-            x_tpn = x_input[start_idx:end_idx]
-            qr_tpn = qr_input[start_idx:end_idx]
-        else:
-            x_tpn = x_input
-            qr_tpn = qr_input
-
-        query_input = query_input.detach()
-        key_input = key_input.detach()
-        value_input = value_input.detach()
-        head_per_rank = num_heads // tensor_model_parallel_size
-        start_head = tp_rank * head_per_rank
-        end_head = (tp_rank + 1) * head_per_rank
-        query_tpn = query_input[:, :, start_head:end_head, :].clone().requires_grad_(True)
-        key_tpn = key_input[:, :, start_head:end_head, :].clone().requires_grad_(True)
-        value_tpn = value_input[:, :, start_head:end_head, :].clone().requires_grad_(True)
-        attention_mask_tpn = attention_mask
-
-        # Forward pass with gradients enabled
-        sparse_attention_tpn.train()
-        output_tpn = sparse_attention_tpn(
-            query=query_tpn,
-            key=key_tpn,
-            value=value_tpn,
-            x=x_tpn,
-            qr=qr_tpn,
-            attention_mask=attention_mask_tpn,
-            attn_mask_type=AttnMaskType.causal,
-        )
-
-        # Backward pass
-        loss_tpn = output_tpn.sum()
-        loss_tpn.backward()
-
-        from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
-
-        output_tpn_gathered = gather_from_tensor_model_parallel_region(
-            output_tpn, group=pg_collection_tpn.tp
-        )
-        assert output_tpn_gathered.shape == output_tp1.shape
-        assert torch.allclose(
-            output_tpn_gathered.detach(), output_tp1.detach(), rtol=0, atol=0
-        ), f"Sparse attention outputs mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse_loss={use_sparse_indexer_loss}"
-
-        # 1. Check indexer gradients.
-        for name, param in sparse_attention_tpn.indexer.named_parameters():
-            if param.grad is not None and name in indexer_tp1_grads:
-                torch.testing.assert_close(
-                    param.grad, indexer_tp1_grads[name], rtol=1e-5, atol=1e-5
-                )
-
-        # 2. Query/Key/Value gradients need to be gathered along num_heads dim (dim 2) if SP is enabled
-        # Flatten last two dims: [seq_len, batch, num_heads, head_dim] -> [seq_len, batch, num_heads * head_dim]
-        sq, b, nh, hd = query_tpn.grad.shape
-        query_grad_flat = query_tpn.grad.reshape(sq, b, nh * hd)
-        key_grad_flat = key_tpn.grad.reshape(sq, b, nh * hd)
-        value_grad_flat = value_tpn.grad.reshape(sq, b, nh * hd)
-
-        # Gather along last dim
-        query_grad_gathered_flat = gather_from_tensor_model_parallel_region(
-            query_grad_flat, group=pg_collection_tpn.tp
-        )
-        key_grad_gathered_flat = gather_from_tensor_model_parallel_region(
-            key_grad_flat, group=pg_collection_tpn.tp
-        )
-        value_grad_gathered_flat = gather_from_tensor_model_parallel_region(
-            value_grad_flat, group=pg_collection_tpn.tp
-        )
-
-        # Reshape back: [seq_len, batch, num_heads * head_dim] -> [seq_len, batch, num_heads, head_dim]
-        query_tpn_grad_gathered = query_grad_gathered_flat.reshape(sq, b, num_heads, hd)
-        key_tpn_grad_gathered = key_grad_gathered_flat.reshape(sq, b, num_heads, hd)
-        value_tpn_grad_gathered = value_grad_gathered_flat.reshape(sq, b, num_heads, hd)
-
-        assert torch.allclose(
-            query_tpn_grad_gathered.cpu(), query_tp1_grad, rtol=0, atol=0
-        ), f"Query gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
-        assert torch.allclose(
-            key_tpn_grad_gathered.cpu(), key_tp1_grad, rtol=0, atol=0
-        ), f"Key gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
-        assert torch.allclose(
-            value_tpn_grad_gathered.cpu(), value_tp1_grad, rtol=0, atol=0
-        ), f"Value gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
+            baselines[use_sparse_indexer_loss] = (
+                output_tp1.detach().clone(),
+                {
+                    name: param.grad.clone()
+                    for name, param in sparse_attention_tp1.indexer.named_parameters()
+                    if param.grad is not None
+                },
+                query_input.grad.clone().cpu(),
+                key_input.grad.clone().cpu(),
+                value_input.grad.clone().cpu(),
+                num_heads,
+                head_dim,
+            )
 
         Utils.destroy_model_parallel()
+
+        # Test each TP size with all (SP, sparse) combos
+        for tensor_model_parallel_size in self.TP_SIZES:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=1,
+            )
+
+            for sequence_parallel in self.SP_VALUES:
+                for use_sparse_indexer_loss in self.SPARSE_VALUES:
+                    torch.manual_seed(123)
+                    model_parallel_cuda_manual_seed(123)
+
+                    (
+                        output_tp1,
+                        indexer_tp1_grads,
+                        query_tp1_grad,
+                        key_tp1_grad,
+                        value_tp1_grad,
+                        num_heads,
+                        head_dim,
+                    ) = baselines[use_sparse_indexer_loss]
+
+                    config_tpn = self._create_config(
+                        sequence_parallel=sequence_parallel,
+                        use_sparse_indexer_loss=use_sparse_indexer_loss,
+                    )
+                    pg_collection_tpn = ProcessGroupCollection.use_mpu_process_groups(
+                        required_pgs=['tp', 'cp']
+                    )
+                    sparse_attention_tpn = self._create_sparse_attention(
+                        config_tpn, pg_collection_tpn
+                    ).cuda()
+                    tag = f"[TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse={use_sparse_indexer_loss}]"
+
+                    query_input_tpn = torch.randn(
+                        seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ).cuda()
+                    key_input_tpn = torch.randn(
+                        seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ).cuda()
+                    value_input_tpn = torch.randn(
+                        seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ).cuda()
+                    x_input_tpn = torch.randn(
+                        seq_len, batch_size, config_tpn.hidden_size, dtype=torch.bfloat16
+                    ).cuda()
+                    qr_input_tpn = torch.randn(
+                        seq_len, batch_size, config_tpn.q_lora_rank, dtype=torch.bfloat16
+                    ).cuda()
+                    attention_mask_tpn = torch.ones(
+                        batch_size, 1, seq_len, seq_len, dtype=torch.bool
+                    ).cuda()
+                    attention_mask_tpn = torch.tril(attention_mask_tpn)
+
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                    if sequence_parallel:
+                        seq_per_rank = seq_len // tensor_model_parallel_size
+                        start_idx = tp_rank * seq_per_rank
+                        end_idx = (tp_rank + 1) * seq_per_rank
+                        x_tpn = x_input_tpn[start_idx:end_idx]
+                        qr_tpn = qr_input_tpn[start_idx:end_idx]
+                    else:
+                        x_tpn = x_input_tpn
+                        qr_tpn = qr_input_tpn
+
+                    head_per_rank = num_heads // tensor_model_parallel_size
+                    start_head = tp_rank * head_per_rank
+                    end_head = (tp_rank + 1) * head_per_rank
+                    query_tpn = (
+                        query_input_tpn[:, :, start_head:end_head, :].clone().requires_grad_(True)
+                    )
+                    key_tpn = (
+                        key_input_tpn[:, :, start_head:end_head, :].clone().requires_grad_(True)
+                    )
+                    value_tpn = (
+                        value_input_tpn[:, :, start_head:end_head, :].clone().requires_grad_(True)
+                    )
+
+                    sparse_attention_tpn.train()
+                    output_tpn = sparse_attention_tpn(
+                        query=query_tpn,
+                        key=key_tpn,
+                        value=value_tpn,
+                        x=x_tpn,
+                        qr=qr_tpn,
+                        attention_mask=attention_mask_tpn,
+                        attn_mask_type=AttnMaskType.causal,
+                    )
+
+                    loss_tpn = output_tpn.sum()
+                    loss_tpn.backward()
+
+                    output_tpn_gathered = gather_from_tensor_model_parallel_region(
+                        output_tpn, group=pg_collection_tpn.tp
+                    )
+                    assert output_tpn_gathered.shape == output_tp1.shape
+                    assert torch.allclose(
+                        output_tpn_gathered.detach(), output_tp1, rtol=0, atol=0
+                    ), f"{tag} Sparse attention outputs mismatch vs TP=1"
+
+                    for name, param in sparse_attention_tpn.indexer.named_parameters():
+                        if param.grad is not None and name in indexer_tp1_grads:
+                            torch.testing.assert_close(
+                                param.grad, indexer_tp1_grads[name], rtol=1e-5, atol=1e-5
+                            )
+
+                    sq, b, nh, hd = query_tpn.grad.shape
+                    query_grad_gathered = gather_from_tensor_model_parallel_region(
+                        query_tpn.grad.reshape(sq, b, nh * hd), group=pg_collection_tpn.tp
+                    ).reshape(sq, b, num_heads, hd)
+                    key_grad_gathered = gather_from_tensor_model_parallel_region(
+                        key_tpn.grad.reshape(sq, b, nh * hd), group=pg_collection_tpn.tp
+                    ).reshape(sq, b, num_heads, hd)
+                    value_grad_gathered = gather_from_tensor_model_parallel_region(
+                        value_tpn.grad.reshape(sq, b, nh * hd), group=pg_collection_tpn.tp
+                    ).reshape(sq, b, num_heads, hd)
+
+                    assert torch.allclose(
+                        query_grad_gathered.cpu(), query_tp1_grad, rtol=0, atol=0
+                    ), f"{tag} Query gradient mismatch vs TP=1"
+                    assert torch.allclose(
+                        key_grad_gathered.cpu(), key_tp1_grad, rtol=0, atol=0
+                    ), f"{tag} Key gradient mismatch vs TP=1"
+                    assert torch.allclose(
+                        value_grad_gathered.cpu(), value_tp1_grad, rtol=0, atol=0
+                    ), f"{tag} Value gradient mismatch vs TP=1"
+
+            Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_gradient_sync(
-        self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
-    ):
+    def test_dsa_gradient_sync(self):
         """Test that indexer gradients are properly synchronized within TP group."""
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=1
-        )
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
-
-        config = self._create_config(
-            sequence_parallel=sequence_parallel, use_sparse_indexer_loss=use_sparse_indexer_loss
-        )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        sparse_attention = self._create_sparse_attention(config, pg_collection).cuda()
-        sparse_attention.train()
-
         seq_len = 64
         batch_size = 2
-        num_heads = config.num_attention_heads
-        head_dim = config.hidden_size // num_heads
 
-        # Create one common input (all ranks create same input with same seed)
-        query_input = torch.randn(
-            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
-        ).cuda()
-        key_input = torch.randn(
-            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
-        ).cuda()
-        value_input = torch.randn(
-            seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
-        ).cuda()
-        x_input = torch.randn(seq_len, batch_size, config.hidden_size, dtype=torch.bfloat16).cuda()
-        qr_input = torch.randn(seq_len, batch_size, config.q_lora_rank, dtype=torch.bfloat16).cuda()
+        for tensor_model_parallel_size in self.TP_SIZES:
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                pipeline_model_parallel_size=1,
+            )
 
-        # Prepare input: split along seqlen if SP is enabled
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        if sequence_parallel:
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            seq_per_rank = seq_len // tp_size
-            start_idx = tp_rank * seq_per_rank
-            end_idx = (tp_rank + 1) * seq_per_rank
-            x = x_input[start_idx:end_idx]
-            qr = qr_input[start_idx:end_idx]
-        else:
-            x = x_input
-            qr = qr_input
+            for sequence_parallel in self.SP_VALUES:
+                for use_sparse_indexer_loss in self.SPARSE_VALUES:
+                    torch.manual_seed(123)
+                    model_parallel_cuda_manual_seed(123)
 
-        # query, key, value should be split along num_heads dim
-        head_per_rank = num_heads // tensor_model_parallel_size
-        start_head = tp_rank * head_per_rank
-        end_head = (tp_rank + 1) * head_per_rank
-        query = query_input[:, :, start_head:end_head, :]
-        key = key_input[:, :, start_head:end_head, :]
-        value = value_input[:, :, start_head:end_head, :]
+                    config = self._create_config(
+                        sequence_parallel=sequence_parallel,
+                        use_sparse_indexer_loss=use_sparse_indexer_loss,
+                    )
+                    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                        required_pgs=['tp', 'cp']
+                    )
+                    sparse_attention = self._create_sparse_attention(config, pg_collection).cuda()
+                    sparse_attention.train()
+                    tag = f"[TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse={use_sparse_indexer_loss}]"
 
-        attention_mask = torch.ones(batch_size, 1, seq_len, seq_len, dtype=torch.bool).cuda()
-        attention_mask = torch.tril(attention_mask)
+                    num_heads = config.num_attention_heads
+                    head_dim = config.hidden_size // num_heads
 
-        query.requires_grad_(True)
-        key.requires_grad_(True)
-        value.requires_grad_(True)
+                    query_input = torch.randn(
+                        seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ).cuda()
+                    key_input = torch.randn(
+                        seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ).cuda()
+                    value_input = torch.randn(
+                        seq_len, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    ).cuda()
+                    x_input = torch.randn(
+                        seq_len, batch_size, config.hidden_size, dtype=torch.bfloat16
+                    ).cuda()
+                    qr_input = torch.randn(
+                        seq_len, batch_size, config.q_lora_rank, dtype=torch.bfloat16
+                    ).cuda()
 
-        # Forward and backward
-        output = sparse_attention(
-            query=query,
-            key=key,
-            value=value,
-            x=x,
-            qr=qr,
-            attention_mask=attention_mask,
-            attn_mask_type=AttnMaskType.causal,
+                    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                    if sequence_parallel:
+                        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                        seq_per_rank = seq_len // tp_size
+                        start_idx = tp_rank * seq_per_rank
+                        end_idx = (tp_rank + 1) * seq_per_rank
+                        x = x_input[start_idx:end_idx]
+                        qr = qr_input[start_idx:end_idx]
+                    else:
+                        x = x_input
+                        qr = qr_input
+
+                    head_per_rank = num_heads // tensor_model_parallel_size
+                    start_head = tp_rank * head_per_rank
+                    end_head = (tp_rank + 1) * head_per_rank
+                    query = query_input[:, :, start_head:end_head, :]
+                    key = key_input[:, :, start_head:end_head, :]
+                    value = value_input[:, :, start_head:end_head, :]
+
+                    attention_mask = torch.ones(
+                        batch_size, 1, seq_len, seq_len, dtype=torch.bool
+                    ).cuda()
+                    attention_mask = torch.tril(attention_mask)
+
+                    query.requires_grad_(True)
+                    key.requires_grad_(True)
+                    value.requires_grad_(True)
+
+                    output = sparse_attention(
+                        query=query,
+                        key=key,
+                        value=value,
+                        x=x,
+                        qr=qr,
+                        attention_mask=attention_mask,
+                        attn_mask_type=AttnMaskType.causal,
+                    )
+
+                    loss = output.sum()
+                    loss.backward()
+
+                    assert query.grad is not None
+                    assert key.grad is not None
+                    assert value.grad is not None
+
+                    for name, param in sparse_attention.indexer.named_parameters():
+                        if param.requires_grad:
+                            assert (
+                                param.grad is not None
+                            ), f"{tag} Indexer parameter {name} has no gradient"
+
+                    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                    if tp_size > 1:
+                        for name, param in sparse_attention.indexer.named_parameters():
+                            if param.requires_grad and param.grad is not None:
+                                grad_list = [torch.zeros_like(param.grad) for _ in range(tp_size)]
+                                torch.distributed.all_gather(
+                                    grad_list, param.grad, group=pg_collection.tp
+                                )
+
+                                for i in range(1, tp_size):
+                                    assert torch.allclose(
+                                        grad_list[0], grad_list[i], rtol=0, atol=0
+                                    ), f"{tag} Gradient for {name} differs between TP rank 0 and rank {i}"
+
+            Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+class TestDSAModuleSpecDispatch:
+    """Tests for get_dsa_module_spec_for_backend and get_experimental_attention_variant_module_spec."""
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    def _make_dsa_config(self, **kwargs):
+        return MLATransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type='rope',
+            rotary_base=10000,
+            rotary_percent=1.0,
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+            **kwargs,
         )
 
-        loss = output.sum()
-        loss.backward()
+    def test_get_experimental_attention_variant_module_spec_dsa(self):
+        """get_experimental_attention_variant_module_spec dispatches to DSA for variant='dsa'."""
+        config = self._make_dsa_config(experimental_attention_variant="dsa")
+        spec = get_experimental_attention_variant_module_spec(config)
+        assert spec.module == MLASelfAttention
+        assert spec.submodules.core_attention.module == DSAttention
 
-        # Check that gradients exist before sync
-        assert query.grad is not None
-        assert key.grad is not None
-        assert value.grad is not None
+    def test_get_dsa_module_spec_for_backend(self):
+        """get_dsa_module_spec_for_backend returns the correct full spec structure."""
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
-        # Check that indexer parameters have gradients
-        for name, param in sparse_attention.indexer.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, f"Indexer parameter {name} has no gradient"
+        config = self._make_dsa_config()
+        backend = TESpecProvider()
+        spec = get_dsa_module_spec_for_backend(config, backend=backend)
+        assert spec.module == MLASelfAttention
+        assert spec.submodules.core_attention.module == DSAttention
+        assert spec.submodules.core_attention.submodules.indexer.module == DSAIndexer
+        assert spec.params["attn_mask_type"] == AttnMaskType.causal
 
-        # Check that indexer gradients are identical within TP group
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        if tp_size > 1:
-            for name, param in sparse_attention.indexer.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    # Gather gradients from all ranks in TP group only
-                    grad_list = [torch.zeros_like(param.grad) for _ in range(tp_size)]
-                    torch.distributed.all_gather(grad_list, param.grad, group=pg_collection.tp)
+    def test_get_dsa_module_spec_requires_mla(self):
+        """get_dsa_module_spec_for_backend rejects configs without MLA."""
+        from megatron.core.transformer import TransformerConfig as _TransformerConfig
 
-                    # All gradients should be identical within TP group after sync
-                    for i in range(1, tp_size):
-                        assert torch.allclose(
-                            grad_list[0], grad_list[i], rtol=0, atol=0
-                        ), f"Indexer gradient for {name} differs between TP rank 0 and rank {i} after TP sync"
+        config = _TransformerConfig(num_layers=2, hidden_size=256, num_attention_heads=4)
+        with pytest.raises(AssertionError, match="only MLA supports sparse attention"):
+            get_dsa_module_spec_for_backend(config, backend=None)
 
-        Utils.destroy_model_parallel()
+    def test_get_dsa_module_spec_rejects_qk_l2_norm(self):
+        """get_dsa_module_spec_for_backend rejects configs with qk_l2_norm=True."""
+        config = self._make_dsa_config(qk_l2_norm=True)
+        with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
+            get_dsa_module_spec_for_backend(config, backend=None)
