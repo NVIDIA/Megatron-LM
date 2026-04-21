@@ -258,25 +258,46 @@ class HybridModel(LanguageModule):
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
             )
+            self._setup_mtp_cuda_graphs()
 
         # Output
         if post_process or self.mtp_process:
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                self.vocab_size,
-                config=config,
-                init_method=(
-                    config.embedding_init_method
-                    if config.use_mup and not self.share_embeddings_and_output_weights
-                    else config.init_method
-                ),
-                bias=False,
-                skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
-                tp_group=self.pg_collection.tp,
+            output_init_method = (
+                config.embedding_init_method
+                if config.use_mup and not self.share_embeddings_and_output_weights
+                else config.init_method
             )
+            if config.transformer_impl == "inference_optimized":
+                from megatron.core.tensor_parallel.inference_layers import (
+                    InferenceColumnParallelLinear,
+                )
+
+                self.output_layer = InferenceColumnParallelLinear(
+                    config.hidden_size,
+                    self.vocab_size,
+                    config=config,
+                    init_method=output_init_method,
+                    gather_output=not self.parallel_output,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,
+                    tp_group=self.pg_collection.tp,
+                )
+            else:
+                self.output_layer = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    self.vocab_size,
+                    config=config,
+                    init_method=output_init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    gather_output=not self.parallel_output,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,
+                    tp_group=self.pg_collection.tp,
+                )
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()

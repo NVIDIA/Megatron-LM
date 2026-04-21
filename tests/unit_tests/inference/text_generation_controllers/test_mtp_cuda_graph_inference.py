@@ -170,16 +170,14 @@ class TestMTPCudaGraphInference:
                 hidden_states=dummy_hidden,
                 next_token_ids=dummy_token_ids,
                 position_ids=dummy_position_ids,
-                depth=0,
             )
         _set_capture_end()
 
     @staticmethod
     def _set_mtp_cuda_graph_flag(model, enabled):
-        """Set ``use_mtp_cuda_graphs`` on all MTP layers."""
+        """Set ``use_mtp_cuda_graphs`` on the model."""
         unwrapped = unwrap_model(model)
-        for layer in unwrapped.mtp.layers:
-            layer.use_mtp_cuda_graphs = enabled
+        unwrapped.use_mtp_cuda_graphs = enabled
 
     # ---- Test 1: graph output matches eager (no additional padding) ------- #
 
@@ -209,7 +207,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
         # Clone immediately — CUDA graph output buffers are reused on next call.
         h_graph = h_graph.clone()
@@ -221,7 +218,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
 
         torch.testing.assert_close(h_graph, h_eager)
@@ -258,7 +254,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden_sp.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
         h_graph = h_graph.clone()
         logits_graph = logits_graph.clone()
@@ -269,7 +264,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden_sp.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
 
         torch.testing.assert_close(h_graph, h_eager)
@@ -486,7 +480,6 @@ class TestMTPCudaGraphInference:
                 hidden_states=current_hidden,
                 next_token_ids=token_ids.clone(),
                 position_ids=position_ids.clone(),
-                depth=depth,
             )
             # Clone — graph output buffers are reused.
             current_hidden = current_hidden.clone()
@@ -529,7 +522,6 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -540,19 +532,15 @@ class TestMTPCudaGraphInference:
 
     @torch.inference_mode()
     def test_mtp_graph_flag_propagation(self):
-        """``use_mtp_cuda_graphs`` is correctly toggled via the helper and
-        every MTP layer sees the same value.
-        """
+        """``use_mtp_cuda_graphs`` is correctly toggled via the helper."""
         model = self._build_model(mtp_num_layers=2)
         unwrapped = unwrap_model(model)
 
         self._set_mtp_cuda_graph_flag(model, True)
-        for layer in unwrapped.mtp.layers:
-            assert layer.use_mtp_cuda_graphs is True
+        assert unwrapped.use_mtp_cuda_graphs is True
 
         self._set_mtp_cuda_graph_flag(model, False)
-        for layer in unwrapped.mtp.layers:
-            assert layer.use_mtp_cuda_graphs is False
+        assert unwrapped.use_mtp_cuda_graphs is False
 
 
 # --------------------------------------------------------------------------- #
@@ -701,7 +689,6 @@ class TestMTPCudaGraphExpertParallel:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
-            depth=0,
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -735,7 +722,7 @@ class TestMTPCudaGraphExpertParallel:
 
         # All ranks must complete without hanging.
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids, depth=0
+            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -849,10 +836,7 @@ class TestMTPCudaGraphExpertParallel:
         dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=dummy_hidden,
-            next_token_ids=dummy_tokens,
-            position_ids=dummy_positions,
-            depth=0,
+            hidden_states=dummy_hidden, next_token_ids=dummy_tokens, position_ids=dummy_positions
         )
 
         assert h_out.shape == (tp_size, 1, self.HIDDEN_SIZE)

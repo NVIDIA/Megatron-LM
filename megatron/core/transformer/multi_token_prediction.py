@@ -22,6 +22,7 @@ from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.tensor_parallel.inference_layers import inference_all_gather_last_dim
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -861,19 +862,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         self.offload_context = nullcontext()
 
-        # Create cuda graph manager for forward_single_position so that
-        # the full MTP forward (embedding, projection, transformer, layernorm)
-        # is captured in a single graph.
-        if config.cuda_graph_impl == "local" and not config.cuda_graph_scope:
-            from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-            self.cudagraph_manager = CudaGraphManager(
-                config,
-                base_module=self,
-                function_name="forward_single_position",
-                need_backward=False,
-            )
-
     def _get_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -932,11 +920,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
         hidden_states, _ = self.eh_proj(hidden_states)
         # For tensor parallel we need to gather the tensor across the model-parallel
-        # ranks after the linear projection. This used to call
-        # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
-        # the gradient in backward pass and was therefore incorrect in this context.
-        # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-        hidden_states = gather_from_tensor_model_parallel_region(hidden_states, group=self.tp_group)
+        # ranks after the linear projection.
+        if not self.training:
+            hidden_states = inference_all_gather_last_dim(hidden_states, self.tp_group, self.config)
+        else:
+            hidden_states = gather_from_tensor_model_parallel_region(
+                hidden_states, group=self.tp_group
+            )
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
             hidden_states = scatter_to_sequence_parallel_region(hidden_states, group=self.tp_group)
@@ -1024,14 +1014,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         return hidden_states
-
-    def _should_call_local_cudagraph(self, *args, **kwargs):
-        """MTP cuda-graphs forward_single_position, not forward.
-
-        Disable the MegatronModule.__call__ interceptor so the training forward
-        path is not routed through the cuda graph manager.
-        """
-        return False
 
     def forward_single_position(
         self,
