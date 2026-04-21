@@ -352,6 +352,15 @@ class CheckpointConfig:
     save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
     """Number of iterations between persistent checkpoint saves."""
 
+    save_params_interval: int | None = None
+    """Number of iterations between param.name->param.data mapping saves."""
+
+    save_activations_interval: int | None = None
+    """Number of iterations between act.name->act.data mapping saves."""
+
+    save_tokens_per_expert_interval: int | None = None
+    """Number of iterations between tokens-per-expert routing metadata saves."""
+
     save_wgrads_interval: int | None = None
     """Number of iterations between wgrad (main_grad) saves."""
 
@@ -476,6 +485,12 @@ class CheckpointConfig:
 
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
+
+    async_ckpt_use_cpu_shm: bool = False
+    """Copy GPU tensors to CPU shared-memory in the training process before handing off to
+    the async checkpoint worker. Avoids CUDA IPC / NVLink fabric handles in the worker
+    subprocess. Useful on MNNVL systems where fabric resources are exhausted.
+    Only applies with the nvrx async strategy."""
 
     fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""
