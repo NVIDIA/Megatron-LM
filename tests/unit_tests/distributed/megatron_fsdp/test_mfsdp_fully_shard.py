@@ -225,8 +225,6 @@ def build_distributed_environment(mesh_dim_config: tuple):
     return device_mesh
 
 
-
-
 class TestMegatronFsdpFullyShard:
     """
     Test the fully_shard API for Megatron-FSDP.
