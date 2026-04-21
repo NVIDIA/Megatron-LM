@@ -531,6 +531,7 @@ class TestMTPCudaGraphInference:
                 ]
 
             graph_tokens = _run_mtp(use_cuda_graph=True)
+            delete_cuda_graphs()
             eager_tokens = _run_mtp(use_cuda_graph=False)
 
             for depth in range(num_spec):
