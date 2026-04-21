@@ -113,6 +113,8 @@ class MockVariableLengthSequencePackingDataIterator:
 def _gather_tensor_from_tp_group(tensor):
     """Gather tensors from all TP ranks for comparison."""
     assert tensor is not None, "Tensor should not be None"
+    if type(tensor) is int:
+        tensor = torch.tensor(tensor, dtype=torch.int32, device=torch.cuda.current_device())
     tp_size = parallel_state.get_tensor_model_parallel_world_size()
     gathered = [torch.zeros_like(tensor) for _ in range(tp_size)]
     torch.distributed.all_gather(
@@ -132,19 +134,24 @@ def _gather_tensor_from_all_ranks(tensor):
 
 
 @pytest.mark.parametrize(
-    ("tp", "pp", "cp"),
+    ("tp", "pp", "cp", "dynamic_cp", "local_cp_size"),
     [
-        (1, 1, 1),  # Basic case: no parallelism
-        (2, 1, 1),  # Tensor parallel only
-        (1, 2, 1),  # Pipeline parallel only
-        (2, 2, 1),  # TP + PP
-        (1, 1, 2),  # CP only
-        (2, 1, 2),  # TP + CP
-        (1, 2, 2),  # PP + CP
-        (1, 4, 1),  # Has middle pp stage
+        (1, 1, 1, False, None),  # Basic case: no parallelism
+        (2, 1, 1, False, None),  # Tensor parallel only
+        (1, 2, 1, False, None),  # Pipeline parallel only
+        (2, 2, 1, False, None),  # TP + PP
+        (1, 1, 2, False, None),  # CP only
+        (2, 1, 2, False, None),  # TP + CP
+        (1, 2, 2, False, None),  # PP + CP
+        (1, 4, 1, False, None),  # Has middle pp stage
+        (1, 1, 4, True, 4),  # DCP: all CP ranks participate
+        (1, 1, 4, True, 2),  # DCP: partial CP (2 out of 4)
+        (1, 1, 4, True, 1),  # DCP: no CP splitting
+        (2, 1, 4, True, 4),  # DCP + TP
+        (1, 2, 4, True, 4),  # DCP + PP
     ],
 )
-def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
+def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, local_cp_size):
     """
     Test get_batch_on_this_rank_for_sequence_packing function with variable-length THD format.
 
@@ -167,7 +174,11 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
         raise ValueError(f"Invalid config: tp={tp}, pp={pp}, cp={cp} exceeds world size 8")
 
     # Initialize model parallel
-    Utils.initialize_model_parallel(tp, pp, None, context_parallel_size=cp)
+    init_kwargs = dict(context_parallel_size=cp)
+    if dynamic_cp:
+        init_kwargs['dynamic_context_parallel'] = True
+        init_kwargs['min_dynamic_context_parallel_size'] = 1
+    Utils.initialize_model_parallel(tp, pp, None, **init_kwargs)
 
     try:
         # Create mock data iterator with variable-length sequences
@@ -183,17 +194,20 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
             data_iterator = iter(
                 MockVariableLengthSequencePackingDataIterator(
                     total_seq_length=args.seq_length,
-                    sequence_lengths=sequence_lengths,  # Variable lengths, sum=8192
-                    seed=42 + dp_rank,  # Same seed within PP/CP group
+                    sequence_lengths=sequence_lengths,
+                    local_cp_size=local_cp_size,
+                    seed=42 + dp_rank,
                 )
             )
         else:
-            # Non-TP-rank-0 ranks don't need the iterator
             data_iterator = None
 
         # Call the function under test
         result = get_batch_on_this_rank_for_sequence_packing(
-            data_iterator=data_iterator, mtp_on_this_rank=False, vp_stage=None
+            data_iterator=data_iterator,
+            mtp_on_this_rank=False,
+            vp_stage=None,
+            dynamic_cp=dynamic_cp,
         )
 
         # Unpack the result
@@ -202,7 +216,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        cp_rank = parallel_state.get_context_parallel_rank()
         is_first_stage = parallel_state.is_pipeline_first_stage(ignore_virtual=True)
         is_last_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
         is_first_or_last = is_first_stage or is_last_stage
@@ -233,7 +246,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
             assert loss_mask is None, "Non-last stage should not have loss_mask"
 
         # =====================================================================
-        # TEST 2: Verify all ranks have consistent packed_seq_params
+        # TEST 2: Verify packed_seq_params consistency
         # =====================================================================
         assert packed_seq_params is not None
         assert packed_seq_params.qkv_format == "thd"
@@ -246,14 +259,30 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
             "cu_seqlens_kv_padded",
             "max_seqlen_kv",
         ]
-        for key in test_keys:
-            tensor = getattr(packed_seq_params, key)
-            assert tensor is not None
-            gathered_tensor = _gather_tensor_from_all_ranks(tensor)
-            for i in range(1, len(gathered_tensor)):
-                assert torch.equal(
-                    gathered_tensor[0], gathered_tensor[i]
-                ), f"Rank 0 and rank {i} have different {key}"
+
+        if dynamic_cp:
+            assert packed_seq_params.local_cp_size == local_cp_size
+            # For DCP, only TP ranks within the same CP group should match.
+            # Different CP groups can have different packed_seq_params.
+            if tp > 1:
+                for key in test_keys:
+                    tensor = getattr(packed_seq_params, key)
+                    assert tensor is not None
+                    gathered = _gather_tensor_from_tp_group(tensor)
+                    for i in range(1, tp):
+                        assert torch.equal(
+                            gathered[0], gathered[i]
+                        ), f"TP rank 0 and rank {i} have different {key}"
+        else:
+            # For THD, all ranks share the same packing metadata.
+            for key in test_keys:
+                tensor = getattr(packed_seq_params, key)
+                assert tensor is not None
+                gathered_tensor = _gather_tensor_from_all_ranks(tensor)
+                for i in range(1, len(gathered_tensor)):
+                    assert torch.equal(
+                        gathered_tensor[0], gathered_tensor[i]
+                    ), f"Rank 0 and rank {i} have different {key}"
 
         # =====================================================================
         # TEST 3: Verify TP ranks receive identical data after broadcast
@@ -275,9 +304,9 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
         # =====================================================================
         # TEST 4: Verify CP partitioning
         # =====================================================================
-        if cp > 1:
-            # With CP, the sequence should be partitioned
-            expected_seq_len = args.seq_length // cp
+        effective_cp = local_cp_size if dynamic_cp else cp
+        if effective_cp is not None and effective_cp > 1:
+            expected_seq_len = args.seq_length // effective_cp
 
             if is_first_stage:
                 actual_seq_len = tokens.shape[1]
@@ -285,7 +314,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
                     actual_seq_len == expected_seq_len
                 ), f"CP partitioned tokens have wrong shape: {actual_seq_len} != {expected_seq_len}"
 
-            # Verify labels only if all CP ranks are at last stage
             if is_last_stage:
                 actual_seq_len = labels.shape[1]
                 assert (
@@ -305,12 +333,18 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
         (2, 4, 1, None, "dp_balanced"),
         (2, 2, 1, None, "dp_balanced"),
         (1, 4, 1, 4, "dp_balanced"),
+        (1, 1, 8, None, "default_dynamic_cp"),
+        (2, 1, 4, None, "default_dynamic_cp"),
+        (1, 2, 4, None, "default_dynamic_cp"),
+        (1, 4, 2, 4, "default_dynamic_cp"),
     ],
 )
 def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     '''
     Test wrap_dataloader function with different scheduler types.
     '''
+    is_dynamic_cp = scheduler_type == "default_dynamic_cp"
+
     args = SimpleNamespace()
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp
@@ -346,17 +380,24 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
         }
 
     # Initialize model parallel
-    Utils.initialize_model_parallel(tp, pp, vpp, context_parallel_size=cp)
+    init_kwargs = dict(context_parallel_size=cp)
+    if is_dynamic_cp:
+        init_kwargs['dynamic_context_parallel'] = True
+        init_kwargs['min_dynamic_context_parallel_size'] = 1
+    Utils.initialize_model_parallel(tp, pp, vpp, **init_kwargs)
 
     global_batch_size = 64
     micro_batch_size = 1
-    nums = [random.randint(2048, args.seq_length) for _ in range(global_batch_size)]  # 64 sequences
+    rng = random.Random(42)
+    nums = [rng.randint(2048, args.seq_length) for _ in range(global_batch_size)]  # 64 sequences
 
     config = SimpleNamespace()
     config.max_seqlen_per_dp_cp_rank = args.max_seqlen_per_dp_cp_rank
     config.microbatch_group_size_per_vp_stage = pp
     config.virtual_pipeline_model_parallel_size = vpp
     config.sequence_packing_scheduler = scheduler_type
+    if is_dynamic_cp:
+        config.min_dynamic_context_parallel_size = 1
 
     dp_rank = parallel_state.get_data_parallel_rank()
     dp_size = parallel_state.get_data_parallel_world_size()
@@ -372,6 +413,9 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     num_micro_batches_old = global_batch_size // micro_batch_size // dp_size
 
     if is_tp_first and (is_pp_first or is_pp_last):
+        # Seed torch RNG so CP siblings produce identical token values
+        torch.manual_seed(42 + dp_rank)
+        torch.cuda.manual_seed(42 + dp_rank)
         samples = [
             _create_single_sample(num)
             for num in nums[dp_rank * num_micro_batches_old : (dp_rank + 1) * num_micro_batches_old]
@@ -419,6 +463,8 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
         if is_tp_first:
             # CHECK KEYS
             batch_keys = ["cu_seqlens", "max_seqlen", "cu_seqlens_padded"]
+            if is_dynamic_cp:
+                batch_keys.append("local_cp_size")
             if vpp is not None and vpp > 1:
                 # check metadata for all stages (save batches to avoid re-consuming iterators)
                 all_stage_batches = []
@@ -442,25 +488,65 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             # CHECK TOKEN SUM ON FIRST OR LAST PP RANK
             # Note: data_iterator is consumed by wrap_data_iterator, new_data_iterator is consumed above.
             # Use `samples` for before-wrap, reuse `batch_all` from the check above for after-wrap.
-            if is_pp_first_or_last:
-                # Compute token sum before wrap
+            # Skip for VPP: microbatch alignment may pad/duplicate samples,
+            # changing the total token count.
+            if is_pp_first_or_last and (vpp is None or vpp <= 1):
+                dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+                cp_size = parallel_state.get_context_parallel_world_size()
+                cp_group = parallel_state.get_context_parallel_group()
+
+                # Count each sequence exactly once using int64 for bitwise comparison.
+                # THD (dp_balanced): CP siblings hold identical packed data,
+                #   so reduce across DP only (not CP) on both sides.
+                # DCP: data is redistributed uniquely across dp_cp ranks,
+                #   so per-microbatch CP all_reduce + scale, then dp_cp all_reduce.
+                # Both sides multiply by max_cp so DCP (with varying local_cp)
+                # can be normalized to the same integer scale without division.
+                max_cp = cp_size
+                dp_group = parallel_state.get_data_parallel_group()
+
+                # Before wrap: CP siblings have identical samples.
+                # Reduce across DP only to count each sequence once.
                 token_sum_before = torch.tensor(0, dtype=torch.int64, device='cuda')
                 for sample in samples:
                     token_sum_before += sample['tokens'].long().sum()
+                torch.distributed.all_reduce(
+                    token_sum_before, op=torch.distributed.ReduceOp.SUM, group=dp_group
+                )
+                token_sum_before *= max_cp
 
-                # Compute token sum after wrap (batch_all already collected above with tokens)
+                # After wrap.
                 token_sum_after = torch.tensor(0, dtype=torch.int64, device='cuda')
-                for batch in batch_all:
-                    token_sum_after += batch['tokens'].long().sum()
-
-                # Reduce sum across dp_cp group and verify equality
-                dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
-                torch.distributed.all_reduce(
-                    token_sum_before, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
-                )
-                torch.distributed.all_reduce(
-                    token_sum_after, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
-                )
+                if is_dynamic_cp:
+                    # DCP: per-microbatch CP all_reduce + scale to max_cp,
+                    # then dp_cp all_reduce to aggregate unique contributions.
+                    for batch in batch_all:
+                        mb_sum = batch['tokens'].long().sum().clone()
+                        local_cp = batch['local_cp_size']
+                        if isinstance(local_cp, torch.Tensor):
+                            local_cp = local_cp.item()
+                        mb_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+                            group_size=local_cp
+                        )
+                        torch.distributed.all_reduce(
+                            mb_sum, op=torch.distributed.ReduceOp.SUM, group=mb_cp_group
+                        )
+                        # all_reduce result = mb_sum * local_cp.
+                        # Scale to mb_sum * max_cp.
+                        mb_sum *= max_cp // local_cp
+                        token_sum_after += mb_sum
+                    torch.distributed.all_reduce(
+                        token_sum_after, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
+                    )
+                else:
+                    # THD: CP siblings hold identical packed data.
+                    # Reduce across DP only (same as before).
+                    for batch in batch_all:
+                        token_sum_after += batch['tokens'].long().sum()
+                    torch.distributed.all_reduce(
+                        token_sum_after, op=torch.distributed.ReduceOp.SUM, group=dp_group
+                    )
+                    token_sum_after *= max_cp
 
                 assert (
                     token_sum_before == token_sum_after

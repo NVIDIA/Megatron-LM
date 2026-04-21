@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
@@ -31,6 +33,48 @@ def token_unpermutation(token_dispatcher, hidden_states):
     hidden_states = token_dispatcher.token_combine(hidden_states)
     hidden_states = token_dispatcher.combine_postprocess(hidden_states)
     return hidden_states, None
+
+
+class _NestedAttrTestDispatcher(MoETokenDispatcher):
+    def dispatch_preprocess(self, tokens, routing_map, probs):
+        raise NotImplementedError
+
+    def token_dispatch(self, hidden_states, probs):
+        raise NotImplementedError
+
+    def dispatch_postprocess(self, hidden_states, probs):
+        raise NotImplementedError
+
+    def combine_preprocess(self, hidden_states):
+        raise NotImplementedError
+
+    def token_combine(self, hidden_states):
+        raise NotImplementedError
+
+    def combine_postprocess(self, hidden_states):
+        raise NotImplementedError
+
+
+def test_get_cudagraph_attr_supports_nested_paths():
+    dispatcher = object.__new__(_NestedAttrTestDispatcher)
+    token_probs = torch.randn(2, 3)
+    dispatcher._comm_manager = SimpleNamespace(
+        token_probs=token_probs, nested=SimpleNamespace(routing_map=torch.randn(2, 4))
+    )
+
+    assert dispatcher.get_cudagraph_attr("_comm_manager.token_probs") is token_probs
+    assert dispatcher.get_cudagraph_attr("_comm_manager.nested.routing_map") is not None
+    assert dispatcher.get_cudagraph_attr("_comm_manager.missing_attr") is None
+
+
+def test_set_cudagraph_attr_supports_nested_paths():
+    dispatcher = object.__new__(_NestedAttrTestDispatcher)
+    dispatcher._comm_manager = SimpleNamespace(routing_map=None)
+    routing_map = torch.randn(4, 5)
+
+    dispatcher.set_cudagraph_attr("_comm_manager.routing_map", routing_map)
+
+    assert dispatcher._comm_manager.routing_map is routing_map
 
 
 class MoEModelTestContainer:
@@ -430,11 +474,24 @@ class TestFlexDispatcher:
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
     @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
-    def test_forward_backward(self, tp_size, ep_size, permute_fusion, moe_flex_dispatcher_backend):
+    @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
+    def test_forward_backward(
+        self,
+        tp_size,
+        ep_size,
+        permute_fusion,
+        moe_flex_dispatcher_backend,
+        moe_permute_fusion_into_hybridep,
+    ):
         if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
             pytest.skip("Deep EP is not available")
         if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
+        if moe_permute_fusion_into_hybridep:
+            if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
+                pytest.skip(
+                    "moe_permute_fusion_into_hybridep skipped because permute_fusion or hybridep is not set"
+                )
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -448,6 +505,7 @@ class TestFlexDispatcher:
             moe_permute_fusion=permute_fusion,
             hidden_size=1024,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
+            moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_dropless_test()
@@ -460,13 +518,24 @@ class TestFlexDispatcher:
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
     @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
+    @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_capacity_forward_backward(
-        self, tp_size, ep_size, permute_fusion, moe_flex_dispatcher_backend
+        self,
+        tp_size,
+        ep_size,
+        permute_fusion,
+        moe_flex_dispatcher_backend,
+        moe_permute_fusion_into_hybridep,
     ):
         if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
             pytest.skip("Deep EP is not available")
         if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
+        if moe_permute_fusion_into_hybridep:
+            if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
+                pytest.skip(
+                    "moe_permute_fusion_into_hybridep skipped because permute_fusion or hybridep is not set"
+                )
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -483,6 +552,7 @@ class TestFlexDispatcher:
             moe_permute_fusion=permute_fusion,
             hidden_size=1024,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
+            moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_capacity_test()
@@ -497,13 +567,24 @@ class TestFlexDispatcher:
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", [True])
     @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
+    @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_router_padding_for_fp8_forward_backward(
-        self, tp_size, ep_size, permute_fusion, moe_flex_dispatcher_backend
+        self,
+        tp_size,
+        ep_size,
+        permute_fusion,
+        moe_flex_dispatcher_backend,
+        moe_permute_fusion_into_hybridep,
     ):
         if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
             pytest.skip("Deep EP is not available")
         if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
+        if moe_permute_fusion_into_hybridep:
+            if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
+                pytest.skip(
+                    "moe_permute_fusion_into_hybridep skipped because permute_fusion or hybridep is not set"
+                )
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -518,6 +599,7 @@ class TestFlexDispatcher:
             moe_permute_fusion=permute_fusion,
             hidden_size=1024,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
+            moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_router_padding_for_fp8_test()

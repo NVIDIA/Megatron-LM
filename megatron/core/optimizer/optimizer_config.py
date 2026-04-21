@@ -137,7 +137,7 @@ class ParamKey:
 
 @dataclass
 class OptimizerConfig:
-    """Base optimizer configuration object."""
+    """Configuration object for Megatron optimizers."""
 
     ##############
     # General
@@ -255,14 +255,14 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
-    # Muon / emerging optimizers.
+    # emerging optimizers.
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD in Muon optimizer."""
 
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
-    muon_use_nesterov: bool = False
+    muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
     muon_scale_mode: str = "spectral"
@@ -270,6 +270,10 @@ class OptimizerConfig:
 
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
+
+    muon_coefficient_type: str = "quintic"
+    """Newton-Schulz coefficient type for the Muon optimizer. Valid types are discovered
+    dynamically from the installed ``emerging_optimizers`` package. Defaults to "quintic"."""
 
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
@@ -279,6 +283,36 @@ class OptimizerConfig:
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    muon_scalar_optimizer: str = 'adam'
+    """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
+    One of 'adam' or 'lion'. Defaults to 'adam'."""
+
+    # Lion.
+    lion_beta1: float = 0.95
+    """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""
+
+    lion_beta2: float = 0.98
+    """Second beta coefficient for Lion optimizer (used in momentum EMA update).
+    Defaults to 0.98."""
+
+    soap_shampoo_beta: float = 0.95
+    """The beta parameter for the Shampoo preconditioner."""
+
+    soap_precondition_frequency: int = 1
+    """The frequency of the Shampoo preconditioner."""
+
+    soap_use_kl_shampoo: bool = True
+    """Whether to use the KL-Shampoo preconditioner."""
+
+    adaptive_muon_moment2_method: str = "adamuon"
+    """The method to use for the moment2 update in Adaptive Muon optimizer."""
+
+    adaptive_muon_beta2: float = 0.95
+    """The beta2 parameter for the Adaptive Muon optimizer."""
+
+    adaptive_muon_eps: float = 1e-8
+    """The eps parameter for the Adaptive Muon optimizer."""
 
     #######################
     # Distributed optimizer
@@ -353,6 +387,9 @@ class OptimizerConfig:
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
+
+    optimizer_cuda_graph: bool = False
+    """If true, enables CUDA graph for optimizer step."""
 
     def __post_init__(self):
         """Check the validity of the config."""

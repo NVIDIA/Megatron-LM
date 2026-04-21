@@ -313,7 +313,12 @@ def apply_rotary_pos_emb(
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
             return fused_apply_rotary_pos_emb_thd(
-                t, cu_seqlens, freqs, cp_size=cp_group.size(), cp_rank=cp_group.rank()
+                t,
+                cu_seqlens,
+                freqs,
+                cp_size=cp_group.size(),
+                cp_rank=cp_group.rank(),
+                interleaved=config.rotary_interleaved,
             )
     # use unfused implementation
     if cu_seqlens is None:

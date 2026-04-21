@@ -4,7 +4,6 @@ import json
 import os
 import sys
 import types
-
 from functools import partial
 
 import torch
@@ -15,64 +14,81 @@ from tools.checkpoint.utils import _ConverterFakeProcessGroup
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron loader')
 
-    group.add_argument('--true-vocab-size', type=int, default=None,
-                       help='original size of vocab, if specified will trim padding from embedding table.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file. If specified will use this to get vocab size and '
-                       'trim padding from the embedding table.')
-    group.add_argument('--megatron-path', type=str, default=None,
-                       help='Base directory of Megatron repository')
-    group.add_argument('--position-embedding-type',
-                       type=str,
-                       default='learned_absolute',
-                       choices=['learned_absolute', 'rope'],
-                       help='Position embedding type.')
-    group.add_argument('--loader-transformer-impl', default='local',
-                       choices=['local', 'transformer_engine'],
-                       help='Which Transformer implementation to use.')
+    group.add_argument(
+        '--true-vocab-size',
+        type=int,
+        default=None,
+        help='original size of vocab, if specified will trim padding from embedding table.',
+    )
+    group.add_argument(
+        '--vocab-file',
+        type=str,
+        default=None,
+        help='Path to the vocab file. If specified will use this to get vocab size and '
+        'trim padding from the embedding table.',
+    )
+    group.add_argument(
+        '--megatron-path', type=str, default=None, help='Base directory of Megatron repository'
+    )
+    group.add_argument(
+        '--position-embedding-type',
+        type=str,
+        default='learned_absolute',
+        choices=['learned_absolute', 'rope'],
+        help='Position embedding type.',
+    )
+    group.add_argument(
+        '--loader-transformer-impl',
+        default='local',
+        choices=['local', 'transformer_engine'],
+        help='Which Transformer implementation to use.',
+    )
+
 
 def _load_checkpoint(queue, args):
 
     # Search in directory above this
-    sys.path.append(os.path.abspath(
-        os.path.join(os.path.dirname(__file__),
-                     os.path.pardir)))
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
-        from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint
-        from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
-        from megatron.legacy import fused_kernels
+        from megatron.legacy.model import module
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint
+        from megatron.training.global_vars import set_args, set_global_variables
     except ModuleNotFoundError:
-        print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
+        print(
+            "Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting."
+        )
         queue.put("exit")
         exit(1)
 
     # We want all arguments to come from us
-    sys.argv = ['script.py',
-                '--no-masked-softmax-fusion',
-                '--no-bias-gelu-fusion',
-                '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
-                '--use-cpu-initialization',
-                '--micro-batch-size', '1',
-                '--no-load-optim',
-                '--no-load-rng',
-                '--no-save-optim',
-                '--no-save-rng',
-                '--mock-data', # To pass the "blend data checks" in arguments.py
-                '--no-initialization',
-                '--load', args.load_dir,
-                '--position-embedding-type', args.position_embedding_type,
-                '--exit-on-missing-checkpoint',
-                '--use-mp-args-from-checkpoint-args',
-                '--no-one-logger',
-                ]
+    sys.argv = [
+        'script.py',
+        '--no-masked-softmax-fusion',
+        '--no-bias-gelu-fusion',
+        '--no-bias-dropout-fusion',
+        '--use-cpu-initialization',
+        '--micro-batch-size',
+        '1',
+        '--no-load-optim',
+        '--no-load-rng',
+        '--no-save-optim',
+        '--no-save-rng',
+        '--mock-data',  # To pass the "blend data checks" in arguments.py
+        '--no-initialization',
+        '--load',
+        args.load_dir,
+        '--position-embedding-type',
+        args.position_embedding_type,
+        '--exit-on-missing-checkpoint',
+        '--use-mp-args-from-checkpoint-args',
+        '--no-one-logger',
+    ]
 
     margs = parse_args()
     margs, checkpoint_args = load_args_from_checkpoint(margs)
@@ -118,12 +134,14 @@ def _load_checkpoint(queue, args):
 
     # Determine how to make our models
     if args.model_type == 'GPT':
-        from model_provider import model_provider as common_model_provider
         from gpt_builders import gpt_builder
+        from model_provider import model_provider as common_model_provider
+
         model_provider = partial(common_model_provider, gpt_builder)
         margs.model_type = ModelType.encoder_or_decoder
     elif args.model_type == 'BERT':
         from pretrain_bert import model_provider
+
         margs.model_type = ModelType.encoder_or_decoder
     else:
         raise Exception(f'unrecognized model type: {args.model_type}')
@@ -133,6 +151,7 @@ def _load_checkpoint(queue, args):
 
     consumed_train_samples = None
     consumed_valid_samples = None
+
     def get_models(count, dtype):
         nonlocal consumed_train_samples
         nonlocal consumed_valid_samples
@@ -154,8 +173,7 @@ def _load_checkpoint(queue, args):
                     pre_process = mpu.is_pipeline_first_stage()
                     post_process = mpu.is_pipeline_last_stage()
                     this_model = model_provider(
-                        pre_process=pre_process,
-                        post_process=post_process
+                        pre_process=pre_process, post_process=post_process
                     ).to(dtype)
                     model_.append(this_model)
             else:
@@ -169,11 +187,11 @@ def _load_checkpoint(queue, args):
             load_checkpoint(model_, None, None)
 
             if consumed_train_samples is not None:
-                assert(margs.consumed_train_samples == consumed_train_samples)
+                assert margs.consumed_train_samples == consumed_train_samples
             else:
                 consumed_train_samples = margs.consumed_train_samples
             if consumed_valid_samples is not None:
-                assert(margs.consumed_valid_samples == consumed_valid_samples)
+                assert margs.consumed_valid_samples == consumed_valid_samples
             else:
                 consumed_valid_samples = margs.consumed_valid_samples
             for vp_rank in range(model_array_len):
@@ -184,11 +202,10 @@ def _load_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
-    
+
     # For backward compatibility during local parallel states refactoring
     fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
     mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-    fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size
     if args.true_vocab_size is not None:
@@ -197,7 +214,9 @@ def _load_checkpoint(queue, args):
         vocab = json.load(open(args.vocab_file))
         true_vocab_size = len(vocab)
         if args.true_vocab_size is not None and true_vocab_size != args.true_vocab_size:
-            print("Both --true-vocab-size and --vocab-file specified and the vocab size does not match, aborting.")
+            print(
+                "Both --true-vocab-size and --vocab-file specified and the vocab size does not match, aborting."
+            )
             queue.put("exit")
             exit(1)
     else:
@@ -258,11 +277,17 @@ def _load_checkpoint(queue, args):
     # Send embeddings
     message = {
         "word embeddings": torch.cat(
-            [models[tp_rank].language_model.embedding.word_embeddings.weight.data for tp_rank in range(tp_size)],
-            dim = 0)
+            [
+                models[tp_rank].language_model.embedding.word_embeddings.weight.data
+                for tp_rank in range(tp_size)
+            ],
+            dim=0,
+        )
     }
     if md.position_embedding_type == 'learned_absolute':
-        message["position embeddings"] = models[0].language_model.embedding.position_embeddings.weight.data
+        message["position embeddings"] = models[
+            0
+        ].language_model.embedding.position_embeddings.weight.data
     else:
         assert not hasattr(models[0].language_model.embedding, 'position_embeddings')
 
@@ -330,8 +355,8 @@ def _load_checkpoint(queue, args):
                     if md.swiglu:
                         for tp_rank in range(tp_size):
                             mlp_l0_bias[tp_rank] = torch.chunk(mlp_l0_bias[tp_rank], 2, dim=0)
-                        message["mlp l0 bias W"] = torch.cat([b[0] for b in mlp_l0_bias],dim=0)
-                        message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias],dim=0)
+                        message["mlp l0 bias W"] = torch.cat([b[0] for b in mlp_l0_bias], dim=0)
+                        message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias], dim=0)
                     else:
                         message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
 
@@ -340,9 +365,7 @@ def _load_checkpoint(queue, args):
                 total_layer_num = total_layer_num + 1
 
     # Send final norm from tp_rank 0
-    message = {
-        "weight": models[0].language_model.encoder.final_norm.weight.data,
-    }
+    message = {"weight": models[0].language_model.encoder.final_norm.weight.data}
     if norm_has_bias:
         message["bias"] = models[0].language_model.encoder.final_norm.bias.data
     queue_put("final norm", message)
@@ -350,17 +373,20 @@ def _load_checkpoint(queue, args):
     if md.output_layer:
         message = {
             "weight": torch.cat(
-                [models[tp_rank].language_model.output_layer.weight.data for tp_rank in range(tp_size)],
-                dim = 0)
+                [
+                    models[tp_rank].language_model.output_layer.weight.data
+                    for tp_rank in range(tp_size)
+                ],
+                dim=0,
+            )
         }
         queue_put("output layer", message)
-
 
     # Send BERT lm head and binary head if it exists
     if md.model_type == 'BERT':
         message = {
             "weight": models[0].language_model.pooler.dense.weight.data,
-            "bias": models[0].language_model.pooler.dense.bias.data
+            "bias": models[0].language_model.pooler.dense.bias.data,
         }
         queue_put("pooler", message)
 
@@ -376,10 +402,11 @@ def _load_checkpoint(queue, args):
         if md.bert_binary_head:
             message = {
                 "weight": models[0].binary_head.weight.data,
-                "bias": models[0].binary_head.bias.data
+                "bias": models[0].binary_head.bias.data,
             }
             queue_put("binary head", message)
     queue.put("done")
+
 
 def load_checkpoint(queue, args):
     try:

@@ -6,6 +6,9 @@ from unittest import mock
 
 import torch
 
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -167,6 +170,9 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
+    # Clear the metadata cache to avoid contamination between tests
+
+    CachedMetadataFileSystemReader.clear_metadata_cache()
 
 
 def setup_model_and_optimizer(
@@ -212,7 +218,10 @@ def setup_model_and_optimizer(
 
     if isinstance(optimizer, ChainedOptimizer):
         for opt in optimizer.chained_optimizers:
-            opt.init_state_fn(opt)
+            if not hasattr(opt, 'optimizer'):
+                opt.init_state_fn(opt)
+            else:
+                opt.init_state_fn(opt.optimizer)
     else:
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:
@@ -221,7 +230,7 @@ def setup_model_and_optimizer(
                     optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
 
 
@@ -308,7 +317,10 @@ def setup_moe_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         for opt in optimizer.chained_optimizers:
-            opt.init_state_fn(opt)
+            if not hasattr(opt, 'optimizer'):
+                opt.init_state_fn(opt)
+            else:
+                opt.init_state_fn(opt.optimizer)
     else:
         for opt in optimizer.chained_optimizers:
             for group in opt.param_groups:
@@ -318,5 +330,5 @@ def setup_moe_model_and_optimizer(
                         opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer

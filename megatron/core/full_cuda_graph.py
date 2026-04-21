@@ -2,6 +2,7 @@
 
 """Full iteration CUDA graph for training."""
 
+import gc
 import logging
 
 import torch
@@ -70,6 +71,7 @@ class StaticBufferLoader:
 
         assert isinstance(inputs, dict)
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
+            self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
@@ -83,6 +85,7 @@ class StaticBufferLoader:
                     else:
                         StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
+            self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 clone_tensors_in_struct(
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
@@ -180,12 +183,10 @@ class FullCudaGraphWrapper:
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
-
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
-
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
@@ -196,3 +197,19 @@ class FullCudaGraphWrapper:
     def next_iter(self, stage):
         """Increment current training/validation iteration."""
         FullCudaGraphWrapper.curr_iteration[stage] += 1
+
+    def reset_cuda_graph(self, stage=None):
+        """Reset CUDA graph."""
+        if stage is None or stage == 'training':
+            if FullCudaGraphWrapper.cuda_graph['training'] is not None:
+                del FullCudaGraphWrapper.cuda_graph['training']
+                FullCudaGraphWrapper.cuda_graph['training'] = None
+            FullCudaGraphWrapper.result['training'] = None
+            FullCudaGraphWrapper.curr_iteration['training'] = 0
+        if stage is None or stage == 'validation':
+            if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
+                del FullCudaGraphWrapper.cuda_graph['validation']
+                FullCudaGraphWrapper.cuda_graph['validation'] = None
+            FullCudaGraphWrapper.result['validation'] = None
+            FullCudaGraphWrapper.curr_iteration['validation'] = 0
+        gc.collect()

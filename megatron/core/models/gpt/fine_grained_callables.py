@@ -3,7 +3,7 @@
 import weakref
 from contextlib import nullcontext
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from torch import Tensor
@@ -23,7 +23,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 
 def weak_method(method):
@@ -330,11 +330,14 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
+        if isinstance(self.stream, Callable):
+            self.stream = self.stream()
         with torch.cuda.stream(self.stream):
-            torch.cuda.nvtx.range_push(f"{self.name} wgrad")
+            nvtx_msg = f"{self.name} wgrad"
+            nvtx_range_push(nvtx_msg)
             for module in self.bwd_dw_callables:
                 module.backward_dw()
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop(nvtx_msg)
 
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
@@ -476,21 +479,31 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
+                mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
+                node.layer_state.mlp_norm_manager = mlp_norm_manager
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-                    with off_interface(
-                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
-                    ) as hidden_states:
+                    with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
                             apply_module(layer.pre_mlp_layernorm), hidden_states
                         )
                 else:
-                    with off_interface(
-                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
-                    ) as hidden_states:
+                    with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
                             hidden_states
                         )
+
+                # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
+                # the layernorm returns (normalized_output, residual). Unpack
+                # and use the fused residual for the downstream BDA connection.
+                if isinstance(pre_mlp_layernorm_output, tuple):
+                    if len(pre_mlp_layernorm_output) != 2:
+                        raise ValueError(
+                            f"When the output of pre_mlp_layernorm is a tuple, it is "
+                            f"expected to have 2 elements (output, residual), but "
+                            f"got {len(pre_mlp_layernorm_output)}"
+                        )
+                    pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
@@ -589,10 +602,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
-        if layer.offload_mlp_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+        mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
+        if mlp_norm_manager is not None:
+            hidden_states = mlp_norm_manager.group_offload(
+                hidden_states, forced_released_tensors=[residual]
             )
+            node.layer_state.mlp_norm_manager = None
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )

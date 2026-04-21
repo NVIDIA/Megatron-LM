@@ -5,6 +5,8 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
+import torch
+
 from megatron.core.utils import log_single_rank
 
 if TYPE_CHECKING:
@@ -291,7 +293,10 @@ class OptimizerParamScheduler:
         # This is important for logging under model parallelism that may leave
         # some ranks with empty default_config parameter groups.
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.get_lr(param_group)
+            if isinstance(param_group.get('lr'), torch.Tensor):
+                param_group['lr'].fill_(self.get_lr(param_group))
+            else:
+                param_group['lr'] = self.get_lr(param_group)
             param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)
 
     def state_dict(self) -> dict:

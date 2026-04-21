@@ -12,7 +12,9 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +24,6 @@ try:
     HAVE_EINOPS = True
 except ImportError:
     HAVE_EINOPS = False
-
-logger = logging.getLogger(__name__)
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -115,12 +115,11 @@ _CONTEXT_PARALLEL_GROUP = None
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
-# Hybrid context parallel groups
-_HYBRID_DP_CP_GROUPS = {}
+# Dynamic context parallel groups
+_DYNAMIC_DP_CP_GROUPS = {}
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
-_DATA_PARALLEL_GROUP_WITH_CP_AG = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
@@ -140,8 +139,6 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
-# Global symmetric memory buffer for inference
-_GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 # List of all process groups
 # Used for updating the timeout for all process groups
@@ -421,29 +418,27 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
+def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1):
     """
-    Creates groups required for hybrid DPxCP.
-    Creates a new group for every power of 2 up to the number of DPxCP ranks.
+    Creates groups required for dynamic DPxCP.
+    Creates a new group for every power of 2 from min_cp_size up to len(ranks).
     Returns a dictionary indexed by group size.
     """
-    hybrid_dp_cp_groups = {}
-    # Generate group for every power of 2 up to the number of CP ranks
-    # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    dynamic_dp_cp_groups = {}
+    group_sizes = [2**i for i in range(int(log2(len(ranks)))) if 2**i >= min_cp_size]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
                 ranks[i : i + group_size],
                 pg_options=pg_options,
-                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
+                group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
             )
             if rank in ranks[i : i + group_size]:
                 assert (
-                    group_size not in hybrid_dp_cp_groups
-                ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
-                hybrid_dp_cp_groups[group_size] = group
-    return hybrid_dp_cp_groups
+                    group_size not in dynamic_dp_cp_groups
+                ), f"Rank {rank} appears in multiple Dynamic DP CP groups of size {group_size}"
+                dynamic_dp_cp_groups[group_size] = group
+    return dynamic_dp_cp_groups
 
 
 class RankGenerator(object):
@@ -555,7 +550,8 @@ def initialize_model_parallel(
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
-    hybrid_context_parallel: bool = False,
+    dynamic_context_parallel: bool = False,
+    min_dynamic_context_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
@@ -567,7 +563,8 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
-    create_all_gather_group: Optional[bool] = False,
+    rank_offset: int = 0,
+    local_world_size: Optional[int] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -682,13 +679,6 @@ def initialize_model_parallel(
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
 
-        create_all_gather_group (bool, default = False):
-            Create a separate process group for all-gather operations to avoid
-            head-of-line blocking with reduce-scatter operations. When enabled,
-            creates an additional NCCL communicator with identical ranks as the
-            dp-cp group but with independent progress engines for better communication
-            overlap.
-
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -735,7 +725,9 @@ def initialize_model_parallel(
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
+    world_size: int = (
+        local_world_size if local_world_size is not None else torch.distributed.get_world_size()
+    )
 
     model_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
 
@@ -781,7 +773,7 @@ def initialize_model_parallel(
         pp=pipeline_model_parallel_size,
         cp=context_parallel_size,
         order=order,
-        rank_offset=0,
+        rank_offset=rank_offset,
     )
 
     # Build expert rank generator
@@ -804,7 +796,7 @@ def initialize_model_parallel(
         pp=pipeline_model_parallel_size,
         cp=1,
         order=order,
-        rank_offset=0,
+        rank_offset=rank_offset,
     )
 
     assert (
@@ -825,7 +817,6 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     global _DATA_PARALLEL_GROUP_WITH_CP
-    global _DATA_PARALLEL_GROUP_WITH_CP_AG
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
@@ -857,15 +848,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP",
         )
-        if create_all_gather_group:
-            group_with_cp_ag = create_group(
-                ranks_with_cp,
-                timeout=timeout,
-                pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
-                group_desc="DATA_PARALLEL_GROUP_WITH_CP_AG",
-            )
-        else:
-            group_with_cp_ag = None
         if create_gloo_process_groups:
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
@@ -877,7 +859,6 @@ def initialize_model_parallel(
             group_with_cp_gloo = None
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-            _DATA_PARALLEL_GROUP_WITH_CP_AG = group_with_cp_ag
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
@@ -937,18 +918,34 @@ def initialize_model_parallel(
         if "NCCL_COLLNET_ENABLE" in os.environ:
             del os.environ["NCCL_COLLNET_ENABLE"]
 
-    if hybrid_context_parallel:
-        global _HYBRID_DP_CP_GROUPS
+    if dynamic_context_parallel:
+        # TODO: Are gloo groups needed for Dynamic CP?
+        global _DYNAMIC_DP_CP_GROUPS
         for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
             assert (
                 len(ranks_with_cp) % 2 == 0
-            ), "Hybrid context parallel requires an even number of ranks"
-            _HYBRID_DP_CP_GROUPS.update(
-                create_hybrid_dp_cp_groups(
-                    rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)
+            ), "Dynamic context parallel requires an even number of ranks"
+            _DYNAMIC_DP_CP_GROUPS.update(
+                create_dynamic_dp_cp_groups(
+                    rank,
+                    ranks_with_cp,
+                    get_nccl_options("dp_cp", nccl_comm_cfgs),
+                    min_cp_size=min_dynamic_context_parallel_size,
                 )
             )
-        # TODO: Are gloo groups needed for hybrid cp?
+
+        data_parallel_size_with_cp = data_parallel_size * context_parallel_size
+        group_sizes = [
+            2**i
+            for i in range(int(log2(data_parallel_size_with_cp)))
+            if 2**i >= min_dynamic_context_parallel_size
+        ]
+        if data_parallel_size_with_cp not in group_sizes:
+            group_sizes.append(data_parallel_size_with_cp)
+        for group_size in group_sizes:
+            group = get_dynamic_data_context_parallel_groups(group_size=group_size)
+            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+            torch.cuda.synchronize()
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
@@ -1356,6 +1353,91 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
+def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
+    """
+    Helper function to create all-gather process groups for AG/RS overlap.
+
+    Creates separate communicators with the same ranks as data parallel groups
+    to enable overlapping all-gather operations with reduce-scatter operations.
+
+    Args:
+        for_expert_parallelism (bool): If True, also creates AG group for expert parameters.
+        timeout (timedelta): Timeout for distributed collectives.
+        nccl_comm_cfgs (dict): NCCL communicator configurations.
+
+    Returns:
+        tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
+               if for_expert_parallelism=False.
+
+    Example:
+        # After initialize_model_parallel():
+        dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+            for_expert_parallelism=True
+        )
+
+        # Add to ProcessGroupCollection:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp_ag = dp_cp_ag
+        pg_collection.expt_dp_ag = expt_dp_ag
+    """
+    if not is_initialized():
+        raise RuntimeError(
+            "create_all_gather_groups() requires parallel state to be initialized. "
+            "Call initialize_model_parallel() first."
+        )
+
+    rank = torch.distributed.get_rank()
+    pp_size = get_pipeline_model_parallel_world_size()
+    cp_size = get_context_parallel_world_size()
+    tp_size = get_tensor_model_parallel_world_size()
+    ep_size = get_expert_model_parallel_world_size()
+    dp_size = get_data_parallel_world_size()
+
+    # Create regular DP all-gather group
+    dp_cp_ag_group = None
+    decoder_rank_gen = RankGenerator(
+        tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order='tp-cp-ep-dp-pp', rank_offset=0
+    )
+
+    for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
+        group_with_cp_ag = create_group(
+            ranks_with_cp,
+            timeout=timeout,
+            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
+            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+        )
+        if rank in ranks_with_cp:
+            dp_cp_ag_group = group_with_cp_ag
+
+    # Create expert DP all-gather group if requested
+    expt_dp_ag_group = None
+    if for_expert_parallelism and ep_size > 1:
+        expert_tp_size = get_expert_tensor_parallel_world_size()
+        expert_dp_size = get_expert_data_parallel_world_size()
+
+        expert_rank_gen = RankGenerator(
+            tp=expert_tp_size,
+            ep=ep_size,
+            dp=expert_dp_size,
+            pp=pp_size,
+            cp=1,
+            order='tp-cp-ep-dp-pp',
+            rank_offset=0,
+        )
+
+        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
+            expert_dp_ag = create_group(
+                expert_dp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
+                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+            )
+            if rank in expert_dp_ranks:
+                expt_dp_ag_group = expert_dp_ag
+
+    return dp_cp_ag_group, expt_dp_ag_group
+
+
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is not None
@@ -1397,9 +1479,7 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(
-    with_context_parallel=False, partial_data_parallel=False, independent_all_gather=False
-):
+def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
     """Get the data-parallel group the caller rank belongs to."""
     if with_context_parallel:
         if partial_data_parallel:
@@ -1407,11 +1487,6 @@ def get_data_parallel_group(
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
             ), "Intra partial data parallel group is not initialized"
             return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-        if independent_all_gather:
-            assert (
-                _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
-            ), "data parallel group with context parallel AG is not initialized"
-            return _DATA_PARALLEL_GROUP_WITH_CP_AG
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP is not None
         ), "data parallel group with context parallel combined is not initialized"
@@ -1420,15 +1495,6 @@ def get_data_parallel_group(
         assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
         assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP
-
-
-def has_separate_all_gather_group() -> bool:
-    """Check if a separate all-gather process group has been created.
-
-    Returns True if a dedicated all-gather process group exists for improved
-    communication overlap, False otherwise.
-    """
-    return _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
 
 
 def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
@@ -1472,16 +1538,15 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=None):
-    """Get the hybrid context parallel groups the caller rank belongs to."""
-    # If the group size is the same as the entire DPxCP group, return the original group
+def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
+    """Get the dynamic context parallel groups the caller rank belongs to."""
     if get_data_parallel_world_size(with_context_parallel=True) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
     if check_initialized:
-        assert _HYBRID_DP_CP_GROUPS is not None
-    return _HYBRID_DP_CP_GROUPS[group_size]
+        assert _DYNAMIC_DP_CP_GROUPS is not None
+    return _DYNAMIC_DP_CP_GROUPS[group_size]
 
 
 def get_embedding_group(check_initialized=True):
@@ -2014,41 +2079,16 @@ def _set_global_memory_buffer():
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 
-def _set_global_symmetric_memory_buffer():
-    """Initialize global buffer."""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
-
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
-        size_in_mb=256,  # todo: set from an argument?
-        process_group=get_tensor_model_parallel_group(),
-    )
-
-
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
     return _GLOBAL_MEMORY_BUFFER
 
 
-def get_global_symmetric_memory_buffer():
-    """Return the global GlobalSymmetricMemoryBuffer object"""
-    assert (
-        _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None
-    ), "global symmetric memory buffer is not initialized"
-    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-
-
 def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
-
-
-def destroy_global_symmetric_memory_buffer():
-    """Sets the global symmetric memory buffer to None"""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 
 def get_all_ranks():
@@ -2081,14 +2121,14 @@ def destroy_model_parallel():
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
 
-    global _DATA_PARALLEL_GROUP_WITH_CP_AG
-    _DATA_PARALLEL_GROUP_WITH_CP_AG = None
-
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
 
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     _CONTEXT_PARALLEL_GLOBAL_RANKS = None
+
+    global _DYNAMIC_DP_CP_GROUPS
+    _DYNAMIC_DP_CP_GROUPS = {}
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
@@ -2128,9 +2168,6 @@ def destroy_model_parallel():
 
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
-
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (
@@ -2214,3 +2251,5 @@ def destroy_model_parallel():
 
     global _global_process_group_list
     _global_process_group_list = None
+
+    SymmetricMemoryManager.destroy()

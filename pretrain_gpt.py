@@ -27,10 +27,11 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, StragglerDetector
 from megatron.training import (
     get_args,
     get_timers,
@@ -65,7 +66,55 @@ stimer = StragglerDetector()
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
-    """Generate a batch."""
+    """Generate a batch.
+
+    Packed sequence support (SFT / ``--sft`` flag):
+        When ``args.sft`` is True, the dataset emits THD-format batches where
+        multiple sequences are concatenated into a single flat token tensor.
+        The batch includes ``cu_seqlens`` (cumulative sequence lengths, shape
+        ``[1, S+1]``) and ``max_seqlen`` (shape ``[1]``) that describe the
+        individual sequence boundaries.
+
+        This function validates and squeezes those fields:
+          - ``cu_seqlens``:  asserted to have shape ``[1, S+1]`` (micro-batch
+            size must be 1 for packing), then squeezed to ``[S+1]``.
+          - ``max_seqlen``:  asserted to be 1-D; kept as a tensor and passed
+            to ``get_thd_batch_on_this_cp_rank`` which performs the final
+            scalar conversion internally.
+
+        Pipeline stage handling:
+          - First/last PP stages: fetch the full batch (tokens + labels) and
+            route through ``get_thd_batch_on_this_cp_rank`` to produce a
+            ``PackedSeqParams`` object that carries ``cu_seqlens`` and
+            ``max_seqlen`` to the attention kernel.
+          - Middle PP stages: only ``cu_seqlens`` and ``max_seqlen`` are
+            needed for attention masking; all other fields are returned as
+            ``None`` with a ``PackedSeqParams`` built directly here.
+          - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
+            regardless of pipeline stage.
+
+        Difference from ``pretrain_mamba.py``:
+          - Return format: GPT returns a 6-tuple
+            ``(tokens, labels, loss_mask, attention_mask, position_ids,
+            packed_seq_params)`` where ``packed_seq_params`` is a
+            ``PackedSeqParams`` dataclass.  Mamba returns 7 values via
+            ``batch.values()`` with ``cu_seqlens`` and ``max_seqlen`` as
+            separate dict entries (no ``PackedSeqParams`` wrapper).
+          - Middle-stage return: GPT returns ``(None×5, PackedSeqParams)``;
+            Mamba returns an ``empty_batch`` dict with ``cu_seqlens`` and
+            ``max_seqlen`` set.
+          - CP with packed sequences: GPT delegates to
+            ``get_thd_batch_on_this_cp_rank`` (MCore utility); Mamba
+            implements the ``tex.thd_get_partitioned_indices`` CP slicing
+            inline and does not call that helper.
+          - MTP: GPT passes ``mtp_on_this_rank`` to ``get_batch_on_this_tp_rank``
+            and uses it to gate the early-return; Mamba has no MTP support.
+          - ``max_seqlen`` conversion: Mamba converts to a Python int scalar
+            before returning (``int(max_seqlen[0].item())``); GPT keeps it as
+            a tensor and lets ``get_thd_batch_on_this_cp_rank`` convert it,
+            except for the middle-stage ``PackedSeqParams`` where conversion
+            is done inline.
+    """
     args = get_args()
     config = core_transformer_config_from_args(args)
 
@@ -75,10 +124,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
+            dynamic_cp=args.dynamic_context_parallel,
         )
 
     # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage) and (
+    is_packed_sequence = get_args().sft  # SFT always uses packed sequence
+    if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None, None
 
@@ -91,19 +142,32 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
     max_seqlen = batch.pop('max_seqlen', None)
-    local_cp_size = batch.pop('local_cp_size', None)
-    if local_cp_size is not None:
-        local_cp_size = int(local_cp_size.item())
+    batch.pop('local_cp_size', None)
 
-    if cu_seqlens is None and local_cp_size is None:
+    if cu_seqlens is not None:
+        assert (
+            cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
+        ), "micro-batch-size must be 1 for packing"
+        cu_seqlens = cu_seqlens[0]
+        assert max_seqlen.dim() == 1
+
+    # For middle pipeline stages with packed sequences, only cu_seqlens and
+    # max_seqlen are needed (for attention masking); skip the full batch.
+    if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
+        return None, None, None, None, None, PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+            qkv_format='thd',
+        )
+
+    if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
         packed_seq_params = None
-    elif local_cp_size is None:  # Packed THD format
-        assert max_seqlen.dim() == 1
+    else:  # Packed THD format
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
-    else: # Hybrid CP format
-        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
     
     return (*batch.values(), packed_seq_params)
 
@@ -213,13 +277,17 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None):
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     args = get_args()
     config = core_transformer_config_from_args(args)
+    if parallel_state.get_tensor_model_parallel_rank() != 0:
+        return False
+    elif is_packed_sequence:
+        return True
     return (
         is_first_or_last_pipeline_stage(vp_stage)
         or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
-    ) and parallel_state.get_tensor_model_parallel_rank() == 0
+    )
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -260,7 +328,7 @@ def core_gpt_dataset_config_from_args(args):
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,
         "sft_mock_dataset_config_json":args.sft_mock_dataset_config_json,
     }
 
@@ -298,11 +366,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = core_gpt_dataset_config_from_args(args)
 
+
+    is_packed_sequence = False
     if args.sft:
         if args.mock_data:
             dataset_type = MockSFTDataset
         else:
             dataset_type = SFTDataset
+        is_packed_sequence = True  # SFT always uses packed sequence
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset
@@ -313,9 +384,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
-    is_dataset_built = partial(is_dataset_built_on_rank, vp_stage=vp_stage)
+    is_dataset_built = partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence)
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
+        dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")

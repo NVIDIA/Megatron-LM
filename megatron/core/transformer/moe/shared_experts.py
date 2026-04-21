@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -26,6 +27,11 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
 )
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
+else:
+    TELinear, set_save_original_input = None, None
 
 
 class SharedExpertMLP(MLP):
@@ -76,19 +82,8 @@ class SharedExpertMLP(MLP):
                 config.recompute_granularity == 'selective'
                 and "shared_experts" in config.recompute_modules
             )
-            if not shared_experts_recompute:
-                try:
-                    HAVE_TE = True
-                    from megatron.core.extensions.transformer_engine import (
-                        TELinear,
-                        set_save_original_input,
-                    )
-                except ImportError:
-                    HAVE_TE = False
-                    TELinear, set_save_original_input = None, None
-
-                if HAVE_TE and isinstance(self.linear_fc1, TELinear):
-                    set_save_original_input(self.linear_fc1)
+            if not shared_experts_recompute and HAVE_TE and isinstance(self.linear_fc1, TELinear):
+                set_save_original_input(self.linear_fc1)
 
         if self.config.moe_shared_expert_overlap:
             # disable TP related AG/RS communications in the linear module
@@ -120,8 +115,9 @@ class SharedExpertMLP(MLP):
             self.cached_output = None
             self.gate_score = None
 
-            if self.stream is None:
-                self.stream = torch.cuda.Stream()
+            if self.__class__.stream is None:
+                self.__class__.stream = torch.cuda.Stream()
+            self.stream = self.__class__.stream
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
