@@ -131,6 +131,14 @@ class DistributedDataParallel(_BaseDataParallel):
         # This maintains backward compatibility for callers that create DDP directly
         # without pre-computing layouts (e.g., tests, external code).
         if full_param_layout is None and self.ddp_config.use_distributed_optimizer:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "DistributedDataParallel: full_param_layout not provided with "
+                "use_distributed_optimizer=True. Auto-computing layout inside DDP. "
+                "Callers should pre-compute layouts via "
+                "DistributedOptimizer.compute_full_param_layout() and pass them in.",
+            )
             from ..optimizer.distrib_optimizer import DistributedOptimizer
 
             full_param_layout = DistributedOptimizer.compute_full_param_layout(

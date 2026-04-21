@@ -220,6 +220,7 @@ class TestDistOptParamLayout:
     @staticmethod
     def _make_ddp_config(**overrides):
         defaults = dict(
+            grad_reduce_in_fp32=False,
             use_distributed_optimizer=True,
             overlap_grad_reduce=True,
             bucket_size=None,
@@ -328,6 +329,51 @@ class TestDistOptParamLayout:
             padded_numel = end - start
             assert layout.per_bucket_numel_unpadded[i] <= padded_numel
 
+    def test_shared_embedding_with_bucket_size(self):
+        """Shared embedding that hits bucket_size threshold should still get its own bucket."""
+        # 3 regular params + 1 shared embedding, each 5000 elements.
+        # With bucket_size=8000, regular params would form 2-param buckets,
+        # but shared embedding must always be isolated.
+        regulars = [_make_param_with_attrs((5000,)) for _ in range(3)]
+        shared = _make_param_with_attrs((5000,), shared_embedding=True)
+        # Order: regulars first, shared last → reversed: shared first.
+        params = regulars + [shared]
+        dp_size = 2
+        ddp_config = self._make_ddp_config()
+        layout = DistributedOptimizer._compute_per_buffer_param_layout(
+            params, bucket_size=8000, data_parallel_world_size=dp_size, ddp_config=ddp_config
+        )
+
+        # Shared embedding must be alone in its bucket.
+        _, _, shared_bucket = layout.param_index_map[shared]
+        shared_bucket_params = [
+            p for p, (_, _, bid) in layout.param_index_map.items() if bid == shared_bucket
+        ]
+        assert len(shared_bucket_params) == 1
+        assert shared_bucket_params[0] is shared
+
+    def test_layout_matches_default_when_no_padding_needed(self):
+        """When params are 64-aligned and bucket_size=None, distributed optimizer layout
+        should produce the same param_index_map ordering as the default layout
+        (only bucket end padding differs)."""
+        # Use param sizes that are multiples of 64 to avoid start-of-param padding.
+        params = _make_params((64 * 10,), (64 * 20,), (64 * 15,))
+        ddp_config = self._make_ddp_config()
+        dist_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+            params, bucket_size=None, data_parallel_world_size=1, ddp_config=ddp_config
+        )
+        default_layout = _compute_default_per_buffer_param_layout(params, bucket_size=None)
+
+        # With dp_size=1, lcm(1, 128) = 128, so bucket end padding may differ.
+        # But param ordering and unpadded numel should match.
+        for param in params:
+            dist_start, dist_end, dist_bid = dist_layout.param_index_map[param]
+            def_start, def_end, def_bid = default_layout.param_index_map[param]
+            assert dist_start == def_start, f"Start mismatch for param: {dist_start} vs {def_start}"
+            assert dist_end == def_end, f"End mismatch for param: {dist_end} vs {def_end}"
+            assert dist_bid == def_bid, f"Bucket ID mismatch for param: {dist_bid} vs {def_bid}"
+        assert dist_layout.per_bucket_numel_unpadded == default_layout.per_bucket_numel_unpadded
+
 
 # ---------------------------------------------------------------------------
 # Tests for DistributedOptimizer.compute_full_param_layout
@@ -339,6 +385,7 @@ class TestComputeFullParamLayout:
     @staticmethod
     def _make_ddp_config(**overrides):
         defaults = dict(
+            grad_reduce_in_fp32=False,
             use_distributed_optimizer=True,
             overlap_grad_reduce=True,
             bucket_size=None,

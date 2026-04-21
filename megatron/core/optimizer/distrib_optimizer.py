@@ -481,6 +481,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         bucket_size: Optional[int],
         data_parallel_world_size: int,
         ddp_config,
+        param_indices: Optional[List[int]] = None,
     ) -> 'PerBufferParamLayout':
         """Compute how parameters should be laid out in the contiguous buffer.
 
@@ -493,6 +494,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_size: Approximate number of elements per bucket, or None for single bucket.
             data_parallel_world_size: Size of the data-parallel group.
             ddp_config: DistributedDataParallel config object.
+            param_indices: Optional indices for each param among same-dtype params.
 
         Returns:
             PerBufferParamLayout with the computed mapping.
@@ -510,8 +512,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         bucket_params = set()
         bucket_id = 0
 
-        def _finalize_bucket(param_end_index, bucket_start_index):
-            nonlocal bucket_params, bucket_id
+        def _finalize_bucket(param_end_index, bucket_start_index, bucket_id):
             per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
             bucket_end_index = pad_bucket_end(
                 param_end_index,
@@ -519,16 +520,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 ddp_config.pad_buckets_for_high_nccl_busbw,
             )
             bucket_indices.append((bucket_start_index, bucket_end_index))
-            bucket_params = set()
-            bucket_id += 1
-            return bucket_end_index
+            return bucket_end_index, bucket_id + 1
 
         for param in params[::-1]:
             param_start_index = pad_param_start(param_start_index)
 
             # Split shared embedding params into separate bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
-                bucket_start_index = _finalize_bucket(param_start_index, bucket_start_index)
+                bucket_start_index, bucket_id = _finalize_bucket(
+                    param_start_index, bucket_start_index, bucket_id
+                )
+                bucket_params = set()
                 param_start_index = bucket_start_index
 
             param_numel = param.data.nelement()
@@ -539,18 +541,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if (
                 bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
             ) or _does_param_require_new_bucket(param):
-                bucket_start_index = _finalize_bucket(param_end_index, bucket_start_index)
+                bucket_start_index, bucket_id = _finalize_bucket(
+                    param_end_index, bucket_start_index, bucket_id
+                )
+                bucket_params = set()
                 param_start_index = bucket_start_index
             else:
                 param_start_index = param_end_index
 
         if len(bucket_params) > 0:
-            _finalize_bucket(param_end_index, bucket_start_index)
+            _finalize_bucket(param_end_index, bucket_start_index, bucket_id)
 
         return PerBufferParamLayout(
             param_index_map=param_index_map,
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+            param_indices=param_indices if param_indices is not None else [],
         )
 
     @staticmethod
@@ -591,9 +597,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 dp_world_size = data_parallel_world_size
             layout = DistributedOptimizer._compute_per_buffer_param_layout(
-                group_params, bucket_size, dp_world_size, ddp_config
+                group_params, bucket_size, dp_world_size, ddp_config, param_indices
             )
-            layout.param_indices = param_indices
             layouts[buffer_key] = layout
         return FullParamLayout(layouts=layouts)
 

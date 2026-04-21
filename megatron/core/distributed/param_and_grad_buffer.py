@@ -897,7 +897,7 @@ class _ParamAndGradBuffer:
         param_indices: List[int],
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        param_layout=None,
+        param_layout: Optional['PerBufferParamLayout'] = None,
     ):
 
         if pg_collection is None:

@@ -777,9 +777,8 @@ class TestNVFP4IndexMaps:
         param_layout = None
         if use_distributed_optimizer:
             param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
-                params, bucket_size, dp_world_size, ddp_config
+                params, bucket_size, dp_world_size, ddp_config, list(range(len(params)))
             )
-            param_layout.param_indices = list(range(len(params)))
 
         with (
             mock.patch(
