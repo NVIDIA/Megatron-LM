@@ -1,0 +1,12 @@
+num_layers: 52
+hidden_size: 1920
+ffn_hidden_size: 960
+num_attention_heads: 32
+kv_channels: 128
+hybrid_override_pattern: 'MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME'
+mamba_head_dim: 64
+mamba_state_dim: 128
+mamba_num_heads: 64
+num_experts: 128
+moe_router_topk: 6
+moe_shared_expert_intermediate_size: 3712

@@ -1,0 +1,4 @@
+logit_layers: ["output_layer", "output_layer"]
+intermediate_layer_pairs: []
+skip_lm_loss: true
+kd_loss_scale: 1.0
