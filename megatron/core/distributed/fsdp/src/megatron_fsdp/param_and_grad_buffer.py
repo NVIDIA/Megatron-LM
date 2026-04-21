@@ -24,9 +24,10 @@ import math
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
+from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, cast
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -244,8 +245,8 @@ class BucketingPolicy:
         This policy is used to configure the bucketing behavior in FSDP training.
     """
 
-    suggested_bucket_size: Optional[int] = 40_000_000
-    fsdp_unit_modules: List[torch.nn.Module] = dataclasses.field(default_factory=list)
+    suggested_bucket_size: int | None = 40_000_000
+    fsdp_unit_modules: list[torch.nn.Module] = dataclasses.field(default_factory=list)
     data_parallel_sharding_strategy: str = "no_shard"
 
 
@@ -254,14 +255,14 @@ def _pad(number_to_be_padded: int, divisor: int) -> int:
 
 
 def build_data_parallel_buffer_index(
-    elements: List[torch.Size],
+    elements: list[torch.Size],
     data_parallel_rank: int,
     data_parallel_world_size: int,
     is_data_distributed: bool,
     ddp_config: DistributedDataParallelConfig,
     bucket_id: int = 0,
     chunk_size_factor: int = 1,
-) -> Tuple[List[tuple], BucketIndex, ShardBucketIndex]:
+) -> tuple[list[tuple], BucketIndex, ShardBucketIndex]:
     """
     Assuming that all input tensor elements contiguously compose a global
     buffer, give the index range of every tensor, the bucket in the buffer,
@@ -270,13 +271,13 @@ def build_data_parallel_buffer_index(
     deduced from the number of raw parameters assigned to this buffer / bucket.
 
     Args:
-        elements (List[torch.Size]): List of input tensor.
+        elements (list[torch.Size]): List of input tensor.
         data_parallel_rank (int): Rank of the current process in the data parallel group.
         data_parallel_world_size (int): World size of the data parallel group.
         bucket_id (int, optional): The id of the bucket. Defaults to 0.
 
     Returns:
-        Tuple[Dict[int, TensorItemIndex], BucketIndex, ShardBucketIndex]: The index
+        tuple[dict[int, TensorItemIndex], BucketIndex, ShardBucketIndex]: The index
             range of every tensor, every bucket and every in bucket local buffer.
     """
 
@@ -503,7 +504,7 @@ class TemporaryBucketAllocator:
         size: int,
         dtype: torch.dtype,
         device: torch.device,
-        mem_alloc_context: Optional[Callable] = None,
+        mem_alloc_context: Callable | None = None,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -536,7 +537,7 @@ class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
         size: int,
         dtype: torch.dtype,
         device: torch.device,
-        mem_alloc_context: Optional[Callable] = None,
+        mem_alloc_context: Callable | None = None,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -599,7 +600,7 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
         size: int,
         dtype: torch.dtype,
         device: torch.device,
-        mem_alloc_context: Optional[Callable] = None,
+        mem_alloc_context: Callable | None = None,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -652,7 +653,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     def __init__(
         self,
         name: str,
-        fsdp_param_groups: List["ParameterGroup"],
+        fsdp_param_groups: list["ParameterGroup"],
         size: int = 2,
         fallback_to_persistent_buffer: bool = False,
     ):
@@ -746,7 +747,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         size: int,
         dtype: torch.dtype,
         device: torch.device,
-        mem_alloc_context: Optional[Callable] = None,
+        mem_alloc_context: Callable | None = None,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -846,21 +847,21 @@ class DataParallelBuffer:
     def __init__(
         self,
         ddp_config: DistributedDataParallelConfig,
-        params: List[torch.nn.Parameter],
+        params: list[torch.nn.Parameter],
         is_data_distributed: bool,
         bucket_id: int,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-        data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        dp_rank: Optional[int] = None,
-        temporary_bucket_allocator: Optional[TemporaryBucketAllocator] = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        data_parallel_group: torch.distributed.ProcessGroup | None = None,
+        dp_rank: int | None = None,
+        temporary_bucket_allocator: TemporaryBucketAllocator | None = None,
         is_transpose_buffer: bool = False,
-        gradient_scaling_factor: Optional[float] = None,
+        gradient_scaling_factor: float | None = None,
         chunk_size_factor: int = 1,
-        mem_alloc_context: Optional[Callable] = None,
-        item_index_map: Optional[Dict[int, TensorItemIndex]] = None,
-        bucket_index: Optional[BucketIndex] = None,
-        shard_bucket_index: Optional[ShardBucketIndex] = None,
+        mem_alloc_context: Callable | None = None,
+        item_index_map: dict[int, TensorItemIndex] | None = None,
+        bucket_index: BucketIndex | None = None,
+        shard_bucket_index: ShardBucketIndex | None = None,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
@@ -936,7 +937,7 @@ class DataParallelBuffer:
         self.data = data
 
     def fetch_bucket(
-        self, dtype: Optional[torch.dtype] = None, set_param_data: bool = False
+        self, dtype: torch.dtype | None = None, set_param_data: bool = False
     ) -> Bucket:
         """
         Fetch a communication buffer for data-parallel operations. If the buffer
@@ -946,7 +947,7 @@ class DataParallelBuffer:
         The size of the bucket is defined by the `DataParallelBuffer` instance.
 
         Args:
-            dtype (Optional[torch.dtype]): The data type of the tensor
+            dtype (torch.dtype | None): The data type of the tensor
                 to fetch a buffer for. Defaults to None.
 
         Returns:
@@ -983,9 +984,9 @@ class DataParallelBuffer:
     def allocate_bucket_storage(
         self,
         shard: bool = False,
-        dtype: Optional[torch.dtype] = None,
-        device: Optional[torch.device] = None,
-        init_values: Optional[torch.Tensor] = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        init_values: torch.Tensor | None = None,
     ) -> Bucket:
         """
         Allocate a temporary flat communication buffer using the cached
@@ -1002,11 +1003,11 @@ class DataParallelBuffer:
             shard (bool):
                 Whether to allocate a sharded or un-sharded bucket with
                 sizes defined by this DataParallelBuffer.
-            dtype (Optional[torch.dtype]):
+            dtype (torch.dtype | None):
                 Data-type of the allocated bucket.
-            device (Optional[torch.device]):
+            device (torch.device | None):
                 Device of the allocated bucket.
-            init_values (Optional[torch.Tensor]):
+            init_values (torch.Tensor | None):
                 If provided, the allocated storage will be initialized
                 to the values of this (flattened) Tensor.
 
@@ -1051,7 +1052,7 @@ class DataParallelBuffer:
             if hasattr(param, "main_grad"):
                 param.main_grad = None
 
-    def _get_item_slice_in_shard(self, item_id: int) -> Tuple[int, int]:
+    def _get_item_slice_in_shard(self, item_id: int) -> tuple[int, int]:
         """
         Return the coordinates of the slice of the item that is contained
         in this buffer shard. In other words, this returns the coordinates
@@ -1099,7 +1100,7 @@ class DataParallelBuffer:
         # start of the item.
         return (start, end)
 
-    def locate_item_in_global_item(self, item_id: int) -> Tuple[int, int]:
+    def locate_item_in_global_item(self, item_id: int) -> tuple[int, int]:
         """
         Return the coordinates of the slice of the item that is contained
         in this buffer shard. In other words, this returns the coordinates
@@ -1120,7 +1121,7 @@ class DataParallelBuffer:
             return (0, 0)
         return (slice_start, slice_end)
 
-    def _get_item_local_shard_index(self, item_id: int) -> Tuple[int, int]:
+    def _get_item_local_shard_index(self, item_id: int) -> tuple[int, int]:
         """
         Return the local coordinates of the slice of this buffer's shard that
         contains the item with the given ID. In other words, this returns the
@@ -1164,7 +1165,7 @@ class DataParallelBuffer:
         # (sharded or unsharded) buffer.
         return (offset + slice_start, offset + slice_end)
 
-    def _get_item_local_index(self, item_id: int) -> Tuple[int, int]:
+    def _get_item_local_index(self, item_id: int) -> tuple[int, int]:
         """
         Return the local coordinates of the slice of this buffer's data that
         contains the item with the given ID.
@@ -1293,57 +1294,57 @@ class ParameterGroup:
     in distributed training contexts.
 
     Attributes:
-        params (List[torch.nn.Parameter]):
+        params (list[torch.nn.Parameter]):
             The list of model parameters grouped together.
-        dtype (Optional[torch.dtype]):
+        dtype (torch.dtype | None):
             The desired data type for the parameters.
         is_expert_param (bool):
             Indicates if this group contains expert parameters
             (e.g., in mixture-of-experts).
-        requires_grad (Optional[bool]):
+        requires_grad (bool | None):
             Specifies if gradients should be computed for these parameters.
-        fsdp_unit_id (Optional[int]):
+        fsdp_unit_id (int | None):
             Identifier for Fully Sharded Data Parallel (FSDP) unit grouping.
         chunk_size_factor (int):
             Factor determining chunk size for grouped parameter processing.
-        model_weight_buffer (Optional[DataParallelBuffer]):
+        model_weight_buffer (DataParallelBuffer | None):
             Buffer used to store model weights for data-parallel operations.
-        transpose_weight_buffer (Optional[DataParallelBuffer]):
+        transpose_weight_buffer (DataParallelBuffer | None):
             Buffer used to store transpose weights for data-parallel operations.
-        main_weight_buffer (Optional[DataParallelBuffer]):
+        main_weight_buffer (DataParallelBuffer | None):
             Buffer used to store main model weights for data-parallel operations.
-        main_grad_buffer (Optional[DataParallelBuffer]):
+        main_grad_buffer (DataParallelBuffer | None):
             Buffer used to store main gradients for data-parallel operations.
-        hfsdp_helper_wbuf (Optional[DataParallelBuffer]):
+        hfsdp_helper_wbuf (DataParallelBuffer | None):
             Inner-DP helper buffer that owns persistent HFSDP parameter shards.
             Created only when Hybrid FSDP (optimizer-state) full sharding is enabled.
-        hfsdp_helper_wtbuf (Optional[DataParallelBuffer]):
+        hfsdp_helper_wtbuf (DataParallelBuffer | None):
             Inner-DP helper buffer that stores transpose weights for FP8/MXFP8.
             Created only when Hybrid FSDP (optimizer-state) full sharding is enabled.
-        hfsdp_helper_gbuf (Optional[DataParallelBuffer]):
+        hfsdp_helper_gbuf (DataParallelBuffer | None):
             Inner-DP helper buffer that owns persistent HFSDP gradient shards.
             Created only when Hybrid FSDP (optimizer-state) full sharding is enabled.
-        hsdp_comm_gbuf (Optional[DataParallelBuffer]):
+        hsdp_comm_gbuf (DataParallelBuffer | None):
             Extra buffer to allocate buffers that enable custom gradient
             communication data-types when using HSDP or HFSDP only.
             Only allocates memory when `MixedPrecisionPolicy.grad_comm_dtype`
             is set to a non-`None` `torch.dtype`. Contains no local data.
     """
 
-    params: List[torch.nn.Parameter]
-    dtype: Optional[torch.dtype] = None
+    params: list[torch.nn.Parameter]
+    dtype: torch.dtype | None = None
     is_expert_param: bool = False
-    requires_grad: Optional[bool] = None
-    fsdp_unit_id: Optional[int] = None
+    requires_grad: bool | None = None
+    fsdp_unit_id: int | None = None
     chunk_size_factor: int = 1
-    model_weight_buffer: Optional[DataParallelBuffer] = None
-    transpose_weight_buffer: Optional[DataParallelBuffer] = None
-    main_weight_buffer: Optional[DataParallelBuffer] = None
-    main_grad_buffer: Optional[DataParallelBuffer] = None
-    hfsdp_helper_wbuf: Optional[DataParallelBuffer] = None
-    hfsdp_helper_wtbuf: Optional[DataParallelBuffer] = None
-    hfsdp_helper_gbuf: Optional[DataParallelBuffer] = None
-    hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
+    model_weight_buffer: DataParallelBuffer | None = None
+    transpose_weight_buffer: DataParallelBuffer | None = None
+    main_weight_buffer: DataParallelBuffer | None = None
+    main_grad_buffer: DataParallelBuffer | None = None
+    hfsdp_helper_wbuf: DataParallelBuffer | None = None
+    hfsdp_helper_wtbuf: DataParallelBuffer | None = None
+    hfsdp_helper_gbuf: DataParallelBuffer | None = None
+    hsdp_comm_gbuf: DataParallelBuffer | None = None
 
 
 def _get_parameter_groups(
@@ -1364,7 +1365,7 @@ def _get_parameter_groups(
         bucket_group_by_fsdp_unit (bool): Whether to group buckets by FSDP unit.
 
     Returns:
-        Tuple[List[ParameterGroup], Dict[torch.nn.Parameter, int], Dict[int, List[int]]]:
+        tuple[list[ParameterGroup], dict[torch.nn.Parameter, int], dict[int, list[int]]]:
             - The list of parameter groups.
             - The mapping from parameters to their bucket group ID.
             - The mapping from bucket ID to the full group of bucket IDs that are
@@ -1613,8 +1614,8 @@ class ParamAndGradBuffer:
             to the process groups and device meshes used by Megatron-FSDP.
         mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy): Configuration for
             mixed-precision customization of compute and communications in Megatron-FSDP.
-        gradient_scaling_factor (Optional[float]): The gradient scaling factor.
-        expert_gradient_scaling_factor (Optional[float]): The expert gradient
+        gradient_scaling_factor (float | None): The gradient scaling factor.
+        expert_gradient_scaling_factor (float | None): The expert gradient
             scaling factor.
         device (torch.device): The parameter and gradient buffer device.
         only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad (bool):
@@ -1629,8 +1630,8 @@ class ParamAndGradBuffer:
         bucketing_policy: BucketingPolicy,
         dist_index: FSDPDistributedIndex,
         mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
-        gradient_scaling_factor: Optional[float] = None,
-        expert_gradient_scaling_factor: Optional[float] = None,
+        gradient_scaling_factor: float | None = None,
+        expert_gradient_scaling_factor: float | None = None,
         device: torch.device = torch.device("cuda"),
         only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad: bool = True,
         reset_parameters_for_meta_device_init_module: bool = False,
@@ -2862,7 +2863,7 @@ class ParamAndGradBuffer:
         self.dist_main_weight = dist_main_weight
         self.dist_main_grad = {}
 
-    def _init_optimizer_named_parameters(self) -> List[Tuple[str, torch.nn.Parameter]]:
+    def _init_optimizer_named_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
         named_parameters = []
         for pg in self.parameter_groups:
             for item_id, orig_param in enumerate(pg.params):
@@ -3397,7 +3398,7 @@ class GradReducePipeline:
     def __init__(
         self,
         param_and_grad_buffer: ParamAndGradBuffer,
-        rs_stream: Optional[torch.cuda.Stream] = None,
+        rs_stream: torch.cuda.Stream | None = None,
         check_nans: bool = False,
     ) -> None:
         self.buffer = param_and_grad_buffer
@@ -3451,13 +3452,13 @@ class GradReducePipeline:
 
     def reduce_gradients(
         self,
-        params: List[torch.Tensor],
-        suggested_queue_capacity: Optional[int] = None,
+        params: list[torch.Tensor],
+        suggested_queue_capacity: int | None = None,
         outer_fsdp_group_grad_reduce: bool = False,
     ):
         """Reduce the gradients for the given parameters.
         Args:
-            params (List[torch.Tensor]): The parameters.
+            params (list[torch.Tensor]): The parameters.
             suggested_queue_capacity (int, optional): The suggested queue capacity.
                 Defaults to None.
             outer_fsdp_group_grad_reduce (bool, optional): Whether to reduce gradients
@@ -3494,14 +3495,14 @@ class GradReducePipeline:
                 )
 
     def wait_for_previous_grad_reduce(
-        self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
+        self, suggested_queue_size: int = 1, suggested_queue_capacity: int | None = None
     ):
         """
         Wait for the previous reduce-scatter/all-reduce to finish.
         Args:
             suggested_queue_size (int, optional): The recommended queue size in
                 buckets. Defaults to 1.
-            suggested_queue_capacity (Optional[int], optional): The recommended queue capacity
+            suggested_queue_capacity (int | None, optional): The recommended queue capacity
                 in number of parameters in all buckets in the reduction queue. Defaults to None.
         """
         if suggested_queue_capacity is not None:
@@ -3549,7 +3550,7 @@ class GradReducePipeline:
         with torch.cuda.stream(self.rs_stream):
             self.wait_for_previous_grad_reduce(keep_n)
 
-    def get_ready_bucket_group_for_reduction(self, bucket_id: int) -> Optional[List[int]]:
+    def get_ready_bucket_group_for_reduction(self, bucket_id: int) -> list[int] | None:
         """Checks if all buckets in the bucket group containing the given bucket_id
         are ready for gradient reduction.
         If so, returns the list of ready bucket IDs for reduction; otherwise, returns None.
@@ -3558,7 +3559,7 @@ class GradReducePipeline:
             bucket_id (int): The bucket to mark as ready for reduce-scatter or all-reduce.
 
         Returns:
-            Optional[List[int]]: The bucket group ready for gradient reduction,
+            list[int] | None: The bucket group ready for gradient reduction,
             or None if not all buckets are ready.
         """
         # Prepare bucket group for gradient reduce. Note that the
@@ -3584,7 +3585,7 @@ class GradReducePipeline:
 
     def _bucket_group_gradient_reduce(
         self,
-        bucket_group: List[int],
+        bucket_group: list[int],
         async_op: bool = False,
         outer_fsdp_group_grad_reduce: bool = False,
     ) -> bool:
@@ -3592,7 +3593,7 @@ class GradReducePipeline:
         the bucket group are ready, then do the reduce-scatter/all-reduce.
         Args:
             bucket_id (int): The bucket to be marked.
-            bucket_group (List[int]): The bucket group to be reduced.
+            bucket_group (list[int]): The bucket group to be reduced.
             async_op (bool, optional): Whether to do the reduce-scatter/all-reduce
                 asynchronously. Defaults to False.
         Returns:
@@ -3853,9 +3854,7 @@ class AllGatherPipeline:
     """
 
     def __init__(
-        self,
-        param_and_grad_buffer: ParamAndGradBuffer,
-        ag_stream: Optional[torch.cuda.Stream] = None,
+        self, param_and_grad_buffer: ParamAndGradBuffer, ag_stream: torch.cuda.Stream | None = None
     ) -> None:
         self.buffer = param_and_grad_buffer
         self.ag_stream = ag_stream
@@ -3939,10 +3938,10 @@ class AllGatherPipeline:
 
     def all_gather_params(
         self,
-        params: List[torch.Tensor],
+        params: list[torch.Tensor],
         prefetch: bool = False,
         prefetch_order: PrefetchOrder = PrefetchOrder.FORWARD_PASS_ORDER,
-        suggested_AG_prefetch_size: Optional[int] = None,
+        suggested_AG_prefetch_size: int | None = None,
         async_param_gather: bool = True,
         outer_fsdp_group_param_gather: bool = False,
         bwd: bool = False,
@@ -3951,11 +3950,11 @@ class AllGatherPipeline:
         in the order of `prefetch_order`.
 
         Args:
-            params (List[torch.Tensor]): The list of params to be all-gathered.
+            params (list[torch.Tensor]): The list of params to be all-gathered.
             prefetch (bool, optional): Whether to prefetch the next bucket. Defaults to False.
             prefetch_order (PrefetchOrder, optional): The order of prefetching.
                 Defaults to PrefetchOrder.FORWARD_PASS_ORDER.
-            suggested_AG_prefetch_size (Optional[int], optional):
+            suggested_AG_prefetch_size (int | None, optional):
                 The suggested prefetch size for all-gathering. Defaults to None.
             outer_fsdp_group_param_gather (bool, optional):
                 Whether to all-gather parameters across DP-Outer. Defaults to False.
@@ -4388,7 +4387,7 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
     """
     Override the methods of the parameters to prevent undefined behavior.
     Args:
-        params (List[torch.Tensor]): The parameters to add hint on shard to functions.
+        params (list[torch.Tensor]): The parameters to add hint on shard to functions.
         all_gather_pipeline (AllGatherPipeline): The all-gather pipeline.
     """
     for p in params:
