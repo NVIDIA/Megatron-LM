@@ -1501,9 +1501,8 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=args.global_batch_size, 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=args.global_batch_size,
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                )
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
@@ -1528,9 +1527,8 @@ def prepare_data_for_update(
 
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled), 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled),
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )

@@ -465,12 +465,7 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
     global_bs_in_seq = int(n_seqs * ratio)
 
     def side_eff(
-        rank,
-        rampup_batch_size,
-        global_batch_size,
-        micro_batch_size,
-        data_parallel_size,
-        decrease_batch_size_if_needed,
+        rank, global_batch_size, micro_batch_size, data_parallel_size, decrease_batch_size_if_needed
     ):
         # Inside of the get_microbatch_dataloader, we compute the batch size in bins.
         # We want to test this variable.
@@ -488,7 +483,6 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
                     num_bins_this_rank=local_bins,
                     bin_seq_indices=[],
                     global_batch_size=global_bs_in_seq,
-                    rampup_batch_size=1,
                     micro_batch_size=1,
                     decrease_batch_size_if_needed=False,
                 )
