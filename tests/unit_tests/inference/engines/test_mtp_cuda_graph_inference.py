@@ -81,7 +81,9 @@ class TestMTPCudaGraphInference:
 
     # ---- helpers ---------------------------------------------------------- #
 
-    def _build_model(self, *, sequence_parallel=False, mtp_num_layers=2):
+    def _build_model(
+        self, *, sequence_parallel=False, mtp_num_layers=2, mtp_use_repeated_layer=False
+    ):
         """Build a GPT model with MTP layers and local CUDA graph support."""
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = TransformerConfig(
@@ -95,6 +97,7 @@ class TestMTPCudaGraphInference:
             pipeline_model_parallel_size=1,
             pipeline_dtype=torch.bfloat16,
             mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
             sequence_parallel=sequence_parallel,
             cuda_graph_impl="local",
         )
@@ -122,6 +125,7 @@ class TestMTPCudaGraphInference:
         *,
         sequence_parallel=False,
         mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
         num_speculative_tokens=2,
         max_requests=16,
     ):
@@ -131,7 +135,9 @@ class TestMTPCudaGraphInference:
         both decoder and MTP CUDA graphs, matching production warmup exactly.
         """
         model = self._build_model(
-            sequence_parallel=sequence_parallel, mtp_num_layers=mtp_num_layers
+            sequence_parallel=sequence_parallel,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
         )
         config = model.config
         context = DynamicInferenceContext(
@@ -218,19 +224,22 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 1: graph output matches eager (no additional padding) ------- #
 
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_output_matches_eager(self):
+    def test_cuda_graph_output_matches_eager(self, mtp_use_repeated_layer):
         """CUDA graph replay produces the same output as eager execution.
 
         The batch sizes exactly match warmed-up graphs (from the engine's
         CUDA graph warmup), so there is no additional padding.  Both paths
         must produce identical hidden states and logits.
         """
-        engine = self._build_engine()
+        engine = self._build_engine(mtp_use_repeated_layer=mtp_use_repeated_layer)
         model = engine.controller.inference_wrapped_model.model
         unwrapped = unwrap_model(model)
         batch_sizes = self._get_mtp_warmed_batch_sizes(engine)
         assert len(batch_sizes) > 0, "Engine did not warm up any MTP CUDA graphs"
+
+        mtp_depth = None if unwrapped.mtp.mtp_use_repeated_layer else 0
 
         for batch_size in batch_sizes[:3]:
             hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
@@ -244,6 +253,7 @@ class TestMTPCudaGraphInference:
                 hidden_states=hidden.clone(),
                 next_token_ids=token_ids.clone(),
                 position_ids=position_ids.clone(),
+                depth=mtp_depth,
             )
             h_graph = h_graph.clone()
             logits_graph = logits_graph.clone()
@@ -253,6 +263,7 @@ class TestMTPCudaGraphInference:
                 hidden_states=hidden.clone(),
                 next_token_ids=token_ids.clone(),
                 position_ids=position_ids.clone(),
+                depth=mtp_depth,
             )
 
             torch.testing.assert_close(
@@ -266,20 +277,25 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 2: graph matches eager with sequence parallelism ------------ #
 
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_output_matches_eager_with_sp(self):
+    def test_cuda_graph_output_matches_eager_with_sp(self, mtp_use_repeated_layer):
         """CUDA graph replay matches eager with sequence parallelism.
 
         Hidden states are in scattered SP format ``[batch_size/TP, 1, H]``.
         Token/position IDs remain at full ``[1, batch_size]``.  Both paths
         must produce identical outputs.
         """
-        engine = self._build_engine(sequence_parallel=True)
+        engine = self._build_engine(
+            sequence_parallel=True, mtp_use_repeated_layer=mtp_use_repeated_layer
+        )
         model = engine.controller.inference_wrapped_model.model
         unwrapped = unwrap_model(model)
         tp_group = parallel_state.get_tensor_model_parallel_group()
         batch_sizes = self._get_mtp_warmed_batch_sizes(engine)
         assert len(batch_sizes) > 0, "Engine did not warm up any MTP CUDA graphs"
+
+        mtp_depth = None if unwrapped.mtp.mtp_use_repeated_layer else 0
 
         for batch_size in batch_sizes[:3]:
             hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
@@ -295,6 +311,7 @@ class TestMTPCudaGraphInference:
                 hidden_states=hidden_sp.clone(),
                 next_token_ids=token_ids.clone(),
                 position_ids=position_ids.clone(),
+                depth=mtp_depth,
             )
             h_graph = h_graph.clone()
             logits_graph = logits_graph.clone()
@@ -304,6 +321,7 @@ class TestMTPCudaGraphInference:
                 hidden_states=hidden_sp.clone(),
                 next_token_ids=token_ids.clone(),
                 position_ids=position_ids.clone(),
+                depth=mtp_depth,
             )
 
             torch.testing.assert_close(
@@ -317,8 +335,9 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 3: end-to-end _compute_serial_mtp_and_sample with SP ------- #
 
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_sp_padding_end_to_end(self):
+    def test_cuda_graph_sp_padding_end_to_end(self, mtp_use_repeated_layer):
         """Full ``_compute_serial_mtp_and_sample`` with CUDA graphs and SP.
 
         Active request counts that are not multiples of TP are padded.
@@ -332,6 +351,7 @@ class TestMTPCudaGraphInference:
         engine = self._build_engine(
             sequence_parallel=True,
             mtp_num_layers=num_spec,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
             num_speculative_tokens=num_spec,
             max_requests=max_requests,
         )
@@ -411,8 +431,9 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 4: SP padding graph vs eager produces same MTP tokens ------- #
 
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_sp_padding_matches_eager(self):
+    def test_cuda_graph_sp_padding_matches_eager(self, mtp_use_repeated_layer):
         """With SP padding, CUDA graph path produces the same MTP tokens as eager.
 
         Uses a single engine (shared model weights) and toggles the CUDA
@@ -425,6 +446,7 @@ class TestMTPCudaGraphInference:
         engine = self._build_engine(
             sequence_parallel=True,
             mtp_num_layers=num_spec,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
             num_speculative_tokens=num_spec,
             max_requests=max_requests,
         )
@@ -520,8 +542,9 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 5: multiple MTP depths with CUDA graphs --------------------- #
 
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_multi_depth(self):
+    def test_cuda_graph_multi_depth(self, mtp_use_repeated_layer):
         """Run multiple MTP depths with CUDA graphs enabled.
 
         Verifies that the hidden output from one depth feeds correctly into
@@ -529,11 +552,15 @@ class TestMTPCudaGraphInference:
         at every depth.
         """
         num_depths = 2
-        engine = self._build_engine(mtp_num_layers=num_depths)
+        engine = self._build_engine(
+            mtp_num_layers=num_depths, mtp_use_repeated_layer=mtp_use_repeated_layer
+        )
         model = engine.controller.inference_wrapped_model.model
         unwrapped = unwrap_model(model)
         batch_sizes = self._get_mtp_warmed_batch_sizes(engine)
         assert len(batch_sizes) > 0, "Engine did not warm up any MTP CUDA graphs"
+
+        use_repeated = unwrapped.mtp.mtp_use_repeated_layer
 
         batch_size = batch_sizes[0]
         self._set_mtp_cuda_graph_flag(model, True)
@@ -546,10 +573,12 @@ class TestMTPCudaGraphInference:
 
         current_hidden = hidden.clone()
         for depth in range(num_depths):
+            mtp_depth = None if use_repeated else depth
             current_hidden, logits = unwrapped.compute_mtp_single_step(
                 hidden_states=current_hidden,
                 next_token_ids=token_ids.clone(),
                 position_ids=position_ids.clone(),
+                depth=mtp_depth,
             )
             current_hidden = current_hidden.clone()
 
@@ -569,13 +598,14 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 6: eager fallback when no matching graph exists ------------- #
 
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_eager_fallback_no_matching_graph(self):
+    def test_eager_fallback_no_matching_graph(self, mtp_use_repeated_layer):
         """When ``use_mtp_cuda_graphs`` is True but no warmed graph matches the
         batch size, ``compute_mtp_single_step`` falls back to eager execution.
         The system should produce valid outputs without errors.
         """
-        engine = self._build_engine()
+        engine = self._build_engine(mtp_use_repeated_layer=mtp_use_repeated_layer)
         model = engine.controller.inference_wrapped_model.model
         unwrapped = unwrap_model(model)
         warmed_sizes = set(self._get_mtp_warmed_batch_sizes(engine))
@@ -588,6 +618,8 @@ class TestMTPCudaGraphInference:
                 break
         assert fallback_size is not None, "Could not find a non-warmed batch size"
 
+        mtp_depth = None if unwrapped.mtp.mtp_use_repeated_layer else 0
+
         self._set_mtp_cuda_graph_flag(model, True)
         hidden = torch.randn(fallback_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
         dist.broadcast(hidden, src=0)
@@ -599,6 +631,7 @@ class TestMTPCudaGraphInference:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
+            depth=mtp_depth,
         )
 
         assert h_out.shape == (fallback_size, 1, self.HIDDEN_SIZE)
@@ -768,6 +801,7 @@ class TestMTPCudaGraphExpertParallel:
             hidden_states=hidden.clone(),
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
+            depth=0,
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -801,7 +835,7 @@ class TestMTPCudaGraphExpertParallel:
 
         # All ranks must complete without hanging.
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids
+            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids, depth=0
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -915,7 +949,10 @@ class TestMTPCudaGraphExpertParallel:
         dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=dummy_hidden, next_token_ids=dummy_tokens, position_ids=dummy_positions
+            hidden_states=dummy_hidden,
+            next_token_ids=dummy_tokens,
+            position_ids=dummy_positions,
+            depth=0,
         )
 
         assert h_out.shape == (tp_size, 1, self.HIDDEN_SIZE)
