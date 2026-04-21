@@ -218,10 +218,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_world_range = gbuf_world_all_ranges[data_parallel_rank]
 
         # Get each param's ranges.
-        # Use get_unpacked_index_map() which returns full-numel indices for NVFP4 params
-        # (from nvfp4_unpacked_param_index_map) and normal indices for other params.
         param_range_map = cls._build_model_gbuf_param_range_map(
-            param_and_grad_buffer.get_unpacked_index_map(), gbuf_world_range, bucket.offset
+            param_and_grad_buffer.param_index_map, gbuf_world_range, bucket.offset
         )
 
         # Group into dict.
@@ -1504,6 +1502,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 world_tensors = dp_zero_state_dict[gbuf_idx][dtype]
                 world_tensor_keys = world_tensors.keys()
+                # Note: for NVFP4, param_index_map uses unpacked (full numel)
+                # offsets, which is correct here since optimizer states
+                # (fp32_param, exp_avg, exp_avg_sq) are in unpacked space.
                 for model_param, (
                     param_world_start,
                     param_world_end,
