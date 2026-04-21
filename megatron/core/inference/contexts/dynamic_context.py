@@ -863,28 +863,89 @@ class DynamicInferenceContext(BaseInferenceContext):
             for label, dtype, _ in self.request_metadata_types
         }
 
-        # Per-token state (CPU, pinned memory for fast H2D transfer).
-        self.token_to_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device='cpu', pin_memory=True,
+        # Coalesced pinned CPU buffer for the 9 bookkeeping fields that get
+        # transferred to GPU each step via transfer_bookkeeping_to_gpu().
+        # Layout matches ContextGPUView._buf so a single cudaMemcpyAsync
+        # suffices. Int64 token fields come first (8-byte aligned automatically),
+        # then int32 token fields, then int32 request-staging fields.
+        #   token_to_input_ids                         (int64, max_tokens)
+        #   token_to_pos_ids                           (int64, max_tokens)
+        #   token_to_block_idx                         (int32, max_tokens)
+        #   token_to_local_position_within_kv_block    (int32, max_tokens)
+        #   token_to_request_idx                       (int32, max_tokens)
+        #   token_to_position_in_request               (int32, max_tokens)
+        #   request_in_prefill_status  (staging)       (int32, max_requests)
+        #   request_query_lengths      (staging)       (int32, max_requests)
+        #   request_kv_length_offsets  (staging)       (int32, max_requests)
+        #
+        # Token fields are aliased with the source-of-truth attributes
+        # (`self.token_to_input_ids`, etc.) because the forward pass reads
+        # `gpu_view.token_to_input_ids[:n_tok]` which matches the CPU slot
+        # layout `[0, n_tok)`. Request fields, however, are read on GPU at
+        # `[:n_active]` but on CPU at `[paused_count:total_count)` — so the
+        # staging slots here are refreshed each step by copying the active
+        # slice from the persistent `request_*` tensors above.
+        _tok_int64_bytes = self.max_tokens * 8
+        _tok_int32_bytes = self.max_tokens * 4
+        _req_int32_bytes = self.max_requests * 4
+        _total_bytes = 2 * _tok_int64_bytes + 4 * _tok_int32_bytes + 3 * _req_int32_bytes
+        self._cpu_bookkeeping_buf = torch.empty(
+            _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True,
         )
-        self.token_to_pos_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device='cpu', pin_memory=True,
+        # token_to_input_ids and token_to_pos_ids were previously torch.full(0);
+        # zero the whole buffer so their views start at 0 too, and so the
+        # request staging slots start with a deterministic value.
+        self._cpu_bookkeeping_buf.fill_(0)
+
+        _off = 0
+        # Per-token state (source-of-truth lives in the coalesced buffer since
+        # the CPU-side bookkeeping and the GPU forward pass use the same
+        # `[:n_tok]` slice).
+        self.token_to_input_ids = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
+            torch.long
         )
-        self.token_to_request_idx = torch.empty(
-            self.max_tokens, dtype=torch.int32, device='cpu', pin_memory=True,
+        _off += _tok_int64_bytes
+        self.token_to_pos_ids = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
+            torch.long
         )
-        self.token_to_block_idx = torch.empty(
-            self.max_tokens, dtype=torch.int32, device='cpu', pin_memory=True,
+        _off += _tok_int64_bytes
+        self.token_to_block_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int32_bytes].view(
+            torch.int32
         )
+        _off += _tok_int32_bytes
         # i.e For a set of tokens A B C D E F ..  and block_size 4:
         # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
-        self.token_to_position_in_request = torch.empty(
-            self.max_tokens, dtype=torch.int32, device='cpu', pin_memory=True,
-        )
-        self.token_to_local_position_within_kv_block = torch.empty(
-            self.max_tokens, dtype=torch.int32, device='cpu', pin_memory=True,
-        )
+        self.token_to_local_position_within_kv_block = self._cpu_bookkeeping_buf[
+            _off : _off + _tok_int32_bytes
+        ].view(torch.int32)
+        _off += _tok_int32_bytes
+        self.token_to_request_idx = self._cpu_bookkeeping_buf[
+            _off : _off + _tok_int32_bytes
+        ].view(torch.int32)
+        _off += _tok_int32_bytes
+        self.token_to_position_in_request = self._cpu_bookkeeping_buf[
+            _off : _off + _tok_int32_bytes
+        ].view(torch.int32)
+        _off += _tok_int32_bytes
+
+        # Request-level staging views into the coalesced buffer. Write-only on
+        # CPU (refreshed from persistent tensors in transfer_bookkeeping_to_gpu);
+        # read-only on GPU via matching slots in ContextGPUView._buf.
+        self._staging_request_in_prefill_status = self._cpu_bookkeeping_buf[
+            _off : _off + _req_int32_bytes
+        ].view(torch.int32)
+        _off += _req_int32_bytes
+        self._staging_request_query_lengths = self._cpu_bookkeeping_buf[
+            _off : _off + _req_int32_bytes
+        ].view(torch.int32)
+        _off += _req_int32_bytes
+        self._staging_request_kv_length_offsets = self._cpu_bookkeeping_buf[
+            _off : _off + _req_int32_bytes
+        ].view(torch.int32)
+        _off += _req_int32_bytes
+
+        assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
         # GPU view: the single interface for GPU code to read context state.
         # Populated per-step by transfer_bookkeeping_to_gpu().
@@ -1920,41 +1981,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         Called after initialize_attention_state() and before the forward pass.
         All copies use non_blocking=True with pinned CPU memory. CUDA stream
         ordering guarantees the forward pass sees completed transfers.
+
+        The 9 bookkeeping fields are backed by one contiguous pinned CPU buffer
+        and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
+        Request-level staging slots are refreshed from the persistent CPU
+        tensors immediately before the H2D (GPU reads them at `[:n_active]`
+        while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
-        n_tok = self.padded_active_token_count
-
-        # Token-level transfers.
-        self.gpu_view.token_to_input_ids[:n_tok].copy_(
-            self.token_to_input_ids[:n_tok], non_blocking=True,
-        )
-        self.gpu_view.token_to_pos_ids[:n_tok].copy_(
-            self.token_to_pos_ids[:n_tok], non_blocking=True,
-        )
-        self.gpu_view.token_to_block_idx[:n_tok].copy_(
-            self.token_to_block_idx[:n_tok], non_blocking=True,
-        )
-        self.gpu_view.token_to_local_position_within_kv_block[:n_tok].copy_(
-            self.token_to_local_position_within_kv_block[:n_tok], non_blocking=True,
-        )
-        self.gpu_view.token_to_request_idx[:n_tok].copy_(
-            self.token_to_request_idx[:n_tok], non_blocking=True,
-        )
-        self.gpu_view.token_to_position_in_request[:n_tok].copy_(
-            self.token_to_position_in_request[:n_tok], non_blocking=True,
-        )
-
-        # Request-level transfers (consumed by sampling, log-probs, speculative verification).
-        active_slice = slice(self.paused_request_count, self.total_request_count)
         n_active = self.total_request_count - self.paused_request_count
-        self.gpu_view.request_in_prefill_status[:n_active].copy_(
-            self.request_in_prefill_status_tensor[active_slice], non_blocking=True,
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+
+        # Refresh request-level staging slots from the persistent CPU source.
+        # CPU-to-CPU slice assignment on pinned memory (~7.5 KB total for 3
+        # int32 fields at max_requests=624). Negligible vs. the launch overhead
+        # we save by merging 9 H2D memcpys into 1.
+        self._staging_request_in_prefill_status[:n_active] = (
+            self.request_in_prefill_status_tensor[active_slice]
         )
-        self.gpu_view.request_query_lengths[:n_active].copy_(
-            self.request_query_lengths[active_slice], non_blocking=True,
-        )
-        self.gpu_view.request_kv_length_offsets[:n_active].copy_(
-            self.request_kv_length_offsets[active_slice], non_blocking=True,
-        )
+        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
+        self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
+            active_slice
+        ]
+
+        # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
+        # Copying the whole (max_tokens + max_requests)-sized buffer including
+        # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
+        # 8 redundant launch overheads vs. the prior per-field copies.
+        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
 
         # MHA metadata transfer.
         if hasattr(self, '_pending_mha_transfer') and self._pending_mha_transfer is not None:
