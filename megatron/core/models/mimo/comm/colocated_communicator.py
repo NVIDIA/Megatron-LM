@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -16,6 +17,26 @@ class SliceInfo:
 
     start: int
     size: int
+
+
+class BridgeDirection(str, Enum):
+    """Which side of the bridge scales up, if any.
+
+    ``FAN_IN`` — src has more DP replicas than dest; forward all-gathers
+    src outputs along the batch dim, backward narrows the sibling dest
+    gradient down to this src rank's slot.
+
+    ``FAN_OUT`` — dest has more DP replicas; forward narrows, backward
+    all-gathers across the sibling dest DP ranks (the adjoint of narrow
+    is not zero-pad-and-scatter because every dest rank consumes a
+    different slice of the same src activation).
+
+    ``EQUAL`` — matching DP; the bridge is a pure passthrough.
+    """
+
+    FAN_IN = "fan_in"
+    FAN_OUT = "fan_out"
+    EQUAL = "equal"
 
 
 class ColocatedBridgeCommunicator:
@@ -51,42 +72,47 @@ class ColocatedBridgeCommunicator:
         self._extract_parallelism_info()
         self._build_rank_mappings()
 
-        self.all_gather_pg: Optional[dist.ProcessGroup] = None
-        self.all_gather_group_ranks: List[List[int]] = []
-        self.fan_out_gather_pg: Optional[dist.ProcessGroup] = None
-        self.fan_out_gather_group_ranks: List[List[int]] = []
+        # At most one direction is active; fan-in and fan-out are mutually
+        # exclusive (one of ``src_dp / dest_dp`` is >1, the other is 1).
+        # Equal DP uses no collective at all. Unify behind a single
+        # ``gather_pg`` + ``direction`` + ``scale`` rather than a fan-in
+        # and fan-out pair of attributes.
+        self.gather_pg: Optional[dist.ProcessGroup] = None
+        self.gather_group_ranks: List[List[int]] = []
 
-        # Fan-in forward and fan-out backward both build "gather sibling" groups:
-        # each group contains the `scale` ranks on the *opposite* side of the
-        # bridge whose DP indices map into one DP slot on the iterating side.
-        # Fan-in: iterate dest DP, gather src ranks; fan-out: iterate src DP,
-        # gather dest ranks. Same shape, different endpoints — share a builder.
-        if self.fan_in_scale > 1:
-            self.all_gather_group_ranks = self._build_gather_groups(
+        if self.src_dp_size > self.dest_dp_size:
+            self.direction = BridgeDirection.FAN_IN
+            self.scale = self.src_dp_size // self.dest_dp_size
+            self.gather_group_ranks = self._build_gather_groups(
                 iter_size=self.dest_dp_size,
                 sibling_tp_size=self.src_tp_size,
-                scale=self.fan_in_scale,
+                scale=self.scale,
                 rank_to_pos=self.rank_to_src_pos,
             )
-            self.all_gather_pg, _ = dist.new_subgroups_by_enumeration(
-                self.all_gather_group_ranks, backend='nccl'
+            self.gather_pg, _ = dist.new_subgroups_by_enumeration(
+                self.gather_group_ranks, backend='nccl'
             )
-        elif self.fan_out_scale > 1:
-            self.fan_out_gather_group_ranks = self._build_gather_groups(
+        elif self.dest_dp_size > self.src_dp_size:
+            self.direction = BridgeDirection.FAN_OUT
+            self.scale = self.dest_dp_size // self.src_dp_size
+            self.gather_group_ranks = self._build_gather_groups(
                 iter_size=self.src_dp_size,
                 sibling_tp_size=self.dest_tp_size,
-                scale=self.fan_out_scale,
+                scale=self.scale,
                 rank_to_pos=self.rank_to_dest_pos,
             )
-            self.fan_out_gather_pg, _ = dist.new_subgroups_by_enumeration(
-                self.fan_out_gather_group_ranks, backend='nccl'
+            self.gather_pg, _ = dist.new_subgroups_by_enumeration(
+                self.gather_group_ranks, backend='nccl'
             )
+        else:
+            self.direction = BridgeDirection.EQUAL
+            self.scale = 1
 
         logging.info(
             f"[Rank {self.current_rank}] ColocatedBridgeCommunicator: "
             f"{src_module_name}({self.src_tp_size}TP/{self.src_dp_size}DP) -> "
             f"{dest_module_name}({self.dest_tp_size}TP/{self.dest_dp_size}DP), "
-            f"fan_in_scale={self.fan_in_scale}, fan_out_scale={self.fan_out_scale}"
+            f"direction={self.direction.value}, scale={self.scale}"
         )
 
     def _validate_grids(self):
@@ -110,7 +136,6 @@ class ColocatedBridgeCommunicator:
                 f"src={self.src_grid.rank_offset}, dest={self.dest_grid.rank_offset}"
             )
 
-        # PP>1 is out of scope. Both src and dest grids must have PP=1.
         for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
             if 'pp' in grid.dim_names:
                 pp_size = grid.shape[grid.dim_names.index('pp')]
@@ -119,9 +144,7 @@ class ColocatedBridgeCommunicator:
                         f"{name} PP must be 1 for ColocatedBridgeCommunicator, got {pp_size}"
                     )
 
-        # CP>1 on either grid is not yet supported. _build_rank_mappings uses
-        # get_rank_enum(['tp']) which returns cp*pp*dp groups, so enumerating
-        # them directly corrupts dp_idx when CP>1.
+        # CP>1 corrupts dp_idx when we iterate get_rank_enum(['tp']) groups.
         for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
             if 'cp' in grid.dim_names:
                 cp_size = grid.shape[grid.dim_names.index('cp')]
@@ -142,13 +165,6 @@ class ColocatedBridgeCommunicator:
         self.src_dp_size = self.src_grid.shape[self.src_grid.dim_names.index('dp')]
         self.dest_tp_size = self.dest_grid.shape[self.dest_grid.dim_names.index('tp')]
         self.dest_dp_size = self.dest_grid.shape[self.dest_grid.dim_names.index('dp')]
-        # Integer fan-in / fan-out scales. At most one is > 1; the other is 1.
-        self.fan_in_scale = (
-            self.src_dp_size // self.dest_dp_size if self.src_dp_size > self.dest_dp_size else 1
-        )
-        self.fan_out_scale = (
-            self.dest_dp_size // self.src_dp_size if self.dest_dp_size > self.src_dp_size else 1
-        )
 
     def _build_rank_mappings(self):
         self.rank_to_src_pos: Dict[int, Tuple[int, int]] = {}
@@ -174,10 +190,10 @@ class ColocatedBridgeCommunicator:
         """Build ``iter_size * sibling_tp_size`` gather groups of ``scale`` ranks.
 
         For each slot on the "iterating" side and each TP shard on the
-        sibling side, collect the ``scale`` sibling ranks whose DP indices map
-        into that slot. Append order matches group-local-rank order, which is
-        what ``all_gather_into_tensor`` uses to concatenate outputs — do not
-        sort.
+        sibling side, collect the ``scale`` sibling ranks whose DP indices
+        map into that slot. Append order equals group-local-rank order,
+        which ``all_gather_into_tensor`` uses to concatenate outputs — do
+        not sort.
         """
         groups: List[List[int]] = []
         for iter_idx in range(iter_size):
@@ -192,78 +208,61 @@ class ColocatedBridgeCommunicator:
                 groups.append(group_ranks)
         return groups
 
-    def get_slice_info(self, batch_size: int) -> SliceInfo:
-        """Compute batch slice info for the current rank given the full batch size.
-
-        Raises:
-            ValueError: if ``batch_size`` is not divisible by the active scale
-                factor (``fan_out_scale`` or ``fan_in_scale``). Silent
-                truncation on non-divisible batches is a correctness bug that
-                produced one-off mis-slicing in early versions.
-        """
-        if self.fan_out_scale > 1:
-            self._check_divisible(batch_size, self.fan_out_scale, "fan_out_scale")
-            return self._get_fan_out_slice_info(batch_size)
-        if self.fan_in_scale > 1:
-            self._check_divisible(batch_size, self.fan_in_scale, "fan_in_scale")
-            return self._get_fan_in_slice_info(batch_size)
-        return SliceInfo(start=0, size=batch_size)
-
-    def _check_divisible(self, batch_size: int, scale: int, scale_name: str) -> None:
-        if batch_size % scale != 0:
-            raise ValueError(
-                f"ColocatedBridgeCommunicator: batch dim size {batch_size} is not "
-                f"divisible by {scale_name}={scale}. Non-divisible batches would "
-                f"silently drop samples on the narrow/all-gather path."
-            )
-
-    def _get_fan_out_slice_info(self, batch_size: int) -> SliceInfo:
-        dest_dp_idx = self.rank_to_dest_pos[self.current_rank][0]
-        slot = dest_dp_idx % self.fan_out_scale
-        slice_size = batch_size // self.fan_out_scale
-        return SliceInfo(start=slot * slice_size, size=slice_size)
-
-    def _get_fan_in_slice_info(self, batch_size: int) -> SliceInfo:
-        src_dp_idx = self.rank_to_src_pos[self.current_rank][0]
-        slot = src_dp_idx % self.fan_in_scale
-        slice_size = batch_size // self.fan_in_scale
-        return SliceInfo(start=slot * slice_size, size=slice_size)
+    def is_fan_in(self) -> bool:
+        """True if src DP > dest DP (forward all-gathers)."""
+        return self.direction is BridgeDirection.FAN_IN
 
     def is_fan_out(self) -> bool:
-        """Return True if src DP < dest DP (encoder has fewer replicas)."""
-        return self.src_dp_size < self.dest_dp_size
+        """True if src DP < dest DP (forward narrows)."""
+        return self.direction is BridgeDirection.FAN_OUT
 
-    def is_fan_in(self) -> bool:
-        """Return True if src DP > dest DP (encoder has more replicas)."""
-        return self.src_dp_size > self.dest_dp_size
+    def get_slice_info(self, batch_size: int) -> SliceInfo:
+        """Compute this rank's slice of ``batch_size`` on the narrowing side.
+
+        For FAN_OUT this is the forward narrow; for FAN_IN it is the
+        backward narrow against the post-gather batch. EQUAL returns the
+        identity slice.
+
+        Raises ``ValueError`` if ``batch_size`` is not divisible by ``scale``.
+        """
+        if self.direction is BridgeDirection.EQUAL:
+            return SliceInfo(start=0, size=batch_size)
+        self._check_divisible(batch_size)
+        if self.direction is BridgeDirection.FAN_OUT:
+            dp_idx = self.rank_to_dest_pos[self.current_rank][0]
+        else:  # FAN_IN
+            dp_idx = self.rank_to_src_pos[self.current_rank][0]
+        slot = dp_idx % self.scale
+        slice_size = batch_size // self.scale
+        return SliceInfo(start=slot * slice_size, size=slice_size)
+
+    def _check_divisible(self, batch_size: int) -> None:
+        if batch_size % self.scale != 0:
+            raise ValueError(
+                f"ColocatedBridgeCommunicator: batch dim size {batch_size} is "
+                f"not divisible by {self.direction.value} scale={self.scale}."
+            )
 
     def communicate(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Transform tensor from src TP/DP layout to dest TP/DP layout.
+        """Transform ``tensor`` from src TP/DP layout to dest TP/DP layout.
 
-        Raises ``ValueError`` if the batch dim size is not divisible by the
-        active fan-out scale (fan-in backward re-checks via get_slice_info).
+        Raises ``ValueError`` when FAN_OUT and the batch dim is not
+        divisible by ``scale``; FAN_IN only slices on the backward pass
+        and re-checks via ``get_slice_info`` there.
         """
-        # Fan-out forward narrows dim[b] by fan_out_scale; non-divisibility
-        # here would silently truncate the batch. Fan-in forward all-gathers
-        # (no slice), so it doesn't need a forward-side guard.
-        if self.fan_out_scale > 1:
-            batch_dim = self.dim_mapping['b']
-            batch_size = tensor.shape[batch_dim]
-            self._check_divisible(batch_size, self.fan_out_scale, "fan_out_scale")
+        if self.direction is BridgeDirection.FAN_OUT:
+            self._check_divisible(tensor.shape[self.dim_mapping['b']])
         return _ColocatedCommunicate.apply(tensor, self)
 
     def destroy(self) -> None:
-        """Release NCCL process groups created by this communicator.
+        """Release the NCCL subgroup created by this communicator.
 
-        NCCL enforces a hard cap on concurrent communicators (~500). Long-lived
-        or repeated construction (e.g. per-test fixtures, checkpoint reloads)
-        leaks PGs without this call.
+        NCCL caps concurrent communicators; long-lived or repeated
+        construction leaks PGs without this call.
         """
-        for attr in ('all_gather_pg', 'fan_out_gather_pg'):
-            pg = getattr(self, attr, None)
-            if pg is not None:
-                dist.destroy_process_group(pg)
-                setattr(self, attr, None)
+        if self.gather_pg is not None:
+            dist.destroy_process_group(self.gather_pg)
+            self.gather_pg = None
 
 
 class _ColocatedCommunicate(torch.autograd.Function):
@@ -271,81 +270,65 @@ class _ColocatedCommunicate(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, comm: ColocatedBridgeCommunicator) -> torch.Tensor:
-        """Forward: fan-out slices, fan-in all-gathers, equal copies."""
         ctx.comm = comm
         ctx.batch_dim = comm.dim_mapping['b']
-        batch_size = tensor.shape[ctx.batch_dim]
 
-        if comm.is_fan_out():
-            slice_info = comm.get_slice_info(batch_size)
+        if comm.direction is BridgeDirection.FAN_OUT:
+            # Narrow this rank's slice out of the full src batch.
+            slice_info = comm.get_slice_info(tensor.shape[ctx.batch_dim])
             return tensor.narrow(ctx.batch_dim, slice_info.start, slice_info.size).contiguous()
 
-        elif comm.is_fan_in():
-            group = comm.all_gather_pg
-            world_size = dist.get_world_size(group)
-            batch_dim = ctx.batch_dim
+        if comm.direction is BridgeDirection.FAN_IN:
+            # All-gather sibling src outputs into a single full-batch tensor.
+            return _all_gather_along_batch_dim(tensor, comm.gather_pg, ctx.batch_dim)
 
-            # Use all_gather_into_tensor to write directly into a pre-allocated
-            # output buffer, avoiding the N intermediate tensors + torch.cat copy.
-            # all_gather_into_tensor concatenates along dim 0, so when batch_dim
-            # is not 0 we move it to dim 0 before gathering, then restore.
-            input_contig = tensor.contiguous()
-            if batch_dim != 0:
-                input_contig = input_contig.movedim(batch_dim, 0).contiguous()
-
-            out_shape = list(input_contig.shape)
-            out_shape[0] *= world_size
-            output = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
-            dist.all_gather_into_tensor(output, input_contig, group=group)
-
-            if batch_dim != 0:
-                output = output.movedim(0, batch_dim).contiguous()
-            return output
-
-        else:
-            return tensor.contiguous()
+        # EQUAL: pure passthrough.
+        return tensor.contiguous()
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
-        """Backward: adjoint of forward (all-gather for fan-out, slice for fan-in).
+        """Adjoint of forward: narrow for fan-in, all-gather for fan-out.
 
-        Fan-out forward is ``narrow``, which is a local slice with no cross-rank
-        communication. Its autograd adjoint on a single rank is zero-pad, but
-        that would leave each src rank with only its own dest rank's slice of
-        the gradient — missing the contributions from every other dest rank
-        that consumed a different slice of the same src rank's activation.
-        Instead we all-gather the slice gradients across the fan-out sibling
-        group, which reconstructs the full src-batch gradient and hands every
-        participating rank the same full gradient (symmetric with the fan-in
-        forward's all_gather_into_tensor).
+        Fan-out's forward is ``narrow``, whose naive adjoint is zero-pad.
+        That would leave each src rank with only its own dest rank's
+        slice of the gradient, missing the contributions from every
+        other dest rank that consumed a different slice of the same src
+        activation. Instead we all-gather across the fan-out sibling
+        group, reconstructing the full src-batch gradient (symmetric
+        with the fan-in forward's all-gather).
         """
         comm = ctx.comm
         batch_dim = ctx.batch_dim
 
-        if comm.is_fan_out():
-            group = comm.fan_out_gather_pg
-            world_size = dist.get_world_size(group)
+        if comm.direction is BridgeDirection.FAN_OUT:
+            return _all_gather_along_batch_dim(grad_output, comm.gather_pg, batch_dim), None
 
-            input_contig = grad_output.contiguous()
-            if batch_dim != 0:
-                input_contig = input_contig.movedim(batch_dim, 0).contiguous()
-
-            out_shape = list(input_contig.shape)
-            out_shape[0] *= world_size
-            grad_input = torch.empty(out_shape, dtype=grad_output.dtype, device=grad_output.device)
-            dist.all_gather_into_tensor(grad_input, input_contig, group=group)
-
-            if batch_dim != 0:
-                grad_input = grad_input.movedim(0, batch_dim).contiguous()
-            return grad_input, None
-
-        elif comm.is_fan_in():
-            output_batch_size = grad_output.shape[batch_dim]
-            slice_info = comm.get_slice_info(output_batch_size)
+        if comm.direction is BridgeDirection.FAN_IN:
+            slice_info = comm.get_slice_info(grad_output.shape[batch_dim])
             return (
                 grad_output.narrow(batch_dim, slice_info.start, slice_info.size).contiguous(),
                 None,
             )
 
-        else:
-            return grad_output.contiguous(), None
+        return grad_output.contiguous(), None
+
+
+def _all_gather_along_batch_dim(
+    tensor: torch.Tensor, group: dist.ProcessGroup, batch_dim: int
+) -> torch.Tensor:
+    """All-gather ``tensor`` along an arbitrary batch dim into a single tensor.
+
+    ``all_gather_into_tensor`` concatenates along dim 0, so when the
+    batch dim is not 0 we move it, gather, then restore.
+    """
+    world_size = dist.get_world_size(group)
+    src = tensor.contiguous()
+    if batch_dim != 0:
+        src = src.movedim(batch_dim, 0).contiguous()
+    out_shape = list(src.shape)
+    out_shape[0] *= world_size
+    out = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
+    dist.all_gather_into_tensor(out, src, group=group)
+    if batch_dim != 0:
+        out = out.movedim(0, batch_dim).contiguous()
+    return out

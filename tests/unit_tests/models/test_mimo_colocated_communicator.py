@@ -170,8 +170,8 @@ class TestAllGatherGroups:
         dest_grid = create_hypercomm_grid(tp=4, dp=2)
         comm = make_comm(src_grid, dest_grid)
 
-        assert comm.all_gather_group_ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
-        assert comm.all_gather_pg is not None
+        assert comm.gather_group_ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
+        assert comm.gather_pg is not None
 
     def test_fan_out_gather_groups(self):
         # Fan-out TP4/DP2 → TP2/DP4. Groups are keyed (src_dp_idx, dest_tp_idx);
@@ -181,8 +181,8 @@ class TestAllGatherGroups:
         dest_grid = create_hypercomm_grid(tp=2, dp=4)
         comm = make_comm(src_grid, dest_grid)
 
-        assert comm.fan_out_gather_group_ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
-        assert comm.fan_out_gather_pg is not None
+        assert comm.gather_group_ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
+        assert comm.gather_pg is not None
 
 
 # ── Test 3b: _validate_grids negative tests ───────────────────────────────────
@@ -283,27 +283,24 @@ class TestCommunicatePreconditions:
         destroy_all_grids()
 
     def test_non_divisible_batch_raises_fan_out(self):
-        # Fan-out: dest_dp=4, src_dp=2 → fan_out_scale=2. Pass a batch dim of
-        # size 3 so 3 % 2 != 0 and we should raise before any slicing runs.
+        # Fan-out: dest_dp=4, src_dp=2 → scale=2. Pass a batch dim of size 3
+        # so 3 % 2 != 0 and the forward communicate() raises before slicing.
         src_grid = create_hypercomm_grid(tp=4, dp=2)
         dest_grid = create_hypercomm_grid(tp=2, dp=4)
-        comm = make_comm(
-            src_grid, dest_grid, dim_mapping={'b': 0, 'h': 1}
-        )
+        comm = make_comm(src_grid, dest_grid, dim_mapping={'b': 0, 'h': 1})
         tensor = torch.zeros(3, 8, device='cuda')
-        with pytest.raises(ValueError, match="not divisible by fan_out_scale"):
+        with pytest.raises(ValueError, match="not divisible by fan_out"):
             comm.communicate(tensor)
 
     def test_non_divisible_batch_raises_fan_in_backward_narrow(self):
-        # Fan-in: fan_in_scale=2. Fan-in forward all-gathers (no slice), so
-        # the forward path never divides. The backward path narrows the
-        # post-gather output via get_slice_info, which raises on a non-
-        # divisible size. Call get_slice_info directly with an odd size to
-        # exercise that raise path without a full backward.
+        # Fan-in forward all-gathers (no slice), so the forward path never
+        # divides. The backward path narrows the post-gather output via
+        # get_slice_info, which raises on a non-divisible size. Call
+        # get_slice_info directly with an odd size to exercise that path.
         src_grid = create_hypercomm_grid(tp=2, dp=4)
         dest_grid = create_hypercomm_grid(tp=4, dp=2)
         comm = make_comm(src_grid, dest_grid)
-        with pytest.raises(ValueError, match="not divisible by fan_in_scale"):
+        with pytest.raises(ValueError, match="not divisible by fan_in"):
             comm.get_slice_info(batch_size=3)
 
 # ── Test 3d: destroy() releases PGs ──────────────────────────────────────────
@@ -327,20 +324,17 @@ class TestDestroy:
         dest_grid = create_hypercomm_grid(tp=4, dp=2)
         # Don't track via make_comm — destroy() is exactly what we're testing.
         comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
-        assert comm.all_gather_pg is not None
-        assert comm.fan_out_gather_pg is None
+        assert comm.gather_pg is not None
         comm.destroy()
-        assert comm.all_gather_pg is None
-        assert comm.fan_out_gather_pg is None
+        assert comm.gather_pg is None
 
     def test_destroy_releases_fan_out_pg(self):
         src_grid = create_hypercomm_grid(tp=4, dp=2)
         dest_grid = create_hypercomm_grid(tp=2, dp=4)
         comm = ColocatedBridgeCommunicator(src_grid, dest_grid)
-        assert comm.fan_out_gather_pg is not None
-        assert comm.all_gather_pg is None
+        assert comm.gather_pg is not None
         comm.destroy()
-        assert comm.fan_out_gather_pg is None
+        assert comm.gather_pg is None
 
     def test_destroy_is_idempotent(self):
         # Calling destroy twice must not raise — leftover test fixtures often
@@ -414,7 +408,7 @@ class TestBridgeGradients:
         # Expected: manual all_gather over the communicator's fan-in group,
         # then cat along batch_dim. all_gather preserves group-local-rank
         # order, which is the same order the communicator uses.
-        group = comm.all_gather_pg
+        group = comm.gather_pg
         gathered = [torch.empty_like(local_input) for _ in range(dist.get_world_size(group))]
         dist.all_gather(gathered, local_input, group=group)
         expected = torch.cat(gathered, dim=dim_mapping['b'])
@@ -450,7 +444,7 @@ class TestBridgeGradients:
         grad_output = torch.randn_like(out)
         out.backward(grad_output)
 
-        slot = comm.rank_to_src_pos[rank][0] % comm.fan_in_scale
+        slot = comm.rank_to_src_pos[rank][0] % comm.scale
         expected = grad_output.narrow(batch_dim, slot * b_local, b_local).contiguous()
         torch.testing.assert_close(local_input.grad, expected, rtol=0, atol=0)
 
@@ -467,7 +461,7 @@ class TestBridgeGradients:
         rank = dist.get_rank()
         batch_dim = dim_mapping['b']
         b_per_dest = self.B_PER_RANK
-        b_full = b_per_dest * comm.fan_out_scale
+        b_full = b_per_dest * comm.scale
         shape = _shape_for_dim_mapping(dim_mapping, b_full, self.S, self.H)
 
         # Input is TP-replicated on the batch dim (bridge contract). Seed
@@ -477,7 +471,7 @@ class TestBridgeGradients:
 
         actual = comm.communicate(input_tensor)
 
-        slot = comm.rank_to_dest_pos[rank][0] % comm.fan_out_scale
+        slot = comm.rank_to_dest_pos[rank][0] % comm.scale
         expected = input_tensor.narrow(
             batch_dim, slot * b_per_dest, b_per_dest
         ).contiguous()
@@ -505,7 +499,7 @@ class TestBridgeGradients:
 
         rank = dist.get_rank()
         batch_dim = dim_mapping['b']
-        scale = comm.fan_out_scale
+        scale = comm.scale
         b_per_dest = self.B_PER_RANK
         b_full = b_per_dest * scale
         shape = _shape_for_dim_mapping(dim_mapping, b_full, self.S, self.H)
