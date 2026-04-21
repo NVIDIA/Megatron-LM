@@ -1,6 +1,11 @@
-diskcache
 datasets
+jsonlines
+mamba-ssm
+causal-conv1d
 nvidia-modelopt
 omegaconf
+pulp
 tensorstore!=0.1.46,!=0.1.72
+torchprofile
 transformers
+zarr

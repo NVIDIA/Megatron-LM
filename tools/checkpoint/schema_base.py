@@ -44,10 +44,24 @@ class ModelSchema:
         if src is None:
             return
         dst = cls._get_deep_attr(obj, path)
-        assert isinstance(src, torch.Tensor), "src is <%s>." % type(src).__name__
-        assert isinstance(dst, torch.Tensor), "dst is <%s>." % type(dst).__name__
+        assert isinstance(src, torch.Tensor), "src is <%s> at path '%s'." % (type(src).__name__, path)
+        assert isinstance(dst, torch.Tensor), "dst is <%s> at path '%s'." % (type(dst).__name__, path)
         assert not dst.requires_grad, "should be using '.data', from getter above."
-        dst.copy_(src)
+        try:
+            dst.copy_(src)
+        except RuntimeError as e:
+            try:
+                src_shape = tuple(src.shape)
+            except Exception:
+                src_shape = "<unknown>"
+            try:
+                dst_shape = tuple(dst.shape)
+            except Exception:
+                dst_shape = "<unknown>"
+            print("[schema.set] Tensor copy failed at path '%s': src shape %s -> dst shape %s; error: %s" % (
+                path, src_shape, dst_shape, str(e)
+            ))
+            raise
 
     def _get_layers(self, model):
         layers = self._get_deep_attr(model, self["layer_prefix"])
@@ -76,7 +90,22 @@ class ModelSchema:
     def _set(cls, schema, model, params):
         for k, m in schema.items():
             if k in params:
-                cls._set_deep_tensor(model, m, params[k])
+                try:
+                    cls._set_deep_tensor(model, m, params[k])
+                except AssertionError as e:
+                    print("[schema.set] Failed setting key '%s' mapped to path '%s' with src type '%s'" % (
+                        k, m, type(params[k]).__name__
+                    ))
+                    raise
+                except RuntimeError as e:
+                    try:
+                        src_shape = tuple(params[k].shape)
+                    except Exception:
+                        src_shape = "<unknown>"
+                    print("[schema.set] RuntimeError for key '%s' at path '%s' with src shape %s; error: %s" % (
+                        k, m, src_shape, str(e)
+                    ))
+                    raise
 
     def set(self, key, model, params):
         self._set(self[key], model, params)

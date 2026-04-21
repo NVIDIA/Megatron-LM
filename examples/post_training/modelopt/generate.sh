@@ -23,7 +23,6 @@ if [ -z ${PROMPTS_PATH} ]; then
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/generate.py \
         ${MODEL_ARGS} \
         --tensor-model-parallel-size ${TP} \
-        --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --pipeline-model-parallel-size ${PP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
@@ -35,7 +34,6 @@ else
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/generate.py \
         ${MODEL_ARGS} \
         --tensor-model-parallel-size ${TP} \
-        --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --pipeline-model-parallel-size ${PP} \
         --tokenizer-model ${TOKENIZER_MODEL} \

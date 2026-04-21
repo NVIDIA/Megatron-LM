@@ -3,7 +3,6 @@
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -16,10 +15,12 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
-if HAVE_TE:
+try:
     from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
-else:
-    TELayerNormColumnParallelLinear = None
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 
 def _gather_from_tensor_parallel_region(x: Tensor, config: TransformerConfig) -> Tensor:
@@ -66,7 +67,6 @@ if HAVE_TE:
             )
 
         def forward(self, x, **kwargs):
-            """Forward of TELayerNormColumnParallelLinearGathered"""
             out, bias = super().forward(x)
             assert bias is None, "bias should be None since we set skip_bias_add=False"
 
@@ -100,7 +100,6 @@ class ColumnParallelLinearGathered(ColumnParallelLinear):
         runtime_gather_output: bool | None = None,
         **kwargs,
     ):
-        """Forward of ColumnParallelLinearGathered"""
         out, bias = super().forward(input_, weight, runtime_gather_output)
         assert bias is None, "bias should be None since we set skip_bias_add=False"
 

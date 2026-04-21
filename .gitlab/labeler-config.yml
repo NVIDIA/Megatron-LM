@@ -14,6 +14,9 @@ BERT:
 GPT:
   - megatron/core/models/gpt/**
 
+RETRO:
+  - megatron/core/models/retro/**
+
 Dist-Ckpt:
   - megatron/core/dist_checkpointing
 

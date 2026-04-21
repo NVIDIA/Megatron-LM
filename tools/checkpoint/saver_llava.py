@@ -34,11 +34,15 @@ def add_arguments(parser):
     group.add_argument('--target-pipeline-parallel-size', type=int,
                        help='Target tensor model parallel size, default to the pipeline parall size '
                        'in the input checkpoint if provided by the loader, otherwise to 1')
+    group.add_argument('--make-vocab-size-divisible-by', type=int, default=None,
+                       help='Value to make vocab size divisible by. Will pad embedding table if necessary')
     group.add_argument('--saver-transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
     group.add_argument('--target-expert-parallel-size', type=int, default=1,
                        help='Target expert model parallel size, default to 1')
+    group.add_argument('--target-expert-tensor-parallel-size', type=int, default=1,
+                       help='Target expert tensor model parallel size, default to 1')
 
 
 class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
@@ -57,7 +61,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
-                            'sequence_parallel',
+                            'sequence_parallel', 'async_tensor_model_parallel_allreduce',
                             'no_load_optim', 'no_load_rng', 'no_save_optim', 'no_save_rng',
                             'vocab_file',
                             'save_interval', 'save',
@@ -67,7 +71,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                             'distribute_saved_activations',
                             'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
                             'start_weight_decay', 'end_weight_decay',
-                            'ckpt_format', 'inference_batch_times_seqlen_threshold',
+                            'ckpt_format', 'inference_batch_times_seqlen_threshold', 'ckpt_step'
             ]
 
             for arg, value in vars(self.md.checkpoint_args).items():
@@ -80,16 +84,19 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                     print(f"Overwriting default {arg} value {getattr(margs, arg)} with value from checkpoint {value}.")
                     setattr(margs, arg, value)
 
-        print("im here")
         return margs
+
     def build_sys_argv(self):
+        num_experts = getattr(self.md, "num_experts", 0)
+        num_experts = 0 if num_experts is None else num_experts
+        num_experts = str(num_experts)
         my_argv = ['script.py',
                     '--use-checkpoint-args',
                     '--use-mp-args-from-checkpoint-args', # need this since we're loading torch ckpts
                     '--num-layers', str(self.md.num_layers),
                     '--hidden-size', str(self.md.hidden_size),
                     '--seq-length', str(self.md.seq_length),
-                    '--num-experts', str(getattr(self.md, "num_experts", 0)),
+                    '--num-experts', num_experts,
                     '--num-attention-heads', str(self.md.num_attention_heads),
                     '--max-position-embeddings', str(self.md.max_position_embeddings),
                     '--tokenizer-type', str(self.md.tokenizer_type),
@@ -99,6 +106,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                     '--no-masked-softmax-fusion',
                     '--no-bias-gelu-fusion',
                     '--no-bias-dropout-fusion',
+                    '--no-async-tensor-model-parallel-allreduce',
                     '--use-cpu-initialization',
                     '--micro-batch-size', '1',
                     '--no-load-optim',
@@ -114,7 +122,11 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                     '--exit-on-missing-checkpoint',
                     ]
 
-        if self.md.make_vocab_size_divisible_by is not None:
+        if self.args.ckpt_step is not None:
+            my_argv.extend(['--ckpt-step', str(self.args.ckpt_step)])
+        if self.args.make_vocab_size_divisible_by is not None:
+            my_argv.extend(['--make-vocab-size-divisible-by', str(self.args.make_vocab_size_divisible_by)])
+        elif self.md.make_vocab_size_divisible_by is not None:
             my_argv.extend(['--make-vocab-size-divisible-by', str(self.md.make_vocab_size_divisible_by)])
         if self.md.params_dtype == torch.float16:
             my_argv.append('--fp16')
@@ -137,26 +149,56 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
         margs.language_model_type = self.md.checkpoint_args.language_model_type
         margs.vision_model_type = self.md.checkpoint_args.vision_model_type
         margs.tokenizer_prompt_format = getattr(self.md.checkpoint_args, "tokenizer_prompt_format", "dummy")
+        margs.tokenizer_model = getattr(self.md.checkpoint_args, "tokenizer_model", None)
         margs.disable_vision_class_token = getattr(self.md.checkpoint_args, "disable_vision_class_token", False)
         margs.use_tiling = getattr(self.md.checkpoint_args, "use_tiling", False)
         margs.pixel_shuffle = getattr(self.md.checkpoint_args, "pixel_shuffle", False)
+        margs.class_token_len = getattr(self.md.checkpoint_args, "class_token_len", None)
         margs.use_tile_tags = getattr(self.md.checkpoint_args, "use_tile_tags", False)
         margs.max_num_tiles = getattr(self.md.checkpoint_args, "max_num_tiles", 1)
         margs.use_thumbnail = getattr(self.md.checkpoint_args, "use_thumbnail", False)
         margs.img_h = getattr(self.md.checkpoint_args, "img_h", 448)
         margs.img_w = getattr(self.md.checkpoint_args, "img_w", 448)
         margs.patch_dim = getattr(self.md.checkpoint_args, "patch_dim", 16)
-        margs.decoder_seq_length = getattr(self.md.checkpoint_args, "decoder_seq_length", 4096)
+        margs.decoder_seq_length = getattr(self.md.checkpoint_args, "decoder_seq_length", 16384)
         margs.special_tokens = getattr(self.md.checkpoint_args, "special_tokens", "")
         margs.image_tag_type = getattr(self.md.checkpoint_args, "image_tag_type", "")
         margs.allow_missing_vision_projection_checkpoint = getattr(self.md.checkpoint_args, "allow_missing_vision_projection_checkpoint", False)
         margs.freeze_LM = getattr(self.md.checkpoint_args, "freeze_LM", False)
         margs.freeze_ViT = getattr(self.md.checkpoint_args, "freeze_ViT", False)
+        margs.encoder_tensor_model_parallel_size = getattr(self.md.checkpoint_args, "encoder_tensor_model_parallel_size", 0)
         margs.force_system_message = getattr(self.md.checkpoint_args, "force_system_message", False)
         margs.image_tag_type = getattr(self.md.checkpoint_args, "image_tag_type", "")
         margs.num_frames = getattr(self.md.checkpoint_args, "num_frames", 8)
         margs.recompute_vision = getattr(self.md.checkpoint_args, "recompute_vision", False)
         margs.padded_vocab_size = self.md.padded_vocab_size
+        margs.vocab_size = self.md.vocab_size
+        margs.use_vision_backbone_fp8_arch = getattr(self.md.checkpoint_args, "use_vision_backbone_fp8_arch", False)
+        margs.dynamic_resolution = getattr(self.md.checkpoint_args, "dynamic_resolution", False)
+        margs.image_break_token = getattr(self.md.checkpoint_args, "image_break_token", None)
+        margs.conv_merging = getattr(self.md.checkpoint_args, "conv_merging", False)
+        margs.allow_missing_conv_merge_checkpoint = getattr(self.md.checkpoint_args, "allow_missing_conv_merge_checkpoint", False)
+        margs.enable_te_ce = getattr(self.md.checkpoint_args, "enable_te_ce", False)
+        margs.token_merging_variant = getattr(self.md.checkpoint_args, "token_merging_variant", None)
+        margs.token_merging_out_tokens = getattr(self.md.checkpoint_args, "token_merging_out_tokens", None)
+        margs.enable_fusions = getattr(self.md.checkpoint_args, "enable_fusions", False)
+        margs.context_parallel_size = 1
+        margs.efficient_video_sampling_variant = getattr(self.md.checkpoint_args, "efficient_video_sampling_variant", None)
+        # RADIO specific
+        margs.radio_force_eval_mode = getattr(self.md.checkpoint_args, "radio_force_eval_mode", False)
+        margs.radio_force_cpe_eval_mode = getattr(self.md.checkpoint_args, "radio_force_cpe_eval_mode", False)
+        margs.radio_interpolate_only_cpe = getattr(self.md.checkpoint_args, "radio_interpolate_only_cpe", False)
+        margs.radio_cpe_aspect_ratio_select = getattr(self.md.checkpoint_args, "radio_cpe_aspect_ratio_select", False)
+        margs.radio_disable_cpe = getattr(self.md.checkpoint_args, "radio_disable_cpe", False)
+        # Temporal compression args
+        margs.video_temporal_patch_size = getattr(self.md.checkpoint_args, "video_temporal_patch_size", 1)
+        margs.allow_checkpoint_without_temporal_compression = getattr(self.md.checkpoint_args, "allow_checkpoint_without_temporal_compression", False)
+        margs.separate_video_embedder = getattr(self.md.checkpoint_args, "separate_video_embedder", False)
+        # Sound/audio specific args
+        margs.allow_missing_sound_projection_checkpoint = getattr(self.md.checkpoint_args, "allow_missing_sound_projection_checkpoint", False)
+        margs.allow_missing_sound_model_checkpoint = getattr(self.md.checkpoint_args, "allow_missing_sound_model_checkpoint", False)
+        margs.recompute_sound = getattr(self.md.checkpoint_args, "recompute_sound", False)
+        margs.sound_model_type = getattr(self.md.checkpoint_args, "sound_model_type", None)
 
         return margs
 
@@ -167,7 +209,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
-        if self.md.model_type == 'GPT':
+        if self.md.model_type == 'GPT' or self.md.model_type == 'hybrid':
             sys.path.insert(0, './examples/multimodal')
             from examples.multimodal.model import model_provider
             from examples.multimodal.config import get_vision_model_config, get_vision_projection_config
@@ -184,13 +226,18 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
 
         # ViT Embeddings.
         #-----------
-        # The ViT embeddings are put on the PP / EP / TP 0 
+        # The ViT embeddings are put on the PP / EP / TP 0
         vit_embeddings_msg = self.queue_get("vit embeddings")
 
-        if self.md.vision_model_type in ("radio", "radio-g"):
+        if self.md.vision_model_type in ("radio", "radio-so400m", "radio-g", "cradio-g"):
             embedder_weight = chunk_weight(vit_embeddings_msg["embedder weight"], "column", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size)
             if self.md.vision_model_type == "radio-g":
                 embedder_bias = chunk_bias(vit_embeddings_msg["embedder bias"], "column", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size)
+            # Handle video_embedder weights if separate_video_embedder is enabled
+            video_embedder_weight = None
+            if self.md.separate_video_embedder:
+                assert "video_embedder weight" in vit_embeddings_msg, "Missing video_embedder weight when separate_video_embedder=True"
+                video_embedder_weight = chunk_weight(vit_embeddings_msg["video_embedder weight"], "column", self.args.target_tensor_parallel_size, self.args.target_expert_parallel_size)
 
         for ep_rank in range(self.args.target_expert_parallel_size):
             for tp_rank in range(self.args.target_tensor_parallel_size):
@@ -204,11 +251,16 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                 if self.md.vision_model_type == "radio-g":
                     model.vision_model.mask_token.data.copy_(vit_embeddings_msg["mask token"])
 
-                if self.md.vision_model_type in ("radio", "radio-g"):
+                if self.md.vision_model_type in ("radio", "radio-so400m", "radio-g", "cradio-g"):
                     model.vision_model.embedder.weight.data.copy_(embedder_weight[tp_rank])
                     if self.md.vision_model_type == "radio-g":
                         model.vision_model.embedder.bias.data.copy_(embedder_bias[tp_rank])
                     model.vision_model.position_embeddings.data.copy_(vit_embeddings_msg["position embeddings"])
+                    # Load video_embedder weights if present
+                    if self.md.separate_video_embedder:
+                        assert video_embedder_weight is not None, "Missing video_embedder weight when separate_video_embedder=True"
+                        assert hasattr(model.vision_model, 'video_embedder'), "Missing video_embedder in vision model when separate_video_embedder=True"
+                        model.vision_model.video_embedder.weight.data.copy_(video_embedder_weight[tp_rank])
 
                 if self.md.vision_model_type in ("clip"):
                     model.vision_model.ln_pre.weight.data.copy_(vit_embeddings_msg["ln pre weight"])
@@ -218,7 +270,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                     model.vision_model.ln_post.weight.data.copy_(vit_embeddings_msg["ln post weight"])
                     model.vision_model.ln_post.bias.data.copy_(vit_embeddings_msg["ln post bias"])
 
-                if self.md.vision_model_type in ("internvit", "clip", "radio", "radio-g"):
+                if self.md.vision_model_type in ("internvit", "clip", "radio", "radio-so400m", "radio-g", "cradio-g"):
                     model.vision_model.class_token.data.copy_(vit_embeddings_msg["class token"])
 
         # ViT Transformer layers.
@@ -337,8 +389,20 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
             vision_projection_l0_bias = chunk_bias(
             vision_projection_msg.pop("vision projection l0 bias"), "column", self.args.target_tensor_parallel_size)
             vision_projection_l1_bias = vision_projection_msg.pop("vision projection l1 bias")
+
+        if self.md.conv_merging:
+            conv_merge_l0_weight = chunk_weight(
+                vision_projection_msg.pop("conv merge l0 weight"), "column", self.args.target_tensor_parallel_size)
+            conv_merge_l1_weight = chunk_weight(
+                vision_projection_msg.pop("conv merge l1 weight"), "row", self.args.target_tensor_parallel_size)
+
+            if self.md.vision_projection_linear_bias:
+                conv_merge_l0_bias = chunk_bias(
+                vision_projection_msg.pop("conv merge l0 bias"), "column", self.args.target_tensor_parallel_size)
+                conv_merge_l1_bias = vision_projection_msg.pop("conv merge l1 bias")
+
         for tp_rank in range(self.args.target_tensor_parallel_size):
-            # The vision projection is on the PP / EP 0 
+            # The vision projection is on the PP / EP 0
             model = self.get_local_model(0, 0, tp_rank)
             model.vision_projection.encoder.linear_fc1.weight.data.copy_(
                 vision_projection_l0_weight[tp_rank])
@@ -354,6 +418,17 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
                 model.vision_projection.encoder.linear_fc1.bias.data.copy_(
                     vision_projection_l0_bias[tp_rank])
                 model.vision_projection.encoder.linear_fc2.bias.data.copy_(vision_projection_l1_bias)
+
+            if self.md.conv_merging:
+                model.conv_merge.mlp.linear_fc1.weight.data.copy_(
+                    conv_merge_l0_weight[tp_rank])
+                model.conv_merge.mlp.linear_fc2.weight.data.copy_(
+                    conv_merge_l1_weight[tp_rank])
+
+                if self.md.vision_projection_linear_bias:
+                    model.conv_merge.mlp.linear_fc1.bias.data.copy_(
+                        conv_merge_l0_bias[tp_rank])
+                    model.conv_merge.mlp.linear_fc2.bias.data.copy_(conv_merge_l1_bias)
 
     def receive_model(self):
         extra_layer_schema = {}
@@ -376,14 +451,20 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
         schema_vision_backbone = get_model_schema(
             "GPT",
             self.margs.transformer_impl,
-            self.margs.num_experts,
-            self.margs.expert_model_parallel_size,
+            None, # No MoE vision encoder
+            None, # No MoE vision encoder
             prefix="vision_model.",
             extra_layer_schema=extra_layer_schema,
         )
         self.receive_vision_backbone(schema_vision_backbone)
 
         self.receive_vision_projection()
+
+        # Receive sound projection if present
+        self.receive_sound_projection()
+
+        # Receive sound model if present
+        self.receive_sound_model()
 
         schema = get_model_schema(
             self.md.model_type,
@@ -394,6 +475,93 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
         )
         self.receive_lm(schema, prefix="language_model")
 
+    def receive_sound_model(self):
+        """Receive the sound_model weights and load into HF Parakeet wrapper if present."""
+        if getattr(self.md, 'sound_model_type', None) is None:
+            return
+        # We expect a start message with number of chunks
+        try:
+            start_msg = self.queue_get("sound model start")
+        except Exception:
+            return
+
+        total_chunks = start_msg.get("chunks", 0)
+        merged = {}
+        for idx in range(total_chunks):
+            chunk_msg = self.queue_get(f"sound model chunk {idx}")
+            merged.update(chunk_msg)
+        # Consume end sentinel
+        _ = self.queue_get("sound model end")
+
+        # Load weights if sound_model exists
+        model = self.get_local_model(0, 0, 0)
+        if not hasattr(model, 'sound_model') or model.sound_model is None:
+            return
+
+        # Split back to feature_extractor and model namespaces
+        fe_prefix = "sound_model.feature_extractor."
+        mdl_prefix = "sound_model.model."
+        fe_state = {k[len(fe_prefix):]: v for k, v in merged.items() if k.startswith(fe_prefix)}
+        mdl_state = {k[len(mdl_prefix):]: v for k, v in merged.items() if k.startswith(mdl_prefix)}
+
+        # Copy into modules; move tensors to current device, preserve original dtypes
+        device = next(model.parameters()).device
+        # feature_extractor may be absent for some models; guard each
+        if hasattr(model.sound_model, 'feature_extractor') and model.sound_model.feature_extractor is not None and len(fe_state) > 0:
+            fe_state = {k: (t.to(device=device) if hasattr(t, 'to') else t) for k, t in fe_state.items()}
+            model.sound_model.feature_extractor.load_state_dict(fe_state, strict=False)
+        if hasattr(model.sound_model, 'model') and model.sound_model.model is not None and len(mdl_state) > 0:
+            mdl_state = {k: (t.to(device=device) if hasattr(t, 'to') else t) for k, t in mdl_state.items()}
+            model.sound_model.model.load_state_dict(mdl_state, strict=False)
+
+    def receive_sound_projection(self):
+        """Receive sound projection parameters if the model has sound_projection."""
+        # If no sound model/projection expected, return quietly
+        if getattr(self.md, 'sound_model_type', None) is None:
+            return
+        try:
+            projection_msg = self.queue_get("sound projection")
+        except Exception:
+            # If nothing was sent, skip
+            return
+
+        sound_projection_l0_weight = chunk_weight(
+            projection_msg.pop("sound projection l0 weight"), "column", self.args.target_tensor_parallel_size
+        )
+        sound_projection_l1_weight = chunk_weight(
+            projection_msg.pop("sound projection l1 weight"), "row", self.args.target_tensor_parallel_size
+        )
+
+        has_norm_weight = False
+        if "sound projection norm weight" in projection_msg:
+            sound_projection_norm_weight = projection_msg.pop("sound projection norm weight")
+            has_norm_weight = True
+        has_norm_bias = False
+        if "sound projection norm bias" in projection_msg:
+            sound_projection_norm_bias = projection_msg.pop("sound projection norm bias")
+            has_norm_bias = True
+
+        if getattr(self.md, 'sound_projection_linear_bias', False):
+            sound_projection_l0_bias = chunk_bias(
+                projection_msg.pop("sound projection l0 bias"), "column", self.args.target_tensor_parallel_size
+            )
+            sound_projection_l1_bias = projection_msg.pop("sound projection l1 bias")
+
+        for tp_rank in range(self.args.target_tensor_parallel_size):
+            # The sound projection is on the PP / EP 0 like vision
+            model = self.get_local_model(0, 0, tp_rank)
+            if not hasattr(model, 'sound_projection') or model.sound_projection is None:
+                continue
+            model.sound_projection.encoder.linear_fc1.weight.data.copy_(sound_projection_l0_weight[tp_rank])
+            model.sound_projection.encoder.linear_fc2.weight.data.copy_(sound_projection_l1_weight[tp_rank])
+            if has_norm_weight:
+                model.sound_projection.encoder.linear_fc1.layer_norm_weight.data.copy_(sound_projection_norm_weight)
+            if has_norm_bias:
+                model.sound_projection.encoder.linear_fc1.layer_norm_bias.data.copy_(sound_projection_norm_bias)
+            if getattr(self.md, 'sound_projection_linear_bias', False):
+                model.sound_projection.encoder.linear_fc1.bias.data.copy_(sound_projection_l0_bias[tp_rank])
+                model.sound_projection.encoder.linear_fc2.bias.data.copy_(sound_projection_l1_bias)
+
 def save_checkpoint(queue, args):
     """
     Required top-level function that creates the saver and calls its .save().
@@ -403,4 +571,4 @@ def save_checkpoint(queue, args):
         saver.save()
     except Exception as e:
         raise e
-    
+

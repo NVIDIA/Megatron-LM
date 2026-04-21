@@ -6,23 +6,190 @@ import torch
 from megatron.core.activations import fast_gelu, quick_gelu, squared_relu
 
 
-def get_language_model_config(config):
+def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=None):
+    config.bias_activation_fusion = enable_fusions
+    config.bias_dropout_fusion = enable_fusions
+    config.apply_rope_fusion = enable_fusions
+    if apply_rope_fusion is not None:
+        config.apply_rope_fusion = apply_rope_fusion
+
     if config.language_model_type == "llama3_8b":
         config.activation_func = torch.nn.functional.silu
         config.add_bias_linear = False
-        config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
         config.layernorm_zero_centered_gamma = (
             False  # Zero centered gamma not supported for RMSNorm
         )
-        config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 14336
     elif config.language_model_type == "llama3.1_8b":
         config.activation_func = torch.nn.functional.silu
         config.add_bias_linear = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 14336
+    elif config.language_model_type == "llama3.1_70B":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 28672
+    elif config.language_model_type == "mistral_7b":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 14336
+    elif config.language_model_type == "nemotron5-8b":
+        config.add_bias_linear = False
+        config.gated_linear_unit = False
+        config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+        config.ffn_hidden_size = 21504
+        config.masked_softmax_fusion = True
+        config.attention_softmax_in_fp32 = True
+    elif config.language_model_type == "yi-34b":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 20480
+    elif config.language_model_type == "qwen2.0_72B":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.add_qkv_bias = True
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 29568
+    elif config.language_model_type == "qwen2.5_7B":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.add_qkv_bias = True
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 18944
+    elif config.language_model_type == "qwen2.5_72B":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.add_qkv_bias = True
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 29568
+    elif config.language_model_type == "nemotron5-hybrid-8b":
+        config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+        config.squared_relu = True
+        config.add_bias_linear = False
+        config.apply_query_key_layer_scaling = False
+        config.gated_linear_unit = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 21504
+    elif config.language_model_type == "nemotron5-hybrid-8b-reasoning":
+        config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+        config.squared_relu = True
+        config.add_bias_linear = False
+        config.apply_query_key_layer_scaling = False
+        config.gated_linear_unit = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 21504
+    elif config.language_model_type == "nemotron5-hybrid-12b":
+        config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+        config.squared_relu = True
+        config.add_bias_linear = False
+        config.apply_query_key_layer_scaling = False
+        config.gated_linear_unit = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 20480
+        config.mamba_state_dim = 128
+        config.mamba_num_heads = 128
+        config.mamba_head_dim = 80
+    elif config.language_model_type == "nemotron5-hybrid-9b":
+        config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+        config.squared_relu = True
+        config.add_bias_linear = False
+        config.apply_query_key_layer_scaling = False
+        config.gated_linear_unit = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 15680
+        config.mamba_state_dim = 128
+        config.mamba_num_heads = 128
+        config.mamba_head_dim = 80
+    elif config.language_model_type == "nemotron5-hybrid-56b":
+        config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+        config.squared_relu = True
+        config.add_bias_linear = False
+        config.apply_query_key_layer_scaling = False
+        config.gated_linear_unit = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 32768
+        config.mamba_state_dim = 256
+    elif config.language_model_type == "llama3.2_1b":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 8192
+    elif config.language_model_type.startswith("hf://"):
+        # Loaded from HuggingFace config file.
+        import transformers
+        hf_config = transformers.AutoConfig.from_pretrained(config.language_model_type.split("hf://")[1])
+        config.hf_config = hf_config
+        config.hidden_size = hf_config.hidden_size
+    elif config.language_model_type == "llama_nemotron_8b":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
         config.bias_activation_fusion = False
         config.gated_linear_unit = True
         config.apply_query_key_layer_scaling = False
@@ -33,7 +200,8 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 14336
-    elif config.language_model_type == "llama3.1_70B":
+    elif config.language_model_type == "llama_nemotron_super_49b":
+        #TODO: these might not be correct
         config.activation_func = torch.nn.functional.silu
         config.add_bias_linear = False
         config.bias_activation_fusion = False
@@ -46,137 +214,23 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 28672
-    elif config.language_model_type == "mistral_7b":
-        config.activation_func = torch.nn.functional.silu
-        config.add_bias_linear = False
+    elif config.language_model_type == "nemotron6-moe":
         config.bias_activation_fusion = False
-        config.gated_linear_unit = True
-        config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
         config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 14336
-    elif config.language_model_type == "nemotron5-8b":
-        config.add_bias_linear = False
-        config.bias_activation_fusion = False
-        config.gated_linear_unit = False
-        config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
-        config.activation_func = squared_relu
-        config.ffn_hidden_size = 21504
-        config.masked_softmax_fusion = True
-        config.attention_softmax_in_fp32 = True
-    elif config.language_model_type == "yi-34b":
-        config.activation_func = torch.nn.functional.silu
-        config.add_bias_linear = False
-        config.bias_activation_fusion = False
-        config.gated_linear_unit = True
-        config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
-        config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 20480
-    elif config.language_model_type == "qwen2.0_72B":
-        config.activation_func = torch.nn.functional.silu
-        config.add_bias_linear = False
-        config.add_qkv_bias = True
-        config.bias_activation_fusion = False
-        config.gated_linear_unit = True
-        config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
-        config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 29568
-    elif config.language_model_type == "qwen2.5_7B":
-        config.activation_func = torch.nn.functional.silu
-        config.add_bias_linear = False
-        config.add_qkv_bias = True
-        config.bias_activation_fusion = False
-        config.gated_linear_unit = True
-        config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
-        config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 18944
-    elif config.language_model_type == "qwen2.5_72B":
-        config.activation_func = torch.nn.functional.silu
-        config.add_bias_linear = False
-        config.add_qkv_bias = True
-        config.bias_activation_fusion = False
-        config.gated_linear_unit = True
-        config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
-        config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 29568
-    elif config.language_model_type == "nemotron5-hybrid-8b":
-        config.activation_func = squared_relu
-        config.squared_relu = True
-        config.add_bias_linear = False
-        config.bias_activation_fusion = False
-        config.apply_query_key_layer_scaling = False
-        config.gated_linear_unit = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
-        config.bias_dropout_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 21504
-    elif config.language_model_type == "nemotron5-hybrid-56b":
-        config.activation_func = squared_relu
-        config.squared_relu = True
-        config.add_bias_linear = False
-        config.bias_activation_fusion = False
-        config.apply_query_key_layer_scaling = False
-        config.gated_linear_unit = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
-        config.bias_dropout_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 32768
-        config.mamba_state_dim = 256
-    elif config.language_model_type == "llama3.2_1b":
-        config.activation_func = torch.nn.functional.silu
-        config.add_bias_linear = False
-        config.bias_activation_fusion = False
-        config.gated_linear_unit = True
-        config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
-        config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 8192
-    elif config.language_model_type.startswith("hf://"):
-        # Loaded from HuggingFace config file.
-        import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(config.language_model_type.split("hf://")[1])
-        config.hf_config = hf_config
-        config.hidden_size = hf_config.hidden_size
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 
     return config
 
 
-def get_vision_model_config(config, apply_query_key_layer_scaling):
+def get_vision_model_config(config, enable_fusions=False):
+    config.bias_activation_fusion = False   # Radio uses an incompatible activation func.
+    config.bias_dropout_fusion = enable_fusions
+    config.apply_rope_fusion = enable_fusions
+
+    if config.language_model_type == "nemotron6-moe":
+        config.bias_dropout_fusion = False
+
     if config.vision_model_type == "clip":
         config.num_layers = 24
         config.num_attention_heads = 16
@@ -191,12 +245,10 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.kv_channels = 64
         config.num_query_groups = 16
         config.layernorm_zero_centered_gamma = False
-        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        config.bias_activation_fusion = False
-        config.bias_dropout_fusion = False
+        config.apply_query_key_layer_scaling = False
         config.attention_softmax_in_fp32 = True
         config.normalization = 'LayerNorm'
-        config.apply_rope_fusion = False
+        config.class_token_len = 1
     elif config.vision_model_type == "siglip":
         config.num_layers = 27
         config.num_attention_heads = 16
@@ -211,14 +263,12 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.kv_channels = 72
         config.num_query_groups = 16
         config.layernorm_zero_centered_gamma = False
-        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        config.bias_activation_fusion = False
-        config.bias_dropout_fusion = False
+        config.apply_query_key_layer_scaling = False
         config.attention_softmax_in_fp32 = True
         config.normalization = 'LayerNorm'
-        config.apply_rope_fusion = False
         config.qk_layernorm = False
         config.layernorm_epsilon = 1e-6
+        config.class_token_len = 0
     elif config.vision_model_type == "internvit":
         config.num_layers = 45
         config.num_attention_heads = ((24 // config.tensor_model_parallel_size) + 1) * config.tensor_model_parallel_size
@@ -232,13 +282,11 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.gated_linear_unit = False
         config.activation_func = torch.nn.functional.gelu
         config.layernorm_zero_centered_gamma = False
-        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        config.bias_activation_fusion = False
-        config.bias_dropout_fusion = False
+        config.apply_query_key_layer_scaling = False
         config.attention_softmax_in_fp32 = True
         config.normalization = 'RMSNorm'
         config.layernorm_epsilon = 1e-6
-        config.apply_rope_fusion = False
+        config.class_token_len = 1
     elif config.vision_model_type == "internvit300M":
         config.num_layers = 24
         config.num_attention_heads = 16
@@ -252,14 +300,12 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.gated_linear_unit = False
         config.activation_func = torch.nn.functional.gelu
         config.layernorm_zero_centered_gamma = False
-        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        config.bias_activation_fusion = False
-        config.bias_dropout_fusion = False
+        config.apply_query_key_layer_scaling = False
         config.attention_softmax_in_fp32 = True
         config.normalization = 'LayerNorm'
         config.layernorm_epsilon = 1e-6
-        config.apply_rope_fusion = False
         config.qk_layernorm = False
+        config.class_token_len = 1
     elif config.vision_model_type == "radio":
         config.num_layers = 32
         config.num_attention_heads = 16
@@ -272,14 +318,30 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.kv_channels = 80
         config.num_query_groups = 16
         config.layernorm_zero_centered_gamma = False
-        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        config.bias_activation_fusion = False
-        config.bias_dropout_fusion = False
+        config.apply_query_key_layer_scaling = False
         config.attention_softmax_in_fp32 = True
         config.normalization = 'LayerNorm'
-        config.apply_rope_fusion = False
         config.qk_layernorm = False
         config.layernorm_epsilon = 1e-6
+        config.class_token_len = 8
+    elif config.vision_model_type == "radio-so400m":
+        config.num_layers = 27
+        config.num_attention_heads = 16
+        config.add_bias_linear = True
+        config.add_qkv_bias = True
+        config.hidden_size = 1152
+        config.ffn_hidden_size = 4304
+        config.gated_linear_unit = False
+        config.activation_func = fast_gelu
+        config.kv_channels = 72  # 1152 // 16
+        config.num_query_groups = 16
+        config.layernorm_zero_centered_gamma = False
+        config.apply_query_key_layer_scaling = False
+        config.attention_softmax_in_fp32 = True
+        config.normalization = 'LayerNorm'
+        config.qk_layernorm = False
+        config.layernorm_epsilon = 1e-6
+        config.class_token_len = 10
     elif config.vision_model_type == "radio-g":
         config.num_layers = 40
         config.num_attention_heads = 24
@@ -292,14 +354,12 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.kv_channels = 64
         config.num_query_groups = 24
         config.layernorm_zero_centered_gamma = False
-        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        config.bias_activation_fusion = False
-        config.bias_dropout_fusion = False
+        config.apply_query_key_layer_scaling = False
         config.attention_softmax_in_fp32 = True
         config.normalization = 'LayerNorm'
-        config.apply_rope_fusion = False
         config.qk_layernorm = False
         config.layernorm_epsilon = 1e-6
+        config.class_token_len = 5
     elif config.vision_model_type == "cradio-g":
         config.num_layers = 40
         config.num_attention_heads = 24
@@ -312,14 +372,12 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.kv_channels = 64
         config.num_query_groups = 24
         config.layernorm_zero_centered_gamma = False
-        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        config.bias_activation_fusion = False
-        config.bias_dropout_fusion = False
+        config.apply_query_key_layer_scaling = False
         config.attention_softmax_in_fp32 = True
         config.normalization = 'LayerNorm'
-        config.apply_rope_fusion = False
         config.qk_layernorm = False
         config.layernorm_epsilon = 1e-6
+        config.class_token_len = 8
     elif config.vision_model_type.startswith("hf://"):
         import transformers
         hf_config = transformers.AutoConfig.from_pretrained(config.vision_model_type.split("hf://")[1])
@@ -331,16 +389,20 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
     return config
 
 
-def get_vision_projection_config(config, hidden_size):
+def get_vision_projection_config(config, hidden_size, enable_fusions=False):
     # If using FP8, then keep the whole vision projection in FP8.
     config.first_last_layers_bf16 = False
     config.num_layers_at_start_in_bf16 = 0
     config.num_layers_at_end_in_bf16 = 0
 
     config.gated_linear_unit = False
-    config.bias_activation_fusion = False
     config.add_bias_linear = False
     config.hidden_size = hidden_size  # Used as the vision projection output size, i.e., the input to the language model.
+
+    config.bias_activation_fusion = enable_fusions
+    config.bias_dropout_fusion = enable_fusions
+    config.apply_rope_fusion = enable_fusions
+
     if config.language_model_type == "llama3_8b":
         config.ffn_hidden_size = 14336
         config.activation_func = torch.nn.functional.gelu
@@ -372,9 +434,23 @@ def get_vision_projection_config(config, hidden_size):
     elif config.language_model_type == "nemotron5-hybrid-56b":
         config.ffn_hidden_size = 32768
         config.activation_func = squared_relu
+        config.bias_activation_fusion = False
     elif config.language_model_type in ("nemotron5-8b", "nemotron5-hybrid-8b"):
         config.ffn_hidden_size = 21504
         config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+    elif config.language_model_type == "nemotron5-hybrid-12b":
+        config.ffn_hidden_size = 20480
+        config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+    elif config.language_model_type == "nemotron5-hybrid-9b":
+        config.ffn_hidden_size = 15680
+        config.activation_func = squared_relu
+        config.bias_activation_fusion = False
+    elif config.language_model_type == "nemotron6-moe":
+        config.ffn_hidden_size = 20480
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
     elif config.language_model_type == "llama3.2_1b":
         config.ffn_hidden_size = 2048
         config.activation_func = torch.nn.functional.gelu
@@ -382,6 +458,75 @@ def get_vision_projection_config(config, hidden_size):
     elif config.language_model_type.startswith("hf://"):
         config.activation_func = torch.nn.functional.gelu
         config.ffn_hidden_size = 4096
+        config.normalization = "LayerNorm"
+    elif config.language_model_type == "llama_nemotron_8b":
+        config.ffn_hidden_size = 14336
+        config.activation_func = torch.nn.functional.gelu
+        config.layernorm_epsilon = 1e-5
+        config.add_bias_linear = True
+        config.normalization = "LayerNorm"
+    elif config.language_model_type == "llama_nemotron_super_49b":
+        config.ffn_hidden_size = 14336
+        config.activation_func = torch.nn.functional.gelu
+        config.layernorm_epsilon = 1e-5
+        config.add_bias_linear = True
+        config.normalization = "LayerNorm"
+    else:
+        raise ValueError(f"unknown language model type {config.language_model_type}")
+
+    return config
+
+
+def get_sound_model_config(config):
+    if config.sound_model_type.startswith("hf://"):
+        import transformers
+
+        if "parakeet" in config.sound_model_type:
+            from megatron.core.models.huggingface.fastconformer.configuration_fastconformer import FastConformerConfig
+            hf_config = FastConformerConfig.from_pretrained(config.sound_model_type.split("hf://")[1])
+        else:
+            hf_config = transformers.AutoConfig.from_pretrained(config.sound_model_type.split("hf://")[1])
+
+        config.hf_config = hf_config
+        if "NV-Whisper" in config.sound_model_type:
+            config.hidden_size = hf_config.audio_config.d_model
+        elif "parakeet" in config.sound_model_type:
+            config.hidden_size = hf_config.d_model
+        else:
+            config.hidden_size = hf_config.hidden_size
+    elif config.sound_model_type.startswith("nemo://"):
+        from megatron.core.models.huggingface.fastconformer_model import get_nemo_sound_model
+
+        _, encoder = get_nemo_sound_model(config.sound_model_type)
+        config.hidden_size = encoder.d_model
+    else:
+        raise ValueError(f"unknown sound model type {config.sound_model_type}")
+
+    return config
+
+def get_sound_projection_config(config, hidden_size, enable_fusions=False):
+    config.gated_linear_unit = False
+    config.add_bias_linear = False
+    config.hidden_size = hidden_size  # Used as the vision projection output size, i.e., the input to the language model.
+
+    config.bias_activation_fusion = enable_fusions
+    config.bias_dropout_fusion = enable_fusions
+    config.apply_rope_fusion = enable_fusions
+
+    if config.language_model_type in ("llama3.1_8b", "nemotron5-hybrid-9b"):
+        config.ffn_hidden_size = 4096
+        config.activation_func = torch.nn.functional.gelu
+        config.layernorm_epsilon = 1e-5
+        config.add_bias_linear = True
+        config.normalization = "LayerNorm"
+    elif config.language_model_type == "nemotron6-moe":
+        config.ffn_hidden_size = 4096
+        config.bias_activation_fusion = False
+    elif config.language_model_type == "llama_nemotron_8b":
+        config.ffn_hidden_size = 14336
+        config.activation_func = torch.nn.functional.gelu
+        config.layernorm_epsilon = 1e-5
+        config.add_bias_linear = True
         config.normalization = "LayerNorm"
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
@@ -410,3 +555,6 @@ class EvaluationConfig:
     num_partitions: int = 0
     partition_id: int = 0
     num_samples_per_partition: int = 0
+
+    # Tokenizer kwargs
+    enable_thinking: bool = False

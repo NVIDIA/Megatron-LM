@@ -69,7 +69,16 @@ class TestCLIPViTModel:
 def test_get_num_image_embeddings(vision_model, pixel_shuffle, tile_tags, expected):
     assert (
         get_num_image_embeddings(
-            448, 448, 14, vision_model, True, 1, pixel_shuffle, tile_tags, 0, "nemotron5"
+            img_h=448,
+            img_w=448,
+            patch_dim=14,
+            vision_model_type=vision_model,
+            disable_vision_class_token=True,
+            class_token_len=1,
+            pixel_shuffle=pixel_shuffle,
+            use_tile_tags=tile_tags,
+            max_num_tiles=0,
+            tokenizer_type="nemotron5",
         )
         == expected
     )

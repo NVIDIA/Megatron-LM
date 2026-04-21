@@ -5,13 +5,13 @@ import torch
 from transformer_engine.pytorch.float8_tensor import Float8Tensor
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
+from megatron.core.dist_checkpointing.serialization import (
+    get_default_load_sharded_strategy,
+    get_default_save_sharded_strategy,
+)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
-)
-from megatron.core.dist_checkpointing.strategies.torch import (
-    TorchDistLoadShardedStrategy,
-    TorchDistSaveShardedStrategy,
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -95,7 +95,7 @@ class TestFP8:
             }
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_fp8_save_load', sync=True) as ckpt_dir:
-            save_strategy = TorchDistSaveShardedStrategy()
+            save_strategy = get_default_save_sharded_strategy()
             if use_fpsl:
                 save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, None, True)
             save(get_state_dict(4), ckpt_dir, save_strategy)
@@ -104,7 +104,7 @@ class TestFP8:
             Utils.initialize_model_parallel(*dest_tp_pp)
 
             if use_fpsl:
-                load_strategy = TorchDistLoadShardedStrategy()
+                load_strategy = get_default_load_sharded_strategy(ckpt_dir)
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy, None, False, load_exchange_algo
                 )

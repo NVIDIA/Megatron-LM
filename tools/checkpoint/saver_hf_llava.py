@@ -4,14 +4,56 @@ import sys
 import torch
 
 from schema_hf import get_vision_model_schema, get_language_model_schema
+from saver_hf import HFCheckpointSaver
 
-from transformers.modeling_utils import WEIGHTS_INDEX_NAME, WEIGHTS_NAME, shard_checkpoint
+from huggingface_hub import save_torch_state_dict
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='HuggingFace LLaVA saver')
 
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of Megatron repository')
+
+def _convert_nemo_parakeet_key_to_hf(key: str) -> str:
+    """Convert NeMo Parakeet key names to HuggingFace Parakeet format.
+    
+    The NeMo checkpoint uses different naming conventions than the HuggingFace
+    transformers ParakeetEncoder. This function converts keys during checkpoint saving.
+    
+    Key mappings:
+    - pre_encode.out.* -> subsampling.linear.*
+    - pre_encode.conv.N.* -> subsampling.layers.N.*
+    - layers.N.self_attn.linear_q.* -> layers.N.self_attn.q_proj.*
+    - layers.N.self_attn.linear_k.* -> layers.N.self_attn.k_proj.*
+    - layers.N.self_attn.linear_v.* -> layers.N.self_attn.v_proj.*
+    - layers.N.self_attn.linear_out.* -> layers.N.self_attn.o_proj.*
+    - layers.N.self_attn.linear_pos.* -> layers.N.self_attn.relative_k_proj.*
+    - layers.N.self_attn.pos_bias_u -> layers.N.self_attn.bias_u
+    - layers.N.self_attn.pos_bias_v -> layers.N.self_attn.bias_v
+    - layers.N.conv.batch_norm.* -> layers.N.conv.norm.*
+    """
+    # Subsampling conversions
+    if ".pre_encode.out." in key:
+        key = key.replace(".pre_encode.out.", ".subsampling.linear.")
+    if ".pre_encode.conv." in key:
+        key = key.replace(".pre_encode.conv.", ".subsampling.layers.")
+    
+    # Self-attention projections
+    key = key.replace(".self_attn.linear_q.", ".self_attn.q_proj.")
+    key = key.replace(".self_attn.linear_k.", ".self_attn.k_proj.")
+    key = key.replace(".self_attn.linear_v.", ".self_attn.v_proj.")
+    key = key.replace(".self_attn.linear_out.", ".self_attn.o_proj.")
+    key = key.replace(".self_attn.linear_pos.", ".self_attn.relative_k_proj.")
+    
+    # Position bias names
+    key = key.replace(".self_attn.pos_bias_u", ".self_attn.bias_u")
+    key = key.replace(".self_attn.pos_bias_v", ".self_attn.bias_v")
+    
+    # Batch norm -> norm
+    key = key.replace(".conv.batch_norm.", ".conv.norm.")
+    
+    return key
+
 
 def recover_qkv(new_tensor, num_head, head_dim):
     # Step 1: Reshape back to (num_head, 3*head_dim, -1)
@@ -29,42 +71,9 @@ def recover_qkv(new_tensor, num_head, head_dim):
     
     return q_proj_params, k_proj_params, v_proj_params
 
-class HFCheckpointSaverLLaVA:
+class HFCheckpointSaverLLaVA(HFCheckpointSaver):
     def __init__(self, args, queue):
-        self.args = args
-        self.queue = queue
-
-    def insert_megatron_path(self):
-        sys.path.append(os.path.abspath(
-            os.path.join(os.path.dirname(__file__),
-                         os.path.pardir,
-                         os.path.pardir)))
-        if self.args.megatron_path is not None:
-            sys.path.insert(0, self.args.megatron_path)
-
-    def queue_get(self, name=None):
-        val = self.queue.get()
-        if val == "exit":
-            print("Loader exited, exiting saver")
-            exit(1)
-        if name is not None and self.args.checking and val["name"] != name:
-            val_name = val["name"]
-            print(f'Unexpected message. Expecting "{name}" but got "{val_name}". Exiting saver.')
-            exit(1)
-        if name is not None:
-            print(f"received {name}")
-        return val
-
-    def check_message(self, msg):
-        if not self.args.checking:
-            return
-        msg_name = msg.pop("name")
-        if len(msg.keys()) > 0:
-            print(f"Unexpected values in {msg_name}:")
-            for key in msg.keys():
-                print(f"   {key}")
-            print(f"Exiting. If you want to ignore this, use the argument --no-checking.")
-            exit(1)
+        super().__init__(args, queue)
 
     def receive_vision_backbone(self, schema):
         vision_embeddings_msg = self.queue_get("vit embeddings")
@@ -73,6 +82,8 @@ class HFCheckpointSaverLLaVA:
 
         if self.md.vision_model_type == "radio":
             params_dict["embedder_weight"] = vision_embeddings_msg["embedder weight"]
+            if getattr(self.md, 'separate_video_embedder', False):
+                params_dict["video_embedder_weight"] = vision_embeddings_msg["video_embedder weight"]
             params_dict["class_token"] = vision_embeddings_msg["class token"]
             params_dict["position_embeddings"] = vision_embeddings_msg["position embeddings"]
             params_dict["input_conditioner_norm_mean"] = torch.tensor([0.48145466, 0.4578275, 0.40821073]).unsqueeze(-1).unsqueeze(-1)
@@ -184,147 +195,96 @@ class HFCheckpointSaverLLaVA:
             self.state_dict["mlp1.1.bias"] = projection_msg["vision projection l0 bias"]
             self.state_dict["mlp1.3.bias"] = projection_msg["vision projection l1 bias"]
 
+        # Handle conv merge weights if conv_merging is enabled
+        if self.md.conv_merging:
+            self.state_dict["conv_merge.mlp.0.weight"] = projection_msg["conv merge l0 weight"]
+            self.state_dict["conv_merge.mlp.2.weight"] = projection_msg["conv merge l1 weight"]
+            if self.md.vision_projection_linear_bias:
+                self.state_dict["conv_merge.mlp.0.bias"] = projection_msg["conv merge l0 bias"]
+                self.state_dict["conv_merge.mlp.2.bias"] = projection_msg["conv merge l1 bias"]
 
-    def recover_lm_qkv_weight(self, qkv_weight):
-        dim = self.md.kv_channels
-        tp = self.md.previous_tensor_parallel_size
-        nh = self.md.num_attention_heads // tp
-        ng = self.md.num_query_groups // tp
-        hidden_size = self.md.hidden_size
+    def receive_sound_projection(self):
+        """Receive and save sound projection MLP weights."""
+        if getattr(self.md, 'sound_model_type', None) is None:
+            return
+        
+        try:
+            projection_msg = self.queue_get("sound projection")
+        except:
+            print("No sound projection data available, skipping")
+            return
+        
+        print("Receiving sound projection weights...")
+        
+        # Map to HuggingFace SoundProjection structure
+        # Megatron: sound_mlp1.{0,1,3} -> HF: sound_projection.{norm, linear1, linear2}
+        # Sound projection is an MLP: linear1 -> norm -> activation -> linear2
+        self.state_dict["sound_projection.linear1.weight"] = projection_msg["sound projection l0 weight"]
+        self.state_dict["sound_projection.norm.weight"] = projection_msg["sound projection norm weight"]
+        self.state_dict["sound_projection.linear2.weight"] = projection_msg["sound projection l1 weight"]
+        
+        if "sound projection norm bias" in projection_msg:
+            self.state_dict["sound_projection.norm.bias"] = projection_msg["sound projection norm bias"]
+        
+        if getattr(self.md, 'sound_projection_linear_bias', False):
+            self.state_dict["sound_projection.linear1.bias"] = projection_msg["sound projection l0 bias"]
+            self.state_dict["sound_projection.linear2.bias"] = projection_msg["sound projection l1 bias"]
+        
+        print("Loaded sound projection parameters")
 
-        params_per_tp = torch.chunk(qkv_weight, tp, dim=0)
+    def receive_sound_model(self):
+        """Receive the sound_model weights (e.g., Parakeet encoder) and map them to HF layout.
 
-        q = torch.empty(0)
-        k = torch.empty(0)
-        v = torch.empty(0)
+        The loader (`loader_llava.py`) sends the underlying sound model state dict in chunks
+        with keys prefixed by:
+          - ``sound_model.feature_extractor.*``
+          - ``sound_model.model.*``
 
-        for t in params_per_tp:
-            # 1. Reshape back to (ng, (dim*nh//ng + 2*dim), hidden_size).
-            qkv = t.reshape(ng, dim * (nh // ng) + 2 * dim, -1)
+        In the Hugging Face NemotronH checkpoint, the audio encoder lives under
+        ``sound_encoder.encoder`` (see ``audio_model.SoundEncoder``), so we rewrite
+        those prefixes accordingly:
 
-            # 2. Slice out q, k, v along dim=1.
-            q_t = qkv[:, : dim * (nh // ng), :]  
-            k_t = qkv[:, dim * (nh // ng) : dim * (nh // ng) + dim, :]
-            v_t = qkv[:, dim * (nh // ng) + dim :, :]
+          sound_model.feature_extractor.X -> sound_encoder.encoder.feature_extractor.X
+          sound_model.model.X             -> sound_encoder.encoder.X
+        """
+        # If no sound model is expected, do nothing
+        if getattr(self.md, "sound_model_type", None) is None:
+            return
 
-            # 3. Reshape each to match the original HF shapes.
-            q_t = q_t.reshape(ng, dim * (nh // ng), -1)
-            k_t = k_t.reshape(ng, dim, -1)
-            v_t = v_t.reshape(ng, dim, -1)
+        start_msg = self.queue_get("sound model start")
 
-            qp = q_t.reshape(dim * (nh // ng) * ng, -1)
-            kp = k_t.reshape(dim * ng, -1)
-            vp = v_t.reshape(dim * ng, -1)
+        total_chunks = start_msg.get("chunks", 0)
+        merged = {}
+        for idx in range(total_chunks):
+            chunk_msg = self.queue_get(f"sound model chunk {idx}")
+            merged.update(chunk_msg)
 
-            q = torch.cat([q, qp])
-            k = torch.cat([k, kp])
-            v = torch.cat([v, vp])
+        # Consume end sentinel
+        _ = self.queue_get("sound model end")
 
-        return q, k, v
+        fe_prefix = "sound_model.feature_extractor."
+        mdl_prefix = "sound_model.model."
 
-    def recover_lm_qkv_bias(self, qkv_bias):
-        dim = self.md.kv_channels
-        tp = self.md.previous_tensor_parallel_size
-        nh = self.md.num_attention_heads // tp
-        ng = self.md.num_query_groups // tp
-
-        bias_per_tp = torch.chunk(qkv_bias, tp, dim=0)
-
-        qb = torch.empty(0)
-        kb = torch.empty(0)
-        vb = torch.empty(0)
-
-        for b in bias_per_tp:
-            qkvb = b.reshape(ng, dim * (nh // ng) + 2 * dim)
-
-            q_b = qkvb[:, : dim * (nh // ng)]  
-            k_b = qkvb[:, dim * (nh // ng) : dim * (nh // ng) + dim]
-            v_b = qkvb[:, dim * (nh // ng) + dim :]
-
-            q_b = q_b.reshape(ng, dim * (nh // ng))
-            k_b = k_b.reshape(ng, dim)
-            v_b = v_b.reshape(ng, dim)
-
-            q_b = q_b.reshape(-1)
-            k_b = k_b.reshape(-1)
-            v_b = v_b.reshape(-1)
-
-            qb = torch.cat([qb, q_b]) 
-            kb = torch.cat([kb, k_b]) 
-            vb = torch.cat([vb, v_b]) 
-
-        return qb, kb, vb,
-
-    def receive_lm(self, schema):
-        embeddings_msg = self.queue_get("embeddings")
-        params_dict = {}
-
-        params_dict["word_embeddings"] = embeddings_msg["word embeddings"]
-        if self.md.position_embedding_type == "learned_absolute":
-            # TODO: Below may not be correct, but none of our models use absolute positional embeddings
-            params_dict["position_embeddings"] = embeddings_msg["position embeddings"]
-
-        schema.set(self.state_dict, params_dict)
-
-        for i in range(self.md.num_layers):
-            message = self.queue_get(f"transformer layer {i}")
-            params_dict = {}
-
-            params_dict["input_norm_weight"] = message["input norm weight"]
-            params_dict["post_norm_weight"] = message["post norm weight"]
-            if self.md.norm_has_bias:
-                params_dict["input_norm_bias"] = message["input norm bias"]
-                params_dict["post_norm_bias"] = message["post norm bias"]
-
-            if self.md.swiglu:
-                params_dict["mlp_l0_weight_W"] = message["mlp l0 weight W"]
-                params_dict["mlp_l0_weight_V"] = message["mlp l0 weight V"]
+        for key, value in merged.items():
+            if key.startswith(fe_prefix):
+                # Map feature_extractor weights into HF `SoundEncoder.encoder.feature_extractor`
+                new_key = "sound_encoder.encoder.feature_extractor." + key[len(fe_prefix):]
+            elif key.startswith(mdl_prefix):
+                # Map main encoder weights into HF `SoundEncoder.encoder`
+                new_key = "sound_encoder.encoder." + key[len(mdl_prefix):]
             else:
-                params_dict["mlp_l0_weight"] = message["mlp l0 weight"]
-            if self.md.linear_bias:
-                if self.md.swiglu:
-                    params_dict["mlp_l0_bias_W"] = message["mlp l0 bias W"]
-                    params_dict["mlp_l0_bias_V"] = message["mlp l0 bias V"]
-                else:
-                    params_dict["mlp_l0_bias"] = message["mlp l0 bias"] 
+                # Unknown prefix; skip rather than breaking conversion.
+                continue
 
-            qkv_weight = message["qkv weight"]
-            if self.md.qkv_bias:
-                qkv_bias = message["qkv bias"]
+            # Convert NeMo key names to HuggingFace format
+            new_key = _convert_nemo_parakeet_key_to_hf(new_key)
+            self.state_dict[new_key] = value
 
-            q, k, v = self.recover_lm_qkv_weight(qkv_weight)
-            q = q.clone().detach().contiguous()
-            params_dict["q_proj_weight"] = q
-            k = k.clone().detach().contiguous()
-            params_dict["k_proj_weight"] = k
-            v = v.clone().detach().contiguous()
-            params_dict["v_proj_weight"] = v
-
-            if self.md.qkv_bias:
-                qb, kb, vb = self.recover_lm_qkv_bias(qkv_bias)
-                qb = qb.clone().detach().contiguous()
-                params_dict["q_proj_bias"] = qb
-                kb = kb.clone().detach().contiguous()
-                params_dict["k_proj_bias"] = kb
-                vb = vb.clone().detach().contiguous()
-                params_dict["v_proj_bias"] = vb
-
-            params_dict["mlp_l1_weight"] = message["mlp l1 weight"]
-            params_dict["dense_weight"] = message["dense weight"]
-            if self.md.linear_bias:
-                params_dict["mlp_l1_bias"] = message["mlp l1 bias"]
-                params_dict["dense_bias"] = message["dense bias"]
-
-            schema.set_layer(self.state_dict, i, params_dict)
-
-        params_dict = {
-            "final_norm": self.queue_get('final norm')['weight'],
-            "output_layer": self.queue_get('output layer')['weight'],
-
-        }
-        schema.set(self.state_dict, params_dict)
+        print("Loaded sound model parameters")
 
     def receive_model(self):
+        """Override to handle vision, sound, and language models for LLaVA"""
+        # Vision model
         vision_model_prefix = "vision_model.vision_model."
         vision_layer_prefix = "encoder.layers"
         if self.md.vision_model_type == "radio":
@@ -340,55 +300,25 @@ class HFCheckpointSaverLLaVA:
 
         self.receive_vision_projection()
 
+        # Sound model (if present)
+        # Note: Order must match loader_llava.py lines 455-456
+        if getattr(self.md, 'sound_model_type', None) is not None:
+            self.receive_sound_projection()
+            self.receive_sound_model()
+
+        # Language model
         language_model_prefix = "language_model."
-        language_layer_prefix = "model.layers"
+        if self.md.model_type == "hybrid":
+            language_layer_prefix = "backbone.layers"
+        else:
+            language_layer_prefix = "model.layers"
         language_schema = get_language_model_schema(
+            model_type=self.args.model_type,
             prefix=language_model_prefix,
             layer_prefix=language_layer_prefix,
             use_swiglu=self.md.swiglu,
         )
         self.receive_lm(language_schema)
-
-    def save_state_dict_to_hf_checkpoint(self):
-        if not os.path.exists(self.args.save_dir):
-            os.makedirs(self.args.save_dir)
-
-        # Store the state_dict to file.
-        max_shard_size = "4GB"
-        shards, index = shard_checkpoint(self.state_dict, max_shard_size=max_shard_size)
-
-        # Save the model
-        for shard_file, shard in shards.items():
-            torch.save(shard, os.path.join(self.args.save_dir, shard_file))
-
-        if index is None:
-            print(f"Model weights saved in {os.path.join(self.args.save_dir, WEIGHTS_NAME)}")
-        else:
-            import json
-            save_index_file = os.path.join(self.args.save_dir, WEIGHTS_INDEX_NAME)
-            # Save the index as well
-            with open(save_index_file, "w", encoding="utf-8") as f:
-                content = json.dumps(index, indent=2, sort_keys=True) + "\n"
-                f.write(content)
-            print(
-                f"The model is bigger than the maximum size per checkpoint ({max_shard_size}) and is going to be "
-                    f"split in {len(shards)} checkpoint shards. You can find where each parameters has been saved in the "
-                    f"index located at {save_index_file}."
-            )
-
-    def save(self):
-        self.insert_megatron_path()
-
-        self.md = self.queue_get()
-        
-        self.state_dict = {}
-
-        self.receive_model()
-
-        self.save_state_dict_to_hf_checkpoint()
-
-        print("Done!")
-        
 
 def save_checkpoint(queue, args):
     """

@@ -67,9 +67,7 @@ class TestAllReduceLNGrads:
             else:
                 param.grad = torch.ones_like(param)
 
-        _allreduce_non_tensor_model_parallel_grads(
-            [self.model], self.transformer_config, parallel_state.get_tensor_model_parallel_group()
-        )
+        _allreduce_non_tensor_model_parallel_grads([self.model], self.transformer_config)
 
     @pytest.mark.parametrize(
         ("freeze_model", "pp_size", "share_embeddings"),
@@ -90,7 +88,5 @@ class TestAllReduceLNGrads:
                 param.requires_grad = False
             else:
                 param.grad = torch.ones_like(param)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        embd_group = parallel_state.get_embedding_group()
 
-        _allreduce_word_embedding_grads([self.model], self.transformer_config, embd_group, pp_group)
+        _allreduce_word_embedding_grads([self.model], self.transformer_config)

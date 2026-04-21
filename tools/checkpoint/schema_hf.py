@@ -55,6 +55,116 @@ class HFLMSchema(HFSchema):
         }
         super().__init__(schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix)
 
+class HFHybridLMSchema(HFSchema):
+    def __init__(self, prefix, layer_prefix, use_swiglu=False):
+        schema = {
+            "word_embeddings": f"{prefix}backbone.embeddings.weight",
+            "position_embeddings": f"{prefix}embeddings.position_embedding",
+            "final_norm": f"{prefix}backbone.norm_f.weight",
+            "output_layer": f"{prefix}lm_head.weight",
+        }
+
+        layer_schema = {
+            "norm_weight": "norm.weight",
+            "norm_bias": "norm.bias",
+
+            # Self attention
+            "q_proj_weight": "mixer.q_proj.weight",
+            "k_proj_weight": "mixer.k_proj.weight",
+            "v_proj_weight": "mixer.v_proj.weight",
+            "q_proj_bias": "mixer.q_proj.bias",
+            "k_proj_bias": "mixer.k_proj.bias",
+            "v_proj_bias": "mixer.v_proj.bias",
+            "dense_weight": "mixer.o_proj.weight",
+            "dense_bias": "mixer.o_proj.bias",
+
+            # MLP
+            "mlp_l0_weight": "mixer.up_proj.weight",
+            "mlp_l0_bias": "mixer.up_proj.bias",
+            "mlp_l1_weight": "mixer.down_proj.weight",
+            "mlp_l1_bias": "mixer.down_proj.bias",
+
+            # Mixer
+            "mixer_dt_bias": "mixer.dt_bias",
+            "mixer_D": "mixer.D",
+            "mixer_A_log": "mixer.A_log",
+            "mixer_in_proj_weight": "mixer.in_proj.weight",
+            "mixer_norm_weight": "mixer.norm.weight",
+            "mixer_conv1d_weight" : "mixer.conv1d.weight",
+            "mixer_conv1d_bias" : "mixer.conv1d.bias",
+            "mixer_out_proj_weight" : "mixer.out_proj.weight",
+
+        }
+        super().__init__(schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix)
+
+class HFHybridMoELMSchema(HFSchema):
+    def __init__(self, prefix, layer_prefix, use_swiglu=False):
+        # Top-level schema identical to hybrid LM
+        schema = {
+            "word_embeddings": f"{prefix}backbone.embeddings.weight",
+            "position_embeddings": f"{prefix}embeddings.position_embedding",
+            "final_norm": f"{prefix}backbone.norm_f.weight",
+            "output_layer": f"{prefix}lm_head.weight",
+        }
+
+        # Base layer mapping (attention, mlp, mixer) from hybrid LM
+        layer_schema = {
+            "norm_weight": "norm.weight",
+            "norm_bias": "norm.bias",
+
+            # Self attention
+            "q_proj_weight": "mixer.q_proj.weight",
+            "k_proj_weight": "mixer.k_proj.weight",
+            "v_proj_weight": "mixer.v_proj.weight",
+            "q_proj_bias": "mixer.q_proj.bias",
+            "k_proj_bias": "mixer.k_proj.bias",
+            "v_proj_bias": "mixer.v_proj.bias",
+            "dense_weight": "mixer.o_proj.weight",
+            "dense_bias": "mixer.o_proj.bias",
+
+            # MLP
+            "mlp_l0_weight": "mixer.up_proj.weight",
+            "mlp_l0_bias": "mixer.up_proj.bias",
+            "mlp_l1_weight": "mixer.down_proj.weight",
+            "mlp_l1_bias": "mixer.down_proj.bias",
+
+            # Mixer
+            "mixer_dt_bias": "mixer.dt_bias",
+            "mixer_D": "mixer.D",
+            "mixer_A_log": "mixer.A_log",
+            "mixer_in_proj_weight": "mixer.in_proj.weight",
+            "mixer_norm_weight": "mixer.norm.weight",
+            "mixer_conv1d_weight" : "mixer.conv1d.weight",
+            "mixer_conv1d_bias" : "mixer.conv1d.bias",
+            "mixer_out_proj_weight" : "mixer.out_proj.weight",
+
+            # MoE additions (fixed locations)
+            "router_weight": "mixer.gate.weight",
+            "router_bias": "mixer.gate.e_score_correction_bias",
+            "shared_up_proj_weight": "mixer.shared_experts.up_proj.weight",
+            "shared_down_proj_weight": "mixer.shared_experts.down_proj.weight",
+        }
+
+        self.use_swiglu = use_swiglu
+        super().__init__(schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix)
+
+    def set_layer(self, state_dict, layer_idx, params):
+        # Handle per-expert tensors specially, then delegate for fixed keys
+        experts_up = params.get("experts_up_proj_weight", None)
+        experts_down = params.get("experts_down_proj_weight", None)
+        if experts_up is not None:
+            for e in range(experts_up.shape[0]):
+                state_dict[f"{self.layer_prefix}.{layer_idx}.mixer.experts.{e}.up_proj.weight"] = experts_up[e].clone()
+        if experts_down is not None:
+            for e in range(experts_down.shape[0]):
+                state_dict[f"{self.layer_prefix}.{layer_idx}.mixer.experts.{e}.down_proj.weight"] = experts_down[e].clone()
+
+        # Remove handled keys so parent logic can assert on the rest
+        filtered = {k: v for k, v in params.items() if k not in ("experts_up_proj_weight", "experts_down_proj_weight")}
+        for k, p in filtered.items():
+            assert k in self.layer_mapping, f"params_dict for layer {layer_idx} contains key {k} that isn't specified in the schema"
+            state_dict[f"{self.layer_prefix}.{layer_idx}.{self.layer_mapping[k]}"] = p.clone()
+
 class HFInternViTSchema(HFSchema):
     def __init__(self, prefix, layer_prefix, use_swiglu=False):
         schema = {
@@ -130,6 +240,7 @@ class HFRADIOSchema(HFSchema):
     def __init__(self, prefix, layer_prefix, use_swiglu=False):
         schema = {
             "embedder_weight": f"{prefix}model.patch_generator.embedder.weight",
+            "video_embedder_weight": f"{prefix}model.patch_generator.video_embedder.weight",  # OK if doesn't exist
             "class_token": f"{prefix}model.patch_generator.cls_token.token",
             "position_embeddings": f"{prefix}model.patch_generator.pos_embed",
             "input_conditioner_norm_mean": f"{prefix}input_conditioner.norm_mean",
@@ -171,8 +282,13 @@ def get_vision_model_schema(
 
 
 def get_language_model_schema(
+    model_type = "GPT",
     prefix: T.Optional[str] = "",
     layer_prefix: T.Optional[str] = "",
     use_swiglu=False,
 ) -> HFSchema:
-    return HFLMSchema(prefix, layer_prefix, use_swiglu=use_swiglu)
+    if model_type == "hybrid":
+        # Prefer MoE-capable schema to allow routing/experts when present; it remains compatible with non-MoE layers
+        return HFHybridMoELMSchema(prefix, layer_prefix, use_swiglu=use_swiglu)
+    else:
+        return HFLMSchema(prefix, layer_prefix, use_swiglu=use_swiglu)

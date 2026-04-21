@@ -3,11 +3,16 @@
 import torch
 import torch.nn.functional as F
 
-from megatron.core.activations import squared_relu
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
 ######################  WEIGHTED SQUARED ReLU FUSION  ######################
+
+
+@jit_fuser
+def _squared_relu(x: torch.Tensor) -> torch.Tensor:
+    """Squared ReLU activation: (max(0, x))^2."""
+    return torch.pow(F.relu(x), 2)
 
 
 @jit_fuser
@@ -50,7 +55,7 @@ def weighted_squared_relu_back(g: torch.Tensor, x: torch.Tensor, weights: torch.
     input_grad = _squared_relu_back(g * weights, x)
 
     # Gradient w.r.t. the weights.
-    weights_grad = squared_relu(x) * g.to(w_dtype)
+    weights_grad = _squared_relu(x) * g.to(w_dtype)
     # Sum across the hidden dimension so each token has a single scalar weight.
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
 
@@ -72,6 +77,7 @@ class WeightedSquaredReLUFunction(torch.autograd.Function):
             fp8_input_store (bool): a bool flag to indicate if storing input in fp8.
         """
         ctx.save_for_backward(input, weights)
+        ctx.ori_input_dtype = input.dtype
         return weighted_squared_relu(input, weights)
 
     @staticmethod

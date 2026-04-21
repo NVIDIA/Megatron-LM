@@ -6,8 +6,6 @@
 CHECKPOINT_PATH=$1
 TOKENIZER_PATH=$2
 
-HYBRID_LAYER_PATTERN="M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
-
 DISTRIBUTED_ARGS="--nproc_per_node 1 \
                   --nnodes 1 \
                   --node_rank 0 \
@@ -26,12 +24,14 @@ torchrun $DISTRIBUTED_ARGS ../../tools/run_mamba_text_generation_server.py \
        --tensor-model-parallel-size 1  \
        --pipeline-model-parallel-size 1  \
        --untie-embeddings-and-output-weights \
-       --hybrid-layer-pattern ${HYBRID_LAYER_PATTERN} \
+       --num-layers 56  \
        --hidden-size 4096  \
        --load ${CHECKPOINT_PATH}  \
        --num-attention-heads 32  \
        --group-query-attention \
        --num-query-groups 8 \
+       --hybrid-attention-ratio 0.08 \
+       --hybrid-mlp-ratio 0.5 \
        --attention-dropout 0.0 \
        --hidden-dropout 0.0 \
        --disable-bias-linear \

@@ -1,4 +1,3 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import glob
 import logging
 import os
@@ -36,6 +35,7 @@ def main(pipeline_id: int):
         and pipeline_bridge.downstream_pipeline is not None
     ]
 
+    ASSETS_DIR = pathlib.Path("tmp") / "results" / "iteration=0"
     for pipeline_bridge in pipeline_bridges:
         functional_pipeline = project.pipelines.get(pipeline_bridge.downstream_pipeline['id'])
 
@@ -49,7 +49,6 @@ def main(pipeline_id: int):
             logger.info("Starting with job %s", job.name)
 
             try:
-                shutil.rmtree(pathlib.Path("tmp") / "results", ignore_errors=True)
                 file_name = '__artifacts.zip'
                 with open(file_name, "wb") as f:
                     job.artifacts(streamed=True, action=f.write)
@@ -60,15 +59,11 @@ def main(pipeline_id: int):
                 continue
 
             os.unlink(file_name)
-            iteration_dir = sorted(
-                (pathlib.Path("tmp") / "results").glob("iteration=*"),
-                key=lambda p: int(p.name.split("=")[1]),
-            )[-1]
-            restart_dir = sorted(os.listdir(iteration_dir))[-1]
+            restart_dir = os.listdir(pathlib.Path("tmp") / "results" / "iteration=0")[-1]
             coverage_report_source = list(
                 glob.glob(
                     str(
-                        iteration_dir
+                        pathlib.Path(ASSETS_DIR)
                         / f"{restart_dir}"
                         / "assets"
                         / "basic"

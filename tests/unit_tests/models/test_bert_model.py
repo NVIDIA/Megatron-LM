@@ -1,22 +1,21 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
+from importlib.metadata import version
 
 import pytest
 import torch
 from packaging.version import Version as PkgVersion
+from pytest_mock import mocker
 
 from megatron.core.models.bert.bert_layer_specs import (
     bert_layer_local_spec,
-    get_bert_layer_with_transformer_engine_spec,
-    get_bert_layer_with_transformer_engine_submodules,
+    bert_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
-from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -41,7 +40,7 @@ class TestBertModel:
         self.bert_model = BertModel(
             config=transformer_config,
             num_tokentypes=0,
-            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            transformer_layer_spec=bert_layer_with_transformer_engine_spec,
             vocab_size=100,
             max_sequence_length=4,
         )
@@ -113,7 +112,7 @@ class TestBertModelAttentionDimensions:
         self.bert_model = BertModel(
             config=self.transformer_config,
             num_tokentypes=0,
-            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            transformer_layer_spec=bert_layer_with_transformer_engine_spec,
             vocab_size=100,
             max_sequence_length=4,
         )
@@ -140,15 +139,16 @@ class TestBertModelAttentionDimensions:
 
     @pytest.mark.internal
     def test_transformer_engine_version_1_10(self, mocker):
-        submodules = get_bert_layer_with_transformer_engine_submodules()
-        submodules.self_attention.params['attn_mask_type'] = AttnMaskType.arbitrary
+        bert_layer_with_transformer_engine_spec.submodules.self_attention.params[
+            'attn_mask_type'
+        ] == AttnMaskType.arbitrary
 
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.10"))
-        self.bert_model.transformer_layer_spec = ModuleSpec(
-            module=TransformerLayer, submodules=submodules
-        )
+        self.bert_model.transformer_layer_spec = bert_layer_with_transformer_engine_spec
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
-        attn_mask_type = submodules.self_attention.params['attn_mask_type']
+        attn_mask_type = self.bert_model.transformer_layer_spec.submodules.self_attention.params[
+            'attn_mask_type'
+        ]
         assert (
             attn_mask_type == AttnMaskType.padding
         ), f"Exepcted attn mask type to be padding, but got {attn_mask_type}"
@@ -160,24 +160,24 @@ class TestBertModelAttentionDimensions:
     def test_transformer_engine_version_1_7_to_1_10_flash_attn(self, mocker):
         self.bert_model.config.attention_backend = AttnBackend.flash
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
-        self.bert_model.transformer_layer_spec = get_bert_layer_with_transformer_engine_spec()
+        self.bert_model.transformer_layer_spec = bert_layer_with_transformer_engine_spec
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
         assert (
             attn_mask_dimensions == "b11s"
         ), f"Expected b11s for attn_mask_dimensions but got {attn_mask_dimensions}"
 
     @pytest.mark.internal
-    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_transformer_engine_version_1_7_to_1_10_rng_error(self, mocker):
-        submodules = get_bert_layer_with_transformer_engine_submodules()
-        submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
+        bert_layer_with_transformer_engine_spec.submodules.self_attention.params[
+            'attn_mask_type'
+        ] == AttnMaskType.padding
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
         with pytest.raises(Exception) as exc_info:
             self.bert_model = BertModel(
                 config=self.transformer_config,
                 num_tokentypes=0,
-                transformer_layer_spec=ModuleSpec(module=TransformerLayer, submodules=submodules),
+                transformer_layer_spec=bert_layer_with_transformer_engine_spec,
                 vocab_size=100,
                 max_sequence_length=4,
             )
@@ -190,14 +190,15 @@ class TestBertModelAttentionDimensions:
     @pytest.mark.internal
     def test_transformer_engine_version_1_7_to_1_10_unfused_attention(self, mocker):
         self.bert_model.config.attention_backend = AttnBackend.unfused
-        submodules = get_bert_layer_with_transformer_engine_submodules()
-        submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
+        bert_layer_with_transformer_engine_spec.submodules.self_attention.params[
+            'attn_mask_type'
+        ] == AttnMaskType.padding
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
-        self.bert_model.transformer_layer_spec = ModuleSpec(
-            module=TransformerLayer, submodules=submodules
-        )
+        self.bert_model.transformer_layer_spec = bert_layer_with_transformer_engine_spec
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
-        attn_mask_type = submodules.self_attention.params['attn_mask_type']
+        attn_mask_type = self.bert_model.transformer_layer_spec.submodules.self_attention.params[
+            'attn_mask_type'
+        ]
         assert (
             attn_mask_type == AttnMaskType.arbitrary
         ), f"Exepcted attn mask type to be arbitrary, but got {attn_mask_type}"
@@ -216,7 +217,7 @@ class TestBertModelAttentionDimensions:
             self.bert_model = BertModel(
                 config=self.transformer_config,
                 num_tokentypes=0,
-                transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+                transformer_layer_spec=bert_layer_with_transformer_engine_spec,
                 vocab_size=100,
                 max_sequence_length=4,
             )

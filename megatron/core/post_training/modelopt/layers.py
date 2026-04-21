@@ -1,29 +1,21 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Callable, List, Optional, cast
+from typing import Callable, List, Optional
 
 import torch
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-from megatron.core.typed_torch import copy_signature
 
-logger = logging.getLogger(__name__)
+try:
+    import transformer_engine as te
 
-if HAVE_TE or TYPE_CHECKING:
-    import transformer_engine as te  # type: ignore[import]
-
-    from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
-else:
-    te = None
-    _get_extra_te_kwargs = None
-
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
     "quant_cfg": {
@@ -55,9 +47,7 @@ class Norm:
     mismatch issue.
     """
 
-    def __new__(
-        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5
-    ) -> LayerNormInterface:
+    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
         if not HAVE_TE:
             raise ImportError(
                 "Transformer-Engine is not installed, please install it with "
@@ -99,7 +89,7 @@ class Norm:
             instance._register_state_dict_hook(_state_dict_hook)
             instance._register_load_state_dict_pre_hook(_load_state_dict_pre_hook)
 
-        return cast(LayerNormInterface, instance)
+        return instance
 
 
 class Linear(torch.nn.Linear):
@@ -126,7 +116,6 @@ class Linear(torch.nn.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.config = config
-        self.tp_group = tp_group
 
         self._return_bias = skip_bias_add and bias
 
@@ -164,11 +153,7 @@ class Linear(torch.nn.Linear):
                 if v.ndim == 0:
                     state_dict[k] = v.view(1)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            sharded_offsets=sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata['dp_cp_group'],
+            state_dict, prefix, sharded_offsets=sharded_offsets
         )
         return sharded_state_dict
 
@@ -185,7 +170,7 @@ class RealQuantTransformerLayer(TransformerLayer):
     """Real quantization transformer layer base class.
 
     This base class iniitialize the default TransformerLayer and immediately
-    perform weight-only real quantization via Model Optimizer.
+    perform weight-only real quantization via TensorRT Model Optimizer.
     All linear weights (Linear, ColumnParallelLinear, RowParallelLinear) picked
     up will be replaced with low-bit data type (default torch.uint8). If sub-byte
     real_quant_cfg is used, the weight shape will further be half.
@@ -196,7 +181,6 @@ class RealQuantTransformerLayer(TransformerLayer):
     verbose: bool = False
     real_quant_cfg: str = "None"
 
-    @copy_signature(TransformerLayer.__init__)
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -245,7 +229,7 @@ class RealQuantTransformerLayer(TransformerLayer):
                 if not isinstance(v, torch.Tensor):
                     continue
                 original_dtype, original_shape = self._original_tensor_info.get(k, ("-", "-"))
-                logger.info(
+                print(
                     "{:<64} {:<16} {:<32} {:<16} {:<32}".format(
                         k, original_dtype, original_shape, str(v.dtype), str(v.shape)
                     )

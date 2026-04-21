@@ -4,9 +4,8 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
-  NON_DETERMINSTIC_RESULTS: 1
+  SKIP_PYTEST: 1
 TEST_TYPE: "release"
-LAUNCHER: ft_launcher
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -80,7 +79,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}
   --save: ${CHECKPOINT_SAVE_PATH}
   --no-ckpt-fully-parallel-save: true
-  --save-interval: 150
+  --save-interval: 500
   # Add initialization args
   --init-method-std: 0.008
   # Add logging args
@@ -93,9 +92,7 @@ MODEL_ARGS:
   --log-interval: 1
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
-  --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
-  --wandb-save-dir: ${WANDB_SAVE_PATH}
   # Add mixed precision args
   --bf16: true
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
@@ -103,5 +100,6 @@ MODEL_ARGS:
 METRICS:
   - "iteration-time"
   - "lm loss"
+  - "num-zeros"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"

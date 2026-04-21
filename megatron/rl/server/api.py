@@ -18,7 +18,7 @@ class Server(TypeLookupable):
     async def suspend(self):
         pass
 
-    async def resume(self):
+    def resume(self):
         pass
 
     async def kill(self):

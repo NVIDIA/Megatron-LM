@@ -69,7 +69,7 @@ COMMON_OPTIONS="\
     --transformer-impl transformer_engine \
     --bf16 \
     --te-rng-tracker \
-    --cuda-graph-impl local \
+    --enable-cuda-graph \
     --inference-dynamic-batching-num-cuda-graphs 1 \
     --inference-dynamic-batching-buffer-size-gb 20 \
     --data-parallel-random-init \
@@ -94,7 +94,7 @@ MODEL_OPTIONS="\
   --ckpt-format torch \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-requests $MAX_INFERENCE_BS \
+  --inference-max-batch-size $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --untie-embeddings-and-output-weights \
   --disable-bias-linear \
@@ -172,6 +172,7 @@ torchrun \
     --save $CHECKPOINT_DIR \
     --load $CHECKPOINT_DIR \
     --tensorboard-dir $TB_DIR \
+    --langrl-inference-server-type inplace_megatron \
     --seed $SEED \
     --sequence-parallel \
     --finetune \

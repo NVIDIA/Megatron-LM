@@ -3,10 +3,6 @@ from functools import partial
 
 import torch
 
-from examples.multimodal.layer_scaling import (
-    LayerScalingTransformerLayer,
-    get_bias_dropout_add_layer_scaling,
-)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -15,10 +11,9 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.typed_torch import not_none
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from examples.multimodal.layer_scaling import LayerScalingTransformerLayer, get_bias_dropout_add_layer_scaling
 
-if HAVE_TE:
+try:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -26,14 +21,10 @@ if HAVE_TE:
         TENorm,
         TERowParallelLinear,
     )
-else:
-    (
-        TEColumnParallelLinear,
-        TEDotProductAttention,
-        TELayerNormColumnParallelLinear,
-        TENorm,
-        TERowParallelLinear,
-    ) = (None, None, None, None, None)
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 try:
     import apex
@@ -56,8 +47,8 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
-            linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
+            linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
+            linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
         ),
     )
 
@@ -66,8 +57,7 @@ def get_norm_mlp_module_spec_te() -> ModuleSpec:
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=not_none(TELayerNormColumnParallelLinear),
-            linear_fc2=not_none(TERowParallelLinear),
+            linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
         ),
     )
 
@@ -92,7 +82,7 @@ def get_radio_g_layer_spec(normalization) -> ModuleSpec:
     return ModuleSpec(
         module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=not_none(norm),
+            input_layernorm=norm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
@@ -105,7 +95,7 @@ def get_radio_g_layer_spec(normalization) -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add_layer_scaling,
-            pre_mlp_layernorm=not_none(norm),
+            pre_mlp_layernorm=norm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add_layer_scaling,
         ),
@@ -123,8 +113,8 @@ def get_radio_g_layer_spec_te() -> ModuleSpec:
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=not_none(TELayerNormColumnParallelLinear),
-                    core_attention=not_none(TEDotProductAttention),
+                    linear_qkv=TELayerNormColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
                     linear_proj=TERowParallelLinear,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,

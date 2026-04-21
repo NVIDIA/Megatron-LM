@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -14,10 +13,14 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.utils import is_te_min_version
 
 logger = logging.getLogger(__name__)
 
+# Prefer fused RoPE from Apex as we need the `transpose_output_memory` argument for the bshd trick.
+# See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2469.
 try:
+    # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
 except ImportError:
     fused_apply_rotary_pos_emb = None
@@ -35,14 +38,7 @@ except ImportError:
     apply_rotary_emb_flash = None
 
 
-__all__ = [
-    'apply_rotary_pos_emb',
-    'apply_rotary_emb_flash',
-    'apply_rotary_pos_emb_with_cos_sin',
-    'fused_apply_rotary_pos_emb',
-    'fused_apply_rotary_pos_emb_thd',
-    'get_pos_emb_on_this_cp_rank',
-]
+__all__ = ['apply_rotary_emb_flash']
 
 
 def get_pos_emb_on_this_cp_rank(
@@ -188,9 +184,13 @@ def _apply_rotary_pos_emb_thd(
 
     Args:
         t (Tensor): Input tensor T is of shape [t, h, d]
+        If CP is enabled, input tensor will be already sharded
+
         cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
-        with shape [b + 1] and dtype torch.int32.
-        freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
+        with shape [b + 1] and dtype torch.int32. Regardless whether CP is enabled
+        or not, input tensor will always contain full sequence lengths.
+
+        freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d] or [t, 1, 1, d]
         cp_group (torch.distributed.ProcessGroup): The context parallel group
 
     Returns:
@@ -203,13 +203,22 @@ def _apply_rotary_pos_emb_thd(
     cp_rank = cp_group.rank()
     seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
 
-    # Handle two different frequency tensor formats:
-    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
-    #    -> Use offset-based mapping for exact positional correspondence
-    # 2. Otherwise: freqs contains only max sequence length positions
-    #    -> Use traditional mapping without offsets (map first :seqlen part)
-    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
+    if len(t) == len(freqs):
+        # @ekhvedchenia
+        # If the length of t and freqs are the same, we assume that
+        # freqs were computed from position_ids (that are already CP-sharded)
+        # So we can simply apply RoPe without any acrobatics
+        return _apply_rotary_pos_emb_bshd(
+            t=t.unsqueeze(1),
+            freqs=freqs,
+            rotary_interleaved=rotary_interleaved,
+            multi_latent_attention=multi_latent_attention,
+            mscale=mscale,
+        ).squeeze(1)
+    elif freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
         # CASE 1: Exact mapping with offsets
+        # freqs contains all positions across all sequences
+        # -> Use offset-based mapping for exact positional correspondence
         # Build packed freqs in one pass, then apply once to the whole packed tensor
         sequence_splits = torch.split(t, seqlens)
         freq_slices = []
@@ -231,6 +240,8 @@ def _apply_rotary_pos_emb_thd(
         ).squeeze(1)
     else:
         # CASE 2: Traditional mapping without offsets
+        # freqs contains only max sequence length positions
+        # -> Use traditional mapping without offsets (map first :seqlen part)
         # Build packed freqs for all sequences using the standard mapping, then apply once
         sequence_splits = torch.split(t, seqlens)
         freqs_packed = torch.cat(
@@ -267,53 +278,63 @@ def apply_rotary_pos_emb(
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
-            # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
-            use_unfused = False
+            # NOTE: TE backends do not support mRoPE in bshd format when bs > 1
             if config.mrope_section is not None and freqs.shape[1] > 1:
-                # TODO: Add a check in TransformerConfig and remove this unfused implementation.
-                warnings.warn(
-                    "apply_rope_fusion does not support mRoPE in bshd format when bs > 1. "
-                    "Please set apply_rope_fusion to false. This will become an error in v0.16."
+                return _apply_rotary_pos_emb_bshd(
+                    t,
+                    freqs,
+                    rotary_interleaved=config.rotary_interleaved,
+                    multi_latent_attention=config.multi_latent_attention,
+                    mscale=mscale,
                 )
-                use_unfused = True
-            if mscale != 1.0:
-                warnings.warn(
-                    f"mscale={mscale} is not supported by TE's fused RoPE. "
-                    "Using unfused implementation."
-                )
-                use_unfused = True
-            if not use_unfused:
-                assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
-                return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
+            else:
+                if config.rotary_interleaved:
+                    try:
+                        from megatron.core.extensions.transformer_engine import (
+                            fused_apply_rotary_pos_emb,
+                        )
+
+                        return fused_apply_rotary_pos_emb(t, freqs, interleaved=True)
+                    except ImportError:
+                        raise ImportError(
+                            "TE interleaved fused RoPE is not available."
+                            "Please install TE >= 2.3.0.dev0."
+                        )
+                else:
+                    assert (
+                        fused_apply_rotary_pos_emb is not None
+                    ), "apply_rope_fusion is not available."
+                    return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
-            return fused_apply_rotary_pos_emb_thd(
+            cp_size = cp_group.size()
+            if cp_size > 1:
+                if not is_te_min_version("1.11.0", check_equality=False):
+                    raise ValueError("Only TE >= 1.12 supports RoPE fusion for THD format with CP.")
+                return fused_apply_rotary_pos_emb_thd(
+                    t, cu_seqlens, freqs, cp_size=cp_size, cp_rank=cp_group.rank()
+                )
+            else:
+                return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
+    else:
+        if cu_seqlens is None:
+            return _apply_rotary_pos_emb_bshd(
+                t,
+                freqs,
+                rotary_interleaved=config.rotary_interleaved,
+                multi_latent_attention=config.multi_latent_attention,
+                mscale=mscale,
+            )
+        else:
+            return _apply_rotary_pos_emb_thd(
                 t,
                 cu_seqlens,
                 freqs,
-                cp_size=cp_group.size(),
-                cp_rank=cp_group.rank(),
-                interleaved=config.rotary_interleaved,
+                rotary_interleaved=config.rotary_interleaved,
+                multi_latent_attention=config.multi_latent_attention,
+                mscale=mscale,
+                cp_group=cp_group,
             )
-    # use unfused implementation
-    if cu_seqlens is None:
-        return _apply_rotary_pos_emb_bshd(
-            t,
-            freqs,
-            rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=config.multi_latent_attention,
-            mscale=mscale,
-        )
-    else:
-        return _apply_rotary_pos_emb_thd(
-            t,
-            cu_seqlens,
-            freqs,
-            rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=config.multi_latent_attention,
-            mscale=mscale,
-            cp_group=cp_group,
-        )
 
 
 def apply_rotary_pos_emb_with_cos_sin(

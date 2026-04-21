@@ -1,0 +1,152 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  TORCH_NCCL_AVOID_RECORD_STREAMS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: 0
+  NVTE_FUSED_ATTN: 1
+  PYTHONWARNINGS: ignore
+  NCCL_DEBUG: VERSION
+
+MODEL_ARGS:
+  # Distributed args
+  --distributed-timeout-minutes: 60
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 8
+  --context-parallel-size: 1
+  --expert-tensor-parallel-size: 1
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+
+  # Training args
+  --use-mcore-models: true
+  --sequence-parallel: true
+  --use-flash-attn: true
+  --disable-bias-linear: true
+  --micro-batch-size: 1
+  --global-batch-size: 128
+  --train-iters: 25
+  --exit-duration-in-mins: 230
+  --no-save-optim: true
+  --no-check-for-nan-in-loss-and-grad: true
+  --no-rope-fusion: true
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: te
+  --manual-gc: true
+  --manual-gc-interval: 5
+
+  # Transformer Engine args
+  --transformer-impl: transformer_engine
+
+  # Data args
+  --seq-length: 4096
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --tokenizer-type: NullTokenizer
+  --mock-data: true
+  --split: 99,1,0
+
+  # Add network size args
+  --num-layers: 16
+  --hidden-size: 2560
+  --ffn-hidden-size: 12288
+  --num-attention-heads: 32
+  --kv-channels: 128
+  --max-position-embeddings: 4096
+  --position-embedding-type: rope
+  --rotary-base: 10000
+  --make-vocab-size-divisible-by: 3232
+  --vocab-size: 131072
+  --normalization: RMSNorm
+  --norm-epsilon: 1e-6
+  --swiglu: true
+  --untie-embeddings-and-output-weights: true
+  --multi-latent-attention: true
+  # Comment out the following MTP args to disable MTP
+  --mtp-num-layers: 1
+  --mtp-loss-scaling-factor: 0.1
+
+  # Add regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+  --qk-layernorm: true
+
+  # Add learning rate args
+  --lr-decay-iters: 584765624
+  --lr-warmup-iters: 1536000
+  # Learning rate scaled down from 7.3e-6 (DeepSeek-V3 technical report, GBS=15360) to 3.9e-6 (GBS=8192)
+  --lr-warmup-init: 6.1e-9
+  --lr: 6.1e-8
+  --min-lr: 6.1e-9
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+
+  # Add MoE args
+  --num-experts: 72
+  --moe-layer-freq: ([0]*1+[1]*15)
+  --moe-ffn-hidden-size: 1536
+  --moe-shared-expert-intermediate-size: 3072
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-router-topk: 8
+  --moe-token-dispatcher-type: alltoall
+  --moe-router-pre-softmax: true
+  --moe-grouped-gemm: true
+  --moe-aux-loss-coeff: 1e-4
+  --moe-router-group-topk: 4
+  --moe-router-num-groups: 8
+  --moe-router-topk-scaling-factor: 2.0
+  --moe-router-score-function: sigmoid
+  --moe-router-enable-expert-bias: true
+  --moe-router-bias-update-rate: 1e-3
+  --moe-router-dtype: fp32
+  --moe-permute-fusion: true
+  --moe-expert-capacity-factor: 1.0
+
+  # Add MLA args
+  --q-lora-rank: 1536
+  --kv-lora-rank: 512
+  --qk-head-dim: 128
+  --qk-pos-emb-head-dim: 64
+  --v-head-dim: 128
+  --rotary-scaling-factor: 40
+  --mscale: 1.0
+  --mscale-all-dim: 1.0
+
+  # Add validation args
+  --eval-iters: 32
+  --eval-interval: 200
+
+  # Add checkpointing args
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 500
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
+
+  # Add initialization args
+  --init-method-std: 0.02
+
+  # Add logging args
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-throughput: true
+  --log-interval: 1
+  --logging-level: 40
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+
+  # Add mixed precision args
+  --bf16: true
+
+TEST_TYPE: regular
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

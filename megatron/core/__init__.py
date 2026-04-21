@@ -20,7 +20,6 @@ from megatron.core.package_info import (
     __version__,
 )
 from megatron.core.timers import Timers
-from megatron.core.utils import is_torch_min_version
 
 # Alias parallel_state as mpu, its legacy name
 mpu = parallel_state
@@ -33,20 +32,4 @@ __all__ = [
     "InferenceParams",
     "ModelParallelConfig",
     "Timers",
-    "__contact_emails__",
-    "__contact_names__",
-    "__description__",
-    "__download_url__",
-    "__homepage__",
-    "__keywords__",
-    "__license__",
-    "__package_name__",
-    "__repository_url__",
-    "__shortversion__",
-    "__version__",
 ]
-
-from .safe_globals import register_safe_globals
-
-if is_torch_min_version("2.6a0"):
-    register_safe_globals()

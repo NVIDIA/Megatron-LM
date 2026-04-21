@@ -3,9 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_submodules,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
@@ -18,7 +16,7 @@ from tests.unit_tests.test_utilities import Utils
 def make_test_packed_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = seqlens.max().item()
+    max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
@@ -33,7 +31,7 @@ def make_test_packed_padded_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 18, 44, 52, 96, 118]).cuda()
     cu_seqlens_padded = torch.IntTensor([0, 20, 48, 56, 100, sequence_length]).cuda()
     seqlens = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
-    max_seqlen = seqlens.max().item()
+    max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
@@ -64,7 +62,7 @@ class TestParallelAttentionWithPackedSequence:
         )
         self.parallel_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -140,7 +138,7 @@ class TestParallelAttentionWithPackedSequence:
         transformer_config.recompute_granularity = 'selective'
         checkpointed_parallel_attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )

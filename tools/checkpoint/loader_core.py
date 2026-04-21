@@ -62,8 +62,22 @@ class MegatronCheckpointLoaderLLM(MegatronCheckpointLoaderBase):
         elif self.args.model_type == 'BERT':
             from pretrain_bert import model_provider
             return model_provider
+        elif self.args.model_type == 'hybrid':
+            from pretrain_mamba import model_provider
+            return model_provider
         else:
             raise Exception(f"Unrecognized model type: {self.args.model_type}")
+
+    def _maybe_parse_additional_megatron_args(self, margs, checkpoint_args):
+        """
+        Ensure MoE-related flags present in checkpoint args are propagated to Megatron args
+        so model construction matches the training configuration.
+        """
+        # DeepEP backend requirement for MoE token dispatcher
+        if hasattr(checkpoint_args, 'moe_enable_deepep'):
+            margs.moe_enable_deepep = checkpoint_args.moe_enable_deepep
+        # Return possibly updated args
+        return margs
 
 
     def send_model_over_queue(self):

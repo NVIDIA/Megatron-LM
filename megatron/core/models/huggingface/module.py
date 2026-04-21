@@ -68,10 +68,18 @@ def get_hf_model_type(model_path):
             "please install it with `pip install transformers`"
         )
 
+    # Parakeet is a special case because it's converted from Nemo.
+    if "parakeet" in model_path.lower():
+        return "parakeet"
+
     hf_config = AutoConfig.from_pretrained(model_path.split("hf://")[1])
     model_type = hf_config.architectures[0].lower()
 
-    if "qwen" in model_type:
+    if "NV-Whisper" in hf_config._name_or_path:
+        return "NV-Whisper"
+    elif "whisper" in model_type:
+        return "whisper"
+    elif "qwen" in model_type:
         return "qwen"
     elif "siglip" in model_type:
         return "siglip"
@@ -91,6 +99,12 @@ def build_hf_model(config, model_path):
         from megatron.core.models.huggingface.clip_model import SiglipHuggingFaceModel
 
         model = SiglipHuggingFaceModel(config)
+    elif "NV-Whisper" in model_type:
+        from megatron.core.models.huggingface.nvwhisper_model import NVWhisperHuggingFaceModel
+        model = NVWhisperHuggingFaceModel(config)
+    elif "parakeet" in model_type:
+        from megatron.core.models.huggingface.fastconformer_model import ParakeetHuggingFaceModel
+        model = ParakeetHuggingFaceModel(config)
     else:
         raise NotImplementedError(f"unsupported huggingface model {config.hf_config}")
 

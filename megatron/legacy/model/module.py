@@ -15,6 +15,10 @@ _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 
 
+def param_is_not_shared(param):
+    return not hasattr(param, 'shared') or not param.shared
+
+
 class MegatronModule(torch.nn.Module):
     """Megatron specific extensions of torch Module with support
     for pipelining."""
@@ -117,6 +121,20 @@ class MegatronModule(torch.nn.Module):
             )
             torch.distributed.all_reduce(
                 self.shared_embedding_or_output_weight().data, group=mpu.get_embedding_group()
+            )
+
+        # Ensure that encoder(first stage) and decoder(split stage) position
+        # embeddings have the same initial parameter values
+        # NOTE: We don't currently support T5 with the interleaved schedule.
+        if (
+            mpu.is_rank_in_position_embedding_group()
+            and args.pipeline_model_parallel_split_rank is not None
+        ):
+            # TODO: Support tokentype embedding.
+            self.language_model.embedding.cuda()
+            position_embeddings = self.language_model.embedding.position_embeddings
+            torch.distributed.all_reduce(
+                position_embeddings.weight.data, group=mpu.get_position_embedding_group()
             )
 
 

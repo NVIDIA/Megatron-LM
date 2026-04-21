@@ -2,11 +2,11 @@
   UNIT_TEST: "yes"
   UNIT_TEST_REPEAT: 1
   UNIT_TEST_TIMEOUT: 30
-  INTEGRATION_TEST: "no"
+  INTEGRATION_TEST: "yes"
   INTEGRATION_TEST_SCOPE: mr
   FUNCTIONAL_TEST: "yes"
   FUNCTIONAL_TEST_SCOPE: mr-slim
-  FUNCTIONAL_TEST_REPEAT: 1
+  FUNCTIONAL_TEST_REPEAT: 5
   FUNCTIONAL_TEST_TIME_LIMIT: 2700
   CLUSTER_A100: ""
   CLUSTER_H100: ""
@@ -18,8 +18,6 @@ workflow:
     - if: $CI_PROJECT_NAMESPACE != "ADLR" || ($CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_PROJECT_PATH != "ADLR/megatron-lm")
       when: never
 
-    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == 'ci-approve-dev' || $CI_COMMIT_BRANCH == 'ci-approve-main')
-
     # ci-branches only for schedule
     - if: $CI_COMMIT_BRANCH =~ /ci-/ && $CI_PIPELINE_SOURCE != "schedule"
       when: never
@@ -29,17 +27,11 @@ workflow:
       auto_cancel:
         on_new_commit: none
 
-    # For manual pipelines (GitLab UI)
+    # For manual pipelines
     - if: $CI_PIPELINE_SOURCE == "web"
 
-    # For pipelines created via the REST API (personal access token)
-    - if: $CI_PIPELINE_SOURCE == "api"
-
-    # For trigger pipelines
-    - if: $CI_PIPELINE_SOURCE == "trigger"
-
     # For push to main
-    - if: $CI_PIPELINE_SOURCE == 'push' && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH =~ /^core_/)
+    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_REF_PROTECTED == "true"
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -47,17 +39,17 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
-        FUNCTIONAL_TEST_TIME_LIMIT: 3600
+        FUNCTIONAL_TEST_TIME_LIMIT: 2700
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
       auto_cancel:
-        on_new_commit: interruptible
+        on_new_commit: none
 
     # For merge-trains that need to be fast-tracked
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       variables:
-        UNIT_TEST: "yes"
+        UNIT_TEST: "no"
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
@@ -72,19 +64,7 @@ workflow:
 
     # For MRs with integration suite
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
-      variables:
-        UNIT_TEST: "yes"
-        UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 30
-        INTEGRATION_TEST: "yes"
-        INTEGRATION_TEST_SCOPE: mr
-        FUNCTIONAL_TEST: "no"
-        FUNCTIONAL_TEST_SCOPE: mr-slim
-        FUNCTIONAL_TEST_REPEAT: 1
-        FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
-        CLUSTER_H100: ""
-        PUBLISH: "no"
+      variables: *merge_train_rule
 
     # For MRs with nightly
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
@@ -127,7 +107,7 @@ workflow:
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
-        FUNCTIONAL_TEST_REPEAT: 1
+        FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
         CLUSTER_A100: ""
         CLUSTER_H100: ""
@@ -150,10 +130,6 @@ workflow:
 
 stages:
   - build
-  - test
-  - integration_tests
-  - functional_tests
-  - publish
 
 default:
   interruptible: true
@@ -162,8 +138,6 @@ default:
     when: runner_system_failure
 
 variables:
-  BUILD:
-    value: "yes"
   UNIT_TEST:
     value: "yes"
     options:
@@ -242,11 +216,6 @@ variables:
       - "dgxh100_coreweave"
       - "dgxh100_eos"
     description: "Cluster for H100 workloads"
-  CLUSTER_GB200:
-    value: "dgxgb200_oci-hsg"
-    options:
-      - "dgxgb200_oci-hsg"
-    description: "Cluster for H100 workloads"
   PUBLISH:
     value: "no"
     options:
@@ -278,7 +247,10 @@ variables:
 include:
   - .gitlab/stages/00.pre.yml
   - .gitlab/stages/01.build.yml
-  - .gitlab/stages/02.test.yml
-  - .gitlab/stages/03.integration-tests.yml
-  - .gitlab/stages/04.functional-tests.yml
-  - .gitlab/stages/05.publish.yml
+
+secret_detection:
+  rules:
+    - when: never
+
+.secret-analyzer:
+  stage: build

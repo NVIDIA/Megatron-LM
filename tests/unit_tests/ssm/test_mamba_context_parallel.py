@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import math
+
 import pytest
 import torch
 import torch.nn as nn

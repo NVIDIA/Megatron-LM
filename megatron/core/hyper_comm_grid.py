@@ -158,19 +158,10 @@ class HyperCommGrid:
         rank_enum = self._gen_rank_enum(ordered_dims)
         pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs)
 
-        if dist.get_rank() == 0:
-            logging.info(
-                f"Generated process group for {unique_group_key} with enumeration {rank_enum}"
-            )
+        logging.info(f"Generated process group for {unique_group_key} with enumeration {rank_enum}")
         self._pgs[unique_group_key] = pg
-        return pg
 
-    def destroy(self) -> None:
-        """Destroy all process groups created by this grid."""
-        for pg in self._pgs.values():
-            if pg is not None:
-                dist.destroy_process_group(pg)
-        self._pgs.clear()
+        return pg
 
     def get_pg(self, dims: Union[str, list[str]]) -> dist.ProcessGroup:
         r"""Get a process group based on a list of dimension names
@@ -186,22 +177,6 @@ class HyperCommGrid:
             )
 
         return self._pgs[unique_group_key]
-
-    def get_rank_enum(self, dims: Union[str, list[str]]) -> list[list[int]]:
-        r"""Get the rank enumeration for the requested dimension(s).
-
-        This is the exact enumeration that would be used by create_pg for the same
-        dims. It is useful for creating additional groups whose membership is derived from
-        the grid (e.g., embedding/position-embedding groups derived from PP groups).
-
-        Args:
-            dims: Dimension name or list of dimension names.
-
-        Returns:
-            List of rank lists (one per subgroup).
-        """
-        ordered_dims, _ = self._order_dims(dims)
-        return self._gen_rank_enum(ordered_dims)
 
     def _gen_rank_enum(self, dims: list[str]) -> list[list[int]]:
         r"""Generate rank enumeration before calling new_subgroups_by_enumeration
@@ -262,12 +237,3 @@ class HyperCommGrid:
 
         unique_group_key = "-".join(ordered_dims)
         return ordered_dims, unique_group_key
-
-    def is_current_rank_in_grid(self) -> bool:
-        """Check if the current rank belongs to this grid.
-
-        Returns:
-            True if the current rank is within [rank_offset, rank_offset + size).
-        """
-        rank = dist.get_rank()
-        return bool(self.rank_offset <= rank < self.rank_offset + self.size)

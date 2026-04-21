@@ -26,7 +26,6 @@ DATASET_DIR=""
 TIME="1:00:00"
 RECIPES_DIR="tests/test_utils/recipes"
 CONTAINER_MOUNTS=""
-NO_GPUS_PER_TASK="FALSE"
 
 # Declare associative array for tracking unique mounts
 declare -A seen_mounts
@@ -54,10 +53,6 @@ while [[ $# -gt 0 ]]; do
         TIME="$2"
         shift 2
         ;;
-    --no-gpus-per-task)
-        NO_GPUS_PER_TASK="TRUE"
-        shift 1
-        ;;
     --help)
         print_usage
         exit 0
@@ -70,6 +65,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Check if yq is installed
+if ! command -v yq &>/dev/null; then
+    echo "Error: yq is not installed. Please install it first."
+    exit 1
+fi
+
 # Validate required arguments
 if [ -z "$PARTITION" ] || [ -z "$SLURM_ACCOUNT" ] || [ -z "$IMAGE" ] || [ -z "$DATASET_DIR" ]; then
     echo "Error: Missing required arguments"
@@ -77,8 +78,56 @@ if [ -z "$PARTITION" ] || [ -z "$SLURM_ACCOUNT" ] || [ -z "$IMAGE" ] || [ -z "$D
     exit 1
 fi
 
+# Check if recipes directory exists
+if [ ! -d "$RECIPES_DIR" ]; then
+    echo "Error: Recipes directory '$RECIPES_DIR' does not exist"
+    exit 1
+fi
+
+# Create copy of recipes with interpolated artifacts
+python -m tests.test_utils.python_scripts.common --recipes-dir $RECIPES_DIR --output-dir $RECIPES_DIR/interpolated
+
 # Add current directory to container mounts
-CONTAINER_MOUNTS="$DATASET_DIR:/mnt/artifacts,$(pwd):/opt/megatron-lm"
+CONTAINER_MOUNTS="$(pwd):/opt/megatron-lm"
+
+# Process each YAML file in the recipes directory
+if [ ! -f "$YAML_FILE" ]; then
+    continue
+fi
+
+echo "Processing $(basename "$YAML_FILE")..."
+YAML_FILE=workflows.yaml
+# Extract artifacts from YAML file
+while IFS=: read -r value key; do
+    # Skip empty or malformed entries
+    if [ -z "$value" ] || [ -z "$key" ] || [ "$value" = "/data/" ] || [ "$key" = "/data/" ]; then
+        continue
+    fi
+
+    # Skip entries that don't start with a forward slash
+    if [[ ! "$key" =~ ^/ ]]; then
+        continue
+    fi
+
+    # Create the mount string
+    mount="${DATASET_DIR}/${value}:${key}"
+
+    # Skip if we've seen this mount before
+    if [ "${seen_mounts[$mount]}" = "1" ]; then
+        echo "Skipping duplicate mount: $mount"
+        continue
+    fi
+
+    # Mark this mount as seen
+    seen_mounts[$mount]=1
+
+    if [ -z "$CONTAINER_MOUNTS" ]; then
+        CONTAINER_MOUNTS="$mount"
+    else
+        CONTAINER_MOUNTS="${CONTAINER_MOUNTS},$mount"
+    fi
+done < <(yq eval '.[].spec.artifacts | to_entries | .[] | "\(.value):\(.key)"' "$YAML_FILE")
+rm $YAML_FILE
 
 # Build the final srun command
 SRUN_CMD="srun \
@@ -87,9 +136,8 @@ SRUN_CMD="srun \
     --container-image=$IMAGE \
     --container-workdir=/opt/megatron-lm \
     --container-mounts=$CONTAINER_MOUNTS \
-    --no-container-mount-home \
     --nodes=1 \
-    $(if [ "$NO_GPUS_PER_TASK" = "FALSE" ]; then echo "--gpus-per-task=8"; fi) \
+    --gpus-per-task=8 \
     --time=$TIME \
     --pty bash"
 

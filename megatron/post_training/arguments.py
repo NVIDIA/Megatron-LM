@@ -2,7 +2,7 @@
 
 
 def add_modelopt_args(parser):
-    """Add additional arguments for using Model Optimizer (modelopt) features."""
+    """Add additional arguments for using TensorRT Model Optimizer (modelopt) features."""
     group = parser.add_argument_group(title="modelopt-generic")
 
     # Model and Checkpoint Compatibility
@@ -21,29 +21,19 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
-        help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "
-        "(where layernorms are fused into linear layers). Enables state_dict key remapping so the "
-        "TE checkpoint can be loaded into the local ModelOpt spec for PTQ/export, and saved back "
-        "in TE-compatible format. Mutually exclusive with --export-default-te-spec.",
-    )
-    group.add_argument(
-        "--export-default-te-spec",
-        action="store_true",
-        help="Use the full Transformer-Engine layer spec for model building. "
-        "This builds the model with TELayerNormColumnParallelLinear, TERowParallelLinear, "
-        "TEGroupedMLP, TEDotProductAttention, etc., matching the canonical TE specs.",
+        help="Export a megatron-core transformer-engine checkpoint.",
     )
     group.add_argument(
         "--export-force-local-attention",
         action="store_true",
         help="Forcing local DotProductAttention; otherwise TEDotProductAttention is used.",
     )
+
     # Quantization
     group.add_argument(
         "--export-kv-cache-quant",
-        help="Type of KV cache quantization to perform.",
-        choices=["none", "fp8", "fp8_affine", "nvfp4", "nvfp4_affine", "nvfp4_rotate"],
-        default="none",
+        action="store_true",
+        help="Whether or not to perform KV-cache quantization.",
     )
     group.add_argument(
         "--export-real-quant-cfg",
@@ -56,34 +46,82 @@ def add_modelopt_args(parser):
         "--export-quant-cfg",
         type=str,
         default=None,
-        # TODO replace choices with mtq.config.choices after deprecating the shorter aliases
-        help="Specify a quantization config from mtq.config.choices.",
+        choices=[
+            "int8_sq",
+            "fp8",
+            "fp8_real_quant",
+            "fp8_blockwise",
+            "fp8_blockwise_real_quant",
+            "fp8_blockwise_32",
+            "int4_awq",
+            "w4a8_awq",
+            "nvfp4",
+            "None",
+        ],
+        help="Specify a quantization config from the supported choices.",
     )
+
     # Knowledge Distillation
+    group.add_argument(
+        '--export-kd-cfg',
+        type=str,
+        default=None,
+        help='Path to distillation configuration yaml file.',
+    )
     group.add_argument(
         '--export-kd-teacher-load',
         type=str,
-        help='Path to checkpoint to load as distillation teacher. (Enables distillation mode automatically)',
-    )
-    group.add_argument(
-        '--export-kd-teacher-model-config',
-        type=str,
-        default=None,
-        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+        help='Path to checkpoint to load as distillation teacher.',
     )
     group.add_argument(
         '--export-kd-teacher-ckpt-format',
         type=str,
         default=None,
-        choices=['torch', 'torch_dist', 'torch_dcp'],
+        choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
         help="Checkpoint format of teacher model, if different from student's.",
     )
+
+    # Speculative decoding
     group.add_argument(
-        '--export-kd-cfg',
-        type=str,
-        default=None,
-        help='Path to distillation configuration yaml file, in order to use non-default settings.',
+        '--export-num-medusa-heads',
+        type=int,
+        default=0,
+        help='Number of Medusa heads for speculative decoding.',
     )
+    group.add_argument(
+        '--export-eagle-algorithm',
+        type=str,
+        choices=['eagle1', 'eagle3', 'eagle-mtp'],
+        default="eagle-mtp",
+        help='Chosing the between different flavors of EAGLE algorithms.',
+    )
+    group.add_argument(
+        '--export-num-eagle-layers',
+        type=int,
+        default=0,
+        help='Number of EAGLE layers for speculative decoding.',
+    )
+    group.add_argument(
+        '--export-draft-vocab-size',
+        type=int,
+        default=0,
+        help='The reduced vocabulary size of the draft model.',
+    )
+    group.add_argument(
+        '--export-num-mtp',
+        type=int,
+        default=0,
+        help='Number of MTP modules for speculative decoding.',
+    )
+    group.add_argument(
+        '--export-freeze-mtp',
+        type=int,
+        nargs="*",
+        default=[],
+        help='Index of MTP that will be frozen in training.',
+    )
+
+
 
     # Finetuning
     group.add_argument(
@@ -105,26 +143,19 @@ def add_modelopt_args(parser):
         help='Use Llama-4 expert scaling on input instead of output.',
     )
 
-    # Speculative decoding
-    group.add_argument(
-        '--export-offline-model',
-        action="store_true",
-        help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
-    )
-
-    # Global state
-    group.add_argument(
-        '--modelopt-enabled',
-        action="store_true",
-        help='Will be set automatically when loading a ModelOpt checkpoint.',
-    )
-
-    # GPT-OSS YaRN RoPE support
-    group.add_argument(
-        '--enable-gpt-oss',
-        action="store_true",
-        help='Enable GPT-OSS mode with YaRN RoPE configuration. When enabled, automatically '
-             'configures all YaRN parameters with GPT-OSS defaults.',
-    )
-
     return parser
+
+
+def modelopt_args_enabled(args):
+    """Check if any modelopt-related arguments are provided."""
+    key_args_and_defaults = {
+        "export_real_quant_cfg": "None",
+        "export_quant_cfg": None,
+        "export_kd_teacher_load": None,
+        "export_num_medusa_heads": 0,
+        "export_num_eagle_layers": 0,
+    }
+    for key, default in key_args_and_defaults.items():
+        if hasattr(args, key) and getattr(args, key) != default:
+            return True
+    return False

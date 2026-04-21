@@ -22,7 +22,8 @@ from multimodal_args import add_multimodal_extra_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings, get_num_video_embeddings
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.core.inference.contexts import StaticInferenceContext
@@ -39,7 +40,6 @@ from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_w
     VLMInferenceWrapper,
 )
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, is_last_rank
-from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
@@ -72,6 +72,7 @@ def add_text_generation_args(parser):
     group.add_argument(
         "--task",
         type=str,
+        # NOTE: If adding a new task, update VIDEO_TASKS below if the new task is a video task
         choices=[
             "captioning",
             "TextVQA",
@@ -91,6 +92,7 @@ def add_text_generation_args(parser):
             "PhysGameBench",
             "MVBench",
             "inference",
+            "Math500",
         ],
         help="Generation task to run",
     )
@@ -103,6 +105,15 @@ def add_text_generation_args(parser):
     parser = add_multimodal_extra_args(parser)
 
     return parser
+
+
+# Video tasks where all tiles represent frames from a single video.
+# For these tasks, num_frames = [total_tiles] (all tiles are frames of one video).
+# For image tasks, num_frames = [1] * num_tiles (each tile is a separate image).
+# This distinction is needed for dynamic attention pooling to apply the correct
+# pooling dimensions (e.g., 3x3 for videos vs 2x2 for images).
+# Verified by checking which tasks use read_video() in evaluation_datasets.py
+VIDEO_TASKS = {"VideoMME", "MotionBench", "PhysGameBench", "MVBench"}
 
 
 def get_evaluation_dataloader(
@@ -120,6 +131,13 @@ def get_evaluation_dataloader(
     num_frames,
     num_workers,
     vision_model_type,
+    dynamic_resolution,
+    patch_dim,
+    min_num_patches,
+    seq_length,
+    pixel_shuffle,
+    min_side,
+    conv_merging,
     split="validation"
 ):
     """Build evaluation dataset."""
@@ -137,6 +155,13 @@ def get_evaluation_dataloader(
         partition_id,
         num_frames,
         vision_model_type,
+        dynamic_resolution,
+        patch_dim,
+        min_num_patches,
+        seq_length,
+        pixel_shuffle,
+        min_side,
+        conv_merging,
         split=split
     )
 
@@ -173,21 +198,25 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.num_frames,
         args.num_workers,
         args.vision_model_type,
+        args.dynamic_resolution,
+        args.patch_dim,
+        args.dynamic_resolution_min_patches,
+        args.seq_length,
+        args.pixel_shuffle,
+        args.dynamic_resolution_min_side,
+        args.conv_merging,
         config.split
     )
 
-    num_img_embeddings_per_tile = get_num_image_embeddings(
-        args.img_h,
-        args.img_w,
-        args.patch_dim,
-        args.vision_model_type,
-        args.disable_vision_class_token,
-        1,
-        args.pixel_shuffle,
-        args.use_tile_tags,
-        args.max_num_tiles,
-        args.tokenizer_prompt_format,
-    )
+    # For static resolution, compute per-tile embeddings using correct pooling based on task type
+    is_video_task = config.task in VIDEO_TASKS
+    video_temporal_patch_size = getattr(args, 'video_temporal_patch_size', 1)
+
+    tokenizer_kwargs = dict()
+    if config.enable_thinking:
+        tokenizer_kwargs["chat_template_kwargs"] = {
+            "enable_thinking": config.enable_thinking,
+        }
 
     if args.use_mcore_inference:
         inference_wrapper_config = InferenceWrapperConfig(
@@ -203,7 +232,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed, legacy=True
+            controller, max_batch_size=1, random_seed=args.seed
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -212,28 +241,133 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             num_tokens_to_generate=config.out_seq_length,
         )
 
-    for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):
+    for idx, (imgs, num_tiles, sample_id, question, answers, metadata, imgs_sizes, vision_cu_lengths, vision_max_lengths) in enumerate(dataloader):
         imgs = imgs.to("cuda")
         num_tiles = num_tiles.to("cuda")
+        if vision_cu_lengths is not None:
+            vision_cu_lengths = vision_cu_lengths.to("cuda")
+        if vision_max_lengths is not None:
+            vision_max_lengths = vision_max_lengths.to("cuda")
+
+        # Create vision_packed_seq_params if vision_cu_lengths is provided
+        vision_packed_seq_params = None
+        if vision_cu_lengths is not None:
+            vision_packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=vision_cu_lengths,
+                cu_seqlens_kv=vision_cu_lengths,
+                max_seqlen_q=vision_max_lengths,
+                max_seqlen_kv=vision_max_lengths,
+            )
+
+        # Compute num_frames based on whether this is a video task
+        # For video tasks, all tiles belong to one video; for images, each represents a separate image
+        # This must be computed before num_img_embeddings for correct attention pooling calculation
+        is_video_task = config.task in VIDEO_TASKS
+        if is_video_task:
+            # All tiles are frames of one video
+            num_frames = [torch.sum(num_tiles).item()]
+        else:
+            # Each entry in num_tiles represents a separate image with 1 frame
+            num_frames = [1] * num_tiles.numel()
+
+        # For videos, num_frames[0] is the total frame count for temporal compression
+        total_num_frames = num_frames[0] if is_video_task else 1
+
+        if args.dynamic_resolution:
+            if is_video_task:
+                # For videos, use get_num_video_embeddings (handles both T=1 and T>1)
+                # All frames in a video have the same size (use first frame)
+                num_img_embeddings = get_num_video_embeddings(
+                    num_frames=total_num_frames,
+                    video_temporal_patch_size=video_temporal_patch_size,
+                    img_h=imgs_sizes[0][0],
+                    img_w=imgs_sizes[0][1],
+                    patch_dim=args.patch_dim,
+                    vision_model_type=args.vision_model_type,
+                    disable_vision_class_token=args.disable_vision_class_token,
+                    class_token_len=1,
+                    pixel_shuffle=args.pixel_shuffle,
+                    use_tile_tags=args.use_tiling,
+                    use_image_break_token=args.image_break_token is not None,
+                    conv_merging=args.conv_merging,
+                )
+            else:
+                # For images, sum per-tile embeddings
+                num_img_embeddings = 0
+                for img_size in imgs_sizes:
+                    num_img_embeddings += get_num_image_embeddings(
+                        img_h=img_size[0],
+                        img_w=img_size[1],
+                        patch_dim=args.patch_dim,
+                        vision_model_type=args.vision_model_type,
+                        disable_vision_class_token=args.disable_vision_class_token,
+                        class_token_len=1,
+                        pixel_shuffle=args.pixel_shuffle,
+                        use_tile_tags=args.use_tiling,
+                        use_image_break_token=args.image_break_token is not None,
+                        conv_merging=args.conv_merging,
+                    )
+        else:
+            if is_video_task:
+                # For videos, use get_num_video_embeddings (handles both T=1 and T>1)
+                num_img_embeddings = get_num_video_embeddings(
+                    num_frames=total_num_frames,
+                    video_temporal_patch_size=video_temporal_patch_size,
+                    img_h=args.img_h,
+                    img_w=args.img_w,
+                    patch_dim=args.patch_dim,
+                    vision_model_type=args.vision_model_type,
+                    disable_vision_class_token=args.disable_vision_class_token,
+                    class_token_len=1,
+                    pixel_shuffle=args.pixel_shuffle,
+                    use_tile_tags=args.use_tile_tags,
+                    max_num_tiles=args.max_num_tiles,
+                    tokenizer_type=args.tokenizer_prompt_format,
+                    use_image_break_token=args.image_break_token is not None,
+                    conv_merging=args.conv_merging,
+                )
+            else:
+                # For images, use per-tile calculation
+                total_num_tiles = torch.sum(num_tiles).item()
+                num_img_embeddings_per_tile = get_num_image_embeddings(
+                    img_h=args.img_h,
+                    img_w=args.img_w,
+                    patch_dim=args.patch_dim,
+                    vision_model_type=args.vision_model_type,
+                    disable_vision_class_token=args.disable_vision_class_token,
+                    class_token_len=1,
+                    pixel_shuffle=args.pixel_shuffle,
+                    use_tile_tags=args.use_tile_tags,
+                    max_num_tiles=args.max_num_tiles,
+                    tokenizer_type=args.tokenizer_prompt_format,
+                    use_image_break_token=args.image_break_token is not None,
+                    conv_merging=args.conv_merging,
+                )
+                num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
+
 
         conv = get_conversation(config.task, question, metadata)
 
         if not args.use_mcore_inference:
-            forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
+            forward_step = partial(VLMForwardStep, num_img_embeddings, imgs, num_tiles, num_frames, args.decoder_seq_length, imgs_sizes, vision_cu_lengths, vision_max_lengths)
 
         inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
         if is_first_rank():
 
             if args.use_mcore_inference:
                 inference_request = VLMInferenceRequest(
-                   request_id=inference_engine.get_new_request_id(),
-                   prompt=conv,
-                   prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
-                   sampling_params=sampling_params,
-                   num_img_embeddings_per_tile=num_img_embeddings_per_tile,
-                   imgs=imgs,
-                   num_tiles=num_tiles,
-                   decoder_seq_length=args.decoder_seq_length,
+                    request_id=inference_engine.get_new_request_id(),
+                    prompt=conv,
+                    prompt_tokens=controller.tokenize_prompt(conv),
+                    sampling_params=sampling_params,
+                    num_img_embeddings=num_img_embeddings,
+                    imgs=imgs,
+                    num_tiles=num_tiles,
+                    imgs_sizes=imgs_sizes,
+                    vision_packed_seq_params=vision_packed_seq_params,
+                    decoder_seq_length=args.decoder_seq_length,
+                    num_frames=num_frames,
                 )
                 results: List[InferenceRequest] = inference_engine.generate(
                     inference_requests=[inference_request]
@@ -256,6 +390,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     random_seed=args.seed,
                     detokenize_segments=False,
                     data_parallel=True,
+                    tokenizer_kwargs=tokenizer_kwargs,
             )
 
             for generation in resp_sentences:
@@ -288,7 +423,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 elif config.task == "VideoMME":
                     output_name = "response"
                     output = question
-                elif config.task in ["OCRBench_v2", "RD_TableBench"]:
+                elif config.task in ["OCRBench_v2", "RD_TableBench", "Math500"]:
                     output_name = "predict"
                 else:
                     raise NotImplementedError("no output name defined for", config.task)
@@ -302,7 +437,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     output["prompt"] = prompt
                     output[output_name] = generated
 
-                if config.task in ["captioning", "RD_TableBench"]:
+                if config.task in ["captioning", "RD_TableBench", "Math500"]:
                     output["ground_truth"] = answers
                 elif config.task in (
                     "TextVQA",
@@ -345,11 +480,13 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 inference_request = VLMInferenceRequest(
                    request_id=inference_engine.get_new_request_id(),
                    prompt=conv,
-                   prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
+                   prompt_tokens=controller.tokenize_prompt(conv),
                    sampling_params=sampling_params,
-                   num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                   num_img_embeddings=num_img_embeddings,
                    imgs=imgs,
                    num_tiles=num_tiles,
+                   imgs_sizes=imgs_sizes,
+                   vision_packed_seq_params=vision_packed_seq_params,
                    decoder_seq_length=args.decoder_seq_length,
                 )
                 inference_engine.generate(
@@ -357,7 +494,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 )
             else:
                 generate_and_post_process(
-                    model, inference_context, forward_step=forward_step, detokenize_segments=False, data_parallel=True
+                    model, inference_context, forward_step=forward_step, detokenize_segments=False, data_parallel=True,
+                    tokenizer_kwargs=tokenizer_kwargs,
                 )
 
             idx += 1
@@ -460,25 +598,54 @@ class VLMForwardStep(ForwardStep):
 
     def __init__(
         self,
-        num_img_embeddings_per_tile,
+        num_img_embeddings,
         images,
         num_tiles,
+        num_frames,
         decoder_seq_length,
+        imgs_sizes,
+        vision_cu_lengths,
+        vision_max_lengths,
+        sound_clips,
+        sound_length,
         model,
         inference_context,
     ):
         """Create multimodal forward step."""
         total_num_tiles = torch.sum(num_tiles).item()
-        num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
 
+        #TODO: should i add amount of image embeddings to max seq length of infernece context? see commits before as example
         super().__init__(model, inference_context)
         self._images = images
         self._num_tiles = num_tiles
+        self._num_frames = num_frames
         self._num_img_embeddings = num_img_embeddings
         self.decoder_seq_length = decoder_seq_length
+        self._imgs_sizes = imgs_sizes
 
-        self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
-        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
+        # Create vision_packed_seq_params if vision_cu_lengths is provided
+        self._vision_packed_seq_params = None
+        if vision_cu_lengths is not None:
+            self._vision_packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=vision_cu_lengths,
+                cu_seqlens_kv=vision_cu_lengths,
+                max_seqlen_q=vision_max_lengths,
+                max_seqlen_kv=vision_max_lengths,
+            )
+
+        self._recv_only_vision_embeds = False
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        # Checks if the previous stage only has a vision encoder, and that the current stage has part of the LM decoder.
+        # In this case, the current stage should only receive vision embeddings.
+        if pp_rank > 0:
+            self._recv_only_vision_embeds = parallel_state.is_inside_encoder(pp_rank - 1) and (not parallel_state.is_inside_decoder(pp_rank - 1)) and parallel_state.is_inside_decoder()
+
+        # Checks if the current stage only has a vision encoder
+        self._encoder_only = parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
+
+        self._sound_clips = sound_clips
+        self._sound_length = sound_length
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -488,10 +655,18 @@ class VLMForwardStep(ForwardStep):
             attention_mask=None,
             inference_context=self.inference_context,
             num_image_tiles=self._num_tiles,
+            num_frames=self._num_frames,
             runtime_gather_output=True,
+            imgs_sizes=self._imgs_sizes,
+            vision_packed_seq_params=self._vision_packed_seq_params,
+            sound_clips=self._sound_clips,
+            sound_length=self._sound_length,
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
+        # Make sure we use the *updated* number of image tokens that may have been pruned in `_preprocess_data`.
+        if "image_tokens_count" in self.inference_context.key_value_memory_dict:
+            self._num_img_embeddings = self.inference_context.key_value_memory_dict["image_tokens_count"]
         num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
         num_tokens = tokens.size(1)
         recv_buffer_seq_length = None
@@ -639,6 +814,12 @@ def get_conversation(task, question, metadata=None):
             {"role": "system", "content": "Answer the questions."},
             {"role": "user", "content": f"{question}"},
         ]
+    elif task == "Math500":
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": "detailed thinking on\nSolve the following math problem. Make sure to put the answer (and only answer) inside \\boxed{}.\n\n" + question},
+            #{"role": "user", "content": "Solve the following math problem. Make sure to put the answer (and only answer) inside \\boxed{}.\n\n" + question},
+        ]
     else:
         raise NotImplementedError(f"No prompting support for task {task}")
 
@@ -648,7 +829,7 @@ def get_conversation(task, question, metadata=None):
 
 def get_prompt_and_generated(prompt_and_generation, prompt_format):
     """Strip prompt and other unnecessary text from generation."""
-    if prompt_format in ("llama3", "llama3p1"):
+    if prompt_format in ("llama3", "llama3p1", "llama_nemotron_8b"):
         splitted = prompt_and_generation.split("<|start_header_id|>assistant<|end_header_id|>\n\n")
         prompt = splitted[0]
         generated = splitted[1]
@@ -663,7 +844,7 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
         prompt = splitted[0]
         generated = splitted[1]
         generated = generated.split("<|im_end|>")[0]
-    elif prompt_format in ("nvlm-yi-34b", "qwen2p0", "qwen2p5"):
+    elif prompt_format in ("nvlm-yi-34b", "qwen2p0", "qwen2p5", "nemotron6-moe"):
         splitted = prompt_and_generation.split("<|im_start|>assistant\n")
         prompt = splitted[0]
         generated = splitted[1]
@@ -679,6 +860,16 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
         generated = splitted[1]
         generated = generated.split("[PREFIX]")[0]
         generated = generated.split("\\n")[0]
+    elif prompt_format in ("nemotron-h-reasoning"):
+        splitted = prompt_and_generation.split("\n<SPECIAL_11>Assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("<SPECIAL_11>")[0]
+    elif prompt_format in ("nemotron-h-5p5-reasoning", "nemotron-h-5p5-reasoning-inference"):
+        splitted = prompt_and_generation.split("\n<SPECIAL_11>Assistant\n")
+        prompt = splitted[0]
+        generated = splitted[1]
+        generated = generated.split("<SPECIAL_12>")[0]
     else:
         raise ValueError(f"Prompt format {prompt_format} is not supported.")
 
@@ -843,8 +1034,7 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
-    parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    initialize_megatron()
+    initialize_megatron(extra_args_provider=add_text_generation_args)
 
     args = get_args()
 
@@ -853,7 +1043,7 @@ def eval_tasks():
                               parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

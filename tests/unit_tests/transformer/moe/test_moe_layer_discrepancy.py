@@ -7,8 +7,10 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_submodules,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.initialize import _set_random_seed
@@ -47,7 +49,7 @@ class TestMoELayerDispatcherDiscrepancy:
             expert_model_parallel_size=ep_size,
             sequence_parallel=True if (tp_size > 1) else False,
         )
-        submodules = get_gpt_layer_with_transformer_engine_submodules(
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
         # Init input and layer
@@ -56,13 +58,21 @@ class TestMoELayerDispatcherDiscrepancy:
 
         # Init allgather moe layer
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        layer = TransformerLayer(self.transformer_config, submodules).cuda().float()
+        layer = (
+            TransformerLayer(self.transformer_config, transformer_layer_spec.submodules)
+            .cuda()
+            .float()
+        )
         ag_moe_layer = layer.mlp
         ag_moe_layer.eval()
         # Init a2a moe layer
         self.transformer_config.moe_token_dispatcher_type = "alltoall"
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        layer = TransformerLayer(self.transformer_config, submodules).cuda().float()
+        layer = (
+            TransformerLayer(self.transformer_config, transformer_layer_spec.submodules)
+            .cuda()
+            .float()
+        )
         a2a_moe_layer = layer.mlp
         a2a_moe_layer.eval()
 
@@ -124,7 +134,7 @@ class TestMoELayerDispatcherDiscrepancy:
             sequence_parallel=True if (tp_size > 1 and ep_size > 1) else False,
             bf16=True,
         )
-        submodules = get_gpt_layer_with_transformer_engine_submodules(
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
         # Init input and layer
@@ -133,7 +143,11 @@ class TestMoELayerDispatcherDiscrepancy:
 
         # Init allgather moe layer
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        layer = TransformerLayer(self.transformer_config, submodules).cuda().bfloat16()
+        layer = (
+            TransformerLayer(self.transformer_config, transformer_layer_spec.submodules)
+            .cuda()
+            .bfloat16()
+        )
         ag_moe_layer = layer.mlp
         ag_moe_layer.eval()
 
@@ -191,7 +205,7 @@ class TestMoELayerDispatcherDiscrepancy:
             sequence_parallel=True if (tp_size > 1 and ep_size > 1) else False,
             bf16=True,
         )
-        submodules = get_gpt_layer_with_transformer_engine_submodules(
+        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
         )
         # Init input and layer
@@ -199,7 +213,11 @@ class TestMoELayerDispatcherDiscrepancy:
         input = torch.randn(1, 4096, 4096).cuda().bfloat16()
 
         # Init a2a moe layer
-        layer = TransformerLayer(self.transformer_config, submodules).cuda().bfloat16()
+        layer = (
+            TransformerLayer(self.transformer_config, transformer_layer_spec.submodules)
+            .cuda()
+            .bfloat16()
+        )
         a2a_moe_layer = layer.mlp
         a2a_moe_layer.eval()
 

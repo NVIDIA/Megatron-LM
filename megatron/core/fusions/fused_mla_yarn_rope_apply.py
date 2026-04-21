@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import torch
 from packaging import version
 
-from megatron.core.utils import null_decorator
+from megatron.core.utils import experimental_fn, null_decorator
 
 try:
     import triton
@@ -28,25 +28,16 @@ if not HAVE_TRITON:
 
 
 @triton.jit
-def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
+def _get_thd_token_idx(cu_seqlens, pid_m, seq_num):
     token_idx = -1
-    this_seq_len = 0
     seq_idx = 0
-    last_cum_seqlen = tl.load(cu_seqlens) // cp_size
+    last_cum_seqlen = tl.load(cu_seqlens)
     while seq_idx < seq_num:
-        cur_cum_seqlen = tl.load(cu_seqlens + seq_idx + 1) // cp_size
+        cur_cum_seqlen = tl.load(cu_seqlens + seq_idx + 1)
         if token_idx == -1 and cur_cum_seqlen > pid_m:
             token_idx = pid_m - last_cum_seqlen
-            this_seq_len = cur_cum_seqlen - last_cum_seqlen
         last_cum_seqlen = cur_cum_seqlen
         seq_idx += 1
-    if cp_size > 1:
-        if token_idx < this_seq_len // 2:
-            token_idx = token_idx + cp_rank * this_seq_len // 2
-        else:
-            token_idx = (token_idx - this_seq_len // 2) + (
-                2 * cp_size - cp_rank - 1
-            ) * this_seq_len // 2
     return token_idx
 
 
@@ -77,8 +68,6 @@ def rotary_fwd_q_kernel(
     cu_seqlens_q,
     stride_x_seq,
     stride_x_nheads,
-    cp_rank,
-    cp_size,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -100,7 +89,7 @@ def rotary_fwd_q_kernel(
     if cu_seqlens_q is None:
         token_idx = pid_m // batch_size
     else:
-        token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
+        token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num)
 
     cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
     sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
@@ -157,8 +146,6 @@ def rotary_bwd_q_kernel(
     cu_seqlens_q,
     stride_x_seq,
     stride_x_nheads,
-    cp_rank,
-    cp_size,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -178,7 +165,7 @@ def rotary_bwd_q_kernel(
     if cu_seqlens_q is None:
         token_idx = pid_m // batch_size
     else:
-        token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num, cp_rank, cp_size)
+        token_idx = _get_thd_token_idx(cu_seqlens_q, pid_m, seq_num)
 
     cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
     sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
@@ -213,18 +200,7 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(
-        ctx,
-        q,
-        cos,
-        sin,
-        qk_head_dim,
-        emb_dim,
-        cu_seqlens_q,
-        cp_rank,
-        cp_size,
-        rotary_interleaved=False,
-    ):
+    def forward(ctx, q, cos, sin, qk_head_dim, emb_dim, cu_seqlens_q, rotary_interleaved=False):
         """
         Forward function for ApplyMLARotaryEmbQ.
 
@@ -267,16 +243,12 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
             cu_seqlens_q,
             q.stride(0),
             q.stride(1),
-            cp_rank,
-            cp_size,
         )
         ctx.save_for_backward(cos, sin)
         ctx.qk_head_dim = qk_head_dim
         ctx.emb_dim = emb_dim
         ctx.cu_seqlens_q = cu_seqlens_q
         ctx.rotary_interleaved = rotary_interleaved
-        ctx.cp_rank = cp_rank
-        ctx.cp_size = cp_size
         if cu_seqlens_q is None:
             q = q.view(max_seqlen, batch_size, nheads, headdim)
         return q
@@ -296,7 +268,7 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
         seq_num = None
         if ctx.cu_seqlens_q is None:
             max_seqlen, batch_size, nheads, headdim = grad.shape
-            grad = grad.contiguous().view(-1, nheads, headdim)
+            grad = grad.view(-1, nheads, headdim)
             total_seqlen = grad.shape[0]
         else:
             seq_num = len(ctx.cu_seqlens_q) - 1
@@ -316,14 +288,13 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
             ctx.cu_seqlens_q,
             grad.stride(0),
             grad.stride(1),
-            ctx.cp_rank,
-            ctx.cp_size,
         )
         if ctx.cu_seqlens_q is None:
             grad = grad.view(max_seqlen, batch_size, nheads, headdim)
-        return grad, None, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None
 
 
+@experimental_fn(introduced_with_version="0.13.0")
 def fused_apply_mla_rope_for_q(
     t: torch.Tensor,
     cos: torch.Tensor,
@@ -331,8 +302,6 @@ def fused_apply_mla_rope_for_q(
     qk_head_dim: int,
     emb_dim: int,
     cu_seqlens_q: Optional[torch.Tensor] = None,
-    cp_rank: int = 0,
-    cp_size: int = 1,
     rotary_interleaved: bool = False,
 ):
     """
@@ -358,7 +327,7 @@ def fused_apply_mla_rope_for_q(
         t: inplace modified input tensor
     """
     return ApplyMLARotaryEmbQ.apply(
-        t, cos, sin, qk_head_dim, emb_dim, cu_seqlens_q, cp_rank, cp_size, rotary_interleaved
+        t, cos, sin, qk_head_dim, emb_dim, cu_seqlens_q, rotary_interleaved
     )
 
 
@@ -397,8 +366,6 @@ def rotary_fwd_kv_kernel(
     stride_k_nheads,
     stride_v_seq,
     stride_v_nheads,
-    cp_rank,
-    cp_size,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -427,7 +394,7 @@ def rotary_fwd_kv_kernel(
     if cu_seqlens_kv is None:
         token_idx = pid_m // batch_size
     else:
-        token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
+        token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num)
 
     cos_left = tl.load(COS + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
     sin_left = tl.load(SIN + token_idx * emb_dim + tl.arange(0, emb_dim // 2))
@@ -505,8 +472,6 @@ def rotary_bwd_kv_kernel(
     stride_dkv_seq,
     stride_dkv_nheads,
     stride_demb_seq,
-    cp_rank,
-    cp_size,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -531,7 +496,7 @@ def rotary_bwd_kv_kernel(
     if cu_seqlens_kv is None:
         token_idx = pid_m // batch_size
     else:
-        token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
+        token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num)
 
     dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
     dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
@@ -585,18 +550,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
-        kv,
-        k_pos_emb,
-        cos,
-        sin,
-        emb_dim,
-        k_dim,
-        v_dim,
-        cu_seqlens_kv,
-        cp_rank,
-        cp_size,
-        rotary_interleaved=False,
+        ctx, kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim, cu_seqlens_kv, rotary_interleaved=False
     ):
         """
         Forward function for ApplyMLARotaryEmbKV.
@@ -655,8 +609,6 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             o_key.stride(1),
             o_value.stride(0),
             o_value.stride(1),
-            cp_rank,
-            cp_size,
         )
         ctx.save_for_backward(cos, sin)
         ctx.rotary_interleaved = rotary_interleaved
@@ -664,8 +616,6 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         ctx.k_dim = k_dim
         ctx.v_dim = v_dim
         ctx.cu_seqlens_kv = cu_seqlens_kv
-        ctx.cp_rank = cp_rank
-        ctx.cp_size = cp_size
         if cu_seqlens_kv is None:
             o_key = o_key.view(max_seqlen, -1, nheads, emb_dim + k_dim)
             o_value = o_value.view(max_seqlen, -1, nheads, v_dim)
@@ -688,8 +638,8 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
         if ctx.cu_seqlens_kv is None:
             # sbhd
             max_seqlen, batch_size, nheads, _ = dk.shape
-            dk = dk.contiguous().view(-1, nheads, ctx.emb_dim + ctx.k_dim)
-            dv = dv.contiguous().view(-1, nheads, ctx.v_dim)
+            dk = dk.view(-1, nheads, ctx.emb_dim + ctx.k_dim)
+            dv = dv.view(-1, nheads, ctx.v_dim)
             total_seqlen = dk.shape[0]
         else:
             # thd
@@ -723,15 +673,14 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             d_kv.stride(0),
             d_kv.stride(1),
             d_emb.stride(0),
-            ctx.cp_rank,
-            ctx.cp_size,
         )
         if ctx.cu_seqlens_kv is None:
             d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
             d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
-        return d_kv, d_emb, None, None, None, None, None, None, None, None, None
+        return d_kv, d_emb, None, None, None, None, None, None, None
 
 
+@experimental_fn(introduced_with_version="0.13.0")
 def fused_apply_mla_rope_for_kv(
     kv: torch.Tensor,
     k_pos_emb: torch.Tensor,
@@ -741,8 +690,6 @@ def fused_apply_mla_rope_for_kv(
     k_dim: int,
     v_dim: int,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
-    cp_rank: int = 0,
-    cp_size: int = 1,
     rotary_interleaved: bool = False,
 ):
     """
@@ -768,15 +715,5 @@ def fused_apply_mla_rope_for_kv(
         value: [seq_len, batch_size, head_num, v_dim] or [total_seq_len, head_num, v_dim]
     """
     return ApplyMLARotaryEmbKV.apply(
-        kv,
-        k_pos_emb,
-        cos,
-        sin,
-        emb_dim,
-        k_dim,
-        v_dim,
-        cu_seqlens_kv,
-        cp_rank,
-        cp_size,
-        rotary_interleaved,
+        kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim, cu_seqlens_kv, rotary_interleaved
     )

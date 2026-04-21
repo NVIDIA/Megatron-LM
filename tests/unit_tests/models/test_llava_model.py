@@ -6,18 +6,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import parallel_state as ps
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_submodules,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from megatron.training.global_vars import set_args
 from tests.unit_tests.test_utilities import Utils
@@ -49,19 +47,15 @@ class TestLLaVAModel:
             use_cpu_initialization=False,
         )
 
-        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
-        vision_layer_spec = ModuleSpec(
-            module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
-        )
-        vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        vision_layer_spec = deepcopy(language_layer_spec)
+        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         self.model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=ModuleSpec(
-                module=TransformerLayer, submodules=language_layer_submodules
-            ),
+            language_transformer_layer_spec=language_layer_spec,
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
@@ -331,8 +325,8 @@ class TestLLaVAModel:
                 [0, 512, 1024, 1600], dtype=torch.int32
             ).cuda(),  # Just example values.
             cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).cuda(),
-            max_seqlen_q=1600,
-            max_seqlen_kv=1600,
+            max_seqlen_q=torch.tensor(1600, dtype=torch.int32).cuda(),
+            max_seqlen_kv=torch.tensor(1600, dtype=torch.int32).cuda(),
         )
 
         # NOTE: Packing is only supported with BF16. Use BF16 here and switch back to default.
@@ -487,20 +481,16 @@ def setup_and_teardown_llava_model(request):
         use_cpu_initialization=False,
     )
 
-    language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
-    vision_layer_spec = ModuleSpec(
-        module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
-    )
-    vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
+    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    vision_layer_spec = deepcopy(language_layer_spec)
+    vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
     language_config.language_model_type = "dummy"
     vision_model_type = request.param
     vision_config.vision_model_type = vision_model_type
     model = LLaVAModel(
         language_transformer_config=language_config,
-        language_transformer_layer_spec=ModuleSpec(
-            module=TransformerLayer, submodules=language_layer_submodules
-        ),
+        language_transformer_layer_spec=language_layer_spec,
         language_vocab_size=2048,
         language_max_sequence_length=4096,
         vision_transformer_config=vision_config,
@@ -549,7 +539,7 @@ def create_test_args(cp_size, sequence_parallel):
 
 class TestLLaVAModelTokenParallel:
 
-    def _init_llava_model(self, cp_size, tp_size, sequence_parallel):
+    def _init_llava_model(self, cp_size, tp_size, sequence_parallel, cp_group=None):
         language_hidden_size = 64
         language_num_attention_heads = 16
 
@@ -583,33 +573,31 @@ class TestLLaVAModelTokenParallel:
             context_parallel_size=1,
         )
 
-        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding
         if (
-            language_layer_submodules.self_attention.params.get('attn_mask_type', '')
+            language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
             == AttnMaskType.causal
         ):
-            language_layer_submodules.self_attention.params['attn_mask_type'] = (
+            language_layer_spec.submodules.self_attention.params['attn_mask_type'] = (
                 AttnMaskType.padding_causal
             )
         elif (
-            language_layer_submodules.self_attention.params.get('attn_mask_type', '')
+            language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
             == AttnMaskType.no_mask
         ):
-            language_layer_submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
+            language_layer_spec.submodules.self_attention.params['attn_mask_type'] = (
+                AttnMaskType.padding
+            )
 
-        vision_layer_spec = ModuleSpec(
-            module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
-        )
-        vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
+        vision_layer_spec = deepcopy(language_layer_spec)
+        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=ModuleSpec(
-                module=TransformerLayer, submodules=language_layer_submodules
-            ),
+            language_transformer_layer_spec=language_layer_spec,
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
@@ -620,6 +608,7 @@ class TestLLaVAModelTokenParallel:
             img_h=336,
             img_w=336,
             patch_dim=14,
+            cp_group=cp_group,
         )
 
         return model
@@ -724,7 +713,9 @@ class TestLLaVAModelTokenParallel:
         )
         model = None
         with ctx:
-            model = self._init_llava_model(cp_size, tp_size, sequence_parallel)
+            model = self._init_llava_model(
+                cp_size, tp_size, sequence_parallel, cp_group=ps.get_context_parallel_group()
+            )
 
         if model is None:
             return
@@ -781,19 +772,12 @@ def count_parameters(model):
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    "cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_padding",
-    [
-        (1, 1, False, 99, False, 0),
-        (2, 2, True, 99, False, 5),
-        (2, 2, False, 99, False, 1),
-        (1, 4, False, 99, True, 13),
-    ],
+    "cp_size, tp_size, has_sp, seq_len, expected_padding",
+    [(1, 1, False, 99, 0), (2, 2, True, 99, 5), (2, 2, False, 99, 1)],
 )
-def test_get_padding(cp_size, tp_size, has_sp, seq_len, fp8_enabled, expected_padding):
+def test_get_padding(cp_size, tp_size, has_sp, seq_len, expected_padding):
     """Test calculating padding for context parallel."""
-    padding = context_parallel.get_padding(
-        seq_len, cp_size, tp_size, has_sp, fp8_enabled=fp8_enabled
-    )
+    padding = context_parallel.get_padding(seq_len, cp_size, tp_size, has_sp)
 
     assert padding == expected_padding
 
@@ -820,3 +804,61 @@ def test_get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, exp
             torch.tensor([0, padded_seq_len], dtype=torch.int32),
         )
         assert packed_seq_params.max_seqlen_q == padded_seq_len
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "batch_size, cp_size, expected_samples_per_rank, expected_global_pad",
+    [
+        (8, 2, 4, 0),  # Perfect division
+        (7, 2, 4, 1),  # Needs padding
+        (1, 4, 1, 3),  # Single sample
+    ],
+)
+def test_split_to_context_parallel_ranks(
+    batch_size, cp_size, expected_samples_per_rank, expected_global_pad
+):
+    """Test splitting tensors across context parallel ranks."""
+    tp_size = 8 // cp_size
+    assert 8 % cp_size == 0, "Expected to run this using 8 GPUs."
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+    )
+    model_parallel_cuda_manual_seed(123)
+
+    # Create a dummy tensor with shape [batch_size, 2, 3].
+    global_t = (
+        torch.arange(batch_size * 2 * 3, dtype=torch.bfloat16).reshape(batch_size, 2, 3).cuda()
+    )
+
+    # Split the global tensor to CP ranks.
+    local_t, global_pad = context_parallel.split_to_context_parallel_ranks(global_t)
+
+    # Check shapes
+    assert local_t.shape[0] == expected_samples_per_rank
+    assert local_t.shape[1:] == (2, 3)
+    assert global_pad == expected_global_pad
+
+    # Check values for non-padded elements
+    cp_rank = ps.get_context_parallel_rank()
+    start_idx = cp_rank * expected_samples_per_rank
+    end_idx = min(start_idx + expected_samples_per_rank, batch_size)
+    assert torch.allclose(local_t[: end_idx - start_idx], global_t[start_idx:end_idx])
+
+    # Check padding is zeros
+    end_idx2 = start_idx + expected_samples_per_rank
+    if end_idx < end_idx2:
+        assert torch.all(local_t[end_idx - start_idx :] == 0)
+
+    # Permute similar to the llava model.
+    local_t = local_t.permute(1, 0, 2).contiguous()
+
+    # Gather the tensor from all context parallel ranks.
+    global_t_gathered = context_parallel.gather_from_context_parallel_ranks(local_t, global_pad)
+
+    # Check the gathered tensor is the same as the original tensor.
+    expected_global_t = global_t.permute(1, 0, 2).contiguous()
+
+    assert torch.allclose(global_t_gathered, expected_global_t)
+
+    Utils.destroy_model_parallel()

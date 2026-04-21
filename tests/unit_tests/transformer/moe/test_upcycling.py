@@ -8,7 +8,6 @@ import torch.distributed
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -34,10 +33,12 @@ from megatron.training.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-if HAVE_TE:
+try:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
-else:
-    TEColumnParallelGroupedLinear = None
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 _SEED = 42
 
@@ -114,6 +115,7 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
     args.lr = 3e-5
     args.attention_dropout = 0.0
     args.hidden_dropout = 0.0
+    args.async_tensor_model_parallel_allreduce = False
     args.no_save_optim = True
     args.no_load_optim = True
     args.no_load_rng = True

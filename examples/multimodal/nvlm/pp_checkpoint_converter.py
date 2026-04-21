@@ -17,7 +17,7 @@ def split(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_pe
     iter = args.iteration if args.iteration else 1
     for tp in range(num_tp):
         path = os.path.join(input_dir, f"mp_rank_0{tp}", "model_optim_rng.pt")
-        sd = torch.load(path)
+        sd = torch.load(path, weights_only=False)
 
         if num_layers_per_pp_rank is None:
             num_layers = sd["args"].num_layers
@@ -90,7 +90,7 @@ def combine(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_
 
         for pp in range(input_pp):
             path = os.path.join(input_dir, f"mp_rank_0{tp}_00{pp}", "model_optim_rng.pt")
-            sd = torch.load(path)
+            sd = torch.load(path, weights_only=False)
 
             if pp == 0:
                 new_sd = sd.copy()

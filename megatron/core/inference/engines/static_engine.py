@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
 import warnings
@@ -8,17 +8,13 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
-from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.utils import get_asyncio_loop
 
 try:
     from tqdm import tqdm
@@ -31,7 +27,6 @@ except ImportError:
     HAVE_TQDM = False
 
 
-# pylint: disable=line-too-long
 class StaticInferenceEngine(AbstractEngine):
     """The Megatron core backend constructor
 
@@ -43,6 +38,8 @@ class StaticInferenceEngine(AbstractEngine):
             controller that will be used to define how to preprocess prompts, generate
             outputs and detokenizer the output tokens.
         max_batch_size (int, optional): The maximum number of requests to process at once.
+            Will be set from the InferenceWrapperConfig in `text_generation_controller` by
+            default.
         random_seed (int, optional): Use a random seed if you want deterministic
             results. Defaults to None.
     """
@@ -52,82 +49,25 @@ class StaticInferenceEngine(AbstractEngine):
         text_generation_controller: TextGenerationController,
         max_batch_size: Optional[int] = None,
         random_seed: Optional[int] = None,
-        legacy=False,
-        buffer_size_gb: Optional[float] = 40,
     ):
-        self.legacy = legacy
-        if legacy:
-            warnings.warn(
-                "The static engine will be deprecated and removed in the future version of megatron-core. Switch to DynamicInferenceEngine."
-            )
-        else:
-            warnings.warn(
-                "`StaticInferenceEngine` will be deprecated in a future version of Megatron-core. "
-                "Please directly use `DynamicInferenceEngine` instead. "
-                "`StaticInferenceEngine` currently uses `DynamicInferenceEngine` under the hood.",
-                DeprecationWarning,
-            )
-
-        self.controller = text_generation_controller
-        self.inference_wrapped_model = self.controller.inference_wrapped_model
-        self.config = self.inference_wrapped_model.config
-        self.random_seed = random_seed or 1234
-
-        # Store original context in case we need to fall back to legacy static engine
-        original_context = self.inference_wrapped_model.inference_context
-        assert original_context is not None
-        assert isinstance(original_context, StaticInferenceContext)
-
+        inference_wrapper_config = (
+            text_generation_controller.inference_wrapped_model.inference_wrapper_config
+        )
+        inference_max_batch_size = inference_wrapper_config.inference_max_requests
         if max_batch_size is None:
-            max_batch_size = original_context.max_batch_size
-        elif max_batch_size > original_context.max_batch_size:
+            max_batch_size = inference_max_batch_size
+        elif max_batch_size > inference_max_batch_size:
             warnings.warn(
                 f"Engine `max_batch_size` ({max_batch_size}) > "
-                f"`context.max_batch_size` in `inference_wrapped_model.inference_context` "
-                f"({original_context.max_batch_size}); setting `max_batch_size` to "
-                f"{original_context.max_batch_size}",
+                f"`inference_max_requests` in `inference_wrapper_config` "
+                f"({inference_max_batch_size}); setting `max_batch_size` to "
+                f"{inference_max_batch_size}",
                 UserWarning,
             )
-            max_batch_size = original_context.max_batch_size
-
+            max_batch_size = inference_max_batch_size
+        self.text_generation_controller = text_generation_controller
+        self.random_seed = random_seed
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
-
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(
-            self.inference_wrapped_model.model
-        )
-
-        try:
-            if not legacy:
-                dynamic_context = DynamicInferenceContext(
-                    model_config=self.config,
-                    inference_config=InferenceConfig(
-                        max_sequence_length=original_context.max_sequence_length,
-                        buffer_size_gb=buffer_size_gb,
-                        mamba_inference_state_config=mamba_inference_state_config,
-                        max_requests=max_batch_size,
-                        num_cuda_graphs=1,
-                        block_size_tokens=256,
-                        unified_memory_level=0,
-                    ),
-                )
-
-                self.controller.inference_wrapped_model.inference_context = dynamic_context
-                self.controller.inference_wrapped_model.prep_model_for_inference()
-                self.controller._init_dynamic_sampling_tensors()
-
-                self.dynamic_engine = DynamicInferenceEngine(
-                    controller=self.controller, context=dynamic_context
-                )
-        except Exception as e:
-            # Get exception details for better debugging
-            exception_msg = str(e) if str(e) else f"{type(e).__name__}: {repr(e)}"
-            warnings.warn(
-                f"Error initializing dynamic engine: {exception_msg} , using legacy static engine",
-                UserWarning,
-            )
-            # Restore original context when falling back to legacy static engine
-            self.controller.inference_wrapped_model.inference_context = original_context
-            self.legacy = True
 
     def get_new_request_id(self) -> str:
         """Gets a new request id from the scheduler"""
@@ -143,7 +83,7 @@ class StaticInferenceEngine(AbstractEngine):
         inference_request: Optional[InferenceRequest] = None,
         *,
         inference_parameters: Optional[SamplingParams] = None,
-    ) -> int:
+    ) -> str:
         """
         Adds a request to the scheduler and returns the request ID.
 
@@ -173,10 +113,7 @@ class StaticInferenceEngine(AbstractEngine):
             sampling_params = inference_parameters
 
         if inference_request is None:
-            # Support legacy single-arg tokenize_prompt mocks in tests.
-            prompt_tokens = self.controller.tokenize_prompt(
-                self.controller.tokenizer, prompt, add_BOS
-            )
+            prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
         else:
             prompt_tokens = inference_request.prompt_tokens
 
@@ -190,7 +127,7 @@ class StaticInferenceEngine(AbstractEngine):
         )
 
     def get_stream_generator(
-        self, request_id: int
+        self, request_id: str
     ) -> Union[AsyncGenerator[InferenceRequest, None], None]:
         """Returns the stream generator for the given request ID if it exists."""
         stream = self.scheduler.streams.get(request_id, None)
@@ -198,56 +135,7 @@ class StaticInferenceEngine(AbstractEngine):
             return stream.generator()
         return None
 
-    @torch.inference_mode()
-    def generate_using_dynamic_engine(
-        self,
-        prompts: Optional[List[str]] = None,
-        add_BOS: bool = False,
-        encoder_prompts: Optional[List[str]] = None,
-        common_inference_params: Optional[SamplingParams] = None,
-        sampling_params: Optional[SamplingParams] = None,
-        inference_requests: Optional[List[InferenceRequest]] = None,
-    ) -> List[InferenceRequest]:
-        """Generate using dynamic engine
-
-        Generate using dynamic engine.
-
-        Args:
-            prompts (List[str]): All the prompts as a list of strings
-            add_BOS (bool): Whether to add BOS token to beginning of prompts
-            encoder_prompts (List[dict]): All the encoder prompts as a list of strings
-            common_inference_params: Deprecated. Only used for backward compatibility with
-            MCore <= 0.9.0. Use `sampling_params` going forward.
-            sampling_params (SamplingParams): The request-level sampling parameters
-            inference_requests (List[InferenceRequest]): A pre-populated list of inference requests
-
-        Returns:
-            List[InferenceRequest]: The output is list of inference requests containing the
-            generated tokens, texts and log probs if required
-        """
-        assert hasattr(self, 'dynamic_engine'), "Dynamic engine not initialized"
-
-        if common_inference_params:
-            sampling_params = common_inference_params
-        if prompts:
-            if add_BOS:
-                sampling_params.add_BOS = True
-            request_records = self.dynamic_engine.generate(
-                prompts=prompts, sampling_params=sampling_params
-            )
-        elif inference_requests:
-            prompts = [request.prompt for request in inference_requests]
-            sampling_params = inference_requests[0].sampling_params
-            if add_BOS:
-                sampling_params.add_BOS = True
-            request_records = self.dynamic_engine.generate(
-                prompts=prompts, sampling_params=sampling_params
-            )
-
-        # Return the underlying `InferenceRequest` objects from the `DynamicInferenceRequestRecord`s.
-        return [record.merge() for record in request_records]
-
-    def generate_using_legacy_static_engine(
+    def generate(
         self,
         prompts: Optional[List[str]] = None,
         add_BOS: bool = False,
@@ -258,7 +146,10 @@ class StaticInferenceEngine(AbstractEngine):
     ) -> List[InferenceRequest]:
         """The megatron core inference backend generate function
 
-        This backend returns the output generations as a list.
+        This backend returns the output generations as a dictionary.
+        It returns the prompt tokens along with the generated tokens, the prompt
+        plus the generated string and the output log probabilities if requested
+
         Args:
             prompts (List[str]): All the prompts as a list of strings
             add_BOS (bool): Whether to add BOS token to beginning of prompts
@@ -272,6 +163,8 @@ class StaticInferenceEngine(AbstractEngine):
             List[InferenceRequest]: The output is list of inference requests containing the
             generated tokens, texts and log probs if required
         """
+        # TODO :M core- get rng state tracker
+
         request_ids: List[str] = []
 
         if self.random_seed:
@@ -302,52 +195,6 @@ class StaticInferenceEngine(AbstractEngine):
         ]
         return result
 
-    def generate(
-        self,
-        prompts: Optional[List[str]] = None,
-        add_BOS: bool = False,
-        encoder_prompts: Optional[List[str]] = None,
-        common_inference_params: Optional[SamplingParams] = None,
-        sampling_params: Optional[SamplingParams] = None,
-        inference_requests: Optional[List[InferenceRequest]] = None,
-    ) -> List[InferenceRequest]:
-        """The megatron core inference backend generate function
-
-        This uses dynamic engine if available, otherwise uses legacy static engine.
-
-        Args:
-            prompts (List[str]): All the prompts as a list of strings
-            add_BOS (bool): Whether to add BOS token to beginning of prompts
-            encoder_prompts (List[dict]): All the encoder prompts as a list of strings
-            common_inference_params: Deprecated. Only used for backward compatibility with
-            MCore <= 0.9.0. Use `sampling_params` going forward.
-            sampling_params (SamplingParams): The request-level sampling parameters
-            inference_requests (List[InferenceRequest]): A pre-populated list of inference requests
-
-        Returns:
-            List[InferenceRequest]: The output is list of inference requests containing the
-            generated tokens, texts and log probs if required
-        """
-        # TODO :M core- get rng state tracker
-        if not self.legacy:
-            return self.generate_using_dynamic_engine(
-                prompts=prompts,
-                add_BOS=add_BOS,
-                encoder_prompts=encoder_prompts,
-                common_inference_params=common_inference_params,
-                sampling_params=sampling_params,
-                inference_requests=inference_requests,
-            )
-        else:
-            return self.generate_using_legacy_static_engine(
-                prompts=prompts,
-                add_BOS=add_BOS,
-                encoder_prompts=encoder_prompts,
-                common_inference_params=common_inference_params,
-                sampling_params=sampling_params,
-                inference_requests=inference_requests,
-            )
-
     def run_engine(self):
         """Main functionality to run inference
 
@@ -375,7 +222,7 @@ class StaticInferenceEngine(AbstractEngine):
                     assert isinstance(stream, AsyncStream), stream
                     active_streams[request_id] = stream
             result_dict: Dict[str, InferenceRequest] = (
-                self.controller.generate_all_output_tokens_static_batch(
+                self.text_generation_controller.generate_all_output_tokens_static_batch(
                     active_requests, active_streams
                 )
             )
@@ -385,6 +232,17 @@ class StaticInferenceEngine(AbstractEngine):
             crnt_num_requests_pending = self.scheduler.num_requests_pending()
             tbar.update(prev_num_requests_pending - crnt_num_requests_pending)
             prev_num_requests_pending = crnt_num_requests_pending
+
+        # TODO: Later for dynamic batching we will do something like this
+        """ 
+            if dynamic_batching:
+                result_dict: Dict[
+                    str, InferenceRequest
+                ] = self.text_generation_controller.generate_output_tokens_one_step_dynamic_batch(
+                    active_requests
+                )
+            self.scheduler.update_requests_pools(result_dict=result_dict)         
+        """
 
     def _wrapped_run_engine(self, cuda_device):
         """
@@ -396,8 +254,8 @@ class StaticInferenceEngine(AbstractEngine):
         torch.cuda.set_device(cuda_device)
         self.run_engine()
 
-    async def run_engine_async(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+    async def run_engine_async(self):
         """Runs the engine asynchronously using asyncio"""
-        loop = get_asyncio_loop(loop)
+        loop = asyncio.get_running_loop()
 
         await loop.run_in_executor(None, self._wrapped_run_engine, torch.cuda.current_device())

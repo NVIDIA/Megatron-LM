@@ -23,9 +23,10 @@ from megatron.core.dist_checkpointing.exchange_utils import (
     exchange_loaded_objects_gather_object,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
-from megatron.core.dist_checkpointing.strategies.torch import (
-    TorchDistLoadShardedStrategy,
-    TorchDistSaveShardedStrategy,
+from megatron.core.dist_checkpointing.strategies.base import (
+    AsyncSaveShardedStrategy,
+    LoadShardedStrategy,
+    SaveShardedStrategy,
 )
 from megatron.core.dist_checkpointing.utils import (
     _sharded_object_id,
@@ -37,13 +38,14 @@ from megatron.core.dist_checkpointing.validation import (
     determine_global_metadata,
     validate_sharding_integrity,
 )
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T', ShardedObject, ShardedTensor)
 
 
-class FullyParallelSaveStrategyWrapper:
+class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
     """Wraps arbitrary strategy and distributes the save during `save`.
 
     The save distribution happens without any *data* communication.
@@ -58,7 +60,7 @@ class FullyParallelSaveStrategyWrapper:
     described in `distribute_shards_to_ranks`.
 
     Args:
-        strategy (TorchDistSaveShardedStrategy): base strategy to wrap
+        strategy (SaveShardedStrategy): base strategy to wrap
         parallelization_group (ProcessGroup, optional): process group to use for save
             distribution. Note that this doesn't have to match exactly the
             data distribution, but should cover the replication pattern
@@ -70,35 +72,28 @@ class FullyParallelSaveStrategyWrapper:
 
     def __init__(
         self,
-        strategy: TorchDistSaveShardedStrategy,
+        strategy: SaveShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
-        backend: str = "torch_dist",
-        version: int = 1,
     ):
-        """ """
+        super().__init__(strategy.backend, strategy.version)
         self.base_strategy = strategy
         if parallelization_group is None:
             parallelization_group = torch.distributed.group.WORLD
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
-        self.backend = backend
-        self.version = version
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
-    def async_save(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
-    ):
-        """ """
+    def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        if not isinstance(self.base_strategy, AsyncSaveShardedStrategy):
+            raise CheckpointingException(
+                f'Cannot apply async_save to non-async base strategy {self.base_strategy}'
+            )
         self.apply_saving_parallelization(sharded_state_dict)
-        return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
+        return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-        """ """
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
 
@@ -138,14 +133,18 @@ class FullyParallelSaveStrategyWrapper:
         end = time()
         logger.debug(f"parallel save sharding, time: {end - start}")
 
+    @property
+    def can_handle_sharded_objects(self):
+        return self.base_strategy.can_handle_sharded_objects
 
-class FullyParallelLoadStrategyWrapper:
+
+class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
     """Wraps arbitrary load strategy and distributes the load during `load`.
 
     See `load` method docs for details.
 
     Args:
-        strategy (TorchDistLoadShardedStrategy): base strategy to wrap
+        strategy (LoadShardedStrategy): base strategy to wrap
         parallelization_group (ProcessGroup, optional): process group to use for load
             distribution. Note that this doesn't have to match exactly the
             data distribution, but should cover the replication pattern
@@ -167,11 +166,12 @@ class FullyParallelLoadStrategyWrapper:
 
     def __init__(
         self,
-        strategy: TorchDistLoadShardedStrategy,
+        strategy: LoadShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
     ):
+        super().__init__()
         self.base_strategy = strategy
         if parallelization_group is None:
             parallelization_group = (
@@ -185,12 +185,7 @@ class FullyParallelLoadStrategyWrapper:
         self.cached_global_metadata: Optional[Metadata] = None
 
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
-    def load(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
-    ) -> StateDict:
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
 
         Steps:
@@ -219,12 +214,11 @@ class FullyParallelLoadStrategyWrapper:
             a state dict that would be loaded with the underlying strategy
             without this wrapper.
         """
-        from megatron.core.utils import get_pg_size
 
         loaded_state_dict = {}
 
         if get_pg_size(self.parallelization_group) <= 1:
-            return self.base_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+            return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
         # Step 1 and 2: exchange load metadata and distribute the load
         with debug_time("self.apply_loading_parallelization", logger):
@@ -251,13 +245,11 @@ class FullyParallelLoadStrategyWrapper:
         ), "sharded_state_dict is not empty after deferring tensors and objects"
         with debug_time("base_load_ShardedObjects", logger):
             # Load sharded objects first
-            loaded_objects = self.base_strategy.load(
-                to_load_objects, checkpoint_dir, async_strategy
-            )
+            loaded_objects = self.base_strategy.load(to_load_objects, checkpoint_dir)
 
         with debug_time("base_load_ShardedTensors", logger):
             # Load sharded tensors separately
-            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
+            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
 
         with debug_time("self.exchange_loaded_tensors", logger):
 
@@ -396,13 +388,21 @@ class FullyParallelLoadStrategyWrapper:
 
         return precomputed_distribution
 
+    @property
+    def can_handle_sharded_objects(self):
+        return self.base_strategy.can_handle_sharded_objects
+
     def load_tensors_metadata(self, checkpoint_dir: Path):
-        """ """
         return self.base_strategy.load_tensors_metadata(checkpoint_dir)
 
     def load_sharded_metadata(self, checkpoint_dir: Path):
-        """ """
         return self.base_strategy.load_sharded_metadata(checkpoint_dir)
+
+    def check_backend_compatibility(self, loaded_version):
+        return self.base_strategy.check_backend_compatibility(loaded_version)
+
+    def check_version_compatibility(self, loaded_version):
+        return self.base_strategy.check_version_compatibility(loaded_version)
 
 
 def distribute_main_replicas_with_precomputed_distribution(
@@ -435,8 +435,6 @@ def distribute_main_replicas_with_precomputed_distribution(
     rank1: A: 1, B: 0, C: 1
     rank2: A: 1, B: 1, C: 0
     """
-    from megatron.core.utils import get_pg_rank, get_pg_size
-
     if parallelization_group is None:
         parallelization_group = torch.distributed.group.WORLD
     if get_pg_size(group=parallelization_group) <= 1:

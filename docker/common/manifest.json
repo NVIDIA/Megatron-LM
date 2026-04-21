@@ -1,0 +1,10 @@
+{
+    "ngc-pytorch": "nvcr.io/nvidia/pytorch:25.03-py3",
+    "vcs-dependencies": {
+        "transformer-engine": {
+            "repo": "https://github.com/NVIDIA/TransformerEngine",
+            "ref": "bee4649c15a79ffcb9689ca7c0c963f5febaa28a"
+        }
+    },
+    "pypi-dependencies": {}
+}

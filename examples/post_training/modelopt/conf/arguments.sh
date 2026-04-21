@@ -1,12 +1,4 @@
-#!/bin/bash
-set -e
-
-MLM_MODEL_CFG=${1}
-
-if [ -z $1 ]; then
-    printf "${MLM_ERROR} Model configuration name must be provided as the first argument (e.g. 'meta-llama/Llama-3.2-1B-Instruct')\n"
-    exit 1
-fi
+MLM_MODEL_CFG=$1
 
 # Bash coloring
 RED='\033[0;31m'
@@ -42,7 +34,7 @@ else
     source ${MLM_ENV_SETUP}
 fi
 
-if [[ -z ${MLM_EXTRA_ARGS} ]]; then
+if [ -z ${MLM_EXTRA_ARGS} ]; then
     printf "${MLM_WARNING} Use ${PURPLE}MLM_EXTRA_ARGS${WHITE} to provide additional arguments!\n"
 fi
 
@@ -56,11 +48,6 @@ if [ -z ${TP} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} not set! (default: ${TP})\n"
 fi
 
-if [ -z ${ETP} ]; then
-    ETP=${TP}
-    printf "${MLM_WARNING} Variable ${PURPLE}ETP${WHITE} not set! (default: ${ETP})\n"
-fi
-
 if [ -z ${EP} ]; then
     EP=1
     printf "${MLM_WARNING} Variable ${PURPLE}EP${WHITE} not set! (default: ${EP})\n"
@@ -71,11 +58,6 @@ if [ -z ${PP} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}PP${WHITE} not set! (default: ${PP})\n"
 fi
 
-if [ -z ${CP} ]; then
-    CP=1
-    printf "${MLM_WARNING} Variable ${PURPLE}CP${WHITE} not set! (default: ${CP})\n"
-fi
-
 if [ -z ${DP} ]; then
     DP=1
     printf "${MLM_WARNING} Variable ${PURPLE}DP${WHITE} not set! (default: ${DP})\n"
@@ -83,10 +65,10 @@ fi
 
 
 if [ -z ${LAUNCH_SCRIPT} ]; then
-    LAUNCH_SCRIPT="torchrun --nproc_per_node=$((ETP * EP * PP * CP * DP))"
+    LAUNCH_SCRIPT="torchrun --nproc_per_node=$((TP * EP * PP * DP))"
 fi
 
-# Install Model Optimizer if haven't.
+# Install TensorRT Model Optimizer if haven't.
 if [ -z ${MLM_SKIP_INSTALL} ]; then
     pip install -r ${SCRIPT_DIR}/requirements.txt
 fi

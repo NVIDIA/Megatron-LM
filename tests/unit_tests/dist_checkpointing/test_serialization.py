@@ -77,6 +77,16 @@ class TestSerialization:
             save(sharded_state_dict, ckpt_dir)
             torch.distributed.barrier()
 
+            saved_config = maybe_load_config(ckpt_dir)
+            if saved_config.sharded_backend == 'zarr':
+                assert (ckpt_dir / 'keyA').is_dir()
+                assert (ckpt_dir / 'keyB').is_dir()
+                assert not (ckpt_dir / 'keyC').exists()
+                assert not (ckpt_dir / 'sd_keyA').is_dir()
+
+                if HAVE_DTENSOR:
+                    assert (ckpt_dir / 'keyD').is_dir()
+
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets(
                     'keyA', torch.ones(2, 4), replica_id=Utils.rank
@@ -117,63 +127,48 @@ class TestSerialization:
                 preprocess_common_before_consistancy_check=preprocess_fn,
             )
 
+            saved_config = maybe_load_config(ckpt_dir)
+            if saved_config.sharded_backend == 'zarr':
+                assert (ckpt_dir / 'keyA').is_dir()
+                assert (ckpt_dir / 'keyB').is_dir()
+                assert not (ckpt_dir / 'keyC').exists()
+                assert not (ckpt_dir / 'sd_keyA').is_dir()
+
         Utils.destroy_model_parallel()
 
     def test_multi_process_save_log_difference(self, tmp_path_dist_ckpt, caplog):
         Utils.initialize_model_parallel(2, 4)
-        rank = Utils.rank
-        world_size = Utils.world_size
 
         state_dict = {
             'sd_keyA': ShardedTensor.from_rank_offsets(
-                'keyA', torch.ones(2, 4), (0, rank, world_size)
+                'keyA', torch.ones(2, 4), (0, Utils.rank, Utils.world_size)
             ),
             'sd_keyB': ShardedTensor.from_rank_offsets(
-                'keyB', torch.ones(3, 5, 7), (2, rank, world_size)
+                'keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)
             ),
-            'rank': rank,
+            'rank': torch.distributed.get_rank(),
         }
 
         def preprocess_fn(x):
             return x
 
-        # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_multi_process_save_log_difference', sync=True
-        ) as ckpt_dir:
-            with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING):
+            # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
+            with TempNamedDir(
+                tmp_path_dist_ckpt / 'test_multi_process_save', sync=True
+            ) as ckpt_dir:
                 save(
                     state_dict,
                     ckpt_dir,
                     validate_access_integrity=True,
                     preprocess_common_before_consistancy_check=preprocess_fn,
                 )
-
-        if rank == 0:
-            # Rank 0 should not log the warning related to common state dict difference
-            assert not any(
-                f"Rank {rank} common state dict differs from rank 0 common state dict."
-                in record.message
-                for record in caplog.records
-            )
-        else:
-            found_detailed_match = False
-            # Construct the expected full message string based on user request
-            expected_full_message = (
-                f"Rank {rank} common state dict differs from rank 0 common state dict. "
-                f"Keys only on rank 0: [], "
-                f"Keys only on {rank}: [], "
-                f"Mismatched keys: [(('rank',), <class 'int'>, <class 'int'>)]"
-            )
-
-            for record in caplog.records:
-                if record.message == expected_full_message:
-                    found_detailed_match = True
-                    break
-
-            assert (
-                found_detailed_match
-            ), f"Did not find expected log message format for mismatch on rank {rank}. Expected: {expected_full_message}"
+            # pylint: disable=line-too-long
+            if torch.distributed.get_rank() == 0:
+                assert (
+                    "There is difference in the common state dict in different ranks. The differences are {1: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 2: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 3: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 4: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 5: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 6: ([], [], [(('rank',), <class 'int'>, <class 'int'>)]), 7: ([], [], [(('rank',), <class 'int'>, <class 'int'>)])}"
+                    in caplog.text
+                )
 
         Utils.destroy_model_parallel()
 
@@ -409,6 +404,7 @@ class TestSerialization:
                 load(state_dict, ckpt_dir)
             assert f'is not a distributed checkpoint' in str(exc_info.value)
 
+            # Missing Zarr arrays
             torch.distributed.barrier()
             save(state_dict, ckpt_dir)
             sh_ten.key = 'different_key'
@@ -529,7 +525,6 @@ class TestSerialization:
         not is_torch_min_version("2.3.0"),
         reason="remove_sharded_tensors relies on Torch APIs introduced in v2.3.0",
     )
-    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_remove_sharded_tensors(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
@@ -831,15 +826,16 @@ class TestNonStrictLoad:
             ),
         }
 
+    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_unexpected_keys_handling_during_validation(
-        self, caplog, tmp_path_dist_ckpt, validate_integrity
+        self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -864,7 +860,9 @@ class TestNonStrictLoad:
                 assert 'Missing keys' not in error_msg
 
             # ASSUME_OK_UNEXPECTED results in an exception raised by the underlying strategy
-            with pytest.raises(PyTCheckpointingException) as exc_info:
+            with pytest.raises(
+                PyTCheckpointingException if save_format == 'torch_dist' else CheckpointingException
+            ) as exc_info:
                 load_with_flag(StrictHandling.ASSUME_OK_UNEXPECTED)
             # Informative exceptions with `RAISE_*` options:
             with pytest.raises(CheckpointingException) as exc_info:
@@ -902,15 +900,16 @@ class TestNonStrictLoad:
             loaded_state_dict = load_with_flag(StrictHandling.IGNORE_ALL)
             assert 'TenA' in loaded_state_dict
 
+    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_missing_keys_raises_error_during_validation(
-        self, caplog, tmp_path_dist_ckpt, validate_integrity
+        self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
     ):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -939,6 +938,10 @@ class TestNonStrictLoad:
 
             with caplog.at_level(logging.WARNING):
                 loaded_state_dict = load_with_flag(StrictHandling.LOG_UNEXPECTED)
+            assert (
+                caplog.text == ''
+                or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
+            )
             assert 'TenB' in loaded_state_dict
 
             loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(
@@ -970,11 +973,12 @@ class TestNonStrictLoad:
             assert unexpected_keys == set()
             assert missing_keys == {'TenA', 'ObjB'}
 
+    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
-    def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity):
+    def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -996,22 +1000,31 @@ class TestNonStrictLoad:
             ):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict = load_with_flag(strict)
+                assert (
+                    caplog.text == ''
+                    or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
+                )
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
 
             for strict in (StrictHandling.RETURN_UNEXPECTED, StrictHandling.RETURN_ALL):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(strict)
+                assert (
+                    caplog.text == ''
+                    or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
+                )
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
                 assert missing_keys == set()
                 assert unexpected_keys == set()
 
-    def test_sharded_metadata(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    def test_sharded_metadata(self, tmp_path_dist_ckpt, save_format):
 
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)
             save(sharded_state_dict, ckpt_dir, save_strategy)
             torch.distributed.barrier()
             sharded_metadata = load_sharded_metadata(ckpt_dir)

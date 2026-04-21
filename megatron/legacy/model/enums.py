@@ -5,6 +5,9 @@ import enum
 class LayerType(enum.Enum):
     encoder = 1
     decoder = 2
+    retro_encoder = 3
+    retro_decoder = 4
+    retro_decoder_with_retriever = 5
  
 class AttnType(enum.Enum):
     self_attn = 1

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 import bisect
 import dataclasses
+import functools
 import json
 import re
 import sys
@@ -8,10 +9,11 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from image_processing import ImageTransform, find_closest_aspect_ratio, find_closest_area_weighted_aspect_ratio
+from image_processing import ImageTransform, find_closest_aspect_ratio, find_closest_area_weighted_aspect_ratio, process_images
 from PIL import Image
 from torchvision.transforms import ToPILImage
 import numpy as np
+from einops import rearrange
 import torch
 
 from energon_util import OfflineTargetAspectRatioSample, SampleListSample
@@ -43,6 +45,7 @@ class ImageTaskSample(Sample):
     num_tiles: List[int]
     tokens: torch.Tensor
     total_len: int  # Total token count in the sample, including text and image tokens
+    total_len_padded: int  # Total padded token count in the sample.
     labels: torch.Tensor = None
 
 
@@ -65,6 +68,7 @@ class ImageTaskSamplePacked(Sample):
     num_tiles: List[int]  # Number of tiles for each image of each sample (num_imgs)
     max_length: int    # Maximum length across sub-samples.
     cu_lengths: List[int]  # Cumulative length of each sub-sample in this packed sample incl. text and image tokens (P,)
+    cu_lengths_padded: List[int]  # Cumulative padded length of each sub-sample in this packed sample incl. text and image tokens (P,)
 
 
 # Typing for the resulting batch data after encode_batch()
@@ -88,6 +92,17 @@ class ImageTaskBatchPacked(Batch):
     num_tiles: List[List[int]]  # Number of tiles per image (N, num_imgs)
     max_lengths: List[int]  # Maximum length across sub-samples (N,)
     cu_lengths: List[List[int]]  # Cumulative length of each sub-sample in each packed sample of the batch (N, P)
+    cu_lengths_padded: List[List[int]]  # Cumulative padded length of each sub-sample in each packed sample of the batch (N, P)
+    imgs_sizes: List[Tuple[int, int]]
+    vision_max_lengths: List[int]
+    vision_cu_lengths: List[List[int]]
+    has_pad_img: bool
+
+    # Sound
+    sound_clips: list[torch.Tensor]
+    sound_length: list[int]
+    sound_timestamps: list[tuple[int, int]]
+    num_sound_clips: list[int]
 
 
 # Based on https://github.com/hiyouga/LLaMA-Factory/blob/641d0dab08d96a93c34657742213d8994d9ed476/src/llamafactory/data/processors/processor_utils.py#L19
@@ -153,8 +168,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         self.args = get_args()
 
         self.tokenizer = get_tokenizer()
-        with open(self.args.prompt_path, "r") as f:
-            self.manual_prompts = json.load(f)
+        self.manual_prompts = {}
+        if self.args.prompt_path:
+            with open(self.args.prompt_path, "r") as f:
+                self.manual_prompts = json.load(f)
         self.dataloader_seq_length = self.args.dataloader_seq_length  # Always return samples of this length.
         self.packing_seq_length = self.args.packing_seq_length     # Packing sequence length, if packing is enabled.
         self.is_packing_enabled = self.args.packing_buffer_size is not None and self.args.packing_buffer_size > 0
@@ -166,16 +183,34 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             assert self.packing_seq_length > 0, "packing sequence length must be set"
 
         self.num_image_embeddings_per_tile = get_num_image_embeddings(
-            self.args.img_h,
-            self.args.img_w,
-            self.args.patch_dim,
-            self.args.vision_model_type,
-            self.args.disable_vision_class_token,
-            1,
-            self.args.pixel_shuffle,
-            self.args.use_tile_tags,
-            self.args.max_num_tiles,
-            self.args.tokenizer_prompt_format,
+            img_h=self.args.img_h,
+            img_w=self.args.img_w,
+            patch_dim=self.args.patch_dim,
+            vision_model_type=self.args.vision_model_type,
+            disable_vision_class_token=self.args.disable_vision_class_token,
+            class_token_len=1,
+            pixel_shuffle=self.args.pixel_shuffle,
+            use_tile_tags=self.args.use_tile_tags,
+            max_num_tiles=self.args.max_num_tiles,
+            tokenizer_type=self.args.tokenizer_prompt_format,
+            use_image_break_token=self.args.image_break_token is not None,
+            conv_merging=self.args.conv_merging,
+        )
+
+        # Create a partial function with all the self.args parameters pre-filled
+        # Only img_h and img_w need to be specified when calling this function
+        self._get_num_image_embeddings = functools.partial(
+            get_num_image_embeddings,
+            patch_dim=self.args.patch_dim,
+            vision_model_type=self.args.vision_model_type,
+            disable_vision_class_token=self.args.disable_vision_class_token,
+            class_token_len=1,
+            pixel_shuffle=self.args.pixel_shuffle,
+            use_tile_tags=self.args.use_tile_tags,
+            max_num_tiles=self.args.max_num_tiles,
+            tokenizer_type=self.args.tokenizer_prompt_format,
+            use_image_break_token=self.args.image_break_token is not None,
+            conv_merging=self.args.conv_merging,
         )
 
         self.txt_to_token_dict = {}
@@ -190,20 +225,87 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             find_closest_area_weighted_aspect_ratio if self.args.use_area_weighted_aspect_ratio
             else find_closest_aspect_ratio)
 
-        self.transform_img = ImageTransform(self.img_h, self.args.vision_model_type)
+        self.transform_img = ImageTransform(
+            self.img_h,
+            self.args.vision_model_type,
+            dynamic_resolution=self.args.dynamic_resolution,
+            res_step=self.args.patch_dim,
+            min_num_patches=self.args.dynamic_resolution_min_patches,
+            max_num_patches=self.args.seq_length - (1 if not self.args.disable_vision_class_token else 0), #TODO: handle class toekn length correctly(not just use 1)
+            pixel_shuffle=self.args.pixel_shuffle,
+            min_side=self.args.dynamic_resolution_min_side,
+            conv_merging=self.args.conv_merging,
+            match_tiling_dynamic_resolution=self.args.match_tiling_dynamic_resolution,
+            masked_tiling_dynamic_resolution=getattr(self.args, "masked_tiling_dynamic_resolution", False),
+            thumbnail_area_threshold=self.args.thumbnail_area_threshold,
+        )
 
-    def _get_total_seq_length(self, input_ids, num_tiles):
+    def _verify_no_temporal_compression(self):
+        """
+        This TaskEncoder is not updated to support these features, but we still construct it during
+        training setup even when using MultiModalTaskEncoder, enen though we don't use it. So we
+        have to check this during runtime.
+        """
+        # For tiling only, need a fixed number of embeddings for num_image_embeddings_per_tile
+        # We don't pass in `is_video` to calculate `self.num_image_embeddings_per_tile`,
+        # so we currently require no temporal compression because we can't verify the number of frames
+        video_temporal_patch_size = getattr(self.args, 'video_temporal_patch_size', 1)
+        if video_temporal_patch_size != 1:
+            raise NotImplementedError(
+                f"When using TaskEncoder, temporal compression is not supported."
+                f" Found video_temporal_patch_size={video_temporal_patch_size}."
+            )
+
+    def _get_total_seq_length(self, input_ids, num_tiles, imgs=None):
         """Calculate expected sequence length given text tokens length and number of tiles."""
-        total_num_images = len(num_tiles)
-        total_num_tiles = sum(num_tiles)
-        total_len = len(input_ids) + total_num_tiles * self.num_image_embeddings_per_tile - total_num_images
+        self._verify_no_temporal_compression()
+
+        if self.args.dynamic_resolution:
+            assert imgs is not None
+
+            img_seq_len = 0
+            img_idx = 0
+            # For dynamic resolution, we need to group embeddings by conceptual image
+            # since match tiling can return multiple tensors (main + thumbnail) per image
+            for num_tiles_for_image in num_tiles:
+                # Sum embeddings for all tiles/images belonging to this conceptual image
+                for _ in range(num_tiles_for_image):
+                    img_seq_len += self._get_num_image_embeddings(
+                        img_h=imgs[img_idx].shape[1],
+                        img_w=imgs[img_idx].shape[2],
+                    )
+                    img_idx += 1
+
+            total_len = len(input_ids) + img_seq_len - len(num_tiles)
+        else:
+            total_num_images = len(num_tiles)
+            total_num_tiles = sum(num_tiles)
+            total_len = len(input_ids) + total_num_tiles * self.num_image_embeddings_per_tile - total_num_images
         return total_len
 
-    def _truncate_for_packing(self, input_ids, target, num_tiles):
+    def _truncate_for_packing(self, input_ids, target, num_tiles, imgs):
         """Truncate tokens and labels if they exceed packing sequence length."""
+        self._verify_no_temporal_compression()
+
         total_num_images = len(num_tiles)
         total_num_tiles = sum(num_tiles)
-        total_img_embeddings_len = total_num_tiles * self.num_image_embeddings_per_tile
+        if self.args.dynamic_resolution:
+            assert imgs is not None
+
+            total_img_embeddings_len = 0
+            img_idx = 0
+            # For dynamic resolution, we need to group embeddings by conceptual image
+            # since match tiling can return multiple tensors (main + thumbnail) per image
+            for num_tiles_for_image in num_tiles:
+                # Sum embeddings for all tiles/images belonging to this conceptual image
+                for _ in range(num_tiles_for_image):
+                    total_img_embeddings_len += self._get_num_image_embeddings(
+                        img_h=imgs[img_idx].shape[1],
+                        img_w=imgs[img_idx].shape[2],
+                    )
+                    img_idx += 1
+        else:
+            total_img_embeddings_len = total_num_tiles * self.num_image_embeddings_per_tile
         max_text_tokens = self.packing_seq_length - total_img_embeddings_len + total_num_images
 
         input_ids = input_ids[:max_text_tokens]
@@ -216,33 +318,16 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         return input_ids, target
 
     @stateless(restore_seeds=True)
-    def encode_sample(self, sample: Union[CaptioningSample, OCRSample, VQASample, SimilarityInterleavedSample]):
-        if isinstance(sample, OCRSample):
-            if "pdfa" in sample.__key__:
-                yield self.combined_ocr_encoder(sample, task_type='encode_pdf')
-            elif "multi" in sample.__key__:
-                yield self.combined_ocr_encoder(sample, task_type='_encode_ocr')
-            else:
-                yield self.combined_ocr_encoder(sample, task_type='encode_ocr_ref')
-        elif isinstance(sample, CaptioningSample):
-            yield self.encode_captioning(sample)
-        elif isinstance(sample, VQASample):
-            is_llava_training = sample.__subflavors__["is_llava_training"] if "is_llava_training" in sample.__subflavors__ else False
-
-            if "llava" in sample.__key__ or is_llava_training:
-                yield self.encode_llava_pretrain(sample)
-            else:
-                yield self.encode_any_single_turn_vqa(sample)
-        elif isinstance(sample, SimilarityInterleavedSample):
+    def encode_sample(self, sample: Union[SimilarityInterleavedSample]):
+        if isinstance(sample, SimilarityInterleavedSample):
             yield self.encode_llava_sft(sample)
-        elif isinstance(sample, MultiChoiceVQASample):
-            yield self.encode_any_single_turn_vqa(sample)
         # Because the SampleListSample is defined in the Megatron module but loaded by the Energon
         # library, we need to resort to the more brittle check:
         elif type(sample).__name__ == "SampleListSample":
             yield self.encode_sample_list(sample)
         else:
             raise NotImplementedError("Sample format not supported", sample)
+
 
     def encode_captioning(self, sample: CaptioningSample):
         """Encode CaptioningSample."""
@@ -276,7 +361,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         input_ids, target = self.tokenizer.tokenize_conversation(conv, True, False)
 
         if self.is_packing_enabled:
-            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles)
+            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles, imgs)
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -287,7 +372,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             num_tiles=num_tiles,
             tokens=torch.tensor(input_ids),
             labels=torch.tensor(target),
-            total_len=self._get_total_seq_length(input_ids, num_tiles),
+            total_len=self._get_total_seq_length(input_ids, num_tiles, imgs),
         )
 
     def encode_llava_pretrain(self, sample: VQASample):
@@ -310,7 +395,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         input_ids, target = self.tokenizer.tokenize_conversation(conv, True, False)
 
         if self.is_packing_enabled:
-            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles)
+            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles, imgs)
+
+        assert self._get_total_seq_length(input_ids, num_tiles, imgs) < self.args.decoder_seq_length, f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.args.decoder_seq_length}"
+
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -321,7 +409,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             num_tiles=num_tiles,
             tokens=torch.tensor(input_ids),
             labels=torch.tensor(target),
-            total_len=self._get_total_seq_length(input_ids, num_tiles),
+            total_len=self._get_total_seq_length(input_ids, num_tiles, imgs),
         )
 
     def encode_sample_list(self, samples: SampleListSample):
@@ -346,6 +434,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
     def encode_llava_sft(self, sample: Union[SimilarityInterleavedSample, OfflineTargetAspectRatioSample], truncate_for_sample_list_packing=False):
         """Encode SFT sample."""
+        self._verify_no_temporal_compression()
+
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
 
@@ -369,11 +459,23 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 has_image = True
 
         # Note: Some tokenizers may ignore the system prompt.
-        conversation = [{"role": "system", "content": "Answer the questions."}]
+        if self.args.tokenizer_prompt_format == "nemotron-h-5p5-reasoning":
+            conversation = [{"role": "system", "content": "You are a helpful assistant."}]
+        else:
+            conversation = [{"role": "system", "content": "Answer the questions."}]
         # Format the conversation as a list of "user" / "assistant" turns.
         for text in sample.texts:
             error_msg = f"unexpected role {text['from']} in {sample.texts}"
             assert text["from"] in ["human", "gpt"], error_msg
+            if self.args.tokenizer_prompt_format == "nemotron-h-5p5-reasoning":
+                if text["from"] == "gpt":
+                    # Append empty think tokens if missing
+                    if not("<think>" in text["value"] and "</think>" in text["value"]):
+                        text["value"] = "<think></think>\n" + text["value"].strip()
+                elif text["from"] == "human":
+                    # Remove legacy reasoning instructions from training prompt
+                    text["value"] = text["value"].replace("detailed thinking on\n", "", 1).strip()
+                    assert "detailed thinking on" not in text["value"], f"Found sample with detailed thinking on: {sample.texts} {sample.__key__}"
             conversation.append({
                 "role": "user" if text["from"] == "human" else "assistant",
                 "content": text["value"]})
@@ -452,7 +554,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                         self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
                     imgs += img_tiles
                     num_tiles += [len(img_tiles)]
-                if max_num_tiles == 1:
+                if max_num_tiles == 1 or self.args.dynamic_resolution:
                     break
                 if sum(num_tiles) * self.num_image_embeddings_per_tile > max_image_token_allowed:
                     if max_num_tiles in self.num_tiles_degradation_map:
@@ -487,7 +589,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             imgs = num_tiles = []
 
         if self.is_packing_enabled or truncate_for_sample_list_packing:
-            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles)
+            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles, imgs)
 
         # Some final checks with respect to the number of image tokens and images on the tokenized
         # conversation. There can still be errors, for instance if a non-video sample happens to
@@ -502,16 +604,21 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         assert np.sum(num_tiles) == len(imgs), error_msg
 
         # We need to ensure that there are at least some trainable tokens in the sample.
-        assert self.target_has_trainable_tokens(input_ids, num_tiles, target), "Sample has no trainable tokens."
+        assert self.target_has_trainable_tokens(input_ids, num_tiles, target, imgs), "Sample has no trainable tokens."
 
-        # Context parallel requires padding.
-        total_len = self._get_total_seq_length(input_ids, num_tiles)
+        assert self._get_total_seq_length(input_ids, num_tiles, imgs) < self.args.decoder_seq_length, f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.args.decoder_seq_length}"
+
+        # Context parallel and FP8 require padding.
+        # TODO: Total sample len and padded len are kept the same here.
+        # H100 and newer cuDNN versions can handle different values for them.
+        total_len = self._get_total_seq_length(input_ids, num_tiles, imgs)
+
+        # Individual samples need to be padded if using context parallel or sequence parallel.
+        # Here we don't pad for FP8 because only the final sequence needs to be padded. That is done in batch().
         has_cp = self.args.context_parallel_size > 1
-
-        if has_cp:
-            # Note: FP8 requires padding only the total sequence length.
-            # We pad for FP8 when we have the final, possibly packed sample.
-            padding_needed = get_padding(total_len, self.args.context_parallel_size, self.args.tensor_model_parallel_size, self.args.sequence_parallel, fp8_enabled=False)
+        if has_cp or self.args.sequence_parallel:
+            padding_needed = get_padding(total_len, self.args.context_parallel_size, self.args.tensor_model_parallel_size, self.args.sequence_parallel,
+                                         self.args.tp_comm_overlap, self.args.decoder_seq_length, fp8_enabled=False)
             padding_input = np.ones(padding_needed) * self.tokenizer.pad
             padding_labels = np.ones(padding_needed) * IGNORE_INDEX
             input_ids = np.concatenate([input_ids, padding_input])
@@ -527,10 +634,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             num_tiles=num_tiles,
             tokens=torch.tensor(input_ids),
             labels=torch.tensor(target),
-            total_len=self._get_total_seq_length(input_ids, num_tiles),
+            total_len=total_len,
+            total_len_padded=total_len,
         )
 
-    def target_has_trainable_tokens(self, input_ids, num_tiles, target):
+    def target_has_trainable_tokens(self, input_ids, num_tiles, target, imgs):
+        self._verify_no_temporal_compression()
+
         # Compute the loss mask based on extending the image tags with the proper
         # number of image tokens, extracting the first self.args.decoder_seq_length tokens, and
         # ensuring that some of these tokens have a loss mask > 0.
@@ -539,9 +649,26 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         # and targets to avoid this duplication.
         expanded_target = target.copy()
         expanded_target[input_ids==self.img_token_id] = self.img_token_id
+        if self.args.dynamic_resolution:
+            img_embeddings_len = []
+            img_idx = 0
+            # For dynamic resolution, we need to group embeddings by conceptual image
+            # since match tiling can return multiple tensors (main + thumbnail) per image
+            for num_tiles_for_image in num_tiles:
+                total_embeddings_for_image = 0
+                # Sum embeddings for all tiles/images belonging to this conceptual image
+                for _ in range(num_tiles_for_image):
+                    total_embeddings_for_image += self._get_num_image_embeddings(
+                        img_h=imgs[img_idx].shape[1],
+                        img_w=imgs[img_idx].shape[2],
+                    )
+                    img_idx += 1
+                img_embeddings_len.append(total_embeddings_for_image)
+        else:
+            img_embeddings_len = np.array(num_tiles) * self.num_image_embeddings_per_tile
+
         expanded_target = self.replace_value_with_repetition(
-            expanded_target, self.img_token_id,
-            self.num_image_embeddings_per_tile * np.array(num_tiles), IGNORE_INDEX)
+            expanded_target, self.img_token_id, img_embeddings_len, IGNORE_INDEX)
         loss_mask = torch.ones(torch.tensor(expanded_target).size(), dtype=torch.float)
         loss_mask[expanded_target == self.tokenizer.pad] = 0.0 # mask paddings
         loss_mask[expanded_target == IGNORE_INDEX] = 0.0 # mask prompts
@@ -577,6 +704,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 result.append(item)
 
         return np.array(result)
+
 
     def encode_any_single_turn_vqa(self, sample):
         """Encode MultiChoiceVQA or VQA sample."""
@@ -646,7 +774,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False)
 
         if self.is_packing_enabled:
-            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles)
+            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles, imgs)
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -657,7 +785,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             num_tiles=num_tiles,
             tokens=torch.tensor(input_ids),
             labels=torch.tensor(target),
-            total_len=self._get_total_seq_length(input_ids, num_tiles),
+            total_len=self._get_total_seq_length(input_ids, num_tiles, imgs),
         )
 
     def combined_ocr_encoder(self, sample, task_type):
@@ -672,9 +800,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             sample, cur_prompt, cur_answer = self.encode_ocr_prompt(sample)
 
         imgs = self.transform_img(
-                sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
-                self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
-            )
+            sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
+            self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
+        )
         num_tiles = [len(imgs)]
 
         conversation = [
@@ -686,7 +814,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False)
 
         if self.is_packing_enabled:
-            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles)
+            input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles, imgs)
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -697,7 +825,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             num_tiles=num_tiles,
             tokens=torch.tensor(input_ids),
             labels=torch.tensor(target),
-            total_len=self._get_total_seq_length(input_ids, num_tiles),
+            total_len=self._get_total_seq_length(input_ids, num_tiles, imgs),
         )
 
     def encode_pdf_prompt(self, sample: OCRSample) -> ImageTaskSample:
@@ -791,10 +919,11 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
     def batch(self, samples: List[Union[ImageTaskSample, ImageTaskSamplePacked]]) -> ImageTaskBatchPacked:
         # Stack images to [num_tiles, c, h, w]. If there are no images (text-only), then use a dummy image.
         imgs = [img for s in samples for img in s.imgs]
-        if len(imgs) > 0:
-            imgs = torch.stack(imgs)
-        else:
-            imgs = torch.tensor([[0]], dtype=torch.float32)
+
+        if len(imgs) > 0 and self.args.dynamic_resolution:
+            assert "radio" in self.args.vision_model_type or self.args.vision_model_type in ["clip", "siglip"], (
+                "Dynamic resolution currently only works with radio or clip/siglip"
+            )
 
         # If the user hasn't defined a target dataloader sequence length, then use the max along the sample lengths.
         max_seq_len = self.dataloader_seq_length
@@ -814,39 +943,82 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             labels[i, :target_len] = s.labels[:target_len]
 
         num_tiles = torch.tensor([n for s in samples for n in s.num_tiles], dtype=torch.int32)
+
+        total_seq_len = self._get_total_seq_length(tokens[0], num_tiles, imgs)
+
         if len(num_tiles) == 0:
             num_tiles = torch.tensor([[0]], dtype=torch.int32)
 
+        # Pad image packed seq length to be % 16 if using fp8 and dynamic resolution
+        has_fp8 = self.args.fp8 is not None
+        has_pad_img = torch.tensor(False)
+        # TODO: Context parallel currently requires padding per CP rank so we do it later if needed.
+        no_cp = self.args.context_parallel_size == 1
+
+        if has_fp8 and self.args.dynamic_resolution and no_cp:
+            img_seq_len = 0
+            for img in imgs:
+                img_seq_len += (img.shape[1] // self.args.patch_dim) * (img.shape[2] // self.args.patch_dim)
+            padding_needed = get_padding(img_seq_len, self.args.context_parallel_size, self.args.tensor_model_parallel_size, self.args.sequence_parallel,
+                                         self.args.tp_comm_overlap, self.args.decoder_seq_length, fp8_enabled=has_fp8)
+            if padding_needed > 0:
+                pad_img = torch.zeros([3, self.args.patch_dim, padding_needed * self.args.patch_dim])
+                imgs.append(pad_img)
+                has_pad_img = torch.tensor(True)
+
+        imgs, imgs_sizes, vision_cu_lengths, vision_max_lengths = process_images(
+            imgs, self.args.patch_dim, self.args.dynamic_resolution, batch_mode=True
+        )
+
+        # Set default values if no vision metadata was returned (static resolution case)
+        if vision_cu_lengths is None:
+            vision_cu_lengths = torch.tensor([[0]], dtype=torch.int32)
+        if vision_max_lengths is None:
+            vision_max_lengths = torch.tensor([[0]], dtype=torch.int32)
+
         # Cumulative sample lengths are needed for packing, otherwise use dummy values.
         cu_lengths = torch.tensor([[0]], dtype=torch.int32)
+        cu_lengths_padded = torch.tensor([[0]], dtype=torch.int32)
         max_lengths = torch.tensor([[0]], dtype=torch.int32)
 
         is_packed = isinstance(samples[0], ImageTaskSamplePacked)
-
         if is_packed:
             cu_lengths = torch.stack([s.cu_lengths for s in samples])
+            cu_lengths_padded = torch.stack([s.cu_lengths_padded for s in samples])
             max_lengths = torch.tensor([s.max_length for s in samples], dtype=torch.int32)
 
-        # Pad entire sequence to be a multiple of 32 or 16 if using fp8.
-        has_fp8 = self.args.fp8
+            if self.dataloader_seq_length is not None:
+                for i in range(len(samples)):
+                    cu_lengths[i][-1] = self.dataloader_seq_length
+                    cu_lengths_padded[i][-1] = self.dataloader_seq_length
+                    new_max_length = cu_lengths_padded[i][-1] - cu_lengths[i][-2]
+                    max_lengths[i] = torch.max(max_lengths[i], new_max_length)
+
+        # Pad entire sequence to be a multiple of 16 if using fp8
         if has_fp8:
-            total_seq_len = self._get_total_seq_length(tokens[0], num_tiles)
             padding_needed = get_padding(
                 total_seq_len,
                 self.args.context_parallel_size,
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
+                self.args.tp_comm_overlap,
+                self.args.decoder_seq_length,
                 fp8_enabled=has_fp8,
-                fp8_recipe=self.args.fp8_recipe,
             )
             if padding_needed > 0:
                 tokens = torch.cat([tokens, torch.full((tokens.shape[0], padding_needed), self.tokenizer.pad, dtype=torch.int64)], dim=1)
                 labels = torch.cat([labels, torch.full((labels.shape[0], padding_needed), IGNORE_INDEX, dtype=torch.int64)], dim=1)
                 if is_packed:
                     cu_lengths[0][-1] += padding_needed
-                    new_max_length = cu_lengths[0][-1] - cu_lengths[0][-2]
+                    cu_lengths_padded[0][-1] += padding_needed
+                    new_max_length = cu_lengths_padded[0][-1] - cu_lengths[0][-2]
                     max_lengths = torch.max(max_lengths, new_max_length)
 
+        # No sound support in this old dataloading file.
+        sound_clips = torch.tensor([[0]], dtype=torch.float32)
+        sound_length = torch.tensor([[0]], dtype=torch.int64)
+        sound_timestamps = torch.tensor([[0]], dtype=torch.float32)
+        num_sound_clips = torch.tensor([[0]], dtype=torch.int64)
 
         return ImageTaskBatchPacked(
             __key__=[s.__key__ for s in samples],
@@ -858,7 +1030,16 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             imgs=imgs,
             num_tiles=num_tiles,
             cu_lengths=cu_lengths,
+            cu_lengths_padded=cu_lengths_padded,
             max_lengths=max_lengths,
+            imgs_sizes=imgs_sizes,
+            vision_cu_lengths=vision_cu_lengths,
+            vision_max_lengths=vision_max_lengths,
+            has_pad_img=has_pad_img,
+            sound_clips=sound_clips,
+            sound_length=sound_length,
+            sound_timestamps=sound_timestamps,
+            num_sound_clips=num_sound_clips,
         )
 
     def encode_batch(self, batch: ImageTaskBatchPacked) -> dict:
@@ -901,6 +1082,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         current_length = 0
         max_length = 0
         cu_lengths = [0]
+        cu_lengths_padded = [0]
 
         # Process each sample and build lists that we will concatenate to create the packed sample.
         for _, sample in enumerate(samples):
@@ -923,6 +1105,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
             current_length += sample_len
             cu_lengths.append(current_length)
+            cu_lengths_padded.append(current_length)
 
         # Concatenate packed tokens and labels.
         packed_tokens = torch.cat(packed_tokens, dim=0)
@@ -937,30 +1120,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             labels=packed_labels,
             imgs=packed_imgs,
             cu_lengths=torch.tensor(cu_lengths, dtype=torch.int32),
+            cu_lengths_padded=torch.tensor(cu_lengths_padded, dtype=torch.int32),
             max_length=max_length,
             num_tiles=[n for s in samples for n in s.num_tiles],
         )
-
-
-def print_error_handler(exc: Exception, key: Optional[str]):
-    print(
-        f"The following exception occurred in the dataloader for sample {key} and is skipped",
-        file=sys.stderr,
-    )
-    traceback.print_exc()
-
-
-def format_multichoice_question(question, multichoice_options):
-    """Format multi-choice question."""
-    options_text = ["{}. {}\n".format(chr(ord('A') + i), option) for i, option in
-                    zip(range(len(multichoice_options)), multichoice_options)]
-    options_text = "".join(options_text)
-
-    options_text = f"{options_text}Answer with the option's letter from the given choices directly."
-
-    return "{}\n{}".format(question, options_text)
-
-
-def format_multichoice_answer(idx):
-    """Format multi-choice answer."""
-    return chr(ord('A') + idx)

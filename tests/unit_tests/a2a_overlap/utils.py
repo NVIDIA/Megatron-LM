@@ -1,4 +1,3 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,7 +35,7 @@ class DummyNode:
     to transformer layers in a real model.
     """
 
-    layer_state = DummyState()
+    common_state = DummyState()
     chunk_state = DummyState()
 
     def detach(self, x):
@@ -216,54 +215,33 @@ def get_test_config(num_layers=1, num_moe_experts=8, extra_kwargs={}, moe_groupe
         multi_latent_attention=True,
         num_moe_experts=num_moe_experts,
         moe_grouped_gemm=moe_grouped_gemm,
-        moe_router_dtype="fp32",
         **extra_kwargs,
     )
     return config
 
 
 def get_valid_token_dispatcher_types():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
+    try:
+        from deep_ep import Buffer
+        from deep_ep.utils import EventHandle, EventOverlap
 
-    if HAVE_HYBRIDEP or HAVE_DEEP_EP:
         return ["alltoall", "flex"]
-    else:
+    except ImportError:
         return ["alltoall"]
-
-
-def get_valid_flex_dispatcher_backend():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
-
-    if HAVE_HYBRIDEP:
-        return "hybridep"
-    elif HAVE_DEEP_EP:
-        return "deepep"
-    else:
-        return None
 
 
 def get_valid_fp8_flags():
     from megatron.core.enums import Fp8Recipe
-    from megatron.training.utils import get_device_arch_version
 
     fp8_types = ["e4m3", "hybrid"]
     recipes = []
-    arch = get_device_arch_version()
-
-    if is_te_min_version("2.3.0.dev0"):
-        recipes.append(Fp8Recipe.tensorwise)  # Hopper + Blackwell
-
-    if is_te_min_version("2.4.0.dev0") and arch == 9:
-        recipes.append(Fp8Recipe.blockwise)  # Hopper only
-
-    if is_te_min_version("2.3.0.dev0") and arch >= 10:
-        recipes.append(Fp8Recipe.mxfp8)  # Blackwell only
-
     valid_flags = []
+    if is_te_min_version("2.3.0.dev0"):
+        recipes.append(Fp8Recipe.blockwise)
+        recipes.append(Fp8Recipe.tensorwise)
+
     for fp8_type in fp8_types:
         for recipe in recipes:
-            if fp8_type == "hybrid" and recipe == Fp8Recipe.mxfp8:
-                continue
             valid_flags.append((fp8_type, recipe))
     valid_flags.append(None)
 

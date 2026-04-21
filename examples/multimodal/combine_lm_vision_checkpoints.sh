@@ -34,6 +34,36 @@ if [[ $MODEL_TYPE == "nvlm" ]]; then
         ${OUTPUT_DIR}/iter_0000001/mp_rank_05/model_optim_rng.pt \
         ${OUTPUT_DIR}/iter_0000001/mp_rank_06/model_optim_rng.pt \
         ${OUTPUT_DIR}/iter_0000001/mp_rank_07/model_optim_rng.pt
+elif [[ $MODEL_TYPE == "MOE-small" ]]; then
+    # MOE TP=2 EP=8
+    python examples/multimodal/combine_state_dicts.py \
+        --input \
+        ${MCORE_LM}/iter_0000001/mp_rank_00_000/model_optim_rng.pt \
+        ${MCORE_VISION}/iter_0000001/mp_rank_00/model_optim_rng.pt \
+        ${MCORE_LM}/iter_0000001/mp_rank_01_001/model_optim_rng.pt \
+        ${MCORE_VISION}/iter_0000001/mp_rank_01/model_optim_rng.pt \
+        ${MCORE_LM}/iter_0000001/mp_rank_00_002/model_optim_rng.pt \
+        ${MCORE_VISION}/iter_0000001/mp_rank_00/model_optim_rng.pt \
+        ${MCORE_LM}/iter_0000001/mp_rank_01_003/model_optim_rng.pt \
+        ${MCORE_VISION}/iter_0000001/mp_rank_01/model_optim_rng.pt \
+        ${MCORE_LM}/iter_0000001/mp_rank_00_004/model_optim_rng.pt \
+        ${MCORE_VISION}/iter_0000001/mp_rank_00/model_optim_rng.pt \
+        ${MCORE_LM}/iter_0000001/mp_rank_01_005/model_optim_rng.pt \
+        ${MCORE_VISION}/iter_0000001/mp_rank_01/model_optim_rng.pt \
+        ${MCORE_LM}/iter_0000001/mp_rank_00_006/model_optim_rng.pt \
+        ${MCORE_VISION}/iter_0000001/mp_rank_00/model_optim_rng.pt \
+        ${MCORE_LM}/iter_0000001/mp_rank_01_007/model_optim_rng.pt \
+        ${MCORE_VISION}/iter_0000001/mp_rank_01/model_optim_rng.pt \
+        --prefixes language_model vision_model language_model vision_model language_model vision_model language_model vision_model language_model vision_model language_model vision_model language_model vision_model language_model vision_model \
+        --output \
+        ${OUTPUT_DIR}/iter_0000001/mp_rank_00_000/model_optim_rng.pt \
+        ${OUTPUT_DIR}/iter_0000001/mp_rank_01_001/model_optim_rng.pt \
+        ${OUTPUT_DIR}/iter_0000001/mp_rank_00_002/model_optim_rng.pt \
+        ${OUTPUT_DIR}/iter_0000001/mp_rank_01_003/model_optim_rng.pt \
+        ${OUTPUT_DIR}/iter_0000001/mp_rank_00_004/model_optim_rng.pt \
+        ${OUTPUT_DIR}/iter_0000001/mp_rank_01_005/model_optim_rng.pt \
+        ${OUTPUT_DIR}/iter_0000001/mp_rank_00_006/model_optim_rng.pt \
+        ${OUTPUT_DIR}/iter_0000001/mp_rank_01_007/model_optim_rng.pt
 else
     # Mistral CLIP example TP=4.
     python examples/multimodal/combine_state_dicts.py \

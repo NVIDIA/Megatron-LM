@@ -40,14 +40,18 @@ MAMBA_WHEEL=$(ls $INPUT_WHEEL_DIR/mamba*.whl) || true
 CAUSALCONV1D_WHEEL=$(ls $INPUT_WHEEL_DIR/causal_conv1d*.whl) || true
 [ -z "$CAUSALCONV1D_WHEEL" ] && CAUSALCONV1D_WHEEL=$(bash docker/common/build_causalconv1d.sh --output-wheel-dir $INPUT_WHEEL_DIR | tail -n 1)
 
+GROUPEDGEMM_WHEEL=$(ls $INPUT_WHEEL_DIR/grouped_gemm*.whl) || true
+[ -z "$GROUPEDGEMM_WHEEL" ] && GROUPEDGEMM_WHEEL=$(bash docker/common/build_groupedgemm.sh --output-wheel-dir $INPUT_WHEEL_DIR | tail -n 1)
+
 # Override deps that are already present in the base image
 # only for dev
 if [ "$ENVIRONMENT" = "dev" ]; then
     uv pip install --no-cache-dir --no-deps $TE_WHEEL
 fi
 
-# Install heavy optional deps like mamba, causalconv1d
+# Install heavy optional deps like mamba, causalconv1d, groupedgemm
 uv pip install --no-cache-dir \
     $MAMBA_WHEEL \
     $CAUSALCONV1D_WHEEL \
-    "setuptools<80.0.0,>=77.0.0"
+    $GROUPEDGEMM_WHEEL \
+    "setuptools<80.0.0"

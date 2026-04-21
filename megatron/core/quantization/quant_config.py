@@ -50,8 +50,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from megatron.core.utils import log_single_rank
-
 logger = logging.getLogger(__name__)
 
 try:
@@ -136,13 +134,11 @@ class RecipeConfig:
         self.matchers = matchers
 
     @staticmethod
-    def _build_matchers(matchers_dict: Dict | None) -> List[Matcher]:
+    def _build_matchers(matchers_dict: Dict) -> List[Matcher]:
         # NOTE(slayton): We rely on order for matchers because it allows us to specify an
         # override ordering from the yaml structure. Process matchers in order of
         # definition, so we can have fallthrus.
         matchers: List[Matcher] = []
-        if matchers_dict is None:
-            return matchers
 
         for name, matcher in matchers_dict.items():
             enabled = matcher.get("enabled", False)
@@ -176,13 +172,7 @@ class RecipeConfig:
             raise ImportError("yaml is not installed. Please install it with `pip install pyyaml`.")
 
         with open(recipe_yaml_path, "r") as f:
-            config = yaml.load(f, Loader=yaml.SafeLoader)
-
-        log_single_rank(
-            logger,
-            logging.INFO,
-            f"Loaded quantization recipe from path '{recipe_yaml_path}'. " f"Contents: '{config}'",
-        )
+            config = yaml.load(f, Loader=yaml.FullLoader)
 
         return RecipeConfig.from_config_dict(config)
 
@@ -192,7 +182,7 @@ class RecipeConfig:
 
         matchers_config = config.get("matchers", None)
         matchers = RecipeConfig._build_matchers(matchers_config)
-        config_dict = config.get("configs", {})
+        config_dict = config.get("configs", None)
 
         return RecipeConfig(matchers, config_dict)
 
@@ -204,15 +194,9 @@ class RecipeConfig:
         for matcher in self.matchers:
             config_key = matcher.match(operator_context)
             if config_key is not None:
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f'Context ({operator_context}) matched to quant config "{config_key}"',
-                )
+                logger.info(f'Context ({operator_context}) matched to quant config "{config_key}"')
                 return config_key
-        log_single_rank(
-            logger, logging.INFO, f"No config key match found for Context ({operator_context})"
-        )
+        logger.info(f"No config key match found for Context ({operator_context})")
         return None
 
     def match(self, operator_context: MatchContext) -> QuantizationConfig | None:

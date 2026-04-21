@@ -1,5 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import re
 from copy import deepcopy
 from functools import partial
@@ -277,11 +276,6 @@ def initialize_real_model(
     virtual_pipeline_model_parallel_size=None,
     **config_kwargs,
 ):
-    # These kwargs are passed through training.get_model for model construction,
-    # but are not part of TransformerConfig; strip them before building config.
-    config_kwargs.pop("pg_collection", None)
-    config_kwargs.pop("config", None)
-
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -540,7 +534,7 @@ class TestDistributedOptimizer:
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
     @pytest.mark.skipif(
-        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.5 or later"
     )
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp', 'src_bucket_pad_divisor', 'dest_bucket_pad_divisor'),
@@ -591,7 +585,7 @@ class TestDistributedOptimizer:
             # Init model and optimizer with "src" bucket padding
             with patch('megatron.core.distributed.param_and_grad_buffer.math.lcm') as lcm_mock:
                 lcm_mock.return_value = src_bucket_pad_divisor
-
+                assert len(lcm_mock.mock_calls) == 0
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
                     tp=src_tp_pp[0],
@@ -600,6 +594,7 @@ class TestDistributedOptimizer:
                     dist_opt=True,
                     initialize_fn=initialize_pp_agnostic_model,
                 )
+                assert len(lcm_mock.mock_calls) > 1
 
             metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
 
@@ -617,7 +612,7 @@ class TestDistributedOptimizer:
             # Init model and optimizer with "dest" bucket padding
             with patch('megatron.core.distributed.param_and_grad_buffer.math.lcm') as lcm_mock:
                 lcm_mock.return_value = dest_bucket_pad_divisor
-
+                assert len(lcm_mock.mock_calls) == 0
                 model_B, optimizer_B = setup_model_and_optimizer(
                     seed=3,
                     tp=dest_tp_pp[0],
@@ -626,6 +621,7 @@ class TestDistributedOptimizer:
                     dist_opt=True,
                     initialize_fn=initialize_pp_agnostic_model,
                 )
+                assert len(lcm_mock.mock_calls) > 1
 
             model_sharded_sd = model_B[0].sharded_state_dict()
             load_sharded_state_dict = optimizer_B.sharded_state_dict(
@@ -696,7 +692,7 @@ class TestDistributedOptimizer:
             assert not mismatch
 
     @pytest.mark.skipif(
-        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.7 or later"
     )
     @pytest.mark.parametrize(
         ('src_tp_pp', 'dest_tp_pp', 'sharding_type', 'mem_efficient'),
@@ -705,10 +701,12 @@ class TestDistributedOptimizer:
             # Note: PP must be > 1 if TP <= 2 because of empty buckets otherwise
             ((2, 4), (2, 4), 'fully_reshardable', False),
             ((4, 2), (4, 2), 'dp_reshardable', None),
+            ((8, 1), (8, 1), 'fully_sharded_model_space', None),
             # DP resharding:
             ((4, 2), (4, 1), 'dp_reshardable', None),
             ((2, 4), (2, 2), 'fully_reshardable', False),
             ((2, 4), (2, 2), 'fully_reshardable', True),
+            ((1, 8), (1, 2), 'fully_sharded_model_space', None),
         ],
     )
     @pytest.mark.parametrize("initalize_fn", [initialize_pp_agnostic_model])
@@ -914,12 +912,8 @@ class TestFP32Optimizer:
                     bf16=False,
                 )
 
-                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
-
                 save(
-                    optimizer_A.sharded_state_dict(
-                        model_A[0].sharded_state_dict(), metadata=metadata
-                    ),
+                    optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()),
                     ckpt_dir_A,
                     preprocess_common_before_consistancy_check=preprocess_fn,
                 )
@@ -935,17 +929,12 @@ class TestFP32Optimizer:
                     bf16=False,
                 )
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
-                    model_B[0].sharded_state_dict(), is_loading=True, metadata=metadata
+                    model_B[0].sharded_state_dict(), is_loading=True
                 )
                 state_dict = load(load_sharded_state_dict, ckpt_dir_A)
 
                 optimizer_B.load_state_dict(state_dict)
-                save(
-                    optimizer_B.sharded_state_dict(
-                        model_B[0].sharded_state_dict(), metadata=metadata
-                    ),
-                    ckpt_dir_B,
-                )
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal
@@ -964,12 +953,12 @@ class TestOptimizerResharding:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        ('use_dist_opt', 'bf16', 'fully_parallel'),
+        ('use_dist_opt', 'bf16', 'use_custom_fsdp'),
         (
             (False, True, False),  # regular BF16
             (True, True, False),  # DistOpt BF16
-            (True, True, True),  # DistOpt BF16
-            (False, False, False),  # FP32
+            (True, True, True),  # DistOpt + custom FSDP BF16
+            # (False, False), # FP32
         ),
     )
     @pytest.mark.parametrize(
@@ -980,22 +969,19 @@ class TestOptimizerResharding:
         "initialize_fn", [initialize_gpt_model, initialize_1d_flatten_tensor_model]
     )
     def test_optimizer_resharding(
-        self,
-        tmp_path_dist_ckpt,
-        src_tp_pp,
-        dest_tp_pp,
-        use_dist_opt,
-        bf16,
-        initialize_fn,
-        fully_parallel,
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16, use_custom_fsdp, initialize_fn
     ):
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
             ) as ckpt_dir_B:
+                extra_kwargs = {}
+                if use_custom_fsdp:
+                    extra_kwargs['use_custom_fsdp'] = True
+
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
                     tp=src_tp_pp[0],
@@ -1005,7 +991,10 @@ class TestOptimizerResharding:
                     initialize_fn=initialize_fn,
                 )
 
-                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+                if fully_parallel:
+                    metadata = {'distrib_optim_sharding_type': 'fully_sharded_model_space'}
+                else:
+                    metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
 
                 save(
                     optimizer_A.sharded_state_dict(
@@ -1046,7 +1035,14 @@ class TestOptimizerResharding:
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
 
-    @pytest.mark.parametrize('fully_parallel', (False, True))
+                if use_custom_fsdp and hasattr(torch.nn.parameter.Parameter, "main_grad"):
+                    # Custom fsdp adds the `main_grad` attribute function to the
+                    # torch Parameter, remove this attribute function so that
+                    # it doesn't conflict with the code in the non-custom fsdp
+                    # test branch.
+                    delattr(torch.nn.parameter.Parameter, "main_grad")
+
+    @pytest.mark.parametrize(('use_dist_opt', 'bf16'), ((True, True),))  # DistOpt BF16
     @pytest.mark.parametrize(('use_te', 'use_grouped_mlp'), ((False, False), (False, True)))
     @pytest.mark.parametrize('use_glu', [False, True])
     @pytest.mark.parametrize(
@@ -1071,10 +1067,10 @@ class TestOptimizerResharding:
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
             ) as ckpt_dir_B:
                 Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
                 model_A, optimizer_A = setup_moe_model_and_optimizer(
@@ -1089,7 +1085,10 @@ class TestOptimizerResharding:
                     use_glu=use_glu,
                 )
 
-                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+                if fully_parallel:
+                    metadata = {'distrib_optim_sharding_type': 'fully_sharded_model_space'}
+                else:
+                    metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
 
                 save(
                     optimizer_A.sharded_state_dict(

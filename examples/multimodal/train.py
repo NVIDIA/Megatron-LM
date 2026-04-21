@@ -1,4 +1,3 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain or SFT multimodal."""
 import math
 import os
@@ -17,7 +16,6 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
@@ -43,31 +41,87 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     attention_mask = None
     position_ids = None
     num_tiles = None
+    num_frames = None
     packed_seq_params = None
+    imgs_sizes = None
+    vision_cu_lengths = None
+    vision_max_lengths = None
+    vision_packed_seq_params = None
+    has_pad_img = None
+    samples_seen = None
+    sound_clips = None
+    sound_timestamps = None
+    num_sound_clips = None
+    sound_length = None
 
     args = get_args()
 
     # Dataloader doesn't run on the middle stages in a pipeline parallel model.
     pp_size = get_pipeline_model_parallel_world_size()
-    if not is_first_or_last_stage(pp_size):
+    if not is_first_or_last_stage(pp_size, args.encoder_pipeline_model_parallel_size):
         # Note these are all set to None above.
-        return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
+        return (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            imgs,
+            num_tiles,
+            num_frames,
+            packed_seq_params,
+            imgs_sizes,
+            vision_packed_seq_params,
+            has_pad_img,
+            sound_clips,
+            sound_length,
+            sound_timestamps,
+            num_sound_clips,
+            samples_seen,
+        )
 
     # Broadcast data.
-    nvtx_range_push("get_data")
+    torch.cuda.nvtx.range_push("get_data")
     if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
         data = next(data_iterator)
     else:
         data = None
 
-    data_text = tensor_parallel.broadcast_data(["tokens"], data, torch.int64)["tokens"]
-    labels = tensor_parallel.broadcast_data(["labels"], data, torch.int64)["labels"]
+    data_text = tensor_parallel.broadcast_data(["tokens"], data, torch.int64, optimize=args.optimize_broadcast)["tokens"]
+    labels = tensor_parallel.broadcast_data(["labels"], data, torch.int64, optimize=args.optimize_broadcast)["labels"]
 
-    imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32)["imgs"]
-    num_tiles = tensor_parallel.broadcast_data(["num_tiles"], data, torch.int32)["num_tiles"]
+    imgs = tensor_parallel.broadcast_data(["imgs"], data, torch.float32, optimize=args.optimize_broadcast)["imgs"]
 
-    cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32)["cu_lengths"]
-    max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32)["max_lengths"]
+    # Handle datasets that don't provide num_frames (for backward compatibility with image-only datasets)
+    if get_tensor_model_parallel_rank() == 0 and data is not None and "num_frames" not in data:
+        # For image-only datasets, each tile corresponds to 1 frame
+        if "num_tiles" in data:
+            data["num_frames"] = torch.ones_like(data["num_tiles"], dtype=torch.int32)
+        else:
+            data["num_frames"] = torch.tensor([], dtype=torch.int32)
+
+    tiles_and_frames = tensor_parallel.broadcast_data(["num_tiles", "num_frames"], data, torch.int32, optimize=args.optimize_broadcast)
+    num_tiles, num_frames = tiles_and_frames["num_tiles"], tiles_and_frames["num_frames"]
+
+    cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32, optimize=args.optimize_broadcast)["cu_lengths"]
+    cu_lengths_padded = tensor_parallel.broadcast_data(["cu_lengths_padded"], data, torch.int32, optimize=args.optimize_broadcast)["cu_lengths_padded"]
+    max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32, optimize=args.optimize_broadcast)["max_lengths"]
+
+    if get_tensor_model_parallel_rank() == 0 and 'samples_seen' not in data:
+        data['samples_seen'] = torch.tensor(1, dtype=torch.int32, device=data_text.device)
+
+    samples_seen = tensor_parallel.broadcast_data(["samples_seen"], data, torch.int32, optimize=args.optimize_broadcast)["samples_seen"]
+
+    imgs_sizes = tensor_parallel.broadcast_data(["imgs_sizes"], data, torch.int32, optimize=args.optimize_broadcast)["imgs_sizes"]
+
+    vision_cu_lengths = tensor_parallel.broadcast_data(["vision_cu_lengths"], data, torch.int32, optimize=args.optimize_broadcast)["vision_cu_lengths"]
+    vision_max_lengths = tensor_parallel.broadcast_data(["vision_max_lengths"], data, torch.int32, optimize=args.optimize_broadcast)["vision_max_lengths"]
+    has_pad_img = tensor_parallel.broadcast_data(["has_pad_img"], data, torch.bool, optimize=args.optimize_broadcast)["has_pad_img"]
+
+    sound1 = tensor_parallel.broadcast_data(["sound_clips", "sound_timestamps"], data, torch.float32)
+    sound_clips, sound_timestamps = sound1["sound_clips"], sound1["sound_timestamps"]
+    sound2 = tensor_parallel.broadcast_data(["num_sound_clips", "sound_length"], data, torch.int64)
+    num_sound_clips, sound_length = sound2["num_sound_clips"], sound2["sound_length"]
 
     # No image input (text-only sample) if the dataloader returned a size 1 image.
     if imgs.shape == torch.Size([1, 1]):
@@ -75,13 +129,20 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         # model and then add image embeddings with a zero multiplier.
         if args.use_torch_fsdp2:
             imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
-            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
         else:
             # Similar workaround is not needed without FSDP and we can use an empty image.
             # FIXME: text-only data can cause still cause a hang in the special case where
             # the vision model is own its own pipeline rank and --freeze-ViT is enabled.
             imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
-            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        num_frames = torch.tensor([], dtype=torch.int, device=data_text.device)
+
+    # TODO: Sound encoder from HF/Nemo can hang with text-only samples. Find a better way to handle this.
+    is_sound_frozen = args.freeze_sound_model and args.freeze_sound_projection
+    if getattr(args, "sound_model_type", None) and sound_clips is not None and sound_clips.shape == torch.Size([1, 1]) and not is_sound_frozen:
+        sound_clips = torch.zeros((1, 1600), dtype=sound_clips.dtype, device=sound_clips.device)
+        sound_length = torch.tensor([1600], dtype=sound_length.dtype, device=sound_length.device)
+        sound_timestamps = torch.tensor([], dtype=sound_timestamps.dtype, device=sound_timestamps.device)
 
     # Last pipeline parallel stage doesn't need images.
     if pp_size > 1 and is_pipeline_last_stage():
@@ -93,50 +154,52 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
             cu_lengths.shape[0] == max_lengths.shape[0] == 1
         ), "micro-batch-size must be 1 for packing"
         cu_lengths = cu_lengths[0]
+        cu_lengths_padded = cu_lengths_padded[0]
         max_lengths = max_lengths[0]
 
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_lengths,
             cu_seqlens_kv=cu_lengths,
+            cu_seqlens_q_padded=cu_lengths_padded,
+            cu_seqlens_kv_padded=cu_lengths_padded,
             max_seqlen_q=max_lengths,
             max_seqlen_kv=max_lengths,
         )
 
-    nvtx_range_pop("get_data")
+    # If cu_lengths and max_lengths are non-dummy, construct PackedSeqParams. Otherwise, leave it at None.
+    vision_packed_seq_params = None
+    if vision_cu_lengths.shape != torch.Size([1, 1]):
+        assert (
+            vision_cu_lengths.shape[0] == vision_max_lengths.shape[0] == 1
+        ), "micro-batch-size must be 1 for packing"
+        vision_cu_lengths = vision_cu_lengths[0]
+        vision_max_lengths = vision_max_lengths[0]
+
+        vision_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=vision_cu_lengths,
+            cu_seqlens_kv=vision_cu_lengths,
+            max_seqlen_q=vision_max_lengths,
+            max_seqlen_kv=vision_max_lengths,
+        )
+
+    torch.cuda.nvtx.range_pop()
 
     tokens_ = data_text.long()
 
-    nvtx_range_push("index tokens")
+    torch.cuda.nvtx.range_push("index tokens")
     tokenizer = get_tokenizer()
     text_length = tokens_.shape[1]
     tokens = tokens_[:, :text_length].contiguous()
     labels = labels[:, 1 : text_length + 1].contiguous()
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
-    nvtx_range_pop("index tokens")
+    torch.cuda.nvtx.range_pop()
 
-    nvtx_range_push("get_ltor_masks_and_position_ids")
+    torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
     loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
-    nvtx_range_pop("get_ltor_masks_and_position_ids")
-
-    # If context parallel is enabled, must shard inputs to CP ranks.
-    if args.context_parallel_size > 1 or args.sequence_parallel:
-        assert tokens.shape[0], "micro-batch-size > 1 not supported yet with CP"
-
-        num_image_tokens = torch.sum(tokens == image_token_index).item()
-        num_image_embeddings = img_seq_len * imgs.shape[0] - num_image_tokens
-        seq_len = text_length + num_image_embeddings
-
-        # CP expects sequence length is divisible by CP size so apply padding.
-        mp_padding_needed = context_parallel.get_padding(
-            seq_len, args.context_parallel_size,
-            args.tensor_model_parallel_size, args.sequence_parallel,
-        )
-        tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed)) for item in (tokens, position_ids, labels, loss_mask)]
-
-        # Get PackedSeqParams that indicate the amount of padding for TransformerEngine.
-        packed_seq_params = context_parallel.get_packed_seq_params(tokens, num_image_embeddings, mp_padding_needed, args.context_parallel_size, True)
+    torch.cuda.nvtx.range_pop()
 
     return (
         tokens,
@@ -146,7 +209,16 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         position_ids,
         imgs,
         num_tiles,
+        num_frames,
         packed_seq_params,
+        imgs_sizes,
+        vision_packed_seq_params,
+        has_pad_img,
+        sound_clips,
+        sound_length,
+        sound_timestamps,
+        num_sound_clips,
+        samples_seen,
     )
 
 
@@ -191,7 +263,7 @@ def get_mask_start_and_end_idx(arr):
     return sequences
 
 
-def scaled_loss_func(loss_mask, output_tensor):
+def scaled_loss_func(loss_mask, output_tensor, samples_seen):
     """
     Scaled loss function
 
@@ -202,6 +274,7 @@ def scaled_loss_func(loss_mask, output_tensor):
     Where we use the loss mask to infer the start / end of the conversation turns.
     """
     args = get_args()
+    assert args.context_parallel_size == 1, "this loss func is incorrect for context parallel"
     losses = output_tensor.float()
 
     loss_list = []
@@ -223,34 +296,53 @@ def scaled_loss_func(loss_mask, output_tensor):
         # normalize loss for each turn
         loss_list[idx] = loss_list[idx] * math.sqrt(num_valid_labels_list[idx]) / base_num
 
-    # Some ranks may not get loss tokens due to Context Parallel Sharding
     if len(loss_list) > 0:
         total_loss = torch.stack(loss_list).sum()
         total_tokens = torch.ones_like(total_loss)
-    elif len(loss_list) == 0 and args.context_parallel_size > 1:
-        total_tokens = loss_mask.sum()
-        total_loss = torch.sum(losses.view(-1) * loss_mask)
     else:
         raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
 
     num_tokens = total_tokens.clone().detach().to(torch.int)
     reporting_loss = torch.cat([total_loss.clone().detach().view(1), num_tokens.view(1)])
 
-    return (total_loss, num_tokens, {'lm loss': reporting_loss})
+    return (
+        total_loss,
+        num_tokens,
+        {
+            'lm loss': reporting_loss,
+            '_samples_seen': samples_seen.detach(),
+        }
+    )
 
 
-def loss_func(loss_mask, output_tensor):
+def loss_func(loss_mask, output_tensor, samples_seen):
     args = get_args()
 
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.contiguous().view(-1).float()
     loss = torch.sum(losses * loss_mask)
 
-    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    if args.no_calculate_per_token_loss:
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        num_tokens = torch.clamp(num_tokens, min=1)
+    elif args.use_loss_scaling and args.context_parallel_size > 1:
+        # num_tokens are all-reduced from all CP ranks and loss will be divided by the total num_tokens = args.context_parallel_size.
+        # So we need to multiply loss by args.context_parallel_size to get the correct loss.
+        num_tokens = torch.tensor(1, dtype=torch.int, device=losses.device)
+        loss *= args.context_parallel_size
+    else:
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
-    return (loss, num_tokens, {'lm loss': reporting_loss})
-
+    return (
+        loss,
+        num_tokens,
+        {
+            'lm loss': reporting_loss,
+            '_samples_seen': samples_seen.detach(),
+        },
+    )
 
 def forward_step(data_iterator, model: LLaVAModel):
     """Forward training step.
@@ -275,7 +367,16 @@ def forward_step(data_iterator, model: LLaVAModel):
         position_ids,
         images,
         num_image_tiles,
+        num_frames,
         packed_seq_params,
+        imgs_sizes,
+        vision_packed_seq_params,
+        has_pad_img,
+        sound_clips,
+        sound_length,
+        sound_timestamps,
+        num_sound_clips,
+        samples_seen,
     ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len)
     timers('batch-generator').stop()
 
@@ -287,13 +388,23 @@ def forward_step(data_iterator, model: LLaVAModel):
         labels,
         loss_mask,
         num_image_tiles=num_image_tiles,
+        num_frames=num_frames,
         packed_seq_params=packed_seq_params,
+        imgs_sizes=imgs_sizes,
+        vision_packed_seq_params=vision_packed_seq_params,
+        has_pad_img=has_pad_img,
+        sound_clips=sound_clips,
+        sound_length=sound_length,
+        sound_timestamps=sound_timestamps,
+        num_sound_clips=num_sound_clips,
     )
     args = get_args()
-    if args.use_loss_scaling:
-        loss_function = partial(scaled_loss_func, loss_mask)
+    if args.use_loss_scaling and args.context_parallel_size <= 1:
+        loss_function = partial(scaled_loss_func, loss_mask, samples_seen=samples_seen)
     else:
-        loss_function = partial(loss_func, loss_mask)
+        # For context parallel, we use the regular loss func because the scaling factors are already applied to loss_mask.
+        # We do this because the CP sharding ignores turn boundaries in the conversation.
+        loss_function = partial(loss_func, loss_mask, samples_seen=samples_seen)
 
     return output_tensor, loss_function
 
@@ -303,12 +414,16 @@ def llava_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
+    args = get_args()
+
+    # encoder size is also the index to the first rank of the decoder.
+    epp = args.encoder_pipeline_model_parallel_size
+
     last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1:
+    if len(pp_ranks) == 1 or pp_ranks[epp] == last_rank:
         return [last_rank]
     else:
-        return [pp_ranks[0], last_rank]
+        return [pp_ranks[epp], last_rank]
 
 
 def llava_position_embedding_ranks(pp_ranks):
@@ -316,12 +431,16 @@ def llava_position_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
+    args = get_args()
+
+    # encoder size is also the index to the first rank of the decoder.
+    epp = args.encoder_pipeline_model_parallel_size
+
     last_rank = pp_ranks[-1]
     if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[0]]
+        return [pp_ranks[epp]]
 
 
 def run_online_eval(model):
@@ -344,7 +463,7 @@ def run_online_eval(model):
     # We must write to a storage space that all ranks see.
     output_dir = os.path.join(args.save, "online_eval")
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Use the common evaluation loop
     scores = run_evaluation_loop(model[0].module, configs, output_dir_override=output_dir, print_output=False)
 
@@ -378,19 +497,57 @@ def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
     write_eval_to_tensorboard(data, iteration, writer, walltime)
 
 
-if __name__ == "__main__":
+def post_init_func():
+    # Debug only a specific rank (set DEBUG_RANK env var)
+    # Assumes the job was launched with torch.distributed.run (which sets LOCAL_RANK)
+    debug_rank = os.environ.get('DEBUG_RANK', None)
+    if debug_rank is not None:
+        local_rank = os.environ.get('LOCAL_RANK', None)
+        if local_rank is None:
+            raise ValueError("Expected LOCAL_RANK to be set from torch.distributed.run when using DEBUG_RANK")
 
+        if int(local_rank) == int(debug_rank):
+            import debugpy
+            import socket
+            hostname = socket.gethostname()
+            debug_port = int(os.environ.get('DEBUG_PORT', 3009))
+            debugpy.listen(("0.0.0.0", debug_port))
+            print(f"[Rank {local_rank}] Waiting for debugger. Attach to host: {hostname}, port: {debug_port}...")
+            debugpy.wait_for_client()
+        else:
+            print(f"[Rank {local_rank}] Waiting for rank {debug_rank}...")
+
+        torch.distributed.barrier()
+        print(f"[Rank {local_rank}] Debugger attached, continuing training...")
+
+if __name__ == "__main__":
     train_valid_test_dataloaders_provider.is_distributed = True
 
-    pretrain(
-        train_valid_test_dataloaders_provider,
-        model_provider,
-        ModelType.encoder_or_decoder,
-        forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_multimodal_extra_args,
-        process_non_loss_data_func=write_online_eval_to_tensorboard,
-        get_embedding_ranks=llava_embedding_ranks,
-        get_position_embedding_ranks=llava_position_embedding_ranks,
-        non_loss_data_func=run_online_eval,
-    )
+    try:
+        pretrain(
+            train_valid_test_dataloaders_provider,
+            model_provider,
+            ModelType.encoder_and_decoder,
+            forward_step,
+            args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+            extra_args_provider=add_multimodal_extra_args,
+            process_non_loss_data_func=write_online_eval_to_tensorboard,
+            get_embedding_ranks=llava_embedding_ranks,
+            get_position_embedding_ranks=llava_position_embedding_ranks,
+            non_loss_data_func=run_online_eval,
+            post_init_func=post_init_func,
+        )
+    except Exception as e:
+        # If using DEBUG_RANK to debug, don't exit on failure (or torchrun will kill all ranks)
+        debug_rank = os.environ.get('DEBUG_RANK', None)
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+        if debug_rank is not None and local_rank != int(debug_rank):
+            import time
+            import traceback
+            print(f"\n[Rank {local_rank}] Caught exception during debugging (pausing to keep DEBUG_RANK alive):")
+            traceback.print_exc()
+            while True:
+                time.sleep(60)
+
+        raise

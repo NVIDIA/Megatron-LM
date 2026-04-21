@@ -8,8 +8,7 @@ assignees: ''
 ---
 
 **Describe the regression**
-A clear and concise description of what the regression is. Tag the [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall) 
-to get oncall's attention to this issue.
+A clear and concise description of what the regression is.
 
 **To Reproduce**
 Steps to reproduce the behavior. The easier it is to reproduce the faster it will get maintainer attention.

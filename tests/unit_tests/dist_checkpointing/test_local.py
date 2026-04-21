@@ -1,5 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import filecmp
 import logging
 import shutil
@@ -27,7 +26,6 @@ from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager impor
     LocalCheckpointManager,
 )
 
-from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedTensorFactory
@@ -80,10 +78,7 @@ class TestLocalCheckpointing:
         opt_param_scheduler = None
         rng_state = None
         iteration = None
-        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        metadata = {'distrib_optim_sharding_type': 'fully_reshardable', 'dp_cp_group': dp_cp_group}
-        model_sd_kwargs = dict(metadata={'dp_cp_group': dp_cp_group})
-        optim_sd_kwargs = dict(metadata=metadata)
+        optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space')
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True
@@ -96,7 +91,6 @@ class TestLocalCheckpointing:
             opt_param_scheduler,
             rng_state,
             iteration=iteration,
-            model_sd_kwargs=model_sd_kwargs,
             optim_sd_kwargs=optim_sd_kwargs,
         )
         sharded_tensor_factories = find_matching_values(
@@ -148,7 +142,6 @@ class TestLocalCheckpointing:
             # ShardedObjects and ShardedTensors should be replaced
             assert issubclass(i[-1], ShardedBase)
 
-    @pytest.mark.internal
     @pytest.mark.parametrize(('tp,pp'), [(2, 4), (1, 1)])
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
@@ -166,18 +159,14 @@ class TestLocalCheckpointing:
         )  # FIXME: fails with additional arguments (e.g.,'weight_decay')
         if use_ramdisk:
             tmp_path_dist_ckpt = Path("/dev/shm")
-
-        original_empty = torch.empty
-
-        def deterministic_empty(*args, **kwargs):
-            return original_empty(*args, **kwargs).zero_()
-
-        with (
-            TempNamedDir(tmp_path_dist_ckpt / "test_local", sync=True) as local_ckpt_dir,
-            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
-            mock.patch('torch.empty', new=deterministic_empty),
+        with TempNamedDir(
+            tmp_path_dist_ckpt / "test_local", sync=True
+        ) as local_ckpt_dir, mock.patch(
+            'megatron.training.checkpointing.get_args', new=lambda: mock_args
+        ), mock.patch(
+            'megatron.training.async_utils.get_args', new=lambda: mock_args
+        ), mock.patch(
+            "megatron.training.checkpointing.update_num_microbatches"
         ):
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
             init_basic_mock_args(mock_args, tp, pp)
@@ -185,7 +174,6 @@ class TestLocalCheckpointing:
             mock_args.non_persistent_ckpt_type = 'local'
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
-            mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
             checkpointing_context = {
                 'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
             }
@@ -256,12 +244,10 @@ class TestLocalCheckpointing:
 
         Utils.destroy_model_parallel()
 
-    @pytest.mark.internal
     @pytest.mark.parametrize(('tp,pp'), [(1, 1), (2, 4)])
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
     @pytest.mark.parametrize(('algo'), ['atomic', 'fully_parallel'])
-    @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
     def test_failed_save(self, caplog, tmp_path_dist_ckpt, tp, pp, use_ramdisk, async_save, algo):
         Utils.initialize_model_parallel(tp, pp)
@@ -274,13 +260,16 @@ class TestLocalCheckpointing:
             tmp_path_dist_ckpt = Path("/dev/shm")
 
         def test_save_wrapper(save_wrapper, subdir):
-            with (
-                TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir,
-                mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-                mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
-                mock.patch("megatron.training.checkpointing.update_num_microbatches"),
-                mock.patch.object(LocalCheckpointManager, '_save', new=save_wrapper),
-                caplog.at_level(logging.INFO),
+            with TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir, mock.patch(
+                'megatron.training.checkpointing.get_args', new=lambda: mock_args
+            ), mock.patch(
+                'megatron.training.async_utils.get_args', new=lambda: mock_args
+            ), mock.patch(
+                "megatron.training.checkpointing.update_num_microbatches"
+            ), mock.patch.object(
+                LocalCheckpointManager, '_save', new=save_wrapper
+            ), caplog.at_level(
+                logging.INFO
             ):
 
                 local_ckpt_dir = (
@@ -291,7 +280,6 @@ class TestLocalCheckpointing:
                 mock_args.non_persistent_ckpt_type = 'local'
                 mock_args.non_persistent_local_ckpt_algo = algo
                 mock_args.async_save = async_save
-                mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
                 checkpointing_context = {
                     'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
                 }

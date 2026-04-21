@@ -1,3 +1,0 @@
-- agent_type: examples.rl.environments.math.openmath_agent.OpenMathInstructAgent
-  agent_args: {}
-  weight: 1.0

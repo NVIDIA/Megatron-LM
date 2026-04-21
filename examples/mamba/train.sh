@@ -7,14 +7,14 @@ MODEL_SCALE="800M" # or "8B"
 case "${MODEL_SCALE}" in
     "800M")
         TENSOR_MODEL_PARALLEL_SIZE=1
-        HYBRID_LAYER_PATTERN="M-M-M--M-*M-M-M-M--*M-M-M-M-*M--M-M-M-*M-M--M-M-"
+        NUM_LAYERS=48
         HIDDEN_SIZE=1024
         NUM_ATTENTION_HEADS=16
         GLOBAL_BATCH_SIZE=32
         ;;
     "8B")
         TENSOR_MODEL_PARALLEL_SIZE=4
-        HYBRID_LAYER_PATTERN="M-M-M--M-M*-M-M-M-M--M*-M-M-M-M-M*--M-M-M-M-M*-M--M-M-M-"
+        NUM_LAYERS=56
         HIDDEN_SIZE=4096
         NUM_ATTENTION_HEADS=32
         GLOBAL_BATCH_SIZE=8
@@ -59,11 +59,13 @@ options=" \
        --untie-embeddings-and-output-weights \
        --init-method-std 0.02 \
        --position-embedding-type none \
-       --hybrid-layer-pattern ${HYBRID_LAYER_PATTERN} \
+       --num-layers ${NUM_LAYERS} \
        --hidden-size ${HIDDEN_SIZE} \
        --num-attention-heads ${NUM_ATTENTION_HEADS} \
        --group-query-attention \
        --num-query-groups 8 \
+       --hybrid-attention-ratio 0.08 \
+       --hybrid-mlp-ratio 0.5 \
        --seq-length ${SEQ_LEN} \
        --max-position-embeddings ${SEQ_LEN} \
        --train-samples ${TRAIN_SAMPLES} \

@@ -1,9 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-from typing import TypeVar
-
 import torch
-
-T = TypeVar('T')
 
 
 class IdentityOp(torch.nn.Module):
@@ -11,14 +7,10 @@ class IdentityOp(torch.nn.Module):
     This is a placeholder for IdentityOp(x) -> x
     """
 
-    def __init__(self, *args: object, **kwargs: object):
+    def __init__(self, *args, **kwargs):
         super().__init__()
 
-    def forward(self, x: T, *args: object, **kwargs: object) -> T:
-        """Forward pass.
-
-        Returns x unchanged.
-        """
+    def forward(self, x, *args, **kwargs):
         return x
 
 
@@ -29,12 +21,8 @@ class IdentityFuncOp(IdentityOp):
     return a function at runtime based on passed arguments
     """
 
-    def __init__(self, *args: object, **kwargs: object):
+    def __init__(self, *args, **kwargs):
         super().__init__()
 
-    def forward(self, *args: object, **kwargs: object):
-        """Forward pass.
-
-        Returns a function which returns its first argument unchanged, and discards all others.
-        """
+    def forward(self, *args, **kwargs):
         return super().forward

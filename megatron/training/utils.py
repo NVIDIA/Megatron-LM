@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """General utilities."""
 import json
@@ -7,12 +7,10 @@ import sys
 import warnings
 from contextlib import contextmanager
 from datetime import datetime
-from collections import defaultdict
 
 import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
-from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -21,6 +19,9 @@ except ImportError:
         from amp_C import multi_tensor_l2norm
         from apex.multi_tensor_apply import multi_tensor_applier
     except ImportError:
+
+        import warnings
+
         warnings.warn(
             f'Transformer Engine and Apex are not installed. '
             'Falling back to local implementations of '
@@ -33,6 +34,8 @@ except ImportError:
         )
 
 from megatron.training import get_args, get_timers, get_adlr_autoresume
+from megatron.core import DistributedDataParallel as DDP
+from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -40,10 +43,31 @@ from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
     to_local_if_dtensor,
-    unwrap_model,
 )
+from megatron.core.transformer.module import Float16Module
+from megatron.legacy.model.module import param_is_not_shared
 
-from megatron.core.transformer.module import param_is_not_shared
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
+except ImportError:
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
+
+
+def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -51,29 +75,13 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     args = get_args()
     if not isinstance(model, list):
         model = [model]
-
-    if getattr(args, 'use_megatron_fsdp', False):
-        # All Megatron FSDP parameters are expected to be PyTorch DTensor.
-        # params_data is a dict of device_mesh -> list of local tensors.
-        params = []
-        for model_chunk in model:
-            model_chunk.stop_communication()
-            for name, param in model_chunk.named_parameters():
-                if not hasattr(param, "_local_tensor"):
-                    raise RuntimeError(
-                        f"Megatron FSDP requires parameters are PyTorch DTensor. "
-                        f"Parameter {name} is not a DTensor."
-                    )
-                params.append(param)
-
-        return calc_dtensor_params_l2_norm(params)
-
     # Seperate moe and dense params
     params_data = []
     moe_params_data = []
     sharded_params_data = []
     data_parallel_group = None
 
+    custom_fsdp_all_param_is_shared = False
     for model_chunk in model:
         for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
@@ -81,6 +89,15 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
+            if hasattr(param, "fully_shard_param_local_shard"):
+                param = param.fully_shard_param_local_shard
+                assert [
+                    getattr(p, "fully_shard_param_local_shard", None) is not None
+                    for p in model_chunk.parameters()
+                ]
+                custom_fsdp_all_param_is_shared = True
+                if param.numel() == 0:
+                    continue
             if not getattr(param, 'allreduce', True):
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
@@ -152,6 +169,11 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     )
     norm_2 += sharded_norm_2
 
+    if custom_fsdp_all_param_is_shared:
+        torch.distributed.all_reduce(
+            norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group()
+        )
+
     # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
         moe_norm, _ = multi_tensor_applier(
@@ -162,6 +184,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         moe_norm_2 = moe_norm * moe_norm
 
+        if custom_fsdp_all_param_is_shared:
+            torch.distributed.all_reduce(
+                moe_norm_2,
+                op=torch.distributed.ReduceOp.SUM,
+                group=mpu.get_expert_data_parallel_group(),
+            )
     # Account for MoE norm even if current rank doesn't have any expert params to prevent
     # hang in models with un-even numbers of MoE layers.
     # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
@@ -195,43 +223,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     return norm_2.item() ** 0.5
 
 
-def calc_dtensor_params_l2_norm(params):
-    """Calculate l2 norm of DTensor parameters."""
-    params_data = defaultdict(list)
-    for param in params:
-        params_data[param._spec].append(param._local_tensor)
-
-    total_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
-    dummy_overflow_buf = torch.zeros((1,), dtype=torch.int, device='cuda')
-    for dtensor_spec, local_tensors in params_data.items():
-        local_tensors = [t for t in local_tensors if t.numel() > 0]
-        if len(local_tensors) == 0:
-            norm = torch.zeros((1,), dtype=torch.float32, device='cuda')
-        else:
-            norm, _ = multi_tensor_applier(
-                multi_tensor_l2norm, dummy_overflow_buf, [local_tensors], False  # no per-parameter norm.
-            )
-        norm_2 = norm * norm
-        for pg, placement in zip(
-            dtensor_spec.device_mesh.get_all_groups(),
-            dtensor_spec.placements,
-        ):
-            if placement.is_shard():
-                torch.distributed.all_reduce(
-                    norm_2, op=torch.distributed.ReduceOp.SUM, group=pg
-                )
-            elif placement.is_replicate():
-                # Replicated parameters are already summed across all ranks.
-                pass
-            else:
-                raise RuntimeError(
-                    f"Unsupported placement {placement} for Megatron FSDP."
-                )
-        total_norm_2 += norm_2
-
-    return total_norm_2.item() ** 0.5
-
-
 def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
@@ -241,7 +232,7 @@ def average_losses_across_data_parallel_group(losses):
     return averaged_losses
 
 
-def reduce_max_stat_across_model_parallel_group(stat: float) -> float | None:
+def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
     """
     Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
     We need to ensure the logging and writer rank has those values.
@@ -256,7 +247,20 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float | None:
         stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
     )
     if stat.item() == -1.0:
-        # No rank has a valid stat, so return None to indicate that it is None across all ranks.
+        return None
+    else:
+        return stat.item()
+
+
+def reduce_sum_across_data_parallel_group(stat: float) -> float:
+    """Reduce a stat tensor across the data parallel group."""
+    if stat is None:
+        stat = 0.0
+    stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(
+        stat, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group()
+    )
+    if stat.item() == 0.0:
         return None
     else:
         return stat.item()
@@ -279,15 +283,12 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
 
 def report_memory(name):
     """Simple GPU memory report."""
-    args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
-    string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
-    string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
-    string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
-    string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
-    if args.log_device_memory_used:
-        string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
+    string += ' | allocated: {}'.format(torch.cuda.memory_allocated() / mega_bytes)
+    string += ' | max allocated: {}'.format(torch.cuda.max_memory_allocated() / mega_bytes)
+    string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
+    string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
@@ -311,22 +312,19 @@ def print_params_min_max_norm(optimizer, iteration):
     print(string, flush=True)
 
 
-def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler):
-    """Check for autoresume signal and exit if it is received."""
-    from megatron.training.checkpointing import save_checkpoint
+def check_adlr_termination_and_request_autoresume() -> bool:
+    """Check for autoresume signal and return True if it is received."""
 
-    args = get_args()
     autoresume = get_adlr_autoresume()
     # Add barrier to ensure consistnecy.
     torch.distributed.barrier()
     if autoresume.termination_requested():
-        if args.save:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
         print_rank_0(">>> autoresume termination request found!")
         if torch.distributed.get_rank() == 0:
             autoresume.request_resume()
         print_rank_0(">>> training terminated. Returning")
-        sys.exit(0)
+        return True
+    return False
 
 
 def get_ltor_masks_and_position_ids(data,
@@ -392,61 +390,31 @@ def get_ltor_masks_and_position_ids(data,
     return attention_mask, loss_mask, position_ids
 
 
-def print_rank_0(message, rank=None):
-    """If distributed is initialized or rank is specified, print only on rank 0."""
-    if rank is not None:
-        if rank == 0:
-            print(message, flush=True)
-    else:
-        if _safe_get_rank() == 0:
-            print(message, flush=True)
-
-
-def warn_rank_0(message, rank=None):
-    """If distributed is initialized or rank is specified, warn only on rank 0."""
-    if rank is not None:
-        if rank == 0:
-            warnings.warn(message)
-    else:
-        if _safe_get_rank() == 0:
-            warnings.warn(message)
-
-
-def is_rank0():
-    """Returns true if called in the rank0, false otherwise."""
-    return _safe_get_rank() == 0
-
-
-def is_last_rank():
-    """Returns true if called on last rank, false otherwise."""
-    assert torch.distributed.is_initialized()
-    return _safe_get_rank() == (torch.distributed.get_world_size() - 1)
-
-
-def print_rank_last(message):
-    """If distributed is initialized, print only on last rank."""
-    if torch.distributed.is_initialized() and torch.distributed.get_backend() != 'fake':
-        if is_last_rank():
+def print_rank_0(message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
             print(message, flush=True)
     else:
         print(message, flush=True)
 
 
-def is_hybrid_model(args):
-    """Returns True if the model is a hybrid Mamba-Transformer model."""
-    return args.hybrid_layer_pattern is not None
+def is_rank0():
+    """Returns true if called in the rank0, false otherwise"""
+    return torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
 
 
-def is_first_or_last_pipeline_stage(vp_stage):
-    """Return True if on first or last pipeline stage, taking into account virtual
-    pipeline parallelism."""
-    ignore_virtual = True
-    if vp_stage is not None:
-        ignore_virtual = False
-    return (
-        mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-        or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
-    )
+def is_last_rank():
+    return torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1)
+
+
+def print_rank_last(message):
+    """If distributed is initialized, print only on last rank."""
+    if torch.distributed.is_initialized():
+        if is_last_rank():
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
 
 
 def get_device_arch_version():
@@ -520,7 +488,7 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
+def get_batch_on_this_tp_rank(data_iterator):
 
     args = get_args()
 
@@ -532,9 +500,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 group=mpu.get_tensor_model_parallel_group(),
             )
 
-    if mpu.get_tensor_model_parallel_rank() == 0:
+    if mpu.get_tensor_model_parallel_rank() == 0 and data_iterator is not None:
 
-        assert data_iterator is not None
         data = next(data_iterator)
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
@@ -546,144 +513,68 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 else data["attention_mask"].cuda(non_blocking=True)
             ),
             'position_ids': data["position_ids"].cuda(non_blocking=True),
-            'cu_seqlens': (
-                None
-                if "cu_seqlens" not in data
-                else data["cu_seqlens"].cuda(non_blocking=True)
-            ),
-            'max_seqlen': (
-                None
-                if "max_seqlen" not in data
-                else data["max_seqlen"].cuda(non_blocking=True)
-            ),
-            'local_cp_size': (
-                None
-                if "local_cp_size" not in data
-                else data["local_cp_size"].cuda(non_blocking=True)
-            ),
         }
 
-        def _broadcast_cu_seqlens(cu_seqlens):
-            dev = torch.cuda.current_device()
-            n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
-            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
-            _broadcast(n_tensor)
-
-            if n == 0:
-                buf = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                assert isinstance(cu_seqlens, torch.Tensor)
-                assert cu_seqlens.dtype == torch.int32
-                assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
-                buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
-            _broadcast(buf)
-
-        if args.hybrid_context_parallel:
-            seq_len = torch.tensor(batch['tokens'].shape[0], dtype=torch.int32, device=torch.cuda.current_device())
-            _broadcast(seq_len)
-            
-        if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
+        if args.pipeline_model_parallel_size == 1:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast(batch['max_seqlen'])
-            _broadcast(batch['local_cp_size'])
 
         elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast(batch['max_seqlen'])
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
+            if args.mtp_num_layers is not None:
+                _broadcast(batch['tokens'])
+                _broadcast(batch['position_ids'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
 
     else:
-        if args.hybrid_context_parallel:
-            seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
-            _broadcast(seq_len)
-            shape = (seq_len.item())
-        else:
-            shape = (args.micro_batch_size, args.seq_length)
-            
+
         tokens = torch.empty(
-            shape,
+            (args.micro_batch_size, args.seq_length),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
         labels = torch.empty(
-            shape,
+            (args.micro_batch_size, args.seq_length),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
         loss_mask = torch.empty(
-            shape,
+            (args.micro_batch_size, args.seq_length),
             dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
         if args.create_attention_mask_in_dataloader:
-            shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
             attention_mask = torch.empty(
-                shape_attention_mask,
+                (args.micro_batch_size, 1, args.seq_length, args.seq_length),
                 dtype=torch.bool,
                 device=torch.cuda.current_device(),
             )
         else:
             attention_mask = None
         position_ids = torch.empty(
-            shape,
+            (args.micro_batch_size, args.seq_length),
             dtype=torch.int64,
             device=torch.cuda.current_device(),
         )
-        cu_seqlens = None
-        if args.hybrid_context_parallel or args.sft:
-            max_seqlen = torch.empty(
-                1,
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
-        else:
-            max_seqlen = None
-        
-        local_cp_size = torch.empty(
-            1,
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
-        ) if args.hybrid_context_parallel else None
 
-        def _broadcast_cu_seqlens():
-            dev = torch.cuda.current_device()
-
-            n = torch.empty((), dtype=torch.int64, device=dev)
-            _broadcast(n)
-            n = int(n.item())
-
-            if n == 0:
-                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                cu_seqlens = torch.empty((args.micro_batch_size, n), dtype=torch.int32, device=dev)
-            _broadcast(cu_seqlens)
-
-            return cu_seqlens if n > 0 else None
-
-        if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
+        if args.pipeline_model_parallel_size == 1:
             _broadcast(tokens)
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
             _broadcast(position_ids)
-            cu_seqlens = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
-            _broadcast(local_cp_size)
 
         elif mpu.is_pipeline_first_stage():
             labels = None
@@ -692,17 +583,17 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(tokens)
             _broadcast(attention_mask)
             _broadcast(position_ids)
-            cu_seqlens = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            tokens = None
-            position_ids = None
-            cu_seqlens = None
-            max_seqlen = None
+            if args.mtp_num_layers is not None:
+                _broadcast(tokens)
+                _broadcast(position_ids)
+            else:
+                tokens = None
+                position_ids = None
 
             _broadcast(labels)
             _broadcast(loss_mask)
@@ -714,9 +605,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             'loss_mask': loss_mask,
             'attention_mask': attention_mask,
             'position_ids': position_ids,
-            'cu_seqlens': cu_seqlens,
-            'max_seqlen': max_seqlen,
-            'local_cp_size': local_cp_size,
         }
 
     return batch
@@ -755,39 +643,26 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
 
 
 def get_nvtx_range():
-    """Create an NVTX range context manager.
-
-    Returns a context manager that:
-    - Creates an NVTX range for profiling (nsight-systems compatible)
-    - Optionally tracks time via Megatron timers when time=True
-
-    Args (for returned context manager):
-        msg: Name of the range/timer
-        time: If True, also track with Megatron timers (default: False)
-        log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
-    """
-    from megatron.core.utils import nvtx_range_pop, nvtx_range_push
-
-    @contextmanager
-    def nvtx_range(msg, time=False, log_level=1):
-        if time:
-            timers = get_timers()
-            timers(msg, log_level=log_level).start()
-        try:
-            nvtx_range_push(msg)
-            yield
-        finally:
-            nvtx_range_pop(msg)
-            if time:
-                timers(msg, log_level=log_level).stop()
-
-    return nvtx_range
-
-
-def has_nvrx_installed():
-    """Checks if nvidia-resiliency-ext is installed."""
+    """Create an NVTX range context manager."""
     try:
-        import nvidia_resiliency_ext
-        return True
-    except (ImportError, ModuleNotFoundError):
-        return False
+        from torch.cuda import nvtx
+
+        @contextmanager
+        def nvtx_range(msg, time=False):
+            if time:
+                timers = get_timers()
+                timers(msg, log_level=0).start()
+            try:
+                nvtx.range_push(msg)
+                yield
+            finally:
+                nvtx.range_pop()
+                if time:
+                    timers(msg, log_level=0).stop()
+
+        return nvtx_range
+    except:
+        @contextmanager
+        def dummy_range(msg):
+            yield
+        return dummy_range
