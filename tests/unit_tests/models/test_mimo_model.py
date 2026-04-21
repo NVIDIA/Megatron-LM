@@ -564,37 +564,12 @@ class TestMimoModelNonColocated:
         assert model_language.role.has_modality_modules is False
         assert model_language.role.has_language_module is True
 
-        # Stage info with PP on a non-colocated layout (encoder and language on
-        # different rank ranges, which routes through RankRole.from_grid_map).
-        world_size = dist.get_world_size()
-        half = max(world_size // 2, 1)
-        pp_rank, pp_size = 1, 3
-        language_model_spec = get_language_model_spec(
-            self.hidden_size, self.vocab_size, self.seq_len
-        )
-        vision_submodule_spec = get_vision_submodules_spec(
-            self.hidden_size, self.img_h, self.img_w, self.patch_dim
-        )
-        pp_config = MimoModelConfig(
-            language_model_spec=language_model_spec,
-            modality_submodules_spec={"images": vision_submodule_spec},
-            special_token_ids={"images": 50257},
-            module_to_grid_map={
-                "images": MockGrid(
-                    rank_offset=0, size=half, dim_names=["pp"], pp_rank=pp_rank, pp_size=pp_size
-                ),
-                MIMO_LANGUAGE_MODULE_KEY: MockGrid(
-                    rank_offset=half,
-                    size=world_size - half,
-                    dim_names=["pp"],
-                    pp_rank=pp_rank,
-                    pp_size=pp_size,
-                ),
-            },
-        )
-        model_pp = MimoModel(pp_config)
-        assert model_pp.role.is_first_stage("images") is False
-        assert model_pp.role.is_last_stage("images") is False
+        # Non-colocated / PP role-stage coverage lives in tests/unit_tests/
+        # models/test_mimo_role.py (RankRole unit tests) and
+        # tests/unit_tests/models/test_mimo_1f1b_schedule.py (MimoModel with
+        # a real grid map + PP stages driving forward_backward_pipelining).
+        # Keep this test focused on the "no grid / default parallel state"
+        # path the rest of the file exercises.
 
     def test_selective_init_encoder_only(self):
         """Test encoder-only rank initializes encoder but not language model."""

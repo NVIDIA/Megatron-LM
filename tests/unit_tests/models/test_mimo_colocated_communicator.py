@@ -363,11 +363,27 @@ _DIM_MAPPING_IDS = ["sbh", "bsh"]
 
 
 class TestBridgeGradients:
-    """Gradient correctness for ColocatedBridgeCommunicator.
+    """Bitwise-exact gradient tests for ``ColocatedBridgeCommunicator``.
 
-    All assertions use ``rtol=0, atol=0`` — the bridge is pure data movement
-    (narrow / all-gather), so both forward output and the adjoint backward are
-    exact functions of the inputs. Any deviation is a logic bug.
+    This class is **intentionally distinct** from the model-level correctness
+    tests in ``test_mimo_colocated_correctness.py`` / ``test_mimo_colocated_e2e.py``
+    (see PR review comment 19). The bridge forward and backward are pure data
+    movement (``narrow`` / ``all_gather_into_tensor``) with no FP compute, so
+    the mathematical adjoint relationship can — and should — be asserted at
+    ``rtol=0, atol=0``:
+
+        * fan-in forward == ``torch.cat`` of sibling inputs in slot order
+        * fan-in backward == ``grad_output.narrow`` at this rank's slot
+        * fan-out forward == ``input.narrow`` at this rank's slot
+        * fan-out backward == ``cat`` of every sibling's grad (catches
+          zero-pad-without-gather, wrong slot order, double-counting,
+          missing siblings — the four failure modes of the adjoint)
+        * equal-DP is a pure identity (forward + backward)
+
+    The MimoModel-level tests validate the full training stack including GEMM
+    reduction order and DDP scaling, and can only assert approximate FP32
+    closeness. These tests localise the bridge's own invariants and fail
+    first when one of them regresses.
     """
 
     S = 8
