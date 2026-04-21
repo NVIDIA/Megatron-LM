@@ -1112,7 +1112,9 @@ class TestTextGenerationController:
     @pytest.mark.internal
     def test_speculative_verify_tokens(self):
         """Test consecutive token acceptance logic for speculative decoding."""
-        self.setup_model(torch.float32, static=False, num_speculative_tokens=2, max_requests=2)
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=2, max_requests=2, mtp_num_layers=2
+        )
 
         # Enable speculative decoding
         self.text_generation_controller.num_speculative_tokens = 2
@@ -1508,7 +1510,9 @@ class TestTextGenerationController:
     def test_speculative_mtp_position_ids_with_prefill(self):
         """Test that _compute_serial_mtp_and_sample uses the correct position IDs
         for a mixed batch of prefill and decode requests."""
-        self.setup_model(torch.float32, static=False, num_speculative_tokens=2, max_requests=2)
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=2, max_requests=2, mtp_num_layers=2
+        )
 
         self.text_generation_controller.num_speculative_tokens = 2
         self.text_generation_controller.num_mtp_heads = 2

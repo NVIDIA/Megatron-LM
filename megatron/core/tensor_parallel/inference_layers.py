@@ -251,6 +251,9 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         is_expert: bool,
         stride: int = 1,
         skip_weight_param_allocation: bool = False,
+        # Accepted for signature compatibility with ColumnParallelLinear but unused at inference.
+        embedding_activation_buffer: Optional[list] = None,
+        grad_output_buffer: Optional[list] = None,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
