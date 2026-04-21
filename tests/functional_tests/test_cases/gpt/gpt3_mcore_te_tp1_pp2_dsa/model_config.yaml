@@ -19,6 +19,8 @@ MODEL_ARGS:
   --dsa-indexer-head-dim: 128
   --dsa-indexer-topk: 2048
   --dsa-indexer-loss-coeff: 0.01
+  --dsa-indexer-use-sparse-loss: true
+  --disable-bias-linear: true
   --attention-backend: fused
   --log-params-norm: true
   --log-num-zeros-in-grad: true
@@ -50,7 +52,7 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 10
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 2
+  --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 2
   --sequence-parallel: true
   --untie-embeddings-and-output-weights: true
