@@ -300,10 +300,6 @@ def main():
                         help="Relative tolerance for grad norm comparison")
     args = parser.parse_args()
 
-    # Force flash attention — fused attention has a known THD grad bug.
-    os.environ["NVTE_FLASH_ATTN"] = "1"
-    os.environ["NVTE_FUSED_ATTN"] = "0"
-
     Utils.initialize_model_parallel(tensor_model_parallel_size=1)
     model_parallel_cuda_manual_seed(args.seed)
 

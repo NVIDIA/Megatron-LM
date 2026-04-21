@@ -28,7 +28,9 @@ class TestBuildPackedSeqParams:
     """Tests for ``_build_packed_seq_params``."""
 
     def test_basic(self):
-        params = _build_packed_seq_params([5, 3, 7], device="cpu")
+        params = _build_packed_seq_params(
+            torch.tensor([5, 3, 7], dtype=torch.int32), device="cpu",
+        )
         assert params.qkv_format == "thd"
         assert params.cu_seqlens_q.tolist() == [0, 5, 8, 15]
         assert params.cu_seqlens_kv.tolist() == [0, 5, 8, 15]
@@ -42,24 +44,32 @@ class TestBuildPackedSeqParams:
         assert params.cu_seqlens_kv_padded.tolist() == [0, 5, 8, 15]
 
     def test_equal_lengths(self):
-        params = _build_packed_seq_params([4, 4, 4], device="cpu")
+        params = _build_packed_seq_params(
+            torch.tensor([4, 4, 4], dtype=torch.int32), device="cpu",
+        )
         assert params.cu_seqlens_q.tolist() == [0, 4, 8, 12]
         assert params.max_seqlen_q == 4
         assert params.total_tokens == 12
 
     def test_single_sample(self):
-        params = _build_packed_seq_params([10], device="cpu")
+        params = _build_packed_seq_params(
+            torch.tensor([10], dtype=torch.int32), device="cpu",
+        )
         assert params.cu_seqlens_q.tolist() == [0, 10]
         assert params.max_seqlen_q == 10
         assert params.total_tokens == 10
 
     def test_dtype_is_int32(self):
-        params = _build_packed_seq_params([3, 5], device="cpu")
+        params = _build_packed_seq_params(
+            torch.tensor([3, 5], dtype=torch.int32), device="cpu",
+        )
         assert params.cu_seqlens_q.dtype == torch.int32
 
     def test_seq_idx_computed(self):
         """Verify __post_init__ computes seq_idx for Mamba compatibility."""
-        params = _build_packed_seq_params([3, 2], device="cpu")
+        params = _build_packed_seq_params(
+            torch.tensor([3, 2], dtype=torch.int32), device="cpu",
+        )
         # seq_idx should be [0,0,0,1,1] (shape [1, 5])
         assert params.seq_idx is not None
         assert params.seq_idx.shape == (1, 5)
@@ -166,6 +176,51 @@ class TestPackBatch:
         assert packed.get("labels") is None
         assert packed.get("loss_mask") is None
 
+    def test_data_provided_cu_seqlens_takes_priority(self):
+        """Prefer dataset-provided cu_seqlens over attention_mask."""
+        B, S = 2, 6
+        batch = {
+            "input_ids": torch.tensor([
+                [1, 2, 3, 4, 5, 6],
+                [7, 8, 9, 10, 11, 12],
+            ]),
+            "labels": torch.tensor([
+                [101, 102, 103, 104, 105, 106],
+                [107, 108, 109, 110, 111, 112],
+            ]),
+            "loss_mask": torch.ones(B, S),
+            "position_ids": torch.zeros(3, B, S, dtype=torch.long),
+            # Deliberately inconsistent with cu_seqlens.
+            "attention_mask": torch.ones(B, S),
+            # Per-sample cu_seqlens: sample0 len=4, sample1 len=2.
+            "cu_seqlens": torch.tensor([[0, 4], [0, 2]], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([[0, 4], [0, 2]], dtype=torch.int32),
+            "max_seqlen": torch.tensor([4, 2], dtype=torch.int32),
+        }
+        packed = _pack_batch(batch)
+
+        assert packed["input_ids"].shape == (1, 6)
+        assert packed["input_ids"].tolist() == [[1, 2, 3, 4, 7, 8]]
+        assert packed["labels"].tolist() == [[101, 102, 103, 104, 107, 108]]
+        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 4, 6]
+        assert packed["packed_seq_params"].max_seqlen_q == 4
+        # Raw data-side metadata is no longer needed after packing.
+        assert "cu_seqlens" not in packed
+        assert "cu_seqlens_padded" not in packed
+        assert "max_seqlen" not in packed
+
+    def test_multisegment_cu_seqlens_rejected(self):
+        """[B, N] cu_seqlens with N>2 is explicitly unsupported."""
+        batch = {
+            "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+            "position_ids": torch.zeros(3, 2, 4, dtype=torch.long),
+            "cu_seqlens": torch.tensor(
+                [[0, 2, 4], [0, 1, 4]], dtype=torch.int32,
+            ),
+        }
+        with pytest.raises(ValueError, match="expected \\[B, 2\\]"):
+            _pack_batch(batch)
+
     def test_variable_length_with_attention_mask(self):
         """Variable-length sequences: attention_mask strips padding."""
         B, S = 3, 10
@@ -199,10 +254,10 @@ class TestPackBatch:
 
     def test_packed_seq_params_cumsum_matches_loop(self):
         """Verify torch.cumsum produces the same cu_seqlens as a Python loop."""
-        lengths = [17, 31, 11, 42, 1]
+        lengths = torch.tensor([17, 31, 11, 42, 1], dtype=torch.int32)
         params = _build_packed_seq_params(lengths, device="cpu")
         # Manual cumulative sum
         expected = [0]
-        for sl in lengths:
-            expected.append(expected[-1] + sl)
+        for sl in lengths.tolist():
+            expected.append(expected[-1] + int(sl))
         assert params.cu_seqlens_q.tolist() == expected

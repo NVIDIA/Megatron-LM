@@ -85,6 +85,9 @@ class MockKimiK25VLDataset(Dataset):
             "input_ids": input_ids,
             "labels": labels,
             "loss_mask": loss_mask,
+            "cu_seqlens": torch.tensor([0, self.seq_len], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([0, self.seq_len], dtype=torch.int32),
+            "max_seqlen": torch.tensor(self.seq_len, dtype=torch.int32),
             "pixel_values": pixel_values,
             "image_grid_thw": grid_thw,
         }
