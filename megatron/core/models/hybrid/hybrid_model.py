@@ -281,6 +281,7 @@ class HybridModel(LanguageModule):
                 ),
                 bias=False,
                 skip_bias_add=False,
+                is_expert=False,
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,

@@ -1133,10 +1133,6 @@ class TestDynamicInferenceEngine:
                         "when tp_size > 1."
                     )
                 )
-            if model_provider == "mamba":
-                pytest.skip(
-                    reason="Mamba model is not supported with the inference optimized transformer."
-                )
 
         env = self._run_test(
             model_provider=model_provider,
