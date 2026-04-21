@@ -922,9 +922,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # For tensor parallel we need to gather the tensor across the model-parallel
         # ranks after the linear projection.
         if not self.training:
-            hidden_states = inference_all_gather_last_dim(
-                hidden_states, self.tp_group, self.config
-            )
+            hidden_states = inference_all_gather_last_dim(hidden_states, self.tp_group, self.config)
         else:
             hidden_states = gather_from_tensor_model_parallel_region(
                 hidden_states, group=self.tp_group

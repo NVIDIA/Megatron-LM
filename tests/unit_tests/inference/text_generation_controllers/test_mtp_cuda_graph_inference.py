@@ -836,9 +836,7 @@ class TestMTPCudaGraphExpertParallel:
         dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=dummy_hidden,
-            next_token_ids=dummy_tokens,
-            position_ids=dummy_positions,
+            hidden_states=dummy_hidden, next_token_ids=dummy_tokens, position_ids=dummy_positions
         )
 
         assert h_out.shape == (tp_size, 1, self.HIDDEN_SIZE)

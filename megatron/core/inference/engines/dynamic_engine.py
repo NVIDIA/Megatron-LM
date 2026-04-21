@@ -378,9 +378,7 @@ class DynamicInferenceEngine(AbstractEngine):
             tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
             sp_enabled = model_config.sequence_parallel and tp_size > 1
             mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
-            mtp_warmup_depths = (
-                range(controller._num_mtp_depths) if mtp_pass_depth else [None]
-            )
+            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
@@ -425,12 +423,8 @@ class DynamicInferenceEngine(AbstractEngine):
                                     device=device,
                                     dtype=model_config.params_dtype,
                                 ),
-                                next_token_ids=torch.empty(
-                                    (1, n), device=device, dtype=torch.long
-                                ),
-                                position_ids=torch.empty(
-                                    (1, n), device=device, dtype=torch.int64
-                                ),
+                                next_token_ids=torch.empty((1, n), device=device, dtype=torch.long),
+                                position_ids=torch.empty((1, n), device=device, dtype=torch.int64),
                                 depth=depth,
                             )
 

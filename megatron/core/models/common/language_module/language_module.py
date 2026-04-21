@@ -30,8 +30,6 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
-    nvtx_range_pop,
-    nvtx_range_push,
 )
 
 

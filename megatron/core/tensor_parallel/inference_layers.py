@@ -20,8 +20,8 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 try:
@@ -510,9 +510,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
 
 
 def inference_all_gather_last_dim(
-    x: torch.Tensor,
-    tp_group: torch.distributed.ProcessGroup,
-    config: TransformerConfig,
+    x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
 ) -> torch.Tensor:
     """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
 

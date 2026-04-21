@@ -1678,9 +1678,7 @@ class TestTextGenerationController:
         dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
         hidden_out, logits_out = unwrapped_model.compute_mtp_single_step(
-            hidden_states=dummy_hidden,
-            next_token_ids=dummy_tokens,
-            position_ids=dummy_positions,
+            hidden_states=dummy_hidden, next_token_ids=dummy_tokens, position_ids=dummy_positions
         )
 
         # Hidden output is in SP format: [padded_count/tp_size, 1, H] = [1, 1, H].
