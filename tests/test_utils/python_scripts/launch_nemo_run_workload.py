@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import io
 import logging
 import os
 import pathlib
@@ -138,11 +139,37 @@ def main(
 
     n_attempts = 0
     while n_attempts < 3:
-        with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
-            _ = exp.add([inline_script], tail_logs=False, name="task-1")
+        tee_buffer = io.StringIO()
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
 
-            exp.dryrun(log=True)
-            exp.run(detach=False, tail_logs=True, sequential=False)
+        class _TeeStream:
+            def __init__(self, real_stream, buf):
+                self._real = real_stream
+                self._buf = buf
+
+            def write(self, data):
+                self._real.write(data)
+                self._buf.write(data)
+
+            def flush(self):
+                self._real.flush()
+                self._buf.flush()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        sys.stdout = _TeeStream(original_stdout, tee_buffer)
+        sys.stderr = _TeeStream(original_stderr, tee_buffer)
+        try:
+            with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
+                _ = exp.add([inline_script], tail_logs=False, name="task-1")
+
+                exp.dryrun(log=True)
+                exp.run(detach=False, tail_logs=True, sequential=False)
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
         result_dict = exp.status(return_dict=True)
         _, job_dict = list(result_dict.items())[0]
@@ -154,7 +181,7 @@ def main(
 
         logger.error(f"Job failed with status: {job_dict['status']}")
         log_file_paths = pathlib.Path(os.getcwd()).glob("**/attempt_0/*/std*.log")
-        all_ranks_all_logs = []
+        all_ranks_all_logs = [tee_buffer.getvalue()]
         for log_file_path in log_file_paths:
             with open(log_file_path, "r") as f:
                 all_logs = f.readlines()
