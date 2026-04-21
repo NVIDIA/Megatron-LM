@@ -350,9 +350,20 @@ def _unwrap_pyt_sharded_tensor(
     ret_tensors = []
     for sh in sh_ten.local_shards():
         ten = sh.tensor
-        for _ in range(mcore_sh_ten.prepend_axis_num):
-            assert ten.size(0) == 1
-            ten = ten[0]  # NOTE: ten.squeeze(0) uses more memory for FP8 tensors
+        if mcore_sh_ten.prepend_axis_num > 0:
+            # NOTE: use ``view`` to strip the prepended singleton axes. Indexing
+            # (``ten[0]``) and ``squeeze`` both dispatch through
+            # ``aten.select.int`` / ``aten.squeeze`` which are not implemented
+            # by ``MXFP8Tensor`` (nor by the blockwise tensor class) — they
+            # fall back to ``QuantizedTensor.__torch_dispatch__`` which
+            # dequantizes the entire tensor to BF16 before applying the op.
+            # For large FP8/MXFP8 checkpoints this materializes a full-size
+            # BF16 copy per shard and OOMs right after a successful streaming
+            # load. ``view`` is handled natively by all TE quantized tensor
+            # classes without any dequantize.
+            for _ in range(mcore_sh_ten.prepend_axis_num):
+                assert ten.size(0) == 1
+            ten = ten.view(ten.shape[mcore_sh_ten.prepend_axis_num:])
         ret_tensors.append(ten)
     return ret_tensors
 
