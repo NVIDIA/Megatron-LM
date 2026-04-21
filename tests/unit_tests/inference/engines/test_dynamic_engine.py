@@ -65,7 +65,7 @@ except ImportError:
 
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
-    if model_provider in ("hybrid", "mamba"):
+    if model_provider == "hybrid":
         sequence_packing_available, reason_for_no_sequence_packing = (
             _check_mamba_sequence_packing_support()
         )
@@ -368,7 +368,7 @@ class TestDynamicInferenceEngine:
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=test_config.position_embedding_type,
             ).cuda()
-        elif test_config.model_provider in ("hybrid", "mamba"):
+        elif test_config.model_provider == "hybrid":
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
@@ -632,7 +632,7 @@ class TestDynamicInferenceEngine:
 
         if model_provider == "gpt":
             expected_generated_tokens_list = gpt_expected_generated_tokens
-        elif model_provider in ("hybrid", "mamba"):
+        elif model_provider == "hybrid":
             expected_generated_tokens_list = mamba_expected_generated_tokens
         else:
             raise ValueError(f"Invalid model_provider {model_provider}")
@@ -1131,7 +1131,7 @@ class TestDynamicInferenceEngine:
                         "when tp_size > 1."
                     )
                 )
-            if model_provider in ("hybrid", "mamba"):
+            if model_provider == "hybrid":
                 pytest.skip(
                     reason="Mamba model is not supported with the inference optimized transformer."
                 )
@@ -4319,7 +4319,7 @@ class TestDynamicInferenceEngine:
         Two requests run simultaneously to exercise batched rewind indexing
         where mamba_metadata.request_to_mamba_state_idx differs per request.
         """
-        skip_if_mamba_sequence_packing_not_available("mamba")
+        skip_if_mamba_sequence_packing_not_available("hybrid")
 
         num_tokens_to_generate = 8
         test_config = DynamicEngineTestConfig(
@@ -4329,7 +4329,7 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=num_tokens_to_generate,
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
-            model_provider="mamba",
+            model_provider="hybrid",
         )
         env = self._build_test_env(test_config)
 
@@ -4460,7 +4460,7 @@ class TestChunkedPrefillCudaGraphs:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
-        elif model_provider in ("hybrid", "mamba"):
+        elif model_provider == "hybrid":
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=3,
