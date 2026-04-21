@@ -49,10 +49,14 @@ class FSDPModule(nn.Module):
 
     def _init_named_param_groups(self, mesh, ignored_params):
         ignored_params = ignored_params or set()
+        ignored_modules = set()
         for _, child in self.named_modules():
             if child is not self and isinstance(child, FSDPModule):
                 ignored_params.update(child.parameters())
+                for child_submodule in child.modules():
+                    ignored_modules.add(child_submodule)
 
+        self._materialize_meta_module(ignored_modules)
         fsdp_param_groups = _get_module_fsdp_param_groups(self, mesh, ignored_params=ignored_params)
 
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
@@ -64,6 +68,20 @@ class FSDPModule(nn.Module):
                 param_name = param_to_name[param]
                 param_names.append(param_name)
             self._named_param_groups.append((param_names, fsdp_param_group))
+
+    def _materialize_meta_module(self, ignored_modules):
+        materialization_device = torch.cuda.current_device()
+        for m in self.modules():
+            if m in ignored_modules:
+                continue
+            if all(not p.is_meta for p in m.parameters(recurse=False)):
+                continue
+
+            m.to_empty(device=materialization_device, recurse=False)
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
+            if hasattr(m, "_reset_parameters"):
+                m._reset_parameters()
 
     def _init_fsdp_state(self):
         setattr(self, "_fsdp_state", _FSDPState())
