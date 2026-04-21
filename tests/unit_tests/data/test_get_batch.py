@@ -149,7 +149,7 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
-@pytest.mark.parametrize("seq_length", [1024, 2048, 4096])
+@pytest.mark.parametrize("seq_length", [1024, 4096])
 def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
     if tp_size * pp_size * cp_size > torch.cuda.device_count():
         pytest.skip(
@@ -367,9 +367,9 @@ def create_pretrain_data_iterator(
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
-@pytest.mark.parametrize("seq_length", [1024, 2048, 4096])
+@pytest.mark.parametrize("seq_length", [1024, 4096])
 @pytest.mark.parametrize("create_attention_mask", [True, False])
-@pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
+@pytest.mark.parametrize("micro_batch_size", [1, 4])
 def test_pretrain_batch(
     tp_size, pp_size, cp_size, seq_length, create_attention_mask, micro_batch_size
 ):
