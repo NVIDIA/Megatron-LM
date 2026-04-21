@@ -8,6 +8,7 @@ ENV_VARS:
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   USE_MNNVL: 1
 TEST_TYPE: "release"
+LAUNCHER: ft_launcher
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
