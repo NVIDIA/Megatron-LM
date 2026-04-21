@@ -274,6 +274,43 @@ def _allreduce_position_embedding_grads(
         model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=False
     )
 
+def _allreduce_router_grads(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    All-reduce router grads.
+
+    Reduce grads across all the pp stages to ensure that parameters of the router stay in sync.
+    """
+
+    if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+        grads_dict = {}
+        for model_chunk in model:
+            for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+                if param.requires_grad and getattr(param, 'pipeline_parallel', False):
+                    grad = param.main_grad
+                    if name in grads_dict:
+                        # Add all the virtual PP rank's gradients to
+                        # the first local virtual PP rank.
+                        grads_dict[name][0].add_(grad)
+                        # Append to the end for later update after cross-rank reduce.
+                        grads_dict[name].append(grad)
+                    else:
+                        grads_dict[name] = [grad]
+
+        if grads_dict:
+            # All-reduce the gradient on the first VPP rank.
+            grads = [param_grad[0] for _, param_grad in grads_dict.items()]
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                buf.copy_(synced)
+
+            # Update the gradients on other VPP ranks.
+            for grads in grads_dict.values():
+                for grad in grads[1:]:
+                    grad.copy_(grads[0])
+
 
 def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.nn.Module]):
     """
@@ -456,6 +493,9 @@ def finalize_model_grads(
     _allreduce_conditional_embedding_grads(model, config, pp_group)
     if config.timers is not None:
         config.timers('conditional-embedder-grads-all-reduce').stop()
+
+    if getattr(config, 'flextron', False):
+        _allreduce_router_grads(model, config)
 
     # All-reduce layer-norm grads (for sequence parallelism) and non-tensor parallel modules.
     if config.timers is not None:
