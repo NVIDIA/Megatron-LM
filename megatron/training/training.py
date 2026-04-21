@@ -252,6 +252,14 @@ from .global_vars import (
     get_energy_monitor,
 )
 from . import one_logger_utils
+from .activation_logging import (
+    enable_activation_logging,
+    disable_activation_logging,
+    save_activations,
+    enable_tokens_per_expert_logging,
+    disable_tokens_per_expert_logging,
+    save_tokens_per_expert,
+)
 from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
 
 from . import ft_integration
@@ -1195,15 +1203,14 @@ def pretrain(
         print_datetime('after training is done')
 
         if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
-            save_checkpoint(
+            save_checkpoint_and_time(
                 iteration,
                 model,
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
-                preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                train_data_iterator=train_data_iterator
             )
 
         one_logger and one_logger.log_metrics(
@@ -1615,10 +1622,11 @@ def setup_model_and_optimizer(
     timers = get_timers()
     one_logger = get_one_logger()
 
-    # Skip optimizer when not training. In RL inference-only mode (skip_train + perform_rl_step),
-    # --no-load-optim controls whether the optimizer is skipped (saving memory) or created
-    # (required for --rl-offload-optimizer-during-inference).
-    skip_optimizer = args.skip_train and (not args.perform_rl_step or args.no_load_optim)
+    # Typically, --skip-train is the only thing needed to disable the optimizer.
+    has_normal_optimizer = not args.skip_train
+    # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
+    has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
+    skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -1783,10 +1791,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     timers = get_timers()
 
     rerun_state_machine = get_rerun_state_machine()
-    save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
-                                     (iteration + 1) % args.save_dgrads_interval == 0)
+    save_params_in_this_iteration = (args.save_params_interval is not None and
+                                     (iteration + 1) % args.save_params_interval == 0)
+    save_activations_in_this_iteration = (args.save_activations_interval is not None and
+                                          (iteration + 1) % args.save_activations_interval == 0)
+    save_tpe_in_this_iteration = (args.save_tokens_per_expert_interval is not None and
+                                  (iteration + 1) % args.save_tokens_per_expert_interval == 0)
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
+    save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
+                                     (iteration + 1) % args.save_dgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -1824,6 +1838,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                         optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
+        if save_activations_in_this_iteration:
+            enable_activation_logging(model, args.save)
+        if save_tpe_in_this_iteration:
+            enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
@@ -1838,6 +1856,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
         )
+        if save_activations_in_this_iteration:
+            save_activations(iteration + 1)
+            disable_activation_logging()
+        if save_tpe_in_this_iteration:
+            save_tokens_per_expert(iteration + 1)
+            disable_tokens_per_expert_logging()
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
@@ -1846,20 +1870,23 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for model_chunk in model:
             model_chunk.force_all_reduce = False
 
-    # Checkpoint main_grads.
-    if save_wgrads_in_this_iteration:
-        # Collect state_dict of wgrads (each param's .main_grad field).
+    def _save_state_dict(attr_name, label):
+        # Collect state_dict of the given attribute for each parameter.
         state_dict = defaultdict(dict)
         for model_chunk_id, model_chunk in enumerate(model):
             model_chunk_name = f"model_chunk{model_chunk_id}"
             unwrapped_model_chunk = unwrap_model(model_chunk)
             for param_name, param in unwrapped_model_chunk.named_parameters():
-                if getattr(param, "main_grad", None) is not None:
-                    main_grad_on_cpu = param.main_grad.cpu()
-                    state_dict[model_chunk_name][param_name] = main_grad_on_cpu
+                if getattr(param, attr_name, None) is not None:
+                    tensor_on_cpu = getattr(param, attr_name).cpu()
+                    state_dict[model_chunk_name][param_name] = tensor_on_cpu
 
         # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
-        save_grads(args.save, state_dict, iteration + 1, "wgrads")
+        save_grads(args.save, state_dict, iteration + 1, label)
+
+    # Checkpoint wgrads with parameter names.
+    if save_wgrads_in_this_iteration:
+        _save_state_dict(attr_name="main_grad", label="wgrads")
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
@@ -1886,6 +1913,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
 
     timers('optimizer').stop()
+
+    # Checkpoint params with parameter names.
+    if save_params_in_this_iteration:
+        _save_state_dict(attr_name="data", label="params")
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -2395,6 +2426,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    
+    # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
+    timers(timer_key).stop(barrier=True)
+    save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
+    
     if should_report_memory:
         # Track memory after checkpoint save.
         report_memory(f"(after save_checkpoint for iteration {iteration})")
@@ -2405,12 +2441,12 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
-    timers(timer_key).stop(barrier=True)
+
     timers.log([timer_key])
 
     # Log E2E metrics after save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    save_checkpoint_duration = timers(timer_key).elapsed()
+
     one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
     if args.log_progress and not non_persistent_ckpt:
@@ -3746,8 +3782,16 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
+    # Typically, --skip-train is the only thing needed to disable the optimizer.
+    has_normal_optimizer = not args.skip_train
+    # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
+    has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
+    # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
+    # so in order to disable them, we must check that the optimizer actually exists.
+    has_optimizer = has_normal_optimizer or has_rl_optimizer
     return (
         not args.use_megatron_fsdp
+        and has_optimizer
         and (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
         and args.overlap_param_gather
     )

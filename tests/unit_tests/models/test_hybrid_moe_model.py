@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import hashlib
 import inspect
@@ -10,8 +10,8 @@ from typing import Any, Dict, Mapping, Tuple
 import pytest  # type: ignore[import]
 import torch
 
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -390,14 +390,14 @@ def _diff_configs(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> Tup
     return added, removed, changed
 
 
-class TestMambaMoEModel:
-    """Test the initialization and use of an MoE Mamba model."""
+class TestHybridMoEModel:
+    """Test the initialization and use of an MoE Hybrid model."""
 
     def create_test_args(self):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-        sys.argv = ['test_mamba_moe_model.py']
+        sys.argv = ['test_hybrid_moe_model.py']
         args = parse_args()
 
         # The following args would be set from the nano v3 checkpoint.
@@ -425,7 +425,7 @@ class TestMambaMoEModel:
         args.hidden_dropout = 0.0
         args.hybrid_layer_pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
         args.hybrid_override_pattern = None
-        args.spec = ["megatron.core.models.mamba.mamba_layer_specs", "mamba_stack_spec"]
+        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"]
         args.num_experts = 128
         args.moe_layer_freq = 1
         args.moe_ffn_hidden_size = 1856
@@ -497,9 +497,9 @@ class TestMambaMoEModel:
 
         model_config = core_transformer_config_from_args(args, TransformerConfig)
 
-        self.model = MambaModel(
+        self.model = HybridModel(
             config=model_config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=args.vocab_size,
             max_sequence_length=args.seq_length,
             hybrid_layer_pattern=args.hybrid_layer_pattern,
