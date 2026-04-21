@@ -3714,45 +3714,42 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
         train_data_iterator = None
 
     if valid_dataloaders is not None:
-        # when using full validation, we need to override eval iters with the correct
-        # number of iterations on tp rank 0 so that it can be distributed to the other
-        # ranks later
+        # when using full validation, we need to override eval iters with the
+        # MAX length across DP ranks so all ranks run the same number of steps
         if args.full_validation:
             if args.multiple_validation_sets:
                 if valid_dataloaders[0] is None:
-                    args.eval_iters = [None]*len(valid_dataloaders)
+                    args.eval_iters = [None] * len(valid_dataloaders)
                 else:
-                    args.eval_iters = [len(dl) for dl in valid_dataloaders]
+                    local_eval_iters = [len(dl) for dl in valid_dataloaders]
+                    eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
+                    torch.distributed.all_reduce(
+                        eval_iters_tensor,
+                        op=torch.distributed.ReduceOp.MAX,
+                        group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    )
+                    args.eval_iters = eval_iters_tensor.tolist()
             else:
-                args.eval_iters = len(valid_dataloaders[0])
+                local_eval_iters = len(valid_dataloaders[0])
+                eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
+                torch.distributed.all_reduce(
+                    eval_iters_tensor,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=mpu.get_data_parallel_group(with_context_parallel=True),
+                )
+                args.eval_iters = eval_iters_tensor.item()
 
         if args.multiple_validation_sets:
             if valid_dataloaders[0] is None:
                 valid_data_iterators = [None] * len(valid_dataloaders)
             else:
-                # Get the number of batches for this data parallel rank
-                local_eval_iters = [len(dl) for dl in valid_dataloaders]
-                # Compute the maximum across all data parallel ranks to ensure synchronization
-                eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
-                torch.distributed.all_reduce(
-                    eval_iters_tensor,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=mpu.get_data_parallel_group(with_context_parallel=True)
-                )
-                args.eval_iters = eval_iters_tensor.tolist()
-        else:
-            local_eval_iters = len(valid_dataloaders[0])
-            eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
-            torch.distributed.all_reduce(
-                eval_iters_tensor,
-                op=torch.distributed.ReduceOp.MAX,
-                group=mpu.get_data_parallel_group(with_context_parallel=True)
-            )
-            args.eval_iters = eval_iters_tensor.item()
-
-    if args.multiple_validation_sets:
-        if valid_dataloaders[0] is None:
-            valid_data_iterators = [None] * len(valid_dataloaders)
+                valid_dl_type = "cyclic" if args.full_validation else dl_type
+                valid_data_iterators = [
+                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+                ]
+        elif valid_dataloaders[0] is not None:
+            valid_dl_type = "cyclic" if args.full_validation else dl_type
+            valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
         else:
             valid_data_iterators = None
     else:
