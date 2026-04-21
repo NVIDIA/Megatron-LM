@@ -222,7 +222,13 @@ class DistributedDataParallel(_BaseDataParallel):
             # kernels.
             # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
             # bucket group.
-            bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
+            bucket_groups = partition_buckets(
+                buffers,
+                force_single_bucket_group=disable_bucketing,
+                reduce_scatter_with_fp32_accumulation=(
+                    self.ddp_config.reduce_scatter_with_fp32_accumulation
+                ),
+            )
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
                 assert (
