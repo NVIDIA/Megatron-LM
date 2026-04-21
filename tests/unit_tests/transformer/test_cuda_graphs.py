@@ -575,6 +575,7 @@ class TestTECudaGraphHelper:
         # Initialize num_microbatches calculator
         init_num_microbatches_calculator(
             rank=0,
+            rampup_batch_size=None,
             global_batch_size=micro_batch_size * num_microbatches,
             micro_batch_size=micro_batch_size,
             data_parallel_size=1,
