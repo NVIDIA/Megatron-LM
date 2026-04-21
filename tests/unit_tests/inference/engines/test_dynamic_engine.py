@@ -400,7 +400,8 @@ class TestDynamicInferenceEngine:
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
-                add_bias_linear=test_config.expert_model_parallel_size == 1,
+                add_bias_linear=test_config.expert_model_parallel_size == 1
+                and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
