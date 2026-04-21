@@ -341,13 +341,10 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
     def forward(
         self,
         x: torch.Tensor,
-        weight: Optional[torch.Tensor] = None,
+        weight: torch.Tensor,
         runtime_gather_output: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, None]:
         """Forward pass."""
-        if weight is None:
-            weight = self.weight
-
         if self.tp_size == 1:
             x = _apply_linear(x, weight, self.config)
             return x, None

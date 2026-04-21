@@ -755,7 +755,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 stacklevel=2,
             )
             hybrid_submodules = mamba_submodules
-        self.is_mtp_layer = True
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
