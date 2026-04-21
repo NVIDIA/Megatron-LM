@@ -62,8 +62,8 @@ MODEL_ARGS:
   --return-log-probs: true
   --num-tokens-to-generate: 30
   --max-tokens-to-oom: 3600000
-  --inference-dynamic-batching-max-tokens: 256
-  --inference-dynamic-batching-max-requests: 256
+  --inference-max-tokens: 256
+  --inference-max-requests: 256
   --inference-max-seq-length: 4096
   --enable-chunked-prefill: true
   --output-path: ${INFERENCE_OUTPUT_PATH}

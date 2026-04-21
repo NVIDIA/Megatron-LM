@@ -25,9 +25,7 @@ from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
-from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
     VLMTextGenerationController,
@@ -202,8 +200,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         controller = VLMTextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
-        inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed, legacy=True
+        raise NotImplementedError(
+            "VLM mcore inference requires migration to DynamicInferenceEngine."
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -221,7 +219,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         if not args.use_mcore_inference:
             forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
 
-        inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
+        inference_context = None
         if is_first_rank():
 
             if args.use_mcore_inference:

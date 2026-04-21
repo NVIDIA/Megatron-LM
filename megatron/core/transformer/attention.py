@@ -14,10 +14,7 @@ from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.models.common.embeddings.rope_utils import (
-    apply_rotary_pos_emb,
-    apply_rotary_pos_emb_with_cos_sin,
-)
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -38,7 +35,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
-    deprecate_inference_params,
     divide,
     get_pg_rank,
     get_pg_size,
@@ -52,7 +48,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType, CudaGraphScope
+from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -449,18 +445,6 @@ class Attention(MegatronModule, ABC):
             **extra_kwargs,
         )
 
-    def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
-        """Allocate memory to store kv cache during inference."""
-
-        return torch.empty(
-            inference_max_sequence_length,
-            batch_size,
-            self.num_query_groups_per_partition,
-            dim,
-            dtype=dtype,
-            device=torch.cuda.current_device(),
-        )
-
     def _get_pp_layer_offset_for_inference(self):
         """Return the pipeline parallel layer offset for inference.
 
@@ -494,8 +478,6 @@ class Attention(MegatronModule, ABC):
         rotary_pos_sin: Optional[Tensor] = None,
         rotary_pos_cos_sin: Optional[Tensor] = None,
         sequence_len_offset: Optional[int] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
         """
         Saves the generated key and value tensors to the end of the buffers in inference_context.
@@ -519,38 +501,11 @@ class Attention(MegatronModule, ABC):
             Tuple of: query, key, value, rotary_pos_emb, attn_mask_type, block_table.
         """
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
         attn_mask_type = self.attn_mask_type
         if inference_context is None:
             return query, key, value, rotary_pos_emb, attn_mask_type, None
 
-        # =================================================
-        # Pre-allocate memory for key-values for inference.
-        # =================================================
-        if inference_context.is_static_batching():
-            if self.layer_number not in inference_context.key_value_memory_dict:
-                inf_max_seq_length = inference_context.max_sequence_length
-                inf_max_batch_size = inference_context.max_batch_size
-                inference_key_memory = self._allocate_memory(
-                    inf_max_seq_length, inf_max_batch_size, self.key_hidden_size, key.dtype
-                )
-                inference_value_memory = self._allocate_memory(
-                    inf_max_seq_length, inf_max_batch_size, self.val_hidden_size, value.dtype
-                )
-                inference_context.key_value_memory_dict[self.layer_number] = (
-                    inference_key_memory,
-                    inference_value_memory,
-                )
-            else:
-                # Get the pre-allocated buffers for this layer
-                inference_key_memory, inference_value_memory = (
-                    inference_context.key_value_memory_dict[self.layer_number]
-                )
-
-        if (
-            not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0
-        ) and (not self.training or not is_te_min_version("2.2.0")):
+        if not self.training or not is_te_min_version("2.2.0"):
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
             # Note: in ModelOpt, we may use inference_context for speculative decoding
@@ -559,109 +514,47 @@ class Attention(MegatronModule, ABC):
 
             attn_mask_type = AttnMaskType.no_mask
 
-        if inference_context.is_static_batching():
-            batch_start = inference_context.batch_size_offset
-            batch_end = batch_start + key.size(1)
-            assert batch_end <= inference_key_memory.size(1)
-            sequence_start = inference_context.sequence_len_offset
-            sequence_end = sequence_start + key.size(0)
-            assert sequence_end <= inference_key_memory.size(0), (
-                "Current sequence length is longer than expected maximum sequence length! "
-                "Increase inference_max_seq_length."
-            )
-
-        if self.config.flash_decode:
-            rotary_pos_cos_q = None
-            rotary_pos_sin_q = None
-            rotary_pos_cos_k = None
-            rotary_pos_sin_k = None
-
-            assert inference_context.is_static_batching()
-            if (
-                inference_context.sequence_len_offset > 0 and rotary_pos_cos is not None
-            ):  # Decode phase, not prefill
-                rotary_pos_cos_q = rotary_pos_cos[sequence_end - 1 : sequence_end]
-                rotary_pos_sin_q = rotary_pos_sin[sequence_end - 1 : sequence_end]
-                rotary_pos_cos_k = rotary_pos_cos[sequence_end - 1 : sequence_end]
-                rotary_pos_sin_k = rotary_pos_sin[sequence_end - 1 : sequence_end]
-            elif rotary_pos_cos is not None:  # Prefill
-                rotary_pos_cos_q = rotary_pos_cos[:sequence_end]
-                rotary_pos_sin_q = rotary_pos_sin[:sequence_end]
-                rotary_pos_cos_k = rotary_pos_cos[:sequence_end]
-                rotary_pos_sin_k = rotary_pos_sin[:sequence_end]
-
-            # Flash Decoding assumes that the keys stored in the KV Cache already have RoPE applied.
-            # Apply RoPE before we store the keys to make it compatible with flash decoding kernel
-            if rotary_pos_sin_q is not None and rotary_pos_sin_k is not None:
-                key = apply_rotary_pos_emb_with_cos_sin(
-                    key,
-                    rotary_pos_cos_k,
-                    rotary_pos_sin_k,
-                    rotary_interleaved=self.config.rotary_interleaved,
-                )
-                query = apply_rotary_pos_emb_with_cos_sin(
-                    query,
-                    rotary_pos_cos_q,
-                    rotary_pos_sin_q,
-                    rotary_interleaved=self.config.rotary_interleaved,
-                )
-        else:
-            rotary_pos_cos_q = None
-            rotary_pos_sin_q = None
-
         # Adjust rotary embeddings.
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            if inference_context.is_static_batching():
-                q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
-                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-            else:
-                pass
             rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
         block_table = None
-        if inference_context.is_static_batching():
-            # Copy key and values.
-            inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
-            inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
-            key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
-            value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
-        else:
-            pp_layer_offset = self._get_pp_layer_offset_for_inference()
+        pp_layer_offset = self._get_pp_layer_offset_for_inference()
 
-            # Apply rotary embeddings before appending KV cache.
-            if inference_context.use_flashinfer_fused_rope and (rotary_pos_cos_sin is not None):
-                query, key = inference_context.apply_fused_qk_rotary_emb(
-                    query, key, rotary_pos_cos_sin, self.config
-                )
-            elif rotary_pos_emb is not None:
-                q_pos_emb, k_pos_emb = rotary_pos_emb
-                key = inference_context.apply_rotary_emb_key(
-                    key, k_pos_emb, self.config, self.pg_collection.cp
-                )
-
-                rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
-
-            # Append key/value data tensors to cache.
-            inference_context.append_key_value_cache(
-                self.layer_number - pp_layer_offset, key, value
+        # Apply rotary embeddings before appending KV cache.
+        if inference_context.use_flashinfer_fused_rope and (rotary_pos_cos_sin is not None):
+            query, key = inference_context.apply_fused_qk_rotary_emb(
+                query, key, rotary_pos_cos_sin, self.config
+            )
+        elif rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            key = inference_context.apply_rotary_emb_key(
+                key, k_pos_emb, self.config, self.pg_collection.cp
             )
 
-            if (
-                getattr(self.config, "cache_mla_latents", None)
-                and not inference_context.is_decode_only()
-            ):
-                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
-                kv_cache, _, block_table = inference_context.key_value_cache(
-                    self.layer_number - pp_layer_offset
-                )
-                # Uncompress the KV cache for prefill/mixed mode
-                key, value = self.uncompress_kv_from_cache(kv_cache)
-            else:
-                # Read key/value *pointer* tensors from cache.
-                key, value, block_table = inference_context.key_value_cache(
-                    self.layer_number - pp_layer_offset
-                )
+            rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
+
+        # Append key/value data tensors to cache.
+        inference_context.append_key_value_cache(
+            self.layer_number - pp_layer_offset, key, value
+        )
+
+        if (
+            getattr(self.config, "cache_mla_latents", None)
+            and not inference_context.is_decode_only()
+        ):
+            # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+            kv_cache, _, block_table = inference_context.key_value_cache(
+                self.layer_number - pp_layer_offset
+            )
+            # Uncompress the KV cache for prefill/mixed mode
+            key, value = self.uncompress_kv_from_cache(kv_cache)
+        else:
+            # Read key/value *pointer* tensors from cache.
+            key, value, block_table = inference_context.key_value_cache(
+                self.layer_number - pp_layer_offset
+            )
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
@@ -680,52 +573,6 @@ class Attention(MegatronModule, ABC):
         This method needs to be implemented based on whether the derived class
         is "self-attn" or "cross-attn".
         """
-
-    def flash_decode(
-        self,
-        sequence_len_offset: Tensor,
-        query_layer: Tensor,
-        key_layer: Tensor,
-        value_layer: Tensor,
-        inference_key_memory: Tensor,
-        inference_value_memory: Tensor,
-        rotary_cos: Tensor,
-        rotary_sin: Tensor,
-        rotary_interleaved: bool = False,
-    ) -> tuple[Tensor, Tensor]:
-        """
-        The flash decoding kernel will do the following in a single execution:
-        1. Compute RoPE embedding with precomputed cos & sin tensors
-        2. Update the KV Cache
-        3. Performs the flash attention operation
-        """
-        assert flash_attn_with_kvcache is not None, (
-            "Flash Decoding requires the flash_attn_with_kvcache kernel, "
-            "available in the flash-attn package."
-        )
-        q = query_layer.permute(1, 0, 2, 3)
-        k = key_layer.permute(1, 0, 2, 3)
-        v = value_layer.permute(1, 0, 2, 3)
-        k_cache = inference_key_memory.permute(1, 0, 2, 3)
-        v_cache = inference_value_memory.permute(1, 0, 2, 3)
-
-        if rotary_cos is not None:
-            rotary_cos = rotary_cos.to(query_layer.dtype)
-        if rotary_sin is not None:
-            rotary_sin = rotary_sin.to(query_layer.dtype)
-
-        out = flash_attn_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            k=k,
-            v=v,
-            rotary_cos=rotary_cos,
-            rotary_sin=rotary_sin,
-            cache_seqlens=sequence_len_offset,
-            rotary_interleaved=rotary_interleaved,
-        )
-        return out
 
     def _flash_attention_3_forward_wrapper(
         self,
@@ -981,8 +828,6 @@ class Attention(MegatronModule, ABC):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor]:
         """
         Perform a forward pass through the attention module.
@@ -1016,25 +861,20 @@ class Attention(MegatronModule, ABC):
         if no_rope:
             rotary_pos_emb = None
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        if inference_context and inference_context.is_dynamic_batching():
+        if inference_context:
             assert (
                 HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
         is_inference_mode = inference_context is not None and not self.training
-        # is_using_flash_decode - True is we are using the static inference engine with flash decode
-        is_using_flash_decode = is_inference_mode and self.config.flash_decode
         # is_using_flashinfer_rope - True if we are using the dynamic inference engine
         # with flashinfer fused rope
         is_using_flashinfer_rope = is_inference_mode and (
-            not inference_context.is_static_batching()
-            and inference_context.use_flashinfer_fused_rope
+            inference_context.use_flashinfer_fused_rope
         )
-        if is_using_flash_decode or is_using_flashinfer_rope:
-            # flash decode and flash-infer fused rope use rotary_pos_cos and rotary_pos_sin
+        if is_using_flashinfer_rope:
+            # flashinfer fused rope uses rotary_pos_cos and rotary_pos_sin
             rotary_pos_emb = None
         else:
             assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -1060,7 +900,6 @@ class Attention(MegatronModule, ABC):
                     and rotary_pos_emb[0] is not None
                     and rotary_pos_emb[1] is not None
                 ),
-                not self.config.flash_decode,
                 HAVE_FUSED_QKV_ROPE,
                 self.q_layernorm is None or isinstance(self.q_layernorm, IdentityOp),
                 self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
@@ -1111,39 +950,7 @@ class Attention(MegatronModule, ABC):
             and not self.training
         )
 
-        # This branch only runs in the decode phase of flash decoding and returns after the linear
-        # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
         nvtx_range_push(suffix="adjust_key_value")
-        if in_decode_mode and self.config.flash_decode:
-            assert self.layer_number in inference_context.key_value_memory_dict
-            assert inference_context.sequence_len_offset is not None
-            inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
-                self.layer_number
-            ]
-            output = self.flash_decode(
-                sequence_len_offset=sequence_len_offset,
-                query_layer=query,
-                key_layer=key,
-                value_layer=value,
-                inference_key_memory=inference_key_memory,
-                inference_value_memory=inference_value_memory,
-                rotary_cos=rotary_pos_cos,
-                rotary_sin=rotary_pos_sin,
-                rotary_interleaved=self.config.rotary_interleaved,
-            )
-            out = output.transpose(0, 1).contiguous()
-            context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = self.linear_proj(context_layer)
-            return output, bias
-
-        if (
-            in_decode_mode
-            and self.config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-            and inference_context.is_static_batching()
-        ):
-            raise ValueError(f"CUDA graphs must use flash decode with static batching!")
-
         if split_qkv:
             query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
                 self._adjust_key_value_for_inference(
@@ -1169,9 +976,7 @@ class Attention(MegatronModule, ABC):
         # relative positional embedding (rotary embedding)
         # ================================================
         nvtx_range_push(suffix="rotary_pos_emb")
-        if rotary_pos_emb is not None and (
-            not self.config.flash_decode or inference_context is None
-        ):
+        if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -1189,7 +994,7 @@ class Attention(MegatronModule, ABC):
             if split_qkv:
                 if q_pos_emb is not None:
                     # TODO VIJAY: simplify
-                    if inference_context is None or inference_context.is_static_batching():
+                    if inference_context is None:
                         query = apply_rotary_pos_emb(
                             query,
                             q_pos_emb,
@@ -1238,8 +1043,8 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
         else:
-            if inference_context is None or inference_context.is_static_batching():
-                # Static batching attention kernel.
+            if inference_context is None:
+                # Standard attention kernel (training / no inference context).
                 with off_interface(
                     self.offload_core_attention and self.training, query, "core_attn"
                 ) as query:

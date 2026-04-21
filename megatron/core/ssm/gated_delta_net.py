@@ -37,7 +37,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -262,8 +262,6 @@ class GatedDeltaNet(MegatronModule):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ):
         """
@@ -284,17 +282,10 @@ class GatedDeltaNet(MegatronModule):
         """
         # TODO: Deal with attention_mask
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * self.cp_size
 
         if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()
-            ), "GDN does not currently support dynamic inference batching."
-            assert not self.config.sequence_parallel
-            # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
         if packed_seq_params is not None:

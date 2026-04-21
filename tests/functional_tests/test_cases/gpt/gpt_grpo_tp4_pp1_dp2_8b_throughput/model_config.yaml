@@ -9,9 +9,9 @@ TEST_TYPE: frozen-start
 MODE: rl
 MODEL_ARGS:
   --tensor-model-parallel-size: 4
-  --inference-dynamic-batching-num-cuda-graphs: 1
-  --inference-dynamic-batching-unified-memory-level: 1
-  --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-num-cuda-graphs: 1
+  --inference-unified-memory-level: 1
+  --inference-buffer-size-gb: 20
   --ckpt-format: torch_dist
   --seq-length: 1024
   --inference-max-seq-length: 1024

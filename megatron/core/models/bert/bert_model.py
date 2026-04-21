@@ -25,7 +25,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer
-from megatron.core.utils import deprecate_inference_params, is_te_min_version
+from megatron.core.utils import is_te_min_version
 
 
 class BertModel(LanguageModule):
@@ -301,8 +301,6 @@ class BertModel(LanguageModule):
         tokentype_ids: Tensor = None,
         lm_labels: Tensor = None,
         inference_context=None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """Forward function of BERT model
 
@@ -312,8 +310,6 @@ class BertModel(LanguageModule):
 
         It either returns the Loss values if labels are given  or the final hidden units
         """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
 

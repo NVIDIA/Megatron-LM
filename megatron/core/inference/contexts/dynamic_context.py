@@ -280,7 +280,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
-            ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
+            ), "Flash MLA requires a block size of 64. Set --inference-block-size 64 to fix this assert"
 
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
@@ -1005,10 +1005,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_rounder = math.ceil(cls.REQUEST_ROUNDER / tp_size) * tp_size
 
         return request_rounder * int(math.ceil(int(value) / request_rounder))
-
-    def is_static_batching(self) -> bool:
-        """Is static batching? False."""
-        return False
 
     def is_decode_only(self) -> bool:
         """

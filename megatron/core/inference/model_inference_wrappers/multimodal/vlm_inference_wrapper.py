@@ -8,7 +8,6 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -74,9 +73,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         total_num_tiles = torch.sum(num_tiles).item()
         num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
 
-        batch_size, max_sequence_length = prompts_tokens.shape
-        self.inference_context = StaticInferenceContext(
-            batch_size, max_sequence_length + num_img_embeddings
+        raise NotImplementedError(
+            "VLM inference via VLMInferenceWrapper requires migration to "
+            "DynamicInferenceContext. Use the dynamic inference engine path instead."
         )
 
         inference_input["images"] = images

@@ -161,21 +161,6 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_ids == -1)
 
     @pytest.mark.internal
-    def test_is_static_batching(self):
-
-        dynamic_context = self._get_dynamic_context(
-            params_dtype=torch.float32,
-            num_layers=2,
-            kv_channels=64,
-            num_attention_heads=8,
-            max_sequence_length=512,
-            buffer_size_gb=1.0,
-            block_size_tokens=128,
-            max_tokens=None,
-        )
-        assert not dynamic_context.is_static_batching()
-
-    @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_is_memory_available(self, is_hybrid_model):

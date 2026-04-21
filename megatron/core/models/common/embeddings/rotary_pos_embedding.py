@@ -25,7 +25,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
-from megatron.core.utils import deprecate_inference_params, internal_api
+from megatron.core.utils import internal_api
 
 logger = logging.getLogger(__name__)
 
@@ -216,8 +216,6 @@ class RotaryEmbedding(nn.Module):
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ) -> int:
         """Function to get the rotary sequence length.
 
@@ -232,8 +230,6 @@ class RotaryEmbedding(nn.Module):
         Returns:
             int: The rotary sequence length
         """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if packed_seq_params is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived

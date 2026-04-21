@@ -10,7 +10,6 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.utils import deprecate_inference_params
 from megatron.training import get_args
 
 from .enums import AttnMaskType, LayerType
@@ -482,11 +481,7 @@ class TransformerLanguageModel(MegatronModule):
         pooling_sequence_index=0,
         enc_hidden_states=None,
         output_enc_hidden=False,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ):
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Encoder embedding.
         if self.pre_process:

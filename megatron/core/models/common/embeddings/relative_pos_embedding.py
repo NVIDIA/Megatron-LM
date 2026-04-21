@@ -10,7 +10,7 @@ from torch import Tensor, nn
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params, nvtx_decorator
+from megatron.core.utils import nvtx_decorator
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +140,6 @@ class RelativePositionEmbedding(nn.Module):
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ) -> float:
         """Function to get the rotary sequence length.
 
@@ -155,8 +153,6 @@ class RelativePositionEmbedding(nn.Module):
         Returns:
             float: The rotary sequence length
         """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context is not None:
             relative_seq_len = inference_context.max_sequence_length

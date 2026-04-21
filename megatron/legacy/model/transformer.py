@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from megatron import core
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.core.utils import deprecate_inference_params
 from megatron.legacy.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
@@ -656,10 +655,8 @@ class ParallelAttention(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_context=None,
-                rotary_pos_emb=None, *, inference_params=None):
+                rotary_pos_emb=None):
         # hidden_states: [sq, b, h]
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =================================================
         # Pre-allocate memory for key-values for inference.
@@ -963,11 +960,7 @@ class ParallelTransformerLayer(MegatronModule):
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_context=None,
-                rotary_pos_emb=None,
-                *,
-                inference_params=None):
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+                rotary_pos_emb=None):
 
         # hidden_states: [s, b, h]
 
@@ -1095,7 +1088,7 @@ class NoopTransformerLayer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                inference_context=None, *, inference_params=None):
+                inference_context=None):
         return hidden_states.clone()
 
 
@@ -1400,12 +1393,8 @@ class ParallelTransformer(MegatronModule):
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_context=None,
-                rotary_pos_emb=None,
-                *,
-                inference_params=None):
+                rotary_pos_emb=None):
         # hidden_states: [s, b, h]
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Checks.
         if inference_context:

@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -376,33 +375,6 @@ class TestLLaVAModel:
             num_image_tiles=num_image_tiles,
         )
         assert logits.shape == torch.Size((5, max_seq_len, 8192))
-
-        # Try without labels and with inference params.
-        inference_context = StaticInferenceContext(5, max_seq_len)
-        logits, _ = self.model.forward(
-            img,
-            input_ids,
-            position_ids,
-            attention_mask,
-            labels=None,
-            loss_mask=None,
-            num_image_tiles=num_image_tiles,
-            inference_context=inference_context,
-        )
-        assert logits.shape == torch.Size((5, max_seq_len, 8192))
-
-        # Check KV cache got populated correctly.
-        kv_dict = inference_context.key_value_memory_dict
-
-        assert kv_dict["image_tokens_count"] == 577 * 7
-        for layer_no in range(1, 4):  # 3 layers in the model.
-            layer_kv = kv_dict[layer_no]
-            # Expected shape is [sequence_len, batch_size, num_heads, hidden_size_per_head]
-            assert (
-                layer_kv[0].shape
-                == layer_kv[1].shape
-                == torch.Size((max_seq_len, 5, self.language_num_attention_heads, 16))
-            )
 
     @pytest.mark.internal
     def test_forward_fsdp(self):

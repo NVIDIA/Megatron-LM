@@ -75,15 +75,15 @@ MODEL_ARGS:
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --incoming-requests-per-sec: -1 # all requests arrive up front.
   --inference-repeat-n: 8
-  --inference-dynamic-batching-buffer-size-gb: 20
-  --inference-dynamic-batching-max-requests: 16
+  --inference-buffer-size-gb: 20
+  --inference-max-requests: 16
   --inference-logging-step-interval: 1
   --moe-enable-routing-replay: true
   --prompt-file: "./tests/functional_tests/test_cases/moe/gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_zmq_suspend_resume/prompts.json"
   --suspend-resume-interval: 16
   --suspend-timeout: 4.0
   --rl-kv-cache-management-mode: recompute
-  --inference-dynamic-batching-unified-memory-level: 0
+  --inference-unified-memory-level: 0
   --no-rl-persist-cuda-graphs: true
 
 METRICS:

@@ -40,10 +40,10 @@ MODEL_ARGS:
   --temperature: 1.0
   --top_k: 1
   --return-log-probs: true
-  --inference-dynamic-batching-max-requests-override: 8 # hardcode decode padding tokens to 7 for reproducibility
-  --inference-dynamic-batching-buffer-guaranteed-fraction: 0.05
-  --inference-dynamic-batching-buffer-overflow-factor: 1.2
-  --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-max-requests-override: 8 # hardcode decode padding tokens to 7 for reproducibility
+  --inference-buffer-guaranteed-fraction: 0.05
+  --inference-buffer-overflow-factor: 1.2
+  --inference-buffer-size-gb: 20
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
   --output-path: ${INFERENCE_OUTPUT_PATH}

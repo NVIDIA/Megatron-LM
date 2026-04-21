@@ -7,7 +7,6 @@ from typing import Optional
 
 from megatron.training import get_args
 from megatron.core import tensor_parallel
-from megatron.core.utils import deprecate_inference_params
 
 from .enums import AttnMaskType
 from .language_model import parallel_lm_logits
@@ -76,9 +75,7 @@ class GPTModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, input_ids, position_ids, attention_mask,
-                labels=None, tokentype_ids=None, inference_context=None, *, inference_params=None):
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+                labels=None, tokentype_ids=None, inference_context=None):
 
         lm_output = self.language_model(
             input_ids,

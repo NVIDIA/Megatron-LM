@@ -70,8 +70,8 @@ COMMON_OPTIONS="\
     --bf16 \
     --te-rng-tracker \
     --cuda-graph-impl local \
-    --inference-dynamic-batching-num-cuda-graphs 1 \
-    --inference-dynamic-batching-buffer-size-gb 20 \
+    --inference-num-cuda-graphs 1 \
+    --inference-buffer-size-gb 20 \
     --data-parallel-random-init \
     --attention-backend flash \
     --timing-log-level 1 \

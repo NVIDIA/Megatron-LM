@@ -227,7 +227,6 @@ def _check_supported_type(meta):
 
     # Import inference contexts here to guard against circular import.
     from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-    from megatron.core.inference.contexts.static_context import StaticInferenceContext
 
     _SUPPORTED_TYPES = {
         torch.Tensor,
@@ -237,7 +236,6 @@ def _check_supported_type(meta):
         str,
         float,
         dataclass,
-        StaticInferenceContext,
         DynamicInferenceContext,
         ArgMetadata,
     }
@@ -1503,14 +1501,8 @@ class CudaGraphManager(torch.nn.Module):
         if reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
             if is_inference_mode:
-                is_static_batching = kwargs['inference_context'].is_static_batching()
-                if is_static_batching:
-                    batch_size = kwargs['hidden_states'].shape[0]
-                    is_decode_only = kwargs["inference_context"].is_decode_only()
-                    runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
-                else:
-                    padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
-                    runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
+                padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
+                runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 # If autograd is currently disabled, it doesnt matter if a runner was created
@@ -1547,12 +1539,7 @@ class CudaGraphManager(torch.nn.Module):
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
                         # Cache the newly created runner in the inference lookup table.
-                        if is_static_batching:
-                            self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
-                                runner
-                            )
-                        else:
-                            self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
+                        self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:

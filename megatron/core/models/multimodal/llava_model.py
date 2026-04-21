@@ -22,7 +22,7 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -445,8 +445,6 @@ class LLaVAModel(MegatronModule):
         inference_context,
         image_token_index,
         num_image_tiles,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """Preprocess input data before input to language model.
 
@@ -484,8 +482,6 @@ class LLaVAModel(MegatronModule):
             final_labels (torch.Tensor): labels for image and text positions [b, combined_seq_len].
             final_loss_mask (torch.Tensor): loss mask [b, combined_seq_len].
         """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         assert self.add_decoder, "input text preprocessing is only needed for the language model"
 
@@ -809,8 +805,6 @@ class LLaVAModel(MegatronModule):
         image_token_index: Optional[int] = None,
         runtime_gather_output: Optional[bool] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
 
@@ -840,8 +834,6 @@ class LLaVAModel(MegatronModule):
                 otherwise logits of shape [b, s, vocab_size].
             loss_mask (torch.Tensor): Loss mask expanded to combined sequence length. Shape [b, s].
         """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         use_inference_kv_cache = (
             inference_context is not None

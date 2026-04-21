@@ -36,7 +36,7 @@ from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import deprecate_inference_params, get_pg_size
+from megatron.core.utils import get_pg_size
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -342,8 +342,6 @@ class AbsorbedMLASelfAttention(Attention):
         key_value_states=None,
         packed_seq_params=None,
         inference_context=None,
-        *,
-        inference_params=None,
     ):
         """
         Derives absorbed q, compressed q, and compressed kv tensors from `hidden_states`.
@@ -357,8 +355,6 @@ class AbsorbedMLASelfAttention(Attention):
                 packed_seq_params.local_cp_size is None
             ), "dynamic context parallel is not supported with MLA yet and is planned for future. \
             Please disable dynamic context parallel."
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -562,10 +558,11 @@ class AbsorbedMLASelfAttention(Attention):
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
                 elif packed_seq_params is None or self.config.context_parallel_size == 1:
-                    # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided. This makes sure we can run forward directly with
-                    # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length, except for sequence packing + CP.
+                    # Shorten rotary_pos_emb to the sequence length when
+                    # inference_context is not provided. This makes sure we can run
+                    # forward directly with any sequence length. During training, the
+                    # sequence length is always the full rotary_pos_emb length, except
+                    # for sequence packing + CP.
                     # When sequence packing and context parallel are both enabled, the
                     # position embedding will not split rotary_pos_emb, so it may exceed
                     # the sequence length on this CP rank, but we need the full rotary_pos_emb
@@ -702,8 +699,6 @@ class AbsorbedMLASelfAttention(Attention):
         attention_bias=None,
         packed_seq_params=None,
         sequence_len_offset=None,
-        *,
-        inference_params=None,
     ):
         """Forward pass for multi-latent attention with matrix absorption"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
@@ -715,9 +710,7 @@ class AbsorbedMLASelfAttention(Attention):
         assert not (
             self.training and self.cache_mla_latents
         ), "cache_mla_latents conflicts with training."
-        assert (
-            inference_context is None and inference_params is None
-        ), "Inference is not supported for AbsorbedMLA"
+        assert inference_context is None, "Inference is not supported for AbsorbedMLA"
 
         # =====================
         # Query, Key, and Value

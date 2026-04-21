@@ -23,7 +23,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import deprecate_inference_params
 
 
 class LayerNormBuilder(Protocol):
@@ -109,8 +108,6 @@ class MambaLayer(GraphableMegatronModule):
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
@@ -130,8 +127,6 @@ class MambaLayer(GraphableMegatronModule):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
         if self.config.fp32_residual_connection:
@@ -205,8 +200,5 @@ class MambaLayer(GraphableMegatronModule):
             and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
         ):
             context = kwargs['inference_context']
-            using_cuda_graph = (context.is_static_batching() and context.is_decode_only()) or (
-                not context.is_static_batching() and context.using_cuda_graph_this_step()
-            )
-            return using_cuda_graph
+            return context.using_cuda_graph_this_step()
         return False

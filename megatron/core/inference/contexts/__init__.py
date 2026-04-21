@@ -4,7 +4,6 @@ import warnings
 
 from .base_context import BaseInferenceContext
 from .kv_block_allocator import KVBlockAllocator
-from .static_context import StaticInferenceContext
 
 warnings.warn(
     "The following imports from `dynamic_context.py` will be removed "

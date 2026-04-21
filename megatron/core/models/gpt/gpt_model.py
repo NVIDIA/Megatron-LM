@@ -35,7 +35,6 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     WrappedTensor,
-    deprecate_inference_params,
     is_using_quantization_scales,
 )
 
@@ -344,9 +343,7 @@ class GPTModel(LanguageModule):
                 and inference_context.use_flashinfer_fused_rope
             )
             if in_inference_mode and (self.config.flash_decode or use_flash_infer_fused_rope):
-                assert (
-                    not self.config.flash_decode
-                ) or inference_context.is_static_batching(), (
+                assert not self.config.flash_decode, (
                     "Flash decode is only applicable to static batching."
                 )
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -404,32 +401,12 @@ class GPTModel(LanguageModule):
                     "MultimodalRotaryEmbedding yet."
                 )
 
-        if (
-            in_inference_mode
-            and (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
-            and inference_context.is_static_batching()
-        ):
-            current_batch_size = input_ids.shape[0]
-            sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * current_batch_size,
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
-        else:
-            sequence_len_offset = None
+        sequence_len_offset = None
 
         if in_inference_mode:
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
-            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
-                self.config
-            ):
+            if is_using_quantization_scales(self.config):
                 decoder_input[inference_context.padding_slice] = 0.0
 
             # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
@@ -486,7 +463,6 @@ class GPTModel(LanguageModule):
         extra_block_kwargs: dict = None,
         runtime_gather_output: Optional[bool] = None,
         *,
-        inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         is_spec_decode: Optional[bool] = None,
@@ -509,8 +485,6 @@ class GPTModel(LanguageModule):
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         preproc_output = self._preprocess(
             input_ids=input_ids,
@@ -559,7 +533,6 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
-            inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
             runtime_gather_output=runtime_gather_output,
@@ -581,7 +554,6 @@ class GPTModel(LanguageModule):
         loss_mask=None,
         decoder_input=None,
         attention_mask=None,
-        inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
         runtime_gather_output=None,
@@ -603,9 +575,7 @@ class GPTModel(LanguageModule):
         # tokens rather than stale speculative tokens from the previous step.
         if is_spec_decode is None:
             is_spec_decode = (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
+                in_inference_mode and inference_context.num_speculative_tokens > 0
             )
 
         # logits and loss
@@ -618,7 +588,7 @@ class GPTModel(LanguageModule):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                inference_params=None,  # MTP layers don't use KV cache
+                inference_context=None,  # MTP layers don't use KV cache
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
@@ -656,23 +626,20 @@ class GPTModel(LanguageModule):
         sequence_parallel_override = False
 
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
+            if self.output_layer.sequence_parallel:
+                # Perform the sequence parallel gather here instead of after the output layer
+                # because we need to slice the last token logits from the full view of the
+                # packed logits across all requests.
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=self.pg_collection.tp
+                )
+                self.output_layer.sequence_parallel = False
+                sequence_parallel_override = True
 
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S’, B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+            # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+            # then back to [S’, B, H] for the output layer.
+            reshaped = hidden_states.squeeze(1).unsqueeze(0)
+            hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
@@ -685,7 +652,6 @@ class GPTModel(LanguageModule):
         if sequence_parallel_override:
             assert (
                 in_inference_mode
-                and inference_context.is_dynamic_batching()
                 and inference_context.config.materialize_only_last_token_logits
             )
             self.output_layer.sequence_parallel = True
@@ -721,7 +687,6 @@ class GPTModel(LanguageModule):
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
         runtime_gather_output: Optional[bool] = None,
-        inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
     ):
@@ -746,8 +711,6 @@ class GPTModel(LanguageModule):
                 Additional keyword arguments for blocks. Defaults to None.
             runtime_gather_output (Optional[bool], optional):
                 Whether to gather output at runtime. Defaults to None.
-            inference_params (InferenceParams, optional):
-                Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
             padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
 

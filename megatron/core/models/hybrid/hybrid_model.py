@@ -28,7 +28,6 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
-    deprecate_inference_params,
     is_using_quantization_scales,
     log_single_rank,
 )
@@ -330,7 +329,6 @@ class HybridModel(LanguageModule):
         inference_context: BaseInferenceContext = None,
         runtime_gather_output: Optional[bool] = None,
         *,
-        inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
@@ -348,8 +346,6 @@ class HybridModel(LanguageModule):
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
         in_inference_mode = inference_context is not None and not self.training
 
         if in_inference_mode:
@@ -365,7 +361,6 @@ class HybridModel(LanguageModule):
             # quantization scales to avoid corrupting amax calculations
             if (
                 in_inference_mode
-                and inference_context.is_dynamic_batching()
                 and is_using_quantization_scales(self.config)
             ):
                 decoder_input[inference_context.padding_slice] = 0.0
@@ -420,7 +415,6 @@ class HybridModel(LanguageModule):
         if is_spec_decode is None:
             is_spec_decode = (
                 in_inference_mode
-                and inference_context.is_dynamic_batching()
                 and inference_context.num_speculative_tokens > 0
             )
 
@@ -431,7 +425,7 @@ class HybridModel(LanguageModule):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                inference_params=inference_params,
+                inference_context=None,  # MTP layers don't use KV cache
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 embedding=self.embedding,
@@ -461,23 +455,20 @@ class HybridModel(LanguageModule):
                 )
         sequence_parallel_override = False
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
+            if self.output_layer.sequence_parallel:
+                # Perform the sequence parallel gather here instead of after the output layer
+                # because we need to slice the last token logits from the full view of the
+                # packed logits across all requests.
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=self.pg_collection.tp
+                )
+                self.output_layer.sequence_parallel = False
+                sequence_parallel_override = True
 
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S', B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+            # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+            # then back to [S', B, H] for the output layer.
+            reshaped = hidden_states.squeeze(1).unsqueeze(0)
+            hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
@@ -488,7 +479,6 @@ class HybridModel(LanguageModule):
         if sequence_parallel_override:
             assert (
                 in_inference_mode
-                and inference_context.is_dynamic_batching()
                 and inference_context.config.materialize_only_last_token_logits
             )
             self.output_layer.sequence_parallel = True

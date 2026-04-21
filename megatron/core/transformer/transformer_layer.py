@@ -27,7 +27,6 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
-    deprecate_inference_params,
     get_pg_rank,
     is_te_min_version,
     log_single_rank,
@@ -540,8 +539,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        *,
-        inference_params: Optional[Any] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -573,8 +570,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -1264,18 +1259,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
-                (kwargs.get('inference_context') is not None)
-                or (kwargs.get('inference_params') is not None)
+                kwargs.get('inference_context') is not None
             )
             and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
         ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
-            else:
-                # it can happen that non-decode steps have a token count greater than the max
-                # supported cuda graph token count. In that case this flag will be set to
-                # False by initialize_attention, and we should not use cuda graphs.
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            # it can happen that non-decode steps have a token count greater than the max
+            # supported cuda graph token count. In that case this flag will be set to
+            # False by initialize_attention, and we should not use cuda graphs.
+            using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
             if using_cuda_graph:
                 return True
         return False

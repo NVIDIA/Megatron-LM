@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.inference.contexts.base_context import BaseInferenceContext
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -939,7 +940,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_cos: Optional[torch.Tensor] = None,
         rotary_pos_sin: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -974,7 +975,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         rotary_pos_emb=rotary_pos_emb,
-                        inference_context=inference_params,
+                        inference_context=inference_context,
                         packed_seq_params=packed_seq_params,
                     )
                 else:
@@ -988,7 +989,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_cos=rotary_pos_cos,
                         rotary_pos_sin=rotary_pos_sin,
                         attention_bias=attention_bias,
-                        inference_params=inference_params,
+                        inference_context=inference_context,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
                     )
@@ -1021,7 +1022,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
-        inference_params=None,
+        inference_context=None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
     ) -> Tensor:
@@ -1052,7 +1053,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
-            inference_params=inference_params,
+            inference_context=inference_context,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
@@ -1108,7 +1109,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
@@ -1156,7 +1157,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
-                inference_params=inference_params,
+                inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
@@ -1171,7 +1172,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
                 attention_bias=attention_bias,
-                inference_params=inference_params,
+                inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
@@ -1429,7 +1430,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
@@ -1458,7 +1459,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                inference_params=inference_params,
+                inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,

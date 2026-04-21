@@ -11,7 +11,6 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
-from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
@@ -153,43 +152,6 @@ class TestHybridModel:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == model.vocab_size
-
-    def test_inference(self):
-        micro_batch_size = 2
-        inference_context: BaseInferenceContext = StaticInferenceContext(
-            max_batch_size=micro_batch_size, max_sequence_length=self.model.max_sequence_length
-        )
-        prompt_length = self.model.max_sequence_length - 1
-
-        self.model.cuda()
-
-        # load-context/first-output-token, step/generate
-        for offset in (0, prompt_length):
-            if offset == 0:
-                sequence_length = prompt_length
-            else:
-                sequence_length = 1
-            inference_context.sequence_len_offset = offset
-
-            data = list(range(sequence_length))
-            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-            position_ids = (
-                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-            )
-            attention_mask = torch.ones(
-                (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-            ).cuda()
-
-            logits = self.model.forward(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-            )
-
-            assert logits.shape[0] == micro_batch_size
-            assert logits.shape[1] == sequence_length
-            assert logits.shape[2] == self.model.vocab_size
 
     def test_save_load(self, tmp_path):
         path = tmp_path / "model.pt"

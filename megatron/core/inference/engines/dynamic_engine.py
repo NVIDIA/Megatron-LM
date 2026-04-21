@@ -1662,7 +1662,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        result = await self.controller.async_generate_output_tokens()
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -1934,7 +1934,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
-        Wrapper for controller.generate_output_tokens_dynamic_batch(), to
+        Wrapper for controller.generate_output_tokens(), to
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
 

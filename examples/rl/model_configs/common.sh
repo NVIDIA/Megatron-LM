@@ -16,14 +16,14 @@ COMMON_OPTIONS="\
     --transformer-impl transformer_engine \
     --${PRECISION:-bf16} \
     --te-rng-tracker \
-    --inference-dynamic-batching-buffer-size-gb 20 \
+    --inference-buffer-size-gb 20 \
     --data-parallel-random-init \
     --attention-backend flash \
     --timing-log-level 1 \
     --log-timers-to-tensorboard \
     --save-retain-interval 160 \
-    --inference-dynamic-batching-num-cuda-graphs 1 \
-    --inference-dynamic-batching-unified-memory-level 1 \
+    --inference-num-cuda-graphs 1 \
+    --inference-unified-memory-level 1 \
     --adam-beta1 0.9 \
     --adam-beta2 ${ADAM_BETA2:-0.95} \
     --adam-eps 1e-8 \

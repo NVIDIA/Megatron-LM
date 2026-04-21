@@ -60,8 +60,7 @@ ARGS=" \
     --use-flash-attn \
     --inference-rng-tracker \
     \
-    --inference-dynamic-batching \
-    --inference-dynamic-batching-buffer-size-gb ${BUFFER_SIZE_GB} \
+    --inference-buffer-size-gb ${BUFFER_SIZE_GB} \
     \
     ${EXTRA_ARGS} \
 "
@@ -70,7 +69,7 @@ ARGS=" \
 if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
     ARGS+=" \
         --cuda-graph-impl local \
-        --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
+        --inference-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
     "
 else
     ARGS+=" \

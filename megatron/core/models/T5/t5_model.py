@@ -21,7 +21,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params, get_tensor_model_parallel_group_if_none
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 
 class T5LMHead(MegatronModule):
@@ -288,8 +288,6 @@ class T5Model(LanguageModule):
         output_encoder_hidden_only: bool = False,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -305,8 +303,6 @@ class T5Model(LanguageModule):
         Returns:
             Tensor: loss tensor
         """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         ## Encoder forward
         if encoder_hidden_states is None:

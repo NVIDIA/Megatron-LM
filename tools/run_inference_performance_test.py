@@ -10,20 +10,13 @@ import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
+from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     InferenceRequest,
 )
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-    GPTInferenceWrapper,
-)
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine, get_model_for_inference
@@ -55,7 +48,7 @@ def add_inference_benchmarking_args(parser):
         "--num-input-tokens", type=int, default=128, help="Number of input tokens per request"
     )
     group.add_argument(
-        "--engine-type", choices=["static", "dynamic"], default="static", help="Engine type"
+        "--engine-type", choices=["dynamic"], default="dynamic", help="Engine type"
     )
     group.add_argument(
         "--benchmark-profile", action="store_true", default=False, help="If set, profile"
@@ -74,21 +67,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         AbstractBackend: The chosen backend
     """
 
-    if args.engine_type == "static":
-        tokenizer = get_tokenizer()
-        context = StaticInferenceContext(
-            args.inference_max_requests, args.inference_max_sequence_length
-        )
-        inference_wrapped_model = GPTInferenceWrapper(model, context)
-        inference_wrapped_model.model_is_pipeline_parallel = not (
-            mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
-        )
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
-        )
-        return StaticInferenceEngine(text_generation_controller=text_generation_controller)
-    elif args.engine_type == "dynamic":
-        return get_dynamic_inference_engine(model=model)
+    return get_dynamic_inference_engine(model=model)
 
 
 def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
@@ -222,16 +201,11 @@ def main():
         torch.cuda.cudart().cudaProfilerStart()
 
     start_time = time.perf_counter()
-    if args.engine_type == "static":
-        results: List[InferenceRequest] = inference_engine.generate(
-            prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
-        )
-    else:
-        prompts = [request.prompt_tokens for request in requests]
-        records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
-            prompts=prompts, sampling_params=sampling_params
-        )
-        results: List[InferenceRequest] = [record.merge() for record in records]
+    prompts = [request.prompt_tokens for request in requests]
+    records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
+        prompts=prompts, sampling_params=sampling_params
+    )
+    results: List[InferenceRequest] = [record.merge() for record in records]
 
     end_time = time.perf_counter()
     latency = end_time - start_time

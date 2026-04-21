@@ -149,9 +149,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # When num_speculative_tokens == 0 MTP is not needed at all.  In both
         # cases, running MTP here would issue MoE all-to-all collectives that the
         # real EP ranks do not execute, causing a hang.
-        is_spec_decode = (
-            self.inference_context.is_dynamic_batching() and self.config.mtp_num_layers is not None
-        )
+        is_spec_decode = self.config.mtp_num_layers is not None
         return self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
 
     def _get_batch_size_and_seq_len(
@@ -175,10 +173,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
     def _allocate_recv_buffer(self, batch_size, seq_len):
         """Receive happens between the layers with size [seq_len, batch_size, hidden_size]."""
-        if self.sequence_parallel and self.inference_context.is_dynamic_batching():
-            # For dynamic inference we need to explicitly adjust the recv buffer size here for
-            # sequence parallelism. Static batching does not support sequence parallelism
-            # except for the MoE layers which is handled separately.
+        if self.sequence_parallel:
             seq_len = seq_len // self.tp_size
         recv_size = (seq_len, batch_size, self.config.hidden_size)
         return torch.empty(
@@ -200,10 +195,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
         """
-        tokens = inference_input["tokens"]
         logits = self._forward(inference_input)
-        self.inference_context.increment_sequence_len_offset(tokens.size(1))
-
         return logits
 
     def forward_pass_with_pipeline_parallel(
@@ -240,8 +232,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
             send_to_next_pipeline_rank(
                 output_tensor.type(dtype=self.pipeline_communication_dtype), self.pp_group
             )
-
-        self.inference_context.increment_sequence_len_offset(seq_len)
 
         logits = None
         if is_pipeline_last_stage(self.pp_group):

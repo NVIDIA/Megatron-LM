@@ -16,7 +16,7 @@ try:
 except ImportError as e:
     HAS_BACKEND = False
 
-import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
+import megatron.core.inference.text_generation_server.text_gen_server.endpoints as endpoints
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
 

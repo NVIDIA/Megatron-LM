@@ -4,10 +4,8 @@ import tempfile
 
 import pytest
 import torch
-from packaging.version import Version
 
 from megatron.core import dist_checkpointing, parallel_state
-from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -23,47 +21,11 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import get_te_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch_size: int = 2):
-    inference_context: StaticInferenceContext = StaticInferenceContext(
-        max_batch_size=micro_batch_size, max_sequence_length=model.max_sequence_length
-    )
-    prompt_length = model.max_sequence_length - 1
-
-    # load-context/first-output-token, step/generate
-    for offset in (0, prompt_length):
-        if offset == 0:
-            sequence_length = prompt_length
-        else:
-            sequence_length = 1
-        inference_context.sequence_len_offset = offset
-
-        data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        attention_mask = torch.ones(
-            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
-
-        logits = model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-        )
-
-        assert logits.shape[0] == micro_batch_size
-        assert logits.shape[1] == sequence_length
-        assert logits.shape[2] == model.vocab_size
-
-
 class TestModelOptGPTModel:
-
-    _test_inference = True
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -103,13 +65,6 @@ class TestModelOptGPTModel:
             state_dict = dist_checkpointing.load(modelopt_sharded_state_dict, tmpdirname)
             self.modelopt_model.load_state_dict(state_dict)
 
-    def test_inference(self):
-        if not self._test_inference:
-            return
-        config: TransformerConfig = self.modelopt_model.config
-        model = self.modelopt_model.cuda()
-        model_forward(model, config)
-
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
@@ -119,10 +74,6 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
-
-        # Early version of TE DotProductAttention does not support
-        # q, k, v to have different shapes.
-        self._test_inference = get_te_version() > Version("1.10")
 
         transformer_config = MLATransformerConfig(
             num_layers=2,
@@ -158,10 +109,6 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
-
-        # Early version of TE DotProductAttention does not support
-        # q, k, v to have different shapes.
-        self._test_inference = get_te_version() > Version("1.10")
 
         transformer_config = TransformerConfig(
             num_layers=2,

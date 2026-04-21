@@ -42,7 +42,6 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
-    deprecate_inference_params,
     get_pg_size,
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
@@ -301,8 +300,6 @@ class MultiLatentAttention(Attention):
         packed_seq_params=None,
         position_ids=None,
         sequence_len_offset=None,
-        *,
-        inference_params=None,
     ):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
@@ -316,12 +313,10 @@ class MultiLatentAttention(Attention):
         ), "cache_mla_latents conflicts with training."
 
         # hidden_states: [sq, b, h]
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-        if inference_context and not inference_context.is_static_batching():
+        if inference_context:
             assert (
                 self.config.cache_mla_latents
-            ), "currently to use dynamic backend for MLA cache mla latents must be true"
+            ), "cache_mla_latents must be true for MLA inference"
 
         if self.config.cache_mla_latents:
             self.prepare_for_absorption()
@@ -373,7 +368,7 @@ class MultiLatentAttention(Attention):
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
             )
         else:
-            if inference_context is None or inference_context.is_static_batching():
+            if inference_context is None:
                 extra_kwargs = {}
                 if self.config.experimental_attention_variant == "dsa":
                     # For dsa we need to pass in the original hidden states and the compressed
@@ -645,8 +640,6 @@ class MLASelfAttention(MultiLatentAttention):
         position_ids=None,
         packed_seq_params=None,
         inference_context=None,
-        *,
-        inference_params=None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -661,8 +654,6 @@ class MLASelfAttention(MultiLatentAttention):
                 packed_seq_params.local_cp_size is None
             ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
             Please disable hybrid_context_parallel."
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -885,10 +876,11 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
                 elif packed_seq_params is None or self.config.context_parallel_size == 1:
-                    # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided. This makes sure we can run forward directly with
-                    # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length, except for sequence packing + CP.
+                    # Shorten rotary_pos_emb to the sequence length when
+                    # inference_context is not provided. This makes sure we can run
+                    # forward directly with any sequence length. During training, the
+                    # sequence length is always the full rotary_pos_emb length, except
+                    # for sequence packing + CP.
                     # When sequence packing and context parallel are both enabled, the
                     # position embedding will not split rotary_pos_emb, so it may exceed
                     # the sequence length on this CP rank, but we need the full rotary_pos_emb
@@ -951,9 +943,9 @@ class MLASelfAttention(MultiLatentAttention):
             )
         else:
             if self.cache_mla_latents:
-                assert (
-                    inference_context and not inference_context.is_static_batching()
-                ), "Caching MLA latents only works with dynamic backend inference"
+                assert inference_context is not None, (
+                    "Caching MLA latents requires an inference context"
+                )
                 query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )

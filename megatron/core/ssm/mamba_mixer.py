@@ -37,7 +37,6 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import (
-    deprecate_inference_params,
     is_causal_conv1d_min_version,
     is_mamba_min_version,
     is_using_quantization_scales,
@@ -407,8 +406,6 @@ class MambaMixer(MegatronModule):
         self,
         hidden_states,
         inference_context=None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
@@ -416,30 +413,19 @@ class MambaMixer(MegatronModule):
         Returns: same shape as hidden_states
         """
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
         in_inference_mode = inference_context is not None and not self.training
 
         _, batch, dim = hidden_states.shape
         conv_state, ssm_state = None, None
 
         if in_inference_mode:
-            if inference_context.is_dynamic_batching():
-                return self._dynamic_inference(hidden_states, inference_context)
-            else:
-                assert inference_context.is_static_batching()
-                assert not self.config.sequence_parallel
-                conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
-                if inference_context.seqlen_offset > 0:
-                    # The states are updated inplace
-                    out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
-                    return out, out_bias
+            return self._dynamic_inference(hidden_states, inference_context)
 
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
-        if in_inference_mode or not self.use_mem_eff_path:
+        if not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
             assert packed_seq_params is None, (
                 "Training with packed sequences is not supported "
@@ -1197,46 +1183,6 @@ class MambaMixer(MegatronModule):
         conv_states_shape = (self.conv1d.weight.shape[0], self.d_conv)
         ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
         return (conv_states_shape, ssm_states_shape)
-
-    def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
-        """Initializes or retrieves the SSM state tensors from the cache.
-
-        At the start of any inference (at the prefill step), if there is no cache or if the
-        cached batch size has changed, then new tensors are initialized and stored in the cache.
-        Otherwise the existing tensors are retrieved from the cache and zeroed out.
-        """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        assert inference_context is not None
-        assert inference_context.is_static_batching()
-        assert self.layer_number is not None
-
-        if (
-            self.layer_number not in inference_context.key_value_memory_dict
-            or batch_size != self.cached_batch_size
-        ):
-            conv_state_shape, ssm_state_shape = self.mamba_state_shapes_per_request()
-            conv_state = torch.zeros(
-                batch_size,
-                *conv_state_shape,
-                device=self.conv1d.weight.device,
-                dtype=self.conv1d.weight.dtype,
-            )
-            ssm_state = torch.zeros(
-                batch_size,
-                *ssm_state_shape,
-                device=self.in_proj.weight.device,
-                dtype=self.in_proj.weight.dtype,
-            )
-            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
-            self.cached_batch_size = batch_size
-        else:
-            conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
-            if inference_context.sequence_len_offset == 0:
-                conv_state.zero_()
-                ssm_state.zero_()
-        return conv_state, ssm_state
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

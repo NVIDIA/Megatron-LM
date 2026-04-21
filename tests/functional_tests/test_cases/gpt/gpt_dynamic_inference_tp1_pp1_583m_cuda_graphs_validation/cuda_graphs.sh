@@ -72,10 +72,9 @@ ARGS=" \
   --dist-ckpt-strictness log_unexpected \
   --inference-ckpt-non-strict \
   \
-  --inference-dynamic-batching \
-  --inference-dynamic-batching-buffer-size-gb ${BUFFER_SIZE_GB} \
-  --inference-dynamic-batching-buffer-overflow-factor ${BUFFER_OVERFLOW_FACTOR} \
-  --inference-dynamic-batching-buffer-guaranteed-fraction ${BUFFER_GUARANTEED_FRACTION} \
+  --inference-buffer-size-gb ${BUFFER_SIZE_GB} \
+  --inference-buffer-overflow-factor ${BUFFER_OVERFLOW_FACTOR} \
+  --inference-buffer-guaranteed-fraction ${BUFFER_GUARANTEED_FRACTION} \
   \
   --num-tokens-to-prompt ${NUM_TOKENS_TO_PROMPT} \
   --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
@@ -92,7 +91,7 @@ ARGS=" \
 if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
     ARGS+="  \
       --cuda-graph-impl local \
-      --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
+      --inference-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
     "
 fi
 

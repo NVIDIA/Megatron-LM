@@ -32,7 +32,6 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
-    deprecate_inference_params,
     get_pg_rank,
     make_viewless_tensor,
 )
@@ -617,16 +616,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             not self.training
             and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
-            and (
-                kwargs.get('inference_context') is not None
-                or kwargs.get('inference_params') is not None
-            )
+            and kwargs.get('inference_context') is not None
             and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
         ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
-            else:
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
 
             if using_cuda_graph:
                 return True
@@ -659,7 +652,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         padding_mask: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         *,
-        inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
     ):
         """
@@ -709,7 +701,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                   extract_layer_indices.
         """
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager

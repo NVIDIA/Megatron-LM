@@ -60,9 +60,9 @@ MODEL_OPTIONS="\
   --no-rl-use-sequence-packing \
   --rl-partial-rollouts \
   --moe-pad-experts-for-cuda-graph-inference \
-  --inference-dynamic-batching-max-tokens 8192 \
-  --inference-dynamic-batching-max-requests 128 \
-  --inference-dynamic-batching-num-cuda-graphs 2 \
+  --inference-max-tokens 8192 \
+  --inference-max-requests 128 \
+  --inference-num-cuda-graphs 2 \
   --decode-only-cuda-graphs \
   --cuda-graph-impl local \
   --cuda-graph-scope full \

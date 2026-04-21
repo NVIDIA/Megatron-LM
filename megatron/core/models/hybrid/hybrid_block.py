@@ -29,7 +29,7 @@ from megatron.core.transformer.module import GraphableMegatronModule, MegatronMo
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
 
 @dataclass
@@ -214,16 +214,10 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             not self.training
             and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
-            and (
-                kwargs.get('inference_context') is not None
-                or kwargs.get('inference_params') is not None
-            )
+            and kwargs.get('inference_context') is not None
             and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
         ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
-            else:
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
 
             if using_cuda_graph:
                 return True
@@ -245,8 +239,6 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         attention_mask: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
     ):
@@ -268,8 +260,6 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             Tensor: the output tensor.
         """
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
@@ -278,33 +268,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if inference_context and inference_context.is_static_batching():
-            # NOTE(bnorick): match BaseInferenceContext attributes for
-            # mamba_ssm.utils.generation.BaseInferenceContext,
-            # this hack supports eval
-            inference_context.max_seqlen = inference_context.max_sequence_length
-            inference_context.seqlen_offset = inference_context.sequence_len_offset
-
-        if (
-            (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
-            and inference_context
-            and inference_context.is_static_batching()
-            and not self.training
-        ):
-            current_batch_size = hidden_states.shape[1]
-            sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * current_batch_size,
-                dtype=torch.int32,
-                device='cuda',
-            )
-        else:
-            sequence_len_offset = None
+        sequence_len_offset = None
 
         # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
         # otherwise do nothing extra at the outer level

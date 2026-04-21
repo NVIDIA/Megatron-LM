@@ -281,7 +281,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")
     model_max_seq_len = get_attr_wrapped_model(model, "max_sequence_length")
     inf_max_seq_len = args.inference_max_seq_length
-    max_batch_size = args.inference_dynamic_batching_max_requests
+    max_batch_size = args.inference_max_requests
 
     if position_embedding_type == "learned_absolute":
         # When using absolute position embeddings, it is critical that the
@@ -296,7 +296,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         assert max_batch_size is None or max_batch_size <= model_max_seq_len
     else:
         max_sequence_length = inf_max_seq_len
-    if args.inference_dynamic_batching_max_requests is not None:
+    if args.inference_max_requests is not None:
         max_sequence_length = max(max_sequence_length, max_batch_size)
 
     mamba_inference_state_config = MambaInferenceStateConfig.from_model(
@@ -329,20 +329,20 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 
     return InferenceConfig(
         verbose=True,
-        block_size_tokens=args.inference_dynamic_batching_block_size,
-        buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-        paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
-        mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
+        block_size_tokens=args.inference_block_size,
+        buffer_size_gb=args.inference_buffer_size_gb,
+        paused_buffer_size_gb=args.inference_paused_buffer_size_gb,
+        mamba_memory_ratio=args.inference_mamba_memory_ratio,
         num_cuda_graphs=(
-            args.inference_dynamic_batching_num_cuda_graphs
+            args.inference_num_cuda_graphs
             if args.cuda_graph_impl == "local"
             else None
         ),
-        max_requests=args.inference_dynamic_batching_max_requests,
-        max_tokens=args.inference_dynamic_batching_max_tokens,
-        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        max_requests=args.inference_max_requests,
+        max_tokens=args.inference_max_tokens,
+        unified_memory_level=args.inference_unified_memory_level,
         kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
-        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
+        cuda_graph_mixed_prefill_count=args.inference_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
@@ -350,14 +350,14 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         pg_collection=pg_collection,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         materialize_only_last_token_logits=(not args.return_log_probs),
-        track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
-        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
+        track_generated_token_events=args.inference_track_generated_token_events,
+        track_paused_request_events=args.inference_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
-        enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
-        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
-        prefix_caching_routing_alpha=getattr(args, 'inference_dynamic_batching_prefix_caching_routing_alpha', 0.5),
-        prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
+        enable_prefix_caching=args.inference_enable_prefix_caching,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_prefix_caching_eviction_policy),
+        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_prefix_caching_coordinator_policy),
+        prefix_caching_routing_alpha=getattr(args, 'inference_prefix_caching_routing_alpha', 0.5),
+        prefix_caching_mamba_gb=getattr(args, 'inference_prefix_caching_mamba_gb', None),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
         num_speculative_tokens=args.num_speculative_tokens,
