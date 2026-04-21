@@ -406,6 +406,11 @@ class TestDynamicInferenceEngine:
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                normalization=(
+                    "RMSNorm"
+                    if test_config.transformer_impl == "inference_optimized"
+                    else "LayerNorm"
+                ),
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
