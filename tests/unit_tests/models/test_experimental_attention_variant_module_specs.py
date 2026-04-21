@@ -324,11 +324,13 @@ class TestGetDsaModuleSpec:
             get_dsa_module_spec_for_backend(cfg, backend=_make_backend())
 
     def test_returns_mla_self_attention_spec(self):
-        """Verify the returned attention module is MLA self-attention with causal mask."""
-        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+        """Verify the returned attention module is AbsorbedMLA self-attention with causal mask."""
+        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+            AbsorbedMLASelfAttention,
+        )
 
         spec = self._call()
-        assert spec.module is MLASelfAttention
+        assert spec.module is AbsorbedMLASelfAttention
         assert spec.params == {"attn_mask_type": AttnMaskType.causal}
         assert spec.metainfo == {"fuse_input_layernorm": False}
 
@@ -396,10 +398,12 @@ class TestGetDsaModuleSpec:
         assert subs.linear_q_down_proj == _FakeLinear
         assert subs.linear_q_up_proj == _FakeColumnParallelLinear
         assert subs.linear_kv_down_proj == _FakeLinear
-        assert subs.linear_kv_up_proj == _FakeColumnParallelLinear
+        assert subs.linear_k_up_proj == _FakeColumnParallelLinear
+        assert subs.linear_v_up_proj == _FakeColumnParallelLinear
         assert subs.linear_proj == _FakeRowParallelLinear
-        # column_parallel_linear() is called exactly 3 times (q_proj, q_up_proj, kv_up_proj)
-        assert backend.column_parallel_linear.call_count == 3
+        # column_parallel_linear() is called exactly 4 times
+        # (q_proj, q_up_proj, k_up_proj, v_up_proj)
+        assert backend.column_parallel_linear.call_count == 4
         assert backend.row_parallel_linear.call_count == 1
 
 
