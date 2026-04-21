@@ -2363,7 +2363,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -2486,7 +2486,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2570,7 +2570,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2655,7 +2655,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -3009,7 +3009,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3222,7 +3222,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3342,7 +3342,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3472,7 +3472,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3821,7 +3821,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
             logits = torch.zeros(
