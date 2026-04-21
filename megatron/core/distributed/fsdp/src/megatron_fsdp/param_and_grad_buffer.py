@@ -652,7 +652,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     def __init__(
         self,
         name: str,
-        fsdp_double_buffer_units: List[int],
+        double_buffer_units: List[int],
         bucket_to_unit: List[int],
         size: int = 2,
         fallback_to_persistent_buffer: bool = False,
@@ -660,7 +660,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.name = name
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
         self.allocation_tracker = {}  # tracking the global buffer allocation status
-        self.fsdp_double_buffer_units = fsdp_double_buffer_units
+        self.double_buffer_units = double_buffer_units
         self.bucket_to_unit = bucket_to_unit
 
         # Build unit_to_buckets (unit id -> list of bucket ids) and bucket_to_offset
@@ -678,11 +678,11 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         # --- Fixed Pool Buffering Check ---
         # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
         # If not, the allocator cannot provide its intended memory recycling benefits.
-        assert len(fsdp_double_buffer_units) > 0, "Found no FSDP units to use fixed-size buffering"
+        assert len(double_buffer_units) > 0, "Found no FSDP units to use fixed-size buffering"
 
         if torch.distributed.get_rank() == 0:
             for bucket_id, unit_id in enumerate(bucket_to_unit):
-                if unit_id == -1 or unit_id not in fsdp_double_buffer_units:
+                if unit_id == -1 or unit_id not in double_buffer_units:
                     logging.info(f"FSDP unit (id={unit_id}) does not fit in FixedPoolAllcator")
                     if fallback_to_persistent_buffer is False:
                         logging.info(
@@ -702,7 +702,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.using_buffer = {}  # Map from bucket_id to (buf_group_id, offset) in use.
 
         # Populate the idle buffer pool with all buffer group and bucket offset combinations.
-        num_bucket = len(unit_to_buckets[self.fsdp_double_buffer_units[0]])
+        num_bucket = len(unit_to_buckets[self.double_buffer_units[0]])
         for buf_group_id in range(self.size):  # Iterate over each buffer group in the pool.
             for offset in range(num_bucket):
                 self.idle_buffer.append((buf_group_id, offset))
@@ -758,7 +758,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         allocate a temporary bucket.
         """
         fsdp_unit_id = self.bucket_to_unit[bucket_id]
-        if fsdp_unit_id in self.fsdp_double_buffer_units:
+        if fsdp_unit_id in self.double_buffer_units:
             # Try to allocate from the buffer pool.
             bucket_offset = self.bucket_to_offset[bucket_id]
             buffer_name = None
@@ -817,7 +817,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         free a temporary bucket.
         """
         fsdp_unit_id = self.bucket_to_unit[bucket_id]
-        if fsdp_unit_id in self.fsdp_double_buffer_units:
+        if fsdp_unit_id in self.double_buffer_units:
             if bucket_id not in self.using_buffer:
                 # This bucket is not allocated by fixed pool allocator.
                 return
@@ -2130,7 +2130,7 @@ class ParamAndGradBuffer:
             )
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             UB_BUFFER_NUM = 2
-            fsdp_double_buffer_units = FixedPoolAllocator.compute_double_buffer_units(
+            double_buffer_units = FixedPoolAllocator.compute_double_buffer_units(
                 self.parameter_groups
             )
             bucket_to_unit = [
@@ -2139,20 +2139,20 @@ class ParamAndGradBuffer:
             ]
             self.weight_alloc = FixedPoolAllocator(
                 name="fsdp_params",
-                fsdp_double_buffer_units=fsdp_double_buffer_units,
+                double_buffer_units=double_buffer_units,
                 bucket_to_unit=bucket_to_unit,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
                 name="fsdp_fp8_transpose_params",
-                fsdp_double_buffer_units=fsdp_double_buffer_units,
+                double_buffer_units=double_buffer_units,
                 bucket_to_unit=bucket_to_unit,
                 size=UB_BUFFER_NUM,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads",
-                fsdp_double_buffer_units=fsdp_double_buffer_units,
+                double_buffer_units=double_buffer_units,
                 bucket_to_unit=bucket_to_unit,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=(
@@ -2166,14 +2166,14 @@ class ParamAndGradBuffer:
                 # Otherwise, this allocator will never be used.
                 self.hsdp_grad_comm_alloc = FixedPoolAllocator(
                     name="hsdp_grad_comm",
-                    fsdp_double_buffer_units=fsdp_double_buffer_units,
+                    double_buffer_units=double_buffer_units,
                     bucket_to_unit=bucket_to_unit,
                     size=UB_BUFFER_NUM,
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
                 )
-            self.double_buf_units = fsdp_double_buffer_units
+            self.double_buf_units = double_buffer_units
         else:
             self.weight_alloc = StorageResizeBasedBucketAllocator()
             self.transpose_weight_alloc = StorageResizeBasedBucketAllocator()
