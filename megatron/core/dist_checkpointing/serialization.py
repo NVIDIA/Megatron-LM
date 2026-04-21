@@ -109,7 +109,13 @@ def load(
     #      params with a high-precision state dict;
     #   2. When using delayed scaling, this loading process writes an extra value into the global
     #      amax_history buffer of Transformer Engine, which is undesirable.
-    force_all_tensors_to_non_fp8(sharded_state_dict)
+    #
+    # When the sharded strategy supports per-tensor streaming dequantize
+    # (``stream_fp8_dequant``), both concerns are handled inside the LoadPlanner
+    # on a per-tensor basis, which avoids peaking GPU memory with N
+    # simultaneous high-precision scratch tensors before the load begins.
+    if not getattr(sharded_strategy, "stream_fp8_dequant", False):
+        force_all_tensors_to_non_fp8(sharded_state_dict)
 
     common_state_dict = load_common(checkpoint_dir)
 

@@ -492,12 +492,17 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         *args,
         shapes_validation_sharded_tensors: Iterable[ShardedTensor] = (),
         allow_shape_mismatch_sharded_tensors: Optional[Dict[str, ShardedTensor]] = None,
+        stream_fp8_dequant: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.shapes_validation_sharded_tensors = shapes_validation_sharded_tensors
         self.allow_shape_mismatch_sharded_tensors = allow_shape_mismatch_sharded_tensors
-        self._intermediate_read_item_and_target: Optional[Tuple[ReadItem, torch.Tensor]] = None
+        self.stream_fp8_dequant = stream_fp8_dequant
+        # Maps id(read_item) -> (read_item, target_tensor, amax_snapshot_or_None, kind)
+        # kind is "stream" for the streaming FP8 dequant path and "noncontig" for the
+        # existing contiguity-fix path.
+        self._intermediate_read_items: Dict[int, Tuple[ReadItem, torch.Tensor, Optional[torch.Tensor], str]] = {}
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -553,35 +558,85 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     def resolve_tensor(self, read_item: ReadItem):
         """Override to add FP8 support.
 
-        Narrowing the Float8Tensor can create incontiguous tensors and there are
-        no `copy` kernels for such cases. This method creates a contiguous FP8
-        tensors so that the subsequent `copy_` in FileSystemReader succeeds.
-        Note that this requires tracking the original tensor
-        (as `self._intermediate_read_item_and_target` attribute)
-        and restoring it in `commit_tensor` method.
+        Two paths are handled here:
+
+        1. Streaming FP8 dequantize (when ``stream_fp8_dequant`` is True and the
+           destination is a TE ``QuantizedTensor``). We allocate a per-tensor
+           high-precision scratch buffer, return it as the load destination, and
+           quantize-copy it back into the original tensor in ``commit_tensor``.
+           This replaces the upfront bulk dequantize done by
+           ``force_all_tensors_to_non_fp8`` and keeps at most one scratch tensor
+           live at a time.
+
+        2. Non-contiguous Float8 fix: narrowing a Float8Tensor can produce a
+           non-contiguous view for which no ``copy_`` kernel exists. We fall
+           back to a contiguous Float8 clone and copy it back in
+           ``commit_tensor``.
+
+        Both cases stash state in ``self._intermediate_read_items``, keyed by
+        ``id(read_item)``, so ``commit_tensor`` can undo them.
         """
         target_tensor = super().resolve_tensor(read_item)
+
+        # Lazy import to avoid circular imports (fp8_utils pulls in core.tensor_parallel).
+        from ...fp8_utils import is_float8tensor as _is_quantized_tensor
+
+        if (
+            self.stream_fp8_dequant
+            and HAVE_TE
+            and _is_quantized_tensor(target_tensor)
+            and target_tensor.is_cuda
+        ):
+            # Snapshot amax for delayed-scaling quantizers so the subsequent
+            # BF16->FP8 quantize-copy does not pollute amax_history. For
+            # current-scaling / MXFP8 / blockwise quantizers, amax is None or
+            # absent and the snapshot is a no-op.
+            amax_snapshot: Optional[torch.Tensor] = None
+            quantizer = getattr(target_tensor, "_quantizer", None)
+            amax = getattr(quantizer, "amax", None) if quantizer is not None else None
+            if isinstance(amax, torch.Tensor):
+                amax_snapshot = amax.detach().clone()
+
+            scratch = torch.empty(
+                target_tensor.shape,
+                dtype=target_tensor.dtype,
+                device=target_tensor.device,
+            )
+            self._intermediate_read_items[id(read_item)] = (
+                read_item, target_tensor, amax_snapshot, "stream",
+            )
+            return scratch
+
         if (
             not target_tensor.is_contiguous()
             and HAVE_TE
             and isinstance(target_tensor, Float8Tensor)
         ):
-            self._intermediate_read_item_and_target = (read_item, target_tensor)
+            self._intermediate_read_items[id(read_item)] = (
+                read_item, target_tensor, None, "noncontig",
+            )
             target_tensor = Float8Tensor.make_like(
                 target_tensor, data=target_tensor._data.contiguous()
             )
         return target_tensor
 
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
-        """Restores the original FP8 tensor saved in `resolve_tensor`."""
-        if self._intermediate_read_item_and_target is not None:
-            interm_read_item, target_tensor = self._intermediate_read_item_and_target
-            assert (
-                interm_read_item is read_item
-            ), '`commit_tensor` method should be called right after `resolve_tensor`'
+        """Undo the detours stashed in ``resolve_tensor``.
+
+        - Streaming case: copy the high-precision scratch back into the
+          original quantized tensor (quantize-on-copy), then restore the
+          pre-load ``amax`` for delayed-scaling quantizers.
+        - Non-contiguous case: copy the contiguous clone back into the
+          original narrowed Float8Tensor view.
+        """
+        entry = self._intermediate_read_items.pop(id(read_item), None)
+        if entry is not None:
+            _, target_tensor, amax_snapshot, kind = entry
             target_tensor.copy_(tensor)
+            if kind == "stream" and amax_snapshot is not None:
+                # quantizer was non-None when we took the snapshot
+                target_tensor._quantizer.amax.copy_(amax_snapshot)
             tensor = target_tensor
-            self._intermediate_read_item_and_target = None
         return super().commit_tensor(read_item, tensor)
 
 
@@ -838,9 +893,13 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False):
+    def __init__(self, cache_metadata: bool = False, stream_fp8_dequant: bool = True):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
+        # When True, FP8/MXFP8/blockwise destinations are dequantized per-tensor inside the
+        # LoadPlanner rather than all at once before the load starts. See
+        # serialization.load() and MCoreLoadPlanner.resolve_tensor for details.
+        self.stream_fp8_dequant = stream_fp8_dequant
 
     def load(
         self,
@@ -884,6 +943,7 @@ class TorchDistLoadShardedStrategy:
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                stream_fp8_dequant=self.stream_fp8_dequant,
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),
