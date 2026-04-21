@@ -150,10 +150,19 @@ class DeferredReleaseRegistry:
         keys_to_drain = [
             key for key in self._registry if key[0] == event_id and key[1] != waiting_key
         ]
-        for key in keys_to_drain:
-            tensors = self._registry.pop(key)
-            for t in tensors:
-                t.untyped_storage().resize_(0)
+        # NOTE: resize_(0) returns storage to the CUDA caching allocator.
+        # The allocator tracks the *allocator-stream* (the stream that last
+        # used the tensor), NOT the PyTorch stream context, so wrapping in
+        # `with torch.cuda.stream(waiting_stream)` does not change when the
+        # memory becomes reusable.  We keep the stream context purely for
+        # semantic clarity: these deallocations logically belong to the
+        # waiting stream, which has already synchronized with the producer
+        # via event.wait().
+        with torch.cuda.stream(waiting_stream):
+            for key in keys_to_drain:
+                tensors = self._registry.pop(key)
+                for t in tensors:
+                    t.untyped_storage().resize_(0)
 
     def drain_all(self):
         """Free ALL deferred tensors unconditionally.
