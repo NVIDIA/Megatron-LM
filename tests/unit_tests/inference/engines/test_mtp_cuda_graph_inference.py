@@ -190,23 +190,6 @@ class TestMTPCudaGraphInference:
         unwrapped.use_mtp_cuda_graphs = enabled
 
     @staticmethod
-    def _delete_mtp_cuda_graphs(model):
-        """Reset MTP CUDA graph runners on the model.
-
-        MTP runners are excluded from the global record (``if not self.is_mtp``
-        guard in CudaGraphManager), so ``delete_cuda_graphs()`` does not touch
-        them.  This helper resets them directly.
-        """
-        unwrapped = unwrap_model(model)
-        mgr = getattr(unwrapped, '_mtp_cudagraph_manager', None)
-        if mgr is None:
-            return
-        for runner in mgr.inference_cudagraphs_lookup_table.values():
-            if runner is not None:
-                runner.fwd_graph_recorded = False
-                runner.fwd_graph = None
-
-    @staticmethod
     def _assert_mtp_cuda_graphs_were_replayed(model, expect_replayed):
         """Assert that MTP CUDA graphs were (or were not) replayed.
 
@@ -540,7 +523,6 @@ class TestMTPCudaGraphInference:
                 ]
 
                 ctrl._compute_serial_mtp_and_sample()
-                self._assert_mtp_cuda_graphs_were_replayed(model, use_cuda_graph)
 
                 return [
                     ctrl._sampled_mtp_tokens_cuda[d, :active_request_count].clone()
@@ -548,7 +530,7 @@ class TestMTPCudaGraphInference:
                 ]
 
             graph_tokens = _run_mtp(use_cuda_graph=True)
-            self._delete_mtp_cuda_graphs(model)
+            self._assert_mtp_cuda_graphs_were_replayed(model, True)
             eager_tokens = _run_mtp(use_cuda_graph=False)
 
             for depth in range(num_spec):
@@ -669,6 +651,28 @@ class TestMTPCudaGraphInference:
 
         self._set_mtp_cuda_graph_flag(model, False)
         assert unwrapped.use_mtp_cuda_graphs is False
+
+    # ---- Test 8: delete_cuda_graphs resets MTP runners -------------------- #
+
+    @torch.inference_mode()
+    def test_delete_cuda_graphs_resets_mtp_runners(self):
+        """``delete_cuda_graphs()`` resets MTP CUDA graph runners.
+
+        MTP runners are excluded from the global inference record, so they
+        require special handling in ``delete_cuda_graphs()``.  After deletion,
+        no MTP runners should have ``fwd_graph_recorded=True``.
+        """
+        engine = self._build_engine()
+        model = engine.controller.inference_wrapped_model.model
+
+        self._assert_mtp_cuda_graphs_were_replayed(model, True)
+
+        delete_cuda_graphs()
+
+        unwrapped = unwrap_model(model)
+        manager = getattr(unwrapped, '_mtp_cudagraph_manager', None)
+        assert manager is not None
+        assert len(manager.inference_cudagraphs_lookup_table) == 0
 
 
 # --------------------------------------------------------------------------- #

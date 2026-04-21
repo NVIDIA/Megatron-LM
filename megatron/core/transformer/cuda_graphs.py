@@ -344,6 +344,7 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
+    mtp_cudagraph_managers: list = []
 
     """A pool-like data structure to reuse input and output buffers across cudagraph."""
     tensor_reuse_pool = TensorReusePool()
@@ -519,6 +520,16 @@ def delete_cuda_graphs():
         runner.fwd_graph = None
         runner.bwd_graph = None
         runner.mempool = None
+
+    # Reset MTP runners (excluded from the global inference record).
+    for mgr in _CudagraphGlobalRecord.mtp_cudagraph_managers:
+        for runner in mgr.inference_cudagraphs_lookup_table.values():
+            if runner is not None:
+                runner.cudagraph_created = False
+                runner.fwd_graph_recorded = False
+                runner.fwd_graph = None
+                runner.mempool = None
+        mgr.inference_cudagraphs_lookup_table.clear()
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
