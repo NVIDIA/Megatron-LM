@@ -102,6 +102,7 @@ class Utils:
             return
         ps.destroy_model_parallel()
         Utils.inited = False
+        torch.cuda.memory.empty_cache()
 
     @staticmethod
     def initialize_model_parallel(
