@@ -35,7 +35,6 @@ from .allocators import (
     NCCL_ALLOCATOR,
     Bucket,
     MultiGroupUBRAllocator,
-    RotaryBucketAllocator,
     StorageResizeBasedBucketAllocator,
     TemporaryBucketAllocator,
     nccl_allocator,
