@@ -12,10 +12,9 @@ have been collected, converts them to log-probs and writes them to disk in a sin
 
 For efficient global top-K log-prob computation across TP ranks:
 - Global log-softmax is computed in a numerically stable, TP-aware manner
-- Local top_k is computed on log-probs first
-- Values and indices are concatenated before all_gather to minimize communication
-- A final top_k is applied to the gathered results
-- Each of N ranks saves only its K/N slice to distribute I/O and storage
+- Local top-K is computed on fp32 logits for ranking precision
+- Local candidates are gathered to TP rank 0 for global top-K selection
+- TP rank 0 saves the full top-K log-probabilities (unsharded)
 
 Index storage optimization:
 - Global vocab requires 17 bits, so we store lower 16 bits as uint16
@@ -78,38 +77,55 @@ _MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
 
 FOLDER_NAMES_PREFIX = "logprobs_iter"
 
-# Batched tar naming: tp{T}_cp{C}_dp{D}__{B}.tar
+# Matches both unsharded (``cp{C}_dp{D}__{B}.tar``) and legacy TP-sharded
+# (``tp{T}_cp{C}_dp{D}__{B}.tar``) batched tar filenames.  Capture group 1
+# is always the trailing iteration number *B*.
 _BATCHED_TAR_RE = re.compile(
-    r"^tp(\d+)_cp(\d+)_dp(\d+)__(\d+)\.tar$"
+    r"^(?:tp\d+_)?cp\d+_dp\d+__(\d+)\.tar$"
 )
 
 
 def _batched_tar_filename(
-    tp_rank: int, cp_rank: int, dp_rank: int, last_iter: int,
+    cp_rank: int, dp_rank: int, last_iter: int,
+    tp_rank: Optional[int] = None,
 ) -> str:
-    """Return the canonical filename for a batched tar shard."""
-    return f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}__{last_iter}.tar"
+    """Return the filename for a batched tar shard.
+
+    When *tp_rank* is ``None`` (default), returns the unsharded format
+    ``cp{C}_dp{D}__{B}.tar``.  When *tp_rank* is given, returns the
+    legacy TP-sharded format ``tp{T}_cp{C}_dp{D}__{B}.tar``.
+    """
+    if tp_rank is not None:
+        return f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}__{last_iter}.tar"
+    return f"cp{cp_rank}_dp{dp_rank}__{last_iter}.tar"
 
 
-def _batched_tar_rank_prefix(
-    tp_rank: int, cp_rank: int, dp_rank: int,
+def _batched_tar_prefix(
+    cp_rank: int, dp_rank: int,
+    tp_rank: Optional[int] = None,
 ) -> str:
-    """Return the rank-specific prefix shared by all batched tar shards for one rank."""
-    return f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}__"
+    """Return the glob prefix for batched tar shards.
+
+    When *tp_rank* is ``None`` (default), returns the unsharded prefix
+    ``cp{C}_dp{D}__``.  When *tp_rank* is given, returns the legacy
+    TP-sharded prefix ``tp{T}_cp{C}_dp{D}__``.
+    """
+    if tp_rank is not None:
+        return f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}__"
+    return f"cp{cp_rank}_dp{dp_rank}__"
 
 
 def _sorted_batched_tars(paths: List[str]) -> List[str]:
     """Sort batched tar paths by their iteration number (numeric, ascending).
 
     Filenames are not zero-padded, so a plain lexicographic sort would be
-    wrong (e.g. ``...10.tar`` before ``...9.tar``).  This extracts the
-    trailing iteration number via :data:`_BATCHED_TAR_RE` and sorts
-    numerically, dropping any paths that don't match the pattern.
+    wrong (e.g. ``...10.tar`` before ``...9.tar``).  Works with both
+    TP-sharded and unsharded naming conventions.
     """
     keyed = []
     for p in paths:
         if m := _BATCHED_TAR_RE.match(os.path.basename(p)):
-            keyed.append((int(m.group(4)), p))
+            keyed.append((int(m.group(1)), p))
     keyed.sort()
     return [p for _, p in keyed]
 
@@ -213,6 +229,7 @@ class LogitsSaverHooks:
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
         self.cp_rank = parallel_state.get_context_parallel_rank()
         self.dp_rank = parallel_state.get_data_parallel_rank()
+        self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
 
         # Track number of MTP outputs to ignore
         args = get_args()
@@ -297,7 +314,13 @@ class LogitsSaverHooks:
         self._hook_handles.clear()
 
     def _save_accumulated_log_probs(self) -> None:
-        """Convert all accumulated logits to log-probs and save to disk in a single I/O call."""
+        """Convert all accumulated logits to log-probs and save to disk.
+
+        Only TP rank 0 performs the final top-K selection and writes data.
+        Other TP ranks participate in the necessary collective operations
+        (all-reduce for log-softmax, gather for top-K candidates) and then
+        return without saving.
+        """
         if not self._accumulated_logits:
             logger.warning("No accumulated log-probs to save")
             return
@@ -308,10 +331,12 @@ class LogitsSaverHooks:
 
         with torch.no_grad():
             for logits in self._accumulated_logits:
-                values, indices_low, high_bit = self._process_single_microbatch(logits)
-                all_values.append(values.cpu())
-                all_indices_low.append(indices_low.cpu())
-                all_high_bits.append(high_bit.cpu())
+                result = self._process_single_microbatch(logits)
+                if result is not None:
+                    values, indices_low, high_bit = result
+                    all_values.append(values.cpu())
+                    all_indices_low.append(indices_low.cpu())
+                    all_high_bits.append(high_bit.cpu())
 
         if not all_values:
             return
@@ -325,15 +350,19 @@ class LogitsSaverHooks:
         """Process a single logits tensor and return top-K log-probability data.
 
         Converts raw logits to log-probabilities using a numerically stable,
-        TP-aware log-softmax before selecting the top-K entries.  Because
-        log-softmax is monotonically increasing with respect to the logits,
-        the top-K positions are identical to those of the raw logits.
+        TP-aware log-softmax before selecting the top-K entries.
+
+        All TP ranks participate in the collective operations (all-reduce for
+        log-softmax, gather for top-K candidates), but only TP rank 0
+        performs the final global top-K and returns the result.  Other ranks
+        return ``None``.
 
         Args:
             logits: Tensor of shape (seq_len, batch, local_vocab_size)
 
         Returns:
-            Tuple of (log_prob_values, indices_low, high_bit)
+            Tuple of (log_prob_values, indices_low, high_bit) on TP rank 0,
+            ``None`` on other TP ranks.
         """
         local_vocab_size = logits.shape[-1]
         global_vocab_size = local_vocab_size * self.tp_size
@@ -344,8 +373,6 @@ class LogitsSaverHooks:
 
         # Effective k considering global vocab size
         effective_k = min(self.k, global_vocab_size)
-        # Ensure k is evenly divisible by tp_size for fair sharding
-        effective_k = (effective_k // self.tp_size) * self.tp_size
 
         # Convert to fp32 to lessen precision issues
         dtype = logits.dtype
@@ -370,35 +397,26 @@ class LogitsSaverHooks:
         # Back to original dtype
         log_probs = log_probs.to(dtype)
 
-        # Step 1: Local top-K on fp32 logits for ranking precision,
+        # Local top-K on fp32 logits for ranking precision,
         # then gather the bf16 log-probs at those same positions.
         local_k = min(effective_k, local_vocab_size)
         local_logit_vals, local_indices = torch.topk(logits, local_k, dim=-1)
         local_logprob_vals = torch.gather(log_probs, -1, local_indices)
 
         if self.tp_size > 1:
-            # Step 2: Global top-K across TP ranks (ranked by fp32 logits,
-            # log-probs gathered at the winning positions afterwards).
-            global_values, global_indices = self._compute_global_topk(
-                local_logit_vals, local_logprob_vals, local_indices, effective_k, local_vocab_size
+            # Gather all ranks' local top-K to rank 0 for global selection.
+            result = self._compute_global_topk(
+                local_logit_vals, local_logprob_vals, local_indices,
+                effective_k, local_vocab_size,
             )
+            if result is None:
+                return None
+            global_values, global_indices = result
         else:
             global_values, global_indices = local_logprob_vals, local_indices
 
-        # Step 3: Each rank saves its K/N slice
-        # Since all ranks have identical copies after global topk,
-        # each rank saves only its portion to distribute I/O and storage
-        shard_size = effective_k // self.tp_size
-        start_idx = self.tp_rank * shard_size
-        end_idx = start_idx + shard_size
-
-        shard_values = global_values[..., start_idx:end_idx]
-        shard_indices = global_indices[..., start_idx:end_idx]
-
-        # Split indices: uint16 for lower 16 bits + uint8 for 17th bit
-        indices_low, high_bit = _pack_indices(shard_indices)
-
-        return shard_values, indices_low, high_bit
+        indices_low, high_bit = _pack_indices(global_indices)
+        return global_values, indices_low, high_bit
 
     def _compute_global_topk(
         self,
@@ -407,18 +425,16 @@ class LogitsSaverHooks:
         local_indices: torch.Tensor,
         k: int,
         local_vocab_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute global top-K across all TP ranks efficiently.
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Gather local top-K candidates to rank 0 and compute global top-K.
 
         The ranking is performed on fp32 *logit* values for numerical
         precision, while the returned values are the corresponding bf16
         *log-probabilities* gathered at the winning positions.
 
-        Strategy:
-        1. Convert local indices to global indices by adding rank offset
-        2. Pack (logits, log-probs, indices) and all_gather in one call
-        3. Compute top-K on gathered *logit* values (fp32)
-        4. Re-index: gather the corresponding log-probs and global indices
+        Only TP rank 0 receives the gathered data and performs the final
+        top-K selection.  Other ranks return ``None`` after participating
+        in the ``gather`` collective.
 
         Args:
             local_logit_vals: Local top-K fp32 logit values (seq, batch, local_k)
@@ -429,36 +445,40 @@ class LogitsSaverHooks:
             local_vocab_size: Size of the local vocab shard (vocab_size / tp_size)
 
         Returns:
-            Tuple of (global_logprob_values, global_indices)
+            Tuple of (global_logprob_values, global_indices) on TP rank 0,
+            ``None`` on other TP ranks.
         """
         vocab_offset = self.tp_rank * local_vocab_size
         global_indices = local_indices + vocab_offset
 
-        # Pack logits, log-probs, and indices into a single tensor for one
-        # all_gather call.  fp32 can exactly represent integers up to 2^24,
-        # sufficient for 17-bit vocab indices.
-        # Shape: (seq, batch, local_k, 3)
+        # Pack logits, log-probs, and indices into a single tensor.
+        # fp32 can exactly represent integers up to 2^24, sufficient for
+        # 17-bit vocab indices.  Shape: (seq, batch, local_k, 3)
         combined = torch.stack(
-            [local_logit_vals.float(),
+            [local_logit_vals,
              local_logprob_vals.float(),
              global_indices.float()],
             dim=-1,
         )
 
-        gathered_list = [torch.empty_like(combined) for _ in range(self.tp_size)]
-        dist.all_gather(gathered_list, combined, group=self.tp_group)
+        if self.tp_rank == 0:
+            gather_list = [torch.empty_like(combined) for _ in range(self.tp_size)]
+        else:
+            gather_list = None
+        dist.gather(combined, gather_list, dst=self._tp_dst_rank_global, group=self.tp_group)
+
+        if self.tp_rank != 0:
+            return None
 
         # (seq, batch, tp_size * local_k, 3)
-        gathered = torch.cat(gathered_list, dim=-2)
+        gathered = torch.cat(gather_list, dim=-2)
 
-        gathered_logits = gathered[..., 0].to(local_logit_vals.dtype)
+        gathered_logits = gathered[..., 0]
         gathered_logprobs = gathered[..., 1].to(local_logprob_vals.dtype)
         gathered_indices = gathered[..., 2].to(local_indices.dtype)
 
-        # Rank by fp32 logits
         _, topk_positions = torch.topk(gathered_logits, k, dim=-1)
 
-        # Gather log-probs and indices at the winning positions
         topk_logprobs = torch.gather(gathered_logprobs, -1, topk_positions)
         topk_global_indices = torch.gather(gathered_indices, -1, topk_positions)
 
@@ -531,7 +551,7 @@ class LogitsSaverHooks:
 
         last_iter = max(writes.keys())
         tar_filename = _batched_tar_filename(
-            self.tp_rank, self.cp_rank, self.dp_rank, last_iter,
+            self.cp_rank, self.dp_rank, last_iter,
         )
         tar_path = os.path.join(self.save_dir, tar_filename)
 
@@ -642,39 +662,36 @@ def _read_from_batched_tar(
 ) -> Optional[bytes]:
     """Read a single iteration's data from a batched tar archive.
 
-    Batched tar files are named ``tp{tp}_cp{cp}_dp{dp}__{B}.tar``
-    and contain members ``{x}.pt[.zst]`` for every iteration
-    *x* in the batch.  *B* is the last iteration stored in the archive, so
-    we only open candidates where ``B >= iteration``.
+    Supports both legacy TP-sharded tars (``tp{T}_cp{C}_dp{D}__{B}.tar``)
+    and unsharded tars (``cp{C}_dp{D}__{B}.tar``).  Tries unsharded first,
+    then falls back to sharded.
     """
-    prefix = _batched_tar_rank_prefix(tp_rank, cp_rank, dp_rank)
-    pattern = os.path.join(save_dir, f"{prefix}*.tar")
-
-    for tar_path in _sorted_batched_tars(glob.glob(pattern)):
-        basename = os.path.basename(tar_path)
-        m = _BATCHED_TAR_RE.match(basename)
-        if not m:
-            continue
-        # Verify rank matches (glob may over-match on the prefix)
-        if (int(m.group(1)), int(m.group(2)), int(m.group(3))) != (
-            tp_rank, cp_rank, dp_rank,
-        ):
-            continue
-        if (last_iter := int(m.group(4))) < iteration:
-            continue
-        try:
-            with tarfile.open(tar_path, "r") as tar:
-                for suffix in (".pt.zst", ".pt"):
-                    member_name = f"{iteration}{suffix}"
-                    try:
-                        member = tar.extractfile(member_name)
-                        if member is not None:
-                            raw = member.read()
-                            return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
-                    except KeyError:
-                        continue
-        except (tarfile.TarError, OSError):
-            continue
+    # Try unsharded format first (current), then legacy TP-sharded.
+    for prefix in (
+        _batched_tar_prefix(cp_rank, dp_rank),
+        _batched_tar_prefix(cp_rank, dp_rank, tp_rank=tp_rank),
+    ):
+        pattern = os.path.join(save_dir, f"{prefix}*.tar")
+        for tar_path in _sorted_batched_tars(glob.glob(pattern)):
+            basename = os.path.basename(tar_path)
+            m = _BATCHED_TAR_RE.match(basename)
+            if not m:
+                continue
+            if int(m.group(1)) < iteration:
+                continue
+            try:
+                with tarfile.open(tar_path, "r") as tar:
+                    for suffix in (".pt.zst", ".pt"):
+                        member_name = f"{iteration}{suffix}"
+                        try:
+                            member = tar.extractfile(member_name)
+                            if member is not None:
+                                raw = member.read()
+                                return _decompress_zstd(raw) if suffix == ".pt.zst" else raw
+                        except KeyError:
+                            continue
+            except (tarfile.TarError, OSError):
+                continue
     return None
 
 
@@ -687,12 +704,14 @@ def load_log_probs_by_rank(
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Load a saved log-probs file by specifying the root folder, iteration, and parallel ranks.
 
-    Supports three on-disk layouts (tried in order):
+    Supports four on-disk layouts (tried in order):
 
     1. **Legacy folder** – ``logprobs_iter{iter}/tp{tp}_cp{cp}_dp{dp}.pt[.zst]``
     2. **Legacy folder tar** – ``logprobs_iter{iter}.tar`` containing the folder
-    3. **Batched tar** – ``tp{tp}_cp{cp}_dp{dp}__{B}.tar``
-       containing ``{iter}.pt[.zst]`` for every iteration in the batch
+    3. **Unsharded batched tar** – ``cp{cp}_dp{dp}__{B}.tar``
+       containing ``{iter}.pt[.zst]`` (full top-K, saved by TP rank 0)
+    4. **TP-sharded batched tar** (legacy) – ``tp{tp}_cp{cp}_dp{dp}__{B}.tar``
+       containing ``{iter}.pt[.zst]`` (K/tp_size slice per TP rank)
 
     Args:
         save_dir: Root path containing all log-probs data
