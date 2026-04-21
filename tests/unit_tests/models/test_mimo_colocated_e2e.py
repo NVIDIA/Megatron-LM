@@ -384,3 +384,29 @@ class TestMimoColocatedE2E:
             micro_batch_size=2,
             num_microbatches=4,
         )
+
+    def test_colocated_fan_out_grad_accumulation_8gpu(self):
+        """Fan-out with ``num_microbatches=4`` — exercises gradient accumulation.
+
+        Mirror of ``test_colocated_fan_in_grad_accumulation_8gpu`` for the
+        fan-out layout (encoder_dp < llm_dp). The LLM side sees the larger
+        DP group and slices its inputs per-rank; the encoder's smaller DP
+        group accumulates grads across microbatches while also receiving
+        broadcast-derived hidden states from multiple LLM peers. Covering
+        this direction explicitly catches accumulation bugs that only
+        surface when the encoder-side DP group is the smaller of the two.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        run_colocated_test(
+            encoder_tp=4,
+            encoder_dp=2,
+            llm_tp=2,
+            llm_dp=4,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=4,
+        )
