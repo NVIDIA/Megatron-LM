@@ -669,7 +669,8 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             if unit_id == -1:
                 continue
             fsdp_unit_buckets[unit_id].append(bucket_id)
-        # TODO: instead of storing this to the class, compute bucket_offset (which is a List[int]) and use that in `allocate`.
+        # TODO: instead of storing this to the class, compute bucket_offset (which is a
+        # List[int]) and use that in `allocate`.
         self.fsdp_unit_buckets = fsdp_unit_buckets
 
         # --- Fixed Pool Buffering Check ---
