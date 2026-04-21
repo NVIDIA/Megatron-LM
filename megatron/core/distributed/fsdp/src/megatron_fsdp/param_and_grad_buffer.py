@@ -664,14 +664,20 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.bucket_to_unit = bucket_to_unit
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
-        fsdp_unit_buckets = defaultdict(list)
+        fsdp_unit_buckets: Dict[int, List[int]] = defaultdict(list)
         for bucket_id, unit_id in enumerate(bucket_to_unit):
             if unit_id == -1:
                 continue
             fsdp_unit_buckets[unit_id].append(bucket_id)
-        # TODO: instead of storing this to the class, compute bucket_offset (which is a
-        # List[int]) and use that in `allocate`.
-        self.fsdp_unit_buckets = fsdp_unit_buckets
+
+        # Precompute, per bucket, its offset within its FSDP unit's bucket list.
+        # Only consulted in `allocate` for buckets whose unit is in
+        # `fsdp_double_buffer_units`; -1 elsewhere.
+        bucket_to_offset = [-1] * len(bucket_to_unit)
+        for bucket_ids in fsdp_unit_buckets.values():
+            for off, bid in enumerate(bucket_ids):
+                bucket_to_offset[bid] = off
+        self.bucket_to_offset = bucket_to_offset
 
         # --- Fixed Pool Buffering Check ---
         # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
@@ -700,10 +706,10 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.using_buffer = {}  # Map from bucket_id to (buf_group_id, offset) in use.
 
         # Populate the idle buffer pool with all buffer group and bucket offset combinations.
+        num_bucket = len(fsdp_unit_buckets[self.fsdp_double_buffer_units[0]])
         for buf_group_id in range(self.size):  # Iterate over each buffer group in the pool.
-            num_bucket = len(self.fsdp_unit_buckets[self.fsdp_double_buffer_units[0]])
-            for bucket_offset in range(num_bucket):
-                self.idle_buffer.append((buf_group_id, bucket_offset))
+            for offset in range(num_bucket):
+                self.idle_buffer.append((buf_group_id, offset))
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
@@ -758,7 +764,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         fsdp_unit_id = self.bucket_to_unit[bucket_id]
         if fsdp_unit_id in self.fsdp_double_buffer_units:
             # Try to allocate from the buffer pool.
-            bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
+            bucket_offset = self.bucket_to_offset[bucket_id]
             buffer_name = None
             if bucket_id in self.using_buffer:
                 # If this bucket is already using a buffer, reuse it.
