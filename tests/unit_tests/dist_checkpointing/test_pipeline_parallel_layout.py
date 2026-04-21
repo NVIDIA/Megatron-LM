@@ -305,7 +305,7 @@ def test_save_and_load_checkpoint_vpp(
         args.load = ckpt_path
 
     set_tp_pp_vpp(*src_tp_pp_vpp, pp_layout=src_pp_layout, destroy_first=False)
-    init_num_microbatches_calculator(0, 1, 1, 1)
+    init_num_microbatches_calculator(0, None, 1, 1, 1)
 
     iteration = 123
     layer_spec_fn = get_gpt_decoder_block_spec if is_moe else gpt_te_spec
