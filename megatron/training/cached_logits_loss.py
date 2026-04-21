@@ -248,7 +248,7 @@ def topk_kl_div(
 
     sum_exp = student_logits.exp().sum(dim=-1, keepdim=True)
     if tp_size > 1:
-        dist_nn.functional.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
+        sum_exp = dist_nn.functional.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
     student_logprobs = student_logits - sum_exp.log()
 
     # ---- Gather student log-probs at teacher's top-K positions (local shard only) ----
@@ -266,12 +266,14 @@ def topk_kl_div(
         student_topk_logprobs_exp = student_topk_logprobs.exp() * mask  # don't sum duplicate indices if any
         student_topk_exp_sum = student_topk_logprobs_exp.sum(dim=-1, keepdim=True)
         if tp_size > 1:
-            dist_nn.functional.all_reduce(student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group)
+            student_topk_exp_sum = dist_nn.functional.all_reduce(
+                student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group
+            )
         student_residual = torch.log(1.0 - student_topk_exp_sum + eps)
         teacher_residual = torch.log(1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True).clamp(max=1-eps))
         student_topk_logprobs = torch.cat([student_topk_logprobs, student_residual], dim=-1)
         teacher_topk_logprobs = torch.cat([teacher_topk_logprobs, teacher_residual], dim=-1)
-        mask = torch.cat([mask, mask.new_ones(*mask.shape[:-1], 1)], dim=-1)
+        mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank==0))], dim=-1)
 
     # ---- Sparse KL divergence (summed over top-K dimension) ----
     kl_div = teacher_topk_logprobs.exp() * (teacher_topk_logprobs - student_topk_logprobs)
@@ -568,13 +570,20 @@ class LossFuncCallable:
             return loss_lm, num_tokens, report
 
         # KD loss
-        unwrapped_model = unwrap_model(model)
-        logits = unwrapped_model.logits
-        del unwrapped_model.logits  # free memory during next fwd step
-        loss_kd = self.kd_func(logits)
-        loss_kd = self._mask_loss(loss_kd, loss_mask)
-        # Requires extra TP reduction
-        dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
+        try:
+            unwrapped_model = unwrap_model(model)
+            logits = unwrapped_model.logits
+            del unwrapped_model.logits  # free memory during next fwd step
+
+            loss_kd = self.kd_func(logits)
+            loss_kd = self._mask_loss(loss_kd, loss_mask)
+            # Requires extra TP reduction
+            dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
+        except Exception as e:
+            # Don't fail the entire training process if KD loss fails
+            logger.warning(f">>>>>> KD LOSS FAILED — falling back to LM loss. {type(e).__name__}: {e} <<<<<<")
+            return loss_lm, num_tokens, report
+
         report["logits distillation loss"] = torch.cat([loss_kd.clone().detach().view(1), num_tokens.view(1)])
 
         # Blend the two
@@ -586,3 +595,4 @@ class LossFuncCallable:
         report["total loss"] = torch.cat([loss_total.clone().detach().view(1), num_tokens.view(1)])
 
         return loss_total, num_tokens, report
+

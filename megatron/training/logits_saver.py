@@ -11,8 +11,10 @@ The forward hook accumulates raw logits across microbatches and, once all microb
 have been collected, converts them to log-probs and writes them to disk in a single I/O call.
 
 For efficient global top-K log-prob computation across TP ranks:
-- Global log-softmax is computed in a numerically stable, TP-aware manner
-- Local top-K is computed on fp32 logits for ranking precision
+- Local top-K is computed on fp32 logits first to avoid materializing
+  a full vocab-sized log-softmax tensor
+- The log-softmax denominator (log-sum-exp) is computed TP-aware and applied
+  only to the top-K values
 - Local candidates are gathered to TP rank 0 for global top-K selection
 - TP rank 0 saves the full top-K log-probabilities (unsharded)
 
@@ -36,7 +38,6 @@ from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
 try:
   import zstandard
@@ -179,13 +180,14 @@ class LogitsSaverHooks:
     The hook accumulates logits across microbatches and saves all log-probs to disk
     in a single I/O call once all microbatches have been collected.
 
-    Raw logits are converted to global log-probabilities via a numerically stable,
-    TP-aware log-softmax before top-K selection.  Because log-softmax is monotonically
+    Top-K selection is performed on raw logits first, then log-probabilities
+    are computed only for the selected positions using the log-softmax
+    denominator (log-sum-exp).  Because log-softmax is monotonically
     increasing, the top-K positions are identical to those of the raw logits.
+    This avoids materializing a full vocab-sized log-softmax tensor.
 
     The implementation efficiently handles tensor parallelism by:
-    - Computing global log-probs with all_reduce (MAX then SUM) across TP ranks
-    - Computing local top-K on log-probs first to reduce memory and communication
+    - Computing local top-K on fp32 logits to reduce memory and communication
     - Concatenating values and indices before all_gather
     - Computing global top-K from gathered results
     - Having each rank save only its K/N slice (evenly divisible)
@@ -236,8 +238,8 @@ class LogitsSaverHooks:
         self._mtp_num_layers = args.mtp_num_layers or 0
         self._curr_mtp_passes = 0
 
-        # Hook states
-        self._accumulated_logits: List[torch.Tensor] = []
+        # Hook states – store already-processed top-K results (not full logits)
+        self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._hook_handles: List[Any] = []
 
         # Zstd compression setup
@@ -266,10 +268,12 @@ class LogitsSaverHooks:
         _ACTIVE_LOGITS_SAVER = self
 
     def get_forward_hook(self) -> Callable:
-        """Returns the forward hook to accumulate logits.
+        """Returns the forward hook to capture top-K log-probs per microbatch.
 
         This hook should be registered on the module that outputs logits.
-        It appends a clone of the logits tensor to an internal list.
+        Each microbatch is processed immediately to extract only the small
+        top-K values and indices, avoiding storage of full vocab-sized logits
+        across microbatches.
         """
         def forward_hook(
             module: torch.nn.Module,
@@ -284,13 +288,15 @@ class LogitsSaverHooks:
             if self._curr_mtp_passes == self._mtp_num_layers:
                 # Main output logits come after MTP logits
                 logits = output[0] if isinstance(output, tuple) else output
-                self._accumulated_logits.append(logits.detach().clone())
 
-                # Save all if we have reached the end of the microbatches
-                if len(self._accumulated_logits) == get_num_microbatches():
+                with torch.no_grad():
+                    result = self._process_single_microbatch(logits)
+                if result is not None:
+                    self._accumulated_results.append(result)
+
+                if len(self._accumulated_results) == get_num_microbatches():
                     self._save_accumulated_log_probs()
-                    # Clear for next iteration
-                    self._accumulated_logits.clear()
+                    self._accumulated_results.clear()
 
                 self._curr_mtp_passes = 0
             else:
@@ -314,14 +320,15 @@ class LogitsSaverHooks:
         self._hook_handles.clear()
 
     def _save_accumulated_log_probs(self) -> None:
-        """Convert all accumulated logits to log-probs and save to disk.
+        """Move accumulated top-K results to CPU and save to disk.
 
-        Only TP rank 0 performs the final top-K selection and writes data.
-        Other TP ranks participate in the necessary collective operations
-        (all-reduce for log-softmax, gather for top-K candidates) and then
-        return without saving.
+        By this point each microbatch has already been processed in the
+        forward hook, so this method only transfers the small top-K tensors
+        to CPU and writes them out in a single I/O call.
         """
-        if not self._accumulated_logits:
+        if self.tp_rank != 0:
+            return
+        if not self._accumulated_results:
             logger.warning("No accumulated log-probs to save")
             return
 
@@ -329,19 +336,11 @@ class LogitsSaverHooks:
         all_indices_low = []
         all_high_bits = []
 
-        with torch.no_grad():
-            for logits in self._accumulated_logits:
-                result = self._process_single_microbatch(logits)
-                if result is not None:
-                    values, indices_low, high_bit = result
-                    all_values.append(values.cpu())
-                    all_indices_low.append(indices_low.cpu())
-                    all_high_bits.append(high_bit.cpu())
+        for values, indices_low, high_bit in self._accumulated_results:
+            all_values.append(values.cpu())
+            all_indices_low.append(indices_low.cpu())
+            all_high_bits.append(high_bit.cpu())
 
-        if not all_values:
-            return
-
-        # Single I/O call for all microbatches
         self._write_to_disk(all_values, all_indices_low, all_high_bits)
 
     def _process_single_microbatch(
@@ -349,13 +348,16 @@ class LogitsSaverHooks:
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Process a single logits tensor and return top-K log-probability data.
 
-        Converts raw logits to log-probabilities using a numerically stable,
-        TP-aware log-softmax before selecting the top-K entries.
+        Selects local top-K positions on raw logits first, then computes
+        the global log-sum-exp denominator using ``torch.logsumexp`` for
+        the local shard (leveraging PyTorch's fused CUDA kernel) combined
+        across TP ranks via a numerically stable log-space reduction.
+        This avoids materializing a full vocab-sized log-softmax tensor.
 
         All TP ranks participate in the collective operations (all-reduce for
-        log-softmax, gather for top-K candidates), but only TP rank 0
-        performs the final global top-K and returns the result.  Other ranks
-        return ``None``.
+        the log-sum-exp combination, gather for top-K candidates), but only
+        TP rank 0 performs the final global top-K and returns the result.
+        Other ranks return ``None``.
 
         Args:
             logits: Tensor of shape (seq_len, batch, local_vocab_size)
@@ -371,43 +373,35 @@ class LogitsSaverHooks:
             f"Global vocab size {global_vocab_size} exceeds maximum supported {_MAX_VOCAB_SIZE} (17 bits)"
         )
 
-        # Effective k considering global vocab size
         effective_k = min(self.k, global_vocab_size)
+        local_k = min(effective_k, local_vocab_size)
 
         # Convert to fp32 to lessen precision issues
         dtype = logits.dtype
         logits = logits.float()
 
-        # Compute log-probabilities (global log-softmax, TP-aware)
-        if self.tp_size > 1:
-            # Subtract global max across all TP ranks for numerical stability
-            logits_max, _ = torch.max(logits, dim=-1, keepdim=True)
-            dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=self.tp_group)
-            logits -= logits_max
-
-            # Compute global softmax denominator via all_reduce SUM
-            local_exp_sum = torch.sum(torch.exp(logits), dim=-1, keepdim=True)
-            dist.all_reduce(local_exp_sum, op=dist.ReduceOp.SUM, group=self.tp_group)
-
-            # Each rank holds log-probs for its own vocab shard
-            log_probs = logits - torch.log(local_exp_sum)
-        else:
-            log_probs = F.log_softmax(logits, dim=-1)
-
-        # Back to original dtype
-        log_probs = log_probs.to(dtype)
-
-        # Local top-K on fp32 logits for ranking precision,
-        # then gather the bf16 log-probs at those same positions.
-        local_k = min(effective_k, local_vocab_size)
         local_logit_vals, local_indices = torch.topk(logits, local_k, dim=-1)
-        local_logprob_vals = torch.gather(log_probs, -1, local_indices)
+
+        # Local log-sum-exp via PyTorch's fused CUDA kernel
+        local_lse = torch.logsumexp(logits, dim=-1, keepdim=True)
 
         if self.tp_size > 1:
-            # Gather all ranks' local top-K to rank 0 for global selection.
+            # Combine local log-sum-exp values across TP ranks using
+            # the standard numerically stable log-space reduction:
+            #   global_lse = max_lse + log(sum_i(exp(lse_i - max_lse)))
+            max_lse = local_lse.clone()
+            dist.all_reduce(max_lse, op=dist.ReduceOp.MAX, group=self.tp_group)
+            sum_exp_lse = torch.exp(local_lse - max_lse)
+            dist.all_reduce(sum_exp_lse, op=dist.ReduceOp.SUM, group=self.tp_group)
+            global_lse = max_lse + torch.log(sum_exp_lse)
+        else:
+            global_lse = local_lse
+
+        local_logprob_vals = local_logit_vals - global_lse
+
+        if self.tp_size > 1:
             result = self._compute_global_topk(
-                local_logit_vals, local_logprob_vals, local_indices,
-                effective_k, local_vocab_size,
+                local_logit_vals, local_logprob_vals, local_indices, effective_k, local_vocab_size
             )
             if result is None:
                 return None
@@ -415,7 +409,9 @@ class LogitsSaverHooks:
         else:
             global_values, global_indices = local_logprob_vals, local_indices
 
+        global_values = global_values.to(dtype)
         indices_low, high_bit = _pack_indices(global_indices)
+
         return global_values, indices_low, high_bit
 
     def _compute_global_topk(
