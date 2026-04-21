@@ -155,9 +155,7 @@ class TestMTPCudaGraphInference:
         wrapped = GPTInferenceWrapper(model, context)
         wrapped.model_is_pipeline_parallel = False
         mock_tokenizer = mock.Mock()
-        ctrl = TextGenerationController(
-            inference_wrapped_model=wrapped, tokenizer=mock_tokenizer
-        )
+        ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
         delete_cuda_graphs()
         engine = DynamicInferenceEngine(ctrl, context)
         return engine
@@ -206,9 +204,9 @@ class TestMTPCudaGraphInference:
         table = manager.inference_cudagraphs_lookup_table
         mtp_runners = [v for k, v in table.items() if isinstance(k, tuple) and k[0] == 'mtp']
         if expect_replayed:
-            assert len(mtp_runners) > 0, (
-                "Expected MTP CUDA graphs to be replayed, but no MTP runners found"
-            )
+            assert (
+                len(mtp_runners) > 0
+            ), "Expected MTP CUDA graphs to be replayed, but no MTP runners found"
             for runner in mtp_runners:
                 assert runner.fwd_graph_recorded, (
                     "Expected MTP CUDA graph to be recorded and replayed, "
@@ -242,7 +240,9 @@ class TestMTPCudaGraphInference:
         mtp_depth = None if unwrapped.mtp.mtp_use_repeated_layer else 0
 
         for batch_size in batch_sizes[:3]:
-            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
+            hidden = torch.randn(
+                batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+            )
             dist.broadcast(hidden, src=0)
             token_ids = torch.randint(0, self.VOCAB_SIZE, (1, batch_size), device='cuda')
             dist.broadcast(token_ids, src=0)
@@ -298,7 +298,9 @@ class TestMTPCudaGraphInference:
         mtp_depth = None if unwrapped.mtp.mtp_use_repeated_layer else 0
 
         for batch_size in batch_sizes[:3]:
-            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
+            hidden = torch.randn(
+                batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+            )
             dist.broadcast(hidden, src=0)
             hidden_sp = scatter_to_sequence_parallel_region(hidden, group=tp_group)
 
@@ -419,9 +421,9 @@ class TestMTPCudaGraphInference:
 
             for depth in range(num_spec):
                 sampled = ctrl._sampled_mtp_tokens_cuda[depth, :active_request_count]
-                assert sampled.shape == (active_request_count,), (
-                    f"active={active_request_count}, depth={depth}"
-                )
+                assert sampled.shape == (
+                    active_request_count,
+                ), f"active={active_request_count}, depth={depth}"
                 assert sampled.dtype == torch.int64
                 assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
 
@@ -512,12 +514,8 @@ class TestMTPCudaGraphInference:
                 local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
                 unwrapped._decoder_hidden_states_cache = local_hidden
 
-                ctrl._last_accepted_seq_indices = torch.arange(
-                    active_request_count, device='cuda'
-                )
-                ctrl._torch_sampling_buckets = [
-                    (list(range(active_request_count)), 1.0, 1, 0.0)
-                ]
+                ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+                ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
                 ctrl._torch_sampling_bucket_index_tensors = [
                     torch.arange(active_request_count, device='cuda', dtype=torch.long)
                 ]
@@ -621,7 +619,9 @@ class TestMTPCudaGraphInference:
         mtp_depth = None if unwrapped.mtp.mtp_use_repeated_layer else 0
 
         self._set_mtp_cuda_graph_flag(model, True)
-        hidden = torch.randn(fallback_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
+        hidden = torch.randn(
+            fallback_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+        )
         dist.broadcast(hidden, src=0)
         token_ids = torch.randint(0, self.VOCAB_SIZE, (1, fallback_size), device='cuda')
         dist.broadcast(token_ids, src=0)
@@ -848,10 +848,14 @@ class TestMTPCudaGraphExpertParallel:
         is_dummy = ep_rank % 2 == 0
 
         if is_dummy:
-            hidden = torch.zeros(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
+            hidden = torch.zeros(
+                batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+            )
             token_ids = torch.zeros(1, batch_size, device='cuda', dtype=torch.long)
         else:
-            hidden = torch.randn(batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16)
+            hidden = torch.randn(
+                batch_size, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+            )
             token_ids = torch.randint(0, self.VOCAB_SIZE, (1, batch_size), device='cuda')
         position_ids = torch.arange(batch_size, device='cuda', dtype=torch.int64).unsqueeze(0)
 
@@ -966,7 +970,9 @@ class TestMTPCudaGraphExpertParallel:
         unwrapped = unwrap_model(model)
 
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        dummy_hidden = torch.zeros((tp_size, 1, self.HIDDEN_SIZE), device='cuda', dtype=torch.bfloat16)
+        dummy_hidden = torch.zeros(
+            (tp_size, 1, self.HIDDEN_SIZE), device='cuda', dtype=torch.bfloat16
+        )
         dummy_tokens = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
         dummy_positions = torch.zeros((1, tp_size), device='cuda', dtype=torch.long)
 
