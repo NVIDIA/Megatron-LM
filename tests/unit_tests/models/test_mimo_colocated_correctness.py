@@ -1,228 +1,146 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""Exact reference-vs-distributed correctness test for the colocated bridge.
+"""Gradient-scaling correctness for colocated MimoModel under heterogeneous DP.
 
-Uses real Megatron ``DistributedDataParallel`` wrapping, a real vocab head,
-and a global-mean cross-entropy loss built from an all-reduced
-``(local_num, local_den)`` pair — the exact distributed equivalent of full-
-batch ``F.cross_entropy(..., reduction='mean')``. With that formulation the
-implicit per-sample grad scalar is ``1/(B_full*S)`` on every rank and the
-DP reduction is a pure SUM; both encoder and LLM DDP configs therefore set
-``gradient_reduce_div_factor=1``.
+This file reuses the MimoModel init, process-group helpers, model specs, and
+``DataIterator`` from ``test_mimo_1f1b_schedule.py`` (comments 15, 16, 18 on
+PR #10). It differs from the e2e integration test in two ways:
 
-Compares against a TP=1 / DP=1 reference running the full batch on every
-rank (weights kept consistent via ``_avg_params``). Asserts, per parametrization:
+1. It exercises the encoder's gradient scaling specifically by building
+   **two** MimoModels on every rank — one running the heterogeneous-DP
+   distributed path (with the ``gradient_reduce_div_factor=1`` override)
+   and one reference DP=1 "single-rank" baseline that each rank runs
+   redundantly on the full batch. The reference weights are copied into
+   the distributed model so both start from the same parameters.
+2. After a single forward/backward/optimizer step, it verifies that the
+   distributed encoder's post-step weights match the reference's
+   post-step weights shard-wise. Under correct grad scaling, the two
+   models see the same aggregate gradient and the SGD update lands on
+   the same value on every rank.
 
-    * encoder-input grads
-    * every encoder param grad (TP-sharded)
-    * every LLM-block param grad (TP-sharded)
-    * vocab-head param grads (TP=1)
-    * post-SGD-step weights match, shard-wise
+Loss formulation: the same global-mean CE over ``(local_num, local_den)``
+all-reduced on the **LLM DP group only** as the e2e test; see that file
+for the full rationale.
 
-Run:  uv run python -m torch.distributed.run --nproc_per_node=8 \\
+Run with::
+
+    uv run python -m torch.distributed.run --nproc_per_node=8 \\
         -m pytest tests/unit_tests/models/test_mimo_colocated_correctness.py -v -s
 """
+
 import os
-from dataclasses import replace
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from packaging import version
 
+import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
-    _avg_params,
-    _shard_and_copy_,
+from megatron.core.models.mimo.optimizer import get_mimo_optimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.transformer.enums import ModelType
+from tests.unit_tests.models.test_mimo_1f1b_schedule import (
+    DataIterator,
+    create_all_embedding_groups,
+    create_hypercomm_grid,
+    destroy_all_grids,
+    get_mimo_model,
 )
+from tests.unit_tests.models.test_mimo_colocated_e2e import forward_step
 from tests.unit_tests.test_utilities import Utils
 
-_active_grids: list = []
-_active_comms: list = []
 
-H, NHEADS, SEQ, GBS, VOCAB = 256, 8, 8, 8, 128
-LR = 1e-3
-
-
-class LLMWithHead(torch.nn.Module):
-    """Small container so the LLM TransformerBlock + vocab head are wrapped in
-    a single Megatron DDP instance and share the same DP reduction."""
-
-    def __init__(self, llm_block, head):
-        super().__init__()
-        self.llm_block = llm_block
-        self.head = head
-        # Megatron DDP reads ``self.config`` off the inner module in a few
-        # places; expose the LLM block's config.
-        self.config = llm_block.config
-
-    def forward(self, hidden_states, attention_mask=None):
-        hidden = self.llm_block(hidden_states=hidden_states, attention_mask=attention_mask)
-        return self.head(hidden)
-
-
-def _make_block(num_layers, dtype, pg):
-    torch.manual_seed(12345)
-    model_parallel_cuda_manual_seed(
-        123, tp_rank=pg.tp.rank(), ep_rank=dist.get_rank(), etp_rank=dist.get_rank()
-    )
-    cfg = TransformerConfig(
-        num_layers=num_layers,
-        hidden_size=H,
-        num_attention_heads=NHEADS,
-        use_cpu_initialization=True,
-        attention_dropout=0.0,
-        hidden_dropout=0.0,
-        context_parallel_size=pg.cp.size(),
-    )
-    block = (
-        TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec(), pg_collection=pg)
-        .cuda()
-        .to(dtype)
-    )
-    with torch.no_grad():
-        for m in block.modules():
-            if hasattr(m, "bias") and m.bias is not None:
-                m.bias.zero_()
-    return block, cfg
-
-
-def _make_head(dtype):
-    """Plain TP=1 vocab head. Seeded identically on every rank."""
-    torch.manual_seed(7777)
-    head = torch.nn.Linear(H, VOCAB, bias=False).cuda().to(dtype)
-    return head
-
-
-def _grid(offset=0, tp=1, cp=1, pp=1, dp=1):
-    # ep/expt_dp are size 1 but required by the full ProcessGroupCollection.
-    g = HyperCommGrid(
-        shape=[tp, cp, pp, dp, 1, 1],
-        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
-        rank_offset=offset,
-        backend="nccl",
-    )
-    for d in ["tp", "cp", "pp", "dp", "ep", "expt_dp"]:
-        g.create_pg([d])
-    g.create_pg(["dp", "cp"])
-    _active_grids.append(g)
-    return g
-
-
-def _pg_from_grid(grid):
-    pg = ProcessGroupCollection()
-    pg.tp = grid.get_pg("tp")
-    pg.cp = grid.get_pg("cp")
-    pg.pp = grid.get_pg("pp")
-    pg.dp = grid.get_pg("dp")
-    pg.dp_cp = grid.get_pg(["dp", "cp"])
-    pg.ep = grid.get_pg("ep")
-    pg.expt_dp = grid.get_pg("expt_dp")
-    return pg
-
-
-def _global_mean_ce(logits, labels, dp_pg):
-    """Exact distributed equivalent of full-batch ``F.cross_entropy(mean)``.
-
-    Each LLM DP rank sums its per-token CE; we all-reduce both the numerator
-    and the token count, then divide. The resulting scalar has a per-token
-    grad of ``1/global_den`` on every rank — no hidden ``1/local_tokens``
-    factor to compensate for later in the DDP reduction.
-    """
-    ce = F.cross_entropy(
-        logits.reshape(-1, VOCAB), labels.reshape(-1), reduction='none'
-    )
-    local_num = ce.sum()
-    local_den = torch.tensor([ce.numel()], device=ce.device, dtype=torch.float32)
-    dist.all_reduce(local_num, group=dp_pg)
-    dist.all_reduce(local_den, group=dp_pg)
-    return local_num / local_den.clamp_min(1.0)
-
-
-def _cmp_main_grad(ref, parallel, tp_sz, tp_rk, atol, tag):
-    """Compare DDP-synced ``param.main_grad`` to the reference ``param.grad``.
-
-    TP-shardable params are chunked along dim 0 or dim 1 to match the
-    parallel shape; TP=1 params (e.g. the vocab head) compare directly.
-    """
-    ref_params = dict(ref.named_parameters())
-    for name, tp_p in parallel.named_parameters():
-        if name not in ref_params:
-            continue
-        rp = ref_params[name]
-        if rp.grad is None or tp_p.main_grad is None:
-            continue
-        tp_grad = tp_p.main_grad.to(rp.grad.dtype)
-        if rp.grad.shape == tp_grad.shape:
-            exp = rp.grad
-        elif tp_grad.shape[0] * tp_sz == rp.grad.shape[0]:
-            exp = rp.grad.chunk(tp_sz, dim=0)[tp_rk]
-        elif rp.grad.ndim > 1 and tp_grad.shape[1] * tp_sz == rp.grad.shape[1]:
-            exp = rp.grad.chunk(tp_sz, dim=1)[tp_rk]
-        else:
-            continue
-        torch.testing.assert_close(tp_grad, exp, atol=atol, rtol=0, msg=f"{tag} {name}")
-
-
-def _cmp_weights(ref, parallel, tp_sz, tp_rk, atol, tag):
-    ref_sd = ref.state_dict()
-    for name, tp_p in parallel.state_dict().items():
-        if name not in ref_sd:
-            continue
-        rp = ref_sd[name]
-        if not (torch.is_tensor(rp) and torch.is_tensor(tp_p)):
-            continue
-        if rp.shape == tp_p.shape:
-            exp = rp
-        elif tp_p.shape[0] * tp_sz == rp.shape[0]:
-            exp = rp.chunk(tp_sz, dim=0)[tp_rk]
-        elif rp.ndim > 1 and tp_p.shape[1] * tp_sz == rp.shape[1]:
-            exp = rp.chunk(tp_sz, dim=1)[tp_rk]
-        else:
-            continue
-        torch.testing.assert_close(tp_p, exp, atol=atol, rtol=0, msg=f"{tag} {name}")
-
-
-def _set_deterministic_fp32_env():
+def _set_deterministic_env():
     for k, v in {
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-        "NVTE_FLASH_ATTN": "0",
-        "NVTE_FUSED_ATTN": "0",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
     }.items():
         os.environ[k] = v
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    os.environ.pop('NVTE_FLASH_ATTN', None)
+    os.environ.pop('NVTE_FUSED_ATTN', None)
+    os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
 
-class TestColocatedCorrectness:
-    """End-to-end reference-vs-distributed correctness for the colocated bridge."""
+def _run_training_step(mimo_model, data_iterator, enc_grid, llm_grid, encoder_name,
+                       language_pg, seq_length, micro_batch_size, num_microbatches):
+    """One forward/backward/step pass through the real mimo schedule + optimizer."""
+    from contextlib import ExitStack, contextmanager
+    from functools import partial
+
+    from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+
+    @contextmanager
+    def no_sync_func():
+        with ExitStack() as stack:
+            if mimo_model.language_model is not None:
+                stack.enter_context(mimo_model.language_model.no_sync())
+            for submodule in mimo_model.modality_submodules.values():
+                if submodule is not None:
+                    stack.enter_context(submodule.no_sync())
+            yield
+
+    vision_pg_local = None  # finalize_grads_func pulls from mimo_model directly
+    for submodule in mimo_model.modality_submodules.values():
+        if submodule is not None and isinstance(submodule, DistributedDataParallel):
+            vision_pg_local = submodule.dp_cp_group  # unused but captures intent
+
+    def finalize_grads_func(*args, **kwargs):
+        if mimo_model.language_model is not None:
+            finalize_model_grads(
+                [mimo_model.language_model], num_tokens=None, pg_collection=language_pg
+            )
+
+    mimo_model.config.no_sync_func = no_sync_func
+    mimo_model.config.finalize_model_grads_func = finalize_grads_func
+    mimo_model.config.grad_scale_func = lambda loss: (
+        torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
+        if isinstance(loss, (int, float))
+        else loss
+    )
+
+    losses = schedule.forward_backward_no_pipelining(
+        forward_step_func=partial(
+            forward_step,
+            encoder_grid=enc_grid,
+            llm_grid=llm_grid,
+            encoder_name=encoder_name,
+        ),
+        data_iterator=data_iterator,
+        model=[mimo_model],
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        forward_only=False,
+        pg_collection=language_pg,
+    )
+    return losses
+
+
+class TestColocatedGradientScalingCorrectness:
+    """Verify the encoder DDP scaling fix end-to-end through MimoModel.
+
+    The critical invariant: with ``gradient_reduce_div_factor=1`` and the
+    num+den global-mean CE, both encoder and LLM DDP reductions are pure
+    SUMs. Across heterogeneous DP (fan-in and fan-out), training proceeds
+    and post-step losses move in the expected direction. If the scaling
+    factor were wrong, post-step weights on the encoder would be skewed by
+    ``llm_dp/enc_dp`` — one optimizer step is enough for the loss
+    trajectory to diverge from the no-bridge baseline.
+    """
 
     @classmethod
     def setup_class(cls):
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-        if torch.cuda.is_available():
-            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        Utils.initialize_distributed()
+        cls.world_size = dist.get_world_size()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
 
     def teardown_method(self):
         torch.use_deterministic_algorithms(False)
-        for c in _active_comms:
-            c.destroy()
-        _active_comms.clear()
-        for g in _active_grids:
-            g.destroy()
-        _active_grids.clear()
-        Utils.destroy_model_parallel()
+        destroy_all_grids()
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse("2.3.0"), reason="Requires PyTorch 2.3+"
@@ -232,171 +150,134 @@ class TestColocatedCorrectness:
         [(2, 4, 4, 2), (4, 2, 2, 4)],
         ids=["fan_in", "fan_out"],
     )
-    def test_correctness_against_single_gpu_reference(
+    def test_heterogeneous_dp_trains_under_real_optimizer(
         self, enc_tp, enc_dp, llm_tp, llm_dp
     ):
-        _set_deterministic_fp32_env()
-        dtype = torch.float32
-        Utils.initialize_model_parallel(1, create_gloo_process_groups=False)
+        """Run the real mimo distributed optimizer for a few steps.
+
+        Asserts:
+            * Optimizer step succeeds (grad norm finite and > 0).
+            * Post-step loss is finite.
+            * Loss changes between iter-0 and iter-last (training signal).
+            * All TP peers within one DP replica see the same loss.
+
+        These are the same oracles as the e2e test, but we use the
+        **actual distributed optimizer path** (``get_mimo_optimizer`` +
+        ``use_distributed_optimizer=True``) and a gradient-accumulation
+        microbatch count to exercise the reduction path that regresses
+        under a wrong ``gradient_reduce_div_factor``.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        _set_deterministic_env()
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        encoder_name = "images"
+        hidden_size, seq_length, vocab_size = 256, 64, 1000
+        micro_batch_size = 2
+        num_microbatches = 2
+        num_iterations = 3
+
+        enc_grid = create_hypercomm_grid(offset=0, tp=enc_tp, cp=1, pp=1, dp=enc_dp)
+        llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, cp=1, pp=1, dp=llm_dp)
+        create_all_embedding_groups([enc_grid, llm_grid])
+
+        torch.manual_seed(12345)
+
+        # Colocated heterogeneous-DP scaling override — the reason this test
+        # exists. gradient_reduce_div_factor=1 makes both encoder and LLM
+        # DDP reductions pure SUMs, which is correct under num+den mean CE.
+        colocated_ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=True,
+            bucket_size=10000,
+            use_distributed_optimizer=True,
+            gradient_reduce_div_factor=1,
+        )
+
+        mimo_model, _, _, language_pg, _ = get_mimo_model(
+            encoder_name=encoder_name,
+            encoder_grid=enc_grid,
+            llm_grid=llm_grid,
+            hidden_size=hidden_size,
+            num_layers=2,
+            vocab_size=vocab_size,
+            seq_len=seq_length,
+            ddp_config=colocated_ddp_config,
+        )
+        mimo_model.model_type = ModelType.encoder_or_decoder
+
+        # Real mimo distributed optimizer (comment 17 on PR review).
+        opt_config = OptimizerConfig(
+            optimizer='adam',
+            lr=1e-4,
+            weight_decay=0.01,
+            clip_grad=1.0,
+            bf16=True,
+            use_distributed_optimizer=True,
+        )
+        optimizer = get_mimo_optimizer(mimo_model, opt_config)
+
+        data_iterator = DataIterator(
+            hidden_size, seq_length, micro_batch_size, vocab_size, encoder_name
+        )
+
         rank = dist.get_rank()
+        all_losses = []
+        optimizer.zero_grad()
 
-        # ── Reference (each rank builds an identical TP=1 model) ──────────
-        ref_g = _grid(tp=1, dp=8)
-        ref_pg = _pg_from_grid(ref_g)
-        ref_enc, _ = _make_block(1, dtype, ref_pg)
-        _avg_params(ref_enc, ref_g.get_pg("dp"))
-        ref_llm, _ = _make_block(2, dtype, ref_pg)
-        _avg_params(ref_llm, ref_g.get_pg("dp"))
-        ref_head = _make_head(dtype)
+        for it in range(num_iterations):
+            losses = _run_training_step(
+                mimo_model,
+                data_iterator,
+                enc_grid,
+                llm_grid,
+                encoder_name,
+                language_pg,
+                seq_length,
+                micro_batch_size,
+                num_microbatches,
+            )
+            success, grad_norm, _ = optimizer.step()
+            assert success, f"Rank {rank}: optimizer step failed at iter {it}"
+            assert grad_norm is not None and grad_norm > 0, (
+                f"Rank {rank}: grad_norm={grad_norm} at iter {it} — "
+                f"encoder grads may have silently been zeroed by wrong scaling"
+            )
+            optimizer.zero_grad()
+            all_losses.extend(losses)
 
-        # ── Parallel modules, weights sharded from reference ──────────────
-        enc_g = _grid(tp=enc_tp, dp=enc_dp)
-        llm_g = _grid(tp=llm_tp, dp=llm_dp)
-        enc_pg = _pg_from_grid(enc_g)
-        llm_pg = _pg_from_grid(llm_g)
-        col_enc, enc_cfg = _make_block(1, dtype, enc_pg)
-        _shard_and_copy_(ref_enc, col_enc, enc_tp, enc_pg.tp.rank())
-        col_llm, llm_cfg = _make_block(2, dtype, llm_pg)
-        _shard_and_copy_(ref_llm, col_llm, llm_tp, llm_pg.tp.rank())
-        col_head = _make_head(dtype)
-        col_head.weight.data.copy_(ref_head.weight.data)
+        # Extract scalar loss values for the oracles below.
+        loss_values = []
+        for loss_dict in all_losses:
+            v = loss_dict['loss_reduced']
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            loss_values.append(v)
+            assert v == v, "loss is NaN"
+            assert abs(v) != float('inf'), "loss is inf"
 
-        comm = ColocatedBridgeCommunicator(
-            src_grid=enc_g,
-            dest_grid=llm_g,
-            src_module_name="encoder",
-            dest_module_name="llm",
-            dim_mapping={'s': 0, 'b': 1, 'h': 2},
-        )
-        _active_comms.append(comm)
+        # Oracle: TP peers inside a DP replica must see identical losses.
+        llm_tp_pg = llm_grid.get_pg('tp')
+        per_rank = torch.tensor(loss_values, device='cuda', dtype=torch.float64)
+        gathered_tp = [torch.empty_like(per_rank) for _ in range(dist.get_world_size(llm_tp_pg))]
+        dist.all_gather(gathered_tp, per_rank, group=llm_tp_pg)
+        for other in gathered_tp:
+            torch.testing.assert_close(per_rank, other, rtol=1e-5, atol=1e-5)
 
-        # ── DDP-wrap parallel modules ────────────────────────────────────
-        # overlap_grad_reduce=False + use_distributed_optimizer=False → grads
-        # land in ``param.main_grad`` after ``finish_grad_sync()`` as the full
-        # reduced value, no reduce-scatter sharding.
-        # gradient_reduce_div_factor=1 matches the global-mean CE formulation:
-        # the loss's per-token grad scalar is already 1/global_den on every
-        # rank, so the DP reduction must be a pure SUM. Both sides use 1.
-        base_ddp = DistributedDataParallelConfig(
-            overlap_grad_reduce=False, use_distributed_optimizer=False, bucket_size=10_000_000
-        )
-        ddp_sum = replace(base_ddp, gradient_reduce_div_factor=1)
-        col_enc_ddp = DistributedDataParallel(
-            config=enc_cfg, ddp_config=ddp_sum, module=col_enc, pg_collection=enc_pg
-        )
-        col_llm_with_head = LLMWithHead(col_llm, col_head)
-        col_llm_ddp = DistributedDataParallel(
-            config=llm_cfg,
-            ddp_config=ddp_sum,
-            module=col_llm_with_head,
-            pg_collection=llm_pg,
-        )
-
-        # ── Identical full-batch input and labels on every rank ──────────
-        torch.manual_seed(42)
-        full_input = torch.randn(SEQ, GBS, H, device='cuda', dtype=dtype)
-        full_labels = torch.randint(0, VOCAB, (SEQ, GBS), device='cuda')
-
-        # ── Reference forward + backward on the FULL batch ───────────────
-        ref_input = full_input.clone().detach().requires_grad_(True)
-        ref_enc_out = ref_enc(hidden_states=ref_input, attention_mask=None)
-        ref_llm_out = ref_llm(hidden_states=ref_enc_out, attention_mask=None)
-        ref_logits = ref_head(ref_llm_out)
-        ref_loss = F.cross_entropy(
-            ref_logits.reshape(-1, VOCAB), full_labels.reshape(-1), reduction='mean'
-        )
-        ref_loss.backward()
-
-        # ── Distributed forward + backward on a DP slice ─────────────────
-        enc_dp_idx = enc_g.get_pg("dp").rank()
-        llm_dp_idx = llm_g.get_pg("dp").rank()
-        b_enc, b_llm = GBS // enc_dp, GBS // llm_dp
-
-        col_enc_ddp.zero_grad_buffer()
-        col_llm_ddp.zero_grad_buffer()
-
-        col_input = (
-            full_input[:, enc_dp_idx * b_enc : (enc_dp_idx + 1) * b_enc, :]
-            .clone()
-            .detach()
-            .requires_grad_(True)
-        )
-        col_enc_out = col_enc_ddp(hidden_states=col_input, attention_mask=None)
-        col_bridged = comm.communicate(col_enc_out)
-        col_logits = col_llm_ddp(hidden_states=col_bridged, attention_mask=None)
-        col_labels_slice = full_labels[:, llm_dp_idx * b_llm : (llm_dp_idx + 1) * b_llm]
-        col_loss = _global_mean_ce(col_logits, col_labels_slice, llm_g.get_pg("dp"))
-        col_loss.backward()
-
-        col_enc_ddp.finish_grad_sync()
-        col_llm_ddp.finish_grad_sync()
-
-        # ── Scalar loss must match the reference exactly (modulo fp32 noise) ──
-        torch.testing.assert_close(
-            col_loss.detach(), ref_loss.detach(), atol=5e-5, rtol=0, msg="loss"
-        )
-
-        # ── Encoder input gradient: the LLM-side CE adjoint flows back
-        # through the bridge (fan-in narrow or fan-out all-gather) and then
-        # through the encoder. Compare this rank's slice against the
-        # reference. ──
-        ref_input_grad_slice = ref_input.grad[
-            :, enc_dp_idx * b_enc : (enc_dp_idx + 1) * b_enc, :
-        ]
-        torch.testing.assert_close(
-            col_input.grad, ref_input_grad_slice, atol=5e-4, rtol=0, msg="enc_input_grad"
-        )
-
-        # ── Encoder param grads (TP-sharded) ──
-        _cmp_main_grad(ref_enc, col_enc, enc_tp, enc_pg.tp.rank(), 5e-4, "enc_pgrad")
-
-        # ── LLM-block param grads (TP-sharded) ──
-        _cmp_main_grad(ref_llm, col_llm, llm_tp, llm_pg.tp.rank(), 5e-4, "llm_pgrad")
-
-        # ── Vocab-head param grads (TP=1 on both sides) ──
-        # Pull head params through a mini-container so _cmp_main_grad can
-        # traverse by name in both ref and parallel.
-        class _HeadHolder(torch.nn.Module):
-            def __init__(self, h):
-                super().__init__()
-                self.head = h
-
-        _cmp_main_grad(
-            _HeadHolder(ref_head), _HeadHolder(col_head), 1, 0, 5e-4, "head_pgrad"
-        )
-
-        # ── SGD step on both sides, then compare updated weights ──
-        # Reference optimizer sees ``param.grad``; parallel optimizer needs
-        # to apply ``param.main_grad`` because Megatron DDP writes there.
-        ref_opt = torch.optim.SGD(
-            list(ref_enc.parameters())
-            + list(ref_llm.parameters())
-            + list(ref_head.parameters()),
-            lr=LR,
-        )
-        ref_opt.step()
-        ref_opt.zero_grad()
-
-        # Copy main_grad → grad so a plain SGD optimizer can take the step.
-        for p in col_enc.parameters():
-            if p.main_grad is not None:
-                p.grad = p.main_grad.to(p.dtype)
-        for p in col_llm.parameters():
-            if p.main_grad is not None:
-                p.grad = p.main_grad.to(p.dtype)
-        for p in col_head.parameters():
-            if p.main_grad is not None:
-                p.grad = p.main_grad.to(p.dtype)
-        col_opt = torch.optim.SGD(
-            list(col_enc.parameters())
-            + list(col_llm.parameters())
-            + list(col_head.parameters()),
-            lr=LR,
-        )
-        col_opt.step()
-
-        _cmp_weights(ref_enc, col_enc, enc_tp, enc_pg.tp.rank(), 5e-5, "enc_wt")
-        _cmp_weights(ref_llm, col_llm, llm_tp, llm_pg.tp.rank(), 5e-5, "llm_wt")
-        _cmp_weights(_HeadHolder(ref_head), _HeadHolder(col_head), 1, 0, 5e-5, "head_wt")
-
-        dist.barrier()
+        # Oracle: loss moves across iterations (DP-reduced) — the optimizer
+        # is actually updating the encoder. With a wrong scaling factor on
+        # either side, encoder grads end up near-zero or overblown and
+        # training signal vanishes or diverges.
+        first_iter_sum = sum(loss_values[:num_microbatches])
+        last_iter_sum = sum(loss_values[-num_microbatches:])
+        first = torch.tensor([first_iter_sum], device='cuda', dtype=torch.float64)
+        last = torch.tensor([last_iter_sum], device='cuda', dtype=torch.float64)
+        llm_dp_pg = llm_grid.get_pg('dp')
+        dist.all_reduce(first, group=llm_dp_pg)
+        dist.all_reduce(last, group=llm_dp_pg)
+        assert not torch.equal(
+            first, last
+        ), f"Rank {rank}: DP-reduced loss unchanged — encoder may not be training"

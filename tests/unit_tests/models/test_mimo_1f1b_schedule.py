@@ -293,9 +293,24 @@ def get_vision_submodules_spec(
 
 
 def get_mimo_model(
-    encoder_name, encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seq_len
+    encoder_name,
+    encoder_grid,
+    llm_grid,
+    hidden_size,
+    num_layers,
+    vocab_size,
+    seq_len,
+    ddp_config=None,
 ):
-    """Create MIMO model with TransformerBlock encoder and GPTModel LLM."""
+    """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
+
+    Args:
+        ddp_config: Optional override for the Megatron DDP config. Colocated
+            heterogeneous-DP callers pass a config with
+            ``gradient_reduce_div_factor=1`` so the encoder and LLM DDP
+            reductions are pure SUMs (required under the num+den mean-CE
+            formulation). Default matches the 1F1B schedule tests' config.
+    """
     language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
     vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
 
@@ -328,10 +343,11 @@ def get_mimo_model(
     mimo_model = MimoModel(mimo_config)
     mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
 
-    # Wrap with DDP
-    ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
-    )
+    # Wrap with DDP (caller may override e.g. for heterogeneous-DP scaling).
+    if ddp_config is None:
+        ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+        )
 
     if mimo_model.language_model is not None:
         mimo_model.language_model = DistributedDataParallel(
