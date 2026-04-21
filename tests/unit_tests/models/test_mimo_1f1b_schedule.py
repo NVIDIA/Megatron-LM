@@ -183,12 +183,33 @@ def is_rank_in_grid(grid):
 
 
 def get_language_model_spec(
-    num_layers, hidden_size, num_attention_heads, vocab_size, seq_len, pg_collection
+    num_layers,
+    hidden_size,
+    num_attention_heads,
+    vocab_size,
+    seq_len,
+    pg_collection,
+    bf16=True,
+    bias=True,
+    dropout=True,
 ):
-    """Get the language model spec."""
+    """Get the language model spec.
+
+    ``bf16=False`` switches pipeline dtype and autocast to fp32. Correctness
+    tests also pass ``bias=False, dropout=False`` to remove bias-update and
+    stochastic noise from the cross-config diff signal.
+    """
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
+
+    pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
+    extra_kwargs = {}
+    if not bias:
+        extra_kwargs['add_bias_linear'] = False
+    if not dropout:
+        extra_kwargs['attention_dropout'] = 0.0
+        extra_kwargs['hidden_dropout'] = 0.0
 
     lm_config = TransformerConfig(
         num_layers=num_layers,
@@ -199,10 +220,11 @@ def get_language_model_spec(
         moe_token_dispatcher_type='alltoall',
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
-        pipeline_dtype=torch.bfloat16,
-        bf16=True,
+        pipeline_dtype=pipeline_dtype,
+        bf16=bf16,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='te',
+        **extra_kwargs,
     )
     return ModuleSpec(
         module=GPTModel,
@@ -218,12 +240,12 @@ def get_language_model_spec(
     )
 
 
-def get_projection_config(hidden_size):
+def get_projection_config(hidden_size, bias=True):
     """Return a TransformerConfig for the vision projection MLP."""
     cfg = TransformerConfig(num_layers=1, hidden_size=hidden_size, num_attention_heads=1)
     cfg.ffn_hidden_size = hidden_size
-    cfg.bias_activation_fusion = True
-    cfg.add_bias_linear = True
+    cfg.bias_activation_fusion = bool(bias)
+    cfg.add_bias_linear = bool(bias)
     cfg.activation_func = torch.nn.functional.gelu
     return cfg
 
@@ -239,14 +261,33 @@ def get_projection_layer_spec():
 
 
 def get_vision_submodules_spec(
-    num_layers, hidden_size, num_attention_heads, language_hidden_size, pg_collection
+    num_layers,
+    hidden_size,
+    num_attention_heads,
+    language_hidden_size,
+    pg_collection,
+    bf16=True,
+    bias=True,
+    dropout=True,
 ):
-    """Get the submodule spec for the vision modality."""
+    """Get the submodule spec for the vision modality.
+
+    ``bias=False`` / ``dropout=False`` mirror the LM-spec kwargs for
+    correctness tests.
+    """
     from megatron.core.transformer.transformer_block import TransformerBlock
 
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
     pp_size = pg_collection.pp.size() if pg_collection.pp is not None else 1
     pp_rank = dist.get_rank(pg_collection.pp)
+
+    pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
+    extra_kwargs = {}
+    if not bias:
+        extra_kwargs['add_bias_linear'] = False
+    if not dropout:
+        extra_kwargs['attention_dropout'] = 0.0
+        extra_kwargs['hidden_dropout'] = 0.0
 
     vision_config = TransformerConfig(
         num_layers=num_layers,
@@ -257,8 +298,9 @@ def get_vision_submodules_spec(
         moe_token_dispatcher_type='alltoall',
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
-        pipeline_dtype=torch.bfloat16,
-        bf16=True,
+        pipeline_dtype=pipeline_dtype,
+        bf16=bf16,
+        **extra_kwargs,
     )
     vision_encoder_spec = ModuleSpec(
         module=TransformerBlock,
@@ -274,7 +316,7 @@ def get_vision_submodules_spec(
     vision_projection_spec = ModuleSpec(
         module=MultimodalProjector,
         params={
-            "config": get_projection_config(hidden_size=language_hidden_size),
+            "config": get_projection_config(hidden_size=language_hidden_size, bias=bias),
             "submodules": get_projection_layer_spec().submodules,
             "projector_type": "mlp",
             "input_size": vision_config.hidden_size,
@@ -301,6 +343,9 @@ def get_mimo_model(
     vocab_size,
     seq_len,
     ddp_config=None,
+    bf16=True,
+    bias=True,
+    dropout=True,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
@@ -310,6 +355,11 @@ def get_mimo_model(
             ``gradient_reduce_div_factor=1`` so the encoder and LLM DDP
             reductions are pure SUMs (required under the num+den mean-CE
             formulation). Default matches the 1F1B schedule tests' config.
+        bf16: If True (default) build the model in bf16; if False build in
+            fp32 end-to-end for deterministic numerics in correctness tests.
+        bias: If False, disable ``add_bias_linear`` in LM/vision configs and
+            the projection MLP — removes bias-update noise from diffs.
+        dropout: If False, force attention/hidden dropout to 0.0.
     """
     language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
     vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
@@ -321,6 +371,9 @@ def get_mimo_model(
         vocab_size=vocab_size,
         seq_len=seq_len,
         pg_collection=language_pg,
+        bf16=bf16,
+        bias=bias,
+        dropout=dropout,
     )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
@@ -328,6 +381,9 @@ def get_mimo_model(
         num_attention_heads=8,
         language_hidden_size=hidden_size,
         pg_collection=vision_pg,
+        bf16=bf16,
+        bias=bias,
+        dropout=dropout,
     )
 
     module_to_grid_map = {encoder_name: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid}
@@ -341,7 +397,9 @@ def get_mimo_model(
     )
 
     mimo_model = MimoModel(mimo_config)
-    mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
+    mimo_model.to(torch.device("cuda"))
+    if bf16:
+        mimo_model.to(torch.bfloat16)
 
     # Wrap with DDP (caller may override e.g. for heterogeneous-DP scaling).
     if ddp_config is None:

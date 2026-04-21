@@ -366,8 +366,8 @@ class TestBridgeGradients:
     """Bitwise-exact gradient tests for ``ColocatedBridgeCommunicator``.
 
     This class is **intentionally distinct** from the model-level correctness
-    tests in ``test_mimo_colocated_correctness.py`` / ``test_mimo_colocated_e2e.py``
-    (see PR review comment 19). The bridge forward and backward are pure data
+    tests in ``test_mimo_colocated_correctness.py`` (see PR review comment 19).
+    The bridge forward and backward are pure data
     movement (``narrow`` / ``all_gather_into_tensor``) with no FP compute, so
     the mathematical adjoint relationship can — and should — be asserted at
     ``rtol=0, atol=0``:

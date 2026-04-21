@@ -19,16 +19,20 @@ Why an equal-DP reference is the right oracle:
     every encoder rank feeds its colocated LLM rank with no
     redistribution collective.
   * Loss is the num+den global-mean CE all-reduced on the LLM DP group
-    (same as ``test_mimo_colocated_e2e.py``). With
+    (see ``loss_func`` below). With
     ``gradient_reduce_div_factor=1``, summing local grads across DP
     recovers the DP=1 gradient on both sides.
 
 LLM TP differs between ref (``llm_tp=dist_enc_tp``) and dist
 (``llm_tp=dist_llm_tp``), so ref's LLM weights are copied into dist via
 all-gather-across-ref-TP + slice-for-dist-TP. The LLM forward then
-diverges numerically by bf16 accumulation order, but the aggregate
+diverges numerically by fp32 TP accumulation order, but the aggregate
 gradient that flows back into the encoder remains the DP=1 gradient in
 both models, which is what the post-step encoder weight oracle checks.
+The test runs in fp32 with ``add_bias_linear=False`` and dropout
+disabled to minimize non-bridge numerical noise — this keeps the
+post-bridge hidden states bit-exact and surfaces only TP-shape drift
+in the logits oracle.
 
 If the heterogeneous-DP scaling is wrong (e.g. dividing by encoder_dp
 when it should be 1), the dist encoder's post-step weights diverge from
@@ -55,14 +59,90 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.enums import ModelType
+from megatron.core.utils import unwrap_model
 from tests.unit_tests.models.test_mimo_1f1b_schedule import (
     create_all_embedding_groups,
     create_hypercomm_grid,
     destroy_all_grids,
     get_mimo_model,
 )
-from tests.unit_tests.models.test_mimo_colocated_e2e import forward_step
 from tests.unit_tests.test_utilities import Utils
+
+
+def loss_func(loss_mask, llm_dp_pg, output_tensor):
+    """Global-mean CE across the LLM DP group via all-reduced ``(num, den)``.
+
+    ``output_tensor`` is per-token CE from
+    ``GPTModel.compute_language_model_loss`` with shape ``[b, s]``.
+    Masking ignored tokens, all-reducing numerator and valid-token count
+    across the **LLM DP group only** (TP peers already hold the identical
+    per-token loss so including them would double-count), and dividing is
+    the exact distributed equivalent of full-batch
+    ``F.cross_entropy(..., reduction='mean')``.
+
+    Every rank therefore sees the same scalar and every token's grad
+    scalar is ``1/global_den`` — which pairs with
+    ``gradient_reduce_div_factor=1`` on DDP so the reduction is a pure
+    SUM without any further ``1/dp_size`` division.
+    """
+    if output_tensor is None:
+        return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
+
+    masked = output_tensor.float() * loss_mask.float()
+    local_num = masked.sum()
+    local_den = loss_mask.float().sum()
+    dist.all_reduce(local_num, group=llm_dp_pg)
+    dist.all_reduce(local_den, group=llm_dp_pg)
+    loss = local_num / local_den.clamp_min(1.0)
+    return loss, {'loss_reduced': loss.detach().item()}
+
+
+def forward_step(data_iterator, model, encoder_grid, llm_grid, encoder_name):
+    """Forward step with per-rank data slicing for heterogeneous DP."""
+    batch = next(data_iterator) if data_iterator is not None else {'input_ids': None}
+    llm_dp_pg = llm_grid.get_pg("dp")
+
+    if batch.get('input_ids') is None:
+        output_tensor, loss_mask = model(**batch)
+        return output_tensor, partial(loss_func, loss_mask, llm_dp_pg)
+
+    encoder_dp = encoder_grid.get_pg("dp").size()
+    llm_dp = llm_grid.get_pg("dp").size()
+
+    if encoder_dp > llm_dp:
+        # Fan-in: input was pre-sliced to LLM-DP (larger per-rank batch).
+        # Narrow modality_inputs to the encoder's smaller per-rank slice.
+        scale = encoder_dp // llm_dp
+        encoder_dp_idx = encoder_grid.get_pg("dp").rank()
+        slot = encoder_dp_idx % scale
+
+        if 'modality_inputs' in batch and batch['modality_inputs'] is not None:
+            for mod_name, mod_data in batch['modality_inputs'].items():
+                for enc_name, enc_data in mod_data.items():
+                    for key, tensor in enc_data.items():
+                        if tensor is not None and isinstance(tensor, torch.Tensor):
+                            batch_size = tensor.shape[1]  # [seq, batch, hidden]
+                            slice_size = batch_size // scale
+                            start = slot * slice_size
+                            enc_data[key] = tensor[:, start : start + slice_size, :].contiguous()
+
+    elif llm_dp > encoder_dp:
+        # Fan-out: input was pre-sliced to encoder-DP (larger per-rank batch).
+        # Narrow the LLM-side tensors to this LLM-DP rank's slice.
+        scale = llm_dp // encoder_dp
+        llm_dp_idx = llm_grid.get_pg("dp").rank()
+        slot = llm_dp_idx % scale
+
+        batch_size = batch['input_ids'].shape[0]
+        slice_size = batch_size // scale
+        start = slot * slice_size
+
+        for key in ['input_ids', 'labels', 'loss_mask', 'position_ids']:
+            if key in batch and batch[key] is not None:
+                batch[key] = batch[key][start : start + slice_size].contiguous()
+
+    output_tensor, loss_mask = model(**batch)
+    return output_tensor, partial(loss_func, loss_mask, llm_dp_pg)
 
 
 def _set_deterministic_env():
@@ -120,22 +200,37 @@ def _generate_and_broadcast_global_batches(
     encoder_name,
     num_batches,
     image_token_id=50257,
+    mask_pattern="uniform",
 ):
     """Generate global batches on rank 0 and broadcast so every rank sees
     identical data. Dist pre-slices per rank; ref consumes the full batch.
+
+    ``mask_pattern``:
+      * ``"uniform"`` — every sample has the same valid-token count (image
+        tokens masked, text tokens all valid). Local/global denominators
+        coincide up to DP-rank partitioning.
+      * ``"asymmetric"`` — each sample zeros out an additional sample-
+        dependent number of trailing text tokens, so different samples
+        (and therefore different DP-rank slices) carry different valid-
+        token counts. This exercises the num+den global-mean CE path
+        where the old local-mean recipe would be only approximately
+        correct.
     """
+    if mask_pattern not in ("uniform", "asymmetric"):
+        raise ValueError(f"Unknown mask_pattern: {mask_pattern!r}")
+
     rank = dist.get_rank()
     image_seq_length = seq_length // 2
     batches = []
 
-    for _ in range(num_batches):
+    for batch_idx in range(num_batches):
         if rank == 0:
             encoder_hidden_states = torch.randn(
                 image_seq_length,
                 global_mbs,
                 hidden_size,
                 device='cuda',
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
             )
             image_tokens = torch.full(
                 (global_mbs, image_seq_length),
@@ -156,7 +251,7 @@ def _generate_and_broadcast_global_batches(
                 global_mbs,
                 hidden_size,
                 device='cuda',
-                dtype=torch.bfloat16,
+                dtype=torch.float32,
             )
             input_ids = torch.empty(global_mbs, seq_length, dtype=torch.long, device='cuda')
 
@@ -167,6 +262,17 @@ def _generate_and_broadcast_global_batches(
         labels[input_ids == image_token_id] = -100
         loss_mask = torch.ones(global_mbs, seq_length, device='cuda', dtype=torch.float32)
         loss_mask[input_ids == image_token_id] = 0.0
+
+        if mask_pattern == "asymmetric":
+            # Zero out a sample-dependent trailing run of text tokens so
+            # each sample ends up with a different valid-token count.
+            # Counts are deterministic given (batch_idx, sample_idx) so the
+            # broadcast-on-rank-0 pattern is reproducible on every rank.
+            text_len = seq_length - image_seq_length
+            for sample_idx in range(global_mbs):
+                n_drop = ((batch_idx * 7 + sample_idx * 3) % (text_len - 1)) + 1
+                loss_mask[sample_idx, seq_length - n_drop :] = 0.0
+                labels[sample_idx, seq_length - n_drop :] = -100
         position_ids = (
             torch.arange(seq_length, device='cuda')
             .unsqueeze(0)
@@ -310,6 +416,371 @@ def _copy_ref_params_to_dist(ref_module, dist_module, ref_tp_group, dist_tp_grou
             dist_param.data.copy_(dist_slice.to(dist_param.dtype))
 
 
+def _global_abs_diff_stats(a, b, pg=None):
+    """Absolute-diff stats plus reference-tensor magnitude stats, across ``pg``.
+
+    Reports both the abs-diff distribution AND the magnitude of ``b`` (the
+    reference tensor) so the caller can judge scale: a max abs-diff of 1.0
+    is catastrophic for values of O(1), but fine for values of O(100). The
+    relative-diff column (``rel_max = max_diff / ref_max``) gives a quick
+    percentage read.
+
+    Useful when the per-rank tensors cover different shards — all-reducing
+    MAX/MIN (and MAX of per-rank p95/p99 as a conservative worst-case) lets
+    rank 0 print a global view of drift across every shard in ``pg``. Mean
+    is SUM/world_size, which is the true global mean when every rank holds
+    the same number of elements (true here — shards have the same shape).
+    """
+    diff = (a.float() - b.float()).abs().flatten()
+    ref = b.float().abs().flatten()
+    n = diff.numel()
+
+    if n == 0:
+        zero = torch.tensor(0.0, device='cuda')
+        local_min = local_max = local_mean = local_p50 = local_p95 = local_p99 = zero
+        local_ref_max = local_ref_p95 = local_ref_mean = zero
+    else:
+        local_min = diff.min()
+        local_max = diff.max()
+        local_mean = diff.mean()
+        local_p50 = diff.quantile(0.50)
+        local_p95 = diff.quantile(0.95)
+        local_p99 = diff.quantile(0.99)
+        local_ref_max = ref.max()
+        local_ref_p95 = ref.quantile(0.95)
+        local_ref_mean = ref.mean()
+
+    world = dist.get_world_size(pg) if dist.is_initialized() else 1
+    if world > 1:
+        g_min = local_min.clone()
+        g_max = local_max.clone()
+        g_mean = local_mean.clone()
+        g_p50 = local_p50.clone()
+        g_p95 = local_p95.clone()
+        g_p99 = local_p99.clone()
+        g_ref_max = local_ref_max.clone()
+        g_ref_p95 = local_ref_p95.clone()
+        g_ref_mean = local_ref_mean.clone()
+        dist.all_reduce(g_min, op=dist.ReduceOp.MIN, group=pg)
+        dist.all_reduce(g_max, op=dist.ReduceOp.MAX, group=pg)
+        dist.all_reduce(g_mean, op=dist.ReduceOp.SUM, group=pg)
+        dist.all_reduce(g_p50, op=dist.ReduceOp.MAX, group=pg)
+        dist.all_reduce(g_p95, op=dist.ReduceOp.MAX, group=pg)
+        dist.all_reduce(g_p99, op=dist.ReduceOp.MAX, group=pg)
+        dist.all_reduce(g_ref_max, op=dist.ReduceOp.MAX, group=pg)
+        dist.all_reduce(g_ref_p95, op=dist.ReduceOp.MAX, group=pg)
+        dist.all_reduce(g_ref_mean, op=dist.ReduceOp.SUM, group=pg)
+        g_mean = g_mean / world
+        g_ref_mean = g_ref_mean / world
+        return {
+            'min': g_min.item(),
+            'max': g_max.item(),
+            'mean': g_mean.item(),
+            'p50_worst': g_p50.item(),
+            'p95_worst': g_p95.item(),
+            'p99_worst': g_p99.item(),
+            'ref_max': g_ref_max.item(),
+            'ref_p95': g_ref_p95.item(),
+            'ref_mean': g_ref_mean.item(),
+            'numel_per_rank': n,
+            'ranks': world,
+        }
+    return {
+        'min': local_min.item(),
+        'max': local_max.item(),
+        'mean': local_mean.item(),
+        'p50_worst': local_p50.item(),
+        'p95_worst': local_p95.item(),
+        'p99_worst': local_p99.item(),
+        'ref_max': local_ref_max.item(),
+        'ref_p95': local_ref_p95.item(),
+        'ref_mean': local_ref_mean.item(),
+        'numel_per_rank': n,
+        'ranks': 1,
+    }
+
+
+def _fmt_diff_stats(s):
+    ref_max = s.get('ref_max', 0.0)
+    rel_max = (s['max'] / ref_max) if ref_max > 0 else float('inf')
+    return (
+        f"min={s['min']:.2e} p50={s['p50_worst']:.2e} mean={s['mean']:.2e} "
+        f"p95={s['p95_worst']:.2e} p99={s['p99_worst']:.2e} "
+        f"max={s['max']:.2e} | ref_max={ref_max:.2e} ref_p95={s.get('ref_p95', 0.0):.2e} "
+        f"ref_mean={s.get('ref_mean', 0.0):.2e} rel_max={rel_max:.1%} "
+        f"(n_per_rank={s['numel_per_rank']}, ranks={s['ranks']})"
+    )
+
+
+def _print_from_rank0(msg):
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print(msg, flush=True)
+
+
+def _register_logits_capture(mimo_model):
+    """Forward hook on the LLM ``output_layer``; captures per-microbatch logits.
+
+    The hook runs on every microbatch forward. ``output`` from
+    ``ColumnParallelLinear`` is ``(logits, bias)`` with logits shape
+    ``[s, b, v/tp]`` — this rank's per-DP-slot, per-TP-vocab-shard slice
+    of the global logits tensor. Cloning so backward doesn't mutate.
+
+    Returns ``(captures, handle)``; caller must ``handle.remove()`` after
+    the schedule completes.
+    """
+    gpt = unwrap_model(mimo_model.language_model)
+    captures = []
+
+    def hook(_module, _inputs, output):
+        logits = output[0] if isinstance(output, tuple) else output
+        captures.append(logits.detach().clone())
+
+    handle = gpt.output_layer.register_forward_hook(hook)
+    return captures, handle
+
+
+def _register_llm_input_capture(mimo_model):
+    """Forward pre-hook on the GPT ``decoder``; captures post-bridge hidden states.
+
+    This is the activation entering the transformer block AFTER embedding
+    (skipped when MIMO passes ``decoder_input``) AND after the bridge has
+    moved the encoder output into the LLM's TP/DP layout. Shape is
+    ``[s, b_local, h_full]`` — hidden dim is NOT TP-sharded at this point.
+
+    Comparing dist vs ref at this capture isolates "does the bridge deliver
+    mathematically equivalent inputs to the LLM?" from downstream LLM TP
+    forward drift. If this oracle passes but ``llm_logits`` fails, the
+    divergence is inside the LLM TP forward; if this fails, the bridge
+    (fan_in/fan_out vs equal) is not equivalent.
+    """
+    gpt = unwrap_model(mimo_model.language_model)
+    captures = []
+
+    def pre_hook(_module, args, kwargs):
+        hidden = kwargs.get('hidden_states', None)
+        if hidden is None and args:
+            hidden = args[0]
+        if hidden is not None:
+            captures.append(hidden.detach().clone())
+
+    handle = gpt.decoder.register_forward_pre_hook(pre_hook, with_kwargs=True)
+    return captures, handle
+
+
+def _gather_bs_dp(local_tensor, llm_dp_pg):
+    """All-gather ``[s, b, h]`` across LLM DP along the batch dim."""
+    dp_size = dist.get_world_size(llm_dp_pg)
+    if dp_size <= 1:
+        return local_tensor.contiguous()
+    contig = local_tensor.contiguous()
+    shards = [torch.empty_like(contig) for _ in range(dp_size)]
+    dist.all_gather(shards, contig, group=llm_dp_pg)
+    return torch.cat(shards, dim=1)
+
+
+def _assert_llm_input_match(
+    ref_captures,
+    dist_captures,
+    ref_llm_grid,
+    dist_llm_grid,
+    rtol=1e-3,
+    atol=1e-3,
+):
+    """Post-bridge oracle: hidden states entering the LLM decoder match.
+
+    Hidden dim is not TP-sharded at the decoder input, so only DP-gather
+    across the LLM DP group is needed to reconstruct the full-batch tensor.
+    """
+    assert len(ref_captures) == len(dist_captures), (
+        f"Microbatch count mismatch: ref={len(ref_captures)}, "
+        f"dist={len(dist_captures)}"
+    )
+    ref_dp_pg = ref_llm_grid.get_pg("dp")
+    dist_dp_pg = dist_llm_grid.get_pg("dp")
+
+    mismatches = []
+    for mbs_idx, (ref_local, dist_local) in enumerate(
+        zip(ref_captures, dist_captures)
+    ):
+        ref_full = _gather_bs_dp(ref_local, ref_dp_pg)
+        dist_full = _gather_bs_dp(dist_local, dist_dp_pg)
+        assert ref_full.shape == dist_full.shape, (
+            f"mbs[{mbs_idx}]: gathered llm-input shape mismatch — "
+            f"ref={tuple(ref_full.shape)}, dist={tuple(dist_full.shape)}"
+        )
+        stats = _global_abs_diff_stats(dist_full, ref_full, pg=dist.group.WORLD)
+        _print_from_rank0(
+            f"[llm-input-diff] mbs[{mbs_idx}] shape={tuple(ref_full.shape)} "
+            f"{_fmt_diff_stats(stats)}"
+        )
+        try:
+            torch.testing.assert_close(
+                dist_full, ref_full, rtol=rtol, atol=atol
+            )
+        except AssertionError as e:
+            mismatches.append((mbs_idx, str(e)))
+
+    if mismatches:
+        rank = dist.get_rank()
+        details = "\n".join(f"  mbs[{i}]: {msg}" for i, msg in mismatches)
+        raise AssertionError(
+            f"Rank {rank}: llm-input diverged on {len(mismatches)} microbatch(es):\n"
+            f"{details}"
+        )
+
+
+def _gather_logits_full_batch(local_logits, llm_tp_pg, llm_dp_pg):
+    """All-gather ``[s, b, v/tp]`` across LLM TP (vocab dim) then DP (batch dim).
+
+    Returns ``[s, b * dp_size, v]`` — the full global-batch logits,
+    identical on every rank of the LLM grid. Used to compare dist vs ref
+    on the same global slots regardless of how TP/DP slices them.
+    """
+    tp_size = dist.get_world_size(llm_tp_pg)
+    dp_size = dist.get_world_size(llm_dp_pg)
+
+    vocab_full = local_logits.contiguous()
+    if tp_size > 1:
+        shards = [torch.empty_like(vocab_full) for _ in range(tp_size)]
+        dist.all_gather(shards, vocab_full, group=llm_tp_pg)
+        vocab_full = torch.cat(shards, dim=-1)
+
+    batch_full = vocab_full.contiguous()
+    if dp_size > 1:
+        shards = [torch.empty_like(batch_full) for _ in range(dp_size)]
+        dist.all_gather(shards, batch_full, group=llm_dp_pg)
+        batch_full = torch.cat(shards, dim=1)
+
+    return batch_full
+
+
+def _assert_llm_logits_match(
+    ref_captures,
+    dist_captures,
+    ref_llm_grid,
+    dist_llm_grid,
+    rtol=1e-2,
+    atol=1e-2,
+):
+    """Logits oracle: TP+DP-gathered full-batch logits match microbatch-by-microbatch.
+
+    Dist and ref share the same global batch on every rank (broadcast from
+    rank 0), and with the HyperCommGrid layout both reconstruct global
+    batch rows 0..N in the same order after TP+DP all-gather (see
+    ``_slice_global_batch_*`` helpers for how the slicing lines up).
+    The only numerical difference between the two gathered logits is
+    fp32 accumulation order across a different LLM TP shape — hence the
+    loose ``rtol=atol=1e-2`` default.
+    """
+    assert len(ref_captures) == len(dist_captures), (
+        f"Microbatch count mismatch: ref={len(ref_captures)}, "
+        f"dist={len(dist_captures)}"
+    )
+    ref_tp_pg = ref_llm_grid.get_pg("tp")
+    ref_dp_pg = ref_llm_grid.get_pg("dp")
+    dist_tp_pg = dist_llm_grid.get_pg("tp")
+    dist_dp_pg = dist_llm_grid.get_pg("dp")
+
+    mismatches = []
+    for mbs_idx, (ref_local, dist_local) in enumerate(
+        zip(ref_captures, dist_captures)
+    ):
+        ref_full = _gather_logits_full_batch(ref_local, ref_tp_pg, ref_dp_pg)
+        dist_full = _gather_logits_full_batch(dist_local, dist_tp_pg, dist_dp_pg)
+        assert ref_full.shape == dist_full.shape, (
+            f"mbs[{mbs_idx}]: gathered logits shape mismatch — "
+            f"ref={tuple(ref_full.shape)}, dist={tuple(dist_full.shape)}"
+        )
+        # Gathered full-batch logits are identical on every LLM-grid rank,
+        # so stats at rank 0 represent the tensor globally — no reduction
+        # needed across other ranks.
+        stats = _global_abs_diff_stats(dist_full, ref_full, pg=dist.group.WORLD)
+        _print_from_rank0(
+            f"[logits-diff] mbs[{mbs_idx}] shape={tuple(ref_full.shape)} "
+            f"{_fmt_diff_stats(stats)}"
+        )
+        try:
+            torch.testing.assert_close(
+                dist_full, ref_full, rtol=rtol, atol=atol
+            )
+        except AssertionError as e:
+            mismatches.append((mbs_idx, str(e)))
+
+    if mismatches:
+        rank = dist.get_rank()
+        details = "\n".join(f"  mbs[{i}]: {msg}" for i, msg in mismatches)
+        raise AssertionError(
+            f"Rank {rank}: logits diverged on {len(mismatches)} microbatch(es):\n"
+            f"{details}"
+        )
+
+
+def _snapshot_first_layer_encoder_grads(mimo_model, encoder_name):
+    """Clone ``param.main_grad`` for every ``.layers.0.`` encoder param.
+
+    ``main_grad`` holds the post-DDP-reduction gradient (SUM across encoder
+    DP when ``gradient_reduce_div_factor=1``), populated by the backward
+    pass and consumed by ``optimizer.step()``. Snapshot between backward
+    and step so the values aren't yet zeroed.
+    """
+    encoder = mimo_model.modality_submodules[encoder_name].module
+    snap = {}
+    for name, param in encoder.named_parameters():
+        if '.layers.0.' not in name:
+            continue
+        grad = getattr(param, 'main_grad', None)
+        if grad is None:
+            continue
+        snap[name] = grad.detach().clone()
+    return snap
+
+
+def _assert_first_layer_grads_match(ref_snap, dist_snap, rtol=1e-3, atol=1e-3):
+    """First-layer encoder grad oracle: shard-to-shard match between ref and dist.
+
+    Ref and dist use identical encoder TP/DP layout, so for every
+    ``layers.0.*`` encoder parameter their local shards line up 1:1.
+    Under correct grad scaling both main_grads equal the DP=1 gradient,
+    so the per-shard values must match within fp32 precision. Tighter
+    tolerances than the logits oracle are possible because the encoder
+    forward is identical on both sides — only the LLM TP layout differs,
+    and that noise enters via the gradient flowing back into the encoder.
+    """
+    assert set(ref_snap.keys()) == set(dist_snap.keys()), (
+        f"First-layer param name mismatch — "
+        f"ref-only: {set(ref_snap) - set(dist_snap)}, "
+        f"dist-only: {set(dist_snap) - set(ref_snap)}"
+    )
+    mismatches = []
+    for name in sorted(ref_snap):
+        ref_g = ref_snap[name]
+        dist_g = dist_snap[name]
+        assert ref_g.shape == dist_g.shape, (
+            f"Param '{name}': grad shape {tuple(ref_g.shape)} != "
+            f"{tuple(dist_g.shape)} — caller must match encoder TP."
+        )
+        # Every rank holds its own TP shard of this param; all-reduce
+        # across the full world so rank 0 prints the worst-case drift
+        # across all shards.
+        stats = _global_abs_diff_stats(dist_g, ref_g, pg=dist.group.WORLD)
+        _print_from_rank0(
+            f"[grad-diff] {name} shape={tuple(ref_g.shape)} "
+            f"{_fmt_diff_stats(stats)}"
+        )
+        try:
+            torch.testing.assert_close(dist_g, ref_g, rtol=rtol, atol=atol)
+        except AssertionError as e:
+            mismatches.append((name, str(e)))
+
+    if mismatches:
+        rank = dist.get_rank()
+        details = "\n".join(f"  {n}: {msg}" for n, msg in mismatches)
+        raise AssertionError(
+            f"Rank {rank}: {len(mismatches)} first-layer encoder grad(s) "
+            f"diverged between dist and ref:\n{details}"
+        )
+
+
 def _assert_encoder_weights_match(
     ref_module, dist_module, rtol=1e-3, atol=1e-3
 ):
@@ -319,8 +790,8 @@ def _assert_encoder_weights_match(
     layout (same ``enc_tp`` and ``enc_dp``), so each rank's shards line up
     1:1 and can be compared directly. Under correct grad scaling and
     identical initial state, one Adam step yields shard-wise equal post-step
-    weights — modulo bf16 rounding from the LLM TP layout differing between
-    the two models.
+    weights — modulo fp32 TP accumulation-order drift from the LLM TP
+    layout differing between the two models.
     """
     ref_params = dict(ref_module.named_parameters())
 
@@ -330,6 +801,13 @@ def _assert_encoder_weights_match(
         assert ref_param.shape == dist_param.shape, (
             f"Param '{name}': ref.shape={tuple(ref_param.shape)} != "
             f"dist.shape={tuple(dist_param.shape)} — caller must match encoder TP."
+        )
+        stats = _global_abs_diff_stats(
+            dist_param.data, ref_param.data, pg=dist.group.WORLD
+        )
+        _print_from_rank0(
+            f"[weight-diff] {name} shape={tuple(ref_param.shape)} "
+            f"{_fmt_diff_stats(stats)}"
         )
         try:
             torch.testing.assert_close(
@@ -403,7 +881,7 @@ class TestColocatedGradientScalingCorrectness:
     gradient. The reference uses the same encoder TP/DP as dist but with
     ``enc_tp == llm_tp`` and ``enc_dp == llm_dp`` (identity bridge), so
     after one Adam step the dist model's sharded weights match the ref
-    model's sharded weights within bf16 precision.
+    model's sharded weights within fp32 precision.
 
     If the scaling factor were wrong (e.g., dividing by encoder_dp when
     it should be 1), the encoder's reduced grad would be skewed and
@@ -433,8 +911,12 @@ class TestColocatedGradientScalingCorrectness:
         [(2, 4, 4, 2), (4, 2, 2, 4)],
         ids=["fan_in", "fan_out"],
     )
+    @pytest.mark.parametrize(
+        "mask_pattern", ["uniform", "asymmetric"], ids=["uniform", "asymmetric"]
+    )
+    @pytest.mark.parametrize("num_microbatches", [1, 4], ids=["mbs1", "mbs4"])
     def test_dist_matches_dp1_reference_post_step_weights(
-        self, enc_tp, enc_dp, llm_tp, llm_dp
+        self, enc_tp, enc_dp, llm_tp, llm_dp, mask_pattern, num_microbatches
     ):
         """Heterogeneous-DP dist post-step encoder weights match equal-DP reference.
 
@@ -452,13 +934,13 @@ class TestColocatedGradientScalingCorrectness:
         Both models use ``gradient_reduce_div_factor=1``, so the
         num+den mean-CE summed across DP yields the DP=1 gradient on
         every encoder shard. LLM TP differs between the two models,
-        which introduces bf16 accumulation-order drift in the gradient
+        which introduces fp32 TP accumulation-order drift in the gradient
         flowing back to the encoder but does not change the DP=1
         invariant that the post-step encoder oracle checks.
 
         Reference weights are copied into the distributed model so both
         start from identical state. One Adam step later, the dist shards
-        should match the ref shards within bf16 precision.
+        should match the ref shards within fp32 precision.
         """
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -471,7 +953,6 @@ class TestColocatedGradientScalingCorrectness:
         encoder_name = "images"
         hidden_size, seq_length, vocab_size = 256, 64, 1000
         micro_batch_size = 2
-        num_microbatches = 1
 
         # Global batch spans the larger DP side; dist pre-slices per rank
         # before forward_step (which further slices encoder/LLM side).
@@ -509,6 +990,9 @@ class TestColocatedGradientScalingCorrectness:
             vocab_size=vocab_size,
             seq_len=seq_length,
             ddp_config=ddp_config,
+            bf16=False,
+            bias=False,
+            dropout=False,
         )
         dist_mimo.model_type = ModelType.encoder_or_decoder
 
@@ -523,6 +1007,9 @@ class TestColocatedGradientScalingCorrectness:
             vocab_size=vocab_size,
             seq_len=seq_length,
             ddp_config=ddp_config,
+            bf16=False,
+            bias=False,
+            dropout=False,
         )
         ref_mimo.model_type = ModelType.encoder_or_decoder
 
@@ -555,7 +1042,7 @@ class TestColocatedGradientScalingCorrectness:
             lr=1e-4,
             weight_decay=0.01,
             clip_grad=1.0,
-            bf16=True,
+            bf16=False,
             use_distributed_optimizer=True,
         )
         dist_optimizer = get_mimo_optimizer(dist_mimo, opt_config)
@@ -570,6 +1057,7 @@ class TestColocatedGradientScalingCorrectness:
             vocab_size=vocab_size,
             encoder_name=encoder_name,
             num_batches=num_microbatches,
+            mask_pattern=mask_pattern,
         )
         dist_batches = [
             _slice_global_batch_for_dist(b, dist_enc_grid, dist_llm_grid)
@@ -584,56 +1072,124 @@ class TestColocatedGradientScalingCorrectness:
         ]
         ref_per_rank_batch_size = global_batch_size // enc_dp
 
-        # One optimizer step on dist (heterogeneous forward_step slicing).
-        dist_optimizer.zero_grad()
-        _run_forward_backward(
-            mimo_model=dist_mimo,
-            batches=dist_batches,
-            enc_grid=dist_enc_grid,
-            llm_grid=dist_llm_grid,
-            encoder_name=encoder_name,
-            language_pg=dist_language_pg,
-            micro_batch_size=micro_batch_size,
-            seq_length=seq_length,
-            num_microbatches=num_microbatches,
-        )
-        dist_success, dist_grad_norm, _ = dist_optimizer.step()
-        assert dist_success, "Dist optimizer step failed"
-        assert dist_grad_norm is not None and dist_grad_norm > 0, (
-            f"Dist grad_norm={dist_grad_norm} — encoder grads may have been "
-            "silently zeroed by wrong scaling"
-        )
+        # Logits capture: hook fires on every microbatch forward.
+        # Registered before forward/backward, removed right after so the
+        # hook doesn't leak across the second model's run.
+        dist_logits, dist_logits_hook = _register_logits_capture(dist_mimo)
+        ref_logits, ref_logits_hook = _register_logits_capture(ref_mimo)
+        dist_llm_input, dist_input_hook = _register_llm_input_capture(dist_mimo)
+        ref_llm_input, ref_input_hook = _register_llm_input_capture(ref_mimo)
 
-        # One optimizer step on ref (enc_dp == llm_dp → forward_step skips slicing).
-        ref_optimizer.zero_grad()
-        _run_forward_backward(
-            mimo_model=ref_mimo,
-            batches=ref_batches,
-            enc_grid=ref_enc_grid,
-            llm_grid=ref_llm_grid,
-            encoder_name=encoder_name,
-            language_pg=ref_language_pg,
-            micro_batch_size=ref_per_rank_batch_size,
-            seq_length=seq_length,
-            num_microbatches=num_microbatches,
-        )
-        ref_success, ref_grad_norm, _ = ref_optimizer.step()
-        assert ref_success, "Ref optimizer step failed"
-        assert ref_grad_norm is not None and ref_grad_norm > 0, (
-            f"Ref grad_norm={ref_grad_norm}"
-        )
+        try:
+            # One optimizer step on dist (heterogeneous forward_step slicing).
+            dist_optimizer.zero_grad()
+            _run_forward_backward(
+                mimo_model=dist_mimo,
+                batches=dist_batches,
+                enc_grid=dist_enc_grid,
+                llm_grid=dist_llm_grid,
+                encoder_name=encoder_name,
+                language_pg=dist_language_pg,
+                micro_batch_size=micro_batch_size,
+                seq_length=seq_length,
+                num_microbatches=num_microbatches,
+            )
+            # Snapshot encoder first-layer grads AFTER backward and BEFORE
+            # optimizer.step() consumes/zeros the grad buffer.
+            dist_first_layer_grads = _snapshot_first_layer_encoder_grads(
+                dist_mimo, encoder_name
+            )
+            dist_success, dist_grad_norm, _ = dist_optimizer.step()
+            assert dist_success, "Dist optimizer step failed"
+            assert dist_grad_norm is not None and dist_grad_norm > 0, (
+                f"Dist grad_norm={dist_grad_norm} — encoder grads may have been "
+                "silently zeroed by wrong scaling"
+            )
 
-        # Main oracle: post-step encoder shards match between dist and
-        # ref. Pre-step loss is NOT compared: ref and dist share encoder
-        # TP and per-rank encoder batch but diverge on the LLM side
-        # (different llm_tp, different per-rank LLM batch size), so the
-        # LLM forward — and therefore the reduced loss — differs by bf16
-        # accumulation noise. That noise propagates into each model's
-        # encoder gradient, so the post-step comparison uses slightly
-        # looser tolerances than bf16 rounding alone would require.
-        _assert_encoder_weights_match(
-            ref_mimo.modality_submodules[encoder_name].module,
-            dist_mimo.modality_submodules[encoder_name].module,
-            rtol=1e-3,
-            atol=1e-3,
-        )
+            # One optimizer step on ref (enc_dp == llm_dp → forward_step skips slicing).
+            ref_optimizer.zero_grad()
+            _run_forward_backward(
+                mimo_model=ref_mimo,
+                batches=ref_batches,
+                enc_grid=ref_enc_grid,
+                llm_grid=ref_llm_grid,
+                encoder_name=encoder_name,
+                language_pg=ref_language_pg,
+                micro_batch_size=ref_per_rank_batch_size,
+                seq_length=seq_length,
+                num_microbatches=num_microbatches,
+            )
+            ref_first_layer_grads = _snapshot_first_layer_encoder_grads(
+                ref_mimo, encoder_name
+            )
+            ref_success, ref_grad_norm, _ = ref_optimizer.step()
+            assert ref_success, "Ref optimizer step failed"
+            assert ref_grad_norm is not None and ref_grad_norm > 0, (
+                f"Ref grad_norm={ref_grad_norm}"
+            )
+        finally:
+            dist_logits_hook.remove()
+            ref_logits_hook.remove()
+            dist_input_hook.remove()
+            ref_input_hook.remove()
+
+        # Run all three oracles regardless of individual failures so the
+        # diff-stats print covers every layer. Order: encoder weights /
+        # first-layer grads first (tightest — same encoder TP/DP layout
+        # → shards align 1:1), then LLM logits last (loosest — different
+        # LLM TP layout drives fp32 accumulation drift). Each oracle
+        # printed its own min/mean/p95/p99/max before its assertion ran,
+        # so the user sees the full drift distribution for every test.
+        failures = []
+
+        try:
+            _assert_encoder_weights_match(
+                ref_mimo.modality_submodules[encoder_name].module,
+                dist_mimo.modality_submodules[encoder_name].module,
+                rtol=1e-3,
+                atol=1e-3,
+            )
+        except AssertionError as e:
+            failures.append(('encoder_weights', str(e)))
+
+        try:
+            _assert_first_layer_grads_match(
+                ref_first_layer_grads,
+                dist_first_layer_grads,
+                rtol=1e-3,
+                atol=1e-3,
+            )
+        except AssertionError as e:
+            failures.append(('first_layer_grads', str(e)))
+
+        try:
+            _assert_llm_input_match(
+                ref_llm_input,
+                dist_llm_input,
+                ref_llm_grid,
+                dist_llm_grid,
+                rtol=1e-3,
+                atol=1e-3,
+            )
+        except AssertionError as e:
+            failures.append(('llm_input', str(e)))
+
+        try:
+            _assert_llm_logits_match(
+                ref_logits,
+                dist_logits,
+                ref_llm_grid,
+                dist_llm_grid,
+                rtol=1e-2,
+                atol=1e-2,
+            )
+        except AssertionError as e:
+            failures.append(('llm_logits', str(e)))
+
+        if failures:
+            summary = "\n\n".join(
+                f"== {oracle} ==\n{msg}" for oracle, msg in failures
+            )
+            raise AssertionError(
+                f"{len(failures)} oracle(s) failed:\n{summary}"
+            )
