@@ -1015,6 +1015,24 @@ class MambaMixer(MegatronModule):
 
         return y
 
+    def _get_decode_A_neg_exp(self) -> torch.Tensor:
+        """Cached ``-exp(A_log.float())`` for the decode path.
+
+        A_log is frozen during inference; recomputing it per token otherwise
+        launches three small elementwise kernels (float cast, exp, neg) that
+        rival ``selective_state_update`` itself in the decode profile.
+        """
+        cached = getattr(self, "_A_neg_exp_cache", None)
+        if cached is None:
+            cached = -torch.exp(self.A_log.float())
+            self._A_neg_exp_cache = cached
+        return cached
+
+    def train(self, mode: bool = True):
+        """Invalidate the decode A cache when switching modes (weights may update)."""
+        self._A_neg_exp_cache = None
+        return super().train(mode)
+
     def _ssm_decode(
         self,
         zxBCdt: torch.Tensor,
@@ -1093,7 +1111,7 @@ class MambaMixer(MegatronModule):
             ],
             dim=-1,
         )
-        A = -torch.exp(self.A_log.float())
+        A = self._get_decode_A_neg_exp()
 
         # SSM step
         if selective_state_update is None:
@@ -1165,11 +1183,6 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b s (h p) -> b s h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b s (h p) -> b s h p", p=self.headdim)
-
-            # Upcast the batch_indices to prevent integer overflow errors in the case of
-            # large max request counts.
-            if batch_indices is not None:
-                batch_indices = batch_indices.to(torch.int64)
 
             y = selective_state_update(
                 ssm_state,
