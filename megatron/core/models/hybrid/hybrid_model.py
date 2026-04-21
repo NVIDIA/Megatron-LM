@@ -248,7 +248,7 @@ class HybridModel(LanguageModule):
                 ),
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
-            )    
+            )
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
