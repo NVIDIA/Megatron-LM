@@ -102,6 +102,18 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     if "mcore_gpt" in config:
         config["use_mcore_models"] = config["mcore_gpt"]
 
+    if "hybrid_override_pattern" in config:
+       config["hybrid_override_pattern"] = config["hybrid_override_pattern"]
+    if "mamba_head_dim" in config:
+       config["mamba_head_dim"] = config["mamba_head_dim"]
+    if "mamba_num_heads" in config:
+       config["mamba_num_heads"] = config["mamba_num_heads"]
+    if "mamba_state_dim" in config:
+       config["mamba_state_dim"] = config["mamba_state_dim"]
+    config["enable_router"] = False
+    config["flextron"] = False
+    config["freeze_model"] = False
+
     args_dict = vars(get_args()).copy()
     del args_dict["kv_channels"]  # not recalculated if present
     args_dict.update(config)
