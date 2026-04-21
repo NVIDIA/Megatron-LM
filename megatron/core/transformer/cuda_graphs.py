@@ -52,18 +52,20 @@ try:
     from transformer_engine.pytorch.graph import set_capture_start as te_set_capture_start
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
     from transformer_engine.pytorch.utils import make_weak_ref
-    from transformer_engine.pytorch.module.extended_tensor_parallelism import (
-        ETP_CONFIG,
-        ETPChain,
-        get_ag_stream,
-        get_rs_stream,
-        reallocate_etp_cache_to_mempool,
-        wait_async_comms,
-    )
 
     HAVE_TE_GRAPHS = True
 except:
     HAVE_TE_GRAPHS = False
+
+from megatron.core.etp_utils import (
+    ETP_CONFIG,
+    ETPChain,
+    HAVE_ETP,
+    get_ag_stream,
+    get_rs_stream,
+    reallocate_etp_cache_to_mempool,
+    wait_async_comms,
+)
 
 try:
     from tqdm import tqdm
@@ -400,6 +402,10 @@ class _CudagraphGlobalRecord:
                 )
 
         if any(r[0].parameter_sharding for r in cls.cudagraph_record):
+            assert HAVE_ETP, (
+                "parameter_sharding_size > 1 requires the TransformerEngine build with "
+                "extended_tensor_parallelism; current TE install does not expose it."
+            )
             reallocate_etp_cache_to_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
             ETP_CONFIG.check_param_states = False
 

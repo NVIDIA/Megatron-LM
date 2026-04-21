@@ -42,7 +42,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility
-from megatron.core.etp_utils import ETPEmbeddingWeight, wrap_module_params_etp
+from megatron.core.etp_utils import ETPEmbeddingWeight, HAVE_ETP, wrap_module_params_etp
 
 _grad_accum_fusion_available = True
 try:
@@ -271,10 +271,9 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.ps_size = 1
         if ps_group is not None and ps_group.size() > 1:
-            assert wrap_module_params_etp is not None, (
+            assert HAVE_ETP, (
                 "parameter_sharding_size > 1 requires a transformer_engine "
-                "version that exports wrap_module_params_etp "
-                "(transformer_engine.pytorch.module.extended_tensor_parallelism)"
+                "version that exposes the extended_tensor_parallelism module"
             )
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()
@@ -910,10 +909,9 @@ class ColumnParallelLinear(torch.nn.Module):
 
         self.ps_size = 1
         if ps_group is not None and ps_group.size() > 1:
-            assert wrap_module_params_etp is not None, (
+            assert HAVE_ETP, (
                 "parameter_sharding_size > 1 requires a transformer_engine "
-                "version that exports wrap_module_params_etp "
-                "(transformer_engine.pytorch.module.extended_tensor_parallelism)"
+                "version that exposes the extended_tensor_parallelism module"
             )
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()
@@ -1247,10 +1245,9 @@ class RowParallelLinear(torch.nn.Module):
         
         self.ps_size = 1
         if ps_group is not None and ps_group.size() > 1:
-            assert wrap_module_params_etp is not None, (
+            assert HAVE_ETP, (
                 "parameter_sharding_size > 1 requires a transformer_engine "
-                "version that exports wrap_module_params_etp "
-                "(transformer_engine.pytorch.module.extended_tensor_parallelism)"
+                "version that exposes the extended_tensor_parallelism module"
             )
             wrap_module_params_etp(self, ["weight"], ps_group)
             self.ps_size = ps_group.size()

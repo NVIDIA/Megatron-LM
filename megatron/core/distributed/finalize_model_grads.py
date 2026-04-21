@@ -445,20 +445,19 @@ def finalize_model_grads(
     # rs_stream may still be writing to main_grad when finish_grad_sync starts the DP
     # allreduce on main_stream.
     if config.parameter_sharding_size > 1 or config.expert_parameter_sharding_size > 1:
-        try:
-            from transformer_engine.pytorch.module.extended_tensor_parallelism import (
-                get_all_ag_streams,
-                get_all_rs_streams,
-                wait_async_comms,
-            )
+        from megatron.core.etp_utils import (
+            HAVE_ETP,
+            get_all_ag_streams,
+            get_all_rs_streams,
+            wait_async_comms,
+        )
 
+        if HAVE_ETP:
             wait_async_comms()
             for s in get_all_ag_streams():
                 torch.cuda.current_stream().wait_stream(s)
             for s in get_all_rs_streams():
                 torch.cuda.current_stream().wait_stream(s)
-        except ImportError:
-            pass
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:

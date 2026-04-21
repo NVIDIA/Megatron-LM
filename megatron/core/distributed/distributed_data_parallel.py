@@ -10,10 +10,7 @@ from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 
-try:
-    from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
-except ImportError:
-    ETPShardedParam = None
+from megatron.core.etp_utils import ETPShardedParam, HAVE_ETP
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
@@ -132,7 +129,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if not getattr(param, 'allreduce', True):
                 expert_parallel_params.append(param)
-            elif ETPShardedParam is not None and isinstance(param, ETPShardedParam):
+            elif HAVE_ETP and isinstance(param, ETPShardedParam):
                 etp_params.append(param)
             else:
                 dense_params.append(param)
@@ -380,7 +377,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    if ETPShardedParam is not None and isinstance(param, ETPShardedParam):
+                    if HAVE_ETP and isinstance(param, ETPShardedParam):
                         # ETP params: hook is called explicitly from _finalize_wgrad
                         # (after RS wait + gradient accumulation), not from autograd's
                         # grad accumulator (which may never fire for async RS returning None).
@@ -478,7 +475,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 if self.ddp_config.overlap_grad_reduce:
                     # ETP params may have grad=None: wgrad_reduce_scatter returns None
                     # for async RS, and _finalize_wgrad accumulates into main_grad directly.
-                    if not (ETPShardedParam is not None and isinstance(param, ETPShardedParam)):
+                    if not (HAVE_ETP and isinstance(param, ETPShardedParam)):
                         assert (
                             param.grad is not None
                         ), 'param.grad being None is not safe when overlap_grad_reduce is True'

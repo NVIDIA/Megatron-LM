@@ -7,9 +7,42 @@
 import torch
 
 try:
-    from transformer_engine.pytorch.module.extended_tensor_parallelism import wrap_module_params_etp
+    from transformer_engine.pytorch.module.extended_tensor_parallelism import (
+        ETP_CONFIG,
+        ETPChain,
+        ETPShardedParam,
+        classify_etp_chains,
+        get_ag_stream,
+        get_ag_streams_for_chain,
+        get_all_ag_streams,
+        get_all_rs_streams,
+        get_rs_stream,
+        get_rs_streams_for_chain,
+        reallocate_etp_cache_to_mempool,
+        set_cuda_graph_scope,
+        tag_etp_params_with_names,
+        wait_async_comms,
+        wrap_module_params_etp,
+    )
+
+    HAVE_ETP = True
 except ImportError:
+    ETP_CONFIG = None
+    ETPChain = None
+    ETPShardedParam = None
+    classify_etp_chains = None
+    get_ag_stream = None
+    get_ag_streams_for_chain = None
+    get_all_ag_streams = None
+    get_all_rs_streams = None
+    get_rs_stream = None
+    get_rs_streams_for_chain = None
+    reallocate_etp_cache_to_mempool = None
+    set_cuda_graph_scope = None
+    tag_etp_params_with_names = None
+    wait_async_comms = None
     wrap_module_params_etp = None
+    HAVE_ETP = False
 
 
 class ETPEmbeddingWeight(torch.autograd.Function):

@@ -35,10 +35,7 @@ except ImportError:
 
 from megatron.core import parallel_state
 
-try:
-    from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
-except ImportError:
-    ETPShardedParam = None
+from megatron.core.etp_utils import ETPShardedParam, HAVE_ETP
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     ParamGroupOverride,
@@ -168,7 +165,7 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
-            is_etp = ETPShardedParam is not None and isinstance(param, ETPShardedParam)
+            is_etp = HAVE_ETP and isinstance(param, ETPShardedParam)
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (

@@ -48,10 +48,7 @@ from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
-try:
-    from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
-except ImportError:
-    ETPShardedParam = None
+from megatron.core.etp_utils import ETPShardedParam, HAVE_ETP
 
 
 def get_grad_norm_fp32(
@@ -233,7 +230,7 @@ def count_zeros_fp32(
             is_not_ps_duplicate = True
         else:
             is_etp_param = getattr(param, 'is_etp', False) or (
-                ETPShardedParam is not None and isinstance(param, ETPShardedParam)
+                HAVE_ETP and isinstance(param, ETPShardedParam)
             )
             is_not_ps_duplicate = is_etp_param or ps_rank == 0
         if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_ps_duplicate:

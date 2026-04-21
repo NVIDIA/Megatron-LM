@@ -28,27 +28,25 @@ def _drain_etp_side_streams(chain_id: str = None):
         chain_id: ETPChain.GRAPHED.value, ETPChain.UNGRAPHED.value, or None
                   (drain all chains).
     """
-    try:
-        if chain_id is not None:
-            from transformer_engine.pytorch.module.extended_tensor_parallelism import (
-                get_ag_streams_for_chain,
-                get_rs_streams_for_chain,
-            )
-            for s in get_ag_streams_for_chain(chain_id):
-                torch.cuda.current_stream().wait_stream(s)
-            for s in get_rs_streams_for_chain(chain_id):
-                torch.cuda.current_stream().wait_stream(s)
-        else:
-            from transformer_engine.pytorch.module.extended_tensor_parallelism import (
-                get_all_ag_streams,
-                get_all_rs_streams,
-            )
-            for s in get_all_ag_streams():
-                torch.cuda.current_stream().wait_stream(s)
-            for s in get_all_rs_streams():
-                torch.cuda.current_stream().wait_stream(s)
-    except ImportError:
-        pass
+    from megatron.core.etp_utils import (
+        HAVE_ETP,
+        get_ag_streams_for_chain,
+        get_all_ag_streams,
+        get_all_rs_streams,
+        get_rs_streams_for_chain,
+    )
+    if not HAVE_ETP:
+        return
+    if chain_id is not None:
+        for s in get_ag_streams_for_chain(chain_id):
+            torch.cuda.current_stream().wait_stream(s)
+        for s in get_rs_streams_for_chain(chain_id):
+            torch.cuda.current_stream().wait_stream(s)
+    else:
+        for s in get_all_ag_streams():
+            torch.cuda.current_stream().wait_stream(s)
+        for s in get_all_rs_streams():
+            torch.cuda.current_stream().wait_stream(s)
 
 
 

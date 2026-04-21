@@ -1295,13 +1295,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # ETP_ungraphed) based on the configured cuda_graph_scope. Classification
     # must run after the model is built (for named_parameters()) and before
     # the first forward pass (which lazily builds chain links).
-    try:
-        from transformer_engine.pytorch.module.extended_tensor_parallelism import (
-            ETPShardedParam,
-            tag_etp_params_with_names,
-            set_cuda_graph_scope,
-            classify_etp_chains,
-        )
+    from megatron.core.etp_utils import (
+        HAVE_ETP,
+        classify_etp_chains,
+        set_cuda_graph_scope,
+        tag_etp_params_with_names,
+    )
+    if HAVE_ETP:
         # Pass the active scope + moe_shared_expert_overlap flag so the
         # classifier knows which MoE submodules will be captured. Convert
         # args.cuda_graph_scope (list of CudaGraphScope enum members) to the
@@ -1313,8 +1313,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         for model_module in model:
             tag_etp_params_with_names(model_module)
             classify_etp_chains(model_module)
-    except ImportError:
-        pass
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these

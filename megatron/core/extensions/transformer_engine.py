@@ -20,6 +20,7 @@ from typing_extensions import override
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.etp_utils import HAVE_ETP
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -625,9 +626,8 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
-        # if is_te_min_version("2.10.0"):
-        if is_te_min_version("2.10.0") and ps_group is not None:
-            self.etp_size = get_pg_size(ps_group)
+        if HAVE_ETP:
+            self.etp_size = get_pg_size(ps_group) if ps_group is not None else 1
             extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
 
         super().__init__(
@@ -832,9 +832,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        # if is_te_min_version("2.10.0"):
-        if is_te_min_version("2.10.0") and ps_group is not None:
-            self.etp_size = get_pg_size(ps_group)
+        if HAVE_ETP:
+            self.etp_size = get_pg_size(ps_group) if ps_group is not None else 1
             extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
 
         self.stride = stride
@@ -1569,9 +1568,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
-            # if is_te_min_version("2.10.0"):
-            if is_te_min_version("2.10.0") and ps_group is not None:
-                self.etp_size = get_pg_size(ps_group)
+            if HAVE_ETP:
+                self.etp_size = get_pg_size(ps_group) if ps_group is not None else 1
                 extra_kwargs["etp_group"] = ps_group if torch.distributed.is_initialized() else None
 
             super().__init__(

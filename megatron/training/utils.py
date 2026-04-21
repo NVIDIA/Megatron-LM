@@ -43,10 +43,7 @@ from megatron.core.utils import (
 )
 from megatron.legacy.model.module import param_is_not_shared
 
-try:
-    from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
-except ImportError:
-    ETPShardedParam = None
+from megatron.core.etp_utils import ETPShardedParam, HAVE_ETP
 
 
 def _compute_norm_2(params_list):
@@ -114,7 +111,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
     for model_chunk in model:
         for param in model_chunk.parameters():
-            is_etp = ETPShardedParam is not None and isinstance(param, ETPShardedParam)
+            is_etp = HAVE_ETP and isinstance(param, ETPShardedParam)
 
             # Filter TP duplicates. ETP params are always unique across TP ranks
             # so skip this check for them.

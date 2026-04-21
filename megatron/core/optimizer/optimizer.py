@@ -40,10 +40,7 @@ except ImportError:
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 
-try:
-    from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
-except ImportError:
-    ETPShardedParam = None
+from megatron.core.etp_utils import ETPShardedParam, HAVE_ETP
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
@@ -180,7 +177,7 @@ class MegatronOptimizer(ABC):
             is_not_shared = param_is_not_shared(param)
 
             is_etp_param = getattr(param, 'is_etp', False) or (
-                ETPShardedParam is not None and isinstance(param, ETPShardedParam)
+                HAVE_ETP and isinstance(param, ETPShardedParam)
             )
 
             # ETP params are always unique across TP ranks (tensor_model_parallel
@@ -762,12 +759,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
-                            # Create a copy
-                            from transformer_engine.pytorch.module.extended_tensor_parallelism import ETPShardedParam
-
-                                
                             main_param = param.detach().clone().float()
-                            if isinstance(param, ETPShardedParam):
+                            if HAVE_ETP and isinstance(param, ETPShardedParam):
                                 main_param.is_etp = True
                             else:
                                 main_param.is_etp = False
