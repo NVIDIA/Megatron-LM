@@ -675,6 +675,11 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             unit_to_buckets[unit_id].append(bucket_id)
         self.bucket_to_offset = bucket_to_offset
 
+        # --- Fixed Pool Buffering Check ---
+        # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
+        # If not, the allocator cannot provide its intended memory recycling benefits.
+        assert len(double_buffer_units) > 0, "Found no FSDP units to use fixed-size buffering"
+
         if torch.distributed.get_rank() == 0:
             for bucket_id, unit_id in enumerate(bucket_to_unit):
                 if unit_id == -1 or unit_id not in double_buffer_units:
@@ -697,19 +702,15 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.using_buffer = {}  # Map from bucket_id to (buf_group_id, offset) in use.
 
         # Populate the idle buffer pool with all buffer group and bucket offset combinations.
-        # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
-        # If not, the allocator cannot provide its intended memory recycling benefits.
-        assert len(double_buffer_units) > 0, "Found no FSDP units to use fixed-size buffering"
         # All double-buffer units must have the same bucket count so a single pool shape
         # works for every unit the caller remapped onto it.
         bucket_counts = {len(unit_to_buckets[u]) for u in double_buffer_units}
-        assert len(bucket_counts) == 1, (
-            f"Double-buffer units have inconsistent bucket counts: "
-            f"{ {u: len(unit_to_buckets[u]) for u in double_buffer_units} }"
-        )
-        num_bucket = bucket_counts.pop()
+        assert (
+            len(bucket_counts) == 1
+        ), f"Double-buffer units have inconsistent bucket counts: {bucket_counts}"
+        num_buckets_per_double_buffer_unit = bucket_counts.pop()
         for buf_group_id in range(self.size):  # Iterate over each buffer group in the pool.
-            for offset in range(num_bucket):
+            for offset in range(num_buckets_per_double_buffer_unit):
                 self.idle_buffer.append((buf_group_id, offset))
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
