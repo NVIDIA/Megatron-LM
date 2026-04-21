@@ -41,7 +41,6 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
 
     if split == Split.valid and args.full_validation:
-        # Use specialized sampler for full validation that handles small datasets
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
             data_parallel_rank=mpu.get_data_parallel_rank(),
