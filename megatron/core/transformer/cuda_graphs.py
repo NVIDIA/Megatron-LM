@@ -268,10 +268,6 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
     if not hasattr(base_module, "layer_number"):
         return True, True
 
-    # MTP layers are self-contained; don't chain them with decoder layers.
-    if getattr(base_module, 'is_mtp_layer', False):
-        return True, True
-
     # find all first/last layers of this PP stage
     first_layer_numbers = []
     last_layer_numbers = []
