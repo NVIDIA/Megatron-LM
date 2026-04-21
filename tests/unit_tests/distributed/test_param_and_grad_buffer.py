@@ -10,7 +10,10 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import partition_buckets
+from megatron.core.distributed.param_and_grad_buffer import (
+    _compute_tail_shrink_close_set,
+    partition_buckets,
+)
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
 
@@ -669,3 +672,219 @@ class TestFP32LocalGradAccumulation:
                 )
 
         Utils.destroy_model_parallel()
+
+
+class TestLastBucketScaleFactor:
+    """Tests for the ``bucket_size_last_bucket_scale_factor`` option, which shrinks the
+    exposed reduce-scatter at the end of backward by shifting params out of the final
+    bucket into the preceding bucket."""
+
+    @staticmethod
+    def _fake_params(sizes, shared_embedding_last=False):
+        out = []
+        for i, sz in enumerate(sizes):
+            p = torch.nn.Parameter(torch.zeros(sz), requires_grad=False)
+            if shared_embedding_last and i == len(sizes) - 1:
+                p.shared_embedding = True
+            out.append((p, f"p{i}"))
+        return out
+
+    @staticmethod
+    def _no_own_bucket(p):
+        return False
+
+    @staticmethod
+    def _shared_embedding_own_bucket(p):
+        return getattr(p, 'shared_embedding', False)
+
+    def test_noop_when_scale_factor_is_one(self):
+        params = self._fake_params([100] * 10)
+        assert (
+            _compute_tail_shrink_close_set(
+                params_with_names=params,
+                bucket_size=200,
+                scale_factor=1.0,
+                has_nvfp4_params=False,
+                requires_own_bucket_fn=self._no_own_bucket,
+            )
+            is None
+        )
+
+    def test_noop_when_bucket_size_is_none(self):
+        params = self._fake_params([100] * 5)
+        assert (
+            _compute_tail_shrink_close_set(
+                params_with_names=params,
+                bucket_size=None,
+                scale_factor=0.5,
+                has_nvfp4_params=False,
+                requires_own_bucket_fn=self._no_own_bucket,
+            )
+            is None
+        )
+
+    def test_shared_embedding_disables_feature(self):
+        # With shared-embedding + distopt, the last bucket is forced to be the shared
+        # embedding param alone; shrinking the bucket before it would not reduce the
+        # exposed tail. The helper must no-op in this case.
+        params = self._fake_params([100] * 5, shared_embedding_last=True)
+        assert (
+            _compute_tail_shrink_close_set(
+                params_with_names=params,
+                bucket_size=200,
+                scale_factor=0.5,
+                has_nvfp4_params=False,
+                requires_own_bucket_fn=self._shared_embedding_own_bucket,
+            )
+            is None
+        )
+
+    def test_split_case_carves_small_tail_from_last_full_bucket(self):
+        # 10 params of 100, bucket_size=200 -> default layout [200]*5 (tail=0).
+        # scale=0.5 -> target=100. Shifting the last close from iter 9 to iter 8 carves
+        # a new 100-elem tail off the last full bucket, giving [200]*4 + [100, 100].
+        params = self._fake_params([100] * 10)
+        assert _compute_tail_shrink_close_set(
+            params_with_names=params,
+            bucket_size=200,
+            scale_factor=0.5,
+            has_nvfp4_params=False,
+            requires_own_bucket_fn=self._no_own_bucket,
+        ) == {1, 3, 5, 7, 8}
+
+    def test_extend_case_absorbs_tail_into_penultimate(self):
+        # 12 params of 100, bucket_size=500 -> default layout [500, 500, 200].
+        # scale=0.2 -> target=100. Spread would overshoot (uniform threshold 550 closes
+        # each bucket at 600, leaving no tail), so the feature falls back to moving params
+        # only into the preceding bucket: shift last close from iter 9 to iter 10, giving
+        # [500, 600, 100].
+        params = self._fake_params([100] * 12)
+        assert _compute_tail_shrink_close_set(
+            params_with_names=params,
+            bucket_size=500,
+            scale_factor=0.2,
+            has_nvfp4_params=False,
+            requires_own_bucket_fn=self._no_own_bucket,
+        ) == {4, 10}
+
+    def test_spread_case_distributes_surplus_evenly(self):
+        # 100 params of 10, bucket_size=100 -> default layout [100]*10 (tail=0, 10 buckets).
+        # scale=0.2 -> target=20. Spread threshold = (1000-20)/9 ≈ 108.89, which closes
+        # every bucket at 110 elements (11 params). Expected layout: [110]*9 + [10] — every
+        # non-last bucket uniformly grows by 10, and a 10-elem tail is carved off. This is
+        # the regime where spread dominates penultimate-only (which would produce
+        # [100]*9 + [90, 10] — asymmetric).
+        params = self._fake_params([10] * 100)
+        expected = {10, 21, 32, 43, 54, 65, 76, 87, 98}
+        assert (
+            _compute_tail_shrink_close_set(
+                params_with_names=params,
+                bucket_size=100,
+                scale_factor=0.2,
+                has_nvfp4_params=False,
+                requires_own_bucket_fn=self._no_own_bucket,
+            )
+            == expected
+        )
+
+    def test_noop_when_single_param_fills_last_bucket(self):
+        # 3 params of 100, bucket_size=100 -> default [100]*3 (tail=0).
+        # Splitting any param below target=50 is impossible (each param is 100). No-op.
+        params = self._fake_params([100] * 3)
+        assert (
+            _compute_tail_shrink_close_set(
+                params_with_names=params,
+                bucket_size=100,
+                scale_factor=0.5,
+                has_nvfp4_params=False,
+                requires_own_bucket_fn=self._no_own_bucket,
+            )
+            is None
+        )
+
+    def test_noop_when_moving_tail_would_inflate_penultimate(self):
+        # 9 params of 100, bucket_size=200 -> default [200]*4 + [100], tail=100.
+        # scale=0.4 -> target=80. The only way to shrink the 100-elem tail is to move
+        # the sole tail param into the penultimate, eliminating the tail and pushing
+        # the new last bucket (the extended penultimate) to 300 elements — strictly
+        # worse. Helper must detect this and no-op.
+        params = self._fake_params([100] * 9)
+        assert (
+            _compute_tail_shrink_close_set(
+                params_with_names=params,
+                bucket_size=200,
+                scale_factor=0.4,
+                has_nvfp4_params=False,
+                requires_own_bucket_fn=self._no_own_bucket,
+            )
+            is None
+        )
+
+    def test_noop_when_default_tail_already_meets_target(self):
+        # 11 params of 100, bucket_size=200 -> default [200]*5 + [100], tail=100.
+        # scale=0.5 -> target=100. Default tail already meets target; no shift.
+        params = self._fake_params([100] * 11)
+        assert (
+            _compute_tail_shrink_close_set(
+                params_with_names=params,
+                bucket_size=200,
+                scale_factor=0.5,
+                has_nvfp4_params=False,
+                requires_own_bucket_fn=self._no_own_bucket,
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "scale_factor,num_layers,bucket_size,expected_numel_per_bucket",
+        [
+            # scale=1.0 preserves default behavior — proves the feature is off-by-default
+            # through the full DDP stack.
+            (1.0, 10, 200, [200, 200, 200, 200, 200]),
+            # scale<1.0 triggers the feature — proves the close set wires through to the
+            # actual bucket layout. The no-op and EXTEND branches are covered by the unit
+            # tests above; one passing integration case is enough to prove wiring.
+            (0.5, 10, 200, [200, 200, 200, 200, 100, 100]),
+        ],
+    )
+    def test_end_to_end_bucket_layout(
+        self, scale_factor, num_layers, bucket_size, expected_numel_per_bucket
+    ):
+        """End-to-end check: configured DDP produces the expected bucket layout."""
+        Utils.initialize_model_parallel()
+        # use_distributed_optimizer=False skips per-param and per-bucket padding, so the
+        # bucket numels match the raw param counts exactly. input_dim=output_dim=10 with
+        # no bias gives a 100-elem weight per layer.
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=False,
+            overlap_grad_reduce=True,
+            bucket_size=bucket_size,
+            bucket_size_last_bucket_scale_factor=scale_factor,
+        )
+        module = TestModel(
+            input_dim=10, output_dim=10, num_layers=num_layers, bias=False, shared_embedding=False
+        ).bfloat16()
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config=ddp_config,
+            module=module,
+        )
+        buf = model.buffers[0]
+        actual = [b.numel_unpadded for b in buf.buckets]
+        assert actual == expected_numel_per_bucket, (
+            f"scale_factor={scale_factor}, bucket_size={bucket_size}, "
+            f"num_layers={num_layers}: expected {expected_numel_per_bucket}, got {actual}"
+        )
+        Utils.destroy_model_parallel()
+
+    # Lower boundary 0.0 is excluded; just-above upper boundary 1.01 is out of range.
+    @pytest.mark.parametrize("invalid_value", [0.0, 1.01])
+    def test_config_validation_rejects_out_of_range(self, invalid_value):
+        with pytest.raises(AssertionError):
+            DistributedDataParallelConfig(bucket_size_last_bucket_scale_factor=invalid_value)
+
+    # Middle and upper-boundary (inclusive) values must be accepted.
+    @pytest.mark.parametrize("valid_value", [0.5, 1.0])
+    def test_config_validation_accepts_valid_range(self, valid_value):
+        DistributedDataParallelConfig(bucket_size_last_bucket_scale_factor=valid_value)

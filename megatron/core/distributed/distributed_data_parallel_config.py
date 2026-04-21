@@ -54,6 +54,24 @@ class DistributedDataParallelConfig:
        message size (which for ring algorithms is bucket_size / dp_size) apparently needs
        to be divisible by a power of 2 for high busbw."""
 
+    bucket_size_last_bucket_scale_factor: float = 1.0
+    """Scale factor in (0.0, 1.0] applied to bucket_size to cap the size of the final bucket.
+       Since params are bucketed in reverse model order, the final bucket contains the
+       earliest-in-model parameters and its reduce-scatter fires at the end of backward with
+       no remaining compute to overlap with — it is fully exposed. Setting this below 1.0
+       redistributes params out of the final bucket into earlier buckets, reducing exposed
+       communication.
+
+       The default strategy is SPREAD: raise the close threshold uniformly so every non-last
+       bucket absorbs a roughly equal share of the surplus, keeping the layout uniform. This
+       is more robust than piling the surplus into the penultimate bucket alone, which could
+       make that bucket's RS extend past the remaining backward window and itself become
+       exposed. When spread cannot land cleanly against indivisible param boundaries the
+       feature falls back to moving params only into the preceding bucket. It automatically
+       no-ops when no adjustment can reduce the exposed tail (e.g. tail is a single large
+       indivisible param) or when shared-embedding parameters force their own bucket.
+       Defaults to 1.0 (no shrinking)."""
+
     reduce_scatter_with_fp32_accumulation: bool = False
     """If true, use a reduce-scatter implementation which sends lower-precision values
        over the wire (using an all-to-all to keep total communication overhead in line
@@ -225,3 +243,8 @@ class DistributedDataParallelConfig:
                 "Only need to explicitly specify param_name patterns for FP32 local accumulation "
                 "if .main_grads aren't already in FP32"
             )
+
+        assert 0.0 < self.bucket_size_last_bucket_scale_factor <= 1.0, (
+            "bucket_size_last_bucket_scale_factor must be in (0.0, 1.0], got "
+            f"{self.bucket_size_last_bucket_scale_factor}"
+        )
