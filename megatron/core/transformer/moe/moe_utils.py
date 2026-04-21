@@ -776,7 +776,7 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            return torch.topk(scores, k=topk, dim=1)
+            return torch.topk(scores, k=topk, dim=1, sorted=False)
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active

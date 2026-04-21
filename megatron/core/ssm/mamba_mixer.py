@@ -1016,21 +1016,42 @@ class MambaMixer(MegatronModule):
         return y
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
-        """Cached ``-exp(A_log.float())`` for the decode path.
+        """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
 
         A_log is frozen during inference; recomputing it per token otherwise
         launches three small elementwise kernels (float cast, exp, neg) that
-        rival ``selective_state_update`` itself in the decode profile.
+        rival ``selective_state_update`` itself in the decode profile. The
+        expand()-view carries stride 0 on headdim and dstate, which the kernel's
+        TIE_HDIM fast path relies on.
         """
         cached = getattr(self, "_A_neg_exp_cache", None)
         if cached is None:
-            cached = -torch.exp(self.A_log.float())
+            base = -torch.exp(self.A_log.float())
+            cached = base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
             self._A_neg_exp_cache = cached
         return cached
 
+    def _get_decode_dt_bias_expanded(self) -> torch.Tensor:
+        """Cached ``dt_bias`` expanded to ``(nheads, headdim)`` for decode."""
+        cached = getattr(self, "_dt_bias_expanded_cache", None)
+        if cached is None:
+            cached = self.dt_bias.unsqueeze(-1).expand(-1, self.headdim)
+            self._dt_bias_expanded_cache = cached
+        return cached
+
+    def _get_decode_D_expanded(self) -> torch.Tensor:
+        """Cached ``D`` expanded to ``(nheads, headdim)`` for decode."""
+        cached = getattr(self, "_D_expanded_cache", None)
+        if cached is None:
+            cached = self.D.unsqueeze(-1).expand(-1, self.headdim)
+            self._D_expanded_cache = cached
+        return cached
+
     def train(self, mode: bool = True):
-        """Invalidate the decode A cache when switching modes (weights may update)."""
+        """Invalidate decode caches when switching modes (weights may update)."""
         self._A_neg_exp_cache = None
+        self._dt_bias_expanded_cache = None
+        self._D_expanded_cache = None
         return super().train(mode)
 
     def _ssm_decode(
@@ -1111,10 +1132,10 @@ class MambaMixer(MegatronModule):
             ],
             dim=-1,
         )
-        A = self._get_decode_A_neg_exp()
-
         # SSM step
         if selective_state_update is None:
+            # Fallback uses 1D A; the decode cache is pre-expanded for Triton.
+            A = -torch.exp(self.A_log.float())
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
 
@@ -1172,17 +1193,17 @@ class MambaMixer(MegatronModule):
 
             y = y.unsqueeze(1)  # Restore seq dimension
         else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+            A = self._get_decode_A_neg_exp()
+            dt_bias = self._get_decode_dt_bias_expanded()
+            D = self._get_decode_D_expanded()
 
-            # Incorporate sequence dimension in einops rearrengements
-            dt = repeat(dt, "b s h -> b s h p", p=self.headdim)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
-            D = repeat(self.D, "h -> h p", p=self.headdim)
-            B = rearrange(B, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
-            C = rearrange(C, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
-            x_reshaped = rearrange(x, "b s (h p) -> b s h p", p=self.headdim)
+            # Reshape/broadcast inputs for the Triton kernel
+            dt = dt.unsqueeze(-1).expand(-1, -1, -1, self.headdim)
+            B = B.view(*B.shape[:-1], self.ngroups_local_tp, self.d_state)
+            C = C.view(*C.shape[:-1], self.ngroups_local_tp, self.d_state)
+            x_reshaped = x.view(*x.shape[:-1], self.nheads_local_tp, self.headdim)
             if not self.rmsnorm:
-                z = rearrange(z, "b s (h p) -> b s h p", p=self.headdim)
+                z = z.view(*z.shape[:-1], self.nheads_local_tp, self.headdim)
 
             y = selective_state_update(
                 ssm_state,
