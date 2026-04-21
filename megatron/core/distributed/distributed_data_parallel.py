@@ -69,6 +69,29 @@ class DistributedDataParallel(_BaseDataParallel):
             ddp_config.bucket_size = None
 
         self.ddp_config = ddp_config
+
+        # Validate the gradient_reduce_div_factor override upfront so bad
+        # values fail fast at DDP construction instead of silently producing
+        # wrong-scaled grads downstream.
+        div_override = ddp_config.gradient_reduce_div_factor
+        if div_override is not None:
+            if type(div_override) is not int or div_override < 1:
+                raise ValueError(
+                    "DistributedDataParallelConfig.gradient_reduce_div_factor "
+                    f"must be a positive int, got {div_override!r} "
+                    f"(type={type(div_override).__name__})."
+                )
+            if config.calculate_per_token_loss:
+                # Per-token loss forces scaling_factor=1.0 and does the
+                # final division externally via ``finalize_model_grads``.
+                # Layering an explicit div factor on top is ambiguous and
+                # almost certainly a bug — refuse the combination.
+                raise ValueError(
+                    "gradient_reduce_div_factor cannot be combined with "
+                    "config.calculate_per_token_loss=True; the per-token "
+                    "loss path pins scaling_factor=1.0 and divides externally."
+                )
+
         log_single_rank(
             logger,
             logging.INFO,
