@@ -5,7 +5,7 @@
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch.distributed as dist
 
@@ -68,6 +68,42 @@ class RankRole:
     mode: ModuleLayout = ModuleLayout.COLOCATED
 
     @classmethod
+    def build(
+        cls,
+        modality_module_names: List[str],
+        module_to_grid_map: Optional[Dict[str, 'HyperCommGrid']] = None,
+    ) -> 'RankRole':
+        """Construct a RankRole from modality names and an optional grid map.
+
+        This is the unified entry point — callers pass the same first
+        argument (``modality_module_names``) in both colocated and
+        non-colocated cases and let ``build`` dispatch based on what the
+        grid map says:
+
+            * ``module_to_grid_map is None`` → COLOCATED with no grid
+              (legacy global parallel_state). Every module lives on
+              every rank.
+            * All grids span the same ranks (same ``rank_offset`` +
+              ``size``) → COLOCATED across the shared rank range.
+              Per-bridge ``ColocatedBridgeCommunicator`` instances
+              handle heterogeneous TP/DP on the MimoModel side.
+            * Grids differ → NON_COLOCATED; delegate to
+              ``from_grid_map`` to pick up PP-stage info for each
+              module this rank participates in.
+        """
+        if module_to_grid_map is None or cls._all_grids_colocated(module_to_grid_map):
+            return cls.colocated(modality_module_names)
+        return cls.from_grid_map(module_to_grid_map, modality_module_names)
+
+    @staticmethod
+    def _all_grids_colocated(module_to_grid_map: Dict[str, 'HyperCommGrid']) -> bool:
+        grids = list(module_to_grid_map.values())
+        first = grids[0]
+        return all(
+            g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:]
+        )
+
+    @classmethod
     def colocated(cls, modality_module_names: List[str]) -> 'RankRole':
         """Create a role for colocated layout: every module on every rank, PP=1.
 
@@ -75,6 +111,9 @@ class RankRole:
             modality_module_names: Modality module names (e.g. ``["images",
                 "audio"]``). The language model key is appended automatically
                 so the arg shape matches ``from_grid_map``.
+
+        Prefer ``RankRole.build`` unless you specifically need the colocated
+        factory without the grid-map dispatch.
         """
         all_module_names = list(modality_module_names) + [MIMO_LANGUAGE_MODULE_KEY]
         return cls(
@@ -105,6 +144,9 @@ class RankRole:
         Raises:
             ValueError: If grid map keys don't match expected module names.
             RuntimeError: If current rank is not in any module grid.
+
+        Prefer ``RankRole.build`` unless you specifically need the non-colocated
+        factory without the grid-map dispatch.
         """
         # Validate keys
         expected_keys = set(modality_module_names) | {MIMO_LANGUAGE_MODULE_KEY}

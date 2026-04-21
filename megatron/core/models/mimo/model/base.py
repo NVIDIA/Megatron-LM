@@ -61,14 +61,12 @@ class MimoModel(MegatronModule):
         self.mimo_config = mimo_config
         modality_names = list(mimo_config.modality_submodules_spec.keys())
         self.colocated_comms = {}
-        if mimo_config.module_to_grid_map and not self._is_colocated(
-            mimo_config.module_to_grid_map
-        ):
-            self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
-        else:
-            self.role = RankRole.colocated(modality_names)
-            if mimo_config.module_to_grid_map:
-                self._build_colocated_communicators()
+        # Single dispatch point for both colocated and non-colocated layouts.
+        self.role = RankRole.build(modality_names, mimo_config.module_to_grid_map)
+        if self.role.mode is ModuleLayout.COLOCATED and mimo_config.module_to_grid_map:
+            # Per-encoder bridge needed iff modules share ranks but may differ
+            # in TP/DP within those ranks.
+            self._build_colocated_communicators()
 
         # Use special token IDs from the config
         self.special_token_ids = (
@@ -496,13 +494,6 @@ class MimoModel(MegatronModule):
             return {lang_name: lm_output}
 
         return lm_output
-
-    @staticmethod
-    def _is_colocated(module_to_grid_map):
-        """Check if all grids span the same ranks (colocated)."""
-        grids = list(module_to_grid_map.values())
-        first = grids[0]
-        return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
 
     def _build_colocated_communicators(self):
         grid_map = self.mimo_config.module_to_grid_map
