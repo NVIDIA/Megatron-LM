@@ -128,17 +128,6 @@ def main(
             "NCCL_DEBUG_FILE": "/opt/megatron-lm/assets_dir/logs/nccl_debug.log",
             "HF_HOME": "/mnt/hf_home",
             "TRANSFORMERS_OFFLINE": "1",
-            "NCCL_PROTO": "simple",
-            "NCCL_ALGO": "Ring",
-            "NCCL_COLLNET_ENABLE": "0",
-            "NCCL_NVLS_ENABLE": "0",
-            # Disable the EFA tuner plugin so NCCL_ALGO/NCCL_PROTO are
-            # actually respected instead of being overridden at runtime.
-            "NCCL_TUNER_PLUGIN": "",
-            # Match the NCCL default (4 MB) so buffer-chunking behaviour
-            # is the same as on Slurm nodes.
-            "NCCL_BUFFSIZE": "4194304",
-            "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
         },
         packager=run.Packager(),
         volumes=artifacts,
