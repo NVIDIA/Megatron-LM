@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Disable nvidia-resiliency-ext (incompatible with some container PyTorch versions)
+export DISABLE_NVRX=1
+
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # Common arguments and base model specific arguments
