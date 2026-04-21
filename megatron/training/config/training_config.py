@@ -16,21 +16,21 @@ class TrainingConfig:
     data-parallel-size. If this value is None, then use micro-batch-size * data-parallel-size
     as the global batch size. This choice will result in 1 for number of micro-batches."""
 
-    rampup_batch_size: list[int] | None = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
-    """Batch size ramp up with the following values: <start batch size>, <batch size increment>,
-    <ramp-up samples>
-    For example:
-        rampup-batch-size = [16, 8, 300000]
-        global-batch-size 1024
-    will start with global batch size 16 and over (1024 - 16) / 8 = 126 intervals will increase
-    the batch size linearly to 1024. In each interval we will use approximately
-    300000 / 126 = 2380 samples.
+    step_batch_size_schedule: str | None = None
+    """Step-wise batch size schedule in format "THRESHOLD:BS THRESHOLD:BS ...".
+    Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+    If sequence length is provided, thresholds are interpreted as tokens; otherwise as samples.
+    Example:
+        step_batch_size_schedule = "0:768 250B:1536 500B:3072 750B:6144"
+    Cannot be used together with decrease_batch_size_if_needed.
     """
+
 
     decrease_batch_size_if_needed: bool = False
     """If set, decrease batch size if microbatch_size * dp_size does not 
     divide batch_size. Old batch_size will be restored if training is re-started 
-    with dp_size that divides batch_size // microbatch_size."""
+    with dp_size that divides batch_size // microbatch_size. Not supported with
+    step-batch-size-schedule."""
 
     empty_unused_memory_level: Literal[0, 1, 2] = 0
     """Call torch.cuda.empty_cache() each iteration (training and eval), to reduce fragmentation.
@@ -101,6 +101,23 @@ class ValidationConfig:
     eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
     during training.
+    """
+
+    start_eval_at_iter: int | None = None
+    """If set, evaluation will only start after this iteration number. Useful for skipping
+    evaluation during early training iterations when the model is not yet meaningful.
+    If not set, evaluation starts from the first eval_interval.
+    """
+
+    eval_global_batch_size: int | None = None
+    """Global batch size to use during evaluation. If not set, defaults to global_batch_size.
+    Must be divisible by (eval_micro_batch_size * data_parallel_size).
+    """
+
+    eval_micro_batch_size: int | None = None
+    """Micro batch size to use during evaluation. If not set, defaults to micro_batch_size.
+    Changing this affects per-device memory usage during eval and the number of microbatches per
+    eval step.
     """
 
     skip_train: bool = False
@@ -335,6 +352,15 @@ class CheckpointConfig:
     save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
     """Number of iterations between persistent checkpoint saves."""
 
+    save_params_interval: int | None = None
+    """Number of iterations between param.name->param.data mapping saves."""
+
+    save_activations_interval: int | None = None
+    """Number of iterations between act.name->act.data mapping saves."""
+
+    save_tokens_per_expert_interval: int | None = None
+    """Number of iterations between tokens-per-expert routing metadata saves."""
+
     save_wgrads_interval: int | None = None
     """Number of iterations between wgrad (main_grad) saves."""
 
@@ -459,6 +485,12 @@ class CheckpointConfig:
 
     async_ckpt_io_priority: Optional[int] = 3
     """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process."""
+
+    async_ckpt_use_cpu_shm: bool = False
+    """Copy GPU tensors to CPU shared-memory in the training process before handing off to
+    the async checkpoint worker. Avoids CUDA IPC / NVLink fabric handles in the worker
+    subprocess. Useful on MNNVL systems where fabric resources are exhausted.
+    Only applies with the nvrx async strategy."""
 
     fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""

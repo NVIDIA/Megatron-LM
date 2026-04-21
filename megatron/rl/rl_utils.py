@@ -460,7 +460,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         request = GroupedRolloutRequest(
-            num_groups=args.rl_generation_batch_size,
+            num_groups=args.rl_generation_batch_size if streaming else n_prompts,
             streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
@@ -801,8 +801,8 @@ def compute_group_stats(
             group_traj_lengths.append(sum(roll_turn_lens))
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
             assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
-            group_policy_epoch.append(min(turn[0][1] for turn in rollout.policy_epoch))
-            group_kv_epoch.append(min(turn[0][1] for turn in rollout.kv_cache_epoch))
+            group_policy_epoch.append([epoch for turn in rollout.policy_epoch for _, epoch in turn])
+            group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
             group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_epoch.append(group_policy_epoch)
@@ -852,8 +852,8 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
-        policy_epoch: List[List[int]],
-        kv_cache_epoch: List[List[int]],
+        policy_epoch: List[List[List[int]]],
+        kv_cache_epoch: List[List[List[int]]],
         completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
         current_iteration: int,
@@ -870,8 +870,8 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        policy_epoch: Grouped list of per-rollout min policy epoch stamps.
-        kv_cache_epoch: Grouped list of per-rollout min KV cache epoch stamps.
+        policy_epoch: Grouped list of per-token policy epoch stamps.
+        kv_cache_epoch: Grouped list of per-token KV cache epoch stamps.
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
         current_iteration: Current training iteration.
@@ -884,8 +884,15 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    true_policy_staleness = [current_iteration - s for g in policy_epoch for s in g]
-    true_kv_staleness = [current_iteration - s for g in kv_cache_epoch for s in g]
+    # Per-rollout staleness (oldest token)
+    rollout_policy_staleness = [current_iteration - r[0] for g in policy_epoch for r in g]
+    rollout_kv_staleness = [current_iteration - r[0] for g in kv_cache_epoch for r in g]
+    # Per-rollout staleness (newest token)
+    rollout_policy_last_token_staleness = [current_iteration - r[-1] for g in policy_epoch for r in g]
+    rollout_kv_last_token_staleness = [current_iteration - r[-1] for g in kv_cache_epoch for r in g]
+    # Per-token staleness
+    per_token_policy_staleness = [current_iteration - e for g in policy_epoch for r in g for e in r]
+    per_token_kv_staleness = [current_iteration - e for g in kv_cache_epoch for r in g for e in r]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -907,12 +914,25 @@ def prep_wandb_metrics(
                 'advantages', 'Advantages'
             ),
             'rollout_table': wandb_writer.Table(
-                columns=['reward', 'traj_length', 'num_evictions'],
+                columns=[
+                    'reward', 'traj_length', 'num_evictions',
+                    'policy_staleness', 'kv_staleness',
+                    'policy_last_token_staleness', 'kv_last_token_staleness',
+                ],
                 data=list(zip(
                     [r for g in rewards for r in g],
                     [l for g in traj_lens for l in g],
                     [e for g in num_evictions for e in g],
+                    rollout_policy_staleness,
+                    rollout_kv_staleness,
+                    rollout_policy_last_token_staleness,
+                    rollout_kv_last_token_staleness,
                 )),
+            ),
+            # NOTE: This table can get very large (one row per token across all rollouts).
+            'per_token_table': wandb_writer.Table(
+                columns=['policy_staleness', 'kv_staleness'],
+                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
             ),
             'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
             'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
@@ -929,15 +949,29 @@ def prep_wandb_metrics(
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
-            'mean_policy_staleness': np.mean(true_policy_staleness),
-            'max_policy_staleness': max(true_policy_staleness),
-            'min_policy_staleness': min(true_policy_staleness),
-            'mean_kv_cache_staleness': np.mean(true_kv_staleness),
-            'max_kv_cache_staleness': max(true_kv_staleness),
-            'min_kv_cache_staleness': min(true_kv_staleness),
+            'mean_policy_staleness': np.mean(rollout_policy_staleness),
+            'max_policy_staleness': max(rollout_policy_staleness),
+            'min_policy_staleness': min(rollout_policy_staleness),
+            'mean_kv_cache_staleness': np.mean(rollout_kv_staleness),
+            'max_kv_cache_staleness': max(rollout_kv_staleness),
+            'min_kv_cache_staleness': min(rollout_kv_staleness),
+            'mean_policy_last_token_staleness': np.mean(rollout_policy_last_token_staleness),
+            'max_policy_last_token_staleness': max(rollout_policy_last_token_staleness),
+            'min_policy_last_token_staleness': min(rollout_policy_last_token_staleness),
+            'mean_kv_cache_last_token_staleness': np.mean(rollout_kv_last_token_staleness),
+            'max_kv_cache_last_token_staleness': max(rollout_kv_last_token_staleness),
+            'min_kv_cache_last_token_staleness': min(rollout_kv_last_token_staleness),
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
+            'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
+                'staleness', 'Per-Token Policy Staleness'
+            ),
+            'per_token_kv_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
+                'staleness', 'Per-Token KV Cache Staleness'
+            ),
     }
     if example_group:
         if tokenizer is None:
@@ -1467,9 +1501,8 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=args.global_batch_size, 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=args.global_batch_size,
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                )
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
@@ -1494,9 +1527,8 @@ def prepare_data_for_update(
 
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled), 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled),
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
@@ -1515,14 +1547,6 @@ def prepare_data_for_update(
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
-
-        with nvtx_range("rl/log-wandb-tb", time=True):
-            maybe_log_training_metrics(
-                group_stats=group_stats,
-                current_iteration=args.curr_iteration,
-                tokenizer=tokenizer,
-                example_groups=example_groups,
-            )
 
     return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
