@@ -112,7 +112,8 @@ class TestMTPCudaGraphInference:
             post_process=True,
             mtp_block_spec=mtp_block_spec,
         ).cuda()
-        model = model.to(config.params_dtype)
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
         model.eval()
         return model
 
@@ -715,7 +716,8 @@ class TestMTPCudaGraphExpertParallel:
             post_process=True,
             mtp_block_spec=mtp_block_spec,
         ).cuda()
-        model = model.to(config.params_dtype)
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
         model.eval()
         return model
 
