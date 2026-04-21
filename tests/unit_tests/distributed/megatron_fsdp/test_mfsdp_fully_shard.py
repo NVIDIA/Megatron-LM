@@ -234,179 +234,230 @@ class TestMegatronFsdpFullyShard:
     """
 
     FULLY_SHARD_CASES = [
+        # Transformer base sharding coverage (TP=1 always).
         pytest.param(
             dict(
-                model_type=CNN,
-                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                model_type=TRANSFORMER,
+                dp_shard_strategy=NO_SHARD,
                 dp_outer_strategy=None,
-                mesh_dim_config=(2, 2, 2, 1),
+                mesh_dim_config=(1, 4, 1, 1),
                 preserve_fp32_weights=False,
                 init_model_with_meta_device=False,
                 torch_compile=False,
             ),
-            id="baseline-cnn-zero3-cp2",
+            id="transformer-ddp",
+        ),
+        pytest.param(
+            dict(
+                model_type=TRANSFORMER,
+                dp_shard_strategy=OPTIM,
+                dp_outer_strategy=None,
+                mesh_dim_config=(1, 4, 1, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="transformer-z1",
+        ),
+        pytest.param(
+            dict(
+                model_type=TRANSFORMER,
+                dp_shard_strategy=OPTIM_GRADS,
+                dp_outer_strategy=None,
+                mesh_dim_config=(1, 4, 1, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="transformer-z2",
         ),
         pytest.param(
             dict(
                 model_type=TRANSFORMER,
                 dp_shard_strategy=OPTIM_GRADS_PARAMS,
                 dp_outer_strategy=None,
-                mesh_dim_config=(1, 2, 2, 2),
+                mesh_dim_config=(1, 4, 1, 1),
                 preserve_fp32_weights=False,
                 init_model_with_meta_device=False,
                 torch_compile=False,
             ),
-            id="transformer-zero3-tp2",
+            id="transformer-z3",
         ),
+        # CP coverage to make sure DP-CP flattening works.
+        pytest.param(
+            dict(
+                model_type=TRANSFORMER,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=None,
+                mesh_dim_config=(1, 2, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="transformer-z3-cp2",
+        ),
+        pytest.param(
+            dict(
+                model_type=TRANSFORMER,
+                dp_shard_strategy=OPTIM_GRADS,
+                dp_outer_strategy=OPTIM,
+                mesh_dim_config=(2, 1, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="transformer-hsdp-z2-cp2",
+        ),
+        pytest.param(
+            dict(
+                model_type=TRANSFORMER,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=OPTIM,
+                mesh_dim_config=(2, 1, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="transformer-hsdp-z3-cp2",
+        ),
+        pytest.param(
+            dict(
+                model_type=TRANSFORMER,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=NO_SHARD,
+                mesh_dim_config=(2, 1, 2, 1),
+                preserve_fp32_weights=False,
+                init_model_with_meta_device=False,
+                torch_compile=False,
+            ),
+            id="transformer-hfsdp-cp2",
+        ),
+        # TE Transformer special-buffer / meta / FP32-main coverage.
         pytest.param(
             dict(
                 model_type=TE_TRANSFORMER,
                 dp_shard_strategy=OPTIM_GRADS_PARAMS,
                 dp_outer_strategy=None,
-                mesh_dim_config=(1, 2, 2, 2),
-                preserve_fp32_weights=False,
-                init_model_with_meta_device=False,
+                mesh_dim_config=(1, 4, 1, 1),
+                preserve_fp32_weights=True,
+                init_model_with_meta_device=True,
                 torch_compile=False,
             ),
-            id="te-transformer-zero3-tp2",
+            id="te-transformer-z3-meta-fp32-main",
         ),
         pytest.param(
             dict(
-                model_type=CNN,
-                dp_shard_strategy=OPTIM,
-                dp_outer_strategy=None,
-                mesh_dim_config=(2, 2, 2, 1),
-                preserve_fp32_weights=False,
-                init_model_with_meta_device=False,
+                model_type=TE_TRANSFORMER,
+                dp_shard_strategy=OPTIM_GRADS_PARAMS,
+                dp_outer_strategy=NO_SHARD,
+                mesh_dim_config=(2, 1, 2, 1),
+                preserve_fp32_weights=True,
+                init_model_with_meta_device=True,
                 torch_compile=False,
             ),
-            id="zero1",
+            id="te-transformer-hfsdp-meta-fp32-main",
         ),
-        pytest.param(
-            dict(
-                model_type=CNN,
-                dp_shard_strategy=OPTIM_GRADS,
-                dp_outer_strategy=None,
-                mesh_dim_config=(2, 2, 2, 1),
-                preserve_fp32_weights=False,
-                init_model_with_meta_device=False,
-                torch_compile=False,
-            ),
-            id="zero2",
-        ),
-        pytest.param(
-            dict(
-                model_type=CNN,
-                dp_shard_strategy=NO_SHARD,
-                dp_outer_strategy=None,
-                mesh_dim_config=(2, 2, 2, 1),
-                preserve_fp32_weights=False,
-                init_model_with_meta_device=False,
-                torch_compile=False,
-            ),
-            id="no-shard",
-        ),
+        # CNN variety case: "turn everything on" without TP.
         pytest.param(
             dict(
                 model_type=CNN,
                 dp_shard_strategy=OPTIM_GRADS_PARAMS,
                 dp_outer_strategy=NO_SHARD,
-                mesh_dim_config=(2, 2, 2, 1),
-                preserve_fp32_weights=False,
-                init_model_with_meta_device=False,
-                torch_compile=False,
-            ),
-            id="hfsdp-outer-replicated",
-        ),
-        pytest.param(
-            dict(
-                model_type=CNN,
-                dp_shard_strategy=OPTIM_GRADS_PARAMS,
-                dp_outer_strategy=OPTIM,
-                mesh_dim_config=(2, 2, 2, 1),
-                preserve_fp32_weights=False,
-                init_model_with_meta_device=False,
-                torch_compile=False,
-            ),
-            id="hsdp-outer-sharded",
-        ),
-        pytest.param(
-            dict(
-                model_type=CNN,
-                dp_shard_strategy=OPTIM_GRADS_PARAMS,
-                dp_outer_strategy=None,
-                mesh_dim_config=(2, 2, 2, 1),
+                mesh_dim_config=(2, 1, 2, 1),
                 preserve_fp32_weights=True,
                 init_model_with_meta_device=True,
                 torch_compile=True,
             ),
-            id="meta-init-preserve-fp32-compile",
+            id="cnn-hfsdp-cp2-meta-fp32-main-compile",
         ),
     ]
 
     DCP_CHECKPOINT_CASES = [
+        # Transformer checkpoint coverage across sharding levels.
         pytest.param(
             dict(
-                mesh_dim_config=(1, 4, 2, 1),
-                shard_strategy=OPTIM_GRADS_PARAMS,
-                outer_shard_strategy=NO_SHARD,
-                model_type=CNN,
-            ),
-            id="baseline-cnn-zero3-cp2",
-        ),
-        pytest.param(
-            dict(
-                mesh_dim_config=(1, 4, 2, 1),
-                shard_strategy=OPTIM_GRADS,
-                outer_shard_strategy=NO_SHARD,
-                model_type=CNN,
-            ),
-            id="cnn-zero2-cp2",
-        ),
-        pytest.param(
-            dict(
-                mesh_dim_config=(1, 4, 2, 1),
-                shard_strategy=OPTIM,
-                outer_shard_strategy=NO_SHARD,
-                model_type=CNN,
-            ),
-            id="cnn-zero1-cp2",
-        ),
-        pytest.param(
-            dict(
-                mesh_dim_config=(2, 2, 2, 1),
-                shard_strategy=OPTIM_GRADS_PARAMS,
-                outer_shard_strategy=OPTIM,
-                model_type=CNN,
-            ),
-            id="cnn-hsdp-zero3",
-        ),
-        pytest.param(
-            dict(
-                mesh_dim_config=(1, 4, 2, 1),
+                mesh_dim_config=(1, 4, 1, 1),
                 shard_strategy=OPTIM_GRADS_PARAMS,
                 outer_shard_strategy=NO_SHARD,
                 model_type=TRANSFORMER,
             ),
-            id="transformer-zero3",
+            id="transformer-z3",
         ),
         pytest.param(
             dict(
-                mesh_dim_config=(1, 4, 2, 1),
+                mesh_dim_config=(1, 4, 1, 1),
+                shard_strategy=OPTIM_GRADS,
+                outer_shard_strategy=NO_SHARD,
+                model_type=TRANSFORMER,
+            ),
+            id="transformer-z2",
+        ),
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 1, 1),
+                shard_strategy=OPTIM,
+                outer_shard_strategy=NO_SHARD,
+                model_type=TRANSFORMER,
+            ),
+            id="transformer-z1",
+        ),
+        # CP coverage for DP-CP flattening.
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 2, 2, 1),
+                shard_strategy=OPTIM_GRADS_PARAMS,
+                outer_shard_strategy=NO_SHARD,
+                model_type=TRANSFORMER,
+            ),
+            id="transformer-z3-cp2",
+        ),
+        # Hybrid sharding coverage.
+        pytest.param(
+            dict(
+                mesh_dim_config=(2, 1, 2, 1),
+                shard_strategy=OPTIM_GRADS_PARAMS,
+                outer_shard_strategy=OPTIM,
+                model_type=TRANSFORMER,
+            ),
+            id="transformer-hsdp-z3-cp2",
+        ),
+        pytest.param(
+            dict(
+                mesh_dim_config=(2, 1, 2, 1),
+                shard_strategy=OPTIM_GRADS_PARAMS,
+                outer_shard_strategy=NO_SHARD,
+                model_type=TRANSFORMER,
+            ),
+            id="transformer-hfsdp-cp2",
+        ),
+        # TE Transformer checkpoint sanity.
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 1, 1),
                 shard_strategy=OPTIM_GRADS_PARAMS,
                 outer_shard_strategy=NO_SHARD,
                 model_type=TE_TRANSFORMER,
             ),
-            id="te-transformer-zero3",
+            id="te-transformer-z3",
         ),
         pytest.param(
             dict(
-                mesh_dim_config=(1, 4, 2, 1),
+                mesh_dim_config=(1, 2, 2, 1),
+                shard_strategy=OPTIM_GRADS_PARAMS,
+                outer_shard_strategy=NO_SHARD,
+                model_type=TE_TRANSFORMER,
+            ),
+            id="te-transformer-z3-cp2",
+        ),
+        # Explicit unsupported path.
+        pytest.param(
+            dict(
+                mesh_dim_config=(1, 4, 1, 1),
                 shard_strategy=NO_SHARD,
                 outer_shard_strategy=NO_SHARD,
-                model_type=CNN,
+                model_type=TRANSFORMER,
             ),
-            id="no-shard-xfail",
+            id="transformer-ddp-xfail",
             marks=pytest.mark.xfail(
                 reason="Megatron-FSDP does not support NO_SHARD for checkpointing yet."
             ),
