@@ -90,10 +90,10 @@ class TestMTPCudaGraphInference:
             num_attention_heads=self.NUM_ATTN_HEADS,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.local,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             tensor_model_parallel_size=self.TP_SIZE,
             pipeline_model_parallel_size=1,
-            pipeline_dtype=torch.float32,
+            pipeline_dtype=torch.bfloat16,
             mtp_num_layers=mtp_num_layers,
             sequence_parallel=sequence_parallel,
             cuda_graph_impl="local",
@@ -380,7 +380,7 @@ class TestMTPCudaGraphInference:
 
             torch.manual_seed(42)
             full_hidden = torch.randn(
-                padded_count, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.float32
+                padded_count, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
             )
             dist.broadcast(full_hidden, src=0)
             local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
@@ -484,7 +484,7 @@ class TestMTPCudaGraphInference:
 
                 torch.manual_seed(42)
                 full_hidden = torch.randn(
-                    padded_count, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.float32
+                    padded_count, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
                 )
                 dist.broadcast(full_hidden, src=0)
                 local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
@@ -693,7 +693,7 @@ class TestMTPCudaGraphExpertParallel:
             num_attention_heads=self.NUM_ATTN_HEADS,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.local,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16,
             expert_model_parallel_size=_EP_SIZE,
             num_moe_experts=self.NUM_MOE_EXPERTS,
             moe_token_dispatcher_type="alltoall",
