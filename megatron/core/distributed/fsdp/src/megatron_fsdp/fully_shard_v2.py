@@ -88,6 +88,22 @@ class FSDPModule(nn.Module):
             for name, param in zip(param_names, fsdp_param_group.dist_params):
                 _replace_module_parameter(self, name, param)
 
+    def _scale_gradients(self, scaling_factor: float):
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for fsdp_param_group in child._fsdp_param_groups:
+                if fsdp_param_group.main_grad_buffer is not None:
+                    fsdp_param_group.main_grad_buffer.data.mul_(scaling_factor)
+
+    def _zero_grad_buffer(self):
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for fsdp_param_group in child._fsdp_param_groups:
+                if fsdp_param_group.main_grad_buffer is not None:
+                    fsdp_param_group.main_grad_buffer.data.zero_()
+
 
 class _FSDPState:
 

@@ -110,14 +110,15 @@ class ParameterGroup:
     def _init_dist_params(self):
         self.dist_params = []
         s = self.sharding_strategy
-        if s == "optim_grads_params":
+        is_param_shard = s == "optim_grads_params"
+        if is_param_shard:
             placements = [Shard(dim=0)]
         else:
             placements = [Replicate()]
         for p in self.params:
             if s != "no_shard":
                 wbuf = self.model_weight_buffer
-                data = wbuf.get_item(self.param_idx[p])
+                data = wbuf.get_item(self.param_idx[p], only_shard=is_param_shard)
             else:
                 data = p.detach()
 

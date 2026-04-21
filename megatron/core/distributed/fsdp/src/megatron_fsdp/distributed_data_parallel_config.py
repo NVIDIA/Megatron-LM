@@ -151,6 +151,10 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    use_fully_shard_api: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
+    """
+
     def __post_init__(self):
         import os
 

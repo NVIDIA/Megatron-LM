@@ -14,6 +14,7 @@
 
 import logging
 import random
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 try:
@@ -56,7 +57,7 @@ except ImportError as import_megatron_fsdp_error:
     IMPORT_MEGATRON_FSDP_ERROR = import_megatron_fsdp_error
     HAVE_MEGATRON_FSDP = False
 
-from megatron.core.transformer.moe.experts import GroupedMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
 logger = logging.getLogger(__name__)
 
@@ -220,23 +221,53 @@ class FullyShardedDataParallel(_BaseDataParallel):
         else:
             from torch.distributed.fsdp import fully_shard
 
+        if (
+            fsdp_unit_modules is None
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            fsdp_unit_modules = [TransformerLayer]
+
         edp_mesh = _init_dp_mesh(pg_collection, edp=True)
         dp_mesh = _init_dp_mesh(pg_collection, edp=False)
 
         for m in module.modules():
-            if isinstance(m, (GroupedMLP, TEGroupedMLP)):
-                fully_shard(m, edp_mesh)
-        for m in module.modules():
-            if isinstance(m, tuple(fsdp_unit_modules)):
-                fully_shard(m, dp_mesh)
-        fully_shard(module, dp_mesh)
+            if isinstance(m, (TEGroupedMLP, SequentialMLP)):
+                fully_shard(m, mesh=edp_mesh)
+        if fsdp_unit_modules is not None:
+            for m in module.modules():
+                if isinstance(m, tuple(fsdp_unit_modules)):
+                    fully_shard(m, mesh=dp_mesh)
+        fully_shard(module, mesh=dp_mesh)
 
         super().__init__(config=config, module=module)
+
+        noop = lambda *args, **kwargs: None
+
+        def not_implemented_op():
+            raise NotImplementedError(
+                "This operation is not implemented for the fully_shard API path. "
+            )
+
+        self.ddp_config = ddp_config
+        self.no_sync = nullcontext()
+        self.start_param_sync = noop
+        self.start_grad_sync = noop
+        self.finish_grad_sync = noop
+        self.scale_gradients = self.module._scale_gradients
+        self.zero_grad_buffer = self.module._zero_grad_buffer
+        self.broadcast_params = not_implemented_op
+        self.synchronize_param_gather = noop
+        self.module.state_dict_for_save_checkpoint = not_implemented_op
+        self.state_dict_for_save_checkpoint = not_implemented_op
 
     def load_state_dict(self, state_dict, strict=True):
         """
         Load the state dictionary into the module.
         """
+        if self.ddp_config.use_fully_shard_api:
+            super().load_state_dict(state_dict, strict=strict)
+            return
+
         custom_state_dict = {}
         for key, value in state_dict.items():
             if self.config.fp8 and key.endswith('._extra_state'):
@@ -460,6 +491,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         Stop communication for the module.
         """
+        if self.ddp_config.use_fully_shard_api:
+            raise NotImplementedError(
+                "stop_communication is not implemented for the fully_shard API path. "
+            )
+
         self.module.synchronize_gradient_reduce()
         self.module.synchronize_param_gather()
 
@@ -489,15 +525,15 @@ def _init_dp_mesh(pg_collection, edp=False):
     if edp:
         mesh = DeviceMesh.from_group(
             device_type="cuda",
-            group=pg_collection.expt_dp_group,
-            mesh_ranks=dist.get_process_group_ranks(pg_collection.expt_dp_group),
+            group=pg_collection.expt_dp,
+            mesh=dist.get_process_group_ranks(pg_collection.expt_dp),
             mesh_dim_names=("edp",),
         )
     else:
         mesh = DeviceMesh.from_group(
             device_type="cuda",
             group=pg_collection.dp_cp,
-            mesh_ranks=dist.get_process_group_ranks(pg_collection.dp_cp),
+            mesh=dist.get_process_group_ranks(pg_collection.dp_cp),
             mesh_dim_names=("dp",),
         )
 
