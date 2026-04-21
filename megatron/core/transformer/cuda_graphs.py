@@ -1151,13 +1151,23 @@ class _CudaGraphRunner(torch.nn.Module):
                 return ref
 
             # Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
-            # reference. This is safe for surfaces whose memory is managed by the CUDA graph pool
-            # (driver-pinned, stable addresses) but not safe for tensors allocated by the caching
-            # allocator, whose data_ptr() may be invalidated by block coalescing or empty_cache().
+            # reference.  Only graph mempool tensors in the graph mempool (e.g. a previous layer's
+            # output reused as this graph's input) are safe to weak-ref since their memory is
+            # driver-pinned with stable addresses.  We identify them as tensors that are not owned
+            # by the reuse pool and have the attribute `can_skip_replay_copy` set by
+            # _resolve_input_buffer.  Everything else, including reuse-pool buffers, stray tensors
+            # from dataclass __post_init__ side-effects (e.g. seq_idx created by
+            # PackedSeqParams.__post_init__ during dataclasses.replace inside the tree_map) must
+            # retain strong refs, or it will cause a use-after-free on replay that manifests as a
+            # segfault under memory pressure.
             def replace_with_weak_ref_for_input_surface(arg):
-                if torch.is_tensor(arg) and _CudagraphGlobalRecord.tensor_reuse_pool.owns(arg):
-                    return arg
-                return replace_with_weak_ref(arg)
+                if not torch.is_tensor(arg):
+                    return replace_with_weak_ref(arg)
+                if not _CudagraphGlobalRecord.tensor_reuse_pool.owns(arg) and hasattr(
+                    arg, 'can_skip_replay_copy'
+                ):
+                    return replace_with_weak_ref(arg)
+                return arg
 
             self.fwd_graph_input_surface = tree_map(
                 replace_with_weak_ref_for_input_surface, self.fwd_graph_input_surface

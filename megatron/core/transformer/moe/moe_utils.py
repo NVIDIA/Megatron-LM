@@ -19,7 +19,10 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metrics_tracker,
+    get_moe_overload_factor_tracker,
+)
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
@@ -303,7 +306,7 @@ def permute(
     fused: bool = False,
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
-    align_size: int = -1,
+    align_size: int = 0,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -365,7 +368,11 @@ def permute(
                 "fused_permute_with_probs typically requires TE >= 2.1.0, and "
                 "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
+        if (
+            fused_permute_and_pad_with_probs is not None
+            and tokens_per_expert is not None
+            and align_size > 0
+        ):
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
@@ -1000,6 +1007,82 @@ def clear_aux_losses_tracker() -> None:
     get_moe_metrics_tracker().clear()
 
 
+class RecordDispatchTokenCountsFunction(torch.autograd.Function):
+    """Autograd hook: post-dispatch token totals for overload reporting (see report())."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        local_balanced_token_count: torch.Tensor,
+        layer_number: Optional[int],
+    ):
+        """Record actual token total and balanced count on forward; pass tensor through.
+
+        Args:
+            tensor: Tensor in the autograd graph (e.g. dispatched_input) — pass-through.
+            tokens_per_expert: Per-local-expert counts from dispatch_postprocess (any
+                device).
+            local_balanced_token_count: Scalar float, num_local_tokens * topk (token
+                rows from forward hidden_states).
+            layer_number: Layer index (1-based).
+
+        Returns:
+            tensor unchanged.
+        """
+        if layer_number is None:
+            return tensor
+
+        tokens_on_rank = (
+            tokens_per_expert.detach().sum().to(device=tensor.device, dtype=torch.float32)
+        )
+
+        balanced = local_balanced_token_count.detach().to(device=tensor.device, dtype=torch.float32)
+
+        tracker = get_moe_overload_factor_tracker()
+        tracker.record_fwd(layer_number, tokens_on_rank, balanced)
+
+        ctx.save_for_backward(tokens_on_rank, balanced)
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass: append negated actual and balanced count for paired cumsums."""
+        if ctx.saved_tensors:
+            tokens_on_rank, balanced = ctx.saved_tensors
+            get_moe_overload_factor_tracker().record_bwd(tokens_on_rank, balanced)
+        return grad_output, None, None, None
+
+
+def record_dispatch_token_counts(
+    tensor: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    local_balanced_token_count: torch.Tensor,
+    layer_number: Optional[int],
+) -> torch.Tensor:
+    """Wrap tensor with an autograd hook for dispatch token counts (overload metrics).
+
+    Records tokens_per_expert.sum() on this rank and the balanced token count scalar.
+    Overload factors are computed later in MoEOverloadFactorTracker.report(). Process groups
+    must already be registered on the global tracker (MoELayer does this in __init__
+    when log_moe_overload_factor is enabled).
+
+    Args:
+        tensor: Tensor in the autograd graph (typically dispatched_input).
+        tokens_per_expert: Output of dispatch_postprocess (per-expert counts).
+        local_balanced_token_count: Scalar float, num_local_tokens * moe_router_topk
+            (num_local_tokens from MoE forward hidden_states shape).
+        layer_number: Layer index (1-based).
+
+    Returns:
+        tensor unchanged.
+    """
+    return RecordDispatchTokenCountsFunction.apply(
+        tensor, tokens_per_expert, local_balanced_token_count, layer_number
+    )
+
+
 @deprecated(
     version="0.16", removal_version="0.18", alternative="get_moe_metrics_tracker()._sync_metrics()"
 )
@@ -1340,7 +1423,8 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    return 16
+    # Only FP8 or FP4 requires padding. Defaults to 0.
+    return 0
 
 
 def skip_routed_expert_padding(config: TransformerConfig) -> bool:

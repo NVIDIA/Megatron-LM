@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
@@ -42,6 +43,11 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
     skip_routed_expert_padding,
+)
+from megatron.core.transformer.moe.paged_stash import (
+    get_paged_stash_context,
+    paged_stash_group_commit,
+    paged_stash_group_start,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -766,45 +772,72 @@ class TEGroupedMLP(MegatronModule):
         )
 
     def _is_fused_impl_supported(self) -> bool:
-        """Check if the TE op fuser supports implementing this module."""
+        """Check if the TE op fuser supports implementing this module.
+
+        Logs a warning for each unsatisfied condition to aid debugging
+        (e.g. when CUDA graph fails because the CuTe DSL fused kernel
+        was not activated and GroupedLinear falls back to tolist()).
+        """
+
+        def _unsupported(reason):
+            logger.warning("TE fused GroupedMLP not available: %s", reason)
+            return False
 
         # Check Transformer Engine installation
         if not HAVE_TE:
-            return False  # Transformer Engine is not available
+            return _unsupported("Transformer Engine is not installed")
         try:
             from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
         except ImportError:
-            return False  # Transformer Engine version is too old
+            return _unsupported("TE too old (missing pytorch.ops.GroupedLinear)")
 
         if not is_te_min_version("2.14.0"):
-            return False
+            return _unsupported("TE version < 2.14.0")
 
         # Check for unsupported features
         if self.tp_group.size() > 1:
-            return False  # Tensor parallelism is not supported
+            return _unsupported(f"expert TP > 1 (tp_size={self.tp_group.size()})")
         if self.offload_expert_fc1 or self.offload_moe_act:
-            return False  # Fine-grained activation offloading is not supported
+            return _unsupported("fine-grained activation offloading enabled")
         if self.config.moe_apply_probs_on_input:
-            return False  # Pre-multiplying probs is not supported
+            return _unsupported("moe_apply_probs_on_input enabled")
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
-            return False
+            return _unsupported(f"linear_fc1 is {type(self.linear_fc1).__name__}")
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
-            return False
+            return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU (ScaledSwiGLU) or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
-        if self.config.gated_linear_unit:
-            if self.activation_func == F.silu:
-                return True
-            if self.activation_func == quick_gelu:
-                try:
-                    from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-                except ImportError:
-                    return False
-                return True
+        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
+        # Use config.activation_func instead of self.activation_func because when
+        # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
+        if not self.config.gated_linear_unit:
+            return _unsupported("gated_linear_unit not enabled")
+        if self.config.activation_func == F.silu:
+            pass  # SwiGLU — supported
+        elif self.config.activation_func == quick_gelu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
+            except ImportError:
+                return _unsupported("quick_gelu needs TE >= 2.15")
+        else:
+            return _unsupported(f"unsupported activation: {self.config.activation_func}")
 
-        return False
+        # Check TE CuTe DSL fused kernel conditions (must match TE's
+        # fuse_grouped_mlp_ops matching logic)
+        import os
+
+        if os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0") == "0":
+            return _unsupported(
+                "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set — CuTe DSL fused kernel disabled"
+            )
+        if self.config.moe_mlp_glu_interleave_size != 32:
+            return _unsupported(
+                f"moe_mlp_glu_interleave_size={self.config.moe_mlp_glu_interleave_size} "
+                f"(CuTe DSL requires 32)"
+            )
+
+        return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
@@ -857,9 +890,9 @@ class TEGroupedMLP(MegatronModule):
 
         # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
-        if self.activation_func == F.silu and self.config.gated_linear_unit:
+        if self.config.activation_func == F.silu and self.config.gated_linear_unit:
             op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
-        elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+        elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:
                 op = te.pytorch.ops.ScaledClampedQGeGLU(
@@ -965,19 +998,40 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = torch.tensor(
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
+        # if the number of tokens is 0, pad the hidden states to 256
 
-        # Call fused impl
-        output = ops(
-            permuted_local_hidden_states,
-            tokens_per_expert,  # FC1
-            permuted_probs,  # Scaled SwiGLU
-            tokens_per_expert,  # FC2
-        )
-
+        if self.config.moe_paged_stash:
+            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+            max_num_tokens = permuted_local_hidden_states.shape[0]
+            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+            cap_factor = self.config.moe_expert_rank_capacity_factor
+            avg_num_tokens = (
+                int(max_num_tokens // cap_factor)
+                if cap_factor is not None and cap_factor > 0
+                else None
+            )
+            stash_context = get_paged_stash_context(
+                name="grouped_mlp",
+                max_num_tokens=max_num_tokens,
+                num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
+            )
+        else:
+            stash_context = nullcontext()
+        with stash_context:
+            # Call fused impl
+            output = ops(
+                permuted_local_hidden_states,
+                tokens_per_expert,  # FC1
+                permuted_probs,  # Scaled SwiGLU
+                tokens_per_expert,  # FC2
+            )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
-
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
     def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
@@ -1271,6 +1325,19 @@ class TEGroupedMLP(MegatronModule):
                 assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
                 fused_children[2].backward_dw()
                 fused_children[0].backward_dw()
+                # DDP registers wgrad hooks on the original linear_fc1/fc2 module objects
+                # (those are in the nn.Module tree), but backward_dw() is called on the
+                # NEW GroupedLinear instances created by _make_fused_ops().  We must
+                # explicitly fire the hooks on the originals so DDP can zero param.grad
+                # and trigger reduce-scatter – otherwise param.grad is never cleared and
+                # AccumulateGrad performs a spurious add_ into main_grad.
+                # TODO: find a better place to invoke _trigger_wgrad_accumulation_and_reduce_hooks.
+                # The wgrad hook registration lives in TE while the trigger is issued here
+                # in MCore, so the hook lifecycle is split across both codebases. Consolidate
+                # ownership on one side (either register+trigger entirely in TE, or expose
+                # the fused backward_dw through MCore) to remove this fragmentation.
+                self.linear_fc2._trigger_wgrad_accumulation_and_reduce_hooks()
+                self.linear_fc1._trigger_wgrad_accumulation_and_reduce_hooks()
             return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
@@ -1377,14 +1444,22 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
-            setattr(
-                self,
-                buf_name,
-                MXFP8Tensor(
-                    data=torch.stack(q_list, dim=0).contiguous(),
-                    scale=torch.stack(s_list, dim=0).contiguous(),
-                ),
-            )
+            stacked_data = torch.stack(q_list, dim=0).contiguous()
+            stacked_scale = torch.stack(s_list, dim=0).contiguous()
+
+            setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
+
+            # Redirect per-expert weight .data to views into the stacked buffer,
+            # mirroring _build_concatenated_weights. This frees the original
+            # allocations while keeping the Parameter objects intact.
+            for i in range(self.num_local_experts):
+                w = getattr(linear, f'weight{i}')
+                if isinstance(w, MXFP8Tensor):
+                    w.data = stacked_data[i]
+                    w.scale = stacked_scale[i]
+                elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
+                    w.data.data = stacked_data[i]
+                    w.data.scale = stacked_scale[i]
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
@@ -1500,7 +1575,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            if self.config.fp8_recipe == "mxfp8":
+            w = self.linear_fc1.weight0
+            if isinstance(w, MXFP8Tensor) or (
+                hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
+            ):
                 self._build_concatenated_mxfp8_weights()
             else:
                 self._build_concatenated_weights()
