@@ -284,6 +284,8 @@ class TestDynamicInferenceEngine:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
+            expert_model_parallel_size=test_config.expert_model_parallel_size,
+            expert_tensor_parallel_size=1,
         )
 
         set_rounder(4)
@@ -1145,11 +1147,6 @@ class TestDynamicInferenceEngine:
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             transformer_impl=transformer_impl,
         )
-
-        # Free NCCL communicators between parametrized runs to avoid resource exhaustion.
-        del env
-        gc.collect()
-        torch.cuda.empty_cache()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
