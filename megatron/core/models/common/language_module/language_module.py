@@ -68,7 +68,7 @@ class LanguageModule(MegatronModule):
 
         Must be called by subclasses after ``self.mtp`` is created.
         """
-        if self.config.cuda_graph_impl == "local" and not self.config.cuda_graph_scope:
+        if self.config.cuda_graph_impl == "local":
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
             self._mtp_cudagraph_manager = CudaGraphManager(
