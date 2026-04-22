@@ -255,7 +255,9 @@ class TestNCCLAllGatherDispatcher:
         local_tokens = tokens_per_rank[rank]
         total_tokens = sum(tokens_per_rank)
 
-        NCCLAllGatherDispatcher.set_step_metadata(local_tokens, ep_group, use_allgather_v=use_allgather_v)
+        NCCLAllGatherDispatcher.set_step_metadata(
+            local_tokens, ep_group, use_allgather_v=use_allgather_v
+        )
 
         global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
         global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
@@ -317,7 +319,9 @@ class TestNVLSAllGatherVDispatcher:
     def _make_dispatcher(self):
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
-        from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
 
         config = _make_base_config(expert_model_parallel_size=Utils.world_size)
         num_local_experts = config.num_moe_experts // Utils.world_size
@@ -364,7 +368,9 @@ class TestNVLSAllGatherVDispatcher:
         accumulate in fp32 before writing bf16 output.
         """
         from megatron.core.parallel_state import get_expert_model_parallel_group
-        from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
 
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
@@ -396,9 +402,7 @@ class TestNVLSAllGatherVDispatcher:
         static_routing_map = global_routing_map[start:end].contiguous()
 
         if not are_tensors_nvls_eligible(static_hidden, static_probs, static_routing_map):
-            pytest.skip(
-                "Tensors are not NVLS-eligible (need SM>=9 and 16-byte aligned memory)"
-            )
+            pytest.skip("Tensors are not NVLS-eligible (need SM>=9 and 16-byte aligned memory)")
 
         NVLSAllGatherVDispatcher.set_step_metadata(num_local_tokens, ep_group)
 
