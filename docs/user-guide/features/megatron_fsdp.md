@@ -340,7 +340,7 @@ Source: Feng, Wei, Will Constable, and Yifan Mao. “Getting Started with Fully 
 
 | Optimization | Description | Config |
 |--------------|-------------|--------|
-| **FSDP Unit Modules** | A list of `str` or `class` import paths for `torch.nn.Module`(s) that are considered FSDP unit modules by Megatron-FSDP. |  Defaults to Megatron-Core's `[TransformerLayer]` in Megatron-LM. Configurable via the `fsdp_unit_modules` argument using the `MegatronFSDP` class or `fully_shard` API. |
+| **FSDP Unit Modules** | A list of `str` or `class` import paths for `torch.nn.Module`(s) that are considered FSDP unit modules and sharded by Megatron-FSDP. Parameters and sub-modules that are not members of an FSDP unit are not sharded. |  Defaults to Megatron-Core's `[TransformerLayer]` in Megatron-LM. Configurable via the `fsdp_unit_modules` argument using the `MegatronFSDP` class or `fully_shard` API. |
 | **FSDP Double Buffer Allocator** | Megatron-FSDP uses the double-buffer allocator, which persistently allocates a buffer pair assigned to alternating FSDP units that temporarily stores parameters and gradients. Automatically used with NCCL user buffer registration. | `--fsdp-double-buffer` |
 | **Param All-Gather Overlap** | Whether to overlap parameter all-gather with compute. Automatically activated for the ZeRO-3 sharding strategy. | `--overlap-param-gather` |
 | **Gradient Reduce-Scatter Overlap** | Whether to overlap gradient reduce-scatter or all-reduce with compute. Automatically activated for ZeRO-2 and ZeRO-3 sharding strategies. | `--overlap-grad-reduce` |
@@ -349,6 +349,8 @@ Source: Feng, Wei, Will Constable, and Yifan Mao. “Getting Started with Fully 
 > Only a small depth-wise fraction of the model state can exist un-sharded at any point in time.
 
 **FSDP Unit Modules** represent fractions of the model state that are computed and communicated as a (coalesced) group, un-sharded when needed for computation, and re-sharded after computation to release memory for subsequent model states. Implicitly, an FSDP unit module is also a **_modeling contract_**, requiring that FSDP-managed unit module parameters are not accessed or modified beyond the scope of the forward pass, backward pass, or optimization step.
+
+Megatron-FSDP accepts a list of `str` or `class` paths representing FSDP unit modules via the `fsdp_unit_modules` argument, which is currently hard-coded to supported model classes (like `TransformerLayer`) in Megatron-Core. It performs a depth-first traversal of the model (via `torch.nn.Module.named_modules()`) and groups the parameters of each matching module for sharding and coalesced communication. Nested units are resolved by precedence: if a module matches an FSDP unit class but is already a sub-module of a previously registered FSDP unit, it is skipped, so the outermost (and necessarily largest) FSDP unit class in any module sub-tree becomes the effective FSDP unit module.
 
 > Communication should overlap computation.
 
@@ -374,14 +376,14 @@ To implement these "unit-periodic" mechanics, Megatron-FSDP uses `Module` hooks 
   - Un-shards the model parameters of the current and (via pre-fetching) forward-subsequent FSDP unit modules.
   - When `MegatronFSDP.forward()` is invoked, Megatron-FSDP will swap all parameter references to point to the un-sharded `Tensor` compute weights for the forward and backward pass.
 - **Post-Forward**
-  - Re-shards model weights after the forward pass.
+  - Re-shards model weights after the forward pass, if the module is an FSDP unit. Non-unit modules remain persistently un-sharded.
     - When using activation recomputation during the backwards pass, computing both `fprop` and `dgrad` requires these parameters, so parameters are resharded during **Post-Backward**.
   - Releases the transpose cache of quantized parameters (in FSDP / ZeRO-3) for specific quantization recipes in `TransformerEngine`.
 - **Pre-Backward**
   - Un-shards the model parameters of the current and (via pre-fetching) backward-subsequent FSDP unit modules.
     - Implemented as a `torch.autograd.graph.register_multi_grad_hook` triggered by the output `dgrad`, and installed via a `Module` _post-forward_ hook.
 - **Post-Backward**
-  - Re-shards model weights after the backward pass.
+  - Re-shards model weights after the backward pass, if the module is an FSDP unit. Non-unit modules remain persistently un-sharded.
     - Implemented by injecting an Autograd function (`RegisterFSDPBackwardFunction`) that is installed during a `Module` _pre-forward_ hook.
   - Reduces gradients after the backward pass.
     - Implemented using a `Tensor.register_post_accumulate_grad_hook` triggered by `param.grad`, as well as a root-level post-backward hook installed during **Pre-Backward** (`torch.autograd.Variable._execution_engine.queue_callback`).
