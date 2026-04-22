@@ -118,7 +118,8 @@ def _multimem_all_gather_v_kernel(
             if BITS == 128:
                 # Each 128-bit pack occupies 2 uint64 units; output_byte_offset // 8 converts
                 # the tensor's byte offset within the symm-mem buffer to uint64 units.
-                # The global offset is multiplied by 2 to convert from 128-bit units to uint64 units.
+                # The global offset is multiplied by 2 to convert from 128-bit 
+                # units to uint64 units.
                 multicast_ptrs = (
                     multicast_ptr.to(tl.pointer_type(tl.uint64))
                     + output_byte_offset // 8
