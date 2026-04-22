@@ -536,7 +536,6 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
-    _CudagraphGlobalRecord.mtp_cudagraph_managers = []
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
