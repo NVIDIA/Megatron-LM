@@ -2655,7 +2655,6 @@ dev = [
     { name = "multi-storage-client" },
     { name = "nvidia-modelopt", marker = "(sys_platform != 'darwin' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "nvidia-resiliency-ext" },
-    { name = "nvtx" },
     { name = "onnxscript", version = "0.5.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "onnxscript", version = "0.6.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "openai", extra = ["aiohttp"], marker = "extra == 'extra-13-megatron-core-dev'" },
@@ -2680,7 +2679,6 @@ lts = [
     { name = "mamba-ssm" },
     { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-lts'" },
     { name = "multi-storage-client" },
-    { name = "nvtx" },
     { name = "onnxscript", version = "0.6.2", source = { registry = "https://pypi.org/simple" } },
     { name = "opentelemetry-api", version = "1.33.1", source = { registry = "https://pypi.org/simple" } },
     { name = "tensorstore", version = "0.1.82", source = { registry = "https://pypi.org/simple" } },
@@ -2788,8 +2786,6 @@ requires-dist = [
     { name = "numpy" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=b2bb3d728a18795807d9f76c535e005a609a1b01" },
-    { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
-    { name = "nvtx", marker = "extra == 'lts'", specifier = "~=0.2" },
     { name = "onnxscript", marker = "extra == 'dev'" },
     { name = "onnxscript", marker = "extra == 'lts'" },
     { name = "openai", extras = ["aiohttp"], marker = "extra == 'dev'" },
@@ -3740,29 +3736,6 @@ dependencies = [
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8c/79/017fab2f7167a9a9795665f894d04f77aafceca80821b51589bb4b23ff5c/nvidia_sphinx_theme-0.0.9.post1-py3-none-any.whl", hash = "sha256:21ca60206dff2f380d7783d64bbaf71a5b9cacae53c7d0686f089c16b5a3d45a", size = 143816, upload-time = "2025-11-09T23:16:55.719Z" },
-]
-
-[[package]]
-name = "nvtx"
-version = "0.2.15"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/92/dd/692765e87de30bae1522cdffaa0f2b52949658a92a0fa6d96b1a01eae9d2/nvtx-0.2.15.tar.gz", hash = "sha256:2287d3be05b85661deb386f878d1f536c2e532774aa9ec7a50c434942ed81ae5", size = 121230, upload-time = "2026-03-18T10:01:25.547Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/c2/07/698355285a03a366ef63ea9762fc1feef3f9f25483e1655408f72d827090/nvtx-0.2.15-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2cc530cd0f1a2c14a3a7e683833db509888ac5ed4ead94e5c9e2c7317c6937a7", size = 807159, upload-time = "2026-03-18T10:09:49.232Z" },
-    { url = "https://files.pythonhosted.org/packages/c0/d1/08f22448d83481408d663065764ba583df091a7de629ed38fc97e522f1af/nvtx-0.2.15-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3ca8030a6d197952318013dd1c12c22da1d4b9feb76ba72e0fcd449961183c2c", size = 806187, upload-time = "2026-03-18T10:13:32.972Z" },
-    { url = "https://files.pythonhosted.org/packages/54/23/c97c39e3b7ba256aa343cb828ca0d1c8421f705ca84795658ecd14ca95ed/nvtx-0.2.15-cp312-cp312-win_amd64.whl", hash = "sha256:70a1e768964e0520b68ccabc4df391cc227537c45936a7eba6507bc65e617e00", size = 129178, upload-time = "2026-03-18T10:02:55.299Z" },
-    { url = "https://files.pythonhosted.org/packages/05/c9/8341224b8284f7deb6a634119939de5885adc421e64b6743693b30da2186/nvtx-0.2.15-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d28660d9c46f8ba750d781572b6aa5a1e6221abba224ab32d7fb32c2d0fd67df", size = 780787, upload-time = "2026-03-18T10:10:40.634Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/c0/4a5bb7897918de7c7e0191d9342df8ae4cb797ff07276e0f20d13e497ce7/nvtx-0.2.15-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10749686633f880ad53dcdbb2179fad41b45dcf5b7631d4a1070a577577bd386", size = 782575, upload-time = "2026-03-18T10:13:57.3Z" },
-    { url = "https://files.pythonhosted.org/packages/38/b9/6b381ac7c5a3ded331aebbf25f8959d19b51d320fb2514c76c6b6edddaaa/nvtx-0.2.15-cp313-cp313-win_amd64.whl", hash = "sha256:a6650b029263d12f8427a4dee8bd59cb9c91bccb60543bfcb20bc2b00fdcd672", size = 128764, upload-time = "2026-03-18T10:02:33.343Z" },
-    { url = "https://files.pythonhosted.org/packages/75/69/a9acb6d95d2e0e381b2956544768528dd8d7a9e827af8c2014169d838284/nvtx-0.2.15-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:25813ead4fff4d3a6e04f69a72507b096a6bdbecefa369f1100b0e584767bca8", size = 833375, upload-time = "2026-03-18T10:06:31.955Z" },
-    { url = "https://files.pythonhosted.org/packages/38/56/c7e8645061cc2fc23f3a54f33e1e340df59216f07dcfb97d46b8ae7dd26c/nvtx-0.2.15-cp313-cp313t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3741edac4678b92f03d22a3f0a2dfd469f422f85e63db71b038e02525b2404ad", size = 788639, upload-time = "2026-03-18T10:12:01.69Z" },
-    { url = "https://files.pythonhosted.org/packages/96/03/fadd82acdbca6d1c49ac517081a0c3714346f52f4c7e1d4449d77605b4aa/nvtx-0.2.15-cp313-cp313t-win_amd64.whl", hash = "sha256:8be06c3c8c267eba56a0396366b9593092e0b75ea8d3702b303d48c0a1662f0e", size = 142609, upload-time = "2026-03-18T10:01:48.832Z" },
-    { url = "https://files.pythonhosted.org/packages/e0/5b/ca0ba6fa769d08174b7a5b4775c279e2e26611cdd5e7833aa699187871c7/nvtx-0.2.15-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b5171b8283dd3ea9ae688a86d16901b4c2c142c4eb0a4bdbf6c222f5f67f9524", size = 781769, upload-time = "2026-03-18T10:08:59.357Z" },
-    { url = "https://files.pythonhosted.org/packages/f7/e1/e02fafc01c18f1868a2d2c030953f49e38d65f2d95884789a6c46ff308f1/nvtx-0.2.15-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:3c6d0f27d4f8a2f479eb64a6b842c13aee32120348a1715d995b9bb9f75b35cf", size = 774614, upload-time = "2026-03-18T10:12:46.979Z" },
-    { url = "https://files.pythonhosted.org/packages/20/77/a2b64335bab7c75fe1c054cc4ebe2d3b3234cbdb04d2e1d6ca73551c54f5/nvtx-0.2.15-cp314-cp314-win_amd64.whl", hash = "sha256:9934fad0b441cfa6e896a848b092498ba23e2ff205c2b9a7b60520ff8367ffef", size = 130932, upload-time = "2026-03-18T10:03:43.507Z" },
-    { url = "https://files.pythonhosted.org/packages/db/24/528619230976c18364eda2340906ea67b3bf7588b7ce59e054723614abae/nvtx-0.2.15-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aca61135c76b8107ae3c994325613afa661e1336a991c59cc9c6176829b3b32c", size = 834439, upload-time = "2026-03-18T10:05:01.181Z" },
-    { url = "https://files.pythonhosted.org/packages/ef/7b/c1b96f13ef89bdf2a8c2f326a97bed89699271990d7c8624fda3fedc6e61/nvtx-0.2.15-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:58653bf6fd8453947b9e5153da2ad7aeb0ceafa030de7f133efb3eada5da7ca7", size = 790247, upload-time = "2026-03-18T10:11:39.124Z" },
-    { url = "https://files.pythonhosted.org/packages/14/5d/e000de781d92b732d52c572517db0e9e3a0085795f8bdc18201713c52d1f/nvtx-0.2.15-cp314-cp314t-win_amd64.whl", hash = "sha256:9d1d10db4fb4a3b0ffd6ed37bf25f0a966a3b4d34b3c9abb1f6572732959a6e5", size = 149109, upload-time = "2026-03-18T10:03:21.615Z" },
 ]
 
 [[package]]
