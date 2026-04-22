@@ -1839,6 +1839,11 @@ class TextGenerationController:
         return {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
+            # Already a CPU tensor (independent of _sampled_tokens_cuda via the
+            # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
+            # the separate new_sample_copy). Returning the CPU copy avoids a
+            # D2H sync when the engine later calls sample.tolist().
+            "sample": sampled_tokens_cpu,
             **(update_result or {}),
         }
 
@@ -1947,13 +1952,18 @@ class TextGenerationController:
             range_pop()
 
             if skip_bookkeeping:
-                request_bookkeeping = {}
+                # _transfer_samples_to_cpu wasn't invoked on this path, so do
+                # a one-shot D2H here to keep "sample" as a CPU tensor for
+                # downstream consumers.
+                request_bookkeeping = {
+                    "sample": self._sampled_tokens_cuda[:active_request_count].cpu(),
+                }
             else:
+                # request_bookkeeping supplies "sample" as the already-CPU
+                # tensor produced by _transfer_samples_to_cpu.
                 request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
             ret = {
-                # Clone needed: _sampled_tokens_cuda is a reused buffer overwritten each step.
-                "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
                 "accepted_tokens": (
                     # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
                     self._accepted_tokens_per_request.clone()
