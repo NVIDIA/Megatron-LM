@@ -65,7 +65,6 @@ from megatron.core.etp_utils import (
     get_rs_stream,
     reallocate_etp_cache_to_mempool,
     wait_async_comms,
-    _inflight_comm_params,
 )
 
 try:
@@ -573,21 +572,24 @@ class _CudagraphRecordNode(torch.autograd.Function):
             _CudagraphGlobalRecord.record_bwd_graph(runner)
             runner.bwd_graph_recorded = True
 
-        if runner.parameter_sharding:
-            for etp_param in _inflight_comm_params:
-                if etp_param.is_routed_expert and \
-                    parallel_state.get_expert_parameter_sharding_world_size() > 1:
-                    runner.need_expert_ps_barrier = True
-                else:
-                    if parallel_state.get_parameter_sharding_world_size() > 1:
-                        runner.need_ps_barrier = True
-
         return None, grads
 
 
 class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
     cudagraph io and fp8/fp4 if used."""
+
+    ## 1-event scheme (fwd and bwd):
+    #   runner_N.stream:  GEMM ──▶ wait_async_comms ▶ _wait_side_streams ──completion_event.record
+    #   ag_stream:        AG ──────────────────────▶ ag_event.record
+    #   main_stream:                                                   completion_event.wait ▶ [next work]
+    #                                                                   ↑ serialized after AG ↑
+    #
+    # main_stream only unblocks after ag/rs streams are fully drained, so eager ops that
+    # follow (e.g. expert GEMMs reading the weight buffer) are guaranteed to see completed data.
+    #
+    # wait_async_comms() is called INSIDE the captured graph (not before replay) so that
+    # ag_event.record() is embedded in the graph and fires at the right moment on ag_stream.
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
@@ -638,9 +640,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
-        if runner.parameter_sharding:
-            wait_async_comms()
-
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
@@ -680,9 +679,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 continue
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
-
-        if runner.parameter_sharding:
-            wait_async_comms()
 
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
@@ -816,8 +812,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 self._register_side_stream(self.fwd_side_streams, graphed_ag)
                 self._register_side_stream(self.bwd_side_streams, graphed_ag)
                 self._register_side_stream(self.bwd_side_streams, graphed_rs)
-                self.need_expert_ps_barrier = False
-                self.need_ps_barrier = False
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -1025,7 +1019,6 @@ class _CudaGraphRunner(torch.nn.Module):
                     warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
                     warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
 
-
                 if self.grad_enabled:
                     warmup_outputs = self.get_tensors(warmup_outputs)
                     warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
@@ -1062,6 +1055,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 with torch.cuda.graph(
                     self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
                 ):
+
                     self._sync_against_side_streams(self.fwd_side_streams)
 
                     fwd_graph_outputs = self.func(
@@ -1071,13 +1065,11 @@ class _CudaGraphRunner(torch.nn.Module):
                     if self.parameter_sharding:
                         wait_async_comms(ETPChain.GRAPHED.value)
 
-                    # Record completion event inside the graph so the current stream can
-                    # proceed as soon as module compute finishes, before async comms are joined.
-                    if self.use_stream:
-                        self.fwd_completion_event.record()
-
                     if self.fwd_side_streams:
                         self._wait_side_streams(self.fwd_side_streams)
+
+                    if self.use_stream:
+                        self.fwd_completion_event.record()
                 
                 # Unfreeze GC.
                 if FREEZE_GC:
@@ -1184,19 +1176,15 @@ class _CudaGraphRunner(torch.nn.Module):
                 out_grad.requires_grad = True
             self.static_grad_outputs.append(out_grad)
 
+        torch.cuda.synchronize()
+
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
             gc.freeze()
 
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+
             self._sync_against_side_streams(self.bwd_side_streams)
-            
-            if self.parameter_sharding:
-                _fence = torch.zeros(1, device=torch.cuda.current_device())
-                if self.need_ps_barrier:
-                    torch.distributed.all_reduce(_fence, group=parallel_state.get_parameter_sharding_group())
-                if self.need_expert_ps_barrier:
-                    torch.distributed.all_reduce(_fence, group=parallel_state.get_expert_parameter_sharding_group())
 
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
@@ -1210,11 +1198,11 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.parameter_sharding:
                 wait_async_comms(ETPChain.GRAPHED.value)
 
-            if self.use_stream:
-                self.bwd_completion_event.record()
-
             if self.bwd_side_streams:
                 self._wait_side_streams(self.bwd_side_streams)
+
+            if self.use_stream:
+                self.bwd_completion_event.record()
 
         # Unfreeze GC.
         if FREEZE_GC:
