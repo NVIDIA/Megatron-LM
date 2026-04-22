@@ -260,6 +260,8 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         # TEColumnParallelLinear rejects gather_output=True, so always pass
         # False and handle output gathering ourselves in forward().
+        # TE also does not support skip_weight_param_allocation, so we always
+        # let TE allocate the weight and remove it afterwards when sharing.
         super().__init__(
             input_size,
             output_size,
@@ -270,10 +272,12 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             skip_bias_add=skip_bias_add,
             is_expert=is_expert,
             stride=stride,
-            skip_weight_param_allocation=skip_weight_param_allocation,
+            skip_weight_param_allocation=False,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
         )
+        if skip_weight_param_allocation:
+            self.weight = None
         self.gather_output = gather_output
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
