@@ -36,7 +36,9 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.core.activations import squared_relu
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
@@ -84,6 +86,34 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
     return parser
 
+def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
+    args = parse_args(extra_args_provider, ignore_unknown_args)
+
+    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
+        from megatron.training.checkpointing import load_args_from_checkpoint
+
+        assert args.load is not None or args.pretrained_checkpoint is not None, "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
+        assert args.non_persistent_ckpt_type != "local", (
+            "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
+            "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
+            "before initializing LocalCheckpointManager."
+        )
+        load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
+        load_args_from_checkpoint(args)
+
+    if args.yaml_cfg is not None:
+        from megatron.training.yaml_arguments import validate_yaml
+
+        args = validate_yaml(args, args_defaults)
+    else:
+        validate_args(args, args_defaults)
+
+    # set global args, build tokenizer, and set adlr-autoresume,
+    # tensorboard-writer, and timers.
+    set_global_variables(args)
+
+    return args
+
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -100,6 +130,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
 
     # Experimental yaml
     if args.yaml_cfg is not None:
@@ -303,6 +335,12 @@ def tuple_type(x):
 
 
 def validate_args(args, defaults={}):
+
+    # Prep for checkpoint conversion.
+    if args.ckpt_convert_format is not None:
+        assert args.ckpt_convert_save is not None
+        assert args.load is not None
+        args.exit_on_missing_checkpoint = True
 
     # Temporary
     assert args.non_persistent_ckpt_type in [
@@ -618,13 +656,16 @@ def validate_args(args, defaults={}):
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
         )
-        assert (
-            args.rampup_batch_size is None
-        ), "multi-phase training does not support batch size ramp-up"
-
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
+        )
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
@@ -648,10 +689,8 @@ def validate_args(args, defaults={}):
         )
 
         # Ensure that the number of prompts we collect is a multiple of the global batch size.
-        # TODO: Make this account for batch size rampup?
-        assert (
-            num_generated_samples_per_inference_iteration % args.global_batch_size == 0
-        ), f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
+        assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
+            f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
 
         # For now only exit/checkpoint on iterations where we generate data. We don't currently
         # have a way to checkpoint the generated data.
@@ -843,6 +882,11 @@ def validate_args(args, defaults={}):
                 "This argument will be ignored.",
                 args.rank,
             )
+
+    # Infer use of MLA from unified pattern
+    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+        args.multi_latent_attention = True
+
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
     # Uneven virtual pipeline parallelism
@@ -1126,6 +1170,15 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
+        assert args.ckpt_format == "fsdp_dtensor", \
+            "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+    
+    if args.nccl_ub and args.use_megatron_fsdp:
+        # In Megatron-LM, required implementation for manual registration is already provided.
+        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        args.fsdp_manual_registration = True
+        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
+
     if args.fsdp_manual_registration:
         assert (
             args.use_megatron_fsdp
@@ -1207,12 +1260,12 @@ def validate_args(args, defaults={}):
     if args.train_iters and not args.skip_train:
         # If we use iteration-based training, make sure the
         # sample-based options are off.
-        assert args.train_samples is None, 'expected iteration-based training'
-        assert args.lr_decay_samples is None, 'expected iteration-based learning rate decay'
-        assert args.lr_warmup_samples == 0, 'expected iteration-based learning rate warmup'
-        assert (
-            args.rampup_batch_size is None
-        ), 'expected no batch-size rampup for iteration-based training'
+        assert args.train_samples is None, \
+            'expected iteration-based training'
+        assert args.lr_decay_samples is None, \
+            'expected iteration-based learning rate decay'
+        assert args.lr_warmup_samples == 0, \
+            'expected iteration-based learning rate warmup'
         if args.lr_warmup_fraction is not None:
             assert (
                 args.lr_warmup_iters == 0
@@ -1290,6 +1343,8 @@ def validate_args(args, defaults={}):
         if args.save_retain_interval is not None:
             assert args.save_retain_interval > 0
             assert args.save_retain_interval % args.save_interval == 0
+        if args.save_params_interval is not None:
+            assert not args.overlap_param_gather
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
@@ -1989,6 +2044,9 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+            kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -3974,191 +4032,102 @@ def _add_tokenizer_args(parser):
 def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
-    group.add_argument(
-        '--data-path',
-        nargs='*',
-        default=None,
-        help='The weight and prefix list for a set of train, validation, and test'
-        'datasets which split according to --split. The accepted formats are: '
-        '(1) a single prefix, '
-        '(2) a list of weight prefix pairs e.g. weight1 prefix1 weight2 prefix2, '
-        '(3) a list of prefixes e.g. prefix1 prefix2. '
-        'For (3), weights are inferred from the lengths of the contributing datasets. '
-        'This argument is exclusive to the other independent --*-data-path arguments.',
-    )
-    group.add_argument(
-        '--phase-transition-iterations',
-        type=str,
-        default=None,
-        help='Comma-separated list of iterations where phase '
-        'transitions occur. Requires fixed global batch size across phases. '
-        'Does not support batch size ramp-up.',
-    )
-    group.add_argument(
-        '--split',
-        type=str,
-        default=None,
-        help='Comma-separated list of proportions for training,'
-        ' validation, and test split. For example the split '
-        '`90,5,5` will use 90%% of data for training, 5%% for '
-        'validation and 5%% for test.',
-    )
-    group.add_argument(
-        '--train-data-path',
-        nargs='*',
-        default=None,
-        help='The weight and prefix list for an independent train dataset. '
-        'Follows the same pattern rules as --data-path.',
-    )
-    group.add_argument(
-        '--valid-data-path',
-        nargs='*',
-        default=None,
-        help='The weight and prefix list for an independent validation dataset. '
-        'Follows the same pattern rules as --data-path.',
-    )
-    group.add_argument(
-        '--test-data-path',
-        nargs='*',
-        default=None,
-        help='The weight and prefix list for an independent test dataset. '
-        'Follows the same pattern rules as --data-path.',
-    )
-    group.add_argument(
-        '--data-args-path',
-        type=str,
-        default=None,
-        help='Path to data-args. Instead of feeding `--data-path` '
-        'with weighted dataset, we pass in a file path from which '
-        'we read that argument. This is useful when the list of data is '
-        'too big.',
-    )
-    group.add_argument(
-        '--per-split-data-args-path',
-        type=str,
-        default=None,
-        help='Path to per-split-data-args. Instead of feeding '
-        '`--(train|valid|test)-data-path` with weighted dataset, '
-        'we pass in a file path from which we read those arguments. '
-        'This is useful when the list of data is too big. Format is a '
-        'json file with `train`, `valid, `test` keys',
-    )
-    group.add_argument(
-        '--per-dataset-sequences-path',
-        default=None,
-        help='Path to a json file with the sequences per dataset. Check the tools/build_sequences_per_dataset.py script to build this file.',
-    )
-    group.add_argument(
-        '--dataloader-fast-cache-load',
-        action='store_true',
-        help='Option to use the fast cache loading path when building the datasets. Requires all the dataset caches to be built and stored in --data-cache-path.',
-    )
-    group.add_argument(
-        '--dataloader-defer-npy-index-mmap',
-        action='store_true',
-        help='Defer the mmap of the dataset indexes (.npy files) until the first access. Requires all the dataset caches to be built and stored in --data-cache-path.',
-    )
-    group.add_argument(
-        '--data-cache-path', default=None, help='Path to a directory to hold cached index files.'
-    )
-    group.add_argument(
-        '--no-mmap-bin-files',
-        action='store_false',
-        help='Disable mmap-ing of .bin files.',
-        dest='mmap_bin_files',
-    )
-    group.add_argument(
-        '--mock-data',
-        action='store_true',
-        help='Skip data loading and validation and opt for artificial '
-        'generation of mock data when an implementation is available.',
-    )
-    group.add_argument(
-        '--seq-length', type=int, default=None, help='Maximum sequence length to process.'
-    )
-    group.add_argument(
-        '--encoder-seq-length',
-        type=int,
-        default=None,
-        help='Maximum encoder sequence length to process.'
-        'This should be exclusive of --seq-length',
-    )
-    group.add_argument(
-        '--decoder-seq-length',
-        type=int,
-        default=None,
-        help="Maximum decoder sequence length to process.",
-    )
-    group.add_argument(
-        '--sample-rate',
-        type=float,
-        default=1.0,
-        help='sample rate for training data. Supposed to be 0 ' ' < sample_rate < 1',
-    )
-    group.add_argument(
-        '--mask-prob', type=float, default=0.15, help='Probability of replacing a token with mask.'
-    )
-    group.add_argument(
-        '--short-seq-prob',
-        type=float,
-        default=0.1,
-        help='Probability of producing a short sequence.',
-    )
-    group.add_argument('--num-workers', type=int, default=2, help="Dataloader number of workers.")
-    group.add_argument(
-        '--reset-position-ids',
-        action='store_true',
-        help='Reset posistion ids after end-of-document token.',
-    )
-    group.add_argument(
-        '--reset-attention-mask',
-        action='store_true',
-        help='Reset self attention mask after ' 'end-of-document token.',
-    )
-    group.add_argument(
-        '--eod-mask-loss', action='store_true', help='Mask loss for the end of document tokens.'
-    )
-    group.add_argument(
-        '--no-create-attention-mask-in-dataloader',
-        action='store_false',
-        help='If set, do not create attention_masks in dataloader.',
-        dest='create_attention_mask_in_dataloader',
-    )
-    group.add_argument(
-        '--num-dataset-builder-threads',
-        type=int,
-        default=1,
-        help='Number of parallel threads per rank for dataset builder',
-    )
-    group.add_argument(
-        '--object-storage-cache-path',
-        type=str,
-        default=None,
-        help='Path to cache index files when using s3 or msc dataloader',
-    )
-    group.add_argument(
-        '--mid-level-dataset-surplus',
-        type=float,
-        default=0.005,
-        help='The sample surplus to build for the mid-level datasets(s)',
-    )
-    group.add_argument(
-        '--allow-ambiguous-pad-tokens',
-        action='store_true',
-        help='Whether to prevent pad tokens already present in the dataset '
-        'from being masked out when the pad token incorrectly shares the same id '
-        'with other special tokens in the tokenizer. Note that this argument has '
-        'no effect when the tokenizer correctly provides a unique id for the pad. '
-        'Masking out such ambiguous pad tokens results in training instability. '
-        'Such a scenario is best resolved by fixing the tokenizer; leaving this '
-        'option as False provides a workaround. '
-        'When left to the default of False, any token ids that collide with the '
-        'pad token id - as provided by the tokenizer - will not be masked out of '
-        'the loss calculation: it cannot be determined whether they are truly pad. '
-        'If instead this argument is set, the training flow will treat all tokens '
-        'that share the same id as the pad token as true pad tokens, potentially '
-        'causing severe training instability.',
-    )
+    group.add_argument('--data-path', nargs='*', default=None,
+                       help='The weight and prefix list for a set of train, validation, and test'
+                       'datasets which split according to --split. The accepted formats are: '
+                       '(1) a single prefix, '
+                       '(2) a list of weight prefix pairs e.g. weight1 prefix1 weight2 prefix2, '
+                       '(3) a list of prefixes e.g. prefix1 prefix2. '
+                       'For (3), weights are inferred from the lengths of the contributing datasets. '
+                       'This argument is exclusive to the other independent --*-data-path arguments.')
+    group.add_argument('--phase-transition-iterations', type=str, default=None,
+                       help='Comma-separated list of iterations where phase '
+                       'transitions occur. Requires fixed global batch size across phases.')
+    group.add_argument('--split', type=str, default=None,
+                       help='Comma-separated list of proportions for training,'
+                       ' validation, and test split. For example the split '
+                       '`90,5,5` will use 90%% of data for training, 5%% for '
+                       'validation and 5%% for test.')
+    group.add_argument('--train-data-path', nargs='*', default=None,
+                       help='The weight and prefix list for an independent train dataset. '
+                       'Follows the same pattern rules as --data-path.')
+    group.add_argument('--valid-data-path', nargs='*', default=None,
+                       help='The weight and prefix list for an independent validation dataset. '
+                       'Follows the same pattern rules as --data-path.')
+    group.add_argument('--test-data-path', nargs='*', default=None,
+                       help='The weight and prefix list for an independent test dataset. '
+                       'Follows the same pattern rules as --data-path.')
+    group.add_argument('--data-args-path', type=str, default=None,
+                       help='Path to data-args. Instead of feeding `--data-path` '
+                       'with weighted dataset, we pass in a file path from which '
+                       'we read that argument. This is useful when the list of data is '
+                       'too big.')
+    group.add_argument('--per-split-data-args-path', type=str, default=None,
+                       help='Path to per-split-data-args. Instead of feeding '
+                       '`--(train|valid|test)-data-path` with weighted dataset, '
+                       'we pass in a file path from which we read those arguments. '
+                       'This is useful when the list of data is too big. Format is a '
+                       'json file with `train`, `valid, `test` keys')
+    group.add_argument('--per-dataset-sequences-path', default=None,
+                       help='Path to a json file with the sequences per dataset. Check the tools/build_sequences_per_dataset.py script to build this file.')
+    group.add_argument('--dataloader-fast-cache-load', action='store_true',
+                       help='Option to use the fast cache loading path when building the datasets. Requires all the dataset caches to be built and stored in --data-cache-path.')
+    group.add_argument('--dataloader-defer-npy-index-mmap', action='store_true',
+                       help='Defer the mmap of the dataset indexes (.npy files) until the first access. Requires all the dataset caches to be built and stored in --data-cache-path.')
+    group.add_argument('--data-cache-path', default=None,
+                       help='Path to a directory to hold cached index files.')
+    group.add_argument('--no-mmap-bin-files', action='store_false',
+                       help='Disable mmap-ing of .bin files.',
+                       dest='mmap_bin_files')
+    group.add_argument('--mock-data', action='store_true',
+                       help='Skip data loading and validation and opt for artificial '
+                       'generation of mock data when an implementation is available.')
+    group.add_argument('--seq-length', type=int, default=None,
+                       help='Maximum sequence length to process.')
+    group.add_argument('--encoder-seq-length', type=int, default=None,
+                       help='Maximum encoder sequence length to process.'
+                       'This should be exclusive of --seq-length')
+    group.add_argument('--decoder-seq-length', type=int, default=None,
+                       help="Maximum decoder sequence length to process.")
+    group.add_argument('--sample-rate', type=float, default=1.0,
+                       help='sample rate for training data. Supposed to be 0 '
+                            ' < sample_rate < 1')
+    group.add_argument('--mask-prob', type=float, default=0.15,
+                       help='Probability of replacing a token with mask.')
+    group.add_argument('--short-seq-prob', type=float, default=0.1,
+                       help='Probability of producing a short sequence.')
+    group.add_argument('--num-workers', type=int, default=2,
+                       help="Dataloader number of workers.")
+    group.add_argument('--reset-position-ids', action='store_true',
+                       help='Reset posistion ids after end-of-document token.')
+    group.add_argument('--reset-attention-mask', action='store_true',
+                       help='Reset self attention mask after '
+                       'end-of-document token.')
+    group.add_argument('--eod-mask-loss', action='store_true',
+                       help='Mask loss for the end of document tokens.')
+    group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
+                       help='If set, do not create attention_masks in dataloader.',
+                       dest='create_attention_mask_in_dataloader')
+    group.add_argument('--num-dataset-builder-threads', type=int, default=1,
+                       help='Number of parallel threads per rank for dataset builder')
+    group.add_argument('--object-storage-cache-path', type=str, default=None,
+                       help='Path to cache index files when using s3 or msc dataloader')
+    group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
+                       help='The sample surplus to build for the mid-level datasets(s)')
+    group.add_argument('--allow-ambiguous-pad-tokens', action='store_true',
+                       help='Whether to prevent pad tokens already present in the dataset '
+                       'from being masked out when the pad token incorrectly shares the same id '
+                       'with other special tokens in the tokenizer. Note that this argument has '
+                       'no effect when the tokenizer correctly provides a unique id for the pad. '
+                       'Masking out such ambiguous pad tokens results in training instability. '
+                       'Such a scenario is best resolved by fixing the tokenizer; leaving this '
+                       'option as False provides a workaround. '
+                       'When left to the default of False, any token ids that collide with the '
+                       'pad token id - as provided by the tokenizer - will not be masked out of '
+                       'the loss calculation: it cannot be determined whether they are truly pad. '
+                       'If instead this argument is set, the training flow will treat all tokens '
+                       'that share the same id as the pad token as true pad tokens, potentially '
+                       'causing severe training instability.')
     group.add_argument('--fim-data', action='store_true', help='Whether to use the FIM dataset.')
     group.add_argument(
         '--fim-rate',
@@ -4618,42 +4587,28 @@ def _add_heterogeneous_args(parser):
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument(
-        '--enable-experimental', action='store_true', help='Enable experimental features.'
-    )
-    group.add_argument(
-        '--spec',
-        type=str,
-        default=None,
-        nargs='*',
-        help='Specify the <module_location function_name> pair '
-        'that returns a spec to customize a model, transformer '
-        'block, or transformer layer, depending on the use case.'
-        'To use local spec specify local as the argument.'
-        'For more details, see the model class, '
-        '`transformer_block.py`, or `transformer_layer.py`',
-    )
-    group.add_argument(
-        '--hybrid-layer-pattern',
-        type=str,
-        default=None,
-        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-        '* (attention), - (mlp), E (moe). Use | to define pipeline stage '
-        'boundaries for flexible virtual pipeline parallel (fVPP). Use / to '
-        'separate MTP patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
-        'When this flag is used, it is the sole indicator that a hybrid model '
-        'is being run.',
-    )
-    group.add_argument(
-        '--hybrid-override-pattern',
-        type=str,
-        default=None,
-        help='Deprecated. Use --hybrid-layer-pattern instead. '
-        'If specified, its value will be forwarded to --hybrid-layer-pattern.',
-    )
-    group.add_argument(
-        '--yaml-cfg', type=str, default=None, help='Config file to add additional arguments'
-    )
+    group.add_argument('--enable-experimental', action='store_true',
+                       help='Enable experimental features.')
+    group.add_argument('--spec', type=str, default=None, nargs='*',
+                       help='Specify the <module_location function_name> pair '
+                       'that returns a spec to customize a model, transformer '
+                       'block, or transformer layer, depending on the use case.'
+                       'To use local spec specify local as the argument.'
+                       'For more details, see the model class, '
+                       '`transformer_block.py`, or `transformer_layer.py`')
+    group.add_argument('--hybrid-layer-pattern', type=str, default=None,
+                       help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
+                       '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+                       'stage boundaries for flexible virtual pipeline parallel (fVPP). '
+                       'Use / to separate MTP patterns. '
+                       'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+                       'When this flag is used, it is the sole indicator that a hybrid model '
+                       'is being run.')
+    group.add_argument('--hybrid-override-pattern', type=str, default=None,
+                       help='Deprecated. Use --hybrid-layer-pattern instead. '
+                       'If specified, its value will be forwarded to --hybrid-layer-pattern.')
+    group.add_argument('--yaml-cfg', type=str, default=None,
+                       help = 'Config file to add additional arguments')
 
     # Args of precision-aware optimizer.
     group.add_argument(
