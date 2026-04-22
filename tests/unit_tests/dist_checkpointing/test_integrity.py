@@ -68,7 +68,9 @@ class TestIntegrity:
                 data = {"test_metadata": 1}
                 json.dump(data, f)
 
-            save_integrity_manifest(ckpt_dir)
+            if torch.distributed.get_rank() == 0:
+                save_integrity_manifest(ckpt_dir)
+            torch.distributed.barrier()
             integrity_file = Path(ckpt_dir / "integrity.json")
             assert integrity_file.is_file(), "integrity.json doesn't exist."
 
@@ -91,7 +93,9 @@ class TestIntegrity:
                 data = {"test_metadata": 1}
                 json.dump(data, f)
 
-            save_integrity_manifest(ckpt_dir)
+            if torch.distributed.get_rank() == 0:
+                save_integrity_manifest(ckpt_dir)
+            torch.distributed.barrier()
 
             with open(metadata_file, "w") as f:
                 data = {"test_metadata": 11}
