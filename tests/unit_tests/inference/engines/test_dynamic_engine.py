@@ -4503,7 +4503,7 @@ class TestChunkedPrefillCudaGraphs:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
 
     def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
