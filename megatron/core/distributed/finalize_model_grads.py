@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
-from typing import Callable, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -274,6 +274,7 @@ def _allreduce_position_embedding_grads(
         model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=False
     )
 
+
 def _allreduce_router_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
     All-reduce router grads.
@@ -282,7 +283,7 @@ def _allreduce_router_grads(model: List[torch.nn.Module], config: TransformerCon
     """
 
     if parallel_state.get_pipeline_model_parallel_world_size() > 1:
-        grads_dict = {}
+        grads_dict: Dict[str, List[torch.Tensor]] = {}
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
                 if param.requires_grad and getattr(param, 'pipeline_parallel', False):

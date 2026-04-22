@@ -6,7 +6,6 @@ import pytest
 
 from megatron.elastification.router.flex_budget_utils import get_num_parameters
 
-
 # Reference dimensions used by most tests. Small enough to compute by hand.
 _DIMS = dict(
     mamba_num_heads=4,
@@ -28,11 +27,7 @@ _OUTPUT_LAYER = _DIMS["vocab_size"] * _DIMS["hidden_size"]
 
 
 def _att_cost():
-    h, k, q = (
-        _DIMS["hidden_size"],
-        _DIMS["kv_channels"],
-        _DIMS["num_query_groups"],
-    )
+    h, k, q = (_DIMS["hidden_size"], _DIMS["kv_channels"], _DIMS["num_query_groups"])
     n_heads = _DIMS["num_attention_heads"]
     input_ln = h
     linear_proj = n_heads * k * h
@@ -104,11 +99,7 @@ class TestGetNumParameters:
         pattern = "MEM*E"
         total, active = get_num_parameters(hybrid_pattern=pattern, tied_vocab=False, **_DIMS)
         expected_total = (
-            _EMBED_PLUS_LN
-            + _OUTPUT_LAYER
-            + 2 * _mamba_cost()
-            + 2 * _moe_cost_all()
-            + _att_cost()
+            _EMBED_PLUS_LN + _OUTPUT_LAYER + 2 * _mamba_cost() + 2 * _moe_cost_all() + _att_cost()
         )
         expected_active = (
             _EMBED_PLUS_LN

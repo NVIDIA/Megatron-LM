@@ -91,20 +91,14 @@ class TestLoadMemoryConfig:
 
     def test_cli_override_takes_priority_over_preset(self, profiles_file):
         args = _make_args(
-            profile="bf16",
-            profiles_path=profiles_file,
-            bpe_kv_cache=0.5625,  # override
+            profile="bf16", profiles_path=profiles_file, bpe_kv_cache=0.5625  # override
         )
         cfg = load_memory_config(args)
         assert cfg.bpe_kv_cache == 0.5625  # override wins
-        assert cfg.bpe_params == 2.0       # preset preserved
+        assert cfg.bpe_params == 2.0  # preset preserved
 
     def test_param_budget_target_override(self, profiles_file):
-        args = _make_args(
-            profile="bf16",
-            profiles_path=profiles_file,
-            param_budget_target="total",
-        )
+        args = _make_args(profile="bf16", profiles_path=profiles_file, param_budget_target="total")
         cfg = load_memory_config(args)
         assert cfg.param_budget_target == "total"
 

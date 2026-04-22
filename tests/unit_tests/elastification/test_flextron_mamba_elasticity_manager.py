@@ -135,9 +135,7 @@ class TestFlextronMambaElasticityManager:
         mixer, config = self._build_mixer_and_config()
 
         seq_len, micro_batch = 16, 2
-        x = torch.randn(
-            (seq_len, micro_batch, config.hidden_size), device="cuda"
-        )
+        x = torch.randn((seq_len, micro_batch, config.hidden_size), device="cuda")
         baseline_out, _ = mixer(x)
 
         mgr = FlextronMambaElasticityManager(config)

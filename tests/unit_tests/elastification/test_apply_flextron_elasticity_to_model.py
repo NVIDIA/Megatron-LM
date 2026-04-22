@@ -102,12 +102,8 @@ def stub_managers(monkeypatch):
         hooks_module, "add_flextron_transformer_layer_elasticity", _record("transformer_layer")
     )
     monkeypatch.setattr(hooks_module, "add_flextron_moe_elasticity", _record("moe"))
-    monkeypatch.setattr(
-        hooks_module, "add_flextron_topk_router_elasticity", _record("topk_router")
-    )
-    monkeypatch.setattr(
-        hooks_module, "add_flextron_grouped_mlp_elasticity", _record("grouped_mlp")
-    )
+    monkeypatch.setattr(hooks_module, "add_flextron_topk_router_elasticity", _record("topk_router"))
+    monkeypatch.setattr(hooks_module, "add_flextron_grouped_mlp_elasticity", _record("grouped_mlp"))
     monkeypatch.setattr(hooks_module, "add_flextron_mamba_elasticity", _record("mamba"))
     monkeypatch.setattr(hooks_module, "add_flextron_attention_elasticity", _record("attention"))
     monkeypatch.setattr(hooks_module, "add_flextron_stack_elasticity", _record_stack)
@@ -165,10 +161,7 @@ class TestLayerRouting:
         """Regression: the E-layer hook should fire whether the layer class is
         TransformerLayer (modelopt spec) or MoETransformerLayer (default spec)."""
         model = _StubModel(
-            [
-                _moe_layer(cls="TransformerLayer"),
-                _moe_layer(cls="MoETransformerLayer"),
-            ]
+            [_moe_layer(cls="TransformerLayer"), _moe_layer(cls="MoETransformerLayer")]
         )
         config = _make_config(pattern="EE")
         apply_flextron_elasticity_to_model(model, config)

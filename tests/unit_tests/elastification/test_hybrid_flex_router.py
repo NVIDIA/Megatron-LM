@@ -23,11 +23,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def _router_config(
-    hidden_size=256,
-    ffn_hidden_size=128,
-    num_heads=8,
-    mamba_num_heads=8,
-    num_moe_experts=8,
+    hidden_size=256, ffn_hidden_size=128, num_heads=8, mamba_num_heads=8, num_moe_experts=8
 ):
     """Build a TransformerConfig with every attr FlextronRouter reads."""
     config = TransformerConfig(

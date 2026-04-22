@@ -97,9 +97,7 @@ class TestFlextronStackElasticityManager:
 
         # Expected: baseline * sqrt(0.5)  (since per_logit is 1.0 on idx 1)
         expected_scale = (128 / 256) ** 0.5
-        torch.testing.assert_close(
-            scaled, baseline * expected_scale, atol=1e-2, rtol=1e-2
-        )
+        torch.testing.assert_close(scaled, baseline * expected_scale, atol=1e-2, rtol=1e-2)
 
     def test_detach_removes_all_hooks(self):
         config = _stack_config()

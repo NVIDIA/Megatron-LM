@@ -58,10 +58,10 @@ class TestConvertPerListsToIntLists:
         )
         convert_per_lists_to_int_lists(cfg)
         assert cfg.emb_int_list == [1920]
-        assert cfg.mlp_int_list == [480]         # 0.5 * 960
-        assert cfg.head_int_list == [32, 8]      # 1.0 / 0.25 of 32
-        assert cfg.mamba_int_list == [48]        # 0.75 * 64
-        assert cfg.moe_expert_int_list == [64]   # 0.5 * 128
+        assert cfg.mlp_int_list == [480]  # 0.5 * 960
+        assert cfg.head_int_list == [32, 8]  # 1.0 / 0.25 of 32
+        assert cfg.mamba_int_list == [48]  # 0.75 * 64
+        assert cfg.moe_expert_int_list == [64]  # 0.5 * 128
 
     def test_axis_with_no_per_list_is_untouched(self):
         cfg = _make_config(emb_per_list=[1.0])  # only emb
@@ -76,11 +76,16 @@ class TestConvertPerListsToIntLists:
 class TestValidateFlextronPerIntLists:
     def _make_args(self, **overrides):
         defaults = dict(
-            emb_per_list=None, emb_int_list=None,
-            mlp_per_list=None, mlp_int_list=None,
-            head_per_list=None, head_int_list=None,
-            mamba_per_list=None, mamba_int_list=None,
-            moe_expert_per_list=None, moe_expert_int_list=None,
+            emb_per_list=None,
+            emb_int_list=None,
+            mlp_per_list=None,
+            mlp_int_list=None,
+            head_per_list=None,
+            head_int_list=None,
+            mamba_per_list=None,
+            mamba_int_list=None,
+            moe_expert_per_list=None,
+            moe_expert_int_list=None,
         )
         defaults.update(overrides)
         return Namespace(**defaults)
