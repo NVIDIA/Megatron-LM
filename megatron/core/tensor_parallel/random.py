@@ -2,16 +2,20 @@
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
+from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Optional, Union
+from collections.abc import Callable
+from typing import Any, Optional, TypeVar, Union
 
 import torch
 from torch import _C
 from torch.cuda import _lazy_call, _lazy_init
 from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
+from torch.utils.cpp_extension import load_inline
+from typing_extensions import TypeVarTuple, Unpack
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
@@ -19,6 +23,57 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
+
+# ---------------------------------------------------------------------------
+# C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
+# ---------------------------------------------------------------------------
+# Makes dst's UntypedStorage point to src's data WITHOUT copying bytes.
+# Holds a refcounted reference to src's StorageImpl so the memory stays alive.
+# Operates below the Tensor / autograd layer → no version-counter bump,
+# and ALL TensorImpls that reference dst's StorageImpl (including views
+# created by reshape / split / etc. inside TE GroupedLinear) see the data.
+# ---------------------------------------------------------------------------
+
+_SHARE_STORAGE_SRC = r"""
+#include <torch/extension.h>
+
+void share_storage(at::Tensor dst, at::Tensor src) {
+    auto* dst_impl = dst.storage().unsafeGetStorageImpl();
+
+    // Copy src's c10::Storage (increments StorageImpl refcount).
+    auto* src_storage_ref = new c10::Storage(src.storage());
+
+    void*       data   = src_storage_ref->data_ptr().get();
+    size_t      nbytes = src_storage_ref->nbytes();
+    c10::Device device = src_storage_ref->device();
+
+    // Build a DataPtr whose deleter releases our StorageImpl reference.
+    c10::DataPtr shared(
+        data,
+        static_cast<void*>(src_storage_ref),
+        [](void* ctx) { delete static_cast<c10::Storage*>(ctx); },
+        device);
+
+    dst_impl->set_data_ptr(std::move(shared));
+    dst_impl->set_nbytes(nbytes);
+}
+"""
+
+_share_storage_ext = None
+
+
+def _get_share_storage():
+    """Lazily compile & cache the share_storage extension."""
+    global _share_storage_ext
+    if _share_storage_ext is None:
+        _share_storage_ext = load_inline(
+            name="share_storage_ext",
+            cpp_sources=_SHARE_STORAGE_SRC,
+            functions=["share_storage"],
+            verbose=False,
+        )
+    return _share_storage_ext.share_storage
+
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
@@ -493,6 +548,10 @@ def is_checkpointing():
     return IS_CHECKPOINTING
 
 
+_R = TypeVar('_R')
+_Ts = TypeVarTuple('_Ts')
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -503,7 +562,12 @@ class CheckpointFunction(torch.autograd.Function):
 
     # pylint: disable=missing-function-docstring
     @staticmethod
-    def forward(ctx, run_function, distribute_saved_activations, *args):
+    def forward(
+        ctx: Any,
+        run_function: Callable[[Unpack[_Ts]], _R],
+        distribute_saved_activations: bool,
+        *args: Unpack[_Ts],
+    ) -> _R:
         """Forward pass."""
         _set_checkpointing()
 
@@ -570,7 +634,9 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_saved_activations, *args):
+def checkpoint(
+    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+) -> _R:
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
@@ -578,12 +644,17 @@ def checkpoint(function, distribute_saved_activations, *args):
 
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
-    Checkpoint Function Helper for CheckpointWithouOutput.
+    Checkpoint Function Helper for CheckpointWithoutOutput.
     Save context for recompute.
     """
 
     @staticmethod
-    def forward(ctx, run_function, checkpoint_without_output_obj, *args):
+    def forward(
+        ctx: Any,
+        run_function: Callable[[Unpack[_Ts]], _R],
+        checkpoint_without_output_obj: CheckpointWithoutOutput,
+        *args: Unpack[_Ts],
+    ) -> _R:
         """Forward pass."""
         if checkpoint_without_output_obj.fp8:
             fp8 = FP8GlobalStateManager.is_fp8_enabled()
@@ -641,7 +712,7 @@ class CheckpointWithoutOutput(object):
         self.ctx = None
         self.outputs = None
 
-    def checkpoint(self, run_function, *args):
+    def checkpoint(self, run_function: Callable[[Unpack[_Ts]], _R], *args: Unpack[_Ts]) -> _R:
         """Checkpoint function."""
 
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
@@ -709,12 +780,14 @@ class CheckpointWithoutOutput(object):
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
 
-        # restore the recomputed memory without changing the metadata
-        with torch.no_grad():
-            for output, recomputation_output in zip(self.outputs, outputs):
-                output_size = recomputation_output.untyped_storage().size()
-                output.untyped_storage().resize_(output_size)
-                output.untyped_storage().copy_(recomputation_output.untyped_storage())
+        # Zero-copy: make output's StorageImpl point to recomputation_output's data.
+        # This operates at the UntypedStorage level (below TensorImpl), so:
+        #   - ALL views / reshapes that reference output's StorageImpl see the data
+        #     (e.g. TE GroupedLinear's inp.reshape() + torch.split() saved for backward)
+        #   - No tensor version-counter bump (no autograd complaint)
+        share_storage = _get_share_storage()
+        for output, recomputation_output in zip(self.outputs, outputs):
+            share_storage(output, recomputation_output)
 
         self.ctx.outputs = outputs
         self.ctx.inputs = inputs

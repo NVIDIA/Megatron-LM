@@ -17,8 +17,6 @@ on:
         type: boolean
         default: true
     secrets:
-      TWINE_USERNAME:
-        required: true
       TWINE_PASSWORD:
         required: true
 
@@ -45,12 +43,14 @@ jobs:
       PUBLISH_DRYRUN: ${{ inputs.dry-run }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref }}
 
       - name: Build wheel
         id: build-wheel
+        env:
+          NO_VCS_VERSION: "1"
         run: |
           set -x
 
@@ -72,11 +72,11 @@ jobs:
 
           pushd $BUILD_DIR
             rm LICENSE || true
-            docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE bash -c '\
-              for python_version in cp310 cp311 cp312 cp313; do \
+            docker run --rm -e NO_VCS_VERSION=1 -v $(pwd):/workspace -w /workspace $IMAGE bash -c '\
+              for python_version in cp311 cp312 cp313; do \
                 /opt/python/${python_version}-${python_version}/bin/pip install --upgrade "setuptools<80.0.0,>=77.0.0" build; \
               done && \
-              for python_version in cp310 cp311 cp312 cp313; do \
+              for python_version in cp311 cp312 cp313; do \
                 /opt/python/${python_version}-${python_version}/bin/python -m build; \
               done \
             '
@@ -120,25 +120,23 @@ jobs:
 
           if [ "$PACKAGE" = "megatron-core" ]; then
             if [[ "$PLATFORM" == "arm64" ]]; then
-              for file in dist/$WHEEL_PREFIX*cp310*aarch64.whl; do
-                pip install --no-cache-dir "$file"
-              done
+              WHEEL_GLOB="dist/${WHEEL_PREFIX}*cp312*aarch64.whl"
             else
-              for file in dist/$WHEEL_PREFIX*cp310*x86_64.whl; do
-                pip install --no-cache-dir "$file"
-              done
+              WHEEL_GLOB="dist/${WHEEL_PREFIX}*cp312*x86_64.whl"
             fi
           else
-            pip install --no-cache-dir dist/$WHEEL_PREFIX*.whl
+            WHEEL_GLOB="dist/${WHEEL_PREFIX}*.whl"
           fi
 
-          sudo rm -rf megatron/
-
-          RELEASE_NUMBER=$(python -c "import $ROOTPATH; print($ROOTPATH.__version__)")
-          test "${{ steps.build-wheel.outputs.expected-release-number }}" == "$RELEASE_NUMBER"
+          docker run --rm -v $(pwd):/workspace -w /workspace $IMAGE bash -c "\
+            /opt/python/cp312-cp312/bin/pip install --no-cache-dir $WHEEL_GLOB && \
+            rm -rf megatron/ && \
+            RELEASE_NUMBER=\$(/opt/python/cp312-cp312/bin/python -c 'import $ROOTPATH; print($ROOTPATH.__version__)') && \
+            test '${{ steps.build-wheel.outputs.expected-release-number }}' == \"\$RELEASE_NUMBER\" \
+          "
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
           path: dist/
@@ -147,7 +145,6 @@ jobs:
     needs: [build-and-test-wheels]
     runs-on: ubuntu-latest
     if: inputs.no-publish == false
-    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'main' || 'public' }}
     strategy:
       fail-fast: false
       matrix:
@@ -162,7 +159,7 @@ jobs:
       PACKAGE: ${{ matrix.PACKAGE }}
     steps:
       - name: Download wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
           path: dist/
@@ -170,7 +167,7 @@ jobs:
 
       - name: Publish wheels
         env:
-          TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+          TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
           TWINE_REPOSITORY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'pypi' || 'testpypi' }}
           PLATFORM: ${{ matrix.PLATFORM }}

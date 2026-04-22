@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -15,14 +15,15 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -37,6 +38,7 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -327,6 +329,7 @@ class TestLLaVACudaGraph:
         # Get layer specs
         language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
+        assert isinstance(language_layer_spec.submodules, TransformerLayerSubmodules)
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
         # Set vision model type
@@ -459,7 +462,7 @@ class TestLLaVACudaGraph:
                 del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
 
 
-class TestParallelMambaBlockCudagraphs:
+class TestParallelHybridBlockCudagraphs:
     def setup_method(self, method):
         # initialize parallel state
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
@@ -472,25 +475,27 @@ class TestParallelMambaBlockCudagraphs:
         def get_pg_collection():
             return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-        def get_mamba_block(hybrid_override_pattern):
+        def get_mamba_block(hybrid_layer_pattern):
+            layer_type_list = validate_segment_layers(hybrid_layer_pattern)
             transformer_config = TransformerConfig(
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 # Need to specify num_attention_heads and num_layers or TransformerConfig
                 # will generate errors.
-                num_layers=len(hybrid_override_pattern),
+                num_layers=len(layer_type_list),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl="local",
             )
-            modules = mamba_stack_spec.submodules
-            return MambaStack(
+            modules = hybrid_stack_spec.submodules
+            return HybridStack(
                 transformer_config,
                 modules,
-                hybrid_override_pattern=hybrid_override_pattern,
+                layer_type_list=layer_type_list,
+                pp_layer_offset=0,
                 pg_collection=get_pg_collection(),
             )
 
-        self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")
+        self.mamba_block = get_mamba_block(hybrid_layer_pattern="M-M*-")
         self.transformer_config = self.mamba_block.config
 
     def teardown_method(self, method):
@@ -570,7 +575,6 @@ class TestTECudaGraphHelper:
         # Initialize num_microbatches calculator
         init_num_microbatches_calculator(
             rank=0,
-            rampup_batch_size=None,
             global_batch_size=micro_batch_size * num_microbatches,
             micro_batch_size=micro_batch_size,
             data_parallel_size=1,

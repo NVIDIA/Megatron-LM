@@ -1,15 +1,24 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Megatron Energon
 
-Advanced multimodal dataloader for efficient loading of text, images, video, and audio at scale.
+Multimodal dataloader for text, images, video, and audio at scale.
 
 ## Overview
 
-[**Megatron Energon**](https://github.com/NVIDIA/Megatron-Energon) is purpose-built for large-scale multimodal training with:
+[**Megatron Energon**](https://github.com/NVIDIA/Megatron-Energon) supports large-scale multimodal training with:
 
-- **Multimodal support** - Text, images, video, audio
-- **Distributed loading** - Optimized for multi-node training
+- **Multimodal support** - Text, images, video, and audio
+- **Distributed loading** - Suited to multi-node training
 - **Data blending** - Mix datasets with configurable weights
-- **WebDataset format** - Efficient streaming from cloud storage
+- **WebDataset format** - Streaming from cloud storage
 - **State management** - Save and restore training position
 
 ## Installation
@@ -22,12 +31,12 @@ pip install megatron-energon
 
 ### Data Processing
 
-- **Packing** - Optimize sequence length utilization
-- **Grouping** - Smart batching of similar-length sequences
+- **Packing** - Packs samples to use sequence length capacity
+- **Grouping** - Batching of similar-length sequences
 - **Joining** - Combine multiple dataset sources
-- **Object storage** - Stream from S3, GCS, Azure Blob Storage
+- **Object storage** - Stream from S3, GCS, and Azure Blob Storage
 
-### Production-Ready
+### Production Use
 
 - Distributed loading across workers and nodes
 - Checkpoint data loading state
@@ -97,6 +106,8 @@ WorkerConfig(
 
 ### Common Parameters
 
+The following table summarizes frequently used dataset and loader parameters:
+
 | Parameter | Description |
 |-----------|-------------|
 | `batch_size` | Samples per batch |
@@ -123,10 +134,10 @@ for iteration, batch in enumerate(get_loader(train_ds)):
 
 ## Resources
 
-- **[Megatron Energon GitHub](https://github.com/NVIDIA/Megatron-Energon)** - Documentation and examples
-- **[Multimodal Examples](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/multimodal)** - Megatron-LM multimodal training
+- **[Megatron Energon GitHub](https://github.com/NVIDIA/Megatron-Energon)**: Documentation and examples
+- **[Multimodal Examples](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/multimodal)**: Megatron-LM multimodal training
 
 ## Next Steps
 
-- Check [Multimodal Models](../../models/multimodal.md) for supported architectures
-- See [Training Examples](../training-examples.md) for integration examples
+- Refer to [Multimodal Models](../../models/multimodal.md) for supported architectures
+- Refer to [Training Examples](../training-examples.md) for integration examples

@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -44,6 +43,11 @@ class ParameterMetadata:
     is_tp: bool = False
     partition_dim: int = 0
     partition_stride: int = 1
+    # For parameters that pack multiple independently-sharded components of
+    # different sizes (e.g. Mamba in_proj packs z, x, B, C, dt).  When present,
+    # lists the per-TP-rank block sizes along partition_dim.  The refit planner
+    # interleaves these blocks rather than doing a simple contiguous concat.
+    partition_sizes: list[int] | None = None
 
     # EP sharding info (fused/grouped MoE)
     is_ep: bool = False
@@ -251,50 +255,106 @@ def extract_param_metadata(
     pg_collection,
     num_experts: Optional[int] = None,
     layer_module_prefix_map: Mapping[str, str] | None = None,
+    rank_offset: int = 0,
+    _rank_list_cache: dict | None = None,
 ) -> ParameterMetadata:
-    """Extract metadata from a parameter for cross-rank communication."""
+    """Extract metadata from a parameter for cross-rank communication.
+
+    Args:
+        _rank_list_cache: Optional dict used to deduplicate rank lists so
+            that params sharing the same process group reuse one object.
+            This dramatically shrinks pickle size when metadata is gathered
+            across many ranks (pickle uses backreferences for same-``id()``
+            objects, avoiding re-serialization of identical group lists).
+    """
     # TP flags from attributes (set by Megatron linear layers)
     is_tp = bool(getattr(param, 'tensor_model_parallel', False))
     partition_dim = int(getattr(param, 'partition_dim', 0))
     partition_stride = int(getattr(param, 'partition_stride', 1))
-
-    # SwiGLU/GLU compatibility: For gated linear units, fc1 stores interleaved [gate, up] portions
-    # and requires partition_stride=2 for correct resharding. New models set this at construction
-    # time (MLP sets partition_stride=2 on weight when gated_linear_unit=True). For legacy models
-    # where stride=1 was left as default, we apply stride=2 as a fallback for fc1 parameters.
-    # This is safe because: (1) gated models need it, and (2) non-gated models have smaller fc1
-    # and stride doesn't affect single-block transfers.
-    # if 'mlp.linear_fc1' in param_name and is_tp and partition_stride == 1:
-    #     partition_stride = 2
+    partition_sizes = getattr(param, 'partition_sizes', None)
+    if partition_sizes is not None:
+        partition_sizes = list(partition_sizes)
 
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
+
+    # Expert-param detection for TP inference.  When explicit_expert_comm is
+    # active (is_expert and (tp_size>1 or ep)), TE clears parallel_mode so
+    # tensor_model_parallel is never stamped — yet the weight IS TP-sharded
+    # when tp_size > 1.  We detect expert params via num_experts + the
+    # per-expert naming convention (weightK / biasK in TEGroupedLinear).
+    is_expert_param = (
+        num_experts is not None and _detect_expert_index_from_param_name(param_name) is not None
+    )
 
     tensor_parallel_group_ranks: list[int] | None = None
     expert_parallel_group_ranks: list[int] | None = None
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
-    if is_ep:
-        expert_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.ep)
-        # For MoE params, prefer expert TP group when available, else regular TP
-        if is_tp and hasattr(pg_collection, 'expt_tp') and pg_collection.expt_tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.expt_tp)
-        elif is_tp and hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.tp)
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+    # Deduplicate rank lists: params sharing the same TP/DP/EP/PP group get
+    # one shared list object instead of separate copies.  This shrinks pickle
+    # size ~75% when metadata is gathered across many ranks (pickle uses
+    # backreferences for same-id() objects).
+    if _rank_list_cache is None:
+        _rank_list_cache = {}
+
+    def _dedup_ranks(ranks: list[int]) -> list[int]:
+        key = tuple(ranks)
+        if key not in _rank_list_cache:
+            _rank_list_cache[key] = list(key)
+        return _rank_list_cache[key]
+
+    def _offset_ranks(ranks: list[int]) -> list[int]:
+        result = [r + rank_offset for r in ranks] if rank_offset else ranks
+        return _dedup_ranks(result)
+
+    if is_ep or is_expert_param:
+        if is_ep:
+            expert_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.ep)
+            )
+        # For expert params, always provide TP group ranks so the planner can
+        # handle TP size transitions (e.g., TP2→TP1).  When explicit_expert_comm
+        # clears TE's parallel_mode, tensor_model_parallel may not be set even
+        # though the weight IS TP-sharded.  Detect TP via group size instead.
+        expt_tp = getattr(pg_collection, 'expt_tp', None)
+        tp_grp = expt_tp if expt_tp is not None else getattr(pg_collection, 'tp', None)
+        if tp_grp is not None:
+            tp_ranks = _offset_ranks(dist.get_process_group_ranks(tp_grp))
+            tensor_parallel_group_ranks = tp_ranks
+            if not is_tp and len(tp_ranks) > 1:
+                is_tp = True
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     elif is_tp:
         # Non-EP: use regular TP group
         if hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.tp)
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+            tensor_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.tp)
+            )
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     else:
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
+
+    # Always provide TP group ranks so the planner can handle TP size transitions
+    # (e.g., TP2→TP1).  When is_tp=False the param is replicated across the TP group,
+    # but the planner still needs to know the TP topology to plan gather/scatter ops
+    # when the *other* side of the reshard IS TP-sharded.
+    if (
+        tensor_parallel_group_ranks is None
+        and hasattr(pg_collection, 'tp')
+        and pg_collection.tp is not None
+    ):
+        tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.tp))
 
     if hasattr(pg_collection, 'pp') and pg_collection.pp is not None:
-        pipeline_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.pp)
+        pipeline_parallel_group_ranks = _offset_ranks(
+            dist.get_process_group_ranks(pg_collection.pp)
+        )
     else:
-        pipeline_parallel_group_ranks = list(range(dist.get_world_size()))
+        pipeline_parallel_group_ranks = _dedup_ranks(
+            list(range(rank_offset, rank_offset + dist.get_world_size()))
+        )
 
     meta = ParameterMetadata(
         name=param_name,
@@ -304,6 +364,7 @@ def extract_param_metadata(
         is_tp=is_tp,
         partition_dim=partition_dim,
         partition_stride=partition_stride,
+        partition_sizes=partition_sizes,
         is_ep=is_ep,
         num_experts=num_experts,
         owner_rank=owner_rank,
@@ -324,38 +385,129 @@ def select_src_metadata_balanced(
 ) -> ParameterMetadata:
     """Choose a representative source `ParameterMetadata` for a destination rank.
 
-    Multiple source data-parallel (DP) groups may hold the same logical parameter.
-    To avoid always reading from the same group, we:
-      - bucket `src_meta_list` by their DP group (tuple of ranks)
-      - if there is only one bucket, just return the first entry
-      - otherwise, use the destination rank's global rank to select a source
-        DP group in a round-robin fashion, ensuring even distribution of load
-        across all source DP groups.
+    The selected metadata provides topology information (TP/EP/DP group ranks) that the
+    LCM transfer planner uses to compute actual source ranks and slices. This function
+    doesn't perform transfers itself - it just picks which source configuration to use
+    as reference for planning.
+
+    Two scenarios for EP-sharded parameters:
+    1. Non-collocated mode (same EP size, different rank numbering):
+       - Filter by matching EP local rank to pair ranks with same expert position
+       - Example: src ranks [0-63] and dst ranks [64-127] both with EP=8
+       - Dst EP local 0 should use src EP local 0 as reference (same experts)
+
+    2. Resharding mode (different EP sizes):
+       - Skip EP local rank filtering (sizes don't correspond)
+       - Example: EP=8→EP=16 means dst EP local 8 has no matching src EP local
+       - Expert matching handled by resolved_name; LCM handles TP dimension changes
+
+    Finally, balances across data-parallel (DP) groups to distribute load:
+      - Groups src_meta_list by DP group
+      - Selects source DP group via round-robin: dst_rank % num_src_dp_groups
+      - Ensures even distribution of transfer load across source DP replicas
     """
     if not src_meta_list:
         raise ValueError("src_meta_list must be non-empty")
 
-    # Group source metadata by their DP group layout so we can balance across groups.
-    #   (dp_rank0, dp_rank1, ...) -> [ParameterMetadata for that DP group]
+    # ============================================================================
+    # EXPERT PARALLELISM (EP) LOCAL RANK FILTERING
+    # ============================================================================
+    # Purpose: In non-collocated mode with same EP size, ensure destination ranks
+    # use source metadata from ranks with the same EP local position (same experts).
+    #
+    # Why size check matters:
+    #   - Same size (EP=8→EP=8): Local ranks 0-7 exist in both src and dst
+    #     → Filter ensures dst EP local 0 uses src EP local 0 (same global experts)
+    #   - Different size (EP=8→EP=16): Local ranks 0-15 in dst, only 0-7 in src
+    #     → Dst EP local 8 has no corresponding src EP local rank
+    #     → Skip filter; expert reassignment handled by resolved_name matching
+    #
+    # Expert routing: When EP size changes, each expert parameter is matched via
+    # resolved_name (which includes global expert index). The LCM/TP planner
+    # handles any TP dimension changes, and DP round-robin distributes load.
+    # ============================================================================
+    dst_ep_group = dst_metadata.expert_parallel_group_ranks
+    if dst_ep_group is not None:
+        dst_ep_local = dst_ep_group.index(dst_rank)
+        # Check if EP sizes match between source and destination
+        src_ep_size = (
+            len(src_meta_list[0].expert_parallel_group_ranks)
+            if src_meta_list[0].expert_parallel_group_ranks
+            else None
+        )
+        dst_ep_size = len(dst_ep_group)
+
+        # Only filter by EP local rank when sizes match (non-collocated, not resharding)
+        if src_ep_size == dst_ep_size:
+            matching_ep = [
+                m
+                for m in src_meta_list
+                if m.expert_parallel_group_ranks
+                and m.expert_parallel_group_ranks.index(m.owner_rank) == dst_ep_local
+            ]
+            if not matching_ep:
+                # This indicates a configuration bug: sizes match but no local rank match
+                def _ep_local(m):
+                    return (
+                        m.expert_parallel_group_ranks.index(m.owner_rank)
+                        if m.expert_parallel_group_ranks
+                        else None
+                    )
+
+                available = [(m.owner_rank, _ep_local(m)) for m in src_meta_list]
+                raise ValueError(
+                    f"No source metadata with EP local rank {dst_ep_local}"
+                    f" found for dst rank {dst_rank}. Available: {available}"
+                )
+            src_meta_list = matching_ep
+        # else: EP resharding mode (sizes differ) - skip filter, keep all source candidates
+
+    # ============================================================================
+    # LOCAL COPY OPTIMIZATION (COLLOCATED MODE)
+    # ============================================================================
+    # In collocated mode, prefer local copies when available. If dst_rank appears
+    # in the source metadata list (after TP/EP filtering), use it directly to
+    # avoid unnecessary data transfers.
+    #
+    # A local copy is essentially free
+    # (tensor.copy_() on same GPU), while any remote transfer incurs significant
+    # overhead even within the same node.
+    # ============================================================================
+    local_meta = [m for m in src_meta_list if m.owner_rank == dst_rank]
+    if local_meta:
+        # Found local metadata - use it for a free local copy
+        return local_meta[0]
+
+    # ============================================================================
+    # DATA PARALLELISM (DP) LOAD BALANCING
+    # ============================================================================
+    # After TP/EP filtering (if applicable), balance transfer load across source
+    # data-parallel replicas. Each DP group holds a complete copy of the model,
+    # so we can read from any DP group - choosing via round-robin spreads load.
+    #
+    # Load distribution: dst_rank % num_src_dp_groups ensures even distribution
+    # even when destination has different DP configuration than source.
+    # ============================================================================
     grouped_by_dp: dict[tuple[int, ...], list[ParameterMetadata]] = {}
     for meta in src_meta_list:
         dp_group = tuple(meta.data_parallel_group_ranks or [])
         grouped_by_dp.setdefault(dp_group, []).append(meta)
 
-    # Fast path: only one DP layout present; no balancing necessary.
+    # Fast path: only one DP group present; no balancing necessary
     if len(grouped_by_dp) == 1:
         return src_meta_list[0]
 
-    # Use the destination rank's global rank to select a source DP group in a
-    # round-robin fashion. This ensures that even when multiple destination ranks
-    # have the same DP index (e.g., ranks 0,1,2,3 all being at position 0 in their
-    # respective DP groups), they still get distributed across different source
-    # DP groups based on their global rank.
+    # Round-robin selection across source DP groups based on destination global rank
+    # This ensures even distribution: if we have 4 src DP groups and 128 dst ranks,
+    # each src DP group will be selected by 32 dst ranks (128 / 4 = 32)
     sorted_dp_groups = sorted(grouped_by_dp.keys())
     chosen_group = sorted_dp_groups[dst_rank % len(sorted_dp_groups)]
 
-    # Within the chosen group, any representative metadata works; use the first.
-    return grouped_by_dp[chosen_group][0]
-
-
-logger = logging.getLogger(__name__)
+    # Within the chosen DP group, distribute across available metadata entries
+    # to balance load across all TP groups in the DP replica.
+    # Example: With 4 TP groups in a DP group, dst_ranks will cycle through all 4
+    # instead of always using the first one, better distributing transfer load.
+    group_metadata = grouped_by_dp[chosen_group]
+    within_group_idx = (dst_rank // len(sorted_dp_groups)) % len(group_metadata)
+    selected = group_metadata[within_group_idx]
+    return selected

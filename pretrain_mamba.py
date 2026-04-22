@@ -32,17 +32,17 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.models.mamba import MambaModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
 from megatron.training import (
     get_args,
     get_timers,
-    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
     set_startup_timestamps,
 )
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -237,7 +237,7 @@ def forward_step(data_iterator, model: MambaModel):
     if cu_seqlens is None:
         packed_seq_params = None
     else:
-        # TODO(duncan): This class seems overly complex for what needs to be conveyed
+        total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
@@ -246,6 +246,7 @@ def forward_step(data_iterator, model: MambaModel):
             cu_seqlens_kv_padded=None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            total_tokens=total_tokens,
         )
 
     timers('batch-generator').stop()
@@ -274,10 +275,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args):
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -359,11 +357,13 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
+    args = parse_and_validate_args(
+        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
     pretrain(train_valid_test_datasets_provider,
              partial(model_provider, mamba_builder),
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
              store=store,
-             extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
              )

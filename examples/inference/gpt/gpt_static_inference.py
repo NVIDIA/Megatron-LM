@@ -5,6 +5,7 @@ import sys
 import time
 from argparse import Namespace
 
+from megatron.training.arguments import parse_and_validate_args
 import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
@@ -17,7 +18,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 
 sys.path.append(
@@ -64,10 +65,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
     Returns:
         AbstractBackend: The chosen backend
     """
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
     inference_context = StaticInferenceContext(
         args.inference_max_requests, args.inference_max_seq_length
     )
@@ -124,7 +122,7 @@ def main():
 
     # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
     # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
-    initialize_megatron(
+    args = parse_and_validate_args(
         extra_args_provider=add_static_inference_args,
         args_defaults={
             'no_load_rng': True,
@@ -133,8 +131,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-
-    args = get_args()
+    initialize_megatron()
 
     model = get_model_for_inference()
 
@@ -149,10 +146,9 @@ def main():
         top_n_logprobs=args.top_n_logprobs,
     )
 
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
+
     requests = build_requests(args, tokenizer)
     prompts = [r.prompt_text for r in requests]
 
