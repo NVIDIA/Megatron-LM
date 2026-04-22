@@ -200,9 +200,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             cu_seqlens_kv=cu_seqlens_for_params,
             cu_seqlens_q_padded=cu_seqlens_padded,
             cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
-            local_cp_size=local_cp_size,
+            max_seqlen_q=int(max_seqlen.item()),
+            max_seqlen_kv=int(max_seqlen.item()),
+            local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
         )
 
