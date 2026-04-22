@@ -2214,7 +2214,7 @@ def get_batch_on_this_tp_rank(
                 _broadcast(attention_mask)
 
         elif is_sft:
-            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermidiate stages
+            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermediate stages
             tokens = None
             labels = None
             loss_mask = None
