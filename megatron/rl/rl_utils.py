@@ -689,13 +689,6 @@ def get_environment_rollouts(
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
 
-    if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/restore-optimizer-after-inference", time=True):
-            with nvtx_range("rl/restore/grad-buffers", time=True):
-                model[0].restore_grad_buffers()
-            with nvtx_range("rl/restore/optimizer-state", time=True):
-                optimizer.restore_from_cpu()
-
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
             lang_rl_log_dir
@@ -1613,9 +1606,8 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=args.global_batch_size, 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=args.global_batch_size,
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                )
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
@@ -1640,9 +1632,8 @@ def prepare_data_for_update(
 
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled), 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled),
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
@@ -1678,6 +1669,7 @@ def get_grpo_data_iterator(
     sequence_packing: bool,
     is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
+    optimizer_is_on_cpu: bool = False,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -1697,6 +1689,7 @@ def get_grpo_data_iterator(
         sequence_packing: Use sequence packing if True.
         is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
+        optimizer_is_on_cpu: If True, the optimizer was offloaded to CPU and must be restored.
 
     Returns:
         RerunDataIterator for the current training step
@@ -1723,6 +1716,13 @@ def get_grpo_data_iterator(
             sequence_packing=sequence_packing,
             is_correction=is_correction,
         )
+        if optimizer_is_on_cpu:
+            nvtx_range = get_nvtx_range()
+            with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
+                    model[0].restore_grad_buffers()
+                with nvtx_range("rl/restore/optimizer-state", time=True):
+                    optimizer.restore_from_cpu()
         runtime_state.group_stats = group_stats
         runtime_state.example_groups = example_groups
         runtime_state.reset_iteration_counters(iteration)

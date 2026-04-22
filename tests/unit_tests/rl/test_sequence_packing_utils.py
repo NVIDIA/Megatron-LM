@@ -98,13 +98,12 @@ def test_sequence_packing_basic():
     rewards = torch.tensor([1.0, 2.0, 3.0, 4.0])
 
     sequences_tensor = torch.stack(sequences)
-    packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(sequences_tensor, generation_masks)
+    packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
+        sequences_tensor, generation_masks
     )
 
     assert packed_trajs is not None
     assert packed_position_ids is not None
-    assert packed_attention_mask is not None
     assert packed_loss_mask is not None
     assert packing_info is not None
 
@@ -140,8 +139,8 @@ def test_sequence_packing_with_generation_masks():
     )
 
     padded_sequences_tensor = torch.stack(padded_sequences)
-    packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(padded_sequences_tensor, generation_masks)
+    packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
+        padded_sequences_tensor, generation_masks
     )
 
     assert packed_trajs.shape[0] == 1
@@ -162,16 +161,14 @@ def test_sequence_packing_empty_bins():
     )
     packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 0, 0, 0]])
     packed_loss_mask = torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.float)
-    packed_attention_mask = torch.ones(1, bin_size, bin_size)
 
-    empty_trajs, empty_position_ids, empty_loss_mask, empty_attention_mask, empty_packing_info = (
+    empty_trajs, empty_position_ids, empty_loss_mask, empty_packing_info = (
         sequence_packing_utils.create_empty_bins(
             num_empty_bins=num_empty_bins,
             bin_size=bin_size,
             packed_trajs=packed_trajs,
             packed_position_ids=packed_position_ids,
             packed_loss_mask=packed_loss_mask,
-            packed_attention_mask=packed_attention_mask,
             tokenizer=tokenizer,
         )
     )
@@ -220,8 +217,8 @@ def test_sequence_packing_integration():
     ]
 
     sequences_tensor = torch.stack(sequences)
-    packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(sequences_tensor, generation_masks)
+    packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
+        sequences_tensor, generation_masks
     )
 
     assert packed_trajs is not None
@@ -513,12 +510,7 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
     global_bs_in_seq = int(n_seqs * ratio)
 
     def side_eff(
-        rank,
-        rampup_batch_size,
-        global_batch_size,
-        micro_batch_size,
-        data_parallel_size,
-        decrease_batch_size_if_needed,
+        rank, global_batch_size, micro_batch_size, data_parallel_size, decrease_batch_size_if_needed
     ):
         # Inside of the get_microbatch_dataloader, we compute the batch size in bins.
         # We want to test this variable.
@@ -536,7 +528,6 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
                     num_bins_this_rank=local_bins,
                     bin_seq_indices=[],
                     global_batch_size=global_bs_in_seq,
-                    rampup_batch_size=1,
                     micro_batch_size=1,
                     decrease_batch_size_if_needed=False,
                 )
