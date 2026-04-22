@@ -24,8 +24,9 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
+from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine, get_model_for_inference
 from model_provider import model_provider
 
 sys.path.append(
@@ -38,6 +39,7 @@ from typing import List
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0
@@ -150,7 +152,7 @@ def generate_dynamic(
 def main():
     """Main program."""
 
-    initialize_megatron(
+    parse_and_validate_args(
         extra_args_provider=add_inference_benchmarking_args,
         args_defaults={
             'no_load_rng': True,
@@ -159,22 +161,13 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_megatron()
 
     args = get_args()
 
-    # Set up model and load checkpoint
-    if args.model_provider == "gpt":
-        model_builder = gpt_builder
-    elif args.model_provider == "mamba":
-        model_builder = mamba_builder
-    else:
-        raise ValueError(f"Invalid model provider {args.model_provider}")
+    model = get_model_for_inference()
 
-    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
-    tokenizer = get_tokenizer()
-    load_checkpoint(model, None, None)
-    model = model[0]
-    model.eval()
+    tokenizer = build_tokenizer(args)
 
     assert (args.prompts is None) ^ (
         args.num_input_tokens is None

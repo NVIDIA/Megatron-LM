@@ -20,6 +20,7 @@ Slack user groups to match.
 """
 
 import os
+import re
 import sys
 import argparse
 import requests
@@ -29,7 +30,12 @@ from slack_sdk.errors import SlackApiError
 
 # Constants
 GITHUB_API_URL = "https://api.github.com"
-PARENT_TEAM_SLUG = "mcore-reviewers"
+
+# Teams whose *children* are each synced to their own Slack usergroup
+PARENT_TEAM_SLUGS = ["mcore-reviewers"]
+
+# Teams synced directly (the team itself, not its children)
+DIRECT_TEAM_SLUGS = ["mcore-engineers"]
 
 # Caches for email and Slack lookups
 _email_cache = {}
@@ -83,6 +89,8 @@ def github_team_to_slack_usergroup(team_slug):
         name = name[5:]  # Remove "core-"
     elif name.startswith("megatron-"):
         name = name[9:]  # Remove "megatron-"
+    elif name.startswith("mcore-"):
+        name = name[6:]  # Remove "mcore-"
 
     # Remove "-and-"
     name = name.replace("-and-", "-")
@@ -191,8 +199,9 @@ def get_user_email(username):
         if resp.status_code == 200:
             commits = resp.json()
             for commit in commits:
-                # Get email from commit author
                 commit_data = commit.get('commit', {})
+
+                # Get email from commit author metadata
                 author_data = commit_data.get('author', {})
                 email = author_data.get('email')
 
@@ -203,6 +212,16 @@ def get_user_email(username):
                         return email
                     elif public_email is None:
                         public_email = email
+
+                # Check Signed-off-by lines in the commit message for @nvidia.com emails
+                message = commit_data.get('message', '')
+                sob_matches = re.findall(
+                    r'Signed-off-by:.*<([^>]+@nvidia\.com)>', message
+                )
+                if sob_matches:
+                    _email_cache[username] = sob_matches[0]
+                    print(f"Found @nvidia.com email for {username} from Signed-off-by")
+                    return sob_matches[0]
 
         # 3. Use public email if found, otherwise fallback
         if public_email:
@@ -437,13 +456,13 @@ def sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=False):
         return False
 
 
-def get_team_to_usergroup_mapping():
-    """Fetch child teams of mcore-reviewers and generate the mapping."""
+def get_team_to_usergroup_mapping(parent_team_slug):
+    """Fetch child teams of a parent team and generate the mapping."""
     org = get_org()
-    child_teams = get_child_teams(org, PARENT_TEAM_SLUG)
+    child_teams = get_child_teams(org, parent_team_slug)
 
     if not child_teams:
-        print(f"Error: No child teams found under '{PARENT_TEAM_SLUG}'")
+        print(f"Error: No child teams found under '{parent_team_slug}'")
         return {}
 
     mapping = {}
@@ -454,10 +473,30 @@ def get_team_to_usergroup_mapping():
     return mapping
 
 
-def sync_all_teams(dry_run=False):
-    """Sync all GitHub teams under mcore-reviewers to their Slack usergroups."""
-    print(f"Fetching child teams of '{PARENT_TEAM_SLUG}'...")
-    team_to_usergroup = get_team_to_usergroup_mapping()
+def sync_all_teams(dry_run=False, parent_teams=None, direct_teams=None):
+    """Sync GitHub teams to their Slack usergroups.
+
+    Args:
+        parent_teams: List of team slugs whose *children* are each synced.
+                      Defaults to PARENT_TEAM_SLUGS.
+        direct_teams: List of team slugs synced directly (not their children).
+                      Defaults to DIRECT_TEAM_SLUGS.
+    """
+    if parent_teams is None:
+        parent_teams = PARENT_TEAM_SLUGS
+    if direct_teams is None:
+        direct_teams = DIRECT_TEAM_SLUGS
+
+    team_to_usergroup = {}
+
+    for parent_slug in parent_teams:
+        print(f"Fetching child teams of '{parent_slug}'...")
+        mapping = get_team_to_usergroup_mapping(parent_slug)
+        team_to_usergroup.update(mapping)
+
+    for team_slug in direct_teams:
+        usergroup_handle = github_team_to_slack_usergroup(team_slug)
+        team_to_usergroup[team_slug] = usergroup_handle
 
     if not team_to_usergroup:
         return False
@@ -504,12 +543,40 @@ def main():
         action="store_true",
         help="List all configured team-to-usergroup mappings",
     )
+    parser.add_argument(
+        "--parent-team",
+        action="append",
+        dest="parent_teams",
+        metavar="SLUG",
+        help=(
+            "Sync all children of this GitHub team (can be repeated). "
+            f"Defaults to: {PARENT_TEAM_SLUGS}"
+        ),
+    )
+    parser.add_argument(
+        "--team",
+        action="append",
+        dest="direct_teams",
+        metavar="SLUG",
+        help=(
+            "Sync this GitHub team directly (can be repeated). "
+            f"Defaults to: {DIRECT_TEAM_SLUGS}"
+        ),
+    )
 
     args = parser.parse_args()
 
+    # Use CLI values when provided, otherwise fall back to module-level defaults
+    parent_teams = args.parent_teams if args.parent_teams is not None else PARENT_TEAM_SLUGS
+    direct_teams = args.direct_teams if args.direct_teams is not None else DIRECT_TEAM_SLUGS
+
     if args.list:
-        print(f"Fetching child teams of '{PARENT_TEAM_SLUG}'...")
-        team_to_usergroup = get_team_to_usergroup_mapping()
+        team_to_usergroup = {}
+        for parent_slug in parent_teams:
+            print(f"Fetching child teams of '{parent_slug}'...")
+            team_to_usergroup.update(get_team_to_usergroup_mapping(parent_slug))
+        for team_slug in direct_teams:
+            team_to_usergroup[team_slug] = github_team_to_slack_usergroup(team_slug)
         if not team_to_usergroup:
             sys.exit(1)
         print("\nTeam-to-usergroup mappings:")
@@ -519,7 +586,9 @@ def main():
             print(f"{team:<35} @{usergroup:<29}")
         return
 
-    success = sync_all_teams(dry_run=args.dry_run)
+    success = sync_all_teams(
+        dry_run=args.dry_run, parent_teams=parent_teams, direct_teams=direct_teams
+    )
     sys.exit(0 if success else 1)
 
 

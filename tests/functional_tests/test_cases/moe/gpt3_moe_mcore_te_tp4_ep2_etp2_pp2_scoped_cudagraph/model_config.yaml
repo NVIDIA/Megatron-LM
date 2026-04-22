@@ -33,7 +33,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 2
   --expert-model-parallel-size: 2
   --expert-tensor-parallel-size: 2
-  --pipeline-model-parallel-layout: Et\\|\\(tt\\|\\)*6mL # Et|(tt|)*6mL
+  --pipeline-model-parallel-layout: Et|(tt|)*6mL
   --sequence-parallel: true
   --num-experts: 8
   --use-distributed-optimizer: true
@@ -77,20 +77,22 @@ MODEL_ARGS:
   --save-interval: 50
   --eval-interval: 1000
   --eval-iters: 10
-  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
   --data-cache-path: ${DATA_CACHE_PATH}
-  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --ckpt-fully-parallel-load: true
   --ckpt-format: torch_dist
   --ckpt-assume-constant-structure: true
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 TEST_TYPE: ckpt-resume
 METRICS:
   # - "iteration-time"
   - "lm loss"
   - "num-zeros"
-  - "mem-allocated-bytes"
-  - "mem-max-allocated-bytes"
+  # - "mem-allocated-bytes"
+  # - "mem-max-allocated-bytes"
   - "mtp_1 loss"

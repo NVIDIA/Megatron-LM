@@ -8,6 +8,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
   NON_DETERMINSTIC_RESULTS: 1
 TEST_TYPE: "release"
+LAUNCHER: ft_launcher
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -21,8 +22,8 @@ MODEL_ARGS:
   --sequence-parallel: true
   --disable-bias-linear: true
   --micro-batch-size: 4
-  --rampup-batch-size: "[384 384 97656250]"
   --global-batch-size: 1152
+  --step-batch-size-schedule: "0:384 200B:768 400B:1152"
   --train-samples: 4882812
   --manual-gc: true
   # Transformer Engine args
@@ -90,6 +91,8 @@ MODEL_ARGS:
   --bf16: true
   --exit-interval: 13000
   --wandb-save-dir: ${WANDB_SAVE_PATH}
+  --async-save: true
+  --use-persistent-ckpt-worker: true
 METRICS:
   - "iteration-time"
   - "lm loss"

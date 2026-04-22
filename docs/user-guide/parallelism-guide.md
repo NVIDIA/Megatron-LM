@@ -1,8 +1,19 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Parallelism Strategies Guide
 
 Megatron Core supports multiple parallelism strategies that can be combined to efficiently train models from billions to trillions of parameters across thousands of GPUs.
 
 ## Overview
+
+The following table summarizes supported parallelism strategies.
 
 | Strategy | What it parallelizes | Best for |
 |----------|---------------------|----------|
@@ -35,7 +46,8 @@ Shard model parameters, gradients, and optimizer states to reduce memory:
 --data-parallel-sharding-strategy optim_grads_params
 ```
 
-**Sharding strategies:**
+**Sharding strategies**
+
 - `optim` - Shard optimizer states only (ZeRO-1)
 - `optim_grads` - Shard gradients + optimizer (ZeRO-2)
 - `optim_grads_params` - Shard parameters + gradients + optimizer (ZeRO-3)
@@ -49,8 +61,9 @@ Split individual model layers across GPUs. Recommended for large hidden dimensio
 --sequence-parallel              # Enable sequence parallelism (recommended)
 ```
 
-**When to use:**
-- Model layers don't fit on single GPU
+**When to use**
+
+- Model layers do not fit on a single GPU
 - Large hidden dimensions (4096+)
 - Usually combined with DP and PP
 
@@ -63,7 +76,8 @@ Split model layers across GPUs vertically (by depth).
 --num-layers-per-virtual-pipeline-stage 4     # Virtual pipeline for load balancing
 ```
 
-**When to use:**
+**When to use**
+
 - Very deep models (50+ layers)
 - Combine with TP for large models
 - Helps distribute memory across GPUs
@@ -77,12 +91,13 @@ Split long sequences across GPUs for efficient long-context training.
 --cp-comm-type p2p                  # Communication type
 ```
 
-**When to use:**
+**When to use**
+
 - Long sequences (8K+ tokens)
 - Reduces activation memory
 - Can combine with TP, PP, DP
 
-**→ [Context Parallelism Deep Dive](features/context_parallel.md)** - Detailed guide with performance analysis
+Refer to [Context Parallelism Deep Dive](features/context_parallel.md) for a detailed guide with performance analysis.
 
 ## Expert Parallelism (EP)
 
@@ -108,6 +123,8 @@ Recommended configurations based on [NVIDIA NeMo production setups](https://gith
 
 ### Language Models
 
+Recommended language model configurations:
+
 | Model | Size | GPUs | TP | PP | CP | EP | Configuration Notes |
 |-------|------|------|----|----|----|----|---------------------|
 | **LLaMA-3** | 8B | 8 | 1 | 1 | 2 | 1 | CP=2 for long context (8K seqlen) |
@@ -116,6 +133,8 @@ Recommended configurations based on [NVIDIA NeMo production setups](https://gith
 | **GPT-3** | 175B | 128-512 | 4 | 8 | 1 | 1 | Standard large model config |
 
 ### Mixture-of-Experts Models
+
+Recommended mixture-of-experts configurations:
 
 | Model | Size | GPUs | TP | PP | CP | EP | Configuration Notes |
 |-------|------|------|----|----|----|----|---------------------|
@@ -170,7 +189,8 @@ Recommended for all multi-GPU training:
 --use-distributed-optimizer
 ```
 
-Benefits:
+**Benefits**
+
 - Faster checkpointing
 - Reduced memory when combined with FSDP
 - Better performance at scale
@@ -189,7 +209,7 @@ Reduces activation memory by sharding sequence dimension in LayerNorm and Dropou
 
 ### Start Simple
 1. Begin with **Data Parallelism** (DP) only
-2. Add **Tensor Parallelism** (TP) if model doesn't fit
+2. Add **Tensor Parallelism** (TP) if the model does not fit
 3. Add **Pipeline Parallelism** (PP) for very large models
 4. Add **Context Parallelism** (CP) for long sequences
 
@@ -206,6 +226,6 @@ Reduces activation memory by sharding sequence dimension in LayerNorm and Dropou
 
 ## Next Steps
 
-- **API Reference**: See [Tensor Parallel](../api-guide/core/tensor_parallel.md) and [Pipeline Parallel](../api-guide/core/pipeline_parallel.md) API documentation
-- **Advanced Features**: Explore [Megatron FSDP](features/custom_fsdp.md) and [Distributed Optimizer](features/dist_optimizer.md)
-- **Performance Tuning**: Check [NVIDIA NeMo Performance Guide](https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance-guide.html)
+- **API Reference**: Refer to [Tensor Parallel](../api-guide/core/tensor_parallel.md) and [Pipeline Parallel](../api-guide/core/pipeline_parallel.md) in the API documentation
+- **Advanced Features**: Refer to [Megatron FSDP](features/custom_fsdp.md) and [Distributed Optimizer](features/dist_optimizer.md)
+- **Performance Tuning**: Refer to the [NVIDIA NeMo Performance Guide](https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance-guide.html)

@@ -15,8 +15,9 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
+from megatron.core.extensions.transformer_engine import HAVE_TE
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -24,9 +25,7 @@ try:
         TENorm,
         TERowParallelLinear,
     )
-
-    HAVE_TE = True
-except ImportError:
+else:
     (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -34,7 +33,6 @@ except ImportError:
         TENorm,
         TERowParallelLinear,
     ) = (None, None, None, None, None)
-    HAVE_TE = False
 
 try:
     import apex
@@ -175,8 +173,8 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                     mlp=ModuleSpec(
                         module=MLP,
                         submodules=MLPSubmodules(
-                            linear_fc1=TELayerNormColumnParallelLinear,
-                            linear_fc2=TERowParallelLinear,
+                            linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                            linear_fc2=not_none(TERowParallelLinear),
                         ),
                     ),
                     mlp_bda=get_bias_dropout_add,
@@ -191,8 +189,8 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
-            linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+            linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
+            linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
         ),
     )
 
@@ -201,6 +199,7 @@ def get_norm_mlp_module_spec_te() -> ModuleSpec:
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            linear_fc1=not_none(TELayerNormColumnParallelLinear),
+            linear_fc2=not_none(TERowParallelLinear),
         ),
     )

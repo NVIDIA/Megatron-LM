@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import (
@@ -16,9 +17,7 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -26,9 +25,7 @@ try:
         TENorm,
         TERowParallelLinear,
     )
-
-    HAVE_TE = True
-except ImportError:
+else:
     (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -36,7 +33,6 @@ except ImportError:
         TENorm,
         TERowParallelLinear,
     ) = (None, None, None, None, None)
-    HAVE_TE = False
 
 try:
     import apex  # pylint: disable=unused-import
@@ -76,7 +72,8 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                    linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                    linear_fc2=not_none(TERowParallelLinear),
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
@@ -117,7 +114,8 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                    linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                    linear_fc2=not_none(TERowParallelLinear),
                 ),
             ),
             mlp_bda=get_bias_dropout_add,

@@ -40,7 +40,6 @@ def save_checkpoint(queue, args):
         from megatron.training.global_vars import set_global_variables, get_args
         from megatron.core.enums import ModelType
         from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
-        from megatron.legacy import fused_kernels
         from megatron.core import mpu
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
@@ -109,7 +108,6 @@ def save_checkpoint(queue, args):
                 '--no-masked-softmax-fusion',
                 '--no-bias-gelu-fusion',
                 '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
                 '--use-cpu-initialization',
                 '--micro-batch-size', '1',
                 '--no-load-optim',
@@ -146,7 +144,7 @@ def save_checkpoint(queue, args):
         args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'world_size', 'params_dtype',
                         'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                         'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
-                        'sequence_parallel', 'async_tensor_model_parallel_allreduce',
+                        'sequence_parallel',
                         'no_load_optim', 'no_load_rng', 'no_save_optim', 'no_save_rng',
                         'vocab_file', 'tokenizer_model',
                         'save_interval', 'save',
@@ -214,7 +212,6 @@ def save_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
-    fused_kernels.load(margs)
     
     # For backward compatibility during local parallel states refactoring
     fake_tp_group = _ConverterFakeProcessGroup(size=args.target_tensor_parallel_size)

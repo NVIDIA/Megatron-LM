@@ -42,7 +42,8 @@ from megatron.core.utils import (
     to_local_if_dtensor,
     unwrap_model,
 )
-from megatron.legacy.model.module import param_is_not_shared
+
+from megatron.core.transformer.module import param_is_not_shared
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -240,7 +241,7 @@ def average_losses_across_data_parallel_group(losses):
     return averaged_losses
 
 
-def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
+def reduce_max_stat_across_model_parallel_group(stat: float) -> float | None:
     """
     Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
     We need to ensure the logging and writer rank has those values.
@@ -255,6 +256,7 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
         stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
     )
     if stat.item() == -1.0:
+        # No rank has a valid stat, so return None to indicate that it is None across all ranks.
         return None
     else:
         return stat.item()
@@ -430,6 +432,11 @@ def print_rank_last(message):
         print(message, flush=True)
 
 
+def is_hybrid_model(args):
+    """Returns True if the model is a hybrid Mamba-Transformer model."""
+    return args.hybrid_layer_pattern is not None
+
+
 def is_first_or_last_pipeline_stage(vp_stage):
     """Return True if on first or last pipeline stage, taking into account virtual
     pipeline parallelism."""
@@ -600,25 +607,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
 
-        def _broadcast_cu_seqlens(cu_seqlens):
-            dev = torch.cuda.current_device()
-
-            n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
-            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
-            _broadcast(n_tensor)
-
-            if n == 0:
-                buf = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                assert isinstance(cu_seqlens, torch.Tensor)
-                assert cu_seqlens.dtype == torch.int32
-                assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
-                buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
-            _broadcast(buf)
-
-        _broadcast_cu_seqlens(batch['cu_seqlens'])
-        _broadcast(batch['max_seqlen'])
-
     else:
         if args.hybrid_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
@@ -657,7 +645,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             device=torch.cuda.current_device(),
         )
         cu_seqlens = None
-        if args.sft:
+        if args.hybrid_context_parallel or args.sft:
             max_seqlen = torch.empty(
                 1,
                 dtype=torch.int32,
@@ -665,13 +653,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             )
         else:
             max_seqlen = None
-
-        cu_seqlens = None
-        max_seqlen = torch.empty(
-            1,
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
-        ) if args.hybrid_context_parallel else None
+        
         local_cp_size = torch.empty(
             1,
             dtype=torch.int32,
@@ -726,24 +708,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(loss_mask)
             _broadcast(attention_mask)
 
-        def _broadcast_cu_seqlens():
-            dev = torch.cuda.current_device()
-
-            n = torch.empty((), dtype=torch.int64, device=dev)
-            _broadcast(n)
-            n = int(n.item())
-
-            if n == 0:
-                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                cu_seqlens = torch.empty((args.micro_batch_size, n), dtype=torch.int32, device=dev)
-            _broadcast(cu_seqlens)
-
-            return cu_seqlens if n > 0 else None
-
-        cu_seqlens = _broadcast_cu_seqlens()
-        _broadcast(max_seqlen)
-
         batch = {
             'tokens': tokens,
             'labels': labels,
@@ -791,26 +755,39 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
 
 
 def get_nvtx_range():
-    """Create an NVTX range context manager."""
-    try:
-        from torch.cuda import nvtx
+    """Create an NVTX range context manager.
 
-        @contextmanager
-        def nvtx_range(msg, time=False):
-            if time:
-                timers = get_timers()
-                timers(msg, log_level=0).start()
-            try:
-                nvtx.range_push(msg)
-                yield
-            finally:
-                nvtx.range_pop()
-                if time:
-                    timers(msg, log_level=0).stop()
+    Returns a context manager that:
+    - Creates an NVTX range for profiling (nsight-systems compatible)
+    - Optionally tracks time via Megatron timers when time=True
 
-        return nvtx_range
-    except:
-        @contextmanager
-        def dummy_range(msg):
+    Args (for returned context manager):
+        msg: Name of the range/timer
+        time: If True, also track with Megatron timers (default: False)
+        log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
+    """
+    from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+    @contextmanager
+    def nvtx_range(msg, time=False, log_level=1):
+        if time:
+            timers = get_timers()
+            timers(msg, log_level=log_level).start()
+        try:
+            nvtx_range_push(msg)
             yield
-        return dummy_range
+        finally:
+            nvtx_range_pop(msg)
+            if time:
+                timers(msg, log_level=log_level).stop()
+
+    return nvtx_range
+
+
+def has_nvrx_installed():
+    """Checks if nvidia-resiliency-ext is installed."""
+    try:
+        import nvidia_resiliency_ext
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False

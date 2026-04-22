@@ -1,0 +1,103 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NON_DETERMINSTIC_RESULTS: 1
+  NVTE_NORM_FWD_USE_CUDNN: 1
+  NVTE_NORM_BWD_USE_CUDNN: 1
+  NVTE_FUSED_ATTN: 1
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  USE_MNNVL: 1
+TEST_TYPE: "release"
+LAUNCHER: ft_launcher
+MODEL_ARGS:
+  # Distributed args
+  --distributed-timeout-minutes: 60
+  --tensor-model-parallel-size: 4
+  --pipeline-model-parallel-size: 2
+  --num-layers-per-virtual-pipeline-stage: 8
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --tp-comm-overlap: true
+  # Training args
+  --use-mcore-models: true
+  --sequence-parallel: true
+  --disable-bias-linear: true
+  --micro-batch-size: 4
+  --global-batch-size: 1152
+  --step-batch-size-schedule: "0:384 200B:768 400B:1152"
+  --train-samples: 19531250
+  --manual-gc: true
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: te
+  # Transformer Engine args
+  --transformer-impl: transformer_engine
+  # Data args
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --tokenizer-type: GPTSentencePieceTokenizer
+  --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
+  --data-path: $DATA_BLEND
+  --split: 99,1,0
+  --no-mmap-bin-files: true
+  --num-workers: 6
+  # Add network size args
+  --apply-layernorm-1p: true
+  --untie-embeddings-and-output-weights: true
+  --position-embedding-type: rope
+  --rotary-percent: 0.5
+  --squared-relu: true
+  --num-layers: 32
+  --hidden-size: 6144
+  --num-attention-heads: 48
+  --group-query-attention: true
+  --num-query-groups: 8
+  --seq-length: 4096
+  --max-position-embeddings: 4096
+  # Add regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+  # Add learning rate args
+  --lr-decay-samples: 1949218748
+  --lr-warmup-samples: 3906252
+  --lr: 4.5e-4
+  --min-lr: 4.5e-5
+  --decoupled-lr: 5.0e-4
+  --decoupled-min-lr: 4.5e-5
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  # Add validation args
+  --eval-iters: 32
+  --eval-interval: 2000
+  # Add checkpointing args
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 1000
+  --save-retain-interval: 5000
+  # Add initialization args
+  --init-method-std: 0.0134
+  # Add logging args
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-throughput: true
+  --log-interval: 100
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
+  # Add mixed precision args
+  --bf16: true
+  --exit-interval: 51000
+  --wandb-save-dir: ${WANDB_SAVE_PATH}
+  --async-save: true
+  --use-persistent-ckpt-worker: true
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

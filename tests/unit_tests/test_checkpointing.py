@@ -103,6 +103,7 @@ def create_args():
     args.non_persistent_save_interval = None
     args.exit_on_missing_checkpoint = True
     args.async_save = False
+    args.async_strategy = "mcore"
     args.data_parallel_random_init = False
     args.no_save_optim = False
     args.no_save_rng = False
@@ -151,7 +152,9 @@ def create_ckpt_load_args(create_args):
 def init_model_parallel():
     """Init torch distributed."""
     Utils.initialize_model_parallel(1, 1)
-    init_num_microbatches_calculator(0, None, 1, 1, 1)
+    init_num_microbatches_calculator(
+        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+    )
     model_parallel_cuda_manual_seed(123)
     yield  # Run the actual test.
     Utils.destroy_model_parallel()

@@ -288,6 +288,7 @@ def test_save_and_load_checkpoint_vpp(
     args.num_attention_heads = 8
     # Ckpt format
     args.ckpt_format = "torch_dist"
+    args.async_strategy = "mcore"
     set_args(args)
 
     def set_tp_pp_vpp(tp, pp, vpp=None, pp_layout=None, destroy_first=True):
@@ -304,7 +305,9 @@ def test_save_and_load_checkpoint_vpp(
         args.load = ckpt_path
 
     set_tp_pp_vpp(*src_tp_pp_vpp, pp_layout=src_pp_layout, destroy_first=False)
-    init_num_microbatches_calculator(0, None, 1, 1, 1)
+    init_num_microbatches_calculator(
+        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+    )
 
     iteration = 123
     layer_spec_fn = get_gpt_decoder_block_spec if is_moe else gpt_te_spec

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import logging
 from collections import namedtuple
 from functools import partial
@@ -8,9 +8,10 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.mamba import MambaModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
@@ -21,23 +22,22 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
-    from megatron.core.utils import is_te_min_version
 
-    HAVE_TE = True
     try:
         import transformer_engine_torch as tex
 
         HAVE_TEX = True
-    except:
+    except ImportError:
+        tex = None
         HAVE_TEX = False
-except:
-    HAVE_TE = False
+else:
+    TEDotProductAttention = None
+    tex = None
+    HAVE_TEX = False
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
@@ -115,9 +115,7 @@ class LLaVAModel(MegatronModule):
         language_rotary_base: int = 10000,
         language_rope_scaling: bool = False,
         language_rope_scaling_factor: float = 8.0,
-        hybrid_attention_ratio: float = 1.0,
-        hybrid_mlp_ratio: float = 1.0,
-        hybrid_override_pattern: str = None,
+        hybrid_layer_pattern: str = None,
         fp16_lm_cross_entropy: bool = False,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
@@ -198,17 +196,15 @@ class LLaVAModel(MegatronModule):
                 )
                 self.language_model = build_hf_model(language_transformer_config)
             elif language_model_type.startswith('nemotron5-hybrid'):
-                self.language_model = MambaModel(
+                self.language_model = HybridModel(
                     config=language_transformer_config,
-                    mamba_stack_spec=language_transformer_layer_spec,
+                    hybrid_stack_spec=language_transformer_layer_spec,
                     vocab_size=language_vocab_size,
                     max_sequence_length=language_max_sequence_length,
                     parallel_output=parallel_output,
                     position_embedding_type=language_position_embedding_type,
                     pre_process=self.pre_process,
-                    hybrid_attention_ratio=hybrid_attention_ratio,
-                    hybrid_mlp_ratio=hybrid_mlp_ratio,
-                    hybrid_override_pattern=hybrid_override_pattern,
+                    hybrid_layer_pattern=hybrid_layer_pattern,
                     post_process=self.post_process,
                     rotary_percent=language_rotary_percent,
                     rotary_base=language_rotary_base,
@@ -483,7 +479,8 @@ class LLaVAModel(MegatronModule):
         Currently, we assume the language model uses a causal mask.
 
         Returns:
-            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h].
+            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h] if
+                context_parallel_lm == 1 else [b, combined_seq_len, h].
             final_labels (torch.Tensor): labels for image and text positions [b, combined_seq_len].
             final_loss_mask (torch.Tensor): loss mask [b, combined_seq_len].
         """
@@ -738,12 +735,13 @@ class LLaVAModel(MegatronModule):
                     "1.10.0"
                 ), "Please update Transformer Engine to >= 1.10 to use \
                     Context Parallel with THD format data"
-                cp_size = self.cp_group.size()
-                cp_rank = self.cp_group.rank()
+                index = tex.thd_get_partitioned_indices(
+                    packed_seq_params.cu_seqlens_q_padded,
+                    batch[next(iter(batch))].size(1),
+                    self.cp_group.size(),
+                    self.cp_group.rank(),
+                )
                 for key, data in batch.items():
-                    index = tex.thd_get_partitioned_indices(
-                        packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
-                    )
                     batch[key] = data.index_select(1, index)
 
             if self.pre_process:
@@ -916,6 +914,10 @@ class LLaVAModel(MegatronModule):
         if num_image_tiles is None and images is not None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
+        # if context_parallel_lm == 1:
+        #   [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        # else:
+        #   [b, combined_seq_len, h_language], [b, combined_seq_len], [b, combined_seq_len]
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
             image_embeddings,
             language_embeddings,
@@ -926,7 +928,7 @@ class LLaVAModel(MegatronModule):
             inference_context,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
-        )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        )
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
             combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (

@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
+from ..fp4_utils import is_nvfp4tensor
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
@@ -120,9 +121,9 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
 
             if getattr(param, 'allreduce', True):
-                dense_params.append(param)
+                dense_params.append((param, name))
             else:
-                expert_parallel_params.append(param)
+                expert_parallel_params.append((param, name))
 
         def _allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor
@@ -132,22 +133,22 @@ class DistributedDataParallel(_BaseDataParallel):
             param_and_grad_dtype_to_indices = {}
 
             # Group parameters by their gradient type.
-            for param in input_params:
+            for param, param_name in input_params:
                 assert param.requires_grad
 
                 param_dtype = param.dtype
-                if is_float8tensor(param):
+                if is_float8tensor(param) or is_nvfp4tensor(param):
                     # Currently TE's Float8Tensor is a wrapper of torch.Tensor. It has a "fake"
                     # dtype (usually a higher precision dtype such as bfloat16), but its actual
                     # data is stored in the form of a torch uint8 tensor within the Float8Tensor's
-                    # ".data" attribute. Therefore, when creating the param buffer for fp8 params,
-                    # it is necessary to use torch.uint8, not the "fake" dtype got from
+                    # ".data" attribute. Therefore, when creating the param buffer for fp8/fp4
+                    # params,it is necessary to use torch.uint8, not the "fake" dtype got from
                     # "param.dtype".
                     param_dtype = torch.uint8
                 grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype
 
                 params = param_and_grad_dtype_to_params.get((param_dtype, grad_dtype), [])
-                params.append(param)
+                params.append((param, param_name))
                 param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
 
                 # Get the index of each param among the params with same dtype, if a param is fp8,
@@ -236,7 +237,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
-            if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
+            # Note: overlap_param_gather covers both the distributed optimizer and the
+            # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+            # without use_distributed_optimizer.
+            if self.ddp_config.overlap_param_gather:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
                     bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
@@ -344,9 +348,10 @@ class DistributedDataParallel(_BaseDataParallel):
                     grad_acc.register_hook(self._make_backward_post_hook(param))
                     self.grad_accs.append(grad_acc)
 
-        self.use_forward_hook = (
-            self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather
-        )
+        # Note: overlap_param_gather covers both the distributed optimizer and the
+        # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+        # without use_distributed_optimizer.
+        self.use_forward_hook = self.ddp_config.overlap_param_gather
         self.remove_forward_pre_hook_handles = {}
         if self.use_forward_hook:
             self.enable_forward_pre_hook()
@@ -490,10 +495,18 @@ class DistributedDataParallel(_BaseDataParallel):
                 # in "finish_param_sync" stage after zeroing the shared gardient buffers.
                 if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                     for bucket in bucket_group.buckets:
+                        is_bf16_weight_bucket = False
                         for param in bucket.params:
+                            # Skip copying since bf16 weights in the mxfp8 model
+                            # are already mapped to param.data.
+                            if not is_float8tensor(param):
+                                is_bf16_weight_bucket = True
+                                break
                             param_start, param_end = bucket.param_to_index[param]
                             param_slice = bucket.param_data.view(-1)[param_start:param_end]
                             param.data.copy_(param_slice.view(param.data.shape))
+                        if is_bf16_weight_bucket:
+                            continue
                         # All-gathered params are not needed after being copied to param.data.
                         # Zero out the param buffer (shared with grad buffer) for gradient
                         # accumulation. We cannot zero out the entire grad buffer because one grad
@@ -533,6 +546,11 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+    def free_overlap_buffers(self):
+        """Free overlap param-gather GPU buffers across all bucket groups."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.free_overlap_buffers()
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
