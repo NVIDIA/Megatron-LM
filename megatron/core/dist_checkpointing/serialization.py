@@ -58,7 +58,7 @@ def load(
     common_strategy: None = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
-    verify_integrity: bool = True,
+    verify_integrity: bool = False,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -304,7 +304,7 @@ def save(
     ] = None,
     content_metadata: Optional[dict] = None,
     async_strategy: Optional[str] = "nvrx",
-    verify_integrity: bool = True,
+    verify_integrity: bool = False,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
