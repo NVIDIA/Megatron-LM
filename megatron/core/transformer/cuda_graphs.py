@@ -575,18 +575,21 @@ class _CudagraphReplayNode(torch.autograd.Function):
             runner.fwd_graph_input_surface
         ), "Fwd cudagraph received a different number of tensors than what it was graphed with!"
 
-        # Copy new data into fwd graph input buffer
+        # Copy new data into fwd graph input buffer.
+        # A check is needed for whether the static buffers are inference-mode tensors.
+        copy_ctx = torch.inference_mode() if not runner.grad_enabled else nullcontext()
         need_copy_inputs = []
-        for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
-            if (
-                hasattr(cudagraph_input, "can_skip_replay_copy")
-                and cudagraph_input.can_skip_replay_copy
-            ):
-                need_copy_inputs.append(user_input)
-                assert user_input.data_ptr() == cudagraph_input.data_ptr()
-            else:
-                if user_input.data_ptr() != cudagraph_input.data_ptr():
-                    cudagraph_input.copy_(user_input)
+        with copy_ctx:
+            for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
+                if (
+                    hasattr(cudagraph_input, "can_skip_replay_copy")
+                    and cudagraph_input.can_skip_replay_copy
+                ):
+                    need_copy_inputs.append(user_input)
+                    assert user_input.data_ptr() == cudagraph_input.data_ptr()
+                else:
+                    if user_input.data_ptr() != cudagraph_input.data_ptr():
+                        cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
         ctx.save_for_backward(*need_copy_inputs)
@@ -707,7 +710,10 @@ class _CudaGraphRunner(torch.nn.Module):
         self.backward_retain_grad = False
         self.fp8_enabled = False
         self.fp4_enabled = False
+        self.fp8_runtime_enabled = None
+        self.fp4_runtime_enabled = None
         self.deallocate_pipeline_outputs = False
+        self.num_warmup_steps = 0
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -1415,6 +1421,7 @@ class CudaGraphManager(torch.nn.Module):
         function_name=None,
         need_backward=True,
         pg_collection=None,
+        inline_capture=False,
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
@@ -1422,7 +1429,11 @@ class CudaGraphManager(torch.nn.Module):
         Args:
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
+            inline_capture: Normally, whether the inline capture path is taken depends on whether
+                `inference_context` is present in the kwargs of the forward call.
+                Setting this argument to True always forces the inline capture path to be taken.
         """
+        self._inline_capture = inline_capture
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -1432,8 +1443,13 @@ class CudaGraphManager(torch.nn.Module):
         if function_name is not None:
             func = getattr(base_module, function_name)
 
-            def wrapped_func(*args, **kwargs):
-                out = self(base_module, args, kwargs)
+            def wrapped_func(*args, eager=False, cache_key=None, **kwargs):
+                if eager:
+                    return func(*args, **kwargs)
+                out = self(base_module, args, kwargs, cache_key=cache_key)
+                # Unwrap single-element tuple to match the original function's return type.
+                if isinstance(out, tuple) and len(out) == 1:
+                    return out[0]
                 return out
 
             setattr(base_module, function_name, wrapped_func)
@@ -1465,7 +1481,7 @@ class CudaGraphManager(torch.nn.Module):
             )
 
         self.cudagraph_runners: list[_CudaGraphRunner] = []
-        self.inference_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
+        self.custom_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
         # Without pipeline parallelism, microbatches execute one at a time.
@@ -1493,7 +1509,7 @@ class CudaGraphManager(torch.nn.Module):
                 # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
 
-    def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs):
+    def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs, cache_key=None):
         '''Returns a valid cudagraph runner for the current forward call.
         The cudagraph corresponding to this call is the first element of 'self.cudagraph_runners'.
         We iterate through the list by 1 for each call, and the number of calls is equal to the
@@ -1501,16 +1517,8 @@ class CudaGraphManager(torch.nn.Module):
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
         if reuse_cudagraphs:
-            is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
-            if is_inference_mode:
-                is_static_batching = kwargs['inference_context'].is_static_batching()
-                if is_static_batching:
-                    batch_size = kwargs['hidden_states'].shape[0]
-                    is_decode_only = kwargs["inference_context"].is_decode_only()
-                    runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
-                else:
-                    padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
-                    runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
+            if cache_key is not None:
+                runner = self.custom_cudagraphs_lookup_table[cache_key]
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 # If autograd is currently disabled, it doesnt matter if a runner was created
@@ -1544,15 +1552,11 @@ class CudaGraphManager(torch.nn.Module):
                         self.func,
                         self.need_backward,
                     )
+                    if self._inline_capture:
+                        runner.num_warmup_steps = 0
                     self.cudagraph_runners.append(runner)
-                    if is_inference_mode:
-                        # Cache the newly created runner in the inference lookup table.
-                        if is_static_batching:
-                            self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
-                                runner
-                            )
-                        else:
-                            self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
+                    if cache_key is not None:
+                        self.custom_cudagraphs_lookup_table[cache_key] = runner
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
@@ -1572,7 +1576,7 @@ class CudaGraphManager(torch.nn.Module):
 
         return runner
 
-    def __call__(self, megatron_module, args, kwargs):
+    def __call__(self, megatron_module, args, kwargs, cache_key=None):
         """Calls the forward pass of the cudagraphed module.
 
         Args:
@@ -1581,8 +1585,18 @@ class CudaGraphManager(torch.nn.Module):
             args (tuple):  The positional args to be passed to the module.
 
             kwargs (dict):  The keyword args to be passed to the module.
+
+            cache_key: Optional hashable key for O(1) runner lookup.
+                If `inference_context` is provided, this gets set to the correct value.
         """
         is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+        if cache_key is None and is_inference_mode:
+            inference_context = kwargs['inference_context']
+            if inference_context.is_static_batching():
+                batch_size = kwargs['hidden_states'].shape[0]
+                cache_key = (batch_size, inference_context.is_decode_only())
+            else:
+                cache_key = inference_context.padded_batch_dimensions
         is_in_checkpoint_fwd = is_checkpointing()
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
@@ -1594,12 +1608,16 @@ class CudaGraphManager(torch.nn.Module):
                 for module in megatron_module.modules():
                     self.call_ddp_preforward_hook(module)
 
-            runner = self.get_cudagraph_runner(megatron_module, args, kwargs, self.reuse_cudagraphs)
+            runner = self.get_cudagraph_runner(
+                megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
+            )
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
-            if is_inference_mode:
+            if is_inference_mode or self._inline_capture:
                 # Inference generation mode creates graphs immediately
-                runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
+                runner = self.get_cudagraph_runner(
+                    megatron_module, args, kwargs, True, cache_key=cache_key
+                )
 
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
