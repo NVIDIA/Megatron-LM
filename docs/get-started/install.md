@@ -119,7 +119,7 @@ pip install uv
 uv pip install --no-build-isolation "megatron-core[training,dev]"
 ```
 
-**Important:** The `megatron-core` pip package does not install the example and training scripts from this repository. The `[training]` extra, and deprecated `[mlm]` alias, add Python dependencies but do **not** provide the full `Megatron-LM` source tree. To run repository training scripts, see [Running Training Scripts](#running-training-scripts) below.
+**Important:** The `megatron-core` pip package does not install the full `Megatron-LM` repository contents. The `[training]` extra adds Python dependencies but does **not** provide the example and helper scripts from this repository. To run those scripts, see [Running Training Scripts](#running-training-scripts) below.
 
 You are now ready to run training. Refer to [Your First Training Run](quickstart.md) for next steps.
 
