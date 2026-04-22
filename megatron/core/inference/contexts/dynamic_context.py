@@ -863,18 +863,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # GPU scalars for freely-varying counts. Written from Python ints each
         # step; used by graphable ops via torch.where so slice shapes stay fixed.
-        self._real_request_count_gpu = torch.zeros(
-            1, dtype=torch.int32, device=torch.cuda.current_device()
+        # Packed into one contiguous tensor for a single pinned H2D copy.
+        self._context_op_metadata_gpu = torch.zeros(
+            4, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        self._real_token_count_gpu = torch.zeros(
-            1, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self._real_decode_count_gpu = torch.zeros(
-            1, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-        self._real_prefill_count_gpu = torch.zeros(
-            1, dtype=torch.int32, device=torch.cuda.current_device()
-        )
+        self._context_op_metadata_cpu = torch.zeros(4, dtype=torch.int32).pin_memory()
+        self._real_request_count_gpu = self._context_op_metadata_gpu[0:1]
+        self._real_token_count_gpu = self._context_op_metadata_gpu[1:2]
+        self._real_decode_count_gpu = self._context_op_metadata_gpu[2:3]
+        self._real_prefill_count_gpu = self._context_op_metadata_gpu[3:4]
 
         # Pre-allocated index tensors for graphable ops (static addresses).
         self._arange_requests = torch.arange(
@@ -1196,6 +1193,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def run_attn_init_graph_body(self) -> None:
         """Graphable portion of `initialize_attention_state`."""
+        self._context_op_metadata_gpu.copy_(self._context_op_metadata_cpu, non_blocking=True)
         self.build_active_slices()
 
         self.active_attn_metadata["mha_metadata"].update(
@@ -1885,11 +1883,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        # Write GPU scalars before the body so a captured body reads updated values on replay.
-        self._real_request_count_gpu.fill_(self.total_request_count - self.paused_request_count)
-        self._real_token_count_gpu.fill_(self.active_token_count)
-        self._real_decode_count_gpu.fill_(batch_dimensions.decode_req_count)
-        self._real_prefill_count_gpu.fill_(batch_dimensions.prefill_req_count)
+        # Stage GPU scalar values in the pinned CPU buffer.
+        # The actual H2D transfer is captured inside `run_attn_init_graph_body`.
+        self._context_op_metadata_cpu[0] = self.total_request_count - self.paused_request_count
+        self._context_op_metadata_cpu[1] = self.active_token_count
+        self._context_op_metadata_cpu[2] = batch_dimensions.decode_req_count
+        self._context_op_metadata_cpu[3] = batch_dimensions.prefill_req_count
 
         return True
 
