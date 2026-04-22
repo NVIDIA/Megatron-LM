@@ -1679,7 +1679,14 @@ def get_model(
             kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
             kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
             kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
-            kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer
+            kwargs['megatron_fsdp_use_decoupled_grad'] = args.use_precision_aware_optimizer and (
+                # Not directly relevant to Megatron-FSDP.
+                args.main_params_dtype != torch.float32
+                # FIXME(@cspades): Seg-fault caused by MXFP8 FusedAdam.step() with decoupled grad.
+                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                # Use a decoupled gradient when offloading the optimizer state.
+                or self.optimizer_cpu_offload
+            )
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
