@@ -60,6 +60,27 @@ _active_grids: list = []
 _embedding_pg_cache: dict = {}
 
 
+def build_no_sync_func(mimo_model):
+    """Build a no_sync_func that stacks DDP no_sync over each sub-module.
+
+    Shared by 1F1B pipeline tests and colocated-correctness tests — both need
+    DDP's gradient sync disabled during microbatches and resumed via the
+    schedule's finalize_grads_func.
+    """
+
+    @contextmanager
+    def no_sync_func():
+        with ExitStack() as stack:
+            if mimo_model.language_model is not None:
+                stack.enter_context(mimo_model.language_model.no_sync())
+            for submodule in mimo_model.modality_submodules.values():
+                if submodule is not None:
+                    stack.enter_context(submodule.no_sync())
+            yield
+
+    return no_sync_func
+
+
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     """Create a HyperCommGrid with specified parallelism."""
     grid = HyperCommGrid(
@@ -579,16 +600,7 @@ def run_mimo_1f1b_test(
         seq_len=seq_length,
     )
 
-    # Build schedule functions using pre-created pg_collections (no leaks)
-    @contextmanager
-    def no_sync_func():
-        with ExitStack() as stack:
-            if mimo_model.language_model is not None:
-                stack.enter_context(mimo_model.language_model.no_sync())
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    stack.enter_context(submodule.no_sync())
-            yield
+    no_sync_func = build_no_sync_func(mimo_model)
 
     def finalize_grads_func(*args, **kwargs):
         if mimo_model.language_model is not None:

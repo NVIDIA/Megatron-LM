@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import logging
 import os
 import sys
@@ -232,22 +232,24 @@ class TestValidateGrids:
         with pytest.raises(ValueError, match="same rank offset"):
             make_comm(src_grid, dest_grid)
 
-    def test_src_pp_gt_one_rejected(self):
-        src_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
-        dest_grid = create_hypercomm_grid(tp=4, dp=2)
-        with pytest.raises(ValueError, match="src PP must be 1"):
-            make_comm(src_grid, dest_grid)
-
-    def test_dest_pp_gt_one_rejected(self):
-        src_grid = create_hypercomm_grid(tp=4, dp=2)
-        dest_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
-        with pytest.raises(ValueError, match="dest PP must be 1"):
-            make_comm(src_grid, dest_grid)
-
-    def test_cp_gt_one_rejected(self):
-        src_grid = create_hypercomm_grid(tp=2, cp=2, dp=2)
-        dest_grid = create_hypercomm_grid(tp=4, dp=2)
-        with pytest.raises(ValueError, match="CP must be 1"):
+    @pytest.mark.parametrize(
+        "side,dim,expected",
+        [
+            ("src", "pp", "src PP must be 1"),
+            ("dest", "pp", "dest PP must be 1"),
+            ("src", "cp", "CP must be 1"),
+        ],
+    )
+    def test_pp_or_cp_gt_one_rejected(self, side, dim, expected):
+        bad = {dim: 2, "tp": 2, "dp": 2}
+        good = {"tp": 4, "dp": 2}
+        if side == "src":
+            src_grid = create_hypercomm_grid(**bad)
+            dest_grid = create_hypercomm_grid(**good)
+        else:
+            src_grid = create_hypercomm_grid(**good)
+            dest_grid = create_hypercomm_grid(**bad)
+        with pytest.raises(ValueError, match=expected):
             make_comm(src_grid, dest_grid)
 
     def test_dp_not_divisible(self):

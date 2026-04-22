@@ -182,11 +182,11 @@ class DistributedDataParallel(_BaseDataParallel):
                             == target_gradient_scaling_factor
                         )
                     else:
-                        # For non-expert parameters, gradient_scaling_factor is 1.0.
-                        # For expert parameters, it is expt_dp_group.size() / dp_cp_group.size().
-                        assert gradient_scaling_factor in (
-                            1.0,
-                            self.expt_dp_group.size() / self.dp_cp_group.size(),
+                        # For non-expert parameters, gradient_scaling_factor is 1.
+                        # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
+                        assert (gradient_scaling_factor == 1) or (
+                            gradient_scaling_factor
+                            == (self.expt_dp_group.size() / self.dp_cp_group.size())
                         )
                 else:
                     assert gradient_scaling_factor == target_gradient_scaling_factor
@@ -284,12 +284,12 @@ class DistributedDataParallel(_BaseDataParallel):
             #   3. Final result is scaled by 1/dp_size as desired
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
-                expert_gradient_scaling_factor = (
-                    self.expt_dp_group.size() / self.dp_cp_group.size()
-                )
+                expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
             else:
-                gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
-                expert_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
+                data_parallel_world_size = self.dp_cp_group.size()
+
+                gradient_scaling_factor = 1.0 / data_parallel_world_size
+                expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(

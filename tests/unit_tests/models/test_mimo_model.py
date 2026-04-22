@@ -528,15 +528,13 @@ class TestMimoModelNonColocated:
             self.hidden_size, self.img_h, self.img_w, self.patch_dim
         )
 
-        mimo_config = MimoModelConfig(
-            language_model_spec=language_model_spec,
-            modality_submodules_spec={"images": vision_submodule_spec},
-            special_token_ids={"images": 50257},
-            module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: MockGrid()},
-        )
-
         with pytest.raises(ValueError, match="module_to_grid_map keys must match"):
-            MimoModel(mimo_config)
+            MimoModelConfig(
+                language_model_spec=language_model_spec,
+                modality_submodules_spec={"images": vision_submodule_spec},
+                special_token_ids={"images": 50257},
+                module_to_grid_map={MIMO_LANGUAGE_MODULE_KEY: MockGrid()},
+            )
 
     def test_role_determination(self):
         """Test role correctly identifies modules and stage positions."""
@@ -564,12 +562,12 @@ class TestMimoModelNonColocated:
         assert model_language.role.has_modality_modules is False
         assert model_language.role.has_language_module is True
 
-        # Non-colocated / PP role-stage coverage lives in tests/unit_tests/
-        # models/test_mimo_role.py (RankRole unit tests) and
-        # tests/unit_tests/models/test_mimo_1f1b_schedule.py (MimoModel with
-        # a real grid map + PP stages driving forward_backward_pipelining).
-        # Keep this test focused on the "no grid / default parallel state"
-        # path the rest of the file exercises.
+        # Stage info with PP
+        model_pp = MimoModel(
+            self._make_config(encoder_in_grid=True, language_in_grid=True, pp_rank=1, pp_size=3)
+        )
+        assert model_pp.role.is_first_stage("images") is False
+        assert model_pp.role.is_last_stage("images") is False
 
     def test_selective_init_encoder_only(self):
         """Test encoder-only rank initializes encoder but not language model."""

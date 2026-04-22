@@ -51,7 +51,6 @@ Run with::
 """
 
 import os
-from contextlib import ExitStack, contextmanager
 from functools import partial
 
 import pytest
@@ -67,6 +66,7 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.models.test_mimo_1f1b_schedule import (
+    build_no_sync_func,
     create_all_embedding_groups,
     create_hypercomm_grid,
     destroy_all_grids,
@@ -192,15 +192,7 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
     sum happens to equal ``N_global``.
     """
 
-    @contextmanager
-    def no_sync_func():
-        with ExitStack() as stack:
-            if mimo_model.language_model is not None:
-                stack.enter_context(mimo_model.language_model.no_sync())
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    stack.enter_context(submodule.no_sync())
-            yield
+    no_sync_func = build_no_sync_func(mimo_model)
 
     def finalize_grads_func(model_list, num_tokens, force_all_reduce=False, **kwargs):
         # Schedule passes the per-rank sum-across-microbatches of what the

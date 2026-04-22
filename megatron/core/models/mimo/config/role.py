@@ -1,4 +1,4 @@
-# Copyright (c) 2025, 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Data classes for MIMO rank role management in multi-module pipeline parallelism."""
 
@@ -73,27 +73,14 @@ class RankRole:
         modality_module_names: List[str],
         module_to_grid_map: Optional[Dict[str, 'HyperCommGrid']] = None,
     ) -> 'RankRole':
-        """Construct a RankRole from modality names and an optional grid map.
+        """Build a RankRole, dispatching by whether grids share ranks.
 
-        This is the unified entry point — callers pass the same first
-        argument (``modality_module_names``) in both colocated and
-        non-colocated cases and let ``build`` dispatch based on what the
-        grid map says:
-
-            * ``module_to_grid_map is None`` → COLOCATED with no grid
-              (legacy global parallel_state). Every module lives on
-              every rank.
-            * All grids span the same ranks (same ``rank_offset`` +
-              ``size``) → COLOCATED across the shared rank range.
-              Per-bridge ``ColocatedBridgeCommunicator`` instances
-              handle heterogeneous TP/DP on the MimoModel side.
-            * Grids differ → NON_COLOCATED; delegate to
-              ``from_grid_map`` to pick up PP-stage info for each
-              module this rank participates in.
+        No grid map or all grids span the same ranks → COLOCATED.
+        Grids differ → NON_COLOCATED with PP-stage info per module.
         """
         if module_to_grid_map is None or cls._all_grids_colocated(module_to_grid_map):
-            return cls.colocated(modality_module_names)
-        return cls.from_grid_map(module_to_grid_map, modality_module_names)
+            return cls._colocated(modality_module_names)
+        return cls._from_grid_map(module_to_grid_map)
 
     @staticmethod
     def _all_grids_colocated(module_to_grid_map: Dict[str, 'HyperCommGrid']) -> bool:
@@ -104,17 +91,8 @@ class RankRole:
         )
 
     @classmethod
-    def colocated(cls, modality_module_names: List[str]) -> 'RankRole':
-        """Create a role for colocated layout: every module on every rank, PP=1.
-
-        Args:
-            modality_module_names: Modality module names (e.g. ``["images",
-                "audio"]``). The language model key is appended automatically
-                so the arg shape matches ``from_grid_map``.
-
-        Prefer ``RankRole.build`` unless you specifically need the colocated
-        factory without the grid-map dispatch.
-        """
+    def _colocated(cls, modality_module_names: List[str]) -> 'RankRole':
+        """Colocated layout: every module on every rank, PP=1."""
         all_module_names = list(modality_module_names) + [MIMO_LANGUAGE_MODULE_KEY]
         return cls(
             modules={
@@ -125,39 +103,14 @@ class RankRole:
         )
 
     @classmethod
-    def from_grid_map(
-        cls, module_to_grid_map: Dict[str, HyperCommGrid], modality_module_names: List[str]
-    ) -> 'RankRole':
-        """Create a role from a module-to-grid mapping for non-colocated PP.
+    def _from_grid_map(cls, module_to_grid_map: Dict[str, HyperCommGrid]) -> 'RankRole':
+        """Non-colocated role for this rank from a module-to-grid mapping.
 
-        Determines which modules the current rank participates in and its
-        pipeline stage position within each module.
-
-        Args:
-            module_to_grid_map: Dict mapping module names to HyperCommGrid objects.
-                Must contain keys matching modality_module_names + MIMO_LANGUAGE_MODULE_KEY.
-            modality_module_names: List of modality module names (e.g., ["images", "audio"]).
-
-        Returns:
-            RankRole for the current rank.
+        Grid map keys are validated by ``MimoModelConfig.__post_init__``.
 
         Raises:
-            ValueError: If grid map keys don't match expected module names.
             RuntimeError: If current rank is not in any module grid.
-
-        Prefer ``RankRole.build`` unless you specifically need the non-colocated
-        factory without the grid-map dispatch.
         """
-        # Validate keys
-        expected_keys = set(modality_module_names) | {MIMO_LANGUAGE_MODULE_KEY}
-        grid_keys = set(module_to_grid_map.keys())
-        if grid_keys != expected_keys:
-            raise ValueError(
-                f"module_to_grid_map keys must match modality module names + "
-                f"'{MIMO_LANGUAGE_MODULE_KEY}'. Missing: {expected_keys - grid_keys}, "
-                f"Extra: {grid_keys - expected_keys}"
-            )
-
         current_rank = dist.get_rank()
         modules = {}
 
@@ -175,7 +128,7 @@ class RankRole:
             is_first = pp_rank == 0
             is_last = pp_rank == pp_size - 1
             logger.info(
-                f"[RankRole.from_grid_map] Rank {current_rank}: module={module_name}, "
+                f"[RankRole._from_grid_map] Rank {current_rank}: module={module_name}, "
                 f"pp_rank={pp_rank}/{pp_size}, is_first_stage={is_first}, is_last_stage={is_last}"
             )
             modules[module_name] = ModuleStageInfo(is_first_stage=is_first, is_last_stage=is_last)

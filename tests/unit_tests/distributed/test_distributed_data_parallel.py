@@ -116,5 +116,3 @@ class TestDistributedDataParallel:
         for p1, p2 in zip(ddp_model1.parameters(), ddp_model2.parameters()):
             if hasattr(p1, 'main_grad') and hasattr(p2, 'main_grad'):
                 testing.assert_close(p1.main_grad, p2.main_grad, rtol=0, atol=0)
-
-

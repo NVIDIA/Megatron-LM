@@ -61,7 +61,6 @@ class MimoModel(MegatronModule):
         self.mimo_config = mimo_config
         modality_names = list(mimo_config.modality_submodules_spec.keys())
         self.colocated_comms = {}
-        # Single dispatch point for both colocated and non-colocated layouts.
         self.role = RankRole.build(modality_names, mimo_config.module_to_grid_map)
         if self.role.mode is ModuleLayout.COLOCATED and mimo_config.module_to_grid_map:
             # Per-encoder bridge needed iff modules share ranks but may differ
