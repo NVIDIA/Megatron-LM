@@ -9,12 +9,15 @@ class NullTokenizer:
 
     Args:
         vocab_size: vocabulary size for embedding
+        eod_id: id of the end-of-document token. Defaults to ``vocab_size - 1``.
+        pad_id: id of the padding token. Defaults to ``-1`` (no pad token).
     """
 
-    def __init__(self, vocab_size, **kwargs):
+    def __init__(self, vocab_size, eod_id=None, pad_id=-1, **kwargs):
         """ """
         self._vocab_size = int(vocab_size)
-        self._eod_id = self._vocab_size - 1
+        self._eod_id = int(eod_id) if eod_id is not None else self._vocab_size - 1
+        self._pad_id = int(pad_id)
 
     def text_to_ids(self, text):
         """Converts text to ids."""
@@ -48,6 +51,8 @@ class NullTokenizer:
             {
                 "class": f"{type(self).__module__}.{type(self).__qualname__}",
                 "vocab_size": self._vocab_size,
+                "eod_id": self._eod_id,
+                "pad_id": self._pad_id,
             }
         )
 
@@ -89,7 +94,7 @@ class NullTokenizer:
     @property
     def pad_id(self):
         """Returns pad token."""
-        return -1
+        return self._pad_id
 
     @property
     def additional_special_tokens_ids(self):
