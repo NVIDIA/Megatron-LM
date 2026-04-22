@@ -1213,13 +1213,9 @@ def _load_state_dict_hook_ignore_param_names(
     """
     for param_name in param_names:
         if param_name in incompatible_keys.missing_keys:
-            # TE's FP8 _extra_state keys are routinely missing for HF-converted checkpoints
-            # and are handled by `_load_state_dict_hook_ignore_extra_state`; skip the
-            # noisy per-key warning for them.
-            if not param_name.endswith("._extra_state"):
-                logging.getLogger(__name__).warning(
-                    f"{param_name} being removed from incompatible_keys.missing_keys in LlavaModel"
-                )
+            logging.getLogger(__name__).warning(
+                f"{param_name} being removed from incompatible_keys.missing_keys in LlavaModel"
+            )
             incompatible_keys.missing_keys.remove(param_name)
 
 
@@ -1239,9 +1235,9 @@ def _load_state_dict_hook_ignore_extra_state(
     for name, keys in incompatible_keys._asdict().items():
         for key in keys[::-1]:
             if "extra_state" in key:
-                # logging.getLogger(__name__).warning(
-                #     f"_extra_state key {key} being removed from {name}"
-                # )
+                logging.getLogger(__name__).warning(
+                    f"_extra_state key {key} being removed from {name}"
+                )
                 keys.remove(key)
 
 
