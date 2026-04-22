@@ -45,6 +45,9 @@ elif HAVE_TRITON:
 
 @triton.jit
 def fast_exp(x):
+    """
+    Fast calculation of exponent via exponent of 2.
+    """
     LOG2E = tl.constexpr(1.4426950408889634)
     return tl.math.exp2(LOG2E * x)
 
@@ -377,8 +380,7 @@ def selective_state_update(
     )
 
     is_blackwell = torch.cuda.get_device_capability(x.device)[0] >= 10
-    
-    
+
     # Default
     BLOCK_SIZE_M, num_warps = 4, 8
     if dstate <= 16:

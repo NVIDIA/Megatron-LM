@@ -248,12 +248,14 @@ try:
                     "top_logprobs": top_logprobs,
                 }
 
-            choices.append({
-                "index": request_idx,
-                "text": text_output,
-                "logprobs": logprobs_data,
-                "finish_reason": finish_reason,
-            })
+            choices.append(
+                {
+                    "index": request_idx,
+                    "text": text_output,
+                    "logprobs": logprobs_data,
+                    "finish_reason": finish_reason,
+                }
+            )
             if result["routing_indices"] is not None:
                 choices[-1]["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (
@@ -267,18 +269,20 @@ try:
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
-        return jsonify({
-            "id": str(uuid.uuid4()),
-            "object": "text_completion",
-            "created": int(time.time()),
-            "model": "EMPTY",
-            "choices": choices,
-            "usage": {
-                "prompt_tokens": prompt_token_count,
-                "completion_tokens": total_completion_tokens,
-                "total_tokens": prompt_token_count + total_completion_tokens,
-            },
-        })
+        return jsonify(
+            {
+                "id": str(uuid.uuid4()),
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": "EMPTY",
+                "choices": choices,
+                "usage": {
+                    "prompt_tokens": prompt_token_count,
+                    "completion_tokens": total_completion_tokens,
+                    "total_tokens": prompt_token_count + total_completion_tokens,
+                },
+            }
+        )
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")
