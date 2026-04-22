@@ -20,6 +20,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
+from ..fp4_utils import get_nvfp4_rowwise_packed_shape, is_nvfp4tensor
 from ..fp8_utils import (
     is_float8tensor,
     is_mxfp8tensor,
@@ -122,7 +123,6 @@ class _ParamAndGradBucket:
         self.layerwise_params_list = None
         self.layerwise_param_flat_sizes = None
         self.layerwise_gather_list = None
-        self._layerwise_src_buffer = None
 
     def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
         """Set per-rank parameter lists for layer-wise async all-gather.
@@ -343,44 +343,38 @@ class _ParamAndGradBucketGroup:
                 param_dtype = bucket.params_list[0].dtype
 
                 if max(bucket.layerwise_param_flat_sizes) == 0:
-                    # All ranks have empty params for this bucket — skip.
                     bucket.layerwise_gather_list = None
                     continue
 
-                # Flatten local params.  Detach from the autograd graph because
-                # start_param_sync can be called during the forward pass (where
-                # autograd is active) and all_gather will write into gather_list
-                # entries in-place.
                 local_size = bucket.layerwise_param_flat_sizes[local_rank]
+                total_gather_size = sum(bucket.layerwise_param_flat_sizes)
+
+                # Reuse grad_data as the all_gather receive buffer; it is idle
+                # during forward and grad_dtype.element_size >= param_dtype.
+                reuse_buf = bucket.grad_data.view(param_dtype)
+                assert reuse_buf.numel() >= total_gather_size
+
+                # Partition reuse_buf into contiguous per-rank receive slices.
+                gather_list = []
+                offset = 0
+                for i in range(dp_size):
+                    size = bucket.layerwise_param_flat_sizes[i]
+                    gather_list.append(reuse_buf[offset : offset + size])
+                    offset += size
+                local_slot_view = gather_list[local_rank]
+
+                # Flatten local params and copy into the local rank's slot.
+                # Detach from autograd since start_param_sync may be called
+                # during the forward pass where autograd is active.
                 if local_size > 0:
                     flat_local_params = _flatten_dense_tensors(
                         bucket.layerwise_params_list[local_rank]
                     ).detach()
-                else:
-                    flat_local_params = torch.empty(
-                        0, device=bucket.grad_data.device, dtype=param_dtype
-                    )
-                # Keep flat_local_params alive until the async operation completes.
-                bucket._layerwise_src_buffer = flat_local_params
-
-                # Allocate per-rank receive buffers with actual sizes (no padding).
-                # Reuse flat_local_params for local_rank's slot to avoid an extra allocation.
-                gather_list = []
-                for i in range(dp_size):
-                    if i == local_rank:
-                        gather_list.append(flat_local_params)
-                    else:
-                        gather_list.append(
-                            torch.empty(
-                                bucket.layerwise_param_flat_sizes[i],
-                                device=flat_local_params.device,
-                                dtype=flat_local_params.dtype,
-                            )
-                        )
+                    local_slot_view.copy_(flat_local_params)
                 bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(
-                    gather_list, flat_local_params, group=group, async_op=async_op
+                    gather_list, local_slot_view, group=group, async_op=async_op
                 )
                 if async_op and work is not None:
                     layerwise_work_handles.append(work)
@@ -401,7 +395,6 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
-                    bucket._layerwise_src_buffer = None
                 self.param_gather_handle = None
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
@@ -511,7 +504,6 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
-                    bucket._layerwise_src_buffer = None
             else:
                 fp8_params = []
                 for bucket in self.buckets:
@@ -720,7 +712,6 @@ class _ParamAndGradBucketGroup:
             self.param_gather_handle = None
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
-            bucket._layerwise_src_buffer = None
 
     def _copy_back_extra_main_grads(self):
         """
@@ -876,25 +867,63 @@ class _ParamAndGradBuffer:
         per_bucket_numel_unpadded = []
         bucket_id = 0
 
-        def _update_bucket_metadata(param_end_index: int) -> int:
+        def _update_bucket_metadata(
+            param_end_index: int,
+            bucket_start_index: int,
+            bucket_indices: list,
+            numel_unpadded_list: list,
+        ) -> int:
             """
-            Record metadata for the bucket starting at bucket_start_index and ending with the
-            passed-in param_end_index. Returns the bucket's end_index.
+            Record metadata for a bucket. Returns the bucket's (padded) end_index.
+
+            Args:
+                param_end_index: End index of the last param in this bucket (unpadded).
+                bucket_start_index: Start index of this bucket.
+                bucket_indices: List to append (start, end) bucket boundaries to.
+                numel_unpadded_list: List to append unpadded bucket numel to.
+
+            Returns:
+                The bucket's end index, padded if using distributed optimizer.
             """
-            nonlocal bucket_start_index, bucket_params, bucket_id
-            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            numel_unpadded_list.append(param_end_index - bucket_start_index)
             bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
+            bucket_indices.append((bucket_start_index, bucket_end_index))
+            return bucket_end_index
 
-            # Record metadata of new bucket.
-            self.bucket_indices.append((bucket_start_index, bucket_end_index))
-            bucket_start_index = bucket_end_index
+        def _finalize_bucket_all_index_spaces(
+            param_end_index: int,
+            bucket_start_index: int,
+            nvfp4_packed_param_end_index: int = None,
+            nvfp4_packed_bucket_start_index: int = None,
+        ) -> tuple:
+            """
+            Record metadata for the current bucket across both main and (if applicable)
+            NVFP4 packed index spaces. Also resets bucket_params and increments bucket_id.
 
-            # Prepare for next bucket.
+            Args:
+                param_end_index: End index of the last param in the bucket (full numel).
+                bucket_start_index: Start index of the bucket (full numel).
+                nvfp4_packed_param_end_index: End index in packed space (NVFP4 only).
+                nvfp4_packed_bucket_start_index: Bucket start in packed space (NVFP4 only).
+
+            Returns:
+                Tuple of (bucket_end_index, nvfp4_packed_bucket_end_index).
+            """
+            nonlocal bucket_params, bucket_id
+            bucket_end_index = _update_bucket_metadata(
+                param_end_index, bucket_start_index, self.bucket_indices, per_bucket_numel_unpadded
+            )
+            nvfp4_packed_bucket_end_index = None
+            if self.has_nvfp4_params:
+                nvfp4_packed_bucket_end_index = _update_bucket_metadata(
+                    nvfp4_packed_param_end_index,
+                    nvfp4_packed_bucket_start_index,
+                    self.nvfp4_packed_bucket_indices,
+                    nvfp4_packed_per_bucket_numel_unpadded,
+                )
             bucket_params = set()
             bucket_id += 1
-
-            # Return the potentially padded bucket_end_index.
-            return bucket_end_index
+            return bucket_end_index, nvfp4_packed_bucket_end_index
 
         def _does_param_require_new_bucket(param):
             """
@@ -909,20 +938,78 @@ class _ParamAndGradBuffer:
                 and self.ddp_config.use_distributed_optimizer
             )
 
+        # Check if this buffer contains NVFP4 params.
+        #
+        # NVFP4 uses a dual-buffer layout: the param buffer stores packed bytes (half the
+        # logical numel) while the grad buffer uses the full numel. This is because NVFP4
+        # packs two FP4 values into a single uint8 byte for storage/communication, but
+        # gradients are computed and reduced in BF16 at full element count.
+        #
+        #   Logical view:  [v0, v1, v2, v3, ...]   numel = N
+        #
+        #   Param buffer  (uint8):      [byte0, byte1, ...]      numel = N // 2
+        #                                 ^^^^^ packs v0+v1
+        #
+        #   Grad buffer:  [g0, g1, g2, g3, ...]   numel = N
+        #
+        # We therefore maintain two index maps:
+        #   - param_index_map:              offsets using full numel.
+        #   - nvfp4_packed_param_index_map: offsets into the packed param buffer (numel // 2).
+        #
+        self.has_nvfp4_params = any(is_nvfp4tensor(p) for p in self.params)
+        # Secondary (packed) index map, counters, and bucket tracking for NVFP4.
+        self.nvfp4_packed_param_index_map = {} if self.has_nvfp4_params else None
+        nvfp4_packed_param_start_index = 0 if self.has_nvfp4_params else None
+        nvfp4_packed_param_end_index = None
+        nvfp4_packed_bucket_start_index = 0 if self.has_nvfp4_params else None
+        self.nvfp4_packed_bucket_indices = [] if self.has_nvfp4_params else None
+        nvfp4_packed_per_bucket_numel_unpadded = [] if self.has_nvfp4_params else None
+
         for param, _ in params_with_names[::-1]:
             # Iterate through parameters in reverse order to roughly follow backprop order.
 
-            this_numel = param.data.nelement()
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
+            if self.has_nvfp4_params:
+                nvfp4_packed_param_start_index = _pad_start_of_param_if_needed(
+                    nvfp4_packed_param_start_index
+                )
 
             # Create bucket with collected parameters if current param needs its own bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
-                # Ensure this param accounts for the new padding introduced at end of
-                # previous bucket.
-                param_start_index = _update_bucket_metadata(param_start_index)
+                # Finalize the current bucket and update start indices for the next bucket.
+                bucket_start_index, nvfp4_packed_bucket_start_index = (
+                    _finalize_bucket_all_index_spaces(
+                        param_start_index,
+                        bucket_start_index,
+                        nvfp4_packed_param_start_index,
+                        nvfp4_packed_bucket_start_index,
+                    )
+                )
+                param_start_index = bucket_start_index
+                if self.has_nvfp4_params:
+                    nvfp4_packed_param_start_index = nvfp4_packed_bucket_start_index
 
-            param_end_index = param_start_index + this_numel
+            # Primary index computation: always uses full param numel.
+            param_numel = param.data.nelement()
+            param_end_index = param_start_index + param_numel
             self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+
+            # Secondary (packed) index computation for NVFP4.
+            if self.has_nvfp4_params:
+                if is_nvfp4tensor(param):
+                    assert (
+                        param_numel % 2 == 0
+                    ), f"NVFP4 requires even numel for packing, got {param_numel}"
+                    # NVFP4 packs two FP4 values into one byte, so packed numel is half.
+                    nvfp4_packed_param_end_index = nvfp4_packed_param_start_index + param_numel // 2
+                else:
+                    nvfp4_packed_param_end_index = nvfp4_packed_param_start_index + param_numel
+                self.nvfp4_packed_param_index_map[param] = (
+                    nvfp4_packed_param_start_index,
+                    nvfp4_packed_param_end_index,
+                    bucket_id,
+                )
+
             bucket_params.add(param)
 
             # If we have enough elements already or the current param is part of the shared
@@ -930,22 +1017,46 @@ class _ParamAndGradBuffer:
             if (
                 bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
             ) or _does_param_require_new_bucket(param):
-                bucket_end_index = _update_bucket_metadata(param_end_index)
-                param_start_index = bucket_end_index
+                # Finalize the current bucket and update start indices for the next bucket.
+                bucket_start_index, nvfp4_packed_bucket_start_index = (
+                    _finalize_bucket_all_index_spaces(
+                        param_end_index,
+                        bucket_start_index,
+                        nvfp4_packed_param_end_index,
+                        nvfp4_packed_bucket_start_index,
+                    )
+                )
+                param_start_index = bucket_start_index
+                if self.has_nvfp4_params:
+                    nvfp4_packed_param_start_index = nvfp4_packed_bucket_start_index
             else:
                 param_start_index = param_end_index
+                if self.has_nvfp4_params:
+                    nvfp4_packed_param_start_index = nvfp4_packed_param_end_index
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            bucket_end_index = _update_bucket_metadata(param_end_index)
+            _finalize_bucket_all_index_spaces(
+                param_end_index,
+                bucket_start_index,
+                nvfp4_packed_param_end_index,
+                nvfp4_packed_bucket_start_index,
+            )
 
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
-        self.numel = bucket_end_index
+        self.numel = self.bucket_indices[-1][1]
         self.numel_unpadded = sum(per_bucket_numel_unpadded)
+        if self.has_nvfp4_params:
+            self.nvfp4_packed_numel = self.nvfp4_packed_bucket_indices[-1][1]
+            self.nvfp4_packed_numel_unpadded = sum(nvfp4_packed_per_bucket_numel_unpadded)
+
         assert self.numel_unpadded <= self.numel
         if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
+            if self.has_nvfp4_params:
+                assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
+                assert self.nvfp4_packed_numel % self.data_parallel_world_size == 0
         else:
             assert self.numel == self.numel_unpadded
 
@@ -999,8 +1110,9 @@ class _ParamAndGradBuffer:
             else:
                 # Only re-map param tensors if using distributed optimizer.
                 if self.ddp_config.use_distributed_optimizer:
+                    numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
                     self.param_data = torch.zeros(
-                        self.numel,
+                        numel,
                         dtype=self.param_dtype,
                         device=torch.cuda.current_device(),
                         requires_grad=False,
@@ -1017,22 +1129,84 @@ class _ParamAndGradBuffer:
         self.param_data_cpu = None
 
         # Finally, map param.data and param.main_grad fields to buffers.
+        def _create_bucket(bucket_id, bucket_params, bucket_params_with_extra_main_grads):
+            """
+            Look up precomputed bucket indices and create a new bucket.
+
+            Args:
+                bucket_id: ID of the bucket to create.
+                bucket_params: List of parameters in this bucket.
+                bucket_params_with_extra_main_grads: List of parameters with
+                    extra FP32 main_grads.
+
+            Returns:
+                A new _ParamAndGradBucket instance.
+            """
+            bucket_start_index, bucket_end_index = self.bucket_indices[bucket_id]
+            if self.has_nvfp4_params:
+                nvfp4_packed_start_index, nvfp4_packed_end_index = self.nvfp4_packed_bucket_indices[
+                    bucket_id
+                ]
+            else:
+                nvfp4_packed_start_index, nvfp4_packed_end_index = None, None
+            return self._new_bucket(
+                bucket_params=bucket_params,
+                start_index=bucket_start_index,
+                end_index=bucket_end_index,
+                numel_unpadded=per_bucket_numel_unpadded[bucket_id],
+                bucket_id=bucket_id,
+                nvfp4_packed_start_index=nvfp4_packed_start_index,
+                nvfp4_packed_end_index=nvfp4_packed_end_index,
+                bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+            )
+
         bucket_params = []
         bucket_params_with_extra_main_grads = []
-        bucket_start_index = 0
         cur_bucket_id = 0
         for param, param_name in params_with_names[::-1]:
+            # Get parameter indices computed in previous loop.
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
+            nvfp4_packed_param_start_index = None
+            if self.has_nvfp4_params:
+                nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
             # For MXFP8 param:
             # we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
             if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param):
                 if self.param_data is not None:
-                    new_param_data = self._get(
-                        param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                    )
-                    if is_float8tensor(param):
+                    if is_nvfp4tensor(param):
+                        # Remap the NVFP4 tensor's internal rowwise uint8 storage so it
+                        # points into the contiguous DDP param buffer. This enables the
+                        # all-gather to communicate packed NVFP4 bytes directly.
+                        from ..fp4_utils import modify_nvfp4_rowwise_storage
+
+                        packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
+                        rowwise_bytes_view = self._get(
+                            packed_shape,
+                            nvfp4_packed_param_start_index,
+                            buffer_type=BufferType.PARAM,
+                        )
+                        modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                    elif is_float8tensor(param):
+                        new_param_data = self._get(
+                            param.data.shape,
+                            (
+                                nvfp4_packed_param_start_index
+                                if self.has_nvfp4_params
+                                else param_start_index
+                            ),
+                            buffer_type=BufferType.PARAM,
+                        )
                         modify_underlying_storage(param, new_param_data)
                     else:
+                        new_param_data = self._get(
+                            param.data.shape,
+                            (
+                                nvfp4_packed_param_start_index
+                                if self.has_nvfp4_params
+                                else param_start_index
+                            ),
+                            buffer_type=BufferType.PARAM,
+                        )
                         old_param_data = param.data
                         param.data = new_param_data
                         assert old_param_data._base is None
@@ -1040,10 +1214,10 @@ class _ParamAndGradBuffer:
                         param.data.detach().copy_(old_param_data)
                         del old_param_data
 
+            # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(
                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
             )
-
             # Create FP32 copy of .main_grads if necessary.
             promote_main_grads_to_higher_precision = False
             for param_name_pattern in ddp_config.param_name_patterns_for_fp32_local_accumulation:
@@ -1068,18 +1242,11 @@ class _ParamAndGradBuffer:
                 self.extra_main_grads.append(param.main_grad)
 
             if bucket_id != cur_bucket_id:
-                bucket_end_index = _pad_end_of_bucket_if_needed(param_start_index)
                 self.buckets.append(
-                    self._new_bucket(
-                        bucket_params=bucket_params,
-                        start_index=bucket_start_index,
-                        end_index=bucket_end_index,
-                        numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                        bucket_id=cur_bucket_id,
-                        bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+                    _create_bucket(
+                        cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads
                     )
                 )
-                bucket_start_index = bucket_end_index
                 bucket_params = []
                 bucket_params_with_extra_main_grads = []
                 assert cur_bucket_id + 1 == len(self.buckets)
@@ -1092,18 +1259,9 @@ class _ParamAndGradBuffer:
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
             self.buckets.append(
-                self._new_bucket(
-                    bucket_params=bucket_params,
-                    start_index=bucket_start_index,
-                    end_index=bucket_end_index,
-                    numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                    bucket_id=cur_bucket_id,
-                    bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
-                )
+                _create_bucket(cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads)
             )
-
         # Log buckets for all PP stages.
         log_strs = []
         log_strs.append(
@@ -1140,11 +1298,13 @@ class _ParamAndGradBuffer:
         `start_index`.
         """
         end_index = start_index + shape.numel()
-        assert end_index <= self.numel, "Requested tensor is out of buffer range"
         if buffer_type == BufferType.PARAM:
+            numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
+            assert end_index <= numel, "Requested tensor is out of param buffer range"
             assert self.param_data is not None
             buffer_tensor = self.param_data[start_index:end_index]
         elif buffer_type == BufferType.GRAD:
+            assert end_index <= self.numel, "Requested tensor is out of grad buffer range"
             buffer_tensor = self.grad_data[start_index:end_index]
         else:
             raise Exception("Illegal buffer type provided to GradBuffer._get() function")
@@ -1159,24 +1319,46 @@ class _ParamAndGradBuffer:
         numel_unpadded: int,
         bucket_id: int,
         bucket_params_with_extra_main_grads: List[torch.Tensor],
+        nvfp4_packed_start_index: int = None,
+        nvfp4_packed_end_index: int = None,
     ) -> _ParamAndGradBucket:
         """
         Helper function that creates a new bucket. Also updates param->bucket mapping.
+
+        For NVFP4 buffers, nvfp4_packed_start_index and nvfp4_packed_end_index
+        are provided separately because the param buffer uses packed numel while
+        the grad buffer uses full numel.
         """
 
         # Assert that indices are correctly padded (if needed), and that bucket
         # position is same as originally computed.
+
         if self.ddp_config.use_distributed_optimizer:
             assert start_index % self.data_parallel_world_size == 0
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]
+        if nvfp4_packed_start_index is not None:
+            assert (
+                nvfp4_packed_start_index,
+                nvfp4_packed_end_index,
+            ) == self.nvfp4_packed_bucket_indices[bucket_id]
 
         # Get appropriate view into global _ParamAndGradBuffer.
+        # For NVFP4, param buffer uses packed offsets; otherwise same as start/end.
         bucketed_param_data = None
         if self.param_data is not None:
-            bucketed_param_data = self._get(
-                torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.PARAM
-            )
+            if nvfp4_packed_start_index is not None:
+                assert nvfp4_packed_end_index is not None
+                bucketed_param_data = self._get(
+                    torch.Size([nvfp4_packed_end_index - nvfp4_packed_start_index]),
+                    nvfp4_packed_start_index,
+                    buffer_type=BufferType.PARAM,
+                )
+            else:
+                bucketed_param_data = self._get(
+                    torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.PARAM
+                )
+        # Grad buffer always uses full-numel offsets.
         bucketed_grad_data = self._get(
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
         )
@@ -1239,7 +1421,9 @@ class _ParamAndGradBuffer:
 
 
 def partition_buckets(
-    buffers: List[_ParamAndGradBuffer], force_single_bucket_group: bool = False
+    buffers: List[_ParamAndGradBuffer],
+    force_single_bucket_group: bool = False,
+    reduce_scatter_with_fp32_accumulation: bool = False,
 ) -> List[_ParamAndGradBucketGroup]:
     """
     Automatically regroup the buckets of input buffers and return a list of bucket groups.
@@ -1330,8 +1514,34 @@ def partition_buckets(
         fp8_buffer = dtype_to_buffer_map[torch.uint8]
         for bucket in fp8_buffer.buckets:
             if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
-                # The last bucket group.
-                group_buckets = [bucket] + non_fp8_buckets
+                # reduce_scatter_with_fp32_accumulation requires exactly one bucket
+                # per group (see assert in _ParamAndGradBucketGroup.reduce_scatter).
+                # Without this flag the non-FP8 buckets would be merged into the last
+                # FP8 group, violating that constraint. So we split them out into
+                # their own individual groups instead.
+                if reduce_scatter_with_fp32_accumulation:
+                    bucket_groups.append(
+                        _ParamAndGradBucketGroup(
+                            [bucket],
+                            buffer.ddp_config,
+                            buffer.data_parallel_group,
+                            buffer.data_parallel_world_size,
+                        )
+                    )
+                    if non_fp8_buckets:
+                        for non_fp8_bucket in non_fp8_buckets:
+                            bucket_groups.append(
+                                _ParamAndGradBucketGroup(
+                                    [non_fp8_bucket],
+                                    buffer.ddp_config,
+                                    buffer.data_parallel_group,
+                                    buffer.data_parallel_world_size,
+                                )
+                            )
+
+                    continue  # Skip the default bucket group creation below
+                else:
+                    group_buckets = [bucket] + non_fp8_buckets
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]

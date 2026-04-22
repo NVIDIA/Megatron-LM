@@ -516,10 +516,6 @@ class FSDPDistributedIndex:
         self.hsdp_outer_dp_shard = hsdp_outer_dp_shard
         self.expt_device_mesh = expt_device_mesh
 
-        # Handling the situation where M-Core MoE EP=1
-        if self.expt_device_mesh is None:
-            self.expt_device_mesh = device_mesh
-
         # Hybrid FSDP Process Groups
         # Retrieve the FSDP process group from the DeviceMesh.
         self.fsdp_group = (
