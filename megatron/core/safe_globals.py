@@ -84,9 +84,6 @@ class SafeUnpickler(pickle.Unpickler):
     )
 
     def find_class(self, module: str, name: str):
-        # Allow legacy typed storage names such as ``torch.FloatStorage``
-        if module == "torch" and name.endswith("Storage"):
-            return super().find_class(module, name)
         if (module, name) not in self._SAFE_CLASSES:
             raise pickle.UnpicklingError(
                 f"Refusing to unpickle disallowed class '{module}.{name}' "
