@@ -354,7 +354,7 @@ def multimem_reduce_scatter_v(
 
 
 @triton.jit
-def _multimem_all_gather_v3_kernel(
+def _multimem_all_gatherv_3tensor_kernel(
     local_ptr_0,
     multicast_ptr_0,
     output_byte_offset_0,
@@ -627,7 +627,7 @@ def multimem_all_gather_v(
     return output_tensor
 
 
-def multimem_all_gather_v3(
+def multimem_all_gatherv_3tensor(
     output_tensor_0: torch.Tensor,
     output_tensor_1: torch.Tensor,
     output_tensor_2: torch.Tensor,
@@ -701,7 +701,7 @@ def multimem_all_gather_v3(
     ), "All three input tensors must have the same local_tokens (first dimension)."
     assert is_device_nvls_capable(
         input_tensor_0.device
-    ), "multimem_all_gather_v3 requires a Hopper+ GPU with NVLink (SM >= 9)."
+    ), "multimem_all_gatherv_3tensor requires a Hopper+ GPU with NVLink (SM >= 9)."
     assert (
         rank_token_offset.numel() == 1
         and rank_token_offset.dtype == torch.int32
@@ -743,7 +743,7 @@ def multimem_all_gather_v3(
     num_warps = max(1, block_size // WARP_SIZE)
     num_blocks = min(engine_max_tokens, MAX_NUM_BLOCKS)
 
-    _multimem_all_gather_v3_kernel[(num_blocks, 1, 1)](
+    _multimem_all_gatherv_3tensor_kernel[(num_blocks, 1, 1)](
         input_tensor_0.data_ptr(),
         symm_mem_hdl_0.multicast_ptr,
         output_byte_offset_0,

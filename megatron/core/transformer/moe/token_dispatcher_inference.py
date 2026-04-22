@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.inference.communication.torch_symm_triton import (
-    multimem_all_gather_v3,
+    multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe.metadata import fused_metadata_update
@@ -450,7 +450,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
-        multimem_all_gather_v3(
+        multimem_all_gatherv_3tensor(
             agv_h["tensor"],
             agv_r["tensor"],
             agv_p["tensor"],
