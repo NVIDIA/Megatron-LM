@@ -143,15 +143,145 @@ Commit everything and push the branch.
   cascades to fail ALL test suites. If every test job fails with ImportError,
   check the training.py import chain first.
 
-### Trigger and Poll
+### Execution model: one step, no background
 
-1. Comment on PR: `/ok to test <SHA>`
-2. Find CI run: `gh run list --json` filtered by
-   `headBranch == "pull-request/<PR_NUMBER>"` (no `--branch` flag available)
-3. Poll with a foreground Bash while-loop (`sleep 120`) using:
-   `gh api repos/$REPO/actions/runs/<RUN_ID>/jobs?per_page=100`
-4. As soon as ANY job fails, investigate immediately — don't wait for the
-   full run. Other jobs continue in parallel while you diagnose and fix.
+You run inside ONE GitHub Actions step. The moment you stop emitting
+tool calls, the step ends and the runner container is destroyed. Any
+background process you started dies with it. There is NO persistent
+session and NO future wakeup. See the workflow prompt's "NO background
+tasks" block for the full ban list.
+
+Practical rule: every wait for CI to resolve is a SINGLE foreground Bash
+tool call that blocks inline until the wait is resolved.
+
+### The Fix-Then-Retrigger Loop
+
+Two nested loops. Do NOT conflate them:
+
+- The **outer loop** is YOUR sequence of tool calls (each iteration: one
+  `/ok to test`, one blocking poll, maybe one fix-and-push). It is NOT a
+  Bash loop. It advances because you make new tool calls.
+- The **inner loop** is a single blocking Bash tool call using
+  `while true; do ... sleep 120; done`. It runs during one iteration of
+  the outer loop and ends when CI reaches a terminal state for that
+  iteration.
+
+The outer loop terminates ONLY when Phase 4's gate is satisfied.
+
+**Source of truth:** `gh pr view <PR_NUMBER> --repo $REPO --json statusCheckRollup`.
+This lists every required check, including external status contexts
+(GitLab CI, `copy-pr-bot`, etc.) that `gh api .../actions/runs/.../jobs`
+does NOT show.
+
+**Outer-loop iteration (each iteration is a few tool calls):**
+
+1. `latest_sha=$(git rev-parse HEAD)` (one Bash call).
+2. Post `/ok to test $latest_sha` on the PR:
+   `gh pr comment <PR_NUMBER> --repo $REPO --body "/ok to test $latest_sha"`
+3. ONE blocking Bash tool call. This is the inner loop. Copy this
+   template verbatim, only changing `REPO` and `PR`:
+
+   ```bash
+   REPO='NVIDIA/Megatron-LM'
+   PR='<PR_NUMBER>'
+   # Names matched case-insensitively, anchored to the START of the name.
+   EXEMPT='copy-pr-bot|is-not-external-contributor|greptile|coderabbit|codeowners|.*review|.*approval|codecov|coverage|build-docs|doc-build|readthedocs|sphinx'
+   # Sentinel check that tells us CI has fully run. Update this if the
+   # aggregate gate job is renamed.
+   SENTINEL='Nemo_CICD_Test'
+
+   while true; do
+     # Normalize both CheckRun (.status / .conclusion) and StatusContext
+     # (.state) entries into the same {name, status, conclusion} shape.
+     rollup=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '
+       .statusCheckRollup[] | [
+         (.name // .context // "?"),
+         (if .__typename == "StatusContext" then
+            (if (.state == "PENDING" or .state == "EXPECTED") then "IN_PROGRESS"
+             else "COMPLETED" end)
+          else (.status // "UNKNOWN") end),
+         (if .__typename == "StatusContext" then
+            (if .state == "SUCCESS" then "SUCCESS"
+             elif (.state == "FAILURE" or .state == "ERROR") then "FAILURE"
+             else "NEUTRAL" end)
+          else (.conclusion // "UNKNOWN") end)
+       ] | @tsv')
+
+     # Sentinel: do NOT declare green until the CI aggregate gate has
+     # reached a terminal state. Before /ok to test triggers the run,
+     # the sentinel is absent; while CI is running, it's IN_PROGRESS.
+     sentinel_line=$(printf '%s\n' "$rollup" | awk -F'\t' -v s="$SENTINEL" '$1 == s')
+     sentinel_status=$(printf '%s\n' "$sentinel_line" | awk -F'\t' 'NR==1 {print $2}')
+     if [ "$sentinel_status" != "COMPLETED" ]; then
+       echo "=== $(date -u) waiting for $SENTINEL (status: ${sentinel_status:-absent}) ==="
+       sleep 120
+       continue
+     fi
+
+     # Classify non-exempt checks (exempt list applied to the NAME only).
+     non_exempt=$(printf '%s\n' "$rollup" | awk -F'\t' -v p="^($EXEMPT)" 'tolower($1) !~ tolower(p)')
+     failed=$(printf '%s\n' "$non_exempt" | awk -F'\t' '$2 == "COMPLETED" && $3 !~ /^(SUCCESS|SKIPPED|NEUTRAL)$/')
+     pending=$(printf '%s\n' "$non_exempt" | awk -F'\t' '$2 != "COMPLETED"')
+
+     if [ -n "$failed" ]; then
+       echo "=== NON-EXEMPT FAILURES ==="
+       printf '%s\n' "$failed"
+       echo "RESULT=FAILURE"
+       exit 0
+     fi
+     if [ -n "$pending" ]; then
+       # Sentinel is COMPLETED but a non-exempt check is still pending —
+       # rare but possible. Keep waiting; do NOT ship.
+       echo "=== $(date -u) sentinel done but non-exempt checks still pending ==="
+       printf '%s\n' "$pending"
+       sleep 120
+       continue
+     fi
+
+     echo "=== ALL NON-EXEMPT CHECKS COMPLETED GREEN ==="
+     printf '%s\n' "$non_exempt"
+     echo "RESULT=GREEN"
+     exit 0
+   done
+   ```
+
+   This Bash call blocks for as long as CI takes (minutes to hours). Do
+   NOT split it into many short polls interleaved with other tool calls
+   — that wastes `--max-turns` and creates windows where you could lose
+   track of the loop state.
+
+4. Read the tool output:
+   - If `RESULT=FAILURE`: use `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs`
+     (or the equivalent for external contexts) to diagnose, fix the code,
+     commit, push. Then start a NEW outer-loop iteration at step 1 with
+     the new HEAD SHA.
+   - If `RESULT=GREEN`: outer loop is done. Proceed to Phase 4.
+
+**Why not wait-for-run-to-register first?** `gh pr comment` with
+`/ok to test <sha>` is handled by `copy-pr-bot`, which takes a few
+seconds to trigger the CI run. The `statusCheckRollup` poll in step 3
+will initially show checks in `PENDING` / `QUEUED`; that's fine — the
+inner loop treats those as "keep waiting" and will see them advance as
+CI progresses. No separate registration poll needed.
+
+### Anti-Patterns (what went wrong on run 24800621116)
+
+- **Do NOT classify a queued/in-progress job as "infrastructure-
+  blocked" and ship.** A stuck queue drains eventually — wait. If the
+  job eventually passes, great; if it fails, go fix it.
+- **Do NOT mark ready while any required check is `PENDING` /
+  `QUEUED` / `IN_PROGRESS` on the HEAD SHA.** A push is not a pass;
+  only a `COMPLETED` + green status is.
+- **Do NOT declare an untested job "pre-existing."** Pre-existing
+  means the test ran to completion and failed the same way on recent
+  dev CI. A job that never ran on your PR cannot be pre-existing.
+- **Do NOT use `gh api .../actions/runs/.../jobs` alone** as the gate
+  signal. External status contexts (GitLab CI pipelines, copy-pr-bot
+  status, etc.) do NOT appear there. Use `statusCheckRollup`.
+- **Do NOT start any background process.** No `&`, no `nohup`, no
+  `run_in_background: true`, no `ScheduleWakeup`. The GitHub Actions
+  step owns your shell; when the step ends, every background process
+  is killed and cannot resume.
 
 ### Failure Investigation
 
@@ -187,29 +317,34 @@ Commit everything and push the branch.
 4. Only if the test **also fails on recent dev CI** can you classify it as
    pre-existing. Document with the dev PR number and CI run as evidence.
 
-### Fix and Re-trigger
-
-- Fix sync-caused failures, commit, push
-- Re-trigger CI immediately (`/ok to test <new SHA>`)
-- Don't wait for the rest of the current run to finish
-- Repeat until all fixable issues are resolved
-
 ---
 
-## Phase 4: Mark PR Ready
+## Phase 4: Mark PR Ready — Strict Gate
 
-Only after the FINAL CI run has **completed** and previously-failing jobs
-now **pass** (or are empirically verified as pre-existing):
+Run `gh pr ready` ONLY when every non-exempt required check on the latest
+CI run (against the current HEAD SHA) satisfies BOTH:
+
+1. `status == "completed"` — NOT `queued`, `in_progress`, `pending`,
+   `waiting`, or `requested`.
+2. `conclusion ∈ {"success", "skipped", "neutral"}`.
+
+If a non-exempt check is pending/queued/in-progress: keep polling; do not
+run `gh pr ready`. If it fails: go back to Phase 3's loop.
+
+The exempt list (approval/coverage/docs) is defined in Phase 3; only those
+checks may be ignored.
+
+A pre-existing failure (same test failing identically on recent dev CI)
+may be accepted, but ONLY after it has fully run, been empirically
+verified against dev, and documented in the PR body with evidence (dev PR
+number + CI run URL).
 
 ```
 gh pr ready <PR_NUMBER> --repo $REPO
 ```
 
-"Fixed" means the fix was pushed AND the CI run finished AND the job passes.
-Pushing a fix is not enough — wait for confirmation.
-
-Comment on PR confirming which checks passed, listing any pre-existing
-failures with evidence (dev PR number + CI result), and stating it is ready
+Then comment on the PR confirming which checks passed, listing any
+documented pre-existing failures with evidence, and stating it is ready
 for human review.
 
 ---

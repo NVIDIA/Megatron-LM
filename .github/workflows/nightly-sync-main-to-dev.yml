@@ -106,25 +106,84 @@ jobs:
             ## Hard Constraints
 
             **Exit condition:** You MUST run `gh pr ready <PR_NUMBER>` before
-            exiting. That command is Phase 4. Do NOT exit after Phase 2 or 3.
+            exiting. That command is Phase 4. Do NOT exit after Phase 1, 2,
+            or 3 — not even if CI is "still running" or "stuck in queue."
+            Keep polling until it resolves, then act.
 
-            **CI polling:** Use a SINGLE foreground Bash `while true` loop
-            with `sleep 120` that calls `gh api` to check job status. One
-            tool call that blocks until CI completes or a failure is found.
+            **NO background tasks. Ever.**
+            You are running inside a single GitHub Actions step. The step
+            process owns your shell. When you stop issuing tool calls, the
+            step ends and the runner container is DESTROYED — every
+            background process dies with it and cannot resume. There is no
+            "future session" to wake up into.
 
-            **Banned patterns (will break the workflow):**
-            - `ScheduleWakeup` — silently ends your session
-            - `run_in_background: true` for polling — orphans hang the job
-            - `tail` on background task output in a loop — burns turns
+            The following are strictly forbidden:
+            - `Bash` with `run_in_background: true`
+            - `Agent` with `run_in_background: true`
+            - `ScheduleWakeup` (nothing will ever wake up)
+            - Any shell command ending in `&`, or using `nohup`, `disown`,
+              or `setsid` to detach a process
+            - `tail -f` on a log produced by a backgrounded task
+
+            Required shape for every long wait: ONE foreground Bash tool
+            call containing an inline `while true; do ... sleep <N>; done`
+            or `until ...; do sleep <N>; done` loop that BLOCKS inside
+            that single tool call and only returns when the wait is
+            resolved (success, failure, or a clearly-classified terminal
+            state). Do NOT break a long wait into many short polls with
+            conversation in between — that wastes `--max-turns` and
+            creates windows where the agent could forget the loop.
+
+            **Source of truth for CI status:**
+            `gh pr view <PR_NUMBER> --repo $REPO --json statusCheckRollup`
+            This lists every required check — GitHub Actions jobs AND
+            external contexts (GitLab CI, `copy-pr-bot`, etc.). The
+            `gh api .../actions/runs/<RUN_ID>/jobs` endpoint alone is
+            NOT sufficient — it misses external contexts.
 
             **Pre-existing failures:** MUST verify against recent dev CI
             before classifying any failure as pre-existing. Run
             `gh pr checks` on a recently merged dev PR. If the test passes
-            on dev, the failure is sync-caused and you must fix it.
+            on dev, the failure is sync-caused and you must fix it. A
+            check that has never completed on your PR cannot be
+            pre-existing — wait for it to finish first.
 
-            **Phase 4 gate:** Do NOT run `gh pr ready` until the FINAL CI
-            run has completed AND previously-failing jobs now pass. Pushing
-            a fix is not enough — wait for CI to confirm.
+            **Phase 4 gate — strict "all terminal, all green":**
+            Do NOT run `gh pr ready` until every non-exempt required check
+            in `statusCheckRollup` satisfies BOTH:
+              - `status == "COMPLETED"` (NOT `QUEUED`, `IN_PROGRESS`,
+                `PENDING`, `WAITING`, or `REQUESTED`), AND
+              - `conclusion` ∈ {`SUCCESS`, `SKIPPED`, `NEUTRAL`}.
+            A check stuck in a runner queue is NOT complete. Never
+            classify queued/in-progress jobs as "infrastructure-blocked"
+            and ship anyway — wait for them to reach a terminal
+            conclusion, then act on that result. When a check fails,
+            loop: diagnose → fix → commit → push → `/ok to test <sha>` →
+            poll. Only exit the loop when the gate is satisfied on the
+            LATEST CI run against the current HEAD SHA.
+
+            **Exempt checks (may be ignored for the Phase 4 gate):**
+            These categories are pre-merge policy signals, not
+            correctness signals, so their failure must not block the
+            sync bot from marking the PR ready for human review.
+
+            - Approval / code-review: `codeowners-approval`,
+              `check-approval`, `multi-approval-bot-summary`,
+              `is-not-external-contributor`, any check whose name
+              contains `review` or `approval`.
+            - Code coverage: `Coverage (unit-test)`, `Coverage_Fake`,
+              any check whose name contains `codecov` or `coverage`
+              (case-insensitive).
+            - Docs: `build-docs / Build docs`, `build-docs-summary`,
+              any check whose name contains `build-docs`, `doc-build`,
+              `readthedocs`, or `sphinx`.
+
+            Everything else — unit tests (`tests/unit_tests/...`),
+            integration tests (`gpt/...`, `moe/...`, etc.), `linting`,
+            `cicd-container-build`, `cicd-mbridge-testing`,
+            `Nemo_CICD_Test`, `copyright-check`, `pre-flight`, wheel
+            builds, etc. — is NOT exempt and must reach a terminal
+            green conclusion.
           show_full_output: true
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
