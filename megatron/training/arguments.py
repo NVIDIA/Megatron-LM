@@ -132,6 +132,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     else:
         args = parser.parse_args()
 
+    args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
+
     # Experimental yaml
     if args.yaml_cfg is not None:
         from .yaml_arguments import load_yaml
@@ -593,11 +595,16 @@ def validate_args(args, defaults={}):
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
         )
-        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
-
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
+        )
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
@@ -617,7 +624,6 @@ def validate_args(args, defaults={}):
             args.grpo_samples_per_iteration * args.grpo_iterations)
 
         # Ensure that the number of prompts we collect is a multiple of the global batch size.
-        # TODO: Make this account for batch size rampup?
         assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
             f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
 
@@ -1036,7 +1042,13 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-        
+    
+    if args.nccl_ub and args.use_megatron_fsdp:
+        # In Megatron-LM, required implementation for manual registration is already provided.
+        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        args.fsdp_manual_registration = True
+        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
+
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
@@ -1116,8 +1128,6 @@ def validate_args(args, defaults={}):
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
@@ -1194,6 +1204,8 @@ def validate_args(args, defaults={}):
         if args.save_retain_interval is not None:
             assert args.save_retain_interval > 0
             assert args.save_retain_interval % args.save_interval == 0
+        if args.save_params_interval is not None:
+            assert not args.overlap_param_gather
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
@@ -2908,8 +2920,7 @@ def _add_data_args(parser):
                        'This argument is exclusive to the other independent --*-data-path arguments.')
     group.add_argument('--phase-transition-iterations', type=str, default=None,
                        help='Comma-separated list of iterations where phase '
-                       'transitions occur. Requires fixed global batch size across phases. '
-                       'Does not support batch size ramp-up.')
+                       'transitions occur. Requires fixed global batch size across phases.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

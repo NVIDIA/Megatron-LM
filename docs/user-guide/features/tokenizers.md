@@ -9,22 +9,22 @@
 
 # Tokenizers
 
-Megatron Core provides a unified tokenizer system with a HuggingFace-style API for easy tokenizer management and configuration.
+Megatron Core provides a unified tokenizer system with a Hugging Face-style API for configuration and loading.
 
 ## Overview
 
-The `MegatronTokenizer` class offers a simple, familiar API for loading and managing tokenizers:
+The `MegatronTokenizer` class uses the same entry points as many Hugging Face workflows for loading and managing tokenizers:
 
-- **Automatic detection** - Load any tokenizer type without specifying the library
-- **Metadata-based configuration** - Store tokenizer settings in JSON for easy reuse
-- **HuggingFace-compatible API** - Familiar `.from_pretrained()` interface
+- **Automatic detection** - Load tokenizer types without naming the backing library in code
+- **Metadata-based configuration** - Store tokenizer settings in JSON for reuse across runs
+- **Hugging Face-compatible API** - `.from_pretrained()`-style loading
 - **Custom tokenizer support** - Extend with model-specific tokenization logic
 
 ## Key Features
 
 ### Unified API
 
-Use the same API regardless of tokenizer backend (SentencePiece, HuggingFace, TikToken, etc.):
+Use the same API regardless of tokenizer backend (SentencePiece, Hugging Face, TikToken, and so on):
 
 ```python
 from megatron.core.tokenizers import MegatronTokenizer
@@ -35,22 +35,25 @@ tokenizer = MegatronTokenizer.from_pretrained("/path/to/tokenizer")
 ### Tokenizer Metadata
 
 Configuration is stored in a JSON metadata file containing:
-- Tokenizer library (HuggingFace, SentencePiece, TikToken, etc.)
+
+- Tokenizer library (Hugging Face, SentencePiece, TikToken, and so on)
 - Chat templates
 - Custom tokenizer class
 - Special token configurations
 
-**Benefits:**
+**Benefits**
+
 - Set configuration once, reuse everywhere
 - No repeated CLI arguments
-- Easy sharing - just copy the tokenizer directory
+- Share setups by copying the tokenizer directory
 
 ### Automatic Library Detection
 
-The correct tokenizer implementation is automatically selected:
-- No need to specify `SentencePieceTokenizer`, `HuggingFaceTokenizer`, etc.
-- Library type detected from metadata
-- Seamless switching between tokenizer backends
+The correct tokenizer implementation is selected automatically:
+
+- Avoids hard-coding `SentencePieceTokenizer`, `HuggingFaceTokenizer`, and related class names in user code
+- Library type is read from metadata
+- Change tokenizer backends by updating metadata and paths
 
 ## Basic Usage
 
@@ -159,7 +162,7 @@ tokenizer = MegatronTokenizer.from_pretrained(
 
 ### Using with Training Scripts
 
-The tokenizer system integrates seamlessly with Megatron-LM training:
+The tokenizer system works with Megatron-LM training scripts:
 
 ```bash
 # Null tokenizer for testing
@@ -170,7 +173,7 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 ```
 
 ```bash
-# HuggingFace tokenizer with metadata
+# Hugging Face tokenizer with metadata
 torchrun --nproc_per_node=8 pretrain_gpt.py \
     --tokenizer-type HuggingFaceTokenizer \
     --tokenizer-model meta-llama/Meta-Llama-3-8B \
@@ -184,9 +187,11 @@ If `--tokenizer-metadata` is not specified, a default metadata file is generated
 
 ## Supported Tokenizer Libraries
 
+The following table lists supported tokenizer backends:
+
 | Library | Description | Use Case |
 |---------|-------------|----------|
-| **HuggingFace** | Transformers tokenizers | Most modern LLMs (LLaMA, Mistral, etc.) |
+| **Hugging Face** | Transformers tokenizers | Most modern LLMs, such as LLaMA and Mistral |
 | **SentencePiece** | Google's tokenizer | GPT-style models, custom vocabularies |
 | **TikToken** | OpenAI's tokenizer | GPT-3.5/GPT-4 style tokenization |
 | **Megatron** | Built-in tokenizers | Legacy GPT-2 BPE |
@@ -214,16 +219,16 @@ MegatronTokenizer.write_metadata(
 )
 ```
 
-## Best Practices
+## Recommendations
 
-1. **Always save metadata** - Create metadata once, reuse across training runs
-2. **Use HuggingFace tokenizers** - When possible, for modern LLM compatibility
-3. **Test tokenization** - Verify encode/decode before starting training
-4. **Version control metadata** - Include `tokenizer_metadata.json` in your experiment configs
-5. **Share tokenizer directories** - Include both model files and metadata for reproducibility
+1. **Save metadata** - Create metadata once, then reuse across training runs
+2. **Prefer Hugging Face tokenizers** - When the model ships one, it reduces integration work
+3. **Test tokenization** - Verify encode and decode before long training jobs
+4. **Version control metadata** - Track `tokenizer_metadata.json` with experiment configs
+5. **Share tokenizer directories** - Ship model files and metadata together for reproducibility
 
 ## Next Steps
 
-- **Prepare Data**: See [Data Preparation](../data-preparation.md) for preprocessing with tokenizers
-- **Train Models**: Use tokenizers in [Training Examples](../training-examples.md)
-- **Supported Models**: Check [Language Models](../../models/llms.md) for model-specific tokenizers
+- **Prepare data**: Refer to [Data Preparation](../data-preparation.md) for preprocessing with tokenizers
+- **Train models**: Refer to [Training Examples](../training-examples.md)
+- **Supported models**: Refer to [Language Models](../../models/llms.md) for model-specific tokenizers
