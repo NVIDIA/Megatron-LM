@@ -357,6 +357,12 @@ class LLaVAModel(MegatronModule):
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
+            elif vision_transformer_config.vision_model_type.startswith("hf://"):
+                from megatron.core.models.huggingface.module import build_hf_model
+
+                self.vision_model = build_hf_model(
+                    vision_transformer_config, vision_transformer_config.vision_model_type
+                )
             else:
                 raise ValueError(
                     "Vision model "
