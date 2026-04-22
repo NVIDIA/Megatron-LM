@@ -1853,6 +1853,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
+    # Override iteration/consumed_samples if requested (e.g. to rewind the data loader).
+    if getattr(args, 'override_ckpt_iteration', None) is not None:
+        target_iter = args.override_ckpt_iteration
+        state_dict['iteration'] = target_iter
+        if 'args' in state_dict:
+            state_dict['args'].consumed_train_samples = target_iter * args.global_batch_size
+            state_dict['args'].skipped_train_samples = 0
+        print_rank_0(f'Overriding checkpoint iteration to {target_iter} '
+                     f'(consumed_train_samples = {target_iter * args.global_batch_size})')
+
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
