@@ -33,11 +33,7 @@ class _LenDataloader:
 
 
 def mock_multi_valid_full_datasets_provider(train_val_test_num_samples):
-    return (
-        iter([1]),
-        [_LenDataloader([2, 2]), _LenDataloader([20, 20, 20])],
-        iter([3]),
-    )
+    return (iter([1]), [_LenDataloader([2, 2]), _LenDataloader([20, 20, 20])], iter([3]))
 
 
 def create_test_args():
