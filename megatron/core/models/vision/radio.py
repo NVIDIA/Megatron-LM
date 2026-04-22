@@ -701,13 +701,18 @@ class RADIOViTModel(VisionModule):
 def fp8_pad_hook(
     module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
 ):
-    """FP8 requires class token length to be a multiple of 16."""
+    """FP8 requires class token length to be a multiple of 16 (for this model).
+
+    Original model checkpoint may not be padded for FP8 so pad it here.
+    """
     if not "vision_model.class_token" in state_dict:
         return
 
+    pad = 32 if module.config.fp8_recipe == "mxfp8" else 16
+
     class_token = state_dict["vision_model.class_token"]
-    if class_token.shape[0] % 16 != 0:
-        pad_len = 16 - (class_token.shape[0] % 16)
+    if class_token.shape[0] % pad != 0:
+        pad_len = pad - (class_token.shape[0] % pad)
         pad_tensor = torch.randn(
             pad_len, class_token.shape[-1], dtype=class_token.dtype, device=class_token.device
         )
