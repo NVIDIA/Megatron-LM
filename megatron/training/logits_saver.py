@@ -76,13 +76,16 @@ def get_current_iteration() -> int:
 
 _MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
 
-FOLDER_NAMES_PREFIX = "logprobs_iter"
+_FOLDER_NAMES_PREFIX = "logprobs_iter"
 
 # Matches both unsharded (``cp{C}_dp{D}__{B}.tar``) and legacy TP-sharded
-# (``tp{T}_cp{C}_dp{D}__{B}.tar``) batched tar filenames.  Capture group 1
-# is always the trailing iteration number *B*.
+# (``tp{T}_cp{C}_dp{D}__{B}.tar``) batched tar filenames.  Named groups:
+#   tp   – TP rank (None when unsharded)
+#   cp   – CP rank
+#   dp   – DP rank
+#   iter – trailing iteration number *B*
 _BATCHED_TAR_RE = re.compile(
-    r"^(?:tp\d+_)?cp\d+_dp\d+__(\d+)\.tar$"
+    r"^(?:tp(?P<tp>\d+)_)?cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
 )
 
 
@@ -126,7 +129,7 @@ def _sorted_batched_tars(paths: List[str]) -> List[str]:
     keyed = []
     for p in paths:
         if m := _BATCHED_TAR_RE.match(os.path.basename(p)):
-            keyed.append((int(m.group(1)), p))
+            keyed.append((int(m.group("iter")), p))
     keyed.sort()
     return [p for _, p in keyed]
 
@@ -167,7 +170,7 @@ def _format_folder_and_filename(
     suffix: str = "",
 ) -> Tuple[str, str]:
     """Generate a unique folder and filename for log-prob data."""
-    folder = os.path.join(save_dir, f"{FOLDER_NAMES_PREFIX}{iteration}")
+    folder = os.path.join(save_dir, f"{_FOLDER_NAMES_PREFIX}{iteration}")
     filename = f"tp{tp_rank}_cp{cp_rank}_dp{dp_rank}{suffix}"
     return folder, filename
 
@@ -207,7 +210,15 @@ class LogitsSaverHooks:
         compress_zstd: Whether to use zstd compression (requires zstandard package)
         flush_interval: Number of iterations to batch before writing a single tar
             archive.  1 (default) preserves the legacy one-file-per-iteration behaviour.
+        save_dtype: String name of the dtype for top-K log-probabilities on
+            disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
     """
+
+    _DTYPE_MAP = {
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16,
+        'fp32': torch.float32,
+    }
 
     def __init__(
         self,
@@ -216,10 +227,16 @@ class LogitsSaverHooks:
         *,
         compress_zstd: bool = False,
         flush_interval: int = 1,
+        save_dtype: str = 'fp16',
     ):
         assert k > 0, "Number of top log-probabilities to save must be positive"
         assert save_dir is not None, "Save directory must be provided"
         assert flush_interval >= 1, "flush_interval must be >= 1"
+        if save_dtype not in self._DTYPE_MAP:
+            raise ValueError(
+                f"save_dtype must be one of {list(self._DTYPE_MAP)}, got '{save_dtype}'"
+            )
+        self._save_dtype = self._DTYPE_MAP[save_dtype]
 
         self.k = k
         self.save_dir = save_dir
@@ -377,7 +394,6 @@ class LogitsSaverHooks:
         local_k = min(effective_k, local_vocab_size)
 
         # Convert to fp32 to lessen precision issues
-        dtype = logits.dtype
         logits = logits.float()
 
         local_logit_vals, local_indices = torch.topk(logits, local_k, dim=-1)
@@ -409,7 +425,7 @@ class LogitsSaverHooks:
         else:
             global_values, global_indices = local_logprob_vals, local_indices
 
-        global_values = global_values.to(dtype)
+        global_values = global_values.to(self._save_dtype)
         indices_low, high_bit = _pack_indices(global_indices)
 
         return global_values, indices_low, high_bit
@@ -425,8 +441,8 @@ class LogitsSaverHooks:
         """Gather local top-K candidates to rank 0 and compute global top-K.
 
         The ranking is performed on fp32 *logit* values for numerical
-        precision, while the returned values are the corresponding bf16
-        *log-probabilities* gathered at the winning positions.
+        precision; the returned log-prob values are still fp32 here and
+        are only cast to the on-disk ``save_dtype`` by the caller.
 
         Only TP rank 0 receives the gathered data and performs the final
         top-K selection.  Other ranks return ``None`` after participating
@@ -434,8 +450,8 @@ class LogitsSaverHooks:
 
         Args:
             local_logit_vals: Local top-K fp32 logit values (seq, batch, local_k)
-            local_logprob_vals: Local top-K log-prob values at the same
-                positions, in the model's native dtype (seq, batch, local_k)
+            local_logprob_vals: Local top-K fp32 log-prob values at the
+                same positions (seq, batch, local_k)
             local_indices: Local top-K indices in [0, local_vocab_size)
             k: Target number of top elements
             local_vocab_size: Size of the local vocab shard (vocab_size / tp_size)
@@ -489,7 +505,8 @@ class LogitsSaverHooks:
         """Write all microbatch data to disk in a single I/O call.
 
         File format: serialized dict with:
-        - values: list of bfloat16 tensors of log-probabilities (one per microbatch)
+        - values: list of tensors of log-probabilities (one per microbatch)
+          in ``self._save_dtype`` (default ``torch.float16``)
         - indices_low: list of uint16 tensors (lower 16 bits of vocab indices)
         - bit_17: list of bool tensors (17th bit, same shape as indices_low)
 
@@ -673,7 +690,7 @@ def _read_from_batched_tar(
             m = _BATCHED_TAR_RE.match(basename)
             if not m:
                 continue
-            if int(m.group(1)) < iteration:
+            if int(m.group("iter")) < iteration:
                 continue
             try:
                 with tarfile.open(tar_path, "r") as tar:

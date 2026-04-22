@@ -143,6 +143,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
                 num_workers=args.logits_load_num_workers,
                 prefetch_factor=args.logits_load_prefetch_factor,
                 kd_loss_alpha=args.logits_load_kd_loss_alpha,
+                ignore_errors=args.logits_load_ignore_errors,
             )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     else:

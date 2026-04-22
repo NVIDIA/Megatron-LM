@@ -2366,6 +2366,9 @@ def _add_logging_args(parser):
                             'flushing as a single tar archive. 1 (default) '
                             'preserves the legacy one-file-per-iteration behaviour. '
                             'Higher values reduce inode usage.')
+    group.add_argument('--logits-save-dtype', type=str, default='fp16',
+                       choices=['fp16', 'bf16', 'fp32'],
+                       help='Dtype for on-disk top-K log-probabilities.')
     group.add_argument('--logits-load-dir', type=str, default=None,
                        help='Directory to load logits.')
     group.add_argument('--logits-load-num-workers', type=int, default=4,
@@ -2374,6 +2377,11 @@ def _add_logging_args(parser):
                        help='Prefetch factor for loading logits.')
     group.add_argument('--logits-load-kd-loss-alpha', type=float, default=0.65,
                        help='KD loss alpha for loading logits.')
+    group.add_argument('--logits-load-ignore-errors', action='store_true',
+                       default=False,
+                       help='When set, KD loss errors are logged as warnings '
+                            'and training falls back to LM-only loss instead '
+                            'of crashing.')
     return parser
 
 

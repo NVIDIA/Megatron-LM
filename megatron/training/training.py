@@ -1972,7 +1972,8 @@ def setup_model_and_optimizer(
             k=args.logits_save_top_k,
             save_dir=args.logits_save_dir,
             compress_zstd=args.logits_save_compress,
-            flush_interval=getattr(args, 'logits_save_flush_interval', 1),
+            flush_interval=args.logits_save_flush_interval,
+            save_dtype=args.logits_save_dtype,
         )
         logits_saver.attach_hooks(unwrapped_model[0].output_layer)
 
