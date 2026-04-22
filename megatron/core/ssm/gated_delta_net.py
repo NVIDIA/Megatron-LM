@@ -233,6 +233,15 @@ class GatedDeltaNet(MegatronModule):
             tp_group=self.pg_collection.tp,
         )
 
+        # Cache for CP context objects built by FLA. Rebuilding these per-forward
+        # is unsafe under CUDA graph capture because build_cp_context allocates
+        # fresh tensors whose memory pointers are baked into the captured graph;
+        # on the next call those tensors are reallocated, leaving the replayed
+        # graph pointing at stale memory. For non-packed (SBHD) input the
+        # cu_seqlens is fully determined by the (static) global sequence length,
+        # so we cache the (cu_seqlens, cp_context) pair keyed on seq_len_global.
+        self._fla_cp_context_cache = {}
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -289,11 +298,15 @@ class GatedDeltaNet(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         cp_group_fla = self.pg_collection.cp
-        cp_group_a2a = torch.distributed.new_group(
-            ranks=[torch.distributed.get_rank()]
-        )  # TODO(yuzhongw): add a flag to choose A2A or FLA CP.
+        # TODO(yuzhongw): add a flag to choose A2A or FLA CP.
+        # The A2A path is currently unused; it would need its own single-rank
+        # process group. Creating `torch.distributed.new_group` on every forward
+        # is both wasteful and unsafe under CUDA graph capture (the call touches
+        # collective state that cannot be recorded). Pass None to the A2A
+        # helpers, which already treat a None group as size 1.
+        cp_group_a2a = None
         cp_size_fla = cp_group_fla.size()
-        cp_size_a2a = cp_group_a2a.size()  # TODO(yuzhongw): add a flag to choose A2A or FLA CP.
+        cp_size_a2a = 1
 
         seq_len_local, batch, _ = hidden_states.shape
         seq_len_post_a2a = seq_len_local * self.sp_size * cp_size_a2a
@@ -343,12 +356,29 @@ class GatedDeltaNet(MegatronModule):
 
         if cp_size_fla > 1:
             if cu_seqlens_q is None:
-                cu_seqlens_q = torch.tensor(
-                    [0, seq_len_global], device=torch.cuda.current_device(), dtype=torch.long
+                # Non-packed input: the only source of cu_seqlens is the static
+                # global sequence length. Cache both the cu_seqlens tensor and
+                # the resulting FLA CP context so we don't reallocate them on
+                # every forward — those reallocations break CUDA graph capture.
+                cached = self._fla_cp_context_cache.get(seq_len_global)
+                if cached is None:
+                    cached_cu_seqlens = torch.tensor(
+                        [0, seq_len_global], device=torch.cuda.current_device(), dtype=torch.long
+                    )
+                    cached_ctx = build_cp_context(
+                        cu_seqlens=cached_cu_seqlens,
+                        group=cp_group_fla,
+                        conv1d_kernel_size=self.conv_kernel_dim,
+                    )
+                    cached = (cached_cu_seqlens, cached_ctx)
+                    self._fla_cp_context_cache[seq_len_global] = cached
+                cu_seqlens_q, fla_cp_context = cached
+            else:
+                fla_cp_context = build_cp_context(
+                    cu_seqlens=cu_seqlens_q,
+                    group=cp_group_fla,
+                    conv1d_kernel_size=self.conv_kernel_dim,
                 )
-            fla_cp_context = build_cp_context(
-                cu_seqlens=cu_seqlens_q, group=cp_group_fla, conv1d_kernel_size=self.conv_kernel_dim
-            )
         else:
             fla_cp_context = None
 
