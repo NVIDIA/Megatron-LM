@@ -12,9 +12,11 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
     get_layer_maps_from_layer_type_list,
+    parse_fusion_groups,
     parse_hybrid_pattern,
     pattern_from_ratios,
     select_pipeline_segment,
+    strip_brackets,
     validate_segment_layers,
 )
 
@@ -688,3 +690,128 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mamba_map == {0: 0, 1: 1, 2: 2}
         assert mlp_map == {}
         assert moe_map == {}
+
+
+@pytest.mark.internal
+class TestStripBrackets:
+
+    def test_no_brackets(self):
+        assert strip_brackets("M*M*") == "M*M*"
+
+    def test_with_brackets(self):
+        assert strip_brackets("[*-]M[*-]M") == "*-M*-M"
+
+    def test_with_brackets_and_pipes(self):
+        assert strip_brackets("[*-]M|[*-]M") == "*-M|*-M"
+
+    def test_empty(self):
+        assert strip_brackets("") == ""
+
+    def test_all_fused(self):
+        assert strip_brackets("[*-*-]") == "*-*-"
+
+
+@pytest.mark.internal
+class TestParseFusionGroups:
+
+    def test_no_brackets(self):
+        assert parse_fusion_groups("M*M*") == []
+
+    def test_single_group(self):
+        assert parse_fusion_groups("[*-]MM") == [(0, 1)]
+
+    def test_two_groups(self):
+        assert parse_fusion_groups("[*-]M[*-]M") == [(0, 1), (3, 4)]
+
+    def test_group_at_end(self):
+        assert parse_fusion_groups("MM[*-]") == [(2, 3)]
+
+    def test_three_layer_group(self):
+        assert parse_fusion_groups("[M*-]M") == [(0, 2)]
+
+    def test_all_fused(self):
+        assert parse_fusion_groups("[*-*-]") == [(0, 3)]
+
+    def test_adjacent_groups(self):
+        assert parse_fusion_groups("[*-][ME]") == [(0, 1), (2, 3)]
+
+
+@pytest.mark.internal
+class TestBracketValidation:
+    """Tests for bracket validation in _validate_pattern (via parse_hybrid_pattern
+    and validate_segment_layers).
+    """
+
+    def test_valid_brackets_in_main_pattern(self):
+        """Brackets in main pattern are accepted."""
+        result = parse_hybrid_pattern("[*-]M[*-]M")
+        assert result.main_pattern == "[*-]M[*-]M"
+
+    def test_valid_brackets_with_pipes(self):
+        """Brackets within pipe segments are accepted."""
+        result = parse_hybrid_pattern("[*-]M|[*-]M")
+        assert result.main_pattern == "[*-]M|[*-]M"
+
+    def test_valid_brackets_in_segment(self):
+        """validate_segment_layers strips brackets."""
+        result = validate_segment_layers("[*-]M*")
+        assert result == ['*', '-', 'M', '*']
+
+    def test_unmatched_open_bracket(self):
+        with pytest.raises(ValueError, match="unmatched '\\['"):
+            parse_hybrid_pattern("[*-M*")
+
+    def test_unmatched_close_bracket(self):
+        with pytest.raises(ValueError, match="unmatched '\\]'"):
+            parse_hybrid_pattern("*-]M*")
+
+    def test_nested_brackets(self):
+        with pytest.raises(ValueError, match="nested '\\['"):
+            parse_hybrid_pattern("[[*-]]M")
+
+    def test_empty_brackets(self):
+        with pytest.raises(ValueError, match="empty fusion group"):
+            parse_hybrid_pattern("[]M*")
+
+    def test_single_layer_bracket(self):
+        with pytest.raises(ValueError, match="only 1 layer"):
+            parse_hybrid_pattern("[*]M*")
+
+    def test_brackets_crossing_pipe(self):
+        with pytest.raises(ValueError, match="pipe '\\|'.*inside"):
+            parse_hybrid_pattern("[*|M]")
+
+    def test_layer_count_with_brackets(self):
+        """get_hybrid_total_layer_count counts each fusion group as 1 physical layer."""
+        # "[*-]M[*-]M" -> 2 fused blocks + 2 mamba = 4 physical layers
+        assert get_hybrid_total_layer_count("[*-]M[*-]M") == 4
+        assert get_hybrid_total_layer_count("[*-]M|[*-]M") == 4
+        # 3-layer fusion still counts as 1 block
+        assert get_hybrid_total_layer_count("[M*-]M") == 2
+        # No-bracket pattern is unchanged
+        assert get_hybrid_total_layer_count("M*M*") == 4
+
+    def test_layer_counts_with_brackets(self):
+        """get_hybrid_layer_counts correctly ignores brackets."""
+        counts = get_hybrid_layer_counts("[*-]M[*-]M")
+        assert counts['*'] == 2
+        assert counts['-'] == 2
+        assert counts['M'] == 2
+
+    def test_brackets_in_mtp_pattern(self):
+        """Brackets in MTP patterns are accepted."""
+        result = parse_hybrid_pattern("M*M*/[*-]/[*-]")
+        assert result.mtp_pattern == "[*-]"
+        assert result.mtp_num_depths == 2
+
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
+    def test_offset_with_brackets_in_segment(self, mock_log):
+        """select_pipeline_segment counts each fusion group as 1 layer for offset."""
+        # Segment 0: "[*-]M" -> 1 fused block + 1 mamba = 2 physical layers
+        # Segment 1 should therefore start at offset 2 (not 3).
+        _, offset = select_pipeline_segment("[*-]M|M*", pp_group=None, vp_stage=1)
+        assert offset == 2
+
+        # Segment 0: "[*-][ME]" -> 2 fused blocks
+        _, offset = select_pipeline_segment("[*-][ME]|M", pp_group=None, vp_stage=1)
+        assert offset == 2

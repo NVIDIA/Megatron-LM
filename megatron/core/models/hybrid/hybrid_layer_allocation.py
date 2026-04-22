@@ -22,6 +22,8 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
+    FUSION_START = "["
+    FUSION_END = "]"
     VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
 
     @classmethod
@@ -137,8 +139,8 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
         Total number of layers in the main decoder pattern.
     """
     main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0]
-    _validate_pattern(main_pattern, "main", allow_pipe=True)
-    return len(main_pattern.replace(Symbols.PIPE, ''))
+    _validate_pattern(main_pattern, "main", allow_pipe=True, allow_brackets=True)
+    return count_pattern_layers(main_pattern)
 
 
 def get_hybrid_total_pipeline_segment_count(pattern: str) -> int:
@@ -204,6 +206,11 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     depth. The main pattern may contain "|" pipe symbols for pipeline stage
     boundaries.
 
+    A matching pair of "[" and "]" square brackets indicates that a fusion optimization should be
+    applied. Currently, this only works for an Attention/sequence mixer variant followed by an MLP
+    variant, e.g., "*-" for Attention+MLP or "ME" for Mamba+MoE. The contents in the pairs may not
+    cross pipeline boundaries.
+
     Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
 
     Args:
@@ -228,6 +235,9 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
 
         >>> parse_hybrid_pattern("M-M-|M-M*-/MM/MM")
         ParsedHybridPattern(main_pattern="M-M-|M-M*-", mtp_pattern="MM", mtp_num_depths=2)
+
+        >>> parse_hybrid_pattern("[M-][M-]|[M-]M[*-]/MM/MM")
+        ParsedHybridPattern(main_pattern="[M-][M-]|[M-]M[*-]", mtp_pattern="MM", mtp_num_depths=2)
     """
     if pattern is None:
         return ParsedHybridPattern(main_pattern=None, mtp_pattern=None, mtp_num_depths=0)
@@ -237,13 +247,13 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     if len(parts) == 1:
         # No MTP separator found - pattern is main decoder only
         main_pattern = parts[0]
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, "main", allow_pipe=True, allow_brackets=True)
         return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
 
     # First part is main decoder pattern
     main_pattern = parts[0]
     if main_pattern:
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, "main", allow_pipe=True, allow_brackets=True)
 
     # Remaining parts are MTP patterns (one per depth)
     mtp_parts = parts[1:]
@@ -264,7 +274,7 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
                 f"Full pattern: '{pattern}'"
             )
 
-    _validate_pattern(mtp_pattern, "MTP", allow_pipe=False)
+    _validate_pattern(mtp_pattern, "MTP", allow_pipe=False, allow_brackets=True)
 
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,
@@ -273,18 +283,27 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     )
 
 
-def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False) -> None:
+def _validate_pattern(
+    pattern: str, pattern_name: str, allow_pipe: bool = False, allow_brackets: bool = False
+) -> None:
     """Validate that a pattern contains only valid layer symbols.
 
     Args:
         pattern: Layer pattern string to validate
         pattern_name: Name of pattern for error messages (e.g., "main" or "MTP")
         allow_pipe: Whether to allow the pipe '|' separator (for main patterns)
+        allow_brackets: Whether to allow fusion bracket markers '[' and ']'
 
     Raises:
-        ValueError: If pattern contains invalid symbols
+        ValueError: If pattern contains invalid symbols or brackets are malformed
     """
-    valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
+    valid_chars = Symbols.VALID_LAYERS.copy()
+    if allow_pipe:
+        valid_chars.add(Symbols.PIPE)
+    if allow_brackets:
+        valid_chars.add(Symbols.FUSION_START)
+        valid_chars.add(Symbols.FUSION_END)
+
     for char in pattern:
         if char not in valid_chars:
             raise ValueError(
@@ -292,39 +311,207 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
+    if allow_brackets:
+        _validate_brackets(pattern, pattern_name)
+
     # Disallow Attention + MLA/DSA hybridity.
     if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+
+
+def _validate_brackets(pattern: str, pattern_name: str) -> None:
+    """Validate that fusion brackets in `pattern` are well-formed.
+
+    Rules:
+        - Brackets must be balanced: every '[' must have a matching ']'.
+        - No nesting: '[' inside an open bracket group is invalid.
+        - No empty groups: '[]' with no layer symbols inside is invalid.
+        - A bracket group must contain at least 2 layer symbols (fusion of one
+          layer is meaningless).
+        - Bracket groups may not span across pipe ('|') boundaries (this is
+          enforced regardless of whether '|' is otherwise valid in the pattern,
+          since '|' inside a group is always disallowed).
+
+    Args:
+        pattern: The pattern string (already validated for character legality).
+        pattern_name: Human-readable name for error messages.
+
+    Raises:
+        ValueError: On any bracket violation.
+    """
+    depth = 0
+    group_layer_count = 0
+
+    for i, char in enumerate(pattern):
+        if char == Symbols.FUSION_START:
+            if depth > 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, nested '[' at position {i} is not allowed. "
+                    f"Pattern: '{pattern}'"
+                )
+            depth += 1
+            group_layer_count = 0
+        elif char == Symbols.FUSION_END:
+            if depth <= 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, unmatched ']' at position {i}. "
+                    f"Pattern: '{pattern}'"
+                )
+            if group_layer_count == 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, empty fusion group '[]' at position {i}. "
+                    f"Pattern: '{pattern}'"
+                )
+            if group_layer_count < 2:
+                raise ValueError(
+                    f"In {pattern_name} pattern, fusion group ending at position {i} "
+                    f"contains only {group_layer_count} layer – need at least 2. "
+                    f"Pattern: '{pattern}'"
+                )
+            depth -= 1
+        elif char == Symbols.PIPE:
+            if depth > 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, pipe '|' at position {i} appears inside "
+                    f"a fusion group '[…|…]'. Fusion groups may not cross pipeline "
+                    f"boundaries. Pattern: '{pattern}'"
+                )
+        else:
+            # Must be a valid layer symbol.
+            if depth > 0:
+                group_layer_count += 1
+
+    if depth > 0:
+        raise ValueError(
+            f"In {pattern_name} pattern, unmatched '[' with no closing ']'. "
+            f"Pattern: '{pattern}'"
+        )
+    # This should never happen with the above logic.
+    if depth < 0:
+        raise ValueError(
+            f"In {pattern_name} pattern, found more ']' than '[' brackets. Pattern: '{pattern}'"
+        )
+
+
+def strip_brackets(pattern: str) -> str:
+    """Remove fusion bracket markers from a pattern string.
+
+    Returns the pattern with all '[' and ']' characters removed, leaving only
+    layer symbols and (if present) pipe separators.
+
+    Args:
+        pattern: A pattern string that may contain fusion brackets.
+
+    Returns:
+        The pattern with brackets stripped.
+
+    Examples:
+        >>> strip_brackets("[*-]M[*-]M")
+        '*-M*-M'
+        >>> strip_brackets("M*M*")
+        'M*M*'
+    """
+    return pattern.replace(Symbols.FUSION_START, '').replace(Symbols.FUSION_END, '')
+
+
+def count_pattern_layers(pattern: str) -> int:
+    """Count the number of physical layer blocks in a pattern.
+
+    Each fusion group `[...]` counts as a single layer (because its sub-layers
+    are fused into one transformer block at runtime), regardless of how many
+    sub-layer symbols it contains. Pipe separators are ignored.
+
+    Args:
+        pattern: A pattern string that may contain fusion brackets and/or
+            pipe separators. Assumed to have already passed bracket
+            validation.
+
+    Returns:
+        Number of physical layer blocks the pattern represents.
+
+    Examples:
+        >>> count_pattern_layers("M*M*")
+        4
+        >>> count_pattern_layers("[*-]M[*-]M")  # 2 fused + 2 mamba
+        4
+        >>> count_pattern_layers("[*-]M|[*-]M")
+        4
+    """
+    count = 0
+    in_group = False
+    for char in pattern:
+        if char == Symbols.FUSION_START:
+            in_group = True
+            count += 1  # whole group counts as one block
+        elif char == Symbols.FUSION_END:
+            in_group = False
+        elif char == Symbols.PIPE:
+            continue
+        elif not in_group and char in Symbols.VALID_LAYERS:
+            count += 1
+    return count
+
+
+def parse_fusion_groups(pattern: str) -> List[Tuple[int, int]]:
+    """Extract fusion groups from a bracket-annotated pattern string.
+
+    Each `[...]` group maps to a `(start, end)` tuple of layer indices
+    (inclusive) in the *bracket-stripped* pattern.
+
+    Args:
+        pattern: A single segment pattern (no pipe separators) that may
+            contain fusion brackets.
+
+    Returns:
+        List of `(start_layer_index, end_layer_index)` tuples (inclusive).
+        Empty list when the pattern has no brackets.
+
+    Examples:
+        >>> parse_fusion_groups("[*-]M[*-]M")
+        [(0, 1), (3, 4)]
+        >>> parse_fusion_groups("M*M*")
+        []
+    """
+    _validate_brackets(pattern, "fusion")
+
+    groups: List[Tuple[int, int]] = []
+    layer_index = 0
+    group_start: Optional[int] = None
+
+    for char in pattern:
+        if char == Symbols.FUSION_START:
+            group_start = layer_index
+        elif char == Symbols.FUSION_END:
+            assert group_start is not None
+            # end is inclusive – the last layer index in the group
+            groups.append((group_start, layer_index - 1))
+            group_start = None
+        elif char in Symbols.VALID_LAYERS:
+            layer_index += 1
+
+    return groups
 
 
 def validate_segment_layers(segment: str) -> List[str]:
     """Validate and convert a single pipeline segment pattern to a layer type list.
 
     This is used after the main pattern has been split by '|' into segments.
-    Each segment should contain only valid layer symbols (no '|').
+    Each segment should contain only valid layer symbols (no '|'). Fusion
+    bracket markers ('[', ']') are permitted but stripped from the returned
+    layer type list.
 
     Args:
-        segment: A single pipeline segment pattern string (e.g., "M-M*-")
+        segment: A single pipeline segment pattern string (e.g., "[*-]M[*-]M")
 
     Returns:
-        List of layer type characters.
+        List of layer type characters (brackets stripped).
 
     Raises:
-        ValueError: If segment contains invalid layer symbols.
+        ValueError: If segment contains invalid layer symbols or malformed brackets.
     """
-    layer_type_list = list(segment)
-    for layer_char in layer_type_list:
-        if layer_char not in Symbols.VALID_LAYERS:
-            raise ValueError(
-                f"In hybrid layer pattern segment, '{layer_char}' is not "
-                f"one of {Symbols.VALID_LAYERS}"
-            )
-
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
-
-    return layer_type_list
+    _validate_pattern(segment, "segment", allow_pipe=False, allow_brackets=True)
+    stripped = strip_brackets(segment)
+    return list(stripped)
 
 
 def select_pipeline_segment(
@@ -467,7 +654,7 @@ def select_pipeline_segment(
             f"the current PP/VPP configuration."
         )
 
-    layer_offset = sum(len(segments[i]) for i in range(segment_index))
+    layer_offset = sum(count_pattern_layers(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
     layer_type_list = validate_segment_layers(my_segment)
