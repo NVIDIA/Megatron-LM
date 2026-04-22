@@ -689,30 +689,35 @@ def run_mimo_1f1b_test(
 
     optimizer.zero_grad()
 
-    losses = schedule.forward_backward_pipelining_without_interleaving(
-        forward_step_func=step_func,
-        data_iterator=data_iterator,
-        model=[mimo_model],
-        num_microbatches=num_microbatches,
-        seq_length=seq_length,
-        micro_batch_size=micro_batch_size,
-        forward_only=False,
-        p2p_communicator=communicator,
-        pg_collection=pg_collection,
-    )
+    try:
+        losses = schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=step_func,
+            data_iterator=data_iterator,
+            model=[mimo_model],
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            forward_only=False,
+            p2p_communicator=communicator,
+            pg_collection=pg_collection,
+        )
 
-    # Optimizer step with global gradient clipping
-    success, grad_norm, num_zeros = optimizer.step()
-    assert success, "Optimizer step failed"
-    assert grad_norm is not None and grad_norm > 0, f"Expected positive grad norm, got {grad_norm}"
+        # Optimizer step with global gradient clipping
+        success, grad_norm, num_zeros = optimizer.step()
+        assert success, "Optimizer step failed"
+        assert grad_norm is not None and grad_norm > 0, (
+            f"Expected positive grad norm, got {grad_norm}"
+        )
 
-    # Verify results on last LLM stage
-    if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
-        assert len(losses) > 0, "Expected losses on last LLM stage"
-        for loss_dict in losses:
-            assert 'loss_reduced' in loss_dict
+        # Verify results on last LLM stage
+        if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
+            assert len(losses) > 0, "Expected losses on last LLM stage"
+            for loss_dict in losses:
+                assert 'loss_reduced' in loss_dict
 
-    return losses
+        return losses
+    finally:
+        mimo_model.destroy()
 
 
 # ============================================================================

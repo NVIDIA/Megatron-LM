@@ -202,7 +202,7 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
                     stack.enter_context(submodule.no_sync())
             yield
 
-    def finalize_grads_func(model_list, num_tokens, **kwargs):
+    def finalize_grads_func(model_list, num_tokens, force_all_reduce=False, **kwargs):
         # Schedule passes the per-rank sum-across-microbatches of what the
         # loss_func returned. Because loss_func runs only on the LLM side,
         # this is the LLM-local token count.
@@ -219,13 +219,23 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
         n_global = num_tokens.item()
 
         # Phase 2: per-side DDP finish without built-in num_tokens scaling.
+        # Forward ``force_all_reduce`` so PP grad-sync semantics (if ever
+        # exercised here) aren't silently dropped.
         if mimo_model.language_model is not None:
             finalize_model_grads(
-                [mimo_model.language_model], num_tokens=None, pg_collection=language_pg
+                [mimo_model.language_model],
+                num_tokens=None,
+                pg_collection=language_pg,
+                force_all_reduce=force_all_reduce,
             )
         for submodule in mimo_model.modality_submodules.values():
             if submodule is not None:
-                finalize_model_grads([submodule], num_tokens=None, pg_collection=vision_pg)
+                finalize_model_grads(
+                    [submodule],
+                    num_tokens=None,
+                    pg_collection=vision_pg,
+                    force_all_reduce=force_all_reduce,
+                )
 
         # Phase 3: uniform divide by N_global. Guard div-by-zero for the
         # degenerate fully-masked batch.
@@ -957,8 +967,16 @@ class TestColocatedGradientScalingCorrectness:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    def setup_method(self):
+        # Track MimoModels built by the test so teardown can release any
+        # ColocatedBridgeCommunicator subgroups before destroy_all_grids.
+        self._mimo_models = []
+
     def teardown_method(self):
         torch.use_deterministic_algorithms(False)
+        for model in self._mimo_models:
+            model.destroy()
+        self._mimo_models.clear()
         destroy_all_grids()
 
     @pytest.mark.skipif(
@@ -1058,6 +1076,7 @@ class TestColocatedGradientScalingCorrectness:
             per_token_loss=True,
         )
         dist_mimo.model_type = ModelType.encoder_or_decoder
+        self._mimo_models.append(dist_mimo)
 
         # Reference with equal-DP uniform (enc_tp == llm_tp, enc_dp == llm_dp).
         torch.manual_seed(12345)
@@ -1076,6 +1095,7 @@ class TestColocatedGradientScalingCorrectness:
             per_token_loss=True,
         )
         ref_mimo.model_type = ModelType.encoder_or_decoder
+        self._mimo_models.append(ref_mimo)
 
         # Force identical initial state: encoder shards already match
         # (same TP layout), so the helper copies shard-to-shard. LLM
