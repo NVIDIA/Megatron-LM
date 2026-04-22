@@ -166,16 +166,21 @@ def reset_persistent_async_worker(async_strategy):
     module.clear_metadata_cache()
 
 
-def get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> NVRxAsyncRequest:
+def get_save_and_finalize_callbacks(
+    writer, save_state_dict_ret, async_strategy: str = "nvrx"
+) -> AsyncRequest | NVRxAsyncRequest:
     """Creates an async save request for fsdp_dtensor & torch_dcp with a finalize function."""
     save_fn, preload_fn, save_args = writer.get_save_function_and_args()
+    _, async_modules = get_async_strategy(async_strategy)
+    async_request_cls = async_modules["AsyncRequest"]
+    save_state_dict_async_finalize = async_modules["save_state_dict_async_finalize"]
 
     def finalize_fn():
         """Finalizes async checkpointing and synchronizes processes."""
         save_state_dict_async_finalize(*save_state_dict_ret)
 
     return make_nvrx_async_request(
-        NVRxAsyncRequest,
+        async_request_cls,
         save_fn,
         save_args,
         [finalize_fn],

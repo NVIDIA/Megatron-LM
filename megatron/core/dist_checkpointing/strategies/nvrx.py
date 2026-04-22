@@ -9,6 +9,9 @@ def has_nvrx_async_support() -> bool:
     """Checks whether the NVRx async checkpointing symbols Megatron uses are importable."""
     try:
         core = import_module("nvidia_resiliency_ext.checkpointing.async_ckpt.core")
+        cached_metadata_reader = import_module(
+            "nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader"
+        )
         filesystem_async = import_module(
             "nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async"
         )
@@ -21,6 +24,7 @@ def has_nvrx_async_support() -> bool:
     required_symbols = (
         getattr(core, "AsyncCallsQueue", None),
         getattr(core, "AsyncRequest", None),
+        getattr(cached_metadata_reader, "CachedMetadataFileSystemReader", None),
         getattr(filesystem_async, "FileSystemWriterAsync", None),
         getattr(filesystem_async, "_results_queue", None),
         getattr(filesystem_async, "get_write_results_queue", None),

@@ -1046,14 +1046,9 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
     if async_strategy == "nvrx":
         try:
             # nvrx async imports
-            try:
-                from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
-                    CachedMetadataFileSystemReader,
-                )
-            except (ImportError, ModuleNotFoundError):
-                from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
-                    CachedMetadataFileSystemReader,
-                )
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
+                CachedMetadataFileSystemReader,
+            )
             from nvidia_resiliency_ext.checkpointing.async_ckpt.core import (
                 AsyncCallsQueue,
                 AsyncRequest,
