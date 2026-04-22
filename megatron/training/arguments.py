@@ -36,6 +36,7 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training.argument_utils import ArgumentGroupFactory
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
