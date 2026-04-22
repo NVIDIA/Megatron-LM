@@ -147,21 +147,6 @@ def _build_transform(input_size, vision_model_type):
             T.ToTensor(),
             T.Normalize(mean=pixel_mean, std=pixel_std),
         ])
-    elif vision_model_type.startswith("hf://"):
-        from megatron.core.models.huggingface.module import get_hf_model_type
-
-        model_type = get_hf_model_type(vision_model_type)
-        if "siglip" in model_type:
-            from transformers.models.siglip.image_processing_siglip import SiglipImageProcessor
-
-            processor = SiglipImageProcessor(size={"height": input_size, "width": input_size})
-
-            def transform(x):
-                x = x.convert("RGB") if x.mode != "RGB" else x
-                x = processor(x, return_tensors="pt")
-                return x["pixel_values"][0]
-        else:
-            raise NotImplementedError(f"image processing not defined for huggingface model {vision_model_type}")
     else:
         raise NotImplementedError(f"image processing not defined for vision model {vision_model_type}")
 
