@@ -132,6 +132,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     else:
         args = parser.parse_args()
 
+    args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
+
     # Experimental yaml
     if args.yaml_cfg is not None:
         from .yaml_arguments import load_yaml
@@ -593,11 +595,16 @@ def validate_args(args, defaults={}):
         args.phase_transition_iterations = sorted(
             int(x.strip()) for x in args.phase_transition_iterations.split(",")
         )
-        assert args.rampup_batch_size is None, "multi-phase training does not support batch size ramp-up"
-
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
+    is_global_batch_size_explicitly_specified = getattr(
+        args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
+    )
+    if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
+        raise ValueError(
+            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
+        )
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
@@ -617,7 +624,6 @@ def validate_args(args, defaults={}):
             args.grpo_samples_per_iteration * args.grpo_iterations)
 
         # Ensure that the number of prompts we collect is a multiple of the global batch size.
-        # TODO: Make this account for batch size rampup?
         assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
             f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
 
@@ -799,6 +805,11 @@ def validate_args(args, defaults={}):
                 "This argument will be ignored.",
                 args.rank
             )
+
+    # Infer use of MLA from unified pattern
+    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+        args.multi_latent_attention = True
+
     # === End of hybrid layer pattern: deprecation handling and validation ===
 
     # Uneven virtual pipeline parallelism
@@ -1111,8 +1122,6 @@ def validate_args(args, defaults={}):
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
-        assert args.rampup_batch_size is None, \
-            'expected no batch-size rampup for iteration-based training'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_iters == 0, \
                 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
@@ -1189,6 +1198,8 @@ def validate_args(args, defaults={}):
         if args.save_retain_interval is not None:
             assert args.save_retain_interval > 0
             assert args.save_retain_interval % args.save_interval == 0
+        if args.save_params_interval is not None:
+            assert not args.overlap_param_gather
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
@@ -1763,6 +1774,9 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+            kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -2900,8 +2914,7 @@ def _add_data_args(parser):
                        'This argument is exclusive to the other independent --*-data-path arguments.')
     group.add_argument('--phase-transition-iterations', type=str, default=None,
                        help='Comma-separated list of iterations where phase '
-                       'transitions occur. Requires fixed global batch size across phases. '
-                       'Does not support batch size ramp-up.')
+                       'transitions occur. Requires fixed global batch size across phases.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -3286,9 +3299,10 @@ def _add_experimental_args(parser):
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-                       '* (attention), - (mlp), E (moe). Use | to define pipeline stage '
-                       'boundaries for flexible virtual pipeline parallel (fVPP). Use / to '
-                       'separate MTP patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+                       '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+                       'stage boundaries for flexible virtual pipeline parallel (fVPP). '
+                       'Use / to separate MTP patterns. '
+                       'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
