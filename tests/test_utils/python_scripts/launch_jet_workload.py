@@ -292,16 +292,16 @@ def telemetrics_and_exit(
         logger.info("No dashboard endpoint found, skipping telemetrics")
         return
 
-    res = requests.post(
-        DASHBOARD_ENDPOINT,
-        data=payload,
-        headers={"Content-Type": "application/json", "Accept-Charset": "UTF-8"},
-    )
-
-    if not res.ok:
-        raise requests.exceptions.HTTPError(
-            f"Failed to make POST request. Received response: {res.status_code}"
+    try:
+        res = requests.post(
+            DASHBOARD_ENDPOINT,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept-Charset": "UTF-8"},
         )
+        if not res.ok:
+            logger.warning(f"Failed to make POST request. Received response: {res.status_code}")
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to post telemetry: {e}")
     sys.exit(int(not success))
 
 
