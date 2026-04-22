@@ -2,12 +2,12 @@
 
 import io
 import pickle
-import pytest
-import torch
-
 from argparse import Namespace
 from collections import OrderedDict
 from pickle import UnpicklingError
+
+import pytest
+import torch
 
 from megatron.core.safe_globals import SafeUnpickler
 from megatron.core.utils import is_torch_min_version
