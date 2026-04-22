@@ -434,7 +434,6 @@ def test_packing_observability_metrics():
         original_trajs=None,
         packed_trajs=packed_trajs,
         packed_position_ids=None,
-        packed_attention_mask=None,
         packed_loss_mask=None,
     )
 
