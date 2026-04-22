@@ -20,7 +20,10 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
@@ -509,3 +512,38 @@ def inference_all_gather_last_dim(
             return torch.cat(tensor_list, dim=-1).contiguous()
 
     return gather_from_tensor_model_parallel_region(x, group=tp_group)
+
+
+def inference_reduce_scatter_first_dim(
+    x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
+) -> torch.Tensor:
+    """NVLS-optimized reduce-scatter along the first dimension, with NCCL fallback.
+
+    Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
+    where autograd is not needed and NVLS symmetric-memory is available.
+    """
+    tp_size = dist.get_world_size(tp_group)
+    if tp_size == 1:
+        return x
+
+    triton_nvls_kernels_allowed = not getattr(
+        config, 'inference_disable_triton_nvls_kernels', False
+    )
+
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
+
+        if (
+            x.dtype == torch.bfloat16
+            and are_tensors_nvls_eligible(x)
+            and symm_mem_buffer["handle"] is not None
+        ):
+            symm_mem_buffer["tensor"].copy_(x)
+            output_dims = list(x.size())
+            output_dims[0] = x.size(0) // tp_size
+            output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
+            multimem_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
+            return output
+
+    return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)
