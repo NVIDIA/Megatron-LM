@@ -280,7 +280,7 @@ try:
         return jsonify(
             {
                 "id": str(uuid.uuid4()),
-                "object": "text_completion", # as per the openAI spec
+                "object": "text_completion",  # as per the openAI spec
                 "created": int(time.time()),
                 "model": "EMPTY",
                 "choices": choices,
