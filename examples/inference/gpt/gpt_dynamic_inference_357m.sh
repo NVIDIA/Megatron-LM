@@ -5,6 +5,7 @@
 set -u
 
 # Libraries.
+pip install simpy
 pip install sentencepiece
 pip install tiktoken
 
