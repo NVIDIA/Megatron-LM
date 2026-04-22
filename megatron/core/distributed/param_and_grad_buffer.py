@@ -753,6 +753,134 @@ class _ParamAndGradBucketGroup:
                     self.start_grad_sync(force_all_reduce=force_all_reduce)
 
 
+def _compute_tail_shrink_close_set(
+    params_with_names: List[Tuple[torch.nn.Parameter, str]],
+    bucket_size: Optional[int],
+    scale_factor: float,
+    requires_own_bucket_fn,
+) -> Optional[set]:
+    """
+    Compute the set of iter-index positions (into ``params_with_names[::-1]``) at which a
+    bucket close should be forced, replacing the default ``bucket_size`` threshold, in order
+    to cap the final bucket at ``bucket_size * scale_factor`` elements.
+
+    The primary strategy is SPREAD: raise the close threshold uniformly so every non-last
+    bucket absorbs a share of the surplus and the layout stays roughly uniform. This avoids
+    inflating the penultimate bucket alone — important because an oversized penultimate RS
+    can extend past the remaining backward window and itself become exposed, negating the
+    savings.
+
+    When spread doesn't land cleanly against indivisible param boundaries (e.g. it would
+    overshoot and leave no tail, or drop the bucket count), the fallback moves params only
+    into the preceding bucket:
+      * EXTEND: default tail > target — shift the last close later so the preceding bucket
+        absorbs params from the tail.
+      * SPLIT: default has no tail (total is a multiple of ``bucket_size``) — shift the last
+        close earlier to carve off a small tail from the last full bucket.
+
+    Returns ``None`` (meaning: use the default threshold) when:
+      * the feature is disabled (``scale_factor >= 1.0`` or ``bucket_size is None``),
+      * any param requires its own bucket (shared embedding with distributed optimizer),
+      * no adjustment is feasible without making the exposed tail worse (e.g. the tail is a
+        single large indivisible param, or moving would inflate the preceding bucket past
+        ``2 * bucket_size``).
+    """
+    if bucket_size is None or scale_factor >= 1.0:
+        return None
+    if any(requires_own_bucket_fn(p) for p, _ in params_with_names):
+        return None
+
+    # The default close condition compares `param_end_index - bucket_start_index` against
+    # bucket_size using the full (unpacked) numel for all params — including NVFP4, which
+    # has a separate packed index space. So simulate here with full numel as well.
+    reversed_sizes = [param.data.nelement() for param, _ in params_with_names[::-1]]
+    total_numel = sum(reversed_sizes)
+
+    def _close_points_for_threshold(threshold):
+        """Walk reversed_sizes and return (close_indices, leftover) — the iter-idx
+        positions where a bucket would close at this threshold, and the size of the
+        final in-progress bucket that is never closed (the implicit tail)."""
+        close_indices = []
+        current_bucket_size = 0
+        for i, sz in enumerate(reversed_sizes):
+            current_bucket_size += sz
+            if current_bucket_size >= threshold:
+                close_indices.append(i)
+                current_bucket_size = 0
+        return close_indices, current_bucket_size
+
+    default_closes, default_tail = _close_points_for_threshold(bucket_size)
+    if not default_closes:
+        return None
+
+    target_last = int(bucket_size * scale_factor)
+    if 0 < default_tail <= target_last:
+        # Default layout already meets the target.
+        return None
+
+    num_buckets = len(default_closes) + (1 if default_tail > 0 else 0)
+    if num_buckets < 2:
+        return None
+
+    # Primary: SPREAD. Raise the close threshold uniformly so every non-last bucket
+    # absorbs an equal share of the surplus instead of piling it all into the penultimate.
+    spread_threshold = (total_numel - target_last) / (num_buckets - 1)
+    spread_closes, spread_tail = _close_points_for_threshold(spread_threshold)
+    spread_is_clean = (
+        0 < spread_tail <= target_last
+        and len(spread_closes) == num_buckets - 1
+        and spread_closes != default_closes
+    )
+    if spread_is_clean:
+        return set(spread_closes)
+
+    # Fallback: PENULTIMATE-ONLY. Move params in/out of the bucket adjacent to the tail,
+    # used when spread overshoots indivisible param boundaries and leaves no tail.
+    last_close_idx = default_closes[-1]
+    penultimate_start_idx = default_closes[-2] + 1 if len(default_closes) >= 2 else 0
+    penultimate_size = sum(reversed_sizes[penultimate_start_idx : last_close_idx + 1])
+    max_penultimate = 2 * bucket_size
+
+    shift = 0
+    absorbed = 0
+    if default_tail == 0:
+        # SPLIT: total is a multiple of bucket_size; carve a target-sized tail off the
+        # end of the last full bucket by moving the last close earlier.
+        for i in range(last_close_idx, penultimate_start_idx - 1, -1):
+            sz = reversed_sizes[i]
+            if absorbed + sz > target_last:
+                break
+            if penultimate_size - (absorbed + sz) <= 0:
+                # Never empty the preceding bucket.
+                break
+            absorbed += sz
+            shift -= 1
+    else:
+        # EXTEND: the natural tail is too big; absorb params from the tail into the
+        # preceding bucket by moving the last close later.
+        tail_start_idx = last_close_idx + 1
+        for i in range(tail_start_idx, len(reversed_sizes)):
+            sz = reversed_sizes[i]
+            new_penultimate_size = penultimate_size + absorbed + sz
+            new_tail_size = default_tail - (absorbed + sz)
+            if new_penultimate_size > max_penultimate:
+                break
+            if new_tail_size <= 0:
+                # Never eliminate the tail — moving would make the penultimate the new
+                # (larger) exposed bucket, strictly worse than leaving things alone.
+                break
+            absorbed += sz
+            shift += 1
+            if new_tail_size <= target_last:
+                break
+
+    if shift == 0:
+        return None
+
+    adjusted = default_closes[:-1] + [last_close_idx + shift]
+    return set(adjusted)
+
+
 class _ParamAndGradBuffer:
     """
     Groups parameters and gradients into a contiguous buffer, and then breaks the buffer into
@@ -965,7 +1093,20 @@ class _ParamAndGradBuffer:
         self.nvfp4_packed_bucket_indices = [] if self.has_nvfp4_params else None
         nvfp4_packed_per_bucket_numel_unpadded = [] if self.has_nvfp4_params else None
 
-        for param, _ in params_with_names[::-1]:
+        # If tail-shrinking is requested, precompute a set of iter-idx positions at which a
+        # bucket close should be forced. The close-set replaces the normal bucket_size
+        # threshold comparison, but only when it would actually reduce the exposed final
+        # bucket — otherwise we fall back to the default logic. See the helper below for the
+        # feasibility checks. When shared-embedding parameters force their own bucket, the
+        # final bucket is fixed and this feature is disabled.
+        close_after_iter_idx_set = _compute_tail_shrink_close_set(
+            params_with_names=params_with_names,
+            bucket_size=bucket_size,
+            scale_factor=self.ddp_config.bucket_size_last_bucket_scale_factor,
+            requires_own_bucket_fn=_does_param_require_new_bucket,
+        )
+
+        for iter_idx, (param, _) in enumerate(params_with_names[::-1]):
             # Iterate through parameters in reverse order to roughly follow backprop order.
 
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
@@ -1013,10 +1154,17 @@ class _ParamAndGradBuffer:
             bucket_params.add(param)
 
             # If we have enough elements already or the current param is part of the shared
-            # embedding layer and needs a separate bucket, form a new bucket.
-            if (
-                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
-            ) or _does_param_require_new_bucket(param):
+            # embedding layer and needs a separate bucket, form a new bucket. When
+            # tail-shrinking is active, defer to the precomputed close set instead of the
+            # raw bucket_size threshold.
+            if close_after_iter_idx_set is not None:
+                bucket_size_reached = iter_idx in close_after_iter_idx_set
+            else:
+                bucket_size_reached = (
+                    bucket_size is not None
+                    and (param_end_index - bucket_start_index) >= bucket_size
+                )
+            if bucket_size_reached or _does_param_require_new_bucket(param):
                 # Finalize the current bucket and update start indices for the next bucket.
                 bucket_start_index, nvfp4_packed_bucket_start_index = (
                     _finalize_bucket_all_index_spaces(
