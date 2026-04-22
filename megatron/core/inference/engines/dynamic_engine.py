@@ -1164,10 +1164,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
                         )
-                    if request.tpot is None:
-                        request.tpot = []
-                    per_token_step_time = step_time / len(tokens)
-                    request.tpot.extend([per_token_step_time] * len(tokens))
+                    # TPOT is observability-only. step_time is 0.0 on
+                    # non-logging steps (async_forward skips the event sync),
+                    # so gate the update to keep the metric a truthful sparse
+                    # sample instead of polluting it with zeros.
+                    if step_time > 0:
+                        if request.tpot is None:
+                            request.tpot = []
+                        per_token_step_time = step_time / len(tokens)
+                        request.tpot.extend([per_token_step_time] * len(tokens))
 
                 # Check for stop words (after token is appended).
                 # With speculative decoding, a stop word may end before the last
@@ -1649,56 +1654,74 @@ class DynamicInferenceEngine(AbstractEngine):
         # schedule requests
         self.schedule_waiting_requests()
 
-        # Saving pre-step state, for printing output below.
+        # The print block (async_bookkeep) and metrics block both fire on this
+        # condition after step_count is incremented. Predict it up-front so we
+        # can skip the GPU-timing sync and the context_state dict builds that
+        # only exist to feed those logging/metrics blocks.
+        will_log_this_step = (
+            self.logging_step_interval > 0
+            and (self.context.step_count + 1) % self.logging_step_interval == 0
+        )
+
         is_decode_only = self.context.is_decode_only()
-        pre_step_context_state = {
-            "is_decode_only": is_decode_only,
-            "max_requests": self.context.max_requests,
-            "total_request_count": self.context.total_request_count,
-            "paused_request_count": self.context.paused_request_count,
-            "active_token_count": self.context.active_token_count,
-            "step_count": self.context.step_count,
-        }
+        if will_log_this_step:
+            pre_step_context_state = {
+                "is_decode_only": is_decode_only,
+                "max_requests": self.context.max_requests,
+                "total_request_count": self.context.total_request_count,
+                "paused_request_count": self.context.paused_request_count,
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
+        else:
+            # active_token_count and step_count are still consumed by
+            # post_process_requests' pre_fwd_* args (for add_event_generated_token);
+            # the other four fields are only read in the gated print block.
+            pre_step_context_state = {
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
 
         # Generate tokens.
         nvtx_range_push("Prefill" if not is_decode_only else "Decode")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
-        self.step_start_event.record()
+        if will_log_this_step:
+            self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
-        self.step_end_event.record()
-        self.step_end_event.synchronize()
-        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        if will_log_this_step:
+            self.step_end_event.record()
+            self.step_end_event.synchronize()
+            step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        else:
+            step_time = 0.0
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
-        if (
-            self.logging_step_interval > 0
-            and self.context.step_count > 0
-            and self.context.step_count % self.logging_step_interval == 0
-            and self.metrics_writer is not None
-        ):
-            kvcache_util_stats = self.context.get_kvcache_utilization_stats()
+        if will_log_this_step:
+            kvcache_util_stats = (
+                self.context.get_kvcache_utilization_stats()
+                if self.metrics_writer is not None
+                else None
+            )
+            post_step_context_state = {
+                "waiting_request_count": len(self.waiting_request_ids),
+                "finished_request_count": self.finished_request_count,
+                "evicted_request_count": self.evicted_request_count,
+                "kv_stats": kvcache_util_stats,
+                "total_active_block_count": self.context.kv_block_allocator.active_count,
+                "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+                "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            }
+            context_state = {**pre_step_context_state, **post_step_context_state}
         else:
-            kvcache_util_stats = None
-
-        post_step_context_state = {
-            "waiting_request_count": len(self.waiting_request_ids),
-            "finished_request_count": self.finished_request_count,
-            "evicted_request_count": self.evicted_request_count,
-            "kv_stats": kvcache_util_stats,
-            "padded_active_token_count": self.context.padded_active_token_count,
-            "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
-            "total_active_block_count": self.context.kv_block_allocator.active_count,
-            "total_paused_block_count": self.context.kv_block_allocator.paused_count,
-            "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
-            "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
-        }
-
-        context_state = {**pre_step_context_state, **post_step_context_state}
+            # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
+            # (`if context_state["kv_stats"] is not None`) remains well-typed.
+            context_state = {**pre_step_context_state, "kv_stats": None}
 
         return result, context_state, step_time
 
