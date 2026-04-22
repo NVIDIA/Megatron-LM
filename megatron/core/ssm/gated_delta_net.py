@@ -27,7 +27,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel import all_to_all, get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -387,6 +387,24 @@ class GatedDeltaNet(MegatronModule):
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
+        # FLA CP expects the contiguous-time chunk layout (rank r holds chunks
+        # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule, while Megatron
+        # feeds us the zigzag attention-load-balanced layout (rank r holds
+        # [r, 2*cp-r-1]). Reshuffle chunks over the CP group with a single
+        # all-to-all — no full-sequence gather required.
+        if cp_size_fla > 1:
+            nvtx_range_push(suffix="zigzag_to_contiguous")
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                local_cu_seqlens = cu_seqlens_q // cp_size_fla
+                unpacked = _unpack_sequence(qkvzba, local_cu_seqlens, dim=0)
+                qkvzba = torch.cat(
+                    [zigzag_to_contiguous_chunks(u, cp_group_fla, seq_dim=0) for u in unpacked],
+                    dim=0,
+                )
+            else:
+                qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_fla, seq_dim=0)
+            nvtx_range_pop(suffix="zigzag_to_contiguous")
+
         # CP All to All: CP to HP
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size_a2a, dim=0)
@@ -535,6 +553,25 @@ class GatedDeltaNet(MegatronModule):
         # From bshd back to sbhd format
         norm_out = norm_out.reshape(batch, seq_len_post_a2a, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
+
+        # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
+        # Restores the Megatron attention-load-balanced layout that downstream
+        # layers and loss computation expect.
+        if cp_size_fla > 1:
+            nvtx_range_push(suffix="contiguous_to_zigzag")
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                local_cu_seqlens = cu_seqlens_q // cp_size_fla
+                unpacked = _unpack_sequence(norm_out, local_cu_seqlens, dim=0)
+                norm_out = torch.cat(
+                    [
+                        contiguous_to_zigzag_chunks(u, cp_group=cp_group_fla, seq_dim=0)
+                        for u in unpacked
+                    ],
+                    dim=0,
+                )
+            else:
+                norm_out = contiguous_to_zigzag_chunks(norm_out, cp_group=cp_group_fla, seq_dim=0)
+            nvtx_range_pop(suffix="contiguous_to_zigzag")
 
         # CP all to all: HP to CP
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -984,6 +1021,125 @@ def tensor_a2a_hp2cp(
         tensor = _all_to_all_hp2cp(tensor, cp_group)
 
     return tensor
+
+
+def zigzag_to_contiguous_chunks(
+    x: torch.Tensor, cp_group: torch.distributed.ProcessGroup, seq_dim: int = 0
+) -> torch.Tensor:
+    """Permute chunks across the CP group from the Megatron zigzag layout to
+    FLA's contiguous-time layout.
+
+    In the zigzag (attention load-balanced) layout, rank ``r`` holds global
+    chunks ``[r, 2*cp-r-1]`` of size ``T/(2*cp)``. The FLA-CP-aware ops
+    instead expect the contiguous-time layout where rank ``r`` holds
+    ``[2r, 2r+1]``. Since the permutation is at the chunk level, a single
+    all-to-all of chunks realizes the reshuffle — no full-sequence gather
+    is required (total traffic per rank is ``2*T*H/cp`` bytes, matching the
+    Mamba A2A CP path without its full-sequence memory blow-up).
+    """
+    return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=True)
+
+
+def contiguous_to_zigzag_chunks(
+    x: torch.Tensor, cp_group: torch.distributed.ProcessGroup, seq_dim: int = 0
+) -> torch.Tensor:
+    """Inverse of :func:`zigzag_to_contiguous_chunks`."""
+    return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=False)
+
+
+def _zigzag_contiguous_chunk_swap(
+    x: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    seq_dim: int,
+    to_contiguous: bool,
+) -> torch.Tensor:
+    """Single-all-to-all chunk permutation between zigzag and contiguous layouts.
+
+    Each rank holds exactly two chunks along ``seq_dim``. The mapping from
+    local (rank, slot) to (rank, slot) in the target layout is deterministic
+    and depends only on ``cp_size`` and ``cp_rank``, so we pack send data in
+    destination-rank order and use one ``all_to_all_single`` (with unequal
+    splits) to route each chunk to its target rank.
+    """
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size == 1:
+        return x
+    cp_rank = cp_group.rank()
+
+    # Work with seq_dim at position 0.
+    if seq_dim != 0:
+        x = x.movedim(seq_dim, 0)
+    x = x.contiguous()
+
+    seq_len_local = x.size(0)
+    assert seq_len_local % 2 == 0, (
+        f"zigzag/contiguous chunk swap requires an even local sequence length, "
+        f"got {seq_len_local}."
+    )
+    chunk_len = seq_len_local // 2
+
+    def _rank_to_chunks(rank: int, in_zigzag: bool) -> Tuple[int, int]:
+        """Global chunk indices at (slot 0, slot 1) for this rank."""
+        if in_zigzag:
+            return (rank, 2 * cp_size - rank - 1)
+        return (2 * rank, 2 * rank + 1)
+
+    def _chunk_to_dest(chunk_idx: int, target_zigzag: bool) -> Tuple[int, int]:
+        """Destination (rank, slot) for a given global chunk index in the target layout."""
+        if target_zigzag:
+            if chunk_idx < cp_size:
+                return chunk_idx, 0
+            return 2 * cp_size - chunk_idx - 1, 1
+        return chunk_idx // 2, chunk_idx % 2
+
+    source_in_zigzag = to_contiguous
+    target_in_zigzag = not to_contiguous
+
+    local_chunk_indices = _rank_to_chunks(cp_rank, source_in_zigzag)
+    local_dests = [_chunk_to_dest(c, target_in_zigzag) for c in local_chunk_indices]
+
+    # Pack the send buffer so chunks are ordered by (dst_rank, dst_slot) — this
+    # is the natural order for unequal-split all_to_all.
+    local_slot_order = sorted(range(2), key=lambda s: local_dests[s])
+    local_chunks = [x[:chunk_len], x[chunk_len:]]
+    send_buf = torch.cat([local_chunks[s] for s in local_slot_order], dim=0).contiguous()
+
+    input_split_chunks = [0] * cp_size
+    for dst_rank, _ in local_dests:
+        input_split_chunks[dst_rank] += 1
+
+    # Mirror the packing logic at every source rank so we know, for each
+    # received chunk, which local dst_slot it must land in.
+    output_split_chunks = [0] * cp_size
+    recv_dst_slots_per_source: List[List[int]] = [[] for _ in range(cp_size)]
+    for src in range(cp_size):
+        src_chunks = _rank_to_chunks(src, source_in_zigzag)
+        src_dests = [_chunk_to_dest(c, target_in_zigzag) for c in src_chunks]
+        src_slot_order = sorted(range(2), key=lambda s: src_dests[s])
+        for s in src_slot_order:
+            dst_rank, dst_slot = src_dests[s]
+            if dst_rank == cp_rank:
+                output_split_chunks[src] += 1
+                recv_dst_slots_per_source[src].append(dst_slot)
+
+    input_split_sizes = [n * chunk_len for n in input_split_chunks]
+    output_split_sizes = [n * chunk_len for n in output_split_chunks]
+
+    recv_buf = all_to_all(cp_group, send_buf, output_split_sizes, input_split_sizes)
+
+    # Reassemble local chunks in target-layout slot order (slot 0, then slot 1).
+    target_slots: List[Optional[torch.Tensor]] = [None, None]
+    offset = 0
+    for src in range(cp_size):
+        for dst_slot in recv_dst_slots_per_source[src]:
+            target_slots[dst_slot] = recv_buf[offset : offset + chunk_len]
+            offset += chunk_len
+    assert all(t is not None for t in target_slots), "Incomplete chunk reassembly in CP swap"
+
+    out = torch.cat(target_slots, dim=0)
+    if seq_dim != 0:
+        out = out.movedim(0, seq_dim)
+    return out.contiguous()
 
 
 ####################

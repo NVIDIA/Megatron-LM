@@ -390,14 +390,12 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
     )
 
     cosine_similarity_threshold = None
-    if cp_comm_type == "fla" and cp > 1:
-        # TODO: the tolerances are too loose, need to tighten.
-        atol, rtol = 2e-2, 3e-2
-        cosine_similarity_threshold = 0.996
-    elif cp_comm_type == "a2a" and cp > 1:
-        atol, rtol = 5e-3, 1e-2
+    if cp > 1:
+        atol, rtol = 2e-3, 1e-2
+        cosine_similarity_threshold = 0.9999
     else:
-        atol, rtol = 1e-3, 2e-3
+        atol, rtol = 2e-4, 2e-3
+        cosine_similarity_threshold = 0.99999
 
     _test_parallel_attention_correctness(
         transformer_config=transformer_config,
