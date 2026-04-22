@@ -50,4 +50,6 @@ class DAPOAgent(MathAgent):
         return prompt, golden
 
     async def get_reward(self, response, golden: dict, finish_reason: str) -> float:
-        return self.compute_score(response, golden, golden_key="answer", finish_reason=finish_reason)
+        return self.compute_score(
+            response, golden, golden_key="answer", finish_reason=finish_reason
+        )

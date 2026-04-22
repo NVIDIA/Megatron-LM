@@ -205,7 +205,10 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker, get_moe_overload_factor_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metrics_tracker,
+    get_moe_overload_factor_tracker,
+)
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -238,6 +241,14 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 
 from . import ft_integration, one_logger_utils
+from .activation_logging import (
+    disable_activation_logging,
+    disable_tokens_per_expert_logging,
+    enable_activation_logging,
+    enable_tokens_per_expert_logging,
+    save_activations,
+    save_tokens_per_expert,
+)
 from .async_utils import maybe_finalize_async_save
 from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
 from .global_vars import (
@@ -265,29 +276,6 @@ from .utils import (
     unwrap_model,
     update_use_dist_ckpt,
 )
-from .global_vars import (
-    destroy_global_vars,
-    get_args,
-    get_signal_handler,
-    get_timers,
-    get_tensorboard_writer,
-    get_wandb_writer,
-    get_one_logger,
-    get_tokenizer,
-    get_energy_monitor,
-)
-from . import one_logger_utils
-from .activation_logging import (
-    enable_activation_logging,
-    disable_activation_logging,
-    save_activations,
-    enable_tokens_per_expert_logging,
-    disable_tokens_per_expert_logging,
-    save_tokens_per_expert,
-)
-from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
-
-from . import ft_integration
 
 stimer = StragglerDetector()
 
@@ -1388,7 +1376,12 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
+        if (
+            not args.skip_train
+            and args.save
+            and iteration != 0
+            and iteration % args.save_interval != 0
+        ):
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -1396,7 +1389,7 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator
+                train_data_iterator=train_data_iterator,
             )
 
         one_logger and one_logger.log_metrics(
@@ -2012,16 +2005,23 @@ def train_step(
     timers = get_timers()
 
     rerun_state_machine = get_rerun_state_machine()
-    save_params_in_this_iteration = (args.save_params_interval is not None and
-                                     (iteration + 1) % args.save_params_interval == 0)
-    save_activations_in_this_iteration = (args.save_activations_interval is not None and
-                                          (iteration + 1) % args.save_activations_interval == 0)
-    save_tpe_in_this_iteration = (args.save_tokens_per_expert_interval is not None and
-                                  (iteration + 1) % args.save_tokens_per_expert_interval == 0)
-    save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
-                                     (iteration + 1) % args.save_wgrads_interval == 0)
-    save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
-                                     (iteration + 1) % args.save_dgrads_interval == 0)
+    save_params_in_this_iteration = (
+        args.save_params_interval is not None and (iteration + 1) % args.save_params_interval == 0
+    )
+    save_activations_in_this_iteration = (
+        args.save_activations_interval is not None
+        and (iteration + 1) % args.save_activations_interval == 0
+    )
+    save_tpe_in_this_iteration = (
+        args.save_tokens_per_expert_interval is not None
+        and (iteration + 1) % args.save_tokens_per_expert_interval == 0
+    )
+    save_wgrads_in_this_iteration = (
+        args.save_wgrads_interval is not None and (iteration + 1) % args.save_wgrads_interval == 0
+    )
+    save_dgrads_in_this_iteration = (
+        args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
+    )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Offload optimizer states to CPU if enabled.
         if args.offload_optimizer_states:
@@ -2595,7 +2595,7 @@ def training_log(
         # RL token throughput metrics.
         if args.perform_rl_step:
             log_string += rl_utils.log_rl_throughput_metrics(
-                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
+                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer
             )
 
         if should_reset:
@@ -2746,11 +2746,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
-    
+
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
-    
+
     if should_report_memory:
         # Track memory after checkpoint save.
         report_memory(f"(after save_checkpoint for iteration {iteration})")

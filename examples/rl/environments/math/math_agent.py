@@ -20,13 +20,16 @@ assert (
     MATHVERIFY_AVAILABLE
 ), "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."
 
+
 class MathAgent(RewardOnlyAgent):
-    def __init__(self,
+    def __init__(
+        self,
         format_reward: float = 0.0,
         answer_format: str = "tagged",
         negative_reward: float = 0.0,
         partial_end_reward: float = 0.0,
-        **kwargs):
+        **kwargs,
+    ):
         """
         Args:
             format_reward (float): Reward given when the answer is in the expected format,
@@ -48,11 +51,7 @@ class MathAgent(RewardOnlyAgent):
         self.partial_end_reward = partial_end_reward
 
     def compute_score(
-        self,
-        response: str,
-        golden: dict,
-        finish_reason: str,
-        golden_key: str = "answer",
+        self, response: str, golden: dict, finish_reason: str, golden_key: str = "answer"
     ) -> float:
         """Take a response and a golden answer and return a score. Supports tagged or boxed answers.
 
@@ -68,7 +67,7 @@ class MathAgent(RewardOnlyAgent):
             # Only consider the last occurrence
             last_match = answer_tag_match[-1]
             final_answer = last_match.group(1).strip()
-            after = response[last_match.end():].lstrip()
+            after = response[last_match.end() :].lstrip()
 
             try:
                 parsed_answer = parse(final_answer)
@@ -94,7 +93,7 @@ class MathAgent(RewardOnlyAgent):
             if boxed_match:
                 last_match = boxed_match[-1]
                 final_answer = last_match.group(1).strip()
-                after = response[last_match.end():].lstrip()
+                after = response[last_match.end() :].lstrip()
                 try:
                     parsed_answer = parse(final_answer)
                 except ValueError as e:

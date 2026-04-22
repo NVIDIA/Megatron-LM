@@ -26,7 +26,11 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine, get_model_for_inference
+from megatron.inference.utils import (
+    add_inference_args,
+    get_dynamic_inference_engine,
+    get_model_for_inference,
+)
 from model_provider import model_provider
 
 sys.path.append(
@@ -38,8 +42,8 @@ from typing import List
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0

@@ -11,9 +11,10 @@ import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
+
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -241,7 +242,10 @@ def run_inference(
 
                 # Suspend.
                 if attempted_step_count % args.suspend_resume_interval == 0:
-                    print("**** step %d/%d ... suspend." % (engine.context.step_count, attempted_step_count))
+                    print(
+                        "**** step %d/%d ... suspend."
+                        % (engine.context.step_count, attempted_step_count)
+                    )
                     engine.suspend()
 
                 # Resume, 0+ attempted steps later.
@@ -251,7 +255,10 @@ def run_inference(
                     % args.suspend_resume_interval
                     == 0
                 ):
-                    print("**** step %d/%d ... resume." % (engine.context.step_count, attempted_step_count))
+                    print(
+                        "**** step %d/%d ... resume."
+                        % (engine.context.step_count, attempted_step_count)
+                    )
                     engine.resume()
 
             # If engine suspended, continue to next iter.
@@ -469,7 +476,9 @@ def main():
             # Attach peak memory metrics; the functional test only validates these
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
-            json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
+            json_results["lifetime_prefill_token_count"] = (
+                engine.context.lifetime_prefill_token_count
+            )
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:

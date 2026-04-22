@@ -10,6 +10,7 @@ from pydantic import PrivateAttr
 
 try:
     import h2  # noqa: F401
+
     use_http2 = True
 except ImportError:
     use_http2 = False
@@ -32,6 +33,7 @@ from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
@@ -99,11 +101,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=41521, launch_inference_coordinator=True,
+            inference_coordinator_port=41521, launch_inference_coordinator=True
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                start_text_gen_server,
+            )
 
             client = InferenceClient(inference_coordinator_address=dp_addr)
             client.start()
@@ -126,21 +130,18 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        concurrency_limit = (
+            args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        )
         custom_limits = httpx.Limits(
-            max_connections=concurrency_limit,
-            max_keepalive_connections=concurrency_limit,
+            max_connections=concurrency_limit, max_keepalive_connections=concurrency_limit
         )
-        http_client = DefaultAioHttpClient(
-            timeout=None,
-            limits=custom_limits,
-            http2=use_http2
-        )
+        http_client = DefaultAioHttpClient(timeout=None, limits=custom_limits, http2=use_http2)
 
         launched_server._openai_client = AsyncOpenAI(
             base_url=f"http://{launched_server.host}:{launched_server.port}",
             api_key="NONE",
-            http_client=http_client
+            http_client=http_client,
         )
 
         return launched_server
@@ -163,7 +164,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.stop()
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                stop_text_gen_server,
+            )
+
             stop_text_gen_server()
 
     def set_generation_epoch(self, generation_epoch: int):

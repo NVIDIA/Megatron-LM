@@ -135,9 +135,7 @@ def validate_yaml(args, defaults={}):
         args, '_is_global_batch_size_explicitly_specified', args.global_batch_size is not None
     )
     if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
-        raise ValueError(
-            'Cannot specify both --step-batch-size-schedule and --global-batch-size'
-        )
+        raise ValueError('Cannot specify both --step-batch-size-schedule and --global-batch-size')
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
         if args.rank == 0:
@@ -232,12 +230,9 @@ def validate_yaml(args, defaults={}):
     if args.train_iters:
         # If we use iteration-based training, make sure the
         # sample-based options are off.
-        assert args.train_samples is None, \
-            'expected iteration-based training'
-        assert args.lr_decay_samples is None, \
-            'expected iteration-based learning rate decay'
-        assert args.lr_warmup_samples == 0, \
-            'expected iteration-based learning rate warmup'
+        assert args.train_samples is None, 'expected iteration-based training'
+        assert args.lr_decay_samples is None, 'expected iteration-based learning rate decay'
+        assert args.lr_warmup_samples == 0, 'expected iteration-based learning rate warmup'
         if args.lr_warmup_fraction is not None:
             assert (
                 args.lr_warmup_iters == 0

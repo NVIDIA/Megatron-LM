@@ -40,7 +40,6 @@ class TrainingConfig:
     Cannot be used together with decrease_batch_size_if_needed.
     """
 
-
     decrease_batch_size_if_needed: bool = False
     """If set, decrease batch size if microbatch_size * dp_size does not 
     divide batch_size. Old batch_size will be restored if training is re-started 
@@ -540,7 +539,15 @@ class CheckpointConfig:
     subprocess. Useful on MNNVL systems where fabric resources are exhausted.
     Only applies with the nvrx async strategy."""
 
-    fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
+    fully_parallel_load: bool = field(
+        default=False,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--ckpt-fully-parallel-load"],
+                "dest": "ckpt_fully_parallel_load",
+            }
+        },
+    )
     """Apply full load parallelization across DP for distributed checkpoints."""
 
     ckpt_fully_parallel_load_exchange_algo: Literal[

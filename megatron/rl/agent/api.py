@@ -13,11 +13,7 @@ from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..__init__ import Request, TypeLookupable
-from ..inference import (
-    InferenceInterface,
-    LLMChatMessage,
-    ReturnsRaw,
-)
+from ..inference import InferenceInterface, LLMChatMessage, ReturnsRaw
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -218,10 +214,12 @@ class GroupedRolloutGenerator(Agent, ABC):
         # When it's 1, the semaphore is a no-op.
         groups_per_worker = request.num_groups
         if groups_per_worker > 1:
-            assert not request.filter_groups_with_same_reward, \
-                "Cannot use filter_groups_with_same_reward with num_groups > 1."
-        assert self.parallel_generation_tasks >= groups_per_worker, \
-            f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
+            assert (
+                not request.filter_groups_with_same_reward
+            ), "Cannot use filter_groups_with_same_reward with num_groups > 1."
+        assert (
+            self.parallel_generation_tasks >= groups_per_worker
+        ), f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
         num_workers = self.parallel_generation_tasks // groups_per_worker
         unused = self.parallel_generation_tasks % groups_per_worker
         if unused:
@@ -252,10 +250,9 @@ class GroupedRolloutGenerator(Agent, ABC):
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker
                 if groups_per_worker > 1:
-                    await asyncio.gather(*[
-                        generate_and_enqueue(batch_id, i)
-                        for i in range(groups_per_worker)
-                    ])
+                    await asyncio.gather(
+                        *[generate_and_enqueue(batch_id, i) for i in range(groups_per_worker)]
+                    )
                 else:
                     if not await generate_and_enqueue(batch_id, 0):
                         submitted_groups -= groups_per_worker

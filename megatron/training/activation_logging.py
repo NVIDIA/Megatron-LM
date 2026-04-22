@@ -2,11 +2,11 @@
 
 """Forward activation logging using forward hooks."""
 
-from collections import defaultdict
 import json
 import logging
 import os
 import re
+from collections import defaultdict
 from typing import Callable, List, Tuple
 
 import torch
@@ -32,26 +32,34 @@ def _discover_te_types():
 
     try:
         from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
             TELinear,
             TENorm,
-            TEColumnParallelLinear,
             TERowParallelLinear,
-            TELayerNormColumnParallelLinear,
         )
-        all_types.extend([TELinear, TENorm, TEColumnParallelLinear, TERowParallelLinear,
-                          TELayerNormColumnParallelLinear])
+
+        all_types.extend(
+            [
+                TELinear,
+                TENorm,
+                TEColumnParallelLinear,
+                TERowParallelLinear,
+                TELayerNormColumnParallelLinear,
+            ]
+        )
     except ImportError:
         pass
 
     try:
         from megatron.core.extensions.transformer_engine import (
-            TEGroupedLinear,
             TEColumnParallelGroupedLinear,
+            TEGroupedLinear,
             TERowParallelGroupedLinear,
         )
+
         if TEGroupedLinear is not None:
-            grouped = [TEGroupedLinear, TEColumnParallelGroupedLinear,
-                       TERowParallelGroupedLinear]
+            grouped = [TEGroupedLinear, TEColumnParallelGroupedLinear, TERowParallelGroupedLinear]
             all_types.extend(grouped)
             grouped_types.extend(grouped)
     except ImportError:
@@ -62,8 +70,14 @@ def _discover_te_types():
 
 _TE_TYPES, _GROUPED_LINEAR_TYPES = _discover_te_types()
 
-LINEAR_TYPES = (nn.Linear, nn.Embedding, ColumnParallelLinear, RowParallelLinear,
-                Router, *_TE_TYPES)
+LINEAR_TYPES = (
+    nn.Linear,
+    nn.Embedding,
+    ColumnParallelLinear,
+    RowParallelLinear,
+    Router,
+    *_TE_TYPES,
+)
 
 
 def _register_hooks(model, module_types, hook_factory, *, name_filter=None):
@@ -83,13 +97,16 @@ def _register_hooks(model, module_types, hook_factory, *, name_filter=None):
         model_chunk_name = f"model_chunk{model_chunk_id}"
         unwrapped = unwrap_model(model_chunk)
         for module_name, module in unwrapped.named_modules():
-            if isinstance(module, module_types) and (name_filter is None or name_filter(module_name)):
+            if isinstance(module, module_types) and (
+                name_filter is None or name_filter(module_name)
+            ):
                 hook_fn = hook_factory(model_chunk_name, module_name)
                 if hook_fn is None:
                     continue
                 handle = module.register_forward_hook(hook_fn, with_kwargs=True)
                 handles.append(handle)
     return handles
+
 
 class ActivationLogger:
     """Captures and saves forward activations using forward hooks.
@@ -127,14 +144,18 @@ class ActivationLogger:
                 if inp is None:
                     continue
                 key = f"{module_name}/input{idx}"
-                sd[model_chunk_name][key] = inp.detach().cpu() if isinstance(inp, torch.Tensor) else inp
+                sd[model_chunk_name][key] = (
+                    inp.detach().cpu() if isinstance(inp, torch.Tensor) else inp
+                )
             for idx, out in enumerate(output if isinstance(output, tuple) else (output,)):
                 if out is not None and isinstance(out, torch.Tensor):
                     sd[model_chunk_name][f"{module_name}/output{idx}"] = out.detach().cpu()
             for kwarg_key, kwarg_value in kwargs.items():
                 key = f"{module_name}/{kwarg_key}"
                 sd[model_chunk_name][key] = (
-                    kwarg_value.detach().cpu() if isinstance(kwarg_value, torch.Tensor) else kwarg_value
+                    kwarg_value.detach().cpu()
+                    if isinstance(kwarg_value, torch.Tensor)
+                    else kwarg_value
                 )
 
         return hook
@@ -168,7 +189,8 @@ class ActivationLogger:
         if not m:
             logger.warning(
                 "Cannot extract layer number from module name: %r — "
-                "skipping tokens-per-expert hook for this module", module_name
+                "skipping tokens-per-expert hook for this module",
+                module_name,
             )
             return None
         layer = m.group(1)
@@ -185,7 +207,9 @@ class ActivationLogger:
     def register_tpe_hooks(self, model):
         assert not self._tpe_hooks
         self._tpe_hooks = _register_hooks(
-            model, _GROUPED_LINEAR_TYPES, self._make_tpe_hook,
+            model,
+            _GROUPED_LINEAR_TYPES,
+            self._make_tpe_hook,
             name_filter=lambda name: name.endswith("linear_fc1"),
         )
 
@@ -209,13 +233,13 @@ class ActivationLogger:
         os.makedirs(tpe_dir, exist_ok=True)
         filepath = os.path.join(tpe_dir, f"rank{rank}.jsonl")
         lines = "".join(
-            json.dumps({"iter": iteration, "layer": int(layer),
-                        "tpe": microbatches}) + "\n"
+            json.dumps({"iter": iteration, "layer": int(layer), "tpe": microbatches}) + "\n"
             for layer, microbatches in sorted(self._tpe_records.items())
         )
         with open(filepath, "a") as f:
             f.write(lines)
         self._tpe_records.clear()
+
 
 _LOGGER: ActivationLogger | None = None
 
@@ -234,6 +258,7 @@ def _require_logger() -> ActivationLogger:
 
 # -- Full activation logging -------------------------------------------
 
+
 def enable_activation_logging(model: torch.nn.Module, save_dir: str):
     _get_logger(save_dir).register_activation_hooks(model)
 
@@ -247,6 +272,7 @@ def save_activations(iteration: int):
 
 
 # -- Tokens-per-expert logging ----------------------------------------
+
 
 def enable_tokens_per_expert_logging(model: torch.nn.Module, save_dir: str):
     _get_logger(save_dir).register_tpe_hooks(model)

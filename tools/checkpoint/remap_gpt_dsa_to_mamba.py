@@ -60,18 +60,20 @@ def _remap_key(key: str, num_gpt_layers: int) -> str:
 
     # Final layernorm name differs between TransformerBlock and MambaStack
     if key.startswith(final_ln_prefix):
-        return "decoder.final_norm." + key[len(final_ln_prefix):]
+        return "decoder.final_norm." + key[len(final_ln_prefix) :]
 
     if not key.startswith(layer_prefix):
         return key  # embedding, output_layer, rotary_pos_emb, etc.
 
     # Parse "decoder.layers.{N}.{rest}"
-    remainder = key[len(layer_prefix):]
+    remainder = key[len(layer_prefix) :]
     dot_idx = remainder.index('.')
     layer_n = int(remainder[:dot_idx])
-    rest = remainder[dot_idx + 1:]
+    rest = remainder[dot_idx + 1 :]
 
-    assert 0 <= layer_n < num_gpt_layers, f"Layer index {layer_n} out of range [0, {num_gpt_layers}) in key '{key}'"
+    assert (
+        0 <= layer_n < num_gpt_layers
+    ), f"Layer index {layer_n} out of range [0, {num_gpt_layers}) in key '{key}'"
 
     if rest.startswith("input_layernorm.") or rest.startswith("self_attention."):
         return f"{layer_prefix}{2 * layer_n}.{rest}"
@@ -88,9 +90,7 @@ def _remap_key(key: str, num_gpt_layers: int) -> str:
         )
 
 
-def _remap_state_dict(
-    gpt_sd: Dict, num_gpt_layers: int
-) -> Dict:
+def _remap_state_dict(gpt_sd: Dict, num_gpt_layers: int) -> Dict:
     """Apply key remapping to the full GPTModel state dict."""
     return {_remap_key(k, num_gpt_layers): v for k, v in gpt_sd.items()}
 
@@ -106,10 +106,7 @@ def convert(input_path: Path, output_path: Path, num_gpt_layers: int) -> None:
     try:
         import torch
         import torch.distributed.checkpoint as dcp
-        from torch.distributed.checkpoint.format_utils import (
-            dcp_to_torch_save,
-            torch_save_to_dcp,
-        )
+        from torch.distributed.checkpoint.format_utils import dcp_to_torch_save, torch_save_to_dcp
     except ImportError as exc:
         raise SystemExit(
             "PyTorch distributed checkpoint (torch.distributed.checkpoint) is required. "
@@ -129,9 +126,7 @@ def convert(input_path: Path, output_path: Path, num_gpt_layers: int) -> None:
 
         # --- Remap keys ---
         mamba_sd = _remap_state_dict(gpt_sd, num_gpt_layers)
-        print(
-            f"Remapped state dict: {len(gpt_sd)} GPT keys → {len(mamba_sd)} Mamba keys."
-        )
+        print(f"Remapped state dict: {len(gpt_sd)} GPT keys → {len(mamba_sd)} Mamba keys.")
 
         # --- Save remapped state dict as a new flat .pt then convert to DCP ---
         tmp_mamba = output_path.parent / "_tmp_mamba_flat.pt"
@@ -152,15 +147,21 @@ def main() -> None:
         description="Convert GPTModel DSA checkpoint to MambaModel-compatible format."
     )
     parser.add_argument(
-        "--input", required=True, type=Path,
+        "--input",
+        required=True,
+        type=Path,
         help="Path to the source GPTModel DCP checkpoint directory.",
     )
     parser.add_argument(
-        "--output", required=True, type=Path,
+        "--output",
+        required=True,
+        type=Path,
         help="Destination path for the MambaModel DCP checkpoint.",
     )
     parser.add_argument(
-        "--num-gpt-layers", required=True, type=int,
+        "--num-gpt-layers",
+        required=True,
+        type=int,
         help="Number of decoder layers in the GPTModel (e.g. 4).",
     )
     args = parser.parse_args()
