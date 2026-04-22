@@ -32,7 +32,7 @@ def _stack_config(emb_int_list=(256, 128), soft_mask=True, layernorm_epsilon=1e-
 
 
 def _stack_with_final_norm(hidden_size=256, eps=1e-5):
-    """A stand-in MambaStack: only `final_norm` is hooked, nothing else required."""
+    """A stand-in HybridStack: only `final_norm` is hooked, nothing else required."""
     stack = nn.Module()
     stack.final_norm = nn.LayerNorm(hidden_size, eps=eps).cuda().to(torch.bfloat16)
     return stack

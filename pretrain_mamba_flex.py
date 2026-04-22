@@ -12,7 +12,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.mamba import MambaModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
     get_micro_batch_size,
@@ -40,7 +40,7 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -88,7 +88,7 @@ def count_parameters_in_layer(model, layer_name):
     return num_params
 
 
-def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> MambaModel:
+def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> HybridModel:
     """Builds the model.
 
     Args:
@@ -97,7 +97,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
 
 
     Returns:
-        MambaModel: The returned model
+        HybridModel: The returned model
     """
     args = get_args()
     if has_nvidia_modelopt:
@@ -128,13 +128,13 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 
     if args.spec is not None:
-        mamba_stack_spec = import_module(args.spec)
+        hybrid_stack_spec = import_module(args.spec)
     else:
         raise("You must provide a valid Mamba layer spec!")
 
-    model = MambaModel(
+    model = HybridModel(
         config=config,
-        mamba_stack_spec=mamba_stack_spec,
+        hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
@@ -221,7 +221,7 @@ def get_batch(data_iterator):
 SPIKY_LOSS_FACTOR = 10
 
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[MambaModel] = None, selected_budget=None):
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None, selected_budget=None):
     """Loss function.
 
     Args:
@@ -326,12 +326,12 @@ def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42
     _global_choice_counter %= grad_accumulation_steps
     return choice
 
-def forward_step(data_iterator, model: MambaModel):
+def forward_step(data_iterator, model: HybridModel):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
-        model (MambaModel): The GPT Model
+        model (HybridModel): The GPT Model
     """
     args = get_args()
     timers = get_timers()
@@ -518,11 +518,16 @@ if __name__ == "__main__":
 
     _mtt.get_megatron_optimizer_config = _patched_get_opt_cfg
 
+    # `pretrain()` no longer accepts extra_args_provider / args_defaults; parse
+    # args up-front instead (see pretrain_mamba.py for the same pattern).
+    args = parse_and_validate_args(
+        extra_args_provider=mamba_flex_extra_args_provider,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
+
     pretrain(train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
              store=store,
-             extra_args_provider=mamba_flex_extra_args_provider,
              )

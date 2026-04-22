@@ -5,7 +5,7 @@ Flextron Elasticity Hooks
 
 Applies elasticity masking through PyTorch hooks without modifying original
 modules. One manager class per module type (MambaMixer, SelfAttention,
-TransformerLayer, MoELayer, TopKRouter, TEGroupedMLP, MambaStack).
+TransformerLayer, MoELayer, TopKRouter, TEGroupedMLP, HybridStack).
 """
 
 import math
@@ -370,6 +370,8 @@ class FlextronMambaElasticityManager:
 
     def detach_hooks(self):
         """Remove all hooks."""
+        if not hasattr(self, 'hook_handles'):
+            return
         for handle in self.hook_handles:
             handle.remove()
         self.hook_handles.clear()
@@ -493,6 +495,8 @@ class FlextronTransformerLayerElasticityManager:
 
     def detach_hooks(self):
         """Remove all hooks."""
+        if not hasattr(self, 'hook_handles'):
+            return
         for handle in self.hook_handles:
             handle.remove()
         self.hook_handles.clear()
@@ -747,6 +751,8 @@ class FlextronTopKRouterElasticityManager:
 
     def detach_hooks(self):
         """Remove all hooks and restore original methods."""
+        if not hasattr(self, 'hook_handles'):
+            return
         for handle in self.hook_handles:
             if isinstance(handle, tuple) and handle[0] == 'method_replacement':
                 # Restore original method
@@ -840,6 +846,8 @@ class FlextronMoEElasticityManager:
 
     def detach_hooks(self):
         """Remove all hooks."""
+        if not hasattr(self, 'hook_handles'):
+            return
         for handle in self.hook_handles:
             handle.remove()
         self.hook_handles.clear()
@@ -1057,6 +1065,8 @@ class FlextronGroupedMLPElasticityManager:
 
     def detach_hooks(self):
         """Remove all hooks."""
+        if not hasattr(self, 'hook_handles'):
+            return
         for handle in self.hook_handles:
             handle.remove()
         self.hook_handles.clear()
@@ -1275,6 +1285,8 @@ class FlextronAttentionElasticityManager:
 
     def detach_hooks(self):
         """Remove all hooks."""
+        if not hasattr(self, 'hook_handles'):
+            return
         for handle in self.hook_handles:
             handle.remove()
         self.hook_handles.clear()
@@ -1286,7 +1298,7 @@ class FlextronAttentionElasticityManager:
 
 class FlextronStackElasticityManager:
     """
-    Manages elasticity for MambaStack using pure PyTorch hooks.
+    Manages elasticity for HybridStack using pure PyTorch hooks.
     Handles input masking and final norm scaling.
     """
     
@@ -1316,7 +1328,7 @@ class FlextronStackElasticityManager:
         self.stack = stack
 
     def attach_hooks(self, stack):
-        """Attach hooks to MambaStack."""
+        """Attach hooks to HybridStack."""
         if not self.enabled:
             return
 
@@ -1375,7 +1387,8 @@ class FlextronStackElasticityManager:
 
     def detach_hooks(self):
         """Remove all hooks and restore original forward method."""
-
+        if not hasattr(self, 'hook_handles'):
+            return
         for handle in self.hook_handles:
             handle.remove()
         self.hook_handles.clear()
@@ -1515,10 +1528,10 @@ def add_flextron_attention_elasticity(attention_module, config, layer_idx=0):
 
 def add_flextron_stack_elasticity(stack, config):
     """
-    Add elasticity to a MambaStack using hooks.
+    Add elasticity to a HybridStack using hooks.
     
     Args:
-        stack: The MambaStack instance to add elasticity to
+        stack: The HybridStack instance to add elasticity to
         config: Configuration object with flextron settings
         
     Returns:
@@ -1615,7 +1628,7 @@ def apply_flextron_elasticity_to_model(model, config):
                 manager = add_flextron_attention_elasticity(attention_module, config, layer_idx)
                 managers.append(manager)
 
-    # Also add hooks to MambaStack if present
+    # Also add hooks to HybridStack if present
     if hasattr(model, 'decoder') and hasattr(model.decoder, 'final_norm'):
         stack_manager = add_flextron_stack_elasticity(model.decoder, config)
         managers.append(stack_manager)

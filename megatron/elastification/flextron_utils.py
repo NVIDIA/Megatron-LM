@@ -4,7 +4,7 @@
 Flextron Utilities
 
 Provides setup and configuration functions for Flextron elasticity.
-Extracted from MambaModel to keep the core model clean.
+Extracted from HybridModel to keep the core model clean.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -329,7 +329,7 @@ def setup_flextron_model(model):
     Setup Flextron functionality for a model after creation.
     
     Args:
-        model: The MambaModel instance
+        model: The HybridModel instance
         
     Returns:
         FlextronModelManager: Manager object to handle Flextron operations
@@ -350,7 +350,7 @@ def setup_flextron_model(model):
 def inject_flextron_forward_logic(model):
     """
     Inject Flextron-specific forward pass logic into the model.
-    This replaces the router logic that was previously in MambaModel.forward().
+    This replaces the router logic that was previously in HybridModel.forward().
     """
     original_forward = model.forward
     

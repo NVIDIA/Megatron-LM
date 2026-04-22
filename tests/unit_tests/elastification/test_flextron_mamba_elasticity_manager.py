@@ -14,7 +14,7 @@ Run with:
 import pytest
 import torch
 
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -71,7 +71,7 @@ class TestFlextronMambaElasticityManager:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         mixer = MambaMixer(
             config,
-            mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
             config.hidden_size,
             layer_number=1,
             pg_collection=pg_collection,
@@ -197,7 +197,7 @@ class TestAddFlextronMambaElasticity:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         mixer = MambaMixer(
             config,
-            mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
             config.hidden_size,
             layer_number=1,
             pg_collection=pg_collection,
