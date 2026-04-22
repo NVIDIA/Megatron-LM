@@ -42,7 +42,6 @@ elif HAVE_TRITON:
         """Optimized softplus."""
         return tl.math.log1p(tl.exp(dt))
 
-
 @triton.jit
 def fast_exp(x):
     """
