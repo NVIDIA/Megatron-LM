@@ -140,9 +140,7 @@ def _init_permutation_map_kernel(
     tl.store(perm_map_ptr + offsets, tl.full([BLOCK_SIZE], -1, tl.int32), mask=mask)
 
 
-def init_permutation_map(
-    permutation_map: torch.Tensor, n_used: torch.Tensor
-) -> None:
+def init_permutation_map(permutation_map: torch.Tensor, n_used: torch.Tensor) -> None:
     """Fill permutation_map[0:n_used] with -1.
 
     Args:
@@ -152,9 +150,7 @@ def init_permutation_map(
     output_size = permutation_map.shape[0]
     BLOCK_SIZE = 1024
     _init_permutation_map_kernel[(_ceil_div(output_size, BLOCK_SIZE),)](
-        permutation_map,
-        n_used,
-        BLOCK_SIZE=BLOCK_SIZE,
+        permutation_map, n_used, BLOCK_SIZE=BLOCK_SIZE
     )
 
 
@@ -205,7 +201,7 @@ def _permute_tokens_kernel(
         return
     for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
         tok = pair // topk
-        if tok < valid_tokens:    
+        if tok < valid_tokens:
             k = pair % topk
             eid = tl.load(routing_map_ptr + tok * topk + k)
             lid = eid - local_expert_start
@@ -313,10 +309,10 @@ def permute_tokens(
 
 @triton.jit
 def _zero_output_rows_kernel(
-    output_ptr,       # [num_tokens, hidden_dim] fp32 buffer to partially zero
-    valid_tokens_ptr, # scalar int32 CUDA tensor: number of rows to zero
-    hidden_dim,       # hidden dimension
-    num_tokens,       # max token count (fixed for CG)
+    output_ptr,  # [num_tokens, hidden_dim] fp32 buffer to partially zero
+    valid_tokens_ptr,  # scalar int32 CUDA tensor: number of rows to zero
+    hidden_dim,  # hidden dimension
+    num_tokens,  # max token count (fixed for CG)
     BLOCK_H: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
@@ -346,7 +342,7 @@ def _unpermute_tokens_kernel(
     output_ptr,  # [max_tokens, hidden_dim] fp32 output buffer (zeroed by caller)
     n_used_ptr,  # pointer to inclusive_expert_offsets[-1]: number of used rows this iteration
     hidden_dim,  # hidden dimension
-    max_rows,    # output_size (fixed for CG)
+    max_rows,  # output_size (fixed for CG)
     BLOCK_H: tl.constexpr,  # tile size for processing hidden_dim
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
@@ -416,8 +412,15 @@ def unpermute_tokens(
     )
     NUM_BLOCKS = min(output_size, 512)
     _unpermute_tokens_kernel[(NUM_BLOCKS,)](
-        expert_output, permuted_probs, permutation_map, out, n_used, hidden_dim, output_size,
-        BLOCK_H=BLOCK_H, NUM_BLOCKS=NUM_BLOCKS,
+        expert_output,
+        permuted_probs,
+        permutation_map,
+        out,
+        n_used,
+        hidden_dim,
+        output_size,
+        BLOCK_H=BLOCK_H,
+        NUM_BLOCKS=NUM_BLOCKS,
     )
     return out
 
@@ -435,7 +438,7 @@ def _permute_quantize_mxfp8_kernel(
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     K,
     n_col_blocks,
-    max_pairs,         # max_tokens * topk (fixed for CG)
+    max_pairs,  # max_tokens * topk (fixed for CG)
     topk: tl.constexpr,
     local_expert_start,
     num_local_experts: tl.constexpr,

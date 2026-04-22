@@ -73,7 +73,6 @@ def _fused_metadata_kernel(
     if tid > 0:
         return
 
-
     # 1. Multicast-store local_tokens to buffer[RANK].
     mc_ptr = multicast_ptr.to(tl.pointer_type(tl.uint32)) + RANK
     mask = tl.full([], 1, dtype=tl.int1)
@@ -133,4 +132,4 @@ def fused_metadata_update(
         WORLD_SIZE=symm_mem_hdl.world_size,
         num_warps=max(1, (symm_mem_hdl.world_size + 31) // 32),
     )
-    torch.cuda.synchronize() 
+    torch.cuda.synchronize()

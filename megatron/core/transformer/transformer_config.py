@@ -10,10 +10,10 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -1221,7 +1221,6 @@ class TransformerConfig(ModelParallelConfig):
                     "FlashInfer is not compatible with MXFP8 quantization. "
                     "Set inference_grouped_gemm_backend to 'torch'."
                 )
-
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")

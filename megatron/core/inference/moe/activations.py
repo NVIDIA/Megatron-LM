@@ -36,7 +36,7 @@ def _squared_relu_kernel(
     src_idx_ptr,
     n_used_ptr,
     N,
-    max_rows,       # output_size (fixed for CG)
+    max_rows,  # output_size (fixed for CG)
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
 ):
@@ -89,7 +89,7 @@ def _squared_relu_quantize_kernel(
     n_used_ptr,  # pointer to inclusive_expert_offsets[-1]: number of used rows this iteration
     K,
     n_col_blocks,
-    max_rows,       # output_size (fixed for CG)
+    max_rows,  # output_size (fixed for CG)
     REAL_GROUPS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,

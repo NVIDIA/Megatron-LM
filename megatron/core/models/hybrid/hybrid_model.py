@@ -333,7 +333,7 @@ class HybridModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        padding_mask: Optional[Tensor] = None
+        padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post

@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import abc
-import logging
 from typing import Any, Dict, Iterable, Optional, Union
 
 import torch
@@ -17,10 +16,6 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
-from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NCCLAllGatherDispatcher,
-            NVLSAllGatherVDispatcher,
-        )
 
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
 

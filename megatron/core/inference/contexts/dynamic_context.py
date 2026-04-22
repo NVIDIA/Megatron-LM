@@ -22,6 +22,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -35,15 +36,13 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    NCCLAllGatherDispatcher,
+    NVLSAllGatherVDispatcher,
+)
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
-from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NCCLAllGatherDispatcher,
-            NVLSAllGatherVDispatcher,
-)
-
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
 
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -600,13 +599,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.expert_model_parallel_group.size() > 1
             and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
         )
-        # We disable non-decode cuda graphs for the nccl dispatcher. 
-        # The NCCL dispatcher uses allgathers. Thus there is a need to 
-        # run the same sized cuda-graph on every EP rank. This is difficult to 
-        # generalize for non-decode steps. 
+        # We disable non-decode cuda graphs for the nccl dispatcher.
+        # The NCCL dispatcher uses allgathers. Thus there is a need to
+        # run the same sized cuda-graph on every EP rank. This is difficult to
+        # generalize for non-decode steps.
         self.use_cuda_graphs_for_non_decode_steps = (
-            inference_config.use_cuda_graphs_for_non_decode_steps
-            and not self._nccl_ep_dispatcher
+            inference_config.use_cuda_graphs_for_non_decode_steps and not self._nccl_ep_dispatcher
         )
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
@@ -630,7 +628,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 engine_max_tokens=self.max_tokens,
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
-                ep_group=self.expert_model_parallel_group
+                ep_group=self.expert_model_parallel_group,
             )
 
         # Deal with chunked prefill
@@ -1619,7 +1617,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata.batch_allocate_slots(N)
             )
 
-
     def initialize_attention_state(
         self,
         *,
@@ -1647,9 +1644,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
         elif is_expert_parallel_dummy_cuda_graph_step:
             self.add_dummy_requests_for_expert_parallel_step(
-                InferenceBatchDimensions(token_count=self.num_speculative_tokens + 1, 
-                                         prefill_req_count=0, 
-                                         decode_req_count=1)
+                InferenceBatchDimensions(
+                    token_count=self.num_speculative_tokens + 1,
+                    prefill_req_count=0,
+                    decode_req_count=1,
+                )
             )
 
         batch_dimensions = InferenceBatchDimensions(
@@ -1798,10 +1797,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 local_tokens, ep_group, use_allgather_v=not using_cuda_graph
             )
         else:
-            NVLSAllGatherVDispatcher.set_step_metadata(local_tokens, ep_group, mask_routing_map=(
-                    self.inference_grouped_gemm_backend
-                    == InferenceGroupedGemmBackend.FLASHINFER
-                ),)
+            NVLSAllGatherVDispatcher.set_step_metadata(
+                local_tokens,
+                ep_group,
+                mask_routing_map=(
+                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                ),
+            )
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""

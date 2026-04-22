@@ -34,16 +34,16 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
 )
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
+    NVLSAllGatherVDispatcher,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.transformer.moe.token_dispatcher_inference import (
-            InferenceAllGatherDispatcherBase,
-            NVLSAllGatherVDispatcher,
-        )
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
@@ -59,10 +59,7 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import (
-    InferenceGroupedGemmBackend,
-    mcore_fused_moe,
-)
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe
 
 logger = logging.getLogger(__name__)
 
@@ -495,7 +492,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
-    
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -694,17 +690,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
-            assert (
-                not self.training
-            ), "FlashInfer forward path is only used in inference mode."
+            assert not self.training, "FlashInfer forward path is only used in inference mode."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
             return self._mcore_fused_moe_forward(
-                permuted_local_hidden_states,
-                permuted_probs,
-                routing_map=routing_map,
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
 
 

@@ -141,8 +141,7 @@ class InferenceBatchDimensions:
 
     @staticmethod
     def adjust_batch_dims_for_expert_parallelism(
-        local_batch_dims,
-        ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        local_batch_dims, ep_group: Optional[torch.distributed.ProcessGroup] = None
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjust CUDA graph batch dimensions for expert parallelism.
 
@@ -490,8 +489,7 @@ class CUDAGraphBatchDimensionBuilder:
             # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
             # across the EP group so graph selection is consistent.
             adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-                real_batch_dim,
-                ep_group=ep_group,
+                real_batch_dim, ep_group=ep_group
             )
             if adjusted_batch_dim is None:
                 return None

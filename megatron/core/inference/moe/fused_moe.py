@@ -189,6 +189,5 @@ def mcore_fused_moe(
 
     # --- Post-processing: unpermute ---
     return unpermute_tokens(
-        fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens,
-        out=out,
+        fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out
     )

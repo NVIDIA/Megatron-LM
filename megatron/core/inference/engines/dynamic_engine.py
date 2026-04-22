@@ -43,10 +43,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import (
-    Counter,
-    await_process_call,
-)
+from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope

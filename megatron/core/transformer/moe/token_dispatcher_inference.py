@@ -238,9 +238,9 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         padded_output = hidden_states.new_zeros(self.ep_size * max_tokens, hidden_states.shape[1])
         offset = 0
         for dst_rank, n_tokens in enumerate(tokens_per_rank):
-            padded_output[dst_rank * max_tokens : dst_rank * max_tokens + n_tokens] = (
-                hidden_states[offset : offset + n_tokens]
-            )
+            padded_output[dst_rank * max_tokens : dst_rank * max_tokens + n_tokens] = hidden_states[
+                offset : offset + n_tokens
+            ]
             offset += n_tokens
 
         # ReduceScatter: [ep_size * max_tokens, H] → [max_tokens, H].
@@ -272,7 +272,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
     # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=bf16.
-    _symm_agv_hidden: Optional[dict] = None   # {"tensor": ..., "handle": ...}
+    _symm_agv_hidden: Optional[dict] = None  # {"tensor": ..., "handle": ...}
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
     _symm_rsv: Optional[dict] = None
@@ -302,7 +302,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         engine_max_tokens: int,
         topk: int,
         hidden_size: int,
-        ep_group: torch.distributed.ProcessGroup
+        ep_group: torch.distributed.ProcessGroup,
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -351,8 +351,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
                 ("ep_agv_h", cls._symm_agv_hidden),
                 ("ep_agv_r", cls._symm_agv_routing),
                 ("ep_agv_p", cls._symm_agv_probs),
-                ("ep_rsv",   cls._symm_rsv),
-                ("ep_meta",  cls._symm_metadata),
+                ("ep_rsv", cls._symm_rsv),
+                ("ep_meta", cls._symm_metadata),
             )
             if buf["handle"] is None
         ]
@@ -398,7 +398,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Mask stale rows so FlashInfer ignores them; AGV overwrites [0, valid_tokens).
         if mask_routing_map:
             cls._symm_agv_routing["tensor"].fill_(-1)
-
 
     def __init__(
         self,
@@ -452,9 +451,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         ep_max_tokens = self._ep_max_tokens()
 
         multimem_all_gather_v3(
-            agv_h["tensor"], agv_r["tensor"], agv_p["tensor"],
-            hidden_states, self.routing_map, probs,
-            agv_h["handle"], agv_r["handle"], agv_p["handle"],
+            agv_h["tensor"],
+            agv_r["tensor"],
+            agv_p["tensor"],
+            hidden_states,
+            self.routing_map,
+            probs,
+            agv_h["handle"],
+            agv_r["handle"],
+            agv_p["handle"],
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             engine_max_tokens=engine_max,
@@ -494,11 +499,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         if hidden_states is not rsv["tensor"]:
             rsv["tensor"].copy_(hidden_states)
         output = torch.empty(
-            self._local_tokens, hidden_states.shape[1],
-            dtype=hidden_states.dtype, device=hidden_states.device,
+            self._local_tokens,
+            hidden_states.shape[1],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
         multimem_reduce_scatter_v(
-            output, rsv["tensor"], rsv["handle"],
+            output,
+            rsv["tensor"],
+            rsv["handle"],
             rank_token_offset=self._rank_token_offset(),
             ep_max_tokens=self._ep_max_tokens(),
             engine_max_tokens=self._engine_max_tokens,

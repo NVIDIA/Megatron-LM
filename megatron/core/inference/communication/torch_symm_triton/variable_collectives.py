@@ -34,7 +34,7 @@ except ImportError:
 
 from .barrier import symm_mem_sync
 from .multimem_asm import ld_64, ld_128, st_64, st_128
-from .utils import sync_threads, is_device_nvls_capable
+from .utils import is_device_nvls_capable, sync_threads
 
 
 @triton.jit
@@ -246,8 +246,11 @@ def _multimem_reduce_scatter_v_kernel(
             )
             local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
 
-            (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
+            (x, y, z, w) = ld_128(
+                multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32
+            )
             st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
+
 
 def multimem_reduce_scatter_v(
     output_tensor: torch.Tensor,
@@ -288,9 +291,9 @@ def multimem_reduce_scatter_v(
         output_tensor populated with this rank's reduced token outputs.
     """
     assert HAVE_TRITON, "Triton is required for multimem reduce-scatter-v."
-    assert output_tensor.ndim == 2 and input_tensor.ndim == 2, (
-        "output_tensor and input_tensor must be 2-D [tokens, hidden_size]."
-    )
+    assert (
+        output_tensor.ndim == 2 and input_tensor.ndim == 2
+    ), "output_tensor and input_tensor must be 2-D [tokens, hidden_size]."
     assert is_device_nvls_capable(
         output_tensor.device
     ), "multimem_reduce_scatter_v requires a Hopper+ GPU with NVLink (SM >= 9)."
@@ -299,17 +302,18 @@ def multimem_reduce_scatter_v(
         and rank_token_offset.dtype == torch.int32
         and rank_token_offset.is_cuda
     ), "rank_token_offset must be a scalar int32 CUDA tensor."
-    assert output_tensor.dtype in (torch.bfloat16, torch.float32), (
-        f"Only bfloat16 and float32 are supported, got {output_tensor.dtype}"
-    )
-    assert output_tensor.dtype == input_tensor.dtype, (
-        f"output and input dtype mismatch: {output_tensor.dtype} vs {input_tensor.dtype}"
-    )
+    assert output_tensor.dtype in (
+        torch.bfloat16,
+        torch.float32,
+    ), f"Only bfloat16 and float32 are supported, got {output_tensor.dtype}"
+    assert (
+        output_tensor.dtype == input_tensor.dtype
+    ), f"output and input dtype mismatch: {output_tensor.dtype} vs {input_tensor.dtype}"
 
     hidden_size = output_tensor.shape[1]
-    assert input_tensor.shape[1] == hidden_size, (
-        f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
-    )
+    assert (
+        input_tensor.shape[1] == hidden_size
+    ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
     row_bytes = hidden_size * output_tensor.element_size()
     assert row_bytes % 16 == 0, (
         f"Row size ({hidden_size} elements × {output_tensor.element_size()} bytes) = "
@@ -576,9 +580,9 @@ def multimem_all_gather_v(
     ), "rank_token_offset must be a scalar int32 CUDA tensor."
 
     hidden_size = input_tensor.shape[1]
-    assert input_tensor.shape[1] == output_tensor.shape[1], (
-        f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {output_tensor.shape[1]}"
-    )
+    assert (
+        input_tensor.shape[1] == output_tensor.shape[1]
+    ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {output_tensor.shape[1]}"
 
     row_bytes = hidden_size * input_tensor.element_size()
     assert row_bytes % 8 == 0, (
@@ -692,9 +696,9 @@ def multimem_all_gather_v3(
             f"input_tensor_{i} and output_tensor_{i} hidden_size mismatch: "
             f"{inp.shape[1]} vs {out.shape[1]}."
         )
-    assert input_tensor_0.shape[0] == input_tensor_1.shape[0] == input_tensor_2.shape[0], (
-        "All three input tensors must have the same local_tokens (first dimension)."
-    )
+    assert (
+        input_tensor_0.shape[0] == input_tensor_1.shape[0] == input_tensor_2.shape[0]
+    ), "All three input tensors must have the same local_tokens (first dimension)."
     assert is_device_nvls_capable(
         input_tensor_0.device
     ), "multimem_all_gather_v3 requires a Hopper+ GPU with NVLink (SM >= 9)."
@@ -703,13 +707,11 @@ def multimem_all_gather_v3(
         and rank_token_offset.dtype == torch.int32
         and rank_token_offset.is_cuda
     ), "rank_token_offset must be a scalar int32 CUDA tensor."
-    assert symm_mem_hdl_0.rank == symm_mem_hdl_1.rank == symm_mem_hdl_2.rank, (
-        "All three symmetric memory handles must belong to the same EP group (rank mismatch)."
-    )
     assert (
-        symm_mem_hdl_0.world_size
-        == symm_mem_hdl_1.world_size
-        == symm_mem_hdl_2.world_size
+        symm_mem_hdl_0.rank == symm_mem_hdl_1.rank == symm_mem_hdl_2.rank
+    ), "All three symmetric memory handles must belong to the same EP group (rank mismatch)."
+    assert (
+        symm_mem_hdl_0.world_size == symm_mem_hdl_1.world_size == symm_mem_hdl_2.world_size
     ), "All three symmetric memory handles must belong to the same EP group (world_size mismatch)."
 
     MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
