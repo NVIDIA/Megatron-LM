@@ -116,7 +116,7 @@ class RADIOViTModel(VisionModule):
         self.max_num_rows = max_img_h // patch_dim
         self.max_num_cols = max_img_w // patch_dim
         self.max_num_patches = self.max_num_rows * self.max_num_cols
-        
+
         # TODO: are we actually going to use this anywhere?
         self.use_mask_token = use_mask_token
         if self.use_mask_token:
@@ -415,7 +415,7 @@ class RADIOViTModel(VisionModule):
         if self.ln_pre:
             x = self.ln_pre(x)
 
-        x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
+        x = x.permute(1, 0, 2)  # [b, s, h] -> [s, b, h]
         x = x.contiguous()
 
         x = self.decoder(x, attention_mask=attention_mask, packed_seq_params=packed_seq_params)
