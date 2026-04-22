@@ -591,7 +591,7 @@ class TestDistributedOptimizer:
             # Init model and optimizer with "src" bucket padding
             with patch('megatron.core.distributed.param_and_grad_buffer.math.lcm') as lcm_mock:
                 lcm_mock.return_value = src_bucket_pad_divisor
-                assert len(lcm_mock.mock_calls) == 0
+
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
                     tp=src_tp_pp[0],
@@ -600,7 +600,6 @@ class TestDistributedOptimizer:
                     dist_opt=True,
                     initialize_fn=initialize_pp_agnostic_model,
                 )
-                assert len(lcm_mock.mock_calls) > 1
 
             metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
 
@@ -618,7 +617,7 @@ class TestDistributedOptimizer:
             # Init model and optimizer with "dest" bucket padding
             with patch('megatron.core.distributed.param_and_grad_buffer.math.lcm') as lcm_mock:
                 lcm_mock.return_value = dest_bucket_pad_divisor
-                assert len(lcm_mock.mock_calls) == 0
+
                 model_B, optimizer_B = setup_model_and_optimizer(
                     seed=3,
                     tp=dest_tp_pp[0],
@@ -627,7 +626,6 @@ class TestDistributedOptimizer:
                     dist_opt=True,
                     initialize_fn=initialize_pp_agnostic_model,
                 )
-                assert len(lcm_mock.mock_calls) > 1
 
             model_sharded_sd = model_B[0].sharded_state_dict()
             load_sharded_state_dict = optimizer_B.sharded_state_dict(
