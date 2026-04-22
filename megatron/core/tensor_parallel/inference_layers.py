@@ -251,34 +251,24 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         is_expert: bool,
         stride: int = 1,
         skip_weight_param_allocation: bool = False,
-        # Accepted for signature compatibility with ColumnParallelLinear but unused at inference.
-        embedding_activation_buffer: Optional[list] = None,
-        grad_output_buffer: Optional[list] = None,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
-        # TEColumnParallelLinear rejects gather_output=True, so always pass
-        # False and handle output gathering ourselves in forward().
-        # TE also does not support skip_weight_param_allocation, so we always
-        # let TE allocate the weight and remove it afterwards when sharing.
         super().__init__(
             input_size,
             output_size,
             config=config,
             init_method=init_method,
-            gather_output=False,
+            gather_output=gather_output,
             bias=bias,
             skip_bias_add=skip_bias_add,
             is_expert=is_expert,
             stride=stride,
-            skip_weight_param_allocation=False,
+            skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
         )
-        if skip_weight_param_allocation:
-            self.weight = None
-        self.gather_output = gather_output
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
 
@@ -292,13 +282,6 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
-
-    def get_extra_state(self) -> None:
-        """
-        Suppress TE's FP8 extra state.
-        This layer bypasses TE's forward and uses _apply_linear.
-        """
-        return None
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -330,32 +313,20 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        weight: Optional[torch.Tensor] = None,
-        runtime_gather_output: Optional[bool] = None,
-    ) -> Tuple[torch.Tensor, None]:
-        """Forward pass."""
-        # Fall back to self.weight when caller passes None (e.g. output layer
-        # without shared embedding weights), matching ColumnParallelLinear.
-        if weight is None:
-            weight = self.weight
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        """
+        Forward pass.
+        """
+        if self.training:
+            return super().forward(x)
+
         if self.tp_size == 1:
-            x = _apply_linear(x, weight, self.config)
+            x = _apply_linear(x, self.weight, self.config)
             return x, None
 
-        if self.sequence_parallel:
-            symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
-            x = self._all_gather(x, symm_mem_buffer)
-
-        x = _apply_linear(x, weight, self.config)
-
-        gather_output = self.gather_output
-        if runtime_gather_output is not None:
-            gather_output = runtime_gather_output
-        if gather_output:
-            x = inference_all_gather_last_dim(x, self.tp_group, self.config)
+        symm_mem_buffer = self._maybe_allocate_symmetric_buffer(x)
+        x = self._all_gather(x, symm_mem_buffer)
+        x = _apply_linear(x, self.weight, self.config)
 
         return x, None
 

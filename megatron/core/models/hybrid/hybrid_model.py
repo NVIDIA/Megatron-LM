@@ -5,6 +5,7 @@ from typing import Literal, Optional
 
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -261,7 +262,7 @@ class HybridModel(LanguageModule):
 
         # Output
         if post_process or self.mtp_process:
-            self.output_layer = self._get_output_layer_cls(config)(
+            self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
