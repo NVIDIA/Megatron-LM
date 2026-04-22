@@ -38,7 +38,7 @@ def rewind_kv_cache_pytorch(
 ):
     """Pure-PyTorch reference for the KV-cache rewind operation.
 
-    Mirrors the original ``TextGenerationController._rewind_kv_cache`` logic
+    Mirrors the original `TextGenerationController._rewind_kv_cache` logic
     (KV-cache portion only, no Mamba state updates).  Mutates the input tensors
     in-place, just like the Triton kernel.
 
@@ -96,7 +96,7 @@ def verify_speculative_tokens_pytorch(
 ):
     """Pure-PyTorch reference for speculative token verification.
 
-    Mirrors the original ``TextGenerationController._verify_speculative_tokens``
+    Mirrors the original `TextGenerationController._verify_speculative_tokens`
     logic.
     """
     if input_tokens.ndim == 2:
@@ -153,7 +153,7 @@ def prepare_next_forward_pass_pytorch(
 ):
     """Pure-PyTorch reference for preparing the next forward pass.
 
-    Mirrors the original ``_dynamic_step_sample_logits_and_verify_tokens``
+    Mirrors the original `_dynamic_step_sample_logits_and_verify_tokens`
     post-verification logic.
     """
     active_request_count = last_one_indices.shape[0]
@@ -186,8 +186,8 @@ def mamba_state_selective_copy_pytorch(
     """Pure-PyTorch reference for Mamba state selective copy.
 
     For each decode request, copies
-    ``intermediate[layer, slot, accepted_count, ...]`` →
-    ``current[layer, slot, ...]`` for every Mamba layer.
+    `intermediate[layer, slot, accepted_count, ...]` →
+    `current[layer, slot, ...]` for every Mamba layer.
     """
     N = prefill_status.shape[0]
     for i in range(N):

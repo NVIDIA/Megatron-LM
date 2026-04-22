@@ -131,7 +131,7 @@ class TestMTPCudaGraphInference:
     ):
         """Build a DynamicInferenceEngine with automatic MTP CUDA graph warmup.
 
-        The engine's ``__init__`` calls ``create_cuda_graphs()`` which captures
+        The engine's `__init__` calls `create_cuda_graphs()` which captures
         both decoder and MTP CUDA graphs, matching production warmup exactly.
         """
         model = self._build_model(
@@ -164,9 +164,9 @@ class TestMTPCudaGraphInference:
     def _get_mtp_warmed_batch_sizes(engine):
         """Return the MTP batch sizes (padded req_counts) warmed by the engine.
 
-        These are the ``n`` values for which MTP CUDA graphs were captured.
-        Hidden states shape is ``[n // tp, 1, H]`` with SP, ``[n, 1, H]`` without.
-        Token/position IDs are always ``[1, n]``.
+        These are the `n` values for which MTP CUDA graphs were captured.
+        Hidden states shape is `[n // tp, 1, H]` with SP, `[n, 1, H]` without.
+        Token/position IDs are always `[1, n]`.
         """
         context = engine.context
         model_config = engine.controller.inference_wrapped_model.model.config
@@ -183,7 +183,7 @@ class TestMTPCudaGraphInference:
 
     @staticmethod
     def _set_mtp_cuda_graph_flag(model, enabled):
-        """Set ``use_mtp_cuda_graphs`` on the model."""
+        """Set `use_mtp_cuda_graphs` on the model."""
         unwrapped = unwrap_model(model)
         unwrapped.use_mtp_cuda_graphs = enabled
 
@@ -193,7 +193,7 @@ class TestMTPCudaGraphInference:
 
         MTP runners are stored in the CudaGraphManager's lookup table
         rather than the global inference record.  A runner with
-        ``fwd_graph_recorded=True`` confirms the graph was captured and
+        `fwd_graph_recorded=True` confirms the graph was captured and
         replayed.
         """
         unwrapped = unwrap_model(model)
@@ -282,8 +282,8 @@ class TestMTPCudaGraphInference:
     def test_cuda_graph_output_matches_eager_with_sp(self, mtp_use_repeated_layer):
         """CUDA graph replay matches eager with sequence parallelism.
 
-        Hidden states are in scattered SP format ``[batch_size/TP, 1, H]``.
-        Token/position IDs remain at full ``[1, batch_size]``.  Both paths
+        Hidden states are in scattered SP format `[batch_size/TP, 1, H]`.
+        Token/position IDs remain at full `[1, batch_size]`.  Both paths
         must produce identical outputs.
         """
         engine = self._build_engine(
@@ -340,7 +340,7 @@ class TestMTPCudaGraphInference:
     @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
     def test_cuda_graph_sp_padding_end_to_end(self, mtp_use_repeated_layer):
-        """Full ``_compute_serial_mtp_and_sample`` with CUDA graphs and SP.
+        """Full `_compute_serial_mtp_and_sample` with CUDA graphs and SP.
 
         Active request counts that are not multiples of TP are padded.
         The engine's CUDA graph warmup pre-captures MTP graphs for the
@@ -599,8 +599,8 @@ class TestMTPCudaGraphInference:
     @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
     def test_eager_fallback_no_matching_graph(self, mtp_use_repeated_layer):
-        """When ``use_mtp_cuda_graphs`` is True but no warmed graph matches the
-        batch size, ``compute_mtp_single_step`` falls back to eager execution.
+        """When `use_mtp_cuda_graphs` is True but no warmed graph matches the
+        batch size, `compute_mtp_single_step` falls back to eager execution.
         The system should produce valid outputs without errors.
         """
         engine = self._build_engine(mtp_use_repeated_layer=mtp_use_repeated_layer)
@@ -642,7 +642,7 @@ class TestMTPCudaGraphInference:
 
     @torch.inference_mode()
     def test_mtp_graph_flag_propagation(self):
-        """``use_mtp_cuda_graphs`` is correctly toggled via the helper."""
+        """`use_mtp_cuda_graphs` is correctly toggled via the helper."""
         model = self._build_model(mtp_num_layers=2)
         unwrapped = unwrap_model(model)
 
@@ -656,11 +656,11 @@ class TestMTPCudaGraphInference:
 
     @torch.inference_mode()
     def test_delete_cuda_graphs_resets_mtp_runners(self):
-        """``delete_cuda_graphs()`` resets MTP CUDA graph runners.
+        """`delete_cuda_graphs()` resets MTP CUDA graph runners.
 
         MTP runners are excluded from the global inference record, so they
-        require special handling in ``delete_cuda_graphs()``.  After deletion,
-        no MTP runners should have ``fwd_graph_recorded=True``.
+        require special handling in `delete_cuda_graphs()`.  After deletion,
+        no MTP runners should have `fwd_graph_recorded=True`.
         """
         engine = self._build_engine()
         model = engine.controller.inference_wrapped_model.model
@@ -704,8 +704,8 @@ _STATE_DIMS = {
 class TestMTPCudaGraphExpertParallel:
     """Tests for MTP CUDA-graphed inference with expert parallelism.
 
-    Follows the test pattern from ``test_mamba_model_expert_parallel_inference.py``.
-    All tests require at least ``_EP_SIZE`` GPUs.
+    Follows the test pattern from `test_mamba_model_expert_parallel_inference.py`.
+    All tests require at least `_EP_SIZE` GPUs.
     """
 
     HIDDEN_SIZE = 32
@@ -940,7 +940,7 @@ class TestMTPCudaGraphExpertParallel:
         """Verify the dummy-rank bail-out path when only decode CUDA graphs
         are available.
 
-        With ``use_cuda_graphs_for_non_decode_steps=False``, only decode-only
+        With `use_cuda_graphs_for_non_decode_steps=False`, only decode-only
         graphs exist. When any EP rank has prefill requests, no graph matches
         and all ranks fall back to eager mode.  The MTP forward for the dummy
         rank must use eager execution without hanging.

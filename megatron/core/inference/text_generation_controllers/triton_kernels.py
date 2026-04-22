@@ -50,7 +50,7 @@ def _rewind_kv_cache_kernel(
 
     Grid: may be padded beyond active requests for CUDA-graph compatibility.
     Each program handles exactly one request.  Programs with
-    ``pid >= num_active_requests`` are padding and produce safe no-op outputs.
+    `pid >= num_active_requests` are padding and produce safe no-op outputs.
     """
     pid = tl.program_id(0)
 
@@ -120,12 +120,12 @@ def rewind_kv_cache(
         num_active_requests: Number of real (non-padding) requests. When the
             grid is padded beyond this count, the kernel skips padding
             programs so stale data in padding slots cannot corrupt
-            bookkeeping.  Defaults to ``accepted_counts.shape[0]`` (no
+            bookkeeping.  Defaults to `accepted_counts.shape[0]` (no
             padding).
 
     Returns:
         (blocks_to_release, remove_mask) — same semantics as the original
-        torch.compile'd ``_rewind_kv_cache`` (KV-cache portion only; Mamba
+        torch.compile'd `_rewind_kv_cache` (KV-cache portion only; Mamba
         state updates are handled separately by the caller).
     """
     N = accepted_counts.shape[0]
@@ -223,7 +223,7 @@ def verify_speculative_tokens(
 
     Returns:
         (last_one_indices, accepted_tokens_mask, input_tokens)
-        matching the original ``_verify_speculative_tokens`` signature.
+        matching the original `_verify_speculative_tokens` signature.
     """
     if input_tokens.ndim == 2:
         input_tokens = input_tokens.squeeze(0)
@@ -416,15 +416,15 @@ def mamba_state_selective_copy(
     """Copy accepted intermediate Mamba states to current states in-place.
 
     For each decode request, copies
-    ``intermediate[layer, slot, accepted_count, ...]`` →
-    ``current[layer, slot, ...]`` for every Mamba layer.
+    `intermediate[layer, slot, accepted_count, ...]` →
+    `current[layer, slot, ...]` for every Mamba layer.
 
     Args:
-        intermediate_states: ``(L, M, S+1, *state_shape)`` — intermediate buffer.
-        current_states: ``(L, M, *state_shape)`` — current state buffer (updated in-place).
-        prefill_status: ``(N,)`` int tensor — 0 for decode, 1 for prefill.
-        state_idx: ``(N,)`` int tensor — mamba state slot index per request.
-        accepted_counts: ``(N,)`` int tensor — accepted token index per request.
+        intermediate_states: `(L, M, S+1, *state_shape)` — intermediate buffer.
+        current_states: `(L, M, *state_shape)` — current state buffer (updated in-place).
+        prefill_status: `(N,)` int tensor — 0 for decode, 1 for prefill.
+        state_idx: `(N,)` int tensor — mamba state slot index per request.
+        accepted_counts: `(N,)` int tensor — accepted token index per request.
         num_layers: number of Mamba layers (first dim of the state tensors).
     """
     N = prefill_status.shape[0]

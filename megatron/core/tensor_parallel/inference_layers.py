@@ -525,12 +525,12 @@ def inference_all_gather_last_dim(
 ) -> torch.Tensor:
     """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
 
-    Replaces ``gather_from_tensor_model_parallel_region`` in inference paths
+    Replaces `gather_from_tensor_model_parallel_region` in inference paths
     where autograd is not needed and NVLS symmetric-memory is available.
 
     The NVLS path performs a flat all-gather into symmetric memory (concatenating
     along dim-0), then rearranges the result to the last dimension — the same
-    semantics as ``_gather_along_last_dim`` but using hardware multicast when
+    semantics as `_gather_along_last_dim` but using hardware multicast when
     possible.
     """
     tp_size = dist.get_world_size(tp_group)

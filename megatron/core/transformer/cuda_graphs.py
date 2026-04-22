@@ -340,7 +340,7 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
-    mtp_cudagraph_managers: list = []
+    mtp_cudagraph_inference_record: list[tuple] = []
 
     """A pool-like data structure to reuse input and output buffers across cudagraph."""
     tensor_reuse_pool = TensorReusePool()
@@ -506,6 +506,7 @@ def delete_cuda_graphs():
     for record in [
         *_CudagraphGlobalRecord.cudagraph_record,
         *_CudagraphGlobalRecord.cudagraph_inference_record,
+        *_CudagraphGlobalRecord.mtp_cudagraph_inference_record,
     ]:
         runner = record[0]
         assert isinstance(runner, _CudaGraphRunner)
@@ -517,20 +518,11 @@ def delete_cuda_graphs():
         runner.bwd_graph = None
         runner.mempool = None
 
-    # Reset MTP runners (excluded from the global inference record).
-    for mgr in _CudagraphGlobalRecord.mtp_cudagraph_managers:
-        for runner in mgr.inference_cudagraphs_lookup_table.values():
-            if runner is not None:
-                runner.cudagraph_created = False
-                runner.fwd_graph_recorded = False
-                runner.fwd_graph = None
-                runner.mempool = None
-        mgr.inference_cudagraphs_lookup_table.clear()
-
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _CudagraphGlobalRecord.mtp_cudagraph_inference_record = []
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -1675,11 +1667,14 @@ class CudaGraphManager(torch.nn.Module):
                     runner.cudagraph_created = True
                     runner = runner.eval()
 
-                    # Record this to the global execution record.
-                    # MTP runners are self-contained and don't chain with
-                    # decoder layers, so skip the record to avoid polluting
-                    # the previous-layer lookup (which expects layer_number).
-                    if not self.is_mtp:
+                    # Record to the global execution record. MTP runners use a
+                    # separate ledger since they don't chain with decoder layers
+                    # (the previous-layer lookup expects layer_number).
+                    if self.is_mtp:
+                        _CudagraphGlobalRecord.mtp_cudagraph_inference_record.append(
+                            (runner, "fwd", args, kwargs)
+                        )
+                    else:
                         _CudagraphGlobalRecord.cudagraph_inference_record.append(
                             (runner, "fwd", args, kwargs)
                         )
