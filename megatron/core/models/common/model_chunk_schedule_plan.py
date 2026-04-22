@@ -194,10 +194,9 @@ class TransformerLayerSchedulePlan:
             f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
             f"but got {type(self.layer).__name__}."
         )
-        fsdp_module = self.layer
 
         # After the last backward op (attn), release backward-pass params.
-        self.attn.set_fsdp_post_backward_reshard_hook(lambda: post_backward_hook(fsdp_module))
+        self.attn.set_post_backward_hook(lambda: post_backward_hook(self.layer))
 
         # Determine the last node in forward order.
         if isinstance(self.moe_combine, NoopScheduleNode):
@@ -206,7 +205,7 @@ class TransformerLayerSchedulePlan:
             last_fwd_node = self.moe_combine
 
         # After the last forward op, release forward-pass params.
-        last_fwd_node.set_fsdp_post_forward_reshard_hook(lambda: post_forward_hook(fsdp_module))
+        last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(self.layer))
 
     def get_fp8_context(self):
         """

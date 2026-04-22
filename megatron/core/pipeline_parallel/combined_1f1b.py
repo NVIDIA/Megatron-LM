@@ -6,6 +6,7 @@ from typing import List, Union
 
 import torch
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
@@ -18,20 +19,6 @@ from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
-
-
-def find_megatron_fsdp(model):
-    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
-    try:
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
-    except ImportError:
-        return None
-    m = model
-    while m is not None:
-        if isinstance(m, MegatronFSDP):
-            return m
-        m = getattr(m, 'module', None)
-    return None
 
 
 def combined_1f1b_schedule_for_no_pipelining(

@@ -22,6 +22,7 @@ from importlib.metadata import version
 from typing import Callable, Optional, Sequence, Union
 
 try:
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     HAVE_MEGATRON_CORE = True
@@ -96,6 +97,18 @@ def is_submodule(module, parent_module, strict=True):
         if m is module:
             return True
     return False
+
+
+def find_megatron_fsdp(model):
+    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    if not HAVE_MEGATRON_CORE:
+        return None
+    m = model
+    while m is not None:
+        if isinstance(m, MegatronFSDP):
+            return m
+        m = getattr(m, 'module', None)
+    return None
 
 
 def get_mesh_names(

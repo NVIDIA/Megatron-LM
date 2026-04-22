@@ -335,14 +335,14 @@ class TransformerLayerNode(ScheduleNode):
         """Execute forward pass and corresponding hooks."""
         output = super().forward(*inputs)
         if self.is_layer_last_node:
-            self._fsdp_post_forward_reshard_hook()
+            self._post_forward_hook()
         return output
 
     def backward(self, *output_grad):
         """Execute backward pass and corresponding hooks."""
         grads = super().backward(*output_grad)
         if not self.delay_wgrad_compute and self.is_layer_first_node:
-            self._fsdp_post_backward_reshard_hook()
+            self._post_backward_hook()
         return grads
 
     def backward_dw(self):
@@ -386,7 +386,7 @@ class TransformerLayerNode(ScheduleNode):
 
         # Execute resharding hook for Megatron FSDP.
         if self.is_layer_first_node:
-            self._fsdp_post_backward_reshard_hook()
+            self._post_backward_hook()
 
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
@@ -397,15 +397,15 @@ class TransformerLayerNode(ScheduleNode):
 
         self.bwd_dw_callables = None
 
-    def set_fsdp_post_forward_reshard_hook(self, hook):
+    def set_post_forward_hook(self, hook):
         """Register a hook to release FSDP params after this node's forward pass."""
         self.is_layer_last_node = True
-        self._fsdp_post_forward_reshard_hook = hook
+        self._post_forward_hook = hook
 
-    def set_fsdp_post_backward_reshard_hook(self, hook):
+    def set_post_backward_hook(self, hook):
         """Register a hook to release FSDP params after this node's backward pass."""
         self.is_layer_first_node = True
-        self._fsdp_post_backward_reshard_hook = hook
+        self._post_backward_hook = hook
 
     def __del__(self):
         # Release reference as early as possible, this helps avoid memory leak.
