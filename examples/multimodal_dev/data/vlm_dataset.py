@@ -156,6 +156,7 @@ class CordV2VLMDataset(Dataset):
 
         # Pad or truncate input_ids to seq_length
         cur_len = len(input_ids)
+        valid_len = min(cur_len, self.seq_length)
         if cur_len > self.seq_length:
             logger.warning(
                 "Truncating input_ids from %d to %d tokens (seq_length). "
@@ -188,6 +189,12 @@ class CordV2VLMDataset(Dataset):
             "input_ids": input_ids,
             "labels": labels,
             "loss_mask": loss_mask,
+            # Provide per-sample cu_seqlens so packed-sequence path can
+            # consume data-side lengths directly (aligned with other
+            # sequence packing code paths).
+            "cu_seqlens": torch.tensor([0, valid_len], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([0, valid_len], dtype=torch.int32),
+            "max_seqlen": torch.tensor(valid_len, dtype=torch.int32),
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
         }

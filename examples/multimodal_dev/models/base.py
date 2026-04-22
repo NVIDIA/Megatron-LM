@@ -172,19 +172,22 @@ class MultimodalModel(MegatronModule):
         pixel_values: Tensor = None,
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
+        packed_seq_params=None,
         **kwargs,
     ):
         """Forward pass.
 
         Args:
-            input_ids: ``[B, S]`` token IDs.
-            position_ids: ``[3, B, S]`` for MRoPE or ``[B, S]``.
-            attention_mask: ``[B, S]`` attention mask.
-            labels: ``[B, S]`` target token IDs.
-            loss_mask: ``[B, S]`` mask for loss computation.
+            input_ids: ``[B, S]`` token IDs (or ``[1, T]`` in THD mode).
+            position_ids: ``[3, B, S]`` for MRoPE or ``[B, S]``
+                (``[3, 1, T]`` / ``[1, T]`` in THD mode).
+            attention_mask: ``[B, S]`` attention mask (None in THD).
+            labels: ``[B, S]`` target token IDs (``[1, T]`` in THD).
+            loss_mask: ``[B, S]`` mask for loss (``[1, T]`` in THD).
             pixel_values: Preprocessed image pixels.
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
             decoder_input: Pre-computed decoder input (skip embed).
+            packed_seq_params: ``PackedSeqParams`` for THD attention.
 
         Returns:
             Loss tensor (post_process=True) or hidden states.
@@ -217,5 +220,6 @@ class MultimodalModel(MegatronModule):
             decoder_input=decoder_input,
             labels=labels,
             loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
         )
         return output

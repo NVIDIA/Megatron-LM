@@ -178,6 +178,11 @@ if [ "$RECOMPUTE" -eq 1 ]; then
     EXP_NAME+="_recompute_decoder"
 fi
 
+USE_PACKED_SEQUENCE=${USE_PACKED_SEQUENCE:-0}
+if [ "$USE_PACKED_SEQUENCE" -eq 1 ]; then
+    EXP_NAME+="_thd"
+fi
+
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 ROOT_DIR="${ROOT_DIR:-${MEGATRON_LM_PATH}/local/}"
 CHECKPOINT_STORE_PATH="${ROOT_DIR}${EXP_NAME}"
@@ -293,6 +298,10 @@ MULTIMODAL_ARGS=(
     --image-seq-length 256
     --vision-num-layers "$VISION_NUM_LAYERS"
 )
+
+if [ "$USE_PACKED_SEQUENCE" -eq 1 ]; then
+    MULTIMODAL_ARGS+=( --use-packed-sequence )
+fi
 
 # --- Qwen3.5 Decoder Architecture (variant-specific dims set above) ---
 # These must match examples/multimodal_dev/models/qwen35_vl/configuration.py
