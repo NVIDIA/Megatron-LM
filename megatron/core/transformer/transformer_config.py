@@ -887,6 +887,17 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    linear_cp_comm_type: Optional[str] = "fla"
+    """Inter-gpu communication type for context parallelism in linear-attention layers
+    (e.g. Gated Delta Net). Independent of `cp_comm_type`, which only controls standard attention.
+    Can be "a2a" or "fla":
+    "a2a": Scatter heads across the CP group (Ulysses-style); each rank runs the linear-attention
+    kernel on the full sequence for a shard of heads. Correct but memory-heavy.
+    "fla": Keep the sequence sharded across CP ranks and use FLA's CP-aware kernels
+    (chunk_gated_delta_rule + causal_conv1d with a CP context). Cheaper memory footprint; requires
+    a chunk-level reshuffle when the input is in Megatron's zigzag load-balanced layout.
+    """
+
     ##################
     # Cuda Graphs
     ##################
@@ -1245,6 +1256,11 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
+            if self.context_parallel_size > 1:
+                assert self.linear_cp_comm_type in ("a2a", "fla"), (
+                    f"linear_cp_comm_type must be one of 'a2a' or 'fla', "
+                    f"got {self.linear_cp_comm_type!r}."
+                )
         elif self.experimental_attention_variant == "dsa":
             pass
 

@@ -274,6 +274,7 @@ class GatedDeltaNet(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ):
@@ -297,16 +298,29 @@ class GatedDeltaNet(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        cp_group_fla = self.pg_collection.cp
-        # TODO(yuzhongw): add a flag to choose A2A or FLA CP.
-        # The A2A path is currently unused; it would need its own single-rank
-        # process group. Creating `torch.distributed.new_group` on every forward
-        # is both wasteful and unsafe under CUDA graph capture (the call touches
-        # collective state that cannot be recorded). Pass None to the A2A
-        # helpers, which already treat a None group as size 1.
-        cp_group_a2a = None
-        cp_size_fla = cp_group_fla.size()
-        cp_size_a2a = 1
+        # Route the CP group to either the A2A (Ulysses-style) path or the FLA
+        # CP-kernel path according to config.linear_cp_comm_type. The two paths
+        # are mutually exclusive — whichever one is active owns the full CP
+        # group, and the other is given a size-1 group (None). The unused-path
+        # helpers already treat a None group as size 1, avoiding a costly and
+        # CUDA-graph-unsafe `torch.distributed.new_group` on every forward.
+        cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
+        if self.config.linear_cp_comm_type == "fla":
+            cp_group_fla = cp_group
+            cp_group_a2a = None
+        elif self.config.linear_cp_comm_type == "a2a":
+            cp_group_fla = None
+            cp_group_a2a = cp_group
+        elif self.pg_collection.cp.size() == 1:
+            cp_group_fla = None
+            cp_group_a2a = None
+        else:
+            raise ValueError(
+                f"Unsupported linear_cp_comm_type {self.config.linear_cp_comm_type!r}; "
+                "expected 'a2a' or 'fla'."
+            )
+        cp_size_fla = cp_group_fla.size() if cp_group_fla is not None else 1
+        cp_size_a2a = cp_group_a2a.size() if cp_group_a2a is not None else 1
 
         seq_len_local, batch, _ = hidden_states.shape
         seq_len_post_a2a = seq_len_local * self.sp_size * cp_size_a2a

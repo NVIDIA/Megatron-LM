@@ -46,15 +46,28 @@ except ImportError:
 
 
 @pytest.mark.parametrize(
-    ("tp_size", "sp", "cp_size"),
-    [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
+    ("tp_size", "sp", "cp_size", "cp_comm_type"),
+    [
+        # cp_size=1: the CP path is inactive, so cp_comm_type choice is irrelevant.
+        # Cover the "fla" default and skip the "a2a" variants for brevity.
+        (1, False, 1, None),
+        (2, False, 1, None),
+        (2, True, 1, None),
+        # cp_size=2: exercise both CP paths.
+        (1, False, 2, "a2a"),
+        (2, False, 2, "a2a"),
+        (2, True, 2, "a2a"),
+        (1, False, 2, "fla"),
+        (2, False, 2, "fla"),
+        (2, True, 2, "fla"),
+    ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
 class TestGatedDeltaNet:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, tp_size, sp, cp_size):
+    def setup_method(self, tp_size, sp, cp_size, cp_comm_type):
         # Initialize parallel and random seed
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
@@ -65,12 +78,15 @@ class TestGatedDeltaNet:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.sp_size = tp_size if sp else 1
-        self.cp_comm_type = "fla"  # TODO: add a flag to choose A2A or FLA CP.
+        self.cp_comm_type = cp_comm_type
         if self.cp_comm_type == "a2a":
             self.cp_size_fla = 1
             self.cp_size_a2a = self.cp_size
         elif self.cp_comm_type == "fla":
             self.cp_size_fla = self.cp_size
+            self.cp_size_a2a = 1
+        elif self.cp_size == 1:
+            self.cp_size_fla = 1
             self.cp_size_a2a = 1
         else:
             raise ValueError(f"Invalid CP communication type: {self.cp_comm_type}")
@@ -100,6 +116,7 @@ class TestGatedDeltaNet:
             context_parallel_size=cp_size,
             experimental_attention_variant="gated_delta_net",
             linear_attention_freq=[1],
+            linear_cp_comm_type=self.cp_comm_type,
             transformer_impl="transformer_engine",
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(
@@ -125,7 +142,7 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = 1 if self.cp_comm_type == "fla" and self.cp_size > 1 else 2
+        micro_batch_size = 1 if (self.cp_comm_type == "fla" and self.cp_size > 1) else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -220,6 +237,8 @@ class TestGatedDeltaNet:
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
+        if self.cp_size > 1 and self.cp_comm_type == "fla":
+            pytest.skip("FLA CP is not supported for this test case.")
 
         atol, rtol = 3e-4, 3e-4
 
@@ -263,6 +282,8 @@ class TestGatedDeltaNet:
     def test_gpu_forward_thd_padding_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
+        if self.cp_size > 1 and self.cp_comm_type == "fla":
+            pytest.skip("FLA CP is not supported for this test case.")
 
         atol, rtol = 3e-4, 3e-4
         sequence_length = 32
@@ -354,18 +375,22 @@ class TestGDNCuSeqlensResolve:
 
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "cp_comm_type"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 2),  # CP
-        (2, False, 2),  # TP w/o SP + CP
-        (2, True, 2),  # TP w/ SP + CP
+        (4, False, 1, None),  # TP w/o SP
+        (4, True, 1, None),  # TP w/ SP
+        (1, False, 2, "a2a"),  # A2A CP
+        (2, False, 2, "a2a"),  # TP w/o SP + A2A CP
+        (2, True, 2, "a2a"),  # TP w/ SP + A2A CP
+        (1, False, 2, "fla"),  # FLA CP
+        (2, False, 2, "fla"),  # TP w/o SP + FLA CP
+        (2, True, 2, "fla"),  # TP w/ SP + FLA CP
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
-    cp_comm_type = "fla"
+def test_parallel_gated_delta_net_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, cp_comm_type
+):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -382,6 +407,7 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         bf16=True,
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1],
+        linear_cp_comm_type=cp_comm_type,
         transformer_impl="transformer_engine",
     )
 
@@ -409,6 +435,6 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         cp=cp,
         seed=123,
         sequence_length=256,
-        micro_batch_size=1 if cp_comm_type == "fla" and cp > 1 else 4,
+        micro_batch_size=1 if (cp_comm_type == "fla" and cp > 1) else 4,
         sequence_packing=sequence_packing,
     )
