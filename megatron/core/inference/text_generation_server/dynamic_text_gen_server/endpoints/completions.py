@@ -248,31 +248,39 @@ try:
                     "top_logprobs": top_logprobs,
                 }
 
-            choices.append(
-                {
-                    "index": request_idx,
-                    "text": text_output,
-                    "logprobs": logprobs_data,
-                    "finish_reason": finish_reason,
-                }
+            choice_data = {
+                "index": request_idx,
+                "text": text_output,
+                "logprobs": logprobs_data,
+                "finish_reason": finish_reason,
+                "prompt_token_ids": result["prompt_tokens"],
+                "generation_token_ids": result["generated_tokens"],
+                "generation_log_probs": result.get("generated_log_probs", []),
+            }
+            choice_data["policy_epoch"] = result["policy_epoch"]
+            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
+            choice_data["num_evictions"] = sum(
+                1 for e in result["events"] if e.get("type") == "EVICT"
             )
+
             if result["routing_indices"] is not None:
-                choices[-1]["moe_topk_indices"] = result["routing_indices"]
+                choice_data["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (
                     len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
                 )
                 if prompt_length:
-                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                    choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_length
                     ]
 
+            choices.append(choice_data)
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         return jsonify(
             {
                 "id": str(uuid.uuid4()),
-                "object": "text_completion",
+                "object": "text_completion", # as per the openAI spec
                 "created": int(time.time()),
                 "model": "EMPTY",
                 "choices": choices,
