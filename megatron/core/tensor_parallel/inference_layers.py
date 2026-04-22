@@ -326,25 +326,6 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
 
-    def _nvls_gather_last_dim(self, x: torch.Tensor) -> torch.Tensor:
-        """NVLS all-gather along last dim, with NCCL fallback."""
-        ag_buffer_dims = list(x.size())
-        ag_buffer_dims[0] *= self.tp_size
-        buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
-        symm_mem_buffer = buf.maybe_get_tensor(ag_buffer_dims, dtype=x.dtype)
-
-        can_use_nvls = (
-            self.triton_nvls_kernels_allowed
-            and are_tensors_nvls_eligible(x)
-            and symm_mem_buffer["handle"] is not None
-        )
-        if can_use_nvls:
-            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
-            tensor_list = symm_mem_buffer["tensor"].chunk(self.tp_size, dim=0)
-            return torch.cat(tensor_list, dim=-1).contiguous()
-
-        return gather_from_tensor_model_parallel_region(x, group=self.tp_group)
-
     def forward(
         self,
         x: torch.Tensor,
@@ -370,7 +351,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         if runtime_gather_output is not None:
             gather_output = runtime_gather_output
         if gather_output:
-            x = self._nvls_gather_last_dim(x)
+            x = inference_all_gather_last_dim(x, self.tp_group, self.config)
 
         return x, None
 

@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 
 @dataclass(order=True, frozen=True)
@@ -273,7 +273,7 @@ class CUDAGraphBatchDimensionBuilder:
             )
             # Align each entry to TP size
             cuda_graph_token_counts = list(
-                dict.fromkeys(math.ceil(s / tp_size) * tp_size for s in cuda_graph_token_counts)
+                dict.fromkeys(round_up_to_nearest_multiple(s, tp_size) for s in cuda_graph_token_counts)
             )
             # Clamp to max tokens
             cuda_graph_token_counts = [
@@ -295,7 +295,7 @@ class CUDAGraphBatchDimensionBuilder:
             math.ceil(int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER)
         )
         # Make sure divisible by TP size
-        cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
+        cuda_graph_step_size = round_up_to_nearest_multiple(cuda_graph_step_size, tp_size)
 
         # round down cuda graph max tokens to be multiple of TP size
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size

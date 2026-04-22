@@ -63,6 +63,7 @@ from megatron.core.utils import (
     internal_api,
     nvtx_range_pop,
     nvtx_range_push,
+    round_up_to_nearest_multiple,
     trace_async_exceptions,
     unwrap_model,
 )
@@ -410,7 +411,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if mtp_warmup_enabled:
                 n = cuda_graph_batch_dimension.req_count
                 if sp_enabled:
-                    n += (tp_size - n % tp_size) % tp_size
+                    n = round_up_to_nearest_multiple(n, tp_size)
                 if n > 0 and n not in mtp_seen_batch_sizes:
                     mtp_seen_batch_sizes.add(n)
                     device = torch.cuda.current_device()
@@ -436,7 +437,7 @@ class DynamicInferenceEngine(AbstractEngine):
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
-            controller._has_mtp_cuda_graphs = True
+            controller.has_mtp_cuda_graphs = True
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.

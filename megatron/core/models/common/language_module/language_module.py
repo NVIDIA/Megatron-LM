@@ -8,6 +8,8 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.tensor_parallel.inference_layers import InferenceColumnParallelLinear
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
@@ -63,19 +65,25 @@ class LanguageModule(MegatronModule):
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
 
+    @staticmethod
+    def _get_output_layer_cls(config: TransformerConfig):
+        """Return the column-parallel class for the output projection layer."""
+        if config.transformer_impl == "inference_optimized":
+            return InferenceColumnParallelLinear
+        return tensor_parallel.ColumnParallelLinear
+
     def _setup_mtp_cuda_graphs(self):
         """Wrap `compute_mtp_single_step` with a CudaGraphManager.
 
         Must be called by subclasses after `self.mtp` is created.
         """
         if self.config.cuda_graph_impl == "local":
-            from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
             self._mtp_cudagraph_manager = CudaGraphManager(
                 self.config,
                 base_module=self,
                 function_name="compute_mtp_single_step",
                 need_backward=False,
+                is_mtp_inference=True,
             )
 
     def _is_in_embd_group(self):

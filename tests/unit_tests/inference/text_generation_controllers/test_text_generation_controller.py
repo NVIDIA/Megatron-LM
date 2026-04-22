@@ -1129,7 +1129,7 @@ class TestTextGenerationController:
         )  # 1 sampled + 2 spec
 
         # Init accepted tokens tensors
-        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._init_mtp_sampling_tensors()
 
         # Mock inputs: [Req 1 sampled, Req 1 spec1, Req 1 spec2, Req 2 sampled, Req 2 spec1, Req 2 spec2]
         # Target tokens (what the model was fed): [T0, T1, T2, T3, T4, T5]
@@ -1216,7 +1216,7 @@ class TestTextGenerationController:
             ctx.mamba_intermediate_conv_states.fill_(77)
 
         # Mock accepted token counts: Req 0 accepts 1 (rejects 2), Req 1 accepts 0 (rejects 3)
-        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._init_mtp_sampling_tensors()
         self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
             [1, 0], device='cuda'
         )
@@ -1446,7 +1446,7 @@ class TestTextGenerationController:
         initial_avail = ctx.kv_block_allocator.total_avail
 
         # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
-        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._init_mtp_sampling_tensors()
         self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
             [1, 0], device='cuda'
         )
@@ -1487,7 +1487,7 @@ class TestTextGenerationController:
         # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
         ctx.kv_block_allocator.total_avail = 50
 
-        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._init_mtp_sampling_tensors()
         self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
             [0], device='cuda'
         )
@@ -1528,7 +1528,7 @@ class TestTextGenerationController:
         ctx.request_kv_length_offsets[:2] = torch.tensor([10, 0], dtype=torch.int32, device='cuda')
         ctx.request_query_lengths[:2] = torch.tensor([3, 15], dtype=torch.int32, device='cuda')
 
-        self.text_generation_controller._init_mtp_sampling_tensor()
+        self.text_generation_controller._init_mtp_sampling_tensors()
         # Mock base token sampling (the first tokens fed into MTP)
         self.text_generation_controller._sampled_tokens_cuda[:2] = torch.tensor(
             [100, 200], device='cuda'
@@ -1603,7 +1603,7 @@ class TestTextGenerationController:
             active_request_count, dtype=torch.int32, device='cuda'
         )
 
-        ctrl._init_mtp_sampling_tensor()
+        ctrl._init_mtp_sampling_tensors()
         ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
             torch.arange(active_request_count, device='cuda'), self.vocab_size
         )

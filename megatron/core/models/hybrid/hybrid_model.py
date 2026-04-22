@@ -262,15 +262,7 @@ class HybridModel(LanguageModule):
 
         # Output
         if post_process or self.mtp_process:
-            if config.transformer_impl == "inference_optimized":
-                from megatron.core.tensor_parallel.inference_layers import (
-                    InferenceColumnParallelLinear,
-                )
-
-                output_layer_cls = InferenceColumnParallelLinear
-            else:
-                output_layer_cls = tensor_parallel.ColumnParallelLinear
-            self.output_layer = output_layer_cls(
+            self.output_layer = self._get_output_layer_cls(config)(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,

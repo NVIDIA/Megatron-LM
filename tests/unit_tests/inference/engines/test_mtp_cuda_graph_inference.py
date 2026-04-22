@@ -391,7 +391,7 @@ class TestMTPCudaGraphInference:
 
             ctrl.num_speculative_tokens = num_spec
             ctrl.num_mtp_heads = num_spec
-            ctrl._init_mtp_sampling_tensor()
+            ctrl._init_mtp_sampling_tensors()
             ctrl._mtp_token_ids_buf.zero_()
             ctrl._mtp_position_ids_buf.zero_()
             ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
@@ -488,7 +488,7 @@ class TestMTPCudaGraphInference:
 
                 ctrl.num_speculative_tokens = num_spec
                 ctrl.num_mtp_heads = num_spec
-                ctrl._init_mtp_sampling_tensor()
+                ctrl._init_mtp_sampling_tensors()
                 ctrl._mtp_token_ids_buf.zero_()
                 ctrl._mtp_position_ids_buf.zero_()
                 ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
@@ -496,11 +496,11 @@ class TestMTPCudaGraphInference:
                 )
 
                 if use_cuda_graph:
-                    ctrl._has_mtp_cuda_graphs = True
+                    ctrl.has_mtp_cuda_graphs = True
                     ctrl._mtp_resolved_padded_count = padded_count
                     self._set_mtp_cuda_graph_flag(model, True)
                 else:
-                    ctrl._has_mtp_cuda_graphs = False
+                    ctrl.has_mtp_cuda_graphs = False
                     ctrl._mtp_resolved_padded_count = None
                     self._set_mtp_cuda_graph_flag(model, False)
 

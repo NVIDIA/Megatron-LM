@@ -1428,6 +1428,7 @@ class CudaGraphManager(torch.nn.Module):
         function_name=None,
         need_backward=True,
         pg_collection=None,
+        is_mtp_inference=False,
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
@@ -1435,13 +1436,14 @@ class CudaGraphManager(torch.nn.Module):
         Args:
             config: TransformerConfig object containing CUDA graph settings for memory
                 pooling, graph retention, gradient accumulation, FP8/FP4, and warmup steps.
+            is_mtp_inference: Whether this manager wraps an MTP inference forward pass.
         """
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
         rng_tracker = get_cuda_rng_tracker()
         self.need_backward = need_backward
-        self.is_mtp = function_name == "compute_mtp_single_step"
+        self.is_mtp_inference = is_mtp_inference
 
         if function_name is not None:
             func = getattr(base_module, function_name)
@@ -1516,7 +1518,6 @@ class CudaGraphManager(torch.nn.Module):
         over different microbatches by tracking their respective fwd and bwd passes.'''
         if reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
-            is_mtp_inference = self.is_mtp
             if is_inference_mode:
                 is_static_batching = kwargs['inference_context'].is_static_batching()
                 if is_static_batching:
@@ -1526,7 +1527,7 @@ class CudaGraphManager(torch.nn.Module):
                 else:
                     padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
                     runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
-            elif is_mtp_inference:
+            elif self.is_mtp_inference:
                 mtp_key = ('mtp', kwargs['hidden_states'].shape, kwargs.get('depth'))
                 runner = self.inference_cudagraphs_lookup_table.get(mtp_key)
             else:
@@ -1571,7 +1572,7 @@ class CudaGraphManager(torch.nn.Module):
                             )
                         else:
                             self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
-                    elif is_mtp_inference:
+                    elif self.is_mtp_inference:
                         self.inference_cudagraphs_lookup_table[mtp_key] = runner
         else:
             # Create cudagraphs for every microbatch
@@ -1604,7 +1605,7 @@ class CudaGraphManager(torch.nn.Module):
         """
         is_inference_mode = (
             'inference_context' in kwargs.keys() and kwargs['inference_context']
-        ) or self.is_mtp
+        ) or self.is_mtp_inference
         is_in_checkpoint_fwd = is_checkpointing()
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
@@ -1623,7 +1624,7 @@ class CudaGraphManager(torch.nn.Module):
                 # MTP must match the main model's eager/graph mode so all EP
                 # ranks take the same code path. Skip during graph capture.
                 if (
-                    self.is_mtp
+                    self.is_mtp_inference
                     and not getattr(megatron_module, 'use_mtp_cuda_graphs', False)
                     and not is_graph_capturing()
                 ):
@@ -1632,7 +1633,7 @@ class CudaGraphManager(torch.nn.Module):
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
 
-                if not runner.fwd_graph_recorded and self.is_mtp and not is_graph_capturing():
+                if not runner.fwd_graph_recorded and self.is_mtp_inference and not is_graph_capturing():
                     # No pre-warmed graph for this batch size — run eagerly.
                     return self.func(*args, **kwargs)
 
@@ -1670,7 +1671,7 @@ class CudaGraphManager(torch.nn.Module):
                     # Record to the global execution record. MTP runners use a
                     # separate ledger since they don't chain with decoder layers
                     # (the previous-layer lookup expects layer_number).
-                    if self.is_mtp:
+                    if self.is_mtp_inference:
                         _CudagraphGlobalRecord.mtp_cudagraph_inference_record.append(
                             (runner, "fwd", args, kwargs)
                         )

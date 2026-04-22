@@ -41,6 +41,7 @@ from megatron.core.utils import (
     get_pg_size,
     nvtx_range_pop,
     nvtx_range_push,
+    round_up_to_nearest_multiple,
     unwrap_model,
 )
 
@@ -98,6 +99,7 @@ class TextGenerationController:
 
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.num_mtp_heads = self._get_mtp_num_heads()
+        self.has_mtp_cuda_graphs = False
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
         if (
@@ -144,12 +146,6 @@ class TextGenerationController:
 
         self._sampling_backend = "torch"
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
-        # Speculative tokens tensor will be allocated later when num_speculative_tokens is set by the engine
-        self._accepted_tokens_per_request = None
-        # MTP tensor will be allocated later when num_speculative_tokens is set by the engine
-        self._sampled_mtp_tokens_cuda = None
-        # Last accepted sequence indices for serial MTP computation
-        self._last_accepted_seq_indices = None
 
         # Keep track of request metadata.
         self._request_metadata: Dict[str, Tensor] = {}
@@ -165,44 +161,51 @@ class TextGenerationController:
         if self._sampling_backend == "torch":
             self._torch_sampling_buckets: List[Tuple] = []
 
-        self._init_mtp_sampling_tensor()
+        # Cache values that are constant across inference steps.
+        self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        self._is_last_pp_stage = is_pipeline_last_stage(self.pp_group)
+        self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
+        self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
 
-    def _init_mtp_sampling_tensor(self):
-        """Initialize the MTP sampling tensor after num_speculative_tokens is set."""
-        if self.num_speculative_tokens is not None and self.num_speculative_tokens > 0:
-            context = self.inference_wrapped_model.inference_context
-            max_requests = context.max_requests
-            device = torch.cuda.current_device()
-            self._sampled_mtp_tokens_cuda = torch.empty(
-                [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
-            )
-            self._accepted_tokens_per_request = (
-                torch.ones(
-                    [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
-                )
-                * -1
-            )
-            self._accepted_token_counts_per_request = torch.zeros(
-                max_requests, dtype=torch.int64, device=device
-            )
-            self._last_accepted_seq_indices_buf = torch.empty(
-                max_requests, dtype=torch.int64, device=device
-            )
+        self._init_mtp_sampling_tensors()
 
-            # Cache values that are constant across inference steps.
-            self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-            self._is_last_pp_stage = is_pipeline_last_stage(self.pp_group)
-            self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
-            self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
-            self._num_mtp_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+    def _init_mtp_sampling_tensors(self):
+        """Pre-allocate MTP sampling tensors.
 
-            # Pre-allocate padded buffers for per-depth token/position IDs.
-            self._mtp_token_ids_buf = torch.empty(
-                [1, max_requests], dtype=torch.int64, device=device
+        Addresses must be stable across steps for CUDA graph capture.
+        """
+        if not self.num_speculative_tokens:
+            self._sampled_mtp_tokens_cuda = None
+            self._accepted_tokens_per_request = None
+            self._last_accepted_seq_indices = None
+            return
+
+        context = self.inference_wrapped_model.inference_context
+        max_requests = context.max_requests
+        device = torch.cuda.current_device()
+        self._sampled_mtp_tokens_cuda = torch.empty(
+            [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
+        )
+        self._accepted_tokens_per_request = (
+            torch.ones(
+                [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
             )
-            self._mtp_position_ids_buf = torch.empty(
-                [1, max_requests], dtype=torch.int64, device=device
-            )
+            * -1
+        )
+        self._accepted_token_counts_per_request = torch.zeros(
+            max_requests, dtype=torch.int64, device=device
+        )
+        self._last_accepted_seq_indices_buf = torch.empty(
+            max_requests, dtype=torch.int64, device=device
+        )
+        self._last_accepted_seq_indices = None
+        self._num_mtp_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
+        self._mtp_token_ids_buf = torch.empty(
+            [1, max_requests], dtype=torch.int64, device=device
+        )
+        self._mtp_position_ids_buf = torch.empty(
+            [1, max_requests], dtype=torch.int64, device=device
+        )
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -610,14 +613,15 @@ class TextGenerationController:
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
 
-        # Derive the MTP padded batch size from the EP-synced graph dimensions.
-        # In eager mode MTP uses locally SP-aligned batch size instead.
-        if getattr(self, '_has_mtp_cuda_graphs', False) and context.using_cuda_graph_this_step():
+        # Derive the MTP padded batch size from the existing padded graph dimensions.
+        # For MoE models this is post EP sync. In eager mode MTP uses locally SP-aligned
+        # batch size instead.
+        if self.has_mtp_cuda_graphs and context.using_cuda_graph_this_step():
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
             if self._sp_enabled:
-                self._mtp_resolved_padded_count += (
-                    self._tp_size - self._mtp_resolved_padded_count % self._tp_size
-                ) % self._tp_size
+                self._mtp_resolved_padded_count = round_up_to_nearest_multiple(
+                    self._mtp_resolved_padded_count, self._tp_size
+                )
         else:
             self._mtp_resolved_padded_count = None
 
@@ -625,7 +629,7 @@ class TextGenerationController:
         # main model falls back to eager mode, MTP must also run eagerly across
         # all EP ranks — otherwise some ranks may replay a captured graph while
         # others run eagerly, causing EP collectives to hang.
-        if getattr(self, '_has_mtp_cuda_graphs', False):
+        if self.has_mtp_cuda_graphs:
             unwrapped_model.use_mtp_cuda_graphs = context.using_cuda_graph_this_step()
 
         # If using symmetric kernels and we are using using nccl
@@ -899,7 +903,7 @@ class TextGenerationController:
             # Eager path: pad only for SP alignment.
             padded_count = active_request_count
             if self._sp_enabled:
-                padded_count += (self._tp_size - padded_count % self._tp_size) % self._tp_size
+                padded_count = round_up_to_nearest_multiple(padded_count, self._tp_size)
         else:
             padded_count = active_request_count
         pad_count = padded_count - active_request_count
