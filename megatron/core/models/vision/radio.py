@@ -11,6 +11,7 @@ from torch import nn
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -89,7 +90,7 @@ class RADIOViTModel(VisionModule):
         temporal_patch_dim: int = 1,
         temporal_ckpt_compat: bool = False,  # allow_checkpoint_without_temporal_compression
         separate_video_embedder: bool = False,
-        pg_collection=None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=transformer_config)
@@ -109,12 +110,14 @@ class RADIOViTModel(VisionModule):
 
         self.input_dims = (img_h // patch_dim, img_w // patch_dim)
 
+        # used for positional embedding
         self.max_img_h = max_img_h
         self.max_img_w = max_img_w
         self.max_num_rows = max_img_h // patch_dim
         self.max_num_cols = max_img_w // patch_dim
         self.max_num_patches = self.max_num_rows * self.max_num_cols
-
+        
+        # TODO: are we actually going to use this anywhere?
         self.use_mask_token = use_mask_token
         if self.use_mask_token:
             self.mask_token = nn.Parameter(torch.zeros(1, self.visual_hidden_size))
@@ -412,12 +415,12 @@ class RADIOViTModel(VisionModule):
         if self.ln_pre:
             x = self.ln_pre(x)
 
-        x = x.permute(1, 0, 2)
+        x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
 
         x = self.decoder(x, attention_mask=attention_mask, packed_seq_params=packed_seq_params)
 
-        x = x.permute(1, 0, 2)
+        x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
 
         if self.ln_post:
