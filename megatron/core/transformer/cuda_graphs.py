@@ -1422,6 +1422,7 @@ class CudaGraphManager(torch.nn.Module):
         need_backward=True,
         pg_collection=None,
         inline_capture=False,
+        num_warmup_steps=None,
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
@@ -1432,8 +1433,10 @@ class CudaGraphManager(torch.nn.Module):
             inline_capture: Normally, whether the inline capture path is taken depends on whether
                 `inference_context` is present in the kwargs of the forward call.
                 Setting this argument to True always forces the inline capture path to be taken.
+            num_warmup_steps: If set, overrides the per-runner warmup step count.
         """
         self._inline_capture = inline_capture
+        self._num_warmup_steps = num_warmup_steps
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -1552,8 +1555,8 @@ class CudaGraphManager(torch.nn.Module):
                         self.func,
                         self.need_backward,
                     )
-                    if self._inline_capture:
-                        runner.num_warmup_steps = 0
+                    if self._num_warmup_steps is not None:
+                        runner.num_warmup_steps = self._num_warmup_steps
                     self.cudagraph_runners.append(runner)
                     if cache_key is not None:
                         self.custom_cudagraphs_lookup_table[cache_key] = runner
