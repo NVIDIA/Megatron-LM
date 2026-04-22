@@ -12,7 +12,14 @@ class MHAMetadata(MetadataBase):
     """
 
     def __init__(
-        self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
+        self,
+        block_count_total,
+        max_kv_block_count,
+        max_requests,
+        block_size_tokens,
+        max_seqlen,
+        dummy_block_idx: int = -1,
+        enable_phantom_padding: bool = False,
     ):
         super().__init__()
         device = torch.cuda.current_device()
@@ -21,6 +28,8 @@ class MHAMetadata(MetadataBase):
         self.max_kv_blocks = max_kv_block_count
         self.max_bs = max_requests
         self.max_seqlen = max_seqlen
+        self._dummy_block_idx = dummy_block_idx
+        self._enable_phantom_padding = enable_phantom_padding
         self._query_lengths_buf = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
         self._cu_query_seq_lengths_buf = torch.zeros(
             self.max_bs + 1, dtype=torch.int32, device=device
@@ -88,9 +97,10 @@ class MHAMetadata(MetadataBase):
             real_batch_size,
             padded_active_request_count,
             pad_value=torch.tensor(self.max_kv_blocks, dtype=torch.int32, device=self.device).fill_(
-                -1
+                self._dummy_block_idx
             ),
         )
+
         self._cu_kv_seq_lengths_buf[0] = 0
         self.tensor_copy_and_pad(
             self._cu_kv_seq_lengths_buf[1:],
@@ -99,6 +109,39 @@ class MHAMetadata(MetadataBase):
             padded_active_request_count,
             is_cumulative_tensor=True,
         )
+
+        # When phantom padding is enabled and there are phantom requests with
+        # phantom tokens, fill phantom slots with correct query/kv lengths so
+        # that sum(query_lengths) == padded_token_count.  Without this, padding
+        # slots have query_length=0, leaving token positions unowned during
+        # CUDA graph replay.
+        phantom_count = padded_active_request_count - real_batch_size
+        phantom_tokens = padded_active_token_count - batch_dimensions.token_count
+        if self._enable_phantom_padding and phantom_count > 0 and phantom_tokens > 0:
+            per_phantom = phantom_tokens // phantom_count
+            rem_phantom = phantom_tokens % phantom_count
+            phantom_slice = slice(real_batch_size, padded_active_request_count)
+
+            self._query_lengths_buf[phantom_slice] = per_phantom
+            if rem_phantom > 0:
+                self._query_lengths_buf[real_batch_size : real_batch_size + rem_phantom] += 1
+
+            # Phantom requests have no prior KV, so kv_seq_length = query_length.
+            self._kv_seq_lengths_buf[phantom_slice] = self._query_lengths_buf[phantom_slice]
+
+            # Recompute cumulative sums now that phantom slots are non-zero.
+            self._cu_query_seq_lengths_buf[0] = 0
+            torch.cumsum(
+                self._query_lengths_buf[:padded_active_request_count],
+                dim=0,
+                out=self._cu_query_seq_lengths_buf[1 : padded_active_request_count + 1],
+            )
+            self._cu_kv_seq_lengths_buf[0] = 0
+            torch.cumsum(
+                self._kv_seq_lengths_buf[:padded_active_request_count],
+                dim=0,
+                out=self._cu_kv_seq_lengths_buf[1 : padded_active_request_count + 1],
+            )
 
         if padded_batch_dimensions.prefill_req_count == 0:
             self._max_seqlen_q = num_speculative_tokens + 1
@@ -139,10 +182,23 @@ class GraphedMHAMetadata(MHAMetadata):
     """
 
     def __init__(
-        self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
+        self,
+        block_count_total,
+        max_kv_block_count,
+        max_requests,
+        block_size_tokens,
+        max_seqlen,
+        dummy_block_idx: int = -1,
+        enable_phantom_padding: bool = False,
     ):
         super().__init__(
-            block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
+            block_count_total,
+            max_kv_block_count,
+            max_requests,
+            block_size_tokens,
+            max_seqlen,
+            dummy_block_idx=dummy_block_idx,
+            enable_phantom_padding=enable_phantom_padding,
         )
 
     def update(

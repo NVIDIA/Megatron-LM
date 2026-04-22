@@ -555,17 +555,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             "to have consistency between cuda graph sizes and the block table size."
         )
 
-        # When a model uses both EP and Mamba, there are conflicting requirements for the
-        # token_count sync between different ranks.
-        # In order to fix this, we must prevent the request scheduler from using all `max_requests`
-        # requests slots, in order reserve extra slots.
+        # Phantom padding: when EP + Mamba requires all EP ranks to agree on padded batch dimensions
+        # a rank may end up with padded_batch_dimensions that asks for more than `max_requests`.
+        # Phantom padding reserves a spare request slot and handles the attention metadata.
+
+        # If the MoE dispatcher can handle variable token counts natively, this flag is not needed.
+        self._enable_phantom_padding = True
+
+        # Reserve request slots so that after strict EP sync the total
+        # (prefill + decode) fits within max_requests.
         model_sync_needs_reservation = (
-            self.expert_model_parallel_group is not None
+            self._enable_phantom_padding
+            and self.expert_model_parallel_group is not None
             and get_pg_size(self.expert_model_parallel_group) > 1
             and self.is_hybrid_model
         )
-        # One extra slot is sufficient for eager mode.
-        # `cuda_graph_mixed_prefill_count` extra slots are needed for graphed mode.
         prefill_reservation = (
             (inference_config.cuda_graph_mixed_prefill_count or 1)
             if model_sync_needs_reservation
@@ -584,6 +588,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
+            dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
+            enable_phantom_padding=self._enable_phantom_padding,
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
@@ -592,6 +598,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
+            dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
+            enable_phantom_padding=self._enable_phantom_padding,
         )
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
@@ -1026,16 +1034,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Return if this iteration we run decode only implementation.
 
-        Uses padded_batch_dimensions because it reflects the
-        post-expert-parallel sync state (including phantom prefill
-        requests injected for EP+Mamba token-count alignment).
-
-        Must only be called after initialize_attention_state has set
-        padded_batch_dimensions for this step. Callers that run before
-        that point (engine logging, padding computation) should check
-        num_prefill_requests directly.
+        When CUDA graphs are active, uses padded_batch_dimensions because it
+        reflects the post-expert-parallel sync state.  Otherwise falls back to
+        num_prefill_requests which is always up-to-date regardless of where we
+        are in the step lifecycle.
         """
-        return self.padded_batch_dimensions.prefill_req_count == 0
+        if self._using_cuda_graph_this_step:
+            return self.padded_batch_dimensions.prefill_req_count == 0
+        return self.num_prefill_requests == 0
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
@@ -1712,31 +1718,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 padded_decode_req_count = self.num_decode_requests
                 padded_prefill_req_count = target_padding_req_count - padded_decode_req_count
-            # Sync padded_token_count across EP ranks so that MoE all-to-all
-            # sees identical tensor sizes on every rank.
-            ep_group = self.expert_model_parallel_group
-            if ep_group is not None:
-                ep_size = get_pg_size(ep_group)
-                if ep_size > 1:
-                    sync_tensor = torch.tensor(
-                        [padded_token_count], dtype=torch.int32, device=torch.cuda.current_device()
-                    )
-                    torch.distributed.all_reduce(
-                        sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
-                    )
-                    padded_token_count = int(sync_tensor[0].item())
-
-            # Clamp to max_tokens; max_tokens may differ across EP ranks.
-            padded_token_count = min(padded_token_count, self.max_tokens)
-
-            # As discussed previously (see `model_sync_needs_reservation`),
-            # When a model uses both EP and Mamba, there are conflicting requirements.
-            # We must inject an extra phantom prefill to prevent tensor mismatches.
-            if self.is_hybrid_model:
-                decode_token_budget = padded_decode_req_count * (self.num_speculative_tokens + 1)
-                if padded_token_count > decode_token_budget and padded_prefill_req_count == 0:
-                    padded_prefill_req_count = 1
-
             self.padded_batch_dimensions = InferenceBatchDimensions(
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
@@ -1782,34 +1763,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     decode_req_count=adjusted_decode_req_count,
                 )
 
-        # Handle phantom tokens and requests added for Mamba + MoE.
-        mamba_dimensions = attn_dimensions
-        phantom_count = self.padded_batch_dimensions.req_count - attn_dimensions.req_count
-        phantom_tokens = self.padded_batch_dimensions.token_count - attn_dimensions.token_count
-        if phantom_count > 0 and phantom_tokens > 0:
-            per_phantom = phantom_tokens // phantom_count
-            rem_phantom = phantom_tokens % phantom_count
-            end = self.total_request_count
-            phantom_slice = slice(end, end + phantom_count)
-            self.request_query_lengths[phantom_slice] = per_phantom
-            if rem_phantom > 0:
-                self.request_query_lengths[end : end + rem_phantom] += 1
-            self.request_kv_length_offsets[phantom_slice] = 0
-            self.request_to_kv_block_ids[phantom_slice] = (
-                self.kv_block_allocator.dummy_block_idx
-            )
-            # Expand views to include phantoms so mha_metadata.update()
-            # sees all requests and computes cu_query_seq_lengths correctly.
-            expanded_slice = slice(self.paused_request_count, end + phantom_count)
-            query_lengths_view = self.request_query_lengths[expanded_slice]
-            request_kv_length_offsets_view = self.request_kv_length_offsets[expanded_slice]
-            request_to_kv_block_ids_view = self.request_to_kv_block_ids[expanded_slice]
-            attn_dimensions = InferenceBatchDimensions(
-                token_count=self.padded_batch_dimensions.token_count,
-                prefill_req_count=attn_dimensions.prefill_req_count + phantom_count,
-                decode_req_count=attn_dimensions.decode_req_count,
-            )
-
         assert self.active_attn_metadata is not None
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=query_lengths_view,
@@ -1832,25 +1785,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
                     self.mamba_slot_allocator.get_intermediate_gpu_data()
                 )
-            # Mamba metadata must avoid phantom prefills.
             self.mamba_metadata.update(
                 active_mamba_indices_view,
                 token_to_request_idx_view,
                 cu_seqlens,
-                batch_dimensions=mamba_dimensions,
+                batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
                 enable_chunked_prefill=self.is_chunked_prefill_enabled(),
                 intermediate_offsets_gpu=intermediate_offsets_gpu,
                 intermediate_counts_gpu=intermediate_counts_gpu,
             )
-
-        # Clean up phantom data from request-level buffers now that the metadata is built.
-        if phantom_count > 0 and phantom_tokens > 0:
-            end = self.total_request_count
-            phantom_slice = slice(end, end + phantom_count)
-            self.request_to_kv_block_ids[phantom_slice] = -1
-            self.request_query_lengths[phantom_slice] = 0
-            self.request_kv_length_offsets[phantom_slice] = 0
 
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
