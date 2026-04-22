@@ -8,6 +8,7 @@ import inspect
 import logging
 import time
 from abc import ABC
+from typing import TYPE_CHECKING, Any
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.dist_checkpointing.strategies.nvrx import (
@@ -18,8 +19,12 @@ from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
 
-try:
+if TYPE_CHECKING:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
+else:
+    NVRxAsyncRequest = Any
+
+try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import _results_queue
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         save_state_dict_async_finalize,
@@ -29,8 +34,6 @@ except (ImportError, ModuleNotFoundError):
     from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
         save_state_dict_async_finalize,
     )
-
-    NVRxAsyncRequest = ABC
 
 logger = logging.getLogger(__name__)
 

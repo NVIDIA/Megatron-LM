@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from itertools import product
 from logging import getLogger
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 from packaging.version import Version as PkgVersion
 import torch
 from torch.distributed import checkpoint
@@ -52,14 +52,14 @@ from .async_utils import AsyncRequest
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 from .nvrx import filter_supported_kwargs, has_nvrx_async_support, make_nvrx_async_request
 
-try:
+if TYPE_CHECKING:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         CheckpointMetadataCache,
     )
-except (ImportError, ModuleNotFoundError):
-    CheckpointMetadataCache = ABC
-    NVRxAsyncRequest = ABC
+else:
+    CheckpointMetadataCache = Any
+    NVRxAsyncRequest = Any
 
 HAVE_NVRX = has_nvrx_async_support()
 
