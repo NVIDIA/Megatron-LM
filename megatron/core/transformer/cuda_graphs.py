@@ -1633,7 +1633,11 @@ class CudaGraphManager(torch.nn.Module):
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
 
-                if not runner.fwd_graph_recorded and self.is_mtp_inference and not is_graph_capturing():
+                if (
+                    not runner.fwd_graph_recorded
+                    and self.is_mtp_inference
+                    and not is_graph_capturing()
+                ):
                     # No pre-warmed graph for this batch size — run eagerly.
                     return self.func(*args, **kwargs)
 

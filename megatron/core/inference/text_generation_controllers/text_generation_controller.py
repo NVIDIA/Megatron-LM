@@ -200,9 +200,7 @@ class TextGenerationController:
         )
         self._last_accepted_seq_indices = None
         self._num_mtp_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
-        self._mtp_token_ids_buf = torch.empty(
-            [1, max_requests], dtype=torch.int64, device=device
-        )
+        self._mtp_token_ids_buf = torch.empty([1, max_requests], dtype=torch.int64, device=device)
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
         )

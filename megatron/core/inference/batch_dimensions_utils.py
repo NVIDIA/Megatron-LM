@@ -273,7 +273,9 @@ class CUDAGraphBatchDimensionBuilder:
             )
             # Align each entry to TP size
             cuda_graph_token_counts = list(
-                dict.fromkeys(round_up_to_nearest_multiple(s, tp_size) for s in cuda_graph_token_counts)
+                dict.fromkeys(
+                    round_up_to_nearest_multiple(s, tp_size) for s in cuda_graph_token_counts
+                )
             )
             # Clamp to max tokens
             cuda_graph_token_counts = [
