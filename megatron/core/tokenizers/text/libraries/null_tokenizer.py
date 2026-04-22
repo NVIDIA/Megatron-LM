@@ -89,7 +89,7 @@ class NullTokenizer:
     @property
     def pad_id(self):
         """Returns pad token."""
-        return 0
+        return -1
 
     @property
     def additional_special_tokens_ids(self):
