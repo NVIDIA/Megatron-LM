@@ -86,6 +86,13 @@ class CordV2VLMDataset(Dataset):
         image_size: Resize all images to ``(image_size, image_size)``.
         image_token_id: Token ID for image placeholders.
         target_length: Virtual dataset length (repeats examples if needed).
+    
+    NOTE:
+        For qwen3.5 vl processor, an example is below.
+            - For images, the processor duplicates the frame so T=2, which makes the 3D conv behave exactly like a 2D conv on one image, to support both image and video inputs.
+            - image_array, 448 * 448 * 3
+            - pixel_values.shape (28 * 28, 1536 = 16 * 16 * 3 * 2)
+            - image_grid_thw, 1, 28, 28 (H/16, W/16)
     """
 
     def __init__(
@@ -102,7 +109,6 @@ class CordV2VLMDataset(Dataset):
         self.seq_length = seq_length
         self.image_size = (image_size, image_size)
         self._length = target_length if target_length else len(examples)
-
         tok = processor.tokenizer
         self.pad_token_id = tok.pad_token_id if tok.pad_token_id is not None else 0
 
@@ -154,32 +160,13 @@ class CordV2VLMDataset(Dataset):
         pixel_values = batch["pixel_values"]       # [total_patches, pixel_dim]
         image_grid_thw = batch["image_grid_thw"]   # [1, 3]
 
-        # Pad or truncate input_ids to seq_length
-        cur_len = len(input_ids)
-        valid_len = min(cur_len, self.seq_length)
-        if cur_len > self.seq_length:
-            logger.warning(
-                "Truncating input_ids from %d to %d tokens (seq_length). "
-                "Consider increasing --seq-length to avoid dropping tokens.",
-                cur_len,
-                self.seq_length,
-            )
-            input_ids = input_ids[: self.seq_length]
-        else:
-            pad = torch.full(
-                (self.seq_length - cur_len,),
-                self.pad_token_id,
-                dtype=input_ids.dtype,
-            )
-            input_ids = torch.cat([input_ids, pad])
-
         # Labels: shifted next-token prediction targets
         labels = input_ids.clone()
         labels[:-1] = input_ids[1:]
         labels[-1] = -100
 
         # Loss mask: 1 for trainable positions, 0 for padding / image tokens
-        loss_mask = torch.ones(self.seq_length, dtype=torch.float32)
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
         loss_mask[input_ids == self.pad_token_id] = 0.0
         if self.image_token_id is not None:
             loss_mask[input_ids == self.image_token_id] = 0.0
@@ -189,12 +176,6 @@ class CordV2VLMDataset(Dataset):
             "input_ids": input_ids,
             "labels": labels,
             "loss_mask": loss_mask,
-            # Provide per-sample cu_seqlens so packed-sequence path can
-            # consume data-side lengths directly (aligned with other
-            # sequence packing code paths).
-            "cu_seqlens": torch.tensor([0, valid_len], dtype=torch.int32),
-            "cu_seqlens_padded": torch.tensor([0, valid_len], dtype=torch.int32),
-            "max_seqlen": torch.tensor(valid_len, dtype=torch.int32),
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
         }

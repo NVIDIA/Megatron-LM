@@ -4,8 +4,10 @@
 
 from functools import partial
 from typing import Any, Dict, Iterator
+import math
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -13,8 +15,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
-from megatron.core.utils import unwrap_model
-
+from megatron.core import mpu
+from itertools import accumulate
+from megatron.training import get_args
 
 # -------------------------------------------------------------------
 # dtype <-> int mapping for cross-rank broadcast
@@ -185,150 +188,79 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
-def _extract_valid_mask_and_lengths(
-    batch: Dict[str, Any], seq_len: int, device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Resolve per-token validity mask and per-sample lengths.
 
-    Priority:
-    1) ``batch["cu_seqlens"]`` from data pipeline (preferred).
-    2) ``batch["attention_mask"]``.
-    3) Full-length fallback.
-    """
-    B = batch["input_ids"].shape[0]
-    cu_seqlens = batch.get("cu_seqlens", None)
-    if cu_seqlens is not None:
-        cs = cu_seqlens.to(device=device, dtype=torch.int32)
-        if cs.dim() == 2 and cs.shape[0] == B:
-            if cs.shape[1] != 2:
-                raise ValueError(
-                    "Multi-segment cu_seqlens in [B, N] format is not supported yet; "
-                    f"expected [B, 2], got [B, {cs.shape[1]}]"
-                )
-            # Per-sample cu_seqlens, usually [B, 2] => [[0, L_i], ...].
-            seq_lengths = cs[:, 1] - cs[:, 0]
-        elif cs.dim() == 1 and cs.numel() == B + 1:
-            # Already a packed cumulative vector for this microbatch.
-            seq_lengths = cs[1:] - cs[:-1]
-        else:
-            raise ValueError(
-                f"Unsupported cu_seqlens shape {tuple(cs.shape)} for batch size {B}"
-            )
-        seq_lengths = seq_lengths.clamp(min=0, max=seq_len)
-        arange_s = torch.arange(seq_len, device=device).unsqueeze(0)
-        valid_mask = arange_s < seq_lengths.unsqueeze(1)
-        cu_for_pack = torch.zeros(
-            seq_lengths.numel() + 1, dtype=torch.int32, device=device,
+
+def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=False, seq_length: int=None) -> list[Dict[str, Any]]:
+    """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD format."""
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    cp_size = mpu.get_context_parallel_world_size()
+    
+    divisible_by = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    # NOTE: don't consider fp8 padding now
+    
+    if use_packed_sequence:
+        input_ids_list, labels_list, loss_mask_list, pixel_values_list, image_grid_thw_list = [], [], [], [], []
+        seqlens_list, seqlens_padded_list = [], []
+
+        # NOTE: for attention_mask, we don't use attention mask
+        #       for position_ids, let model handle it itself
+        #       we don't cut input id, althrough it exceeds seq_length
+
+        packed_batch = dict()
+
+        for sample in batch:
+            seqlen = sample["input_ids"].shape[0]
+            assert sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape, "labels, input_ids, and loss_mask must have the same shape"
+            target_len = math.ceil(seqlen / divisible_by) * divisible_by
+            input_ids = F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
+            labels = F.pad(sample["labels"], (0, target_len - seqlen), value=-100)
+            loss_mask = F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0)
+
+            input_ids_list.append(input_ids)
+            labels_list.append(labels)
+            loss_mask_list.append(loss_mask)
+            seqlens_list.append(seqlen)
+            seqlens_padded_list.append(target_len)
+            pixel_values_list.append(sample["pixel_values"])
+            image_grid_thw_list.append(sample["image_grid_thw"])
+
+        cu_seqlens = list(accumulate(seqlens_list, initial=0))
+        cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
+
+        packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
+        packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
+        packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+
+        # TODO, maybe pixel_values's seqlens needs to be recorded. 
+        packed_batch["pixel_values"] = torch.concat(pixel_values_list)
+        packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+
+        packed_batch["packed_seq_params"] = PackedSeqParams(
+            cu_seqlens_q=torch.tensor(cu_seqlens, dtype=torch.int32),
+            cu_seqlens_kv=torch.tensor(cu_seqlens, dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor(cu_seqlens_padded, dtype=torch.int32),
+            cu_seqlens_kv_padded=torch.tensor(cu_seqlens_padded, dtype=torch.int32),
+            max_seqlen_q=max(seqlens_padded_list),
+            max_seqlen_kv=max(seqlens_padded_list),
         )
-        torch.cumsum(seq_lengths, dim=0, out=cu_for_pack[1:])
-        return valid_mask, seq_lengths, cu_for_pack
-
-    attention_mask = batch.get("attention_mask", None)
-    if attention_mask is not None:
-        am = attention_mask.to(device=device)
-        if am.dim() > 2:
-            am = am.any(dim=-1)
-            if am.dim() == 3:
-                am = am.squeeze(1)
-        valid_mask = am.to(dtype=torch.bool)
-        seq_lengths = valid_mask.sum(dim=1, dtype=torch.int32)
-        cu_for_pack = torch.zeros(
-            seq_lengths.numel() + 1, dtype=torch.int32, device=device,
-        )
-        torch.cumsum(seq_lengths, dim=0, out=cu_for_pack[1:])
-        return valid_mask, seq_lengths, cu_for_pack
-
-    seq_lengths = torch.full(
-        (B,), seq_len, dtype=torch.int32, device=device,
-    )
-    valid_mask = torch.ones(B, seq_len, dtype=torch.bool, device=device)
-    cu_for_pack = torch.arange(
-        0, (B + 1) * seq_len, step=seq_len, dtype=torch.int32, device=device,
-    )
-    return valid_mask, seq_lengths, cu_for_pack
-
-
-def _pack_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
-    """Pack a ``[B, S]`` batch into ``[1, T]`` THD format.
-
-    Concatenates valid tokens from each sample (stripping padding),
-    builds ``PackedSeqParams``, and stores it in
-    ``batch["packed_seq_params"]``.
-
-    Args:
-        batch: Dict with ``input_ids [B, S]``, ``position_ids [3, B, S]``,
-               ``labels [B, S]``, ``loss_mask [B, S]``, and optionally
-               ``attention_mask [B, S]``.
-
-    Returns:
-        Mutated *batch* dict with packed tensors.
-    """
-    input_ids = batch["input_ids"]  # [B, S]
-    _, S = input_ids.shape
-    device = input_ids.device
-
-    valid_mask, seq_lengths, cu_for_pack = _extract_valid_mask_and_lengths(
-        batch, seq_len=S, device=device,
-    )
-    is_full_length = bool(torch.all(seq_lengths == S).item())
-
-    # Pack input_ids: [B, S] -> [1, T]
-    if is_full_length:
-        batch["input_ids"] = input_ids.reshape(1, -1)
+        return packed_batch
     else:
-        batch["input_ids"] = input_ids[valid_mask].unsqueeze(0)
+        assert seq_length is not None, "seq_length must be provided when use_packed_sequence is False"
+        max_seqlens = max([x["input_ids"].shape[0] for x in batch])
+        target_seqlens = min(max_seqlens, seq_length)
+        padded_batch = dict()
+        
+        for sample in batch:
+            sample["input_ids"] = F.pad(sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]), value=0)
+            sample["labels"] = F.pad(sample["labels"], (0, target_seqlens - sample["labels"].shape[0]), value=-100)
+            sample["loss_mask"] = F.pad(sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]), value=0)
 
-    # Pack labels: [B, S] -> [1, T]
-    if batch.get("labels") is not None:
-        labels = batch["labels"]
-        if is_full_length:
-            batch["labels"] = labels.reshape(1, -1)
-        else:
-            batch["labels"] = labels[valid_mask].unsqueeze(0)
-
-    # Pack loss_mask: [B, S] -> [1, T]
-    if batch.get("loss_mask") is not None:
-        loss_mask = batch["loss_mask"]
-        if is_full_length:
-            batch["loss_mask"] = loss_mask.reshape(1, -1)
-        else:
-            batch["loss_mask"] = loss_mask[valid_mask].unsqueeze(0)
-
-    # Pack position_ids: [3, B, S] -> [3, 1, T] or [B, S] -> [1, T]
-    if batch.get("position_ids") is not None:
-        pos = batch["position_ids"]
-        if pos.dim() == 3 and pos.shape[0] == 3:
-            # MRoPE: [3, B, S] -> [3, 1, T]
-            if is_full_length:
-                batch["position_ids"] = pos.reshape(3, 1, -1)
-            else:
-                packed_pos = [pos[d][valid_mask] for d in range(3)]
-                batch["position_ids"] = torch.stack(packed_pos, dim=0).unsqueeze(1)
-        else:
-            # Standard: [B, S] -> [1, T]
-            if is_full_length:
-                batch["position_ids"] = pos.reshape(1, -1)
-            else:
-                batch["position_ids"] = pos[valid_mask].unsqueeze(0)
-
-    # THD uses cu_seqlens; attention_mask is no longer needed.
-    batch["attention_mask"] = None
-
-    max_seqlen = batch.get("max_seqlen", None)
-    if isinstance(max_seqlen, torch.Tensor):
-        max_seqlen = int(max_seqlen.reshape(-1).max().item())
-    elif max_seqlen is not None:
-        max_seqlen = int(max_seqlen)
-    else:
-        max_seqlen = int(seq_lengths.max().item())
-    batch["packed_seq_params"] = _build_packed_seq_params_from_cu_seqlens(
-        cu_for_pack, max_seqlen=max_seqlen,
-    )
-    # These are consumed at data side; keep only packed metadata.
-    batch.pop("cu_seqlens", None)
-    batch.pop("cu_seqlens_padded", None)
-    batch.pop("max_seqlen", None)
-    return batch
+        padded_batch["input_ids"] = torch.concat([x["input_ids"].unsqueeze(0) for x in batch], dim=0)
+        padded_batch["labels"] = torch.concat([x["labels"].unsqueeze(0) for x in batch], dim=0)
+        padded_batch["loss_mask"] = torch.concat([x["loss_mask"].unsqueeze(0) for x in batch], dim=0)
+        padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
+        padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
+        return padded_batch
 
 
 # -------------------------------------------------------------------
@@ -338,6 +270,7 @@ def _pack_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
 def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
+    args = get_args()
 
     if get_tensor_model_parallel_rank() == 0:
         try:
@@ -361,6 +294,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     if has_data.item() == 0:
         return None
 
+    data = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length)
     batch = broadcast_data_batch(data, device=device)
 
     # Fix shapes produced by default_collate.
@@ -415,33 +349,6 @@ def forward_step(data_iterator, model):
     if batch is None:
         return None, None
 
-    # Compute position_ids before packing (MRoPE needs [B, S] input_ids).
-    position_ids = batch.get("position_ids", None)
-    if position_ids is None:
-        inner = unwrap_model(model)
-        if hasattr(inner, "compute_position_ids"):
-            position_ids = inner.compute_position_ids(
-                input_ids=batch["input_ids"],
-                image_grid_thw=batch.get("image_grid_thw", None),
-            )
-            batch["position_ids"] = position_ids
-
-    # Pack sequences into THD format if enabled.
-    # Lazy import avoids potential import cycles during Megatron init.
-    from megatron.training import get_args
-    args = get_args()
-    packed_seq_params = None
-    if getattr(args, "use_packed_sequence", False):
-        batch = _pack_batch(batch)
-        packed_seq_params = batch.pop("packed_seq_params")
-        position_ids = batch["position_ids"]
-        if getattr(args, "sequence_parallel", False):
-            raise NotImplementedError(
-                "multimodal_dev THD packed sequences currently do not support "
-                "sequence_parallel safely; disable --sequence-parallel or "
-                "--use-packed-sequence."
-            )
-
     pixel_values = batch.get("pixel_values", None)
     if (
         pixel_values is not None
@@ -450,15 +357,16 @@ def forward_step(data_iterator, model):
     ):
         pixel_values = pixel_values.bfloat16()
 
+    # We don't provide position_ids, now. Let model handle it itself.
     output_tensor = model(
         input_ids=batch["input_ids"],
-        position_ids=position_ids,
+        position_ids=batch.get("position_ids"),
         attention_mask=batch.get("attention_mask", None),
         labels=batch.get("labels", None),
         loss_mask=batch.get("loss_mask", None),
         pixel_values=pixel_values,
         image_grid_thw=batch.get("image_grid_thw", None),
-        packed_seq_params=packed_seq_params,
+        packed_seq_params=batch.get("packed_seq_params", None),
     )
 
     loss_mask = batch.get("loss_mask", None)

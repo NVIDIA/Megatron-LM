@@ -20,7 +20,7 @@ set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
-export NVTE_FUSED_ATTN=1
+# export NVTE_FUSED_ATTN=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 DRY_RUN=${DRY_RUN:-1}
@@ -40,7 +40,7 @@ MODEL_VARIANT=${MODEL_VARIANT:-proxy}
 VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
 
 # Batch sizes
-MBS=${MBS:-1}
+MBS=${MBS:-2}
 GBS=${GBS:-64}
 
 # Parallelism
@@ -239,6 +239,9 @@ TRAINING_ARGS=(
     --manual-gc-interval 5
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
+    --sft
+    --attention-backend flash
+    # --calculate-per-token-loss
 )
 
 PROFILE_ARGS=()
@@ -291,7 +294,8 @@ TOKENIZER_ARGS=(
 MULTIMODAL_ARGS=(
     --model-arch qwen35_vl
     --model-variant "$MODEL_VARIANT"
-    --dataset-provider mock
+    --dataset-provider cord_v2
+    --hf-processor-path Qwen/Qwen3.5-397B-A17B
     --image-token-id 248056
     --image-size 224
     --total-seq-length "$SEQ_LEN"
