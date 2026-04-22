@@ -742,6 +742,9 @@ class TestMegatronFSDPE2E:
             assert (
                 not optim.optimizer.master_weights
             ), "Megatron-FSDP should not use FusedAdam master weights."
+            assert (
+                optim.optimizer.use_decoupled_grad
+            ), "Megatron-FSDP should be using a decoupled gradient with FusedAdam."
 
         # Prepare data iterator
         data_iterator = make_gpt_mock_data_iterator(
@@ -773,7 +776,6 @@ class TestMegatronFSDPE2E:
 
         return outputs
 
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
     )
