@@ -75,6 +75,7 @@ class SafeUnpickler(pickle.Unpickler):
             ("torch._utils", "_rebuild_tensor_v2"),
             ("torch._tensor", "_rebuild_from_type_v2"),
             ("torch.storage", "UntypedStorage"),
+            ("torch.storage", "_load_from_bytes"),
             ("transformer_engine.common.recipe", "DelayedScaling"),
             ("transformer_engine.common.recipe", "Float8CurrentScaling"),
             ("transformer_engine.common.recipe", "Float8BlockScaling"),
