@@ -1042,7 +1042,13 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-        
+    
+    if args.nccl_ub and args.use_megatron_fsdp:
+        # In Megatron-LM, required implementation for manual registration is already provided.
+        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        args.fsdp_manual_registration = True
+        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
+
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
@@ -2898,6 +2904,11 @@ def _add_tokenizer_args(parser):
                        help='Converting text to ids will not include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
+    group.add_argument('--null-tokenizer-eod-id', type=int, default=None,
+                       help='EOD token id for NullTokenizer. Defaults to `vocab_size - 1`.')
+    group.add_argument('--null-tokenizer-pad-id', type=int, default=-1,
+                       help='Pad token id for NullTokenizer. Defaults to -1 (no pad token). '
+                            'Set to a value outside the dataset to avoid masking real tokens.')
     return parser
 
 
