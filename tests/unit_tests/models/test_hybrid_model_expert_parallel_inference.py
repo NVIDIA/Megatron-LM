@@ -102,7 +102,7 @@ class TestDynamicInference:
         delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
-    def _build_model(self):
+    def _build_model(self, inference_moe_token_dispatcher_type='nvls'):
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = TransformerConfig(
             num_layers=3,
@@ -116,6 +116,7 @@ class TestDynamicInference:
             num_moe_experts=2,
             moe_token_dispatcher_type="alltoall",
             cuda_graph_impl="local",
+            inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
         )
         model = HybridModel(
             config=config,
@@ -218,14 +219,16 @@ class TestDynamicInference:
     @pytest.mark.parametrize("rank_states", _STATE_COMBOS, ids=[",".join(s) for s in _STATE_COMBOS])
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_ep_state_cross_product(self, rank_states):
+    def test_nvls_ep_state_cross_product(self, rank_states):
         """Test all combinatorial (unordered, with repetition) assignments of
         the four request states across EP ranks.
 
+        The NVLS dispatcher is used (match_ep_token_counts=False), so each rank
+        matches its own batch dimensions independently — no EP all-reduce.
         The context is built with use_cuda_graphs_for_non_decode_steps=True,
         so the CUDA graph list contains decode-only, mixed, and prefill-only
-        graphs. After the EP all-reduce in match_graph_config, every rank
-        (including dummy ranks) should always find a matching graph.
+        graphs, and every rank should always find a matching graph for its
+        own state.
 
         State setup uses add_dummy_requests_for_cudagraph_capture to populate
         the context directly with the desired request configuration.
@@ -241,33 +244,18 @@ class TestDynamicInference:
         if not is_dummy:
             ctx.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[my_state])
 
-        # Phase 2: Initialize attention state (EP collective).
+        # Phase 2: Initialize attention state (no EP collective with NVLS).
         if is_dummy:
             ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
         else:
             ctx.initialize_attention_state()
 
         # Phase 3: Verify.
-        # With mixed CUDA graphs available, every rank — including dummy
-        # ranks whose EP-adjusted dimensions inherit prefill/decode counts
-        # from peers — must find a matching graph.
+        # With NVLS dispatcher each rank matches independently, so every rank
+        # must find a graph for its own state.
         assert ctx.using_cuda_graph_this_step(), (
             f"EP rank {ep_rank} (state={my_state}): expected a CUDA graph match "
             f"with use_cuda_graphs_for_non_decode_steps=True "
-            f"(rank_states={rank_states})"
-        )
-
-        # All EP ranks must agree on padded token count.
-        padded = ctx.padded_batch_dimensions
-        ep_group = parallel_state.get_expert_model_parallel_group()
-        tc = torch.tensor([padded.token_count], dtype=torch.int32, device="cuda")
-        tc_max = tc.clone()
-        tc_min = tc.clone()
-        dist.all_reduce(tc_max, op=dist.ReduceOp.MAX, group=ep_group)
-        dist.all_reduce(tc_min, op=dist.ReduceOp.MIN, group=ep_group)
-        assert tc_max.item() == tc_min.item(), (
-            f"Padded token count mismatch across EP ranks: "
-            f"min={tc_min.item()}, max={tc_max.item()} "
             f"(rank_states={rank_states})"
         )
 
@@ -285,16 +273,14 @@ class TestDynamicInference:
     )
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_dummy_bailout_with_decode_only_cuda_graphs(self, peer_state):
-        """Verify the dummy-rank bail-out path when only decode CUDA graphs
-        are available.
+    def test_nccl_dummy_bailout_with_prefill_peer(self, peer_state):
+        """Verify the dummy-rank bail-out path with the NCCL dispatcher.
 
-        With use_cuda_graphs_for_non_decode_steps=False, the CUDA graph list
-        contains only decode-only graphs. When any EP rank has prefill
-        requests, adjust_batch_dims_for_expert_parallelism returns None
-        (forcing eager mode), and match_graph_config returns None for all
-        ranks. A dummy rank then bails out of initialize_attention_state
-        early (padded_batch_dimensions is not set).
+        With the NCCL dispatcher (match_ep_token_counts=True), when any EP
+        rank has prefill requests, adjust_batch_dims_for_expert_parallelism
+        returns None (forcing eager mode) for ALL ranks. A dummy rank then
+        bails out of initialize_attention_state early (padded_batch_dimensions
+        is not set).
 
         This test verifies that:
           - The dummy rank correctly falls back to model.forward (the real
@@ -308,7 +294,7 @@ class TestDynamicInference:
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         is_even = ep_rank % 2 == 0
 
-        model = self._build_model()
+        model = self._build_model(inference_moe_token_dispatcher_type='nccl')
         ctx = self._build_context(model, use_cuda_graphs_for_non_decode_steps=False)
 
         # Set up request state.
@@ -348,19 +334,14 @@ class TestDynamicInference:
     )
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_mixed_cuda_graphs_tokens_exceed_max_requests(self, peer_state):
-        """Verify eager fallback when mixed CUDA graphs are allowed but
-        a rank's token count exceeds the CUDA graph capacity.
+    def test_nccl_eager_fallback_when_tokens_exceed_capacity(self, peer_state):
+        """Verify eager fallback with the NCCL dispatcher when a rank's token
+        count exceeds the CUDA graph capacity.
 
-        With use_cuda_graphs_for_non_decode_steps=True, the CUDA graph
-        list includes mixed and prefill-only graphs. However, the
-        maximum CUDA graph token capacity is bounded by max_requests
-        (specifically, max_requests * (num_speculative_tokens + 1)).
-
-        When one EP rank has a token count exceeding this capacity, no
-        CUDA graph can accommodate the EP-adjusted dimensions.
-        match_graph_config returns None for all ranks, forcing eager
-        mode globally. This test verifies that:
+        With the NCCL dispatcher (match_ep_token_counts=True), the EP all-reduce
+        propagates the oversized token count to all ranks. Since no CUDA graph
+        can accommodate it, match_graph_config returns None for all ranks,
+        forcing eager mode globally. This test verifies that:
           - No rank matches a CUDA graph (eager mode is forced).
           - Dummy ranks bail out and produce correct shapes via the
             eager dummy_forward path.
@@ -370,7 +351,7 @@ class TestDynamicInference:
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         is_even = ep_rank % 2 == 0
 
-        model = self._build_model()
+        model = self._build_model(inference_moe_token_dispatcher_type='nccl')
 
         # Use a small max_requests so that the CUDA graph capacity
         # (max_requests tokens with no speculative decoding) is easily
