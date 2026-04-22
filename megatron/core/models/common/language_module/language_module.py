@@ -356,6 +356,9 @@ class LanguageModule(MegatronModule):
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 
+        This is called after speculative token verification to compute MTP
+        predictions conditioned on verified tokens only.
+
         Args:
             hidden_states (Tensor): Hidden states at last accepted positions.
             next_token_ids (Tensor): Correct next token IDs [1, N].
