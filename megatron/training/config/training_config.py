@@ -16,6 +16,18 @@ class TrainingConfig:
     data-parallel-size. If this value is None, then use micro-batch-size * data-parallel-size
     as the global batch size. This choice will result in 1 for number of micro-batches."""
 
+    rampup_batch_size: list[int] | None = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
+    """Batch size ramp up with the following values: <start batch size>, <batch size increment>,
+    <ramp-up samples>
+    For example:
+        rampup-batch-size = [16, 8, 300000]
+        global-batch-size 1024
+    will start with global batch size 16 and over (1024 - 16) / 8 = 126 intervals will increase
+    the batch size linearly to 1024. In each interval we will use approximately
+    300000 / 126 = 2380 samples.
+    Deprecated. Use step_batch_size_schedule instead.
+    """
+
     step_batch_size_schedule: str | None = None
     """Step-wise batch size schedule in format "THRESHOLD:BS THRESHOLD:BS ...".
     Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
