@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
+import io
 import pickle
 from argparse import Namespace
 from io import BytesIO
@@ -42,6 +43,11 @@ def register_safe_globals():
     """Register megatron-core safe classes with torch serialization."""
     for cls in SAFE_GLOBALS:
         torch.serialization.add_safe_globals([cls])
+
+
+def safe_load_from_bytes(b):
+    """Safe version (weights_only=True) of `torch.storage._load_from_bytes`."""
+    return torch.load(io.BytesIO(b), weights_only=True)
 
 
 class SafeUnpickler(pickle.Unpickler):
