@@ -301,7 +301,7 @@ class TestMegatronFsdpFullyShard:
                 model_type=TRANSFORMER,
                 dp_shard_strategy=OPTIM_GRADS,
                 dp_outer_strategy=OPTIM,
-                mesh_dim_config=(2, 1, 2, 1),
+                mesh_dim_config=(2, 2, 2, 1),
                 preserve_fp32_weights=False,
                 init_model_with_meta_device=False,
                 torch_compile=False,
@@ -313,7 +313,7 @@ class TestMegatronFsdpFullyShard:
                 model_type=TRANSFORMER,
                 dp_shard_strategy=OPTIM_GRADS_PARAMS,
                 dp_outer_strategy=OPTIM,
-                mesh_dim_config=(2, 1, 2, 1),
+                mesh_dim_config=(2, 2, 2, 1),
                 preserve_fp32_weights=False,
                 init_model_with_meta_device=False,
                 torch_compile=False,
@@ -325,7 +325,7 @@ class TestMegatronFsdpFullyShard:
                 model_type=TRANSFORMER,
                 dp_shard_strategy=OPTIM_GRADS_PARAMS,
                 dp_outer_strategy=NO_SHARD,
-                mesh_dim_config=(2, 1, 2, 1),
+                mesh_dim_config=(2, 2, 2, 1),
                 preserve_fp32_weights=False,
                 init_model_with_meta_device=False,
                 torch_compile=False,
@@ -350,7 +350,7 @@ class TestMegatronFsdpFullyShard:
                 model_type=TE_TRANSFORMER,
                 dp_shard_strategy=OPTIM_GRADS_PARAMS,
                 dp_outer_strategy=NO_SHARD,
-                mesh_dim_config=(2, 1, 2, 1),
+                mesh_dim_config=(2, 2, 2, 1),
                 preserve_fp32_weights=True,
                 init_model_with_meta_device=True,
                 torch_compile=False,
@@ -363,7 +363,7 @@ class TestMegatronFsdpFullyShard:
                 model_type=CNN,
                 dp_shard_strategy=OPTIM_GRADS_PARAMS,
                 dp_outer_strategy=NO_SHARD,
-                mesh_dim_config=(2, 1, 2, 1),
+                mesh_dim_config=(2, 2, 2, 1),
                 preserve_fp32_weights=True,
                 init_model_with_meta_device=True,
                 torch_compile=True,
@@ -414,7 +414,7 @@ class TestMegatronFsdpFullyShard:
         # Hybrid sharding coverage.
         pytest.param(
             dict(
-                mesh_dim_config=(2, 1, 2, 1),
+                mesh_dim_config=(2, 2, 2, 1),
                 shard_strategy=OPTIM_GRADS_PARAMS,
                 outer_shard_strategy=OPTIM,
                 model_type=TRANSFORMER,
@@ -423,7 +423,7 @@ class TestMegatronFsdpFullyShard:
         ),
         pytest.param(
             dict(
-                mesh_dim_config=(2, 1, 2, 1),
+                mesh_dim_config=(2, 2, 2, 1),
                 shard_strategy=OPTIM_GRADS_PARAMS,
                 outer_shard_strategy=NO_SHARD,
                 model_type=TRANSFORMER,
