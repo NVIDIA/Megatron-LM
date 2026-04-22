@@ -6,15 +6,15 @@ import io
 import os
 import pickle
 import warnings
-from abc import ABC
 from collections import defaultdict
 from contextlib import contextmanager
 from itertools import product
 from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union, cast
-from packaging.version import Version as PkgVersion
+
 import torch
+from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard
@@ -651,9 +651,7 @@ class TorchDistSaveShardedStrategy:
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """Sync save always uses the built-in implementation."""
-        async_request = self.async_save(
-            sharded_state_dict, checkpoint_dir, async_strategy="mcore"
-        )
+        async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy="mcore")
         async_request.execute_sync()
         del async_request
 
@@ -704,9 +702,8 @@ class TorchDistSaveShardedStrategy:
         if async_strategy == "nvrx":
             if self._metadata_cache is None:
                 self._metadata_cache = checkpointable_metadata_cache()
-                if (
-                    self.cached_global_metadata is not None
-                    and hasattr(self._metadata_cache, "set_cached_global_metadata")
+                if self.cached_global_metadata is not None and hasattr(
+                    self._metadata_cache, "set_cached_global_metadata"
                 ):
                     self._metadata_cache.set_cached_global_metadata(self.cached_global_metadata)
             # Define additional arguments
