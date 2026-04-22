@@ -340,7 +340,10 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
-    mtp_cudagraph_inference_record: list[tuple] = []
+
+    # MTP CudaGraphManagers registered at construction time so that
+    # delete_cuda_graphs() can clear their lookup tables.
+    mtp_cudagraph_managers: list = []
 
     """A pool-like data structure to reuse input and output buffers across cudagraph."""
     tensor_reuse_pool = TensorReusePool()
@@ -506,7 +509,6 @@ def delete_cuda_graphs():
     for record in [
         *_CudagraphGlobalRecord.cudagraph_record,
         *_CudagraphGlobalRecord.cudagraph_inference_record,
-        *_CudagraphGlobalRecord.mtp_cudagraph_inference_record,
     ]:
         runner = record[0]
         assert isinstance(runner, _CudaGraphRunner)
@@ -518,11 +520,23 @@ def delete_cuda_graphs():
         runner.bwd_graph = None
         runner.mempool = None
 
+    # Reset MTP runners (excluded from the global inference record).
+    for mgr in _CudagraphGlobalRecord.mtp_cudagraph_managers:
+        for runner in mgr.cudagraph_runners:
+            runner.cudagraph_created = False
+            runner.fwd_graph_recorded = False
+            runner.bwd_graph_recorded = False
+            runner.fwd_graph = None
+            runner.bwd_graph = None
+            runner.mempool = None
+        mgr.cudagraph_runners.clear()
+        mgr.inference_cudagraphs_lookup_table.clear()
+
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
-    _CudagraphGlobalRecord.mtp_cudagraph_inference_record = []
+    _CudagraphGlobalRecord.mtp_cudagraph_managers = []
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -1484,6 +1498,10 @@ class CudaGraphManager(torch.nn.Module):
         self.inference_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
+        if is_mtp_inference:
+            # Registered so delete_cuda_graphs() can clear the lookup table.
+            _CudagraphGlobalRecord.mtp_cudagraph_managers.append(self)
+
         # Without pipeline parallelism, microbatches execute one at a time.
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
@@ -1672,14 +1690,11 @@ class CudaGraphManager(torch.nn.Module):
                     runner.cudagraph_created = True
                     runner = runner.eval()
 
-                    # Record to the global execution record. MTP runners use a
-                    # separate ledger since they don't chain with decoder layers
-                    # (the previous-layer lookup expects layer_number).
-                    if self.is_mtp_inference:
-                        _CudagraphGlobalRecord.mtp_cudagraph_inference_record.append(
-                            (runner, "fwd", args, kwargs)
-                        )
-                    else:
+                    # Record to the global execution record.  MTP runners are
+                    # excluded — they don't chain with decoder layers (the
+                    # previous-layer lookup expects layer_number) and are
+                    # cleaned up via mtp_cudagraph_managers instead.
+                    if not self.is_mtp_inference:
                         _CudagraphGlobalRecord.cudagraph_inference_record.append(
                             (runner, "fwd", args, kwargs)
                         )
