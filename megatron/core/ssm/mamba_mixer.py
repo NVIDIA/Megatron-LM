@@ -347,6 +347,14 @@ class MambaMixer(MegatronModule):
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
             setattr(self.A_log, "partition_dim", 0)
+            # Persistent inference cache for -exp(A_log.float()). Allocated
+            # here (outside any later CUDA-graph capture) so its address
+            # lives in the default memory pool and stays valid across every
+            # graph capture and replay, including across RL train/eval
+            # cycles. Never freed -- the memory cost is ``nheads * 4B`` per
+            # layer (a few KB across a full model).
+            self._A_neg_exp_cache = torch.empty_like(A_log, dtype=torch.float32)
+            self._A_neg_exp_cache_stale = True
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
@@ -1021,19 +1029,21 @@ class MambaMixer(MegatronModule):
         A_log is frozen during inference; recomputing it per token otherwise
         launches three small elementwise kernels (float cast, exp, neg) that
         rival ``selective_state_update`` itself in the decode profile. The
-        expand()-view carries stride 0 on headdim and dstate, which the kernel's
-        TIE_HDIM fast path relies on.
+        stride-0 expand view also triggers the kernel's TIE_HDIM fast path.
         """
-        cached = getattr(self, "_A_neg_exp_cache", None)
-        if cached is None:
+        if self.training or torch.is_grad_enabled():
             base = -torch.exp(self.A_log.float())
-            cached = base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
-            self._A_neg_exp_cache = cached
-        return cached
+            return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+        # Inference path. Refill when stale
+        if torch.cuda.is_current_stream_capturing() or self._A_neg_exp_cache_stale:
+            with torch.no_grad():
+                self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+            self._A_neg_exp_cache_stale = False
+        return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
     def train(self, mode: bool = True):
-        """Invalidate the decode A cache when switching modes (weights may update)."""
-        self._A_neg_exp_cache = None
+        """Mark the decode cache stale; weights may have updated."""
+        self._A_neg_exp_cache_stale = True
         return super().train(mode)
 
     def _ssm_decode(
