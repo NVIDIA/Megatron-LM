@@ -963,9 +963,8 @@ class ColumnParallelLinear(torch.nn.Module):
         self.use_inference_optimized_all_gather = (
             getattr(config, 'transformer_impl', None) == 'inference_optimized'
         )
-        self.triton_nvls_kernels_allowed = (
-            self.use_inference_optimized_all_gather
-            and not getattr(config, 'inference_disable_triton_nvls_kernels', False)
+        self.triton_nvls_kernels_allowed = self.use_inference_optimized_all_gather and not getattr(
+            config, 'inference_disable_triton_nvls_kernels', False
         )
 
         self.sequence_parallel = config.sequence_parallel
@@ -1107,9 +1106,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Deferred to avoid circular import: inference_layers → TE → layers.
                 from .inference_layers import inference_all_gather_last_dim
 
-                output = inference_all_gather_last_dim(
-                    output_parallel, self.tp_group, self.config
-                )
+                output = inference_all_gather_last_dim(output_parallel, self.tp_group, self.config)
             else:
                 output = gather_from_tensor_model_parallel_region(
                     output_parallel, group=self.tp_group
