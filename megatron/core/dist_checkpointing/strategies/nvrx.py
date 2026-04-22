@@ -26,13 +26,14 @@ def has_nvrx_async_support() -> bool:
         getattr(core, "AsyncRequest", None),
         getattr(cached_metadata_reader, "CachedMetadataFileSystemReader", None),
         getattr(filesystem_async, "FileSystemWriterAsync", None),
-        getattr(filesystem_async, "_results_queue", None),
         getattr(filesystem_async, "get_write_results_queue", None),
         getattr(state_dict_saver, "CheckpointMetadataCache", None),
         getattr(state_dict_saver, "save_state_dict_async_finalize", None),
         getattr(state_dict_saver, "save_state_dict_async_plan", None),
     )
-    return all(symbol is not None for symbol in required_symbols)
+    return all(symbol is not None for symbol in required_symbols) and hasattr(
+        filesystem_async, "_results_queue"
+    )
 
 
 def filter_supported_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:

@@ -101,6 +101,7 @@ class MCoreSavePlan:
 
 
 logger = getLogger(__name__)
+_logged_mcore_async_deprecation = False
 
 
 def flatten_state_dict(
@@ -670,11 +671,14 @@ class TorchDistSaveShardedStrategy:
 
         Returns: None
         """
+        global _logged_mcore_async_deprecation
         if async_strategy == "mcore":
-            logger.warning(
-                "MCore's async save is deprecated and will be removed in the future releases. "
-                "Please, use NVRx async solution by setting `async_strategy` to `nvrx`."
-            )
+            if not _logged_mcore_async_deprecation:
+                logger.warning(
+                    "MCore's async save is deprecated and will be removed in the future releases. "
+                    "Please, use NVRx async solution by setting `async_strategy` to `nvrx`."
+                )
+                _logged_mcore_async_deprecation = True
 
         # Translate the state dict
         (sharded_state_dict, flat_mapping, rename_mapping) = (
