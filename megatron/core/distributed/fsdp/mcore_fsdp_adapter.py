@@ -249,6 +249,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 "This operation is not implemented for the fully_shard API path. "
             )
 
+        from unittest.mock import Mock
+        self.param_and_grad_buffer = Mock()
+        self.param_and_grad_buffer.parameter_groups = []
+        self.param_and_grad_buffer.copy_main_weights_to_model_weights = Mock()
         self.ddp_config = ddp_config
         self.no_sync = nullcontext()
         self.start_param_sync = noop

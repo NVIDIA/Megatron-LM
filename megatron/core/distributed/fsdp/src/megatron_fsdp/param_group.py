@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional
+import math
 
 import torch
 from torch.distributed.tensor import DeviceMesh
@@ -19,7 +20,6 @@ class ParameterGroup:
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
         param_group_id: int = 0,
-        chunk_size_factor: int = 1,
         main_params_dtype: Optional[torch.dtype] = None,
         gradient_scaling_factor: Optional[float] = None,
         allocator: Optional[TemporaryBucketAllocator] = None,
@@ -41,7 +41,7 @@ class ParameterGroup:
 
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
-        self.chunk_size_factor = chunk_size_factor
+        self.chunk_size_factor = max(1, math.lcm(*[p.shape[1:].numel() for p in params]))
         self.main_params_dtype = main_params_dtype
         self.gradient_scaling_factor = gradient_scaling_factor
         self.allocator = allocator
