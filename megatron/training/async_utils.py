@@ -10,6 +10,10 @@ import time
 from abc import ABC
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
+from megatron.core.dist_checkpointing.strategies.nvrx import (
+    filter_supported_kwargs,
+    make_nvrx_async_request,
+)
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
@@ -70,13 +74,13 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         ),
     )
     # initialize the persistent caller with QoS priorities from args
-    kwargs = {}
+    warmup_kwargs = {}
     if async_strategy == "mcore":
         # Note: nvidia-resiliency-ext uses is_daemon instead of mp_mode (always spawns)
-        kwargs["mp_mode"] = mp_mode
+        warmup_kwargs["mp_mode"] = mp_mode
     elif async_strategy == "nvrx":
         if "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
-            kwargs["cpu_shm_mode"] = args.async_ckpt_use_cpu_shm
+            warmup_kwargs["cpu_shm_mode"] = args.async_ckpt_use_cpu_shm
         elif args.async_ckpt_use_cpu_shm:
             raise AssertionError(
                 "Installed nvidia-resiliency-ext does not support cpu_shm_mode. "
@@ -84,12 +88,17 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
             )
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
-        cpu_priority=args.async_ckpt_cpu_priority,
-        io_priority=args.async_ckpt_io_priority,
-        **kwargs,
+        **filter_supported_kwargs(
+            AsyncCallsQueue.warmup_persistent_caller,
+            {
+                "cpu_priority": args.async_ckpt_cpu_priority,
+                "io_priority": args.async_ckpt_io_priority,
+                **warmup_kwargs,
+            },
+        ),
     )
     # initialize ckpt write results queue
-    get_write_results_queue('fork')
+    get_write_results_queue(**filter_supported_kwargs(get_write_results_queue, {"mp_mode": "fork"}))
     if rank == 0:
         print(f"init_persistent_async_worker: rank {rank}, Async Caller Started in {time.time() - time_start} seconds", flush=True)
 
@@ -165,6 +174,11 @@ def get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> NVRxAsyncReq
         """Finalizes async checkpointing and synchronizes processes."""
         save_state_dict_async_finalize(*save_state_dict_ret)
 
-    return NVRxAsyncRequest(
-        save_fn, save_args, [finalize_fn], async_fn_kwargs={}, preload_fn=preload_fn
+    return make_nvrx_async_request(
+        NVRxAsyncRequest,
+        save_fn,
+        save_args,
+        [finalize_fn],
+        async_fn_kwargs={},
+        preload_fn=preload_fn,
     )

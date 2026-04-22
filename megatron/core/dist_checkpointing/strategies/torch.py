@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 
 import torch
-from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard
@@ -51,19 +50,18 @@ from ..mapping import (
 )
 from .async_utils import AsyncRequest
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
+from .nvrx import filter_supported_kwargs, has_nvrx_async_support, make_nvrx_async_request
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
         CheckpointMetadataCache,
     )
-
-    HAVE_NVRX = True
 except (ImportError, ModuleNotFoundError):
     CheckpointMetadataCache = ABC
     NVRxAsyncRequest = ABC
 
-    HAVE_NVRX = False
+HAVE_NVRX = has_nvrx_async_support()
 
 try:
     if not torch.cuda.is_available():
@@ -651,9 +649,10 @@ class TorchDistSaveShardedStrategy:
         self.validated_loaded_metadata_reuse = False
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-        """Each async strategy can be trivially used as a sync strategy."""
-        strategy = "nvrx" if HAVE_NVRX else "mcore"
-        async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
+        """Sync save always uses the built-in implementation."""
+        async_request = self.async_save(
+            sharded_state_dict, checkpoint_dir, async_strategy="mcore"
+        )
         async_request.execute_sync()
         del async_request
 
@@ -701,7 +700,10 @@ class TorchDistSaveShardedStrategy:
         if async_strategy == "nvrx":
             if self._metadata_cache is None:
                 self._metadata_cache = checkpointable_metadata_cache()
-                if self.cached_global_metadata is not None:
+                if (
+                    self.cached_global_metadata is not None
+                    and hasattr(self._metadata_cache, "set_cached_global_metadata")
+                ):
                     self._metadata_cache.set_cached_global_metadata(self.cached_global_metadata)
             # Define additional arguments
             async_writer_kwargs["use_cached_data_structure"] = self.use_cached_ckpt_structure
@@ -717,8 +719,15 @@ class TorchDistSaveShardedStrategy:
                         "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
                         "to enable cpu_shm_mode."
                     )
-            state_dict_saver_kwargs["enable_cache"] = self.use_cached_ckpt_structure
-            state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache
+            state_dict_saver_kwargs.update(
+                filter_supported_kwargs(
+                    save_state_dict_async_plan,
+                    {
+                        "enable_cache": self.use_cached_ckpt_structure,
+                        "metadata_cache": self._metadata_cache,
+                    },
+                )
+            )
         else:
             # MCore's async implementation
             args_cached_plans = None
@@ -740,10 +749,15 @@ class TorchDistSaveShardedStrategy:
         # Use PyT saving mechanism
         writer = async_writer(
             checkpoint_dir,
-            separation_hint=self.separation_hint,
-            thread_count=self.thread_count,
-            use_msc=MultiStorageClientFeature.is_enabled(),
-            **async_writer_kwargs,
+            **filter_supported_kwargs(
+                async_writer,
+                {
+                    "separation_hint": self.separation_hint,
+                    "thread_count": self.thread_count,
+                    "use_msc": MultiStorageClientFeature.is_enabled(),
+                    **async_writer_kwargs,
+                },
+            ),
         )
 
         # This should be set differently if we run in a smaller process group than the default
@@ -818,11 +832,13 @@ class TorchDistSaveShardedStrategy:
         def finalize_fn():
             save_state_dict_async_finalize(*save_state_dict_ret)
 
-        return async_request(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
+        return make_nvrx_async_request(
+            async_request, save_fn, save_args, [finalize_fn], preload_fn=preload_fn
+        )
 
 
 def _get_filesystem_reader(
-    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, async_strategy: str = "nvrx"
+    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, async_strategy: str = "mcore"
 ) -> FileSystemReader:
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
@@ -846,7 +862,7 @@ class TorchDistLoadShardedStrategy:
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
+        async_strategy: str = "mcore",
     ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
@@ -1030,9 +1046,14 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
     if async_strategy == "nvrx":
         try:
             # nvrx async imports
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
-                CachedMetadataFileSystemReader,
-            )
+            try:
+                from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
+                    CachedMetadataFileSystemReader,
+                )
+            except (ImportError, ModuleNotFoundError):
+                from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
+                    CachedMetadataFileSystemReader,
+                )
             from nvidia_resiliency_ext.checkpointing.async_ckpt.core import (
                 AsyncCallsQueue,
                 AsyncRequest,
@@ -1062,9 +1083,8 @@ def get_async_strategy(async_strategy: str = "nvrx", module: str = None) -> tupl
             async_strategy = "nvrx"
         except (ImportError, ModuleNotFoundError):
             raise ModuleNotFoundError(
-                "nvidia-resiliency-ext package is not installed. "
-                "Please, install nvidia-resiliency-ext package or set `async_strategy` to `mcore` "
-                "to enable async save strategy."
+                "A compatible `nvidia-resiliency-ext` installation is required for "
+                '`async_strategy="nvrx"`. Please install it or set `async_strategy` to `mcore`.'
             )
     elif async_strategy == "mcore":
         # do mcore async imports
