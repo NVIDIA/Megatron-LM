@@ -517,6 +517,12 @@ class CheckpointConfig:
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
+    ckpt_load_validate_sharding_integrity: bool = True
+    """Whether to validate sharding access integrity when loading a distributed checkpoint.
+    When True (default), each tensor shard is checked to be accessed exactly once as main
+    replica by some rank. Disabling skips this validation (useful when shards are deliberately
+    overlapped, e.g. multiple ranks loading the same global tensor)."""
+
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
