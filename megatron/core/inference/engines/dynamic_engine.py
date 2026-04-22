@@ -405,41 +405,42 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Capture all relevant graphs in the pipeline.
             # Note that some steps of the pipeline may capture multiple different variant graphs.
-            for setup_variant in controller.graph_capture_variants():
-                setup_variant(context)
-                controller._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-                # Launch bookkeeping on a side stream so it overlaps with forward.
-                with torch.cuda.stream(controller._pre_forward_bookkeeping_stream):
-                    controller._pre_forward_bookkeeping_event.record()
+            with torch.inference_mode():
+                for setup_variant in controller.graph_capture_variants():
+                    setup_variant(context)
+                    controller._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+                    # Launch bookkeeping on a side stream so it overlaps with forward.
+                    with torch.cuda.stream(controller._pre_forward_bookkeeping_stream):
+                        controller._pre_forward_bookkeeping_event.record()
 
-                controller._dynamic_step_forward_logits(input_ids, position_ids)
+                    controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-                controller._pre_forward_bookkeeping_event.synchronize()
+                    controller._pre_forward_bookkeeping_event.synchronize()
 
-            # MTP CUDA graph warmup for this batch dimension.
-            if mtp_warmup_enabled:
-                n = cuda_graph_batch_dimension.req_count
-                if sp_enabled:
-                    n = round_up_to_nearest_multiple(n, tp_size)
-                if n > 0 and n not in mtp_seen_batch_sizes:
-                    mtp_seen_batch_sizes.add(n)
-                    device = torch.cuda.current_device()
-                    batch_dim = n // tp_size if sp_enabled else n
-                    # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                    for depth in mtp_warmup_depths:
-                        with graph_capture():
-                            unwrapped.compute_mtp_single_step(
-                                hidden_states=torch.zeros(
-                                    (batch_dim, 1, model_config.hidden_size),
-                                    device=device,
-                                    dtype=model_config.params_dtype,
-                                ),
-                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
-                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
-                                depth=depth,
-                            )
+                # MTP CUDA graph warmup for this batch dimension.
+                if mtp_warmup_enabled:
+                    n = cuda_graph_batch_dimension.req_count
+                    if sp_enabled:
+                        n = round_up_to_nearest_multiple(n, tp_size)
+                    if n > 0 and n not in mtp_seen_batch_sizes:
+                        mtp_seen_batch_sizes.add(n)
+                        device = torch.cuda.current_device()
+                        batch_dim = n // tp_size if sp_enabled else n
+                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                        for depth in mtp_warmup_depths:
+                            with graph_capture():
+                                unwrapped.compute_mtp_single_step(
+                                    hidden_states=torch.zeros(
+                                        (batch_dim, 1, model_config.hidden_size),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                                    position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                                    depth=depth,
+                                )
 
-            context.reset()
+                context.reset()
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
