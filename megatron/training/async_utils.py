@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.dist_checkpointing.strategies.nvrx import (
-    filter_supported_kwargs,
     make_nvrx_async_request,
 )
 from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
@@ -91,17 +90,18 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
             )
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
-        **filter_supported_kwargs(
-            AsyncCallsQueue.warmup_persistent_caller,
-            {
-                "cpu_priority": args.async_ckpt_cpu_priority,
-                "io_priority": args.async_ckpt_io_priority,
-                **warmup_kwargs,
-            },
-        ),
+        cpu_priority=args.async_ckpt_cpu_priority,
+        io_priority=args.async_ckpt_io_priority,
+        **warmup_kwargs,
     )
     # initialize ckpt write results queue
-    get_write_results_queue(**filter_supported_kwargs(get_write_results_queue, {"mp_mode": "fork"}))
+    if async_strategy == "nvrx":
+        if "mp_mode" not in inspect.signature(get_write_results_queue).parameters:
+            raise AssertionError(
+                "Installed nvidia-resiliency-ext does not support "
+                "get_write_results_queue(mp_mode=...). Update nvidia-resiliency-ext."
+            )
+    get_write_results_queue(mp_mode="fork")
     if rank == 0:
         print(f"init_persistent_async_worker: rank {rank}, Async Caller Started in {time.time() - time_start} seconds", flush=True)
 

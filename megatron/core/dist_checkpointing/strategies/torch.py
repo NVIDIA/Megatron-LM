@@ -50,7 +50,7 @@ from ..mapping import (
 )
 from .async_utils import AsyncRequest
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
-from .nvrx import filter_supported_kwargs, has_nvrx_async_support, make_nvrx_async_request
+from .nvrx import has_nvrx_async_support, make_nvrx_async_request
 
 if TYPE_CHECKING:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
@@ -723,15 +723,8 @@ class TorchDistSaveShardedStrategy:
                         "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
                         "to enable cpu_shm_mode."
                     )
-            state_dict_saver_kwargs.update(
-                filter_supported_kwargs(
-                    save_state_dict_async_plan,
-                    {
-                        "enable_cache": self.use_cached_ckpt_structure,
-                        "metadata_cache": self._metadata_cache,
-                    },
-                )
-            )
+            state_dict_saver_kwargs["enable_cache"] = self.use_cached_ckpt_structure
+            state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache
         else:
             # MCore's async implementation
             args_cached_plans = None
@@ -753,15 +746,10 @@ class TorchDistSaveShardedStrategy:
         # Use PyT saving mechanism
         writer = async_writer(
             checkpoint_dir,
-            **filter_supported_kwargs(
-                async_writer,
-                {
-                    "separation_hint": self.separation_hint,
-                    "thread_count": self.thread_count,
-                    "use_msc": MultiStorageClientFeature.is_enabled(),
-                    **async_writer_kwargs,
-                },
-            ),
+            separation_hint=self.separation_hint,
+            thread_count=self.thread_count,
+            use_msc=MultiStorageClientFeature.is_enabled(),
+            **async_writer_kwargs,
         )
 
         # This should be set differently if we run in a smaller process group than the default
