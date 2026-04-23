@@ -526,7 +526,7 @@ def save_integrity_manifest(checkpoint_dir: str) -> None:
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
         ckpt_path = msc.Path(checkpoint_dir)
-        for entry in sorted(ckpt_path.iterdir()):
+        for entry in sorted(ckpt_path.iterdir(), key=lambda p: str(p)):
             if entry.name != INTEGRITY_FNAME:
                 manifest[entry.name] = _compute_file_hash(str(entry))
     else:
