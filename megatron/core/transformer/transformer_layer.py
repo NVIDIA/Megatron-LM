@@ -309,6 +309,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        self._input_layernorm_returns_residual = getattr(
+            self.input_layernorm, 'returns_residual', False
+        )
 
         attention_optional_kwargs = {}
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
@@ -341,6 +344,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        self._pre_cross_attn_layernorm_returns_residual = getattr(
+            self.pre_cross_attn_layernorm, 'returns_residual', False
+        )
 
         # [Module 5: CrossAttention]
         self.cross_attention = build_module(
@@ -358,6 +364,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
+        )
+        self._pre_mlp_layernorm_returns_residual = getattr(
+            self.pre_mlp_layernorm, 'returns_residual', False
         )
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
@@ -587,13 +596,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
-        if isinstance(input_layernorm_output, tuple):
-            if len(input_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of input_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(input_layernorm_output)}"
-                )
+        if self._input_layernorm_returns_residual:
             input_layernorm_output, residual = input_layernorm_output
         else:
             residual = hidden_states
@@ -658,14 +661,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
 
-        if isinstance(pre_cross_attn_layernorm_output, tuple):
-            if len(pre_cross_attn_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of pre_cross_attn_layernorm_output "
-                    f"is a tuple, it is expected to have 2 elements "
-                    f"(output, residual), but "
-                    f"got {len(pre_cross_attn_layernorm_output)}"
-                )
+        if self._pre_cross_attn_layernorm_returns_residual:
             pre_cross_attn_layernorm_output, residual = pre_cross_attn_layernorm_output
         else:
             residual = hidden_states
@@ -749,16 +745,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
-        if isinstance(pre_mlp_layernorm_output, tuple):
-            if len(pre_mlp_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of pre_mlp_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(pre_mlp_layernorm_output)}"
-                )
+        if self._pre_mlp_layernorm_returns_residual:
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
         else:
-            # Residual connection.
             residual = hidden_states
 
         if self.config.fp32_residual_connection:
@@ -1175,13 +1164,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 if not self.is_moe_layer:
                     return residual, None, None, None
                 hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
-                if isinstance(hidden_states, tuple):
-                    if len(hidden_states) != 2:
-                        raise ValueError(
-                            f"When the output of pre_mlp_layernorm is a tuple, it is "
-                            f"expected to have 2 elements (output, residual), but "
-                            f"got {len(hidden_states)}"
-                        )
+                if self._pre_mlp_layernorm_returns_residual:
                     hidden_states, residual = hidden_states
 
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
@@ -1393,13 +1376,7 @@ class MoETransformerLayer(TransformerLayer):
 
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-        if isinstance(pre_mlp_layernorm_output, tuple):
-            if len(pre_mlp_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of pre_mlp_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(pre_mlp_layernorm_output)}"
-                )
+        if self._pre_mlp_layernorm_returns_residual:
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
         else:
             residual = hidden_states

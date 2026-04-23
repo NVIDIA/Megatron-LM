@@ -811,8 +811,8 @@ class CheckpointWithoutOutput(object):
 
         # Release output tensor memory while keeping metadata for backward.
         # Skip outputs whose storage is shared with a saved input — freeing those
-        # would destroy the data needed for recomputation (e.g. fused residual norms
-        # where MakeExtraOutput returns the input tensor itself as an extra output).
+        # would destroy the data needed for recomputation (e.g. TE.ops.Sequential 
+        # operations with MakeExtraOutput).
         saved_ptrs = {
             t.untyped_storage().data_ptr()
             for t in self.ctx.saved_tensors
