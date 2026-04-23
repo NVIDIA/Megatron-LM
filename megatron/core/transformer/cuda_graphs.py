@@ -575,21 +575,18 @@ class _CudagraphReplayNode(torch.autograd.Function):
             runner.fwd_graph_input_surface
         ), "Fwd cudagraph received a different number of tensors than what it was graphed with!"
 
-        # Copy new data into fwd graph input buffer.
-        # A check is needed for whether the static buffers are inference-mode tensors.
-        copy_ctx = torch.inference_mode() if not runner.grad_enabled else nullcontext()
+        # Copy new data into fwd graph input buffer
         need_copy_inputs = []
-        with copy_ctx:
-            for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
-                if (
-                    hasattr(cudagraph_input, "can_skip_replay_copy")
-                    and cudagraph_input.can_skip_replay_copy
-                ):
-                    need_copy_inputs.append(user_input)
-                    assert user_input.data_ptr() == cudagraph_input.data_ptr()
-                else:
-                    if user_input.data_ptr() != cudagraph_input.data_ptr():
-                        cudagraph_input.copy_(user_input)
+        for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
+            if (
+                hasattr(cudagraph_input, "can_skip_replay_copy")
+                and cudagraph_input.can_skip_replay_copy
+            ):
+                need_copy_inputs.append(user_input)
+                assert user_input.data_ptr() == cudagraph_input.data_ptr()
+            else:
+                if user_input.data_ptr() != cudagraph_input.data_ptr():
+                    cudagraph_input.copy_(user_input)
 
         ctx.runner = runner
         ctx.save_for_backward(*need_copy_inputs)
