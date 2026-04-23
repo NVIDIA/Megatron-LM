@@ -1016,7 +1016,6 @@ def update_microbatch_calculator(
     num_bins_this_rank: int,
     bin_seq_indices: List[List[int]],
     global_batch_size: int,
-    rampup_batch_size: int,
     micro_batch_size: int,
     decrease_batch_size_if_needed: bool,
 ):
@@ -1026,7 +1025,6 @@ def update_microbatch_calculator(
         num_bins_this_rank: Amount of packing bins that belongs to current rank.
         bin_seq_indices: Global seq indices in the bin, see PackingInfo.
         global_batch_size: Current global batch size.
-        rampup_batch_size: Rampup batch size. See num_microbatches_calculator.py for more.
         micro_batch_size: Micro batch size at init.
         decrease_batch_size_if_needed: Scale down batch size. See num_microbatches_calculator.py for more.
 
@@ -1046,7 +1044,6 @@ def update_microbatch_calculator(
     old_num_microbatches = get_num_microbatches()
     reconfigure_num_microbatches_calculator(
         rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-        rampup_batch_size=rampup_batch_size,
         global_batch_size=bins_bs,
         micro_batch_size=micro_batch_size,
         data_parallel_size=dp_world_size,
@@ -1120,3 +1117,61 @@ def get_sequence_packing_tensorboard_metrics(args):
         metrics['bin-batch-size'] = bin_batch_size
         metrics['consumed-bins'] = args.consumed_train_bins
     return metrics
+
+
+def get_packing_actual_tokens(packing_context: PackingContext) -> int:
+    """Get the actual number of tokens (non-padding) in the packed sequences for this rank.
+
+    Args:
+        packing_context: The PackingContext containing packing information.
+
+    Returns:
+        Total number of actual tokens across all bins on this rank.
+    """
+    return sum(
+        packing_context.packing_info.seq_lengths[idx]
+        for indices in packing_context.packing_info.bin_seq_indices
+        for idx in indices
+    )
+
+
+def get_packing_compute_tokens(packing_context: PackingContext) -> int:
+    """Get the total compute tokens (including padding) for packed sequences on this rank.
+
+    Args:
+        packing_context: The PackingContext containing packing information.
+
+    Returns:
+        Total compute tokens (num_bins * bin_size) on this rank.
+    """
+    return packing_context.packed_trajs.shape[0] * packing_context.packed_trajs.shape[1]
+
+
+def get_packing_efficiency(packing_context: PackingContext) -> float:
+    """Get the packing efficiency (actual_tokens / total_capacity) across all DP ranks.
+
+    Args:
+        packing_context: The PackingContext containing packing information.
+
+    Returns:
+        Packing efficiency as a float between 0 and 1.
+    """
+    total_actual_tokens = sum(packing_context.packing_info.seq_lengths)
+    num_ranks = mpu.get_data_parallel_world_size()
+    bins_per_rank = packing_context.packed_trajs.shape[0]
+    bin_size = packing_context.packed_trajs.shape[1]
+    total_capacity = bins_per_rank * bin_size * num_ranks
+
+    if total_capacity == 0:
+        return 0.0
+
+    return total_actual_tokens / total_capacity
+
+
+def get_packing_avg_seq_length(packing_context: PackingContext) -> float:
+    """Get the average sequence length across all sequences in the packing context."""
+    seq_lengths = packing_context.packing_info.seq_lengths
+    if not seq_lengths:
+        return 0.0
+
+    return sum(seq_lengths) / len(seq_lengths)
