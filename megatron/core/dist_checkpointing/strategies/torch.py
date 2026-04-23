@@ -503,16 +503,16 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         *args,
         shapes_validation_sharded_tensors: Iterable[ShardedTensor] = (),
         allow_shape_mismatch_sharded_tensors: Optional[Dict[str, ShardedTensor]] = None,
-        stream_fp8_dequant: bool = True,
+        stream_ckpt_dequant: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.shapes_validation_sharded_tensors = shapes_validation_sharded_tensors
         self.allow_shape_mismatch_sharded_tensors = allow_shape_mismatch_sharded_tensors
-        self.stream_fp8_dequant = stream_fp8_dequant
+        self.stream_ckpt_dequant = stream_ckpt_dequant
         # Maps id(read_item) -> (read_item, target_tensor, amax_snapshot_or_None, kind)
-        # kind is "stream" for the streaming FP8 dequant path and "noncontig" for the
-        # existing contiguity-fix path.
+        # kind is "stream" for the streaming per-tensor dequant path and "noncontig"
+        # for the existing contiguity-fix path.
         self._intermediate_read_items: Dict[int, Tuple[ReadItem, torch.Tensor, Optional[torch.Tensor], str]] = {}
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
@@ -567,17 +567,18 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         return local_plan
 
     def resolve_tensor(self, read_item: ReadItem):
-        """Override to add FP8 support.
+        """Override to add quantized-tensor support.
 
         Two paths are handled here:
 
-        1. Streaming FP8 dequantize (when ``stream_fp8_dequant`` is True and the
-           destination is a TE ``QuantizedTensor``). We allocate a per-tensor
-           high-precision scratch buffer, return it as the load destination, and
-           quantize-copy it back into the original tensor in ``commit_tensor``.
-           This replaces the upfront bulk dequantize done by
-           ``force_all_tensors_to_non_fp8`` and keeps at most one scratch tensor
-           live at a time.
+        1. Streaming per-tensor dequantize (when ``stream_ckpt_dequant`` is True
+           and the destination is a TE ``QuantizedTensor`` — covers Float8,
+           MXFP8, blockwise FP8, and NVFP4 via the common base class). We
+           allocate a per-tensor high-precision scratch buffer, return it as
+           the load destination, and quantize-copy it back into the original
+           tensor in ``commit_tensor``. This replaces the upfront bulk
+           dequantize done by ``force_all_tensors_to_non_fp8`` and keeps at
+           most one scratch tensor live at a time.
 
         2. Non-contiguous Float8 fix: narrowing a Float8Tensor can produce a
            non-contiguous view for which no ``copy_`` kernel exists. We fall
@@ -593,15 +594,15 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         from ...fp8_utils import is_float8tensor as _is_quantized_tensor
 
         if (
-            self.stream_fp8_dequant
+            self.stream_ckpt_dequant
             and HAVE_TE
             and _is_quantized_tensor(target_tensor)
             and target_tensor.is_cuda
         ):
             # Snapshot amax for delayed-scaling quantizers so the subsequent
             # BF16->FP8 quantize-copy does not pollute amax_history. For
-            # current-scaling / MXFP8 / blockwise quantizers, amax is None or
-            # absent and the snapshot is a no-op.
+            # current-scaling / MXFP8 / blockwise / NVFP4 quantizers, amax is
+            # None or absent on the quantizer and the snapshot is a no-op.
             amax_snapshot: Optional[torch.Tensor] = None
             quantizer = getattr(target_tensor, "_quantizer", None)
             amax = getattr(quantizer, "amax", None) if quantizer is not None else None
@@ -904,13 +905,15 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False, stream_fp8_dequant: bool = True):
+    def __init__(self, cache_metadata: bool = False, stream_ckpt_dequant: bool = False):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
-        # When True, FP8/MXFP8/blockwise destinations are dequantized per-tensor inside the
-        # LoadPlanner rather than all at once before the load starts. See
+        # When True, quantized destinations (FP8/MXFP8/blockwise FP8/NVFP4) are
+        # dequantized per-tensor inside the LoadPlanner rather than all at once
+        # before the load starts. This trades a small planner overhead for a
+        # large reduction in peak GPU memory during load. See
         # serialization.load() and MCoreLoadPlanner.resolve_tensor for details.
-        self.stream_fp8_dequant = stream_fp8_dequant
+        self.stream_ckpt_dequant = stream_ckpt_dequant
 
     def load(
         self,
@@ -954,7 +957,7 @@ class TorchDistLoadShardedStrategy:
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
-                stream_fp8_dequant=self.stream_fp8_dequant,
+                stream_ckpt_dequant=self.stream_ckpt_dequant,
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),

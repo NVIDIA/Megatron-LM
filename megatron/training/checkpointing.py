@@ -1230,7 +1230,7 @@ def _load_global_dist_base_checkpoint(
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
     load_strategy = TorchDistLoadShardedStrategy(
         cache_metadata=args.ckpt_assume_constant_structure,
-        stream_fp8_dequant=args.fp8_ckpt_streaming_load,
+        stream_ckpt_dequant=args.stream_ckpt_dequant,
     )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:

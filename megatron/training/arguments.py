@@ -982,6 +982,31 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
+    # Warn users who have quantized param gather enabled but have not opted into
+    # --stream-ckpt-dequant. Those two flags together are the setup most prone to
+    # OOM during checkpoint load: --fp8-param-gather / --fp4-param-gather cause
+    # model params to live on GPU as TE QuantizedTensors, and the legacy load path
+    # (force_all_tensors_to_non_fp8 in dist_checkpointing.serialization.load) will
+    # dequantize every one of them into a BF16 scratch tensor before the read
+    # starts. On large models that transient allocation (~2 bytes * sum(numel))
+    # is what triggers the OOM. --stream-ckpt-dequant moves the dequantize into
+    # the LoadPlanner so only one scratch tensor is live at a time.
+    if (
+        (args.fp8_param_gather or args.fp4_param_gather)
+        and not args.stream_ckpt_dequant
+        and (args.load is not None or args.pretrained_checkpoint is not None)
+    ):
+        warn_rank_0(
+            "--fp8-param-gather / --fp4-param-gather is enabled but "
+            "--stream-ckpt-dequant is not. Loading a large checkpoint will "
+            "dequantize every quantized model parameter up-front into a BF16 "
+            "scratch tensor (peak overhead ~= 2 bytes * total quantized numel), "
+            "which can OOM on large models. Pass --stream-ckpt-dequant to "
+            "dequantize one tensor at a time inside the LoadPlanner and drop "
+            "peak overhead to ~= 2 bytes * max(numel per tensor).",
+            args.rank,
+        )
+
     # FP4 and FP8 are mutually exclusive
     if args.fp4 and args.fp8:
         raise ValueError("--fp4-format and --fp8-format cannot be used simultaneously. Please choose one.")
@@ -2676,14 +2701,16 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
-    group.add_argument('--no-fp8-ckpt-streaming-load', action='store_false',
-                       dest='fp8_ckpt_streaming_load', default=True,
-                       help='Disable per-tensor streaming dequantize when loading '
-                            'checkpoints with FP8/MXFP8/blockwise model params. When streaming '
-                            'is on (default), each quantized destination is dequantized and '
-                            'repopulated inside the LoadPlanner one at a time, which avoids the '
-                            'large transient GPU allocation caused by the upfront '
-                            'force_all_tensors_to_non_fp8 pass.')
+    group.add_argument('--stream-ckpt-dequant', action='store_true',
+                       dest='stream_ckpt_dequant', default=False,
+                       help='Enable per-tensor streaming dequantize when loading checkpoints '
+                            'with quantized model params (FP8, MXFP8, blockwise FP8, NVFP4). '
+                            'Instead of dequantizing the entire state dict to high precision '
+                            'before the load starts (the default behaviour, which allocates '
+                            'N simultaneous scratch tensors and can OOM on large models), the '
+                            'LoadPlanner dequantizes one destination at a time. Reduces peak '
+                            'GPU memory during load at a small planner overhead. Off by '
+                            'default; enable for large quantized-weight checkpoints.')
     return parser
 
 

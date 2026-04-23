@@ -111,10 +111,12 @@ def load(
     #      amax_history buffer of Transformer Engine, which is undesirable.
     #
     # When the sharded strategy supports per-tensor streaming dequantize
-    # (``stream_fp8_dequant``), both concerns are handled inside the LoadPlanner
-    # on a per-tensor basis, which avoids peaking GPU memory with N
-    # simultaneous high-precision scratch tensors before the load begins.
-    if not getattr(sharded_strategy, "stream_fp8_dequant", False):
+    # (``stream_ckpt_dequant``), both concerns are handled inside the
+    # LoadPlanner on a per-tensor basis, which avoids peaking GPU memory
+    # with N simultaneous high-precision scratch tensors before the load
+    # begins. Covers FP8/MXFP8/blockwise-FP8/NVFP4 via the common
+    # ``QuantizedTensor`` base class.
+    if not getattr(sharded_strategy, "stream_ckpt_dequant", False):
         force_all_tensors_to_non_fp8(sharded_state_dict)
 
     common_state_dict = load_common(checkpoint_dir)
