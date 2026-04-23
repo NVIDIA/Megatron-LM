@@ -1,9 +1,70 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import operator
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+def _normalize_cu_seqlens(
+    cu_seqlens: Tensor, *, allow_dummy_batch_dim: bool, require_nondecreasing: bool
+) -> Tensor:
+    if not isinstance(cu_seqlens, Tensor):
+        raise TypeError("cu_seqlens must be a torch.Tensor")
+
+    if cu_seqlens.dim() == 2:
+        if not allow_dummy_batch_dim:
+            raise ValueError("cu_seqlens must be rank 1")
+        if cu_seqlens.size(0) != 1:
+            raise ValueError("cu_seqlens with a dummy batch dimension must have shape [1, N]")
+        cu_seqlens = cu_seqlens.squeeze(0)
+    elif cu_seqlens.dim() != 1:
+        raise ValueError("cu_seqlens must be rank 1")
+
+    if cu_seqlens.numel() == 0:
+        raise ValueError("cu_seqlens must contain at least one cumulative length")
+
+    cu_seqlens = cu_seqlens.to(dtype=torch.int32)
+
+    if cu_seqlens[0].item() != 0:
+        raise ValueError("cu_seqlens must start at 0")
+
+    if require_nondecreasing and cu_seqlens.numel() > 1:
+        if torch.any(cu_seqlens[1:] < cu_seqlens[:-1]):
+            raise ValueError("cu_seqlens must be nondecreasing")
+
+    return cu_seqlens
+
+
+def _normalize_int(value: int | Tensor) -> int:
+    if isinstance(value, Tensor):
+        if value.dim() == 0:
+            value = value.item()
+        elif value.dim() == 1 and value.numel() == 1:
+            value = value[0].item()
+        else:
+            raise ValueError("expected a Python int, a scalar tensor, or a tensor with shape [1]")
+
+    if isinstance(value, bool):
+        raise TypeError("expected an integer")
+
+    try:
+        value = operator.index(value)
+    except TypeError as exc:
+        raise TypeError("expected an integer or scalar integer tensor") from exc
+
+    if value < 0:
+        raise ValueError("expected a non-negative integer")
+
+    return value
+
+
+def _validate_padded_cu_seqlens_compatibility(cu_seqlens: Tensor, cu_seqlens_padded: Tensor) -> None:
+    if cu_seqlens_padded.shape != cu_seqlens.shape:
+        raise ValueError("padded cu_seqlens must have the same shape as the unpadded cu_seqlens")
+
+    if cu_seqlens_padded.device != cu_seqlens.device:
+        raise ValueError("padded cu_seqlens must be on the same device as the unpadded cu_seqlens")
 
 
 @dataclass
@@ -24,6 +85,104 @@ class PackedSeqParams:
     cp_group: dist.ProcessGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
+
+    @classmethod
+    def from_cu_seqlens(
+        cls,
+        *,
+        cu_seqlens_q: Tensor,
+        max_seqlen_q: int | Tensor,
+        cu_seqlens_kv: Tensor | None = None,
+        max_seqlen_kv: int | Tensor | None = None,
+        cu_seqlens_q_padded: Tensor | None = None,
+        cu_seqlens_kv_padded: Tensor | None = None,
+        total_tokens: int | Tensor | None = None,
+        qkv_format: str = "thd",
+        local_cp_size: int | None = None,
+        cp_group: dist.ProcessGroup | None = None,
+        allow_dummy_batch_dim: bool = True,
+    ) -> "PackedSeqParams":
+        """Construct PackedSeqParams from THD cumulative-length metadata."""
+        if qkv_format != "thd":
+            raise ValueError(
+                f"PackedSeqParams.from_cu_seqlens only supports qkv_format='thd', got {qkv_format!r}"
+            )
+
+        cu_seqlens_q = _normalize_cu_seqlens(
+            cu_seqlens_q, allow_dummy_batch_dim=allow_dummy_batch_dim, require_nondecreasing=True
+        )
+        kv_defaults_from_q = cu_seqlens_kv is None
+        if kv_defaults_from_q:
+            cu_seqlens_kv = cu_seqlens_q
+        else:
+            cu_seqlens_kv = _normalize_cu_seqlens(
+                cu_seqlens_kv,
+                allow_dummy_batch_dim=allow_dummy_batch_dim,
+                require_nondecreasing=True,
+            )
+
+        max_seqlen_q = _normalize_int(max_seqlen_q)
+        if max_seqlen_kv is None:
+            max_seqlen_kv = max_seqlen_q
+        else:
+            max_seqlen_kv = _normalize_int(max_seqlen_kv)
+
+        if cu_seqlens_q_padded is not None:
+            cu_seqlens_q_padded = _normalize_cu_seqlens(
+                cu_seqlens_q_padded,
+                allow_dummy_batch_dim=allow_dummy_batch_dim,
+                require_nondecreasing=False,
+            )
+            _validate_padded_cu_seqlens_compatibility(cu_seqlens_q, cu_seqlens_q_padded)
+
+        if cu_seqlens_kv_padded is None and kv_defaults_from_q:
+            cu_seqlens_kv_padded = cu_seqlens_q_padded
+        elif cu_seqlens_kv_padded is not None:
+            cu_seqlens_kv_padded = _normalize_cu_seqlens(
+                cu_seqlens_kv_padded,
+                allow_dummy_batch_dim=allow_dummy_batch_dim,
+                require_nondecreasing=False,
+            )
+            _validate_padded_cu_seqlens_compatibility(cu_seqlens_kv, cu_seqlens_kv_padded)
+
+        if total_tokens is None:
+            total_tokens = int(cu_seqlens_q[-1].item())
+        else:
+            total_tokens = _normalize_int(total_tokens)
+            if total_tokens < int(cu_seqlens_q[-1].item()):
+                raise ValueError("total_tokens must be >= cu_seqlens_q[-1]")
+
+        return cls(
+            qkv_format=qkv_format,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            cu_seqlens_q_padded=cu_seqlens_q_padded,
+            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+            local_cp_size=local_cp_size,
+            cp_group=cp_group,
+            total_tokens=total_tokens,
+        )
+
+    @classmethod
+    def single_sequence(
+        cls,
+        *,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.int32,
+        qkv_format: str = "thd",
+    ) -> "PackedSeqParams":
+        """Construct THD metadata for a single unpacked sequence."""
+        seq_len = _normalize_int(seq_len)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=dtype, device=device)
+        return cls.from_cu_seqlens(
+            cu_seqlens_q=cu_seqlens,
+            max_seqlen_q=seq_len,
+            total_tokens=seq_len,
+            qkv_format=qkv_format,
+        )
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

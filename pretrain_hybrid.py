@@ -238,14 +238,9 @@ def forward_step(data_iterator, model: HybridModel):
         packed_seq_params = None
     else:
         total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
+        packed_seq_params = PackedSeqParams.from_cu_seqlens(
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=None,
-            cu_seqlens_kv_padded=None,
             max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
             total_tokens=total_tokens,
         )
 

@@ -776,14 +776,9 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 device=tokens.device,
             )
         else:
-            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
-            packed_seq_params = PackedSeqParams(
-                qkv_format='thd',
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=tokens.shape[1],
-                max_seqlen_kv=tokens.shape[1],
-                total_tokens=tokens.shape[1],
+            packed_seq_params = PackedSeqParams.single_sequence(
+                seq_len=tokens.shape[1],
+                device=tokens.device, 
             )
 
     nvtx_range = get_nvtx_range()
