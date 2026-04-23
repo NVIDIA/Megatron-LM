@@ -191,6 +191,6 @@ jobs:
           show_full_output: true
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
-            --model "claude-opus-4-6[1m]"
+            --model "opus[1m]"
             --effort max
-            --max-turns 1000
+            --max-turns 1500
