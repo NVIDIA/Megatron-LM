@@ -309,9 +309,9 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel = output_parallel.transpose(0, 1).contiguous()
             if self.use_inference_optimized_reduce_scatter and not self.training:
                 # Deferred to avoid circular import: inference_layers → TE → layers.
-                from .inference_layers import inference_reduce_scatter_first_dim
+                from .inference_layers import inference_reduce_scatter_to_sequence_parallel_region
 
-                output = inference_reduce_scatter_first_dim(
+                output = inference_reduce_scatter_to_sequence_parallel_region(
                     output_parallel, self.tp_group, self.config
                 )
             else:
@@ -1075,9 +1075,9 @@ class ColumnParallelLinear(torch.nn.Module):
             # All-gather across the partitions.
             if self.use_inference_optimized_all_gather and not self.training:
                 # Deferred to avoid circular import: inference_layers → TE → layers.
-                from .inference_layers import inference_all_gather_last_dim
+                from .inference_layers import inference_all_gather_from_tensor_model_parallel_region
 
-                output = inference_all_gather_last_dim(output_parallel, self.tp_group, self.config)
+                output = inference_all_gather_from_tensor_model_parallel_region(output_parallel, self.tp_group, self.config)
             else:
                 output = gather_from_tensor_model_parallel_region(
                     output_parallel, group=self.tp_group

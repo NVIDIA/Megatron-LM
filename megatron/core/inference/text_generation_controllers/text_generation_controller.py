@@ -54,7 +54,7 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.text_generation_controllers.triton_kernels import (
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
     prepare_next_forward_pass,
     rewind_kv_cache,

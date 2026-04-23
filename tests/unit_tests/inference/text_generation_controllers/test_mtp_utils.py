@@ -2,201 +2,26 @@
 
 """Unit tests for MTP Triton kernels.
 
-Each test provides a pure-PyTorch reference implementation of the operation,
-runs both the reference and the Triton kernel on the same inputs, and asserts
+Each test runs both the pure-PyTorch reference (from mtp_utils_pytorch) and
+the Triton kernel (from mtp_utils_triton) on the same inputs, and asserts
 that the outputs match exactly.
 """
-
-import math
 
 import pytest
 import torch
 
-from megatron.core.inference.text_generation_controllers.triton_kernels import (
+from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
+    mamba_state_selective_copy as mamba_state_selective_copy_pytorch,
+    prepare_next_forward_pass as prepare_next_forward_pass_pytorch,
+    rewind_kv_cache as rewind_kv_cache_pytorch,
+    verify_speculative_tokens as verify_speculative_tokens_pytorch,
+)
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
     prepare_next_forward_pass,
     rewind_kv_cache,
     verify_speculative_tokens,
 )
-
-# ---------------------------------------------------------------------------
-# PyTorch reference implementations
-# ---------------------------------------------------------------------------
-
-
-def rewind_kv_cache_pytorch(
-    accepted_counts,
-    prefill_status,
-    last_kv_block_offset,
-    kv_length_offsets,
-    kv_block_counts,
-    last_kv_block_id,
-    kv_block_ids,
-    num_speculative_tokens,
-    block_size_tokens,
-    num_active_requests=None,
-):
-    """Pure-PyTorch reference for the KV-cache rewind operation.
-
-    Mirrors the original `TextGenerationController._rewind_kv_cache` logic
-    (KV-cache portion only, no Mamba state updates).  Mutates the input tensors
-    in-place, just like the Triton kernel.
-
-    Returns (blocks_to_release, remove_mask).
-    """
-    N = accepted_counts.shape[0]
-    if num_active_requests is None:
-        num_active_requests = N
-
-    blocks_to_release = torch.empty_like(last_kv_block_id)
-    remove_mask = torch.empty(N, device=accepted_counts.device, dtype=torch.bool)
-
-    for i in range(N):
-        if i >= num_active_requests:
-            blocks_to_release[i] = 0
-            remove_mask[i] = False
-            continue
-
-        accepted = accepted_counts[i].item()
-        prefill = prefill_status[i].item()
-        last_offset = last_kv_block_offset[i].item()
-        kv_length = kv_length_offsets[i].item()
-        block_count = kv_block_counts[i].item()
-        last_block = last_kv_block_id[i].item()
-
-        num_to_rewind = 0 if prefill == 1 else num_speculative_tokens - accepted
-        diff = last_offset - num_to_rewind
-        remove = diff < 0
-
-        new_offset = diff % block_size_tokens
-        last_kv_block_offset[i] = new_offset
-        kv_length_offsets[i] = kv_length - num_to_rewind
-
-        blocks_to_release[i] = last_block
-
-        new_block_count = block_count - 1 if remove else block_count
-        kv_block_counts[i] = new_block_count
-
-        prev_idx = max(new_block_count - 1, 0)
-        prev_block_id = kv_block_ids[i, prev_idx].item()
-
-        last_kv_block_id[i] = prev_block_id if remove else last_block
-
-        scatter_idx = min(new_block_count, kv_block_ids.shape[1] - 1)
-        if remove:
-            kv_block_ids[i, scatter_idx] = -1
-
-        remove_mask[i] = remove
-
-    return blocks_to_release, remove_mask
-
-
-def verify_speculative_tokens_pytorch(
-    input_tokens, output_tokens, num_decode_requests, num_prefill_requests, num_speculative_tokens
-):
-    """Pure-PyTorch reference for speculative token verification.
-
-    Mirrors the original `TextGenerationController._verify_speculative_tokens`
-    logic.
-    """
-    if input_tokens.ndim == 2:
-        input_tokens = input_tokens.squeeze(0)
-
-    stride = num_speculative_tokens + 1
-    active_request_count = num_decode_requests + num_prefill_requests
-    decode_len = num_decode_requests * stride
-
-    accepted_tokens_mask = torch.zeros_like(input_tokens, dtype=torch.bool)
-
-    decode_mask_2d = None
-    if num_decode_requests > 0:
-        decode_inputs = input_tokens[:decode_len].reshape(num_decode_requests, stride)
-        decode_outputs = output_tokens[:decode_len].reshape(num_decode_requests, stride)
-
-        decode_outputs_shifted = decode_outputs.roll(1, dims=1)
-        decode_mask_2d = decode_inputs == decode_outputs_shifted
-        decode_mask_2d[:, 0] = True
-        decode_mask_2d = decode_mask_2d.cummin(dim=1).values
-        accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
-
-    if num_prefill_requests > 0:
-        accepted_tokens_mask[decode_len:] = True
-
-    last_one_indices = torch.full(
-        (active_request_count,), -1, device=input_tokens.device, dtype=torch.long
-    )
-
-    if num_decode_requests > 0:
-        local_last_indices = decode_mask_2d.sum(dim=1) - 1
-        row_offsets = torch.arange(num_decode_requests, device=input_tokens.device) * stride
-        last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
-
-    if num_prefill_requests > 0:
-        prefill_valid = torch.nonzero(accepted_tokens_mask[decode_len:]).squeeze(-1) + decode_len
-        last_one_indices[num_decode_requests:] = prefill_valid
-
-    return last_one_indices, accepted_tokens_mask, input_tokens
-
-
-def prepare_next_forward_pass_pytorch(
-    num_decode_requests,
-    output_tokens,
-    required_logit_indices,
-    last_one_indices,
-    accepted_tokens_mask,
-    input_tokens,
-    sampled_tokens_buf,
-    last_accepted_seq_buf,
-    accepted_tokens_per_request,
-    accepted_token_counts,
-    num_speculative_tokens,
-):
-    """Pure-PyTorch reference for preparing the next forward pass.
-
-    Mirrors the original `_dynamic_step_sample_logits_and_verify_tokens`
-    post-verification logic.
-    """
-    active_request_count = last_one_indices.shape[0]
-    stride = num_speculative_tokens + 1
-
-    for pid in range(active_request_count):
-        idx = last_one_indices[pid].item()
-        sampled_tokens_buf[pid] = output_tokens[idx]
-        last_accepted_seq_buf[pid] = required_logit_indices[idx]
-
-        if pid < num_decode_requests:
-            base = pid * stride
-            for s in range(num_speculative_tokens):
-                pos = base + 1 + s
-                if accepted_tokens_mask[pos]:
-                    accepted_tokens_per_request[pid, s] = input_tokens[pos]
-                else:
-                    accepted_tokens_per_request[pid, s] = -1
-
-            count = 0
-            for s in range(num_speculative_tokens):
-                if accepted_tokens_per_request[pid, s].item() != -1:
-                    count += 1
-            accepted_token_counts[pid] = count
-
-
-def mamba_state_selective_copy_pytorch(
-    intermediate_states, current_states, prefill_status, state_idx, accepted_counts, num_layers
-):
-    """Pure-PyTorch reference for Mamba state selective copy.
-
-    For each decode request, copies
-    `intermediate[layer, slot, accepted_count, ...]` →
-    `current[layer, slot, ...]` for every Mamba layer.
-    """
-    N = prefill_status.shape[0]
-    for i in range(N):
-        if prefill_status[i].item() == 1:
-            continue
-        slot = state_idx[i].item()
-        accepted = accepted_counts[i].item()
-        for layer in range(num_layers):
-            current_states[layer, slot] = intermediate_states[layer, slot, accepted]
 
 
 # ---------------------------------------------------------------------------

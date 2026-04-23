@@ -1263,7 +1263,7 @@ class TestTextGenerationController:
         would produce remove_mask=True, causing the block allocator to free
         block IDs that belong to other active requests.
         """
-        from megatron.core.inference.text_generation_controllers.triton_kernels import (
+        from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
             rewind_kv_cache,
         )
 

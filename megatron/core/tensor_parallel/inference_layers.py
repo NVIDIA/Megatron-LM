@@ -479,7 +479,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             return x, None
 
 
-def inference_all_gather_last_dim(
+def inference_all_gather_from_tensor_model_parallel_region(
     x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
 ) -> torch.Tensor:
     """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
@@ -514,7 +514,7 @@ def inference_all_gather_last_dim(
     return gather_from_tensor_model_parallel_region(x, group=tp_group)
 
 
-def inference_reduce_scatter_first_dim(
+def inference_reduce_scatter_to_sequence_parallel_region(
     x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
 ) -> torch.Tensor:
     """NVLS-optimized reduce-scatter along the first dimension, with NCCL fallback.
@@ -522,6 +522,8 @@ def inference_reduce_scatter_first_dim(
     Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
     where autograd is not needed and NVLS symmetric-memory is available.
     """
+    # TODO(ksanthanam): Refactor InferenceRowParallelLinear._matmul_reduce_scatter
+    # to use this function for its non-fused NVLS reduce-scatter path.
     tp_size = dist.get_world_size(tp_group)
     if tp_size == 1:
         return x
