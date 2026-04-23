@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import gc
 import logging
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
@@ -658,7 +659,17 @@ def _split_tensor_factory(
 
     @torch.no_grad()
     def sh_ten_merge_fn(sub_state_dict):
-        return torch.cat(sub_state_dict)
+        try:
+            return torch.cat(sub_state_dict)
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            logger.warning(
+                f"CUDA OutOfMemoryError encountered during tensors merging."
+                f" Switching to CPU merge. (Error: {e})"
+            )
+            merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
+            gc.collect()
+            torch.cuda.empty_cache()
+            return merged_sub_state_dict
 
     return ShardedTensorFactory(
         orig_sh_ten.key, orig_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn, orig_sh_ten.replica_id
