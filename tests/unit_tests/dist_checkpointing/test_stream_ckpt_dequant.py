@@ -99,9 +99,7 @@ class TestStreamCkptDequant:
     # ---------------------------------------------------------------
 
     @pytest.mark.parametrize('stream_ckpt_dequant', [False, True])
-    def test_fp8_save_load_content_equivalence(
-        self, tmp_path_dist_ckpt, stream_ckpt_dequant
-    ):
+    def test_fp8_save_load_content_equivalence(self, tmp_path_dist_ckpt, stream_ckpt_dequant):
         """Loaded FP8 contents must match regardless of which dequantize path is used."""
         Utils.initialize_model_parallel(1, 1)
 
@@ -114,7 +112,7 @@ class TestStreamCkptDequant:
             return {
                 'w': ShardedTensor.from_rank_offsets(
                     'w', get_fp8_tensor(val), replica_id=Utils.rank
-                ),
+                )
             }
 
         with TempNamedDir(tmp_path_dist_ckpt / f'fp8_eq_{stream_ckpt_dequant}') as ckpt_dir:
@@ -131,7 +129,8 @@ class TestStreamCkptDequant:
             torch.testing.assert_close(
                 loaded_w,
                 torch.full((8,), fill_val, dtype=torch.bfloat16, device='cuda'),
-                rtol=0.1, atol=0.1,  # FP8 quantization tolerance
+                rtol=0.1,
+                atol=0.1,  # FP8 quantization tolerance
             )
 
         Utils.destroy_model_parallel()
@@ -144,9 +143,7 @@ class TestStreamCkptDequant:
             return _to_float8(torch.full((8,), val, dtype=torch.bfloat16, device='cuda'))
 
         sd_to_save = {
-            'w': ShardedTensor.from_rank_offsets(
-                'w', get_fp8_tensor(0.25), replica_id=Utils.rank
-            ),
+            'w': ShardedTensor.from_rank_offsets('w', get_fp8_tensor(0.25), replica_id=Utils.rank)
         }
 
         with TempNamedDir(tmp_path_dist_ckpt / 'fp8_amax') as ckpt_dir:
@@ -154,9 +151,7 @@ class TestStreamCkptDequant:
 
             # Rebuild destination with a known (distinct) amax value we can check
             # survives the streaming load.
-            dst = ShardedTensor.from_rank_offsets(
-                'w', get_fp8_tensor(99.0), replica_id=Utils.rank
-            )
+            dst = ShardedTensor.from_rank_offsets('w', get_fp8_tensor(99.0), replica_id=Utils.rank)
             q = getattr(dst.data, "_quantizer", None)
             if q is None or not isinstance(getattr(q, "amax", None), torch.Tensor):
                 pytest.skip("This TE build's Float8Tensor has no quantizer.amax scalar")
@@ -244,9 +239,7 @@ class TestStreamCkptDequant:
 
     @pytest.mark.skipif(not HAVE_MXFP8, reason="MXFP8Tensor not available in this TE build")
     @pytest.mark.parametrize('stream_ckpt_dequant', [False, True])
-    def test_mxfp8_save_load_content_equivalence(
-        self, tmp_path_dist_ckpt, stream_ckpt_dequant
-    ):
+    def test_mxfp8_save_load_content_equivalence(self, tmp_path_dist_ckpt, stream_ckpt_dequant):
         Utils.initialize_model_parallel(1, 1)
 
         # MXFP8 requires 2D with last-dim aligned to block size (32).
@@ -259,7 +252,7 @@ class TestStreamCkptDequant:
             return {
                 'w': ShardedTensor.from_rank_offsets(
                     'w', get_mxfp8_tensor(val), replica_id=Utils.rank
-                ),
+                )
             }
 
         with TempNamedDir(tmp_path_dist_ckpt / f'mxfp8_eq_{stream_ckpt_dequant}') as ckpt_dir:
@@ -274,7 +267,8 @@ class TestStreamCkptDequant:
             torch.testing.assert_close(
                 loaded_w,
                 torch.full((64, 128), fill_val, dtype=torch.bfloat16, device='cuda'),
-                rtol=0.1, atol=0.1,
+                rtol=0.1,
+                atol=0.1,
             )
 
         Utils.destroy_model_parallel()
@@ -291,9 +285,7 @@ class TestStreamCkptDequant:
         Utils.initialize_model_parallel(1, 1)
 
         src = torch.arange(64, dtype=torch.bfloat16, device='cuda')
-        sd_to_save = {
-            'w': ShardedTensor.from_rank_offsets('w', src.clone(), replica_id=Utils.rank),
-        }
+        sd_to_save = {'w': ShardedTensor.from_rank_offsets('w', src.clone(), replica_id=Utils.rank)}
 
         with TempNamedDir(tmp_path_dist_ckpt / f'plain_{stream_ckpt_dequant}') as ckpt_dir:
             save(sd_to_save, ckpt_dir, TorchDistSaveShardedStrategy())
@@ -301,7 +293,7 @@ class TestStreamCkptDequant:
             dst = {
                 'w': ShardedTensor.from_rank_offsets(
                     'w', torch.zeros_like(src), replica_id=Utils.rank
-                ),
+                )
             }
             strategy = TorchDistLoadShardedStrategy(stream_ckpt_dequant=stream_ckpt_dequant)
             loaded = load(dst, ckpt_dir, strategy)
@@ -313,9 +305,9 @@ class TestStreamCkptDequant:
     def test_default_is_off(self):
         """The default for stream_ckpt_dequant must be False (old behaviour preserved)."""
         strat = TorchDistLoadShardedStrategy()
-        assert strat.stream_ckpt_dequant is False, (
-            "Default must be False so users opt-in explicitly."
-        )
+        assert (
+            strat.stream_ckpt_dequant is False
+        ), "Default must be False so users opt-in explicitly."
         planner = MCoreLoadPlanner()
         assert planner.stream_ckpt_dequant is False
 
