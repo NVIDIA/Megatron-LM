@@ -10,7 +10,7 @@ from megatron.core import mpu
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
-from pretrain_mamba import get_batch
+from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
 
 
