@@ -196,10 +196,7 @@ class LogProbsPrefill:
     # -- public API --
 
     def indexing(self, context, *, eager: bool = False) -> None:
-        """Run indexing kernel with optional CUDA graph capture/replay.
-
-        Stores results on ``self`` for use by :meth:`calculate`.
-        """
+        """Run indexing kernel with optional CUDA graph capture/replay."""
         key = ("prefill_idx", context.padded_batch_dimensions)
         result = self.indexing_kernel(context, eager=eager, cache_key=key)
         self._ri, self._cu_ml, self._li, self._li_range, self._mt = result

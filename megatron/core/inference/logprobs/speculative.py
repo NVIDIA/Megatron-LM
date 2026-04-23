@@ -249,19 +249,13 @@ class LogProbsSpeculative:
     # -- public API --
 
     def prefill_indexing(self, context, *, eager: bool = False) -> None:
-        """Run prefill indexing kernel with optional CUDA graph capture/replay.
-
-        Stores results on ``self`` for use by :meth:`calculate`.
-        """
+        """Run prefill indexing kernel with optional CUDA graph capture/replay."""
         key = ("spec_fp_idx", context.padded_batch_dimensions)
         result = self.prefill_indexing_kernel(context, eager=eager, cache_key=key)
         self._fp_ri, self._fp_cu_ml, self._fp_li, self._fp_li_range, self._fp_mt, self._fp_count_gpu = result
 
     def softmax(self, context, logits: Tensor, *, eager: bool = False) -> None:
-        """Run post-forward softmax with optional CUDA graph capture/replay.
-
-        Stores results on ``self`` for use by :meth:`calculate`.
-        """
+        """Run post-forward softmax with optional CUDA graph capture/replay."""
         key = ("spec_sm", context.padded_batch_dimensions)
         self._decode_log_probs, self._prefill_log_probs = self.softmax_kernel(
             context, logits, eager=eager, cache_key=key,

@@ -137,10 +137,7 @@ class LogProbsDecode:
     # -- public API --
 
     def indexing(self, context, *, eager: bool = False) -> None:
-        """Run indexing kernel with optional CUDA graph capture/replay.
-
-        Stores results on ``self`` for use by :meth:`calculate`.
-        """
+        """Run indexing kernel with optional CUDA graph capture/replay."""
         key = ("decode_idx", context.padded_batch_dimensions)
         self._ri, self._padded_arange = self.indexing_kernel(
             context, eager=eager, cache_key=key,
