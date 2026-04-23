@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -24,7 +24,7 @@ class MambaInferenceStateConfig:
     layer_type_list: List[str]
     """
     A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
-    See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list of symbols.
+    See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
@@ -50,7 +50,7 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -309,7 +309,12 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
-    def __post_init__(self):
+    verbose: InitVar[bool] = False
+    """Whether to log detailed context configuration at initialization.
+    This is an InitVar and is not stored as a field on the config."""
+
+    def __post_init__(self, verbose: bool):
+        self._verbose = verbose
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "

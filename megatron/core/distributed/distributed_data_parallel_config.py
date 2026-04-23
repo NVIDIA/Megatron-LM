@@ -72,6 +72,10 @@ class DistributedDataParallelConfig:
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
 
+    fp4_param_gather: bool = False
+    """If true, keep the compute param in fp4 (do not use any other intermediate dtype) and
+       perform the param all-gather in fp4."""
+
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
@@ -194,6 +198,12 @@ class DistributedDataParallelConfig:
       `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
       communication buffers (per FSDP group) adds memory overhead. Defaults to None.
       No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
+    """
+
+    megatron_fsdp_use_decoupled_grad: bool = False
+    """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
+      gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
+      main gradients to parameter dtype for `.grad`.
     """
 
     def __post_init__(self):

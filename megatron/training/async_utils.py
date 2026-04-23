@@ -4,9 +4,9 @@
 This module provides a singleton instance of AsyncCallsQueue which manages
 the async checkpoint save calls.
 """
+import inspect
 import logging
 import time
-
 from abc import ABC
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
@@ -17,8 +17,14 @@ from megatron.training.utils import print_rank_0
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import _results_queue
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+        save_state_dict_async_finalize,
+    )
 except (ImportError, ModuleNotFoundError):
     from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
+    from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
+        save_state_dict_async_finalize,
+    )
 
     NVRxAsyncRequest = ABC
 
@@ -54,12 +60,28 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     time_start = time.time()
     if rank == 0:
         print(f"init_persistent_async_worker: {rank}, Starting Async Caller", flush=True)
-    _async_calls_queue = AsyncCallsQueue(persistent=True)
+    _async_calls_queue = AsyncCallsQueue(
+        persistent=True,
+        **(
+            {"cpu_shm_mode": args.async_ckpt_use_cpu_shm}
+            if async_strategy == "nvrx"
+            and "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.__init__).parameters
+            else {}
+        ),
+    )
     # initialize the persistent caller with QoS priorities from args
     kwargs = {}
     if async_strategy == "mcore":
         # Note: nvidia-resiliency-ext uses is_daemon instead of mp_mode (always spawns)
         kwargs["mp_mode"] = mp_mode
+    elif async_strategy == "nvrx":
+        if "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
+            kwargs["cpu_shm_mode"] = args.async_ckpt_use_cpu_shm
+        elif args.async_ckpt_use_cpu_shm:
+            raise AssertionError(
+                "Installed nvidia-resiliency-ext does not support cpu_shm_mode. "
+                "Update nvidia-resiliency-ext to use --async-ckpt-use-cpu-shm."
+            )
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
         cpu_priority=args.async_ckpt_cpu_priority,
@@ -133,3 +155,16 @@ def reset_persistent_async_worker(async_strategy):
     _async_calls_queue = None
     _, module = get_async_strategy(async_strategy, "CachedMetadataFileSystemReader")
     module.clear_metadata_cache()
+
+
+def get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> NVRxAsyncRequest:
+    """Creates an async save request for fsdp_dtensor & torch_dcp with a finalize function."""
+    save_fn, preload_fn, save_args = writer.get_save_function_and_args()
+
+    def finalize_fn():
+        """Finalizes async checkpointing and synchronizes processes."""
+        save_state_dict_async_finalize(*save_state_dict_ret)
+
+    return NVRxAsyncRequest(
+        save_fn, save_args, [finalize_fn], async_fn_kwargs={}, preload_fn=preload_fn
+    )
