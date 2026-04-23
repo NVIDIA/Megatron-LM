@@ -1284,7 +1284,15 @@ class _CudaGraphRunner(torch.nn.Module):
 
         out_iter = iter(self.to_list(out))
         fwd_outputs = self.to_list(self.fwd_graph_outputs)
-        return tuple(next(out_iter) if torch.is_tensor(o) else o for o in fwd_outputs)
+        replayed = tuple(next(out_iter) if torch.is_tensor(o) else o for o in fwd_outputs)
+        # Preserve the original output's type when it's a non-tensor container
+        # (e.g. a dataclass like ``DeferredAdd``). Without this, a dataclass
+        # output would be silently downgraded to a ``tuple`` on replay,
+        # breaking downstream ``isinstance`` checks.
+        captured = self.fwd_graph_outputs
+        if not torch.is_tensor(captured) and not isinstance(captured, tuple):
+            return type(captured)(*replayed)
+        return replayed
 
     def get_mismatch_errors(self, args, kwargs):
         """Return list of detailed errors for mismatched cudagraph args."""

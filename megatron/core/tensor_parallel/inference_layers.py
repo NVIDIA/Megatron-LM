@@ -162,6 +162,13 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
         # has already applied the rms-norm and all-gather.
         self.skip_norm_and_all_gather = False
+        # One-shot flag armed by the cross-layer deferred-add protocol.
+        # When set, this layer's ``forward`` skips the input RMSNorm
+        # (the previous layer's deferred add + this layer's norm were
+        # already collapsed into a single Triton kernel by
+        # :mod:`megatron.core.fusions.deferred_add`). ``forward`` clears
+        # the flag after reading it so callers don't need to reset state.
+        self.skip_input_norm = False
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -210,8 +217,15 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if self.training:
             return super().forward(x)
 
+        # ``skip_input_norm`` is a one-shot flag armed by the cross-layer
+        # deferred-add protocol: we consume it here and clear it so callers
+        # don't need to remember to reset state between forwards.
+        skip_input_norm = self.skip_input_norm
+        self.skip_input_norm = False
+
         if self.tp_size == 1:
-            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            if not skip_input_norm:
+                x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = _apply_linear(x, self.weight, self.config)
             return x, None
 
@@ -223,6 +237,10 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         )
         if is_in_fused_mode:
             x = symm_mem_buffer["tensor"]
+        elif skip_input_norm:
+            # x is already normed (by the cross-layer deferred-add fusion).
+            # Still need the all-gather before the matmul.
+            x = self._all_gather(x, symm_mem_buffer)
         else:
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = self._all_gather(x, symm_mem_buffer)

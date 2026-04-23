@@ -15,6 +15,16 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.fusions.deferred_add import (
+    AbsorbMode,
+    DeferMode,
+    DeferredAdd,
+    add_fusion_disabled_by_env,
+    materialize,
+    should_absorb_add,
+    should_defer_add,
+)
+from megatron.core.fusions.fused_add_rmsnorm import fused_add_rmsnorm
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -490,6 +500,75 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+        # Cross-layer deferred-add modes. Set by ``wire_add_fusion`` when
+        # this layer is paired with a compatible neighbour. Runtime guards
+        # in the forward path still fall back to the unfused behaviour
+        # under training or grad-enabled modes.
+        self._absorb_mode = AbsorbMode.NONE
+        self._defer_mode = DeferMode.NONE
+
+    def native_absorb_mode(self) -> AbsorbMode:
+        """Where this layer would absorb an incoming ``DeferredAdd``.
+
+        Two entry sites are supported:
+        * ``ATTN_ENTRY`` when ``self_attention`` is real and its
+          ``linear_qkv`` is an ``InferenceLayerNormColumnParallelLinear``
+          exposing ``skip_input_norm`` and ``layer_norm_weight``.
+        * ``PRE_MLP_ENTRY`` when ``self_attention`` is ``IdentityOp`` and
+          ``pre_mlp_layernorm`` is a real norm with a ``weight``.
+        """
+        if add_fusion_disabled_by_env():
+            return AbsorbMode.NONE
+        if getattr(self.config, "transformer_impl", None) != "inference_optimized":
+            return AbsorbMode.NONE
+        if self.recompute_input_layernorm or self.recompute_pre_mlp_layernorm:
+            return AbsorbMode.NONE
+        if self.config.fp32_residual_connection:
+            return AbsorbMode.NONE
+        if not isinstance(self.cross_attention, IdentityOp):
+            return AbsorbMode.NONE
+        if not isinstance(self.self_attention, IdentityOp):
+            lq = getattr(self.self_attention, "linear_qkv", None)
+            if (
+                lq is not None
+                and hasattr(lq, "skip_input_norm")
+                and hasattr(lq, "layer_norm_weight")
+                and lq.layer_norm_weight is not None
+            ):
+                return AbsorbMode.ATTN_ENTRY
+            return AbsorbMode.NONE
+        if (
+            not isinstance(self.mlp, IdentityOp)
+            and not isinstance(self.pre_mlp_layernorm, IdentityOp)
+            and hasattr(self.pre_mlp_layernorm, "weight")
+        ):
+            return AbsorbMode.PRE_MLP_ENTRY
+        return AbsorbMode.NONE
+
+    def native_defer_mode(self) -> DeferMode:
+        """Where this layer would defer its exit residual-add.
+
+        * ``ATTN_EXIT`` for attention-only layers (``mlp`` is ``IdentityOp``):
+          skip ``self_attn_bda`` in ``_forward_attention``.
+        * ``MLP_EXIT`` for layers with a real MLP: skip ``mlp_bda`` in
+          ``_forward_post_mlp``.
+        """
+        if add_fusion_disabled_by_env():
+            return DeferMode.NONE
+        if getattr(self.config, "transformer_impl", None) != "inference_optimized":
+            return DeferMode.NONE
+        if getattr(self.config, "add_bias_linear", False):
+            return DeferMode.NONE
+        if self.config.fp32_residual_connection:
+            return DeferMode.NONE
+        if getattr(self.config, "inference_fuse_tp_communication", False):
+            return DeferMode.NONE
+        if not isinstance(self.mlp, IdentityOp):
+            return DeferMode.MLP_EXIT
+        if not isinstance(self.self_attention, IdentityOp):
+            return DeferMode.ATTN_EXIT
+        return DeferMode.NONE
+
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
 
@@ -576,30 +655,58 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Optional Input Layer norm
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    apply_module(self.input_layernorm), hidden_states
-                )
+        # Cross-layer absorb at the attention entry: fold the previous
+        # layer's deferred residual-add into ``linear_qkv``'s entry norm.
+        # ``PRE_MLP_ENTRY`` absorbs are handled in
+        # ``_forward_pre_mlp_layernorm`` -- pass the ``DeferredAdd`` through.
+        if self._absorb_mode is AbsorbMode.ATTN_ENTRY and should_absorb_add(
+            self, hidden_states
+        ):
+            lq = self.self_attention.linear_qkv
+            input_layernorm_output, residual = fused_add_rmsnorm(
+                hidden_states.delta,
+                hidden_states.residual,
+                lq.layer_norm_weight,
+                eps=self.config.layernorm_epsilon,
+            )
+            # One-shot flag; ``linear_qkv.forward`` clears after consuming.
+            lq.skip_input_norm = True
         else:
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+            # A ``DeferredAdd`` here is either destined for the MLP-entry
+            # absorb (pass it through) or fusion is off at runtime (rehydrate).
+            if isinstance(hidden_states, DeferredAdd) and not (
+                self._absorb_mode is AbsorbMode.PRE_MLP_ENTRY
+                and should_absorb_add(self, hidden_states)
+            ):
+                hidden_states = materialize(hidden_states)
+            # Optional Input Layer norm
+            if self.recompute_input_layernorm:
+                self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                with off_interface(
+                    self.offload_attn_norm, hidden_states, "attn_norm"
+                ) as hidden_states:
+                    input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                        apply_module(self.input_layernorm), hidden_states
+                    )
+            else:
+                with off_interface(
+                    self.offload_attn_norm, hidden_states, "attn_norm"
+                ) as hidden_states:
+                    input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
-        if isinstance(input_layernorm_output, tuple):
-            if len(input_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of input_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(input_layernorm_output)}"
-                )
-            input_layernorm_output, residual = input_layernorm_output
-        else:
-            residual = hidden_states
+            if isinstance(input_layernorm_output, tuple):
+                if len(input_layernorm_output) != 2:
+                    raise ValueError(
+                        f"When the output of input_layernorm is a tuple, it is "
+                        f"expected to have 2 elements (output, residual), but "
+                        f"got {len(input_layernorm_output)}"
+                    )
+                input_layernorm_output, residual = input_layernorm_output
+            else:
+                residual = hidden_states
 
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
+            if self.config.fp32_residual_connection:
+                residual = residual.float()
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -633,6 +740,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias[0]
             )
 
+        # ATTN_EXIT (attention-only layer): defer ``self_attn_bda`` into the
+        # next layer's fused entry and return a ``DeferredAdd``.
+        defer_add_at_attn = (
+            self._defer_mode is DeferMode.ATTN_EXIT
+            and should_defer_add(self)
+            and not using_fused_tp_inference_kernel
+        )
+
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
@@ -641,6 +756,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
+        elif defer_add_at_attn:
+            hidden_states = DeferredAdd(
+                residual=residual, delta=attention_output_with_bias[0]
+            )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -699,8 +818,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
+        When the layer has no MLP and emitted a ``DeferredAdd`` from the attention
+        path, the MLP step is a pass-through and we return directly.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
+        # Early-exit only when THIS layer deferred at the attention exit
+        # (attention-only layer type). A ``DeferredAdd`` may also be passing
+        # through for the MLP entry to absorb; in that case we must still
+        # run ``_forward_mlp`` so the absorb fires.
+        if self._defer_mode is DeferMode.ATTN_EXIT and isinstance(hidden_states, DeferredAdd):
+            return hidden_states, context
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
@@ -712,6 +839,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
+
+        # PRE_MLP_ENTRY absorb: attention-free layer (e.g. MoE-only) folds
+        # the incoming ``DeferredAdd`` into ``pre_mlp_layernorm``.
+        if self._absorb_mode is AbsorbMode.PRE_MLP_ENTRY and should_absorb_add(
+            self, hidden_states
+        ):
+            with off_interface(
+                self.offload_mlp_norm, hidden_states.residual, "mlp_norm"
+            ) as _offloaded_residual:
+                normed, residual = fused_add_rmsnorm(
+                    hidden_states.delta,
+                    _offloaded_residual,
+                    self.pre_mlp_layernorm.weight,
+                    eps=self.config.layernorm_epsilon,
+                )
+            return normed, residual
 
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -864,6 +1007,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
                 mlp_output_with_bias[0]
             )
+
+        # MLP_EXIT defer: skip ``mlp_bda`` and return a ``DeferredAdd`` for
+        # the next layer's fused entry kernel to absorb.
+        if (
+            self._defer_mode is DeferMode.MLP_EXIT
+            and should_defer_add(self)
+            and not using_fused_tp_inference_kernel
+        ):
+            return DeferredAdd(residual=residual, delta=mlp_output_with_bias[0])
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
