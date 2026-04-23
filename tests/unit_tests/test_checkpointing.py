@@ -138,6 +138,7 @@ def create_ckpt_load_args(create_args):
     args.tensor_model_parallel_size = 1
     args.pipeline_model_parallel_size = 1
     args.ckpt_assume_constant_structure = False
+    args.stream_ckpt_dequant = False
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
