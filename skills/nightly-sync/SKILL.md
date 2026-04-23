@@ -260,9 +260,22 @@ the branch.
 - Create as **draft**: `gh pr create --draft`
 - Body should include:
   1. Summary of what was synced (number of commits from main)
-  2. List of files where main's version was taken over the merge
-  3. List of files that were deleted in dev but restored (and why)
-  4. The remerge-diff output (`git show --remerge-diff HEAD` on the merge
+  2. **Python-only line-change stats**, so reviewers can gauge the real
+     code surface (excluding golden-value JSON, uv.lock, etc.). Compute
+     with:
+
+     ```bash
+     git diff --numstat origin/dev...HEAD -- '*.py' \
+       | awk 'BEGIN{a=0;d=0} {a+=$1; d+=$2} END{
+           printf "Python lines: +%d / -%d across %d files\n", a, d, NR
+         }'
+     ```
+
+     Include the exact line (e.g. `Python lines: +1234 / -567 across 42 files`)
+     in the PR body so reviewers see it at a glance.
+  3. List of files where main's version was taken over the merge
+  4. List of files that were deleted in dev but restored (and why)
+  5. The remerge-diff output (`git show --remerge-diff HEAD` on the merge
      commit) so reviewers can inspect ONLY the conflict resolutions. If the
      output is very long, summarize conflicts by file and put the full diff
      in a collapsed `<details>` block. If git is too old for `--remerge-diff`,
