@@ -1338,7 +1338,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             """Build layer using legacy spec-based approach."""
             if self.config.fp8:
                 init_context = get_fp8_context(self.config, is_init=True)
-            elif self.config.fp4
+            elif self.config.fp4:
                 init_context = get_fp4_context(self.config, is_init=True)
             else:
                 init_context = nullcontext()
@@ -1357,7 +1357,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             """Build layer using pattern-based approach (new Mamba path)."""
             if self.config.fp8:
                 init_context = get_fp8_context(self.config, is_init=True)
-            elif self.config.fp4
+            elif self.config.fp4:
                 init_context = get_fp4_context(self.config, is_init=True)
             else:
                 init_context = nullcontext()
