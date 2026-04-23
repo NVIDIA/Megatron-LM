@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Prepare GPT dataset caches ahead of training."""
+"""Prepare GPT dataset caches ahead of training.
+
+Unsupported configurations:
+    --mock-data, --sft, --fim-data, --step-batch-size-schedule
+"""
 
 import argparse
 import json
@@ -13,6 +17,7 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_train_valid_test_num_samples
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import set_args, unset_global_variables
+from megatron.training.training import update_train_iters
 from megatron.training.utils import get_blend_and_blend_per_split
 
 try:
@@ -68,6 +73,10 @@ def _validate_prepare_cache_args(args: Any) -> None:
         raise ValueError("--sft is not supported by tools/prepare_cache.py")
     if getattr(args, "fim_data", False):
         raise ValueError("--fim-data is not supported by tools/prepare_cache.py")
+    if getattr(args, "step_batch_size_schedule", None) is not None:
+        raise ValueError(
+            "--step-batch-size-schedule is not supported by tools/prepare_cache.py"
+        )
 
 
 def _disable_cache_load_only_flags(args: Any) -> Dict[str, bool]:
@@ -161,6 +170,8 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
     set_args(args)
 
     try:
+        # Derive train_iters from --train-samples when needed (pretrain() does the same).
+        update_train_iters(args)
         train_valid_test_num_samples = get_train_valid_test_num_samples()
         _print_effective_configuration(args, train_valid_test_num_samples, ignored_flags)
 

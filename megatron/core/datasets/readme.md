@@ -202,6 +202,8 @@ This is especially useful for large blends or many file prefixes, where building
 
 If the later training job does not specify `--global-batch-size` (which is needed to determine the dataset size and splits), you should specify `--prepare-cache-world-size` to explicitly set the world size used during cache preparation.
 
+`tools/prepare_cache.py` does not support `--mock-data`, `--sft`, `--fim-data`, or `--step-batch-size-schedule`.
+
 ## Fast DataLoader initialization
 
 Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags:

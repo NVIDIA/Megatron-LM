@@ -127,6 +127,7 @@ def _build_prepare_cache_args(file_prefixes, data_cache_path, **overrides):
         mock_data=False,
         sft=False,
         fim_data=False,
+        step_batch_size_schedule=None,
     )
     args.update(overrides)
     return Namespace(**args)
@@ -253,10 +254,34 @@ def test_prepare_cache_builds_and_hits_per_split_dataset_cache(tmp_path_dist_ckp
 
 @pytest.mark.parametrize(
     ("flag_name", "flag_value", "message"),
-    [("mock_data", True, "--mock-data"), ("sft", True, "--sft"), ("fim_data", True, "--fim-data")],
+    [
+        ("mock_data", True, "--mock-data"),
+        ("sft", True, "--sft"),
+        ("fim_data", True, "--fim-data"),
+        ("step_batch_size_schedule", [(0, 8)], "--step-batch-size-schedule"),
+    ],
 )
 def test_prepare_cache_rejects_unsupported_modes(tmp_path, flag_name, flag_value, message):
     args = _build_prepare_cache_args([], tmp_path / "cache", **{flag_name: flag_value})
 
     with pytest.raises(ValueError, match=message):
         build_dataset_caches(args)
+
+
+def test_prepare_cache_builds_with_train_samples(tmp_path_dist_ckpt):
+    _initialize_test_environment()
+
+    tokenizer = _build_null_tokenizer()
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_prepare_cache_builds_with_train_samples", sync=True
+    ) as temp_dir:
+        file_prefixes = _create_shared_file_prefixes(tokenizer, os.path.join(temp_dir, "dataset"))
+        args = _build_prepare_cache_args(
+            file_prefixes, temp_dir / "cache", train_iters=None, train_samples=32
+        )
+
+        summary = build_dataset_caches(args)
+
+        assert args.train_iters == 32 // args.global_batch_size
+        assert summary["train_valid_test_num_samples"][0] == 32
