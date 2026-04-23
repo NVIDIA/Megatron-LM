@@ -94,6 +94,7 @@ def rewind_kv_cache(
     return blocks_to_release, remove_mask
 
 
+# pylint: disable=line-too-long
 def verify_speculative_tokens(
     input_tokens, output_tokens, num_decode_requests, num_prefill_requests, num_speculative_tokens
 ):
@@ -162,6 +163,7 @@ def verify_speculative_tokens(
     return last_one_indices, accepted_tokens_mask, input_tokens
 
 
+# pylint: disable=line-too-long
 def prepare_next_forward_pass(
     num_decode_requests,
     output_tokens,
