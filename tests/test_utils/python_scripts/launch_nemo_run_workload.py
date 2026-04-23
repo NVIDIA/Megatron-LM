@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import io
 import logging
 import os
 import pathlib
@@ -40,6 +41,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "unspecified launch failure" in concat_allranks_logs
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
+        or "The following metrics failed" in concat_allranks_logs
     )
 
 
@@ -120,6 +122,8 @@ def main(
         shm_size="30g",
         env_vars={
             "PYTHONUNBUFFERED": "1",
+            "FORCE_COLOR": "1",
+            "TERM": "xterm-256color",
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": str(n_repeat),
@@ -128,17 +132,6 @@ def main(
             "NCCL_DEBUG_FILE": "/opt/megatron-lm/assets_dir/logs/nccl_debug.log",
             "HF_HOME": "/mnt/hf_home",
             "TRANSFORMERS_OFFLINE": "1",
-            "NCCL_PROTO": "simple",
-            "NCCL_ALGO": "Ring",
-            "NCCL_COLLNET_ENABLE": "0",
-            "NCCL_NVLS_ENABLE": "0",
-            # Disable the EFA tuner plugin so NCCL_ALGO/NCCL_PROTO are
-            # actually respected instead of being overridden at runtime.
-            "NCCL_TUNER_PLUGIN": "",
-            # Match the NCCL default (4 MB) so buffer-chunking behaviour
-            # is the same as on Slurm nodes.
-            "NCCL_BUFFSIZE": "4194304",
-            "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
         },
         packager=run.Packager(),
         volumes=artifacts,
@@ -146,11 +139,37 @@ def main(
 
     n_attempts = 0
     while n_attempts < 3:
-        with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
-            _ = exp.add([inline_script], tail_logs=False, name="task-1")
+        tee_buffer = io.StringIO()
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
 
-            exp.dryrun(log=True)
-            exp.run(detach=False, tail_logs=True, sequential=False)
+        class _TeeStream:
+            def __init__(self, real_stream, buf):
+                self._real = real_stream
+                self._buf = buf
+
+            def write(self, data):
+                self._real.write(data)
+                self._buf.write(data)
+
+            def flush(self):
+                self._real.flush()
+                self._buf.flush()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        sys.stdout = _TeeStream(original_stdout, tee_buffer)
+        sys.stderr = _TeeStream(original_stderr, tee_buffer)
+        try:
+            with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
+                _ = exp.add([inline_script], tail_logs=False, name="task-1")
+
+                exp.dryrun(log=True)
+                exp.run(detach=False, tail_logs=True, sequential=False)
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
         result_dict = exp.status(return_dict=True)
         _, job_dict = list(result_dict.items())[0]
@@ -161,8 +180,8 @@ def main(
             sys.exit(0)
 
         logger.error(f"Job failed with status: {job_dict['status']}")
-        log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/*/attempt_0/*/std*.log")
-        all_ranks_all_logs = []
+        log_file_paths = pathlib.Path(os.getcwd()).glob("**/attempt_0/*/std*.log")
+        all_ranks_all_logs = [tee_buffer.getvalue()]
         for log_file_path in log_file_paths:
             with open(log_file_path, "r") as f:
                 all_logs = f.readlines()

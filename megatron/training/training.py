@@ -677,7 +677,7 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         from operator import itemgetter
 
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
@@ -1203,15 +1203,14 @@ def pretrain(
         print_datetime('after training is done')
 
         if not args.skip_train and args.save and iteration != 0 and iteration % args.save_interval != 0:
-            save_checkpoint(
+            save_checkpoint_and_time(
                 iteration,
                 model,
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
-                preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                train_data_iterator=train_data_iterator
             )
 
         one_logger and one_logger.log_metrics(
@@ -1293,29 +1292,20 @@ def update_train_iters(args):
     if args.train_iters:
         return
 
-    # Constant batch size with sample-based training.
-    if args.rampup_batch_size is None:
-        args.train_iters = args.train_samples // args.global_batch_size
-
-    else:
-        # Sample based training with rampup batch size.
+    if args.step_batch_size_schedule is not None:
+        # Sample based training with step batch size schedule.
         iterations = 0
         consumed_samples = 0
-        # Rampup phase.
-        while (
-            consumed_samples <= int(args.rampup_batch_size[2])
-            and consumed_samples <= args.train_samples
-        ):
+        while consumed_samples < args.train_samples:
             update_num_microbatches(consumed_samples, consistency_check=False)
             consumed_samples += get_current_global_batch_size()
             iterations += 1
         # Reset
         update_num_microbatches(0, consistency_check=False)
-        # Constant phase
-        # Note that we throw away any partial last batch.
-        if args.train_samples > consumed_samples:
-            iterations += (args.train_samples - consumed_samples) // args.global_batch_size
         args.train_iters = iterations
+    else:
+        # Constant batch size with sample-based training.
+        args.train_iters = args.train_samples // args.global_batch_size
 
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
@@ -1516,18 +1506,49 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             dp_init_kwargs = {}
             if args.use_megatron_fsdp:
                 dp_init_kwargs["pg_collection"] = pg_collection
-            model = [
-                DP(
-                    config=config,
-                    ddp_config=ddp_config,
-                    module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication
-                    # for these model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-                    **dp_init_kwargs,
+
+            wrapped_model = []
+            for model_chunk_idx, model_chunk in enumerate(model):
+                chunk_kwargs = dict(dp_init_kwargs)
+                disable_bucketing = (
+                    (model_chunk_idx > 0)
+                    or args.overlap_param_gather_with_optimizer_step
                 )
-                for (model_chunk_idx, model_chunk) in enumerate(model)
-            ]
+
+                # Pre-compute parameter layouts for the distributed optimizer.
+                # Only pass to DDP; FSDP variants don't accept full_param_layout.
+                if args.use_distributed_optimizer and DP is DDP:
+                    all_params = [
+                        p for p in model_chunk.parameters() if p.requires_grad
+                    ]
+                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                    effective_bucket_size = (
+                        None
+                        if disable_bucketing or pp_rank > 0
+                        else ddp_config.bucket_size
+                    )
+                    chunk_kwargs["full_param_layout"] = (
+                        DistributedOptimizer.compute_full_param_layout(
+                            all_params,
+                            effective_bucket_size,
+                            mpu.get_data_parallel_world_size(with_context_parallel=True),
+                            ddp_config,
+                            expert_data_parallel_world_size=(
+                                mpu.get_expert_data_parallel_world_size()
+                            ),
+                        )
+                    )
+
+                wrapped_model.append(
+                    DP(
+                        config=config,
+                        ddp_config=ddp_config,
+                        module=model_chunk,
+                        disable_bucketing=disable_bucketing,
+                        **chunk_kwargs,
+                    )
+                )
+            model = wrapped_model
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
@@ -1739,6 +1760,21 @@ def setup_model_and_optimizer(
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+
+    # Validate that the world size can accommodate the current batch size.
+    # This catches the case where GPUs were scaled up mid-training but the
+    # current position in the batch size schedule yields a batch size that
+    # is too small for the number of data-parallel replicas.
+    num_microbatches = get_num_microbatches()
+    current_global_batch_size = get_current_global_batch_size()
+    data_parallel_size = mpu.get_data_parallel_world_size()
+    assert num_microbatches is not None and num_microbatches >= 1, (
+        f'current global batch size ({current_global_batch_size}) is too small for '
+        f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
+        f'{args.micro_batch_size * data_parallel_size}. The world size cannot accommodate the '
+        f'batch size. This can happen when resuming with more GPUs than the current batch size '
+        f'schedule entry supports.'
+    )
 
     # get model without FP16 and/or DDP wrappers
     if (
@@ -2170,7 +2206,7 @@ def training_log(
         if is_hybrid_model(args):
             from operator import itemgetter
 
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols, get_hybrid_layer_counts,
             )
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
@@ -2288,6 +2324,13 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
+
+        # RL token throughput metrics.
+        if args.perform_rl_step:
+            log_string += rl_utils.log_rl_throughput_metrics(
+                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
+            )
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -2426,6 +2469,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    
+    # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
+    timers(timer_key).stop(barrier=True)
+    save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
+    
     if should_report_memory:
         # Track memory after checkpoint save.
         report_memory(f"(after save_checkpoint for iteration {iteration})")
@@ -2436,12 +2484,12 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
-    timers(timer_key).stop(barrier=True)
+
     timers.log([timer_key])
 
     # Log E2E metrics after save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    save_checkpoint_duration = timers(timer_key).elapsed()
+
     one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
     if args.log_progress and not non_persistent_ckpt:
@@ -2710,12 +2758,13 @@ def train(
         destroy_num_microbatches_calculator()
         # Then initialize with the correct perform_rl_step=True context
         init_num_microbatches_calculator(
-            args.rank,
-            args.rampup_batch_size,
-            args.global_batch_size,
-            args.micro_batch_size,
-            mpu.get_data_parallel_world_size(),
-            args.decrease_batch_size_if_needed
+            rank=args.rank,
+            global_batch_size=args.global_batch_size,
+            micro_batch_size=args.micro_batch_size,
+            data_parallel_size=mpu.get_data_parallel_world_size(),
+            decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+            step_batch_size_schedule=args.step_batch_size_schedule,
+            seq_length=args.seq_length,
         )
         print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
 
@@ -2967,8 +3016,8 @@ def train(
                 )
             else:
                 assert get_num_microbatches() > num_microbatches, (
-                    f"Number of microbatches should be increasing due to batch size rampup; "
-                    f"instead going from {num_microbatches} to {get_num_microbatches()}"
+                    f"Number of microbatches should not decrease; "
+                    f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
                 if args.save is not None:
                     save_checkpoint_and_time(
@@ -3028,6 +3077,7 @@ def train(
                     sequence_packing=args.rl_use_sequence_packing,
                     buffered_rollouts=buffered_rollouts,
                     is_correction=args.rl_inference_logprobs_is_correction,
+                    optimizer_is_on_cpu=args.rl_offload_optimizer_during_inference,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
@@ -3103,6 +3153,7 @@ def train(
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
             getattr(args, "fsdp_manual_registration", False)
+            and getattr(args, "nccl_ub", False)
             and getattr(args, "use_megatron_fsdp", False)
             and iteration ==  start_iteration + 1
         ):
@@ -3110,9 +3161,9 @@ def train(
                 if isinstance(model_chunk, megatron_FSDP) and getattr(
                     model_chunk.ddp_config, "fsdp_manual_registration", False
                 ):
-                    pad_buf = getattr(model_chunk, "param_and_grad_buffer", None)
-                    if pad_buf is not None:
-                        pad_buf.manual_buffer_registration()
+                    param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
+                    if param_and_grad_buffer is not None:
+                        param_and_grad_buffer.manual_buffer_registration()
 
         if args.perform_rl_step and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
