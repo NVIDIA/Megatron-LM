@@ -896,14 +896,22 @@ def validate_args(args, defaults={}):
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
                 'p2p sends and recvs between same 2 ranks per communication batch'
     else:
-        # Overlap P2P communication is disabled if not using the interleaved schedule.
-        args.overlap_p2p_comm = False
-        args.align_param_gather = False
-        # Only print warning if PP size > 1.
-        if args.rank == 0 and args.pipeline_model_parallel_size > 1:
-            print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
-                'since non-interleaved schedule does not support overlapping p2p communication '
-                'and aligned param AG')
+        # v1: non-interleaved steady-state overlap is now allowed.
+        # align_param_gather is still unsupported for non-interleaved.
+        if args.align_param_gather:
+            args.align_param_gather = False
+            if args.rank == 0 and args.pipeline_model_parallel_size > 1:
+                print(
+                    'WARNING: Setting args.align_param_gather to False since '
+                    'non-interleaved schedule does not support aligned param AG'
+                )
+        if args.rank == 0 and args.pipeline_model_parallel_size > 1 and args.overlap_p2p_comm:
+            print(
+                'WARNING: Non-interleaved overlap_p2p_comm v1 only supports training + fixed-shape '
+                'steady-state 1F1B; adjust_tensor_shapes_fn, multimodule, forward_only, '
+                'variable_seq_lengths, mtp_standalone, overlap_p2p_comm_warmup_flush, and '
+                'ring_exchange remain unsupported'
+            )
 
     print_rank_0(
         f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"
