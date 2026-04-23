@@ -14,6 +14,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
@@ -954,21 +955,24 @@ class MultiTokenPredictionLayer(MegatronModule):
         # Unlike transformer_block.py which needs to support mixed-precision in
         # different layers,currently MTP only use global fp8 context.
         if self.config.fp8:
-            fp8_context = get_fp8_context(self.config)
-            transformer_layer_fp8_context = get_fp8_context(self.config)
+            precision_context = get_fp8_context(self.config)
+            transformer_layer_context = get_fp8_context(self.config)
+        elif self.config.fp4:
+            precision_context = get_fp4_context(self.config)
+            transformer_layer_context = get_fp4_context(self.config)
         else:
-            fp8_context = nullcontext()
-            transformer_layer_fp8_context = nullcontext()
+            precision_context = nullcontext()
+            transformer_layer_context = nullcontext()
 
         # TODO: currently ignoring FP4 in MTP layers because we need more numerical validation
         with rng_context:
-            with fp8_context:
+            with precision_context:
                 hidden_states = self._concat_embeddings(hidden_states, decoder_input)
 
             # Use a separate fp8 context for the transformer layer. This is to ensure that when the
             # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is
             # True so that the fp8 weight caching can be triggered correctly.
-            with transformer_layer_fp8_context:
+            with transformer_layer_context:
                 if self.mtp_layer_pattern is not None:
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
@@ -1332,8 +1336,13 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_layer_legacy(layer_spec, layer_number):
             """Build layer using legacy spec-based approach."""
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
-            with fp8_init_context:
+            if self.config.fp8:
+                init_context = get_fp8_context(self.config, is_init=True)
+            elif self.config.fp4
+                init_context = get_fp4_context(self.config, is_init=True)
+            else:
+                init_context = nullcontext()
+            with init_context:
                 module = build_module(
                     layer_spec,
                     config=self.config,
@@ -1346,8 +1355,13 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_layer_with_pattern(layer_spec, layer_number, mtp_layer_pattern, mamba_submodules):
             """Build layer using pattern-based approach (new Mamba path)."""
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
-            with fp8_init_context:
+            if self.config.fp8:
+                init_context = get_fp8_context(self.config, is_init=True)
+            elif self.config.fp4
+                init_context = get_fp4_context(self.config, is_init=True)
+            else:
+                init_context = nullcontext()
+            with init_context:
                 module = build_module(
                     layer_spec,
                     config=self.config,
