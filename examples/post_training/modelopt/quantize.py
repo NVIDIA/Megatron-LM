@@ -145,6 +145,11 @@ def add_text_generate_ptq_args(parser):
         default=None,
         help="Number of last layers to skip quantization.",
     )
+    group.add_argument(
+        "--sync-expert-weight-amax",
+        action="store_true",
+        help="Synchronize expert weight amax across experts.",
+    )
     add_modelopt_args(parser)
     return parser
 
@@ -271,6 +276,8 @@ def get_modelopt_torch_quantization_config():
             num_layers_to_disable=args.num_last_layers_to_skip_quant,
         )
 
+    if args.sync_expert_weight_amax:
+        mtq_config["sync_expert_weight_amax"] = True
     return mtq_config
 
 
@@ -294,6 +301,8 @@ def get_calib_dataloader(
             for i, line in enumerate(f):
                 if len(all_texts) == calib_size:
                     break
+                if not line.strip():
+                    continue
                 sample = json.loads(line)
 
                 # Extract text field from various possible keys

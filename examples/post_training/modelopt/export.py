@@ -102,8 +102,9 @@ if __name__ == "__main__":
         "export_dir": args.export_dir,
         "moe_router_dtype": unwrapped_model.config.moe_router_dtype,
     }
-    if "trust_remote_code" in inspect.signature(mtex.export_mcore_gpt_to_hf).parameters:
-        export_kwargs.update({"trust_remote_code": args.trust_remote_code})
-    
     export_fn = mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
+
+    if "trust_remote_code" in inspect.signature(export_fn).parameters:
+        export_kwargs.update({"trust_remote_code": args.trust_remote_code})
+
     export_fn(unwrapped_model, args.pretrained_model_name, **export_kwargs)
