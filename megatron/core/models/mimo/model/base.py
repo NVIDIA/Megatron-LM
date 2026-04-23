@@ -510,12 +510,7 @@ class MimoModel(MegatronModule):
             )
 
     def destroy(self) -> None:
-        """Release process groups owned by this MimoModel.
-
-        NCCL caps concurrent communicators, so long-lived or
-        repeatedly-rebuilt models leak subgroups without explicit
-        destroy. Tests should call this before ``destroy_all_grids()``.
-        """
+        """Release process groups owned by this MimoModel."""
         for comm in self.colocated_comms.values():
             comm.destroy()
         self.colocated_comms.clear()
