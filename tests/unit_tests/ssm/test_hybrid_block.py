@@ -50,7 +50,7 @@ class TestHybridBlock:
             pg_collection=self.get_pg_collection(),
         )
 
-    def get_dsa_mamba_block(self, layer_pattern):
+    def get_dsa_hybrid_block(self, layer_pattern):
         layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = MLATransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
@@ -207,7 +207,7 @@ class TestHybridBlock:
     def test_dsa_layer_types(self):
         """D symbol creates a TransformerLayer with MLASelfAttention."""
         layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
-        block = self.get_dsa_mamba_block(layer_pattern)
+        block = self.get_dsa_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], MambaLayer)
         assert isinstance(layers[1], TransformerLayer)
@@ -219,7 +219,7 @@ class TestHybridBlock:
         """* and D in the same block fail."""
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.DS_ATTENTION + Symbols.MAMBA
         with pytest.raises(ValueError):
-            block = self.get_dsa_mamba_block(layer_pattern)
+            block = self.get_dsa_hybrid_block(layer_pattern)
 
     def test_mla_layer_types(self):
         """+ symbol creates a TransformerLayer with MLASelfAttention but
