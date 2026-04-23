@@ -73,6 +73,13 @@ def skip_if_mamba_sequence_packing_not_available(model_provider: str):
             pytest.skip(reason_for_no_sequence_packing)
 
 
+def clear_nvte_env_vars():
+    """Clear NVTE env vars set by conftest set_env fixture."""
+    os.environ.pop('NVTE_FLASH_ATTN', None)
+    os.environ.pop('NVTE_FUSED_ATTN', None)
+    os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
+
 def set_rounder(value):
     """Utility function to set the DynamicInferenceContext rounder."""
     DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
@@ -281,6 +288,7 @@ class DynamicInferenceEngineTestBase:
     @classmethod
     @torch.inference_mode()
     def _build_test_env(cls, test_config):
+        clear_nvte_env_vars()
         set_rounder(4)
 
         # Random state.
@@ -4604,10 +4612,7 @@ class TestChunkedPrefillCudaGraphs:
         """Verify generated tokens match across chunked prefill and CUDA graph configs."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
-        # Clear NVTE env vars set by conftest set_env fixture.
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        clear_nvte_env_vars()
 
         random.seed(123)
         torch.manual_seed(123)
