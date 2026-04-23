@@ -265,13 +265,15 @@ class DistributedDataParallel(_BaseDataParallel):
         # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
         # bucket group.
         self.bucket_groups = partition_buckets(
-            self.buffers, force_single_bucket_group=disable_bucketing,
+            self.buffers,
+            force_single_bucket_group=disable_bucketing,
             reduce_scatter_with_fp32_accumulation=(
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
             ),
         )
         self.expert_parallel_bucket_groups = partition_buckets(
-            self.expert_parallel_buffers, force_single_bucket_group=disable_bucketing,
+            self.expert_parallel_buffers,
+            force_single_bucket_group=disable_bucketing,
             reduce_scatter_with_fp32_accumulation=(
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
             ),
