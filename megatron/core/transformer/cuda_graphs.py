@@ -60,6 +60,7 @@ except:
 from megatron.core.etp_utils import (
     ETP_CONFIG,
     ETPChain,
+    ETPShardedParam,
     HAVE_ETP,
     get_ag_stream,
     get_rs_stream,
@@ -707,9 +708,14 @@ class _CudagraphReplayNode(torch.autograd.Function):
         # doesn't re-run from Python. Trigger the hook now so register_grad_ready fires
         # and DDP RS can proceed during backward (not deferred to finish_grad_sync).
         if runner.parameter_sharding:
-            for param in runner.groundtruth_grad_added_to_main_grad:
+            # Fire hooks for ETP params whose main_grad.add_ was captured in THIS runner's bwd_graph
+            # (not for params that merely belong to this runner's params_to_backprop).  A param's
+            # hook must fire in the graph whose replay physically populates its main_grad; otherwise
+            # register_grad_ready → start_grad_sync could issue DP RS against a stale main_grad.
+            # See _compute_finalized_during_bwd_capture for how the set is built.
+            for param in runner.finalized_during_bwd_capture:
                 hook = getattr(param, '_grad_accum_hook', None)
-                if hook is not None and param.grad_added_to_main_grad:
+                if hook is not None:
                     hook()
 
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
@@ -765,6 +771,10 @@ class _CudaGraphRunner(torch.nn.Module):
         self.parameter_sharding = False
         self.fwd_side_streams = []
         self.bwd_side_streams = []
+        # Populated by create_bwd_graph: ETP params whose main_grad.add_ was captured in THIS
+        # graph.  Used in Graphed.backward's post-replay hook loop to fire DDP hooks only in the
+        # graph whose replay populates main_grad.
+        self.finalized_during_bwd_capture = []
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -841,6 +851,33 @@ class _CudaGraphRunner(torch.nn.Module):
         """Make the current stream wait for all registered side streams."""
         for s in side_streams:
             torch.cuda.current_stream().wait_stream(s)
+
+    def _compute_finalized_during_bwd_capture(self):
+        """Analytically compute ETP params whose _finalize_wgrad is captured in THIS graph.
+
+        Derived from the ETP chain structure, not from runtime grad_added_to_main_grad state
+        (which doesn't work because deferred create_bwd_graph runs after the warmup bwd already
+        set grad_added=True for every finalized param globally).
+
+        For each weight p in this runner's params_to_backprop, p.wgrad_reduce_scatter captures:
+          - p itself if p.prev_w is None  (sync path: "last weight in chain" finalizes self)
+          - p.next_w._weights if p.next_w is not None  (next_w-deferred finalize; next_w may
+            live in a different module than self.base_module — that's the cross-graph case)
+        """
+        if not HAVE_ETP or ETPShardedParam is None:
+            return []
+        finalized = {}  # id → param
+        for p in self.params_to_backprop:
+            if not isinstance(p, ETPShardedParam):
+                continue
+            if getattr(p, "prev_w", None) is None:
+                for w in getattr(p, "_weights", [p]):
+                    finalized[id(w)] = w
+            next_w = getattr(p, "next_w", None)
+            if next_w is not None:
+                for w in getattr(next_w, "_weights", [next_w]):
+                    finalized[id(w)] = w
+        return list(finalized.values())
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -1207,6 +1244,11 @@ class _CudaGraphRunner(torch.nn.Module):
         # Unfreeze GC.
         if FREEZE_GC:
             gc.unfreeze()
+
+        # See _compute_finalized_during_bwd_capture for what's in this set and why.
+        self.finalized_during_bwd_capture = (
+            self._compute_finalized_during_bwd_capture() if self.parameter_sharding else []
+        )
 
         # Constructs a tuple suitable for returning from Graphed.backward:
         # Pads out the actually-needed grads with Nones in gradient slots for inputs
