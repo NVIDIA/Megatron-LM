@@ -112,14 +112,14 @@ MODEL_ARGS:
   --lr-mult-router: 100
   --router-gbs: 2
   --router-inter-dim: 256
-  --budget-list: 1.0 0.697
-  --budget-probs: 1.0 1.0
+  --budget-list: "[1.0 0.697]"
+  --budget-probs: "[1.0 1.0]"
   --budget-type: param
-  --emb-int-list: 1024 768 512
-  --mlp-int-list: 512 384 256
-  --head-int-list: 32 24 16
-  --mamba-int-list: 32 24 16
-  --moe-expert-int-list: 32 24 16
+  --emb-int-list: "[1024 768 512]"
+  --mlp-int-list: "[512 384 256]"
+  --head-int-list: "[32 24 16]"
+  --mamba-int-list: "[32 24 16]"
+  --moe-expert-int-list: "[32 24 16]"
   --linear-scaler-start: 1.0
   --linear-scaler-end: 10.0
   --slice: true
