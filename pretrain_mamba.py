@@ -13,6 +13,7 @@ warnings.warn(
     stacklevel=2,
 )
 
-# Execute pretrain_hybrid.py as if it were invoked directly.
-_this_dir = os.path.dirname(os.path.abspath(__file__))
-runpy.run_path(os.path.join(_this_dir, "pretrain_hybrid.py"), run_name="__main__")
+if __name__ == "__main__":
+    # Execute pretrain_hybrid.py as if it were invoked directly.
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    runpy.run_path(os.path.join(_this_dir, "pretrain_hybrid.py"), run_name="__main__")
