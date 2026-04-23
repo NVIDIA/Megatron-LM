@@ -86,6 +86,7 @@ class SafeUnpickler(pickle.Unpickler):
             ("transformer_engine.common.recipe", "MMParams"),
             ("transformer_engine.common.recipe", "QParams"),
             ("megatron.core.extensions.transformer_engine", "TEDelayedScaling"),
+            ("megatron.core.safe_globals", "safe_load_from_bytes"),
         }
     )
 
