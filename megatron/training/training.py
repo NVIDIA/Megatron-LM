@@ -124,6 +124,12 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
+try:
+    from nvidia_resiliency_ext.inprocess import CallWrapper
+except ImportError:
+    CallWrapper = type(None)
+
+
 from megatron.core import mpu, tensor_parallel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
@@ -833,7 +839,7 @@ def pretrain(
     get_position_embedding_ranks=None,
     non_loss_data_func=None,
     store=None,
-    inprocess_call_wrapper: Optional[Any] = None,
+    inprocess_call_wrapper: Optional[CallWrapper] = None,
 ):
     """Main training program.
 

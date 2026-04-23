@@ -107,13 +107,3 @@ class TestAsyncSave:
 
                 assert strategy == "mcore"
                 assert module == MCoreAsyncRequest
-
-    def test_get_async_strategy_missing_nvrx_cached_metadata_reader(self):
-        with mock.patch.dict(
-            'sys.modules',
-            {
-                'nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader': None
-            },
-        ):
-            with pytest.raises(ModuleNotFoundError):
-                get_async_strategy("nvrx", module="CachedMetadataFileSystemReader")

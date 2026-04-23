@@ -139,12 +139,7 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    ckpt_args = common_state_dict.get("args")
-    async_strategy = (
-        getattr(ckpt_args, "async_strategy", "mcore")
-        if getattr(ckpt_args, "async_save", False)
-        else "mcore"
-    )
+    async_strategy = getattr(common_state_dict.get("args"), "async_strategy", "nvrx")
     loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
 
     merge(common_state_dict, loaded_state_dict)
