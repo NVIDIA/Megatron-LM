@@ -677,7 +677,7 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         from operator import itemgetter
 
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
@@ -1506,18 +1506,49 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             dp_init_kwargs = {}
             if args.use_megatron_fsdp:
                 dp_init_kwargs["pg_collection"] = pg_collection
-            model = [
-                DP(
-                    config=config,
-                    ddp_config=ddp_config,
-                    module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication
-                    # for these model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-                    **dp_init_kwargs,
+
+            wrapped_model = []
+            for model_chunk_idx, model_chunk in enumerate(model):
+                chunk_kwargs = dict(dp_init_kwargs)
+                disable_bucketing = (
+                    (model_chunk_idx > 0)
+                    or args.overlap_param_gather_with_optimizer_step
                 )
-                for (model_chunk_idx, model_chunk) in enumerate(model)
-            ]
+
+                # Pre-compute parameter layouts for the distributed optimizer.
+                # Only pass to DDP; FSDP variants don't accept full_param_layout.
+                if args.use_distributed_optimizer and DP is DDP:
+                    all_params = [
+                        p for p in model_chunk.parameters() if p.requires_grad
+                    ]
+                    pp_rank = mpu.get_pipeline_model_parallel_rank()
+                    effective_bucket_size = (
+                        None
+                        if disable_bucketing or pp_rank > 0
+                        else ddp_config.bucket_size
+                    )
+                    chunk_kwargs["full_param_layout"] = (
+                        DistributedOptimizer.compute_full_param_layout(
+                            all_params,
+                            effective_bucket_size,
+                            mpu.get_data_parallel_world_size(with_context_parallel=True),
+                            ddp_config,
+                            expert_data_parallel_world_size=(
+                                mpu.get_expert_data_parallel_world_size()
+                            ),
+                        )
+                    )
+
+                wrapped_model.append(
+                    DP(
+                        config=config,
+                        ddp_config=ddp_config,
+                        module=model_chunk,
+                        disable_bucketing=disable_bucketing,
+                        **chunk_kwargs,
+                    )
+                )
+            model = wrapped_model
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
@@ -2175,7 +2206,7 @@ def training_log(
         if is_hybrid_model(args):
             from operator import itemgetter
 
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols, get_hybrid_layer_counts,
             )
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
@@ -2293,6 +2324,13 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
+
+        # RL token throughput metrics.
+        if args.perform_rl_step:
+            log_string += rl_utils.log_rl_throughput_metrics(
+                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
+            )
+
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
@@ -2720,11 +2758,11 @@ def train(
         destroy_num_microbatches_calculator()
         # Then initialize with the correct perform_rl_step=True context
         init_num_microbatches_calculator(
-            args.rank,
-            args.global_batch_size,
-            args.micro_batch_size,
-            mpu.get_data_parallel_world_size(),
-            args.decrease_batch_size_if_needed,
+            rank=args.rank,
+            global_batch_size=args.global_batch_size,
+            micro_batch_size=args.micro_batch_size,
+            data_parallel_size=mpu.get_data_parallel_world_size(),
+            decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
             step_batch_size_schedule=args.step_batch_size_schedule,
             seq_length=args.seq_length,
         )
@@ -3039,6 +3077,7 @@ def train(
                     sequence_packing=args.rl_use_sequence_packing,
                     buffered_rollouts=buffered_rollouts,
                     is_correction=args.rl_inference_logprobs_is_correction,
+                    optimizer_is_on_cpu=args.rl_offload_optimizer_during_inference,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
@@ -3114,6 +3153,7 @@ def train(
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
             getattr(args, "fsdp_manual_registration", False)
+            and getattr(args, "nccl_ub", False)
             and getattr(args, "use_megatron_fsdp", False)
             and iteration ==  start_iteration + 1
         ):
@@ -3121,9 +3161,9 @@ def train(
                 if isinstance(model_chunk, megatron_FSDP) and getattr(
                     model_chunk.ddp_config, "fsdp_manual_registration", False
                 ):
-                    pad_buf = getattr(model_chunk, "param_and_grad_buffer", None)
-                    if pad_buf is not None:
-                        pad_buf.manual_buffer_registration()
+                    param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
+                    if param_and_grad_buffer is not None:
+                        param_and_grad_buffer.manual_buffer_registration()
 
         if args.perform_rl_step and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)

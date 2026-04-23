@@ -39,7 +39,9 @@ class DummyModel(MegatronModule):
 def init_model_parallel():
     """Init torch distributed."""
     Utils.initialize_model_parallel(1, 1)
-    init_num_microbatches_calculator(0, 1, 1, 1)
+    init_num_microbatches_calculator(
+        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+    )
     model_parallel_cuda_manual_seed(123)
     yield  # Run the actual test.
     Utils.destroy_model_parallel()

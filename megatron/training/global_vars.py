@@ -125,11 +125,11 @@ def set_global_variables(args, build_tokenizer=True):
         print(f'> using step batch size schedule: {args.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
-        args.rank,
-        args.global_batch_size,
-        args.micro_batch_size,
-        args.data_parallel_size,
-        args.decrease_batch_size_if_needed,
+        rank=args.rank,
+        global_batch_size=args.global_batch_size,
+        micro_batch_size=args.micro_batch_size,
+        data_parallel_size=args.data_parallel_size,
+        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
         step_batch_size_schedule=args.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
