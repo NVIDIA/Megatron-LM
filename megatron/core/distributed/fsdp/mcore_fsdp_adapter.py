@@ -240,6 +240,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     fully_shard(m, mesh=dp_mesh)
         fully_shard(module, mesh=dp_mesh)
 
+        module._set_nan_check(True)
+
         super().__init__(config=config, module=module)
 
         noop = lambda *args, **kwargs: None
@@ -250,9 +252,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
             )
 
         from unittest.mock import Mock
+
         self.param_and_grad_buffer = Mock()
         self.param_and_grad_buffer.parameter_groups = []
-        self.param_and_grad_buffer.copy_main_weights_to_model_weights = Mock()
+        self.param_and_grad_buffer.copy_main_weights_to_model_weights = (
+            self.module._copy_main_weights_to_model_weights
+        )
         self.ddp_config = ddp_config
         self.no_sync = nullcontext()
         self.start_param_sync = noop

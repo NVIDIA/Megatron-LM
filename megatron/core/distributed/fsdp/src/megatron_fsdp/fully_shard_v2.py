@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
@@ -34,13 +35,13 @@ def fully_shard(
 
     module._init_named_param_groups(mesh, ignored_params)
     module._init_fsdp_state()
+    module._init_param_main_grad_func()
     _register_forward_pre_hook(module)
     _register_forward_hook(module)
     _register_backward_pre_hook(module)
     _register_backward_hook(module)
 
     module.reshard()
-    # _register_post_accumulate_grad_hooks(module)
 
     return module
 
@@ -69,6 +70,30 @@ class FSDPModule(nn.Module):
                 param_names.append(param_name)
             self._named_param_groups.append((param_names, fsdp_param_group))
 
+    def _init_param_main_grad_func(self):
+        def main_grad_getter(p):
+            # Make sure main_grad memory is allocated when initially accessed.
+            # When gradients are sharded, we can pre-allocate a communication
+            # bucket to avoid casting to a communication data-type. Otherwise,
+            # return the item backed by the main gradient buffer required to
+            # support un-sharded gradient accumulation at high precision.
+            gbuf = p._gbuf
+            item_id = p._item_id
+
+            gbuf_data = gbuf.fetch_unsharded_buffer()
+            assert gbuf_data is not None
+            assert gbuf_data.numel() > 0
+            offset, size = gbuf.buffer_index._get_item_offset(item_id)
+            grad_data = gbuf_data[offset : offset + size].view(p.shape)
+
+            return grad_data
+
+        for param_group in self._fsdp_param_groups:
+            for param in param_group.params:
+                setattr(param, "_gbuf", param_group.main_grad_buffer)
+                setattr(param, "_item_id", param_group.param_idx[param])
+                param.get_main_grad = main_grad_getter.__get__(param)
+
     def _materialize_meta_module(self, ignored_modules):
         materialization_device = torch.cuda.current_device()
         for m in self.modules():
@@ -91,36 +116,110 @@ class FSDPModule(nn.Module):
                 child._fsdp_state._is_root = False
 
     def unshard(self):
-        self.param_to_name = {p: n for n, p in self.named_parameters()}
-        for param_names, fsdp_param_group in self._named_param_groups:
-            fsdp_param_group.unshard()
+        unsharded_param_names = set()
+        for param_names, param_group in self._named_param_groups:
+            unsharded_param_names.update(param_names)
+            if getattr(self, "_enable_nan_checks", False):
+                for name, dist_param in zip(param_names, param_group.dist_params):
+                    assert not torch.isnan(
+                        dist_param._local_tensor
+                    ).any(), f"NaN detected in dist param for parameter {name} in unshard for module {self}"
 
-            for name, param in zip(param_names, fsdp_param_group.params):
+            param_group.unshard()
+
+            for name, param in zip(param_names, param_group.params):
                 _replace_module_parameter(self, name, param)
+
+                if getattr(self, "_enable_nan_checks", False):
+                    assert not torch.isnan(
+                        param
+                    ).any(), f"NaN detected in parameter {name} in unshard for module {self}"
+
+        for name, param in self.named_parameters():
+            if name not in unsharded_param_names:
+                continue
+            assert not isinstance(
+                param, DTensor
+            ), f"Parameter {name} is expected to be unsharded in unshard for module {self}, but got a sharded tensor. "
 
     def reshard(self):
-        self.param_to_name = {p: n for n, p in self.named_parameters()}
-        for param_names, fsdp_param_group in self._named_param_groups:
-            fsdp_param_group.reshard()
+        for param_names, param_group in self._named_param_groups:
+            param_group.reshard()
 
-            for name, param in zip(param_names, fsdp_param_group.dist_params):
-                _replace_module_parameter(self, name, param)
+            for name, dist_param in zip(param_names, param_group.dist_params):
+                _replace_module_parameter(self, name, dist_param)
+
+    def reduce_grad(self):
+        for param_names, param_group in self._named_param_groups:
+            if not param_group.requires_grad:
+                continue
+
+            if getattr(self, "_enable_nan_checks", False):
+                for param in param_group.params:
+                    if param.grad is None:
+                        continue
+                    assert not torch.isnan(
+                        param.grad
+                    ).any(), f"NaN detected in parameter {param} in post_backward for module {self}"
+
+            for name, param in zip(param_names, param_group.params):
+                main_grad = param.get_main_grad()
+                if param.grad is None:
+                    main_grad.zero_()
+                else:
+                    main_grad.copy_(param.grad.detach())
+                    del param.grad
+
+            param_group.reduce_grad(async_op=False)
+
+            for name, param, dist_param, dist_grad in zip(
+                param_names, param_group.params, param_group.dist_params, param_group.dist_grads
+            ):
+                if param.requires_grad and dist_grad is not None:
+                    setattr(dist_param, "grad", dist_grad.to(param.dtype))
+
+            if getattr(self, "_enable_nan_checks", False):
+                for name, dist_grad in zip(param_names, param_group.dist_grads):
+                    if dist_grad is None:
+                        continue
+                    assert not torch.isnan(
+                        dist_grad._local_tensor
+                    ).any(), f"NaN detected in dist grad for parameter {name} in post_backward for module {self}"
+
+            param_group.main_grad_buffer.reshard()
+
+        setattr(self, "needs_grad_reduce", False)
 
     def _scale_gradients(self, scaling_factor: float):
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
-            for fsdp_param_group in child._fsdp_param_groups:
-                if fsdp_param_group.main_grad_buffer is not None:
-                    fsdp_param_group.main_grad_buffer.data.mul_(scaling_factor)
+            for param_group in child._fsdp_param_groups:
+                if param_group.main_grad_buffer is not None:
+                    param_group.main_grad_buffer.data.mul_(scaling_factor)
 
     def _zero_grad_buffer(self):
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
-            for fsdp_param_group in child._fsdp_param_groups:
-                if fsdp_param_group.main_grad_buffer is not None:
-                    fsdp_param_group.main_grad_buffer.data.zero_()
+            for param_group in child._fsdp_param_groups:
+                if param_group.main_grad_buffer is not None:
+                    param_group.main_grad_buffer.data.zero_()
+
+    def _copy_main_weights_to_model_weights(self):
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for param_group in child._fsdp_param_groups:
+                if param_group.main_weight_buffer is None:
+                    continue
+                param_group.model_weight_buffer.data.copy_(param_group.main_weight_buffer.data)
+
+    def _set_nan_check(self, enable_nan_checks: bool):
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            setattr(child, "_enable_nan_checks", enable_nan_checks)
 
 
 class _FSDPState:
@@ -203,6 +302,7 @@ def _register_backward_pre_hook(module: FSDPModule):
         return module.register_forward_hook(forward_hook)
 
     def pre_backward_hook(module, grads):
+        setattr(module, "needs_grad_reduce", True)
         if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
         module.unshard()
@@ -215,8 +315,7 @@ def _register_backward_pre_hook(module: FSDPModule):
 def _register_backward_hook(module: FSDPModule):
     def post_backward(module):
         module.reshard()
-        for fsdp_param_group in module._fsdp_param_groups:
-            fsdp_param_group.reduce_grad()
+        module.reduce_grad()
 
     @torch.compiler.disable
     def _register_post_backward_hook(
@@ -288,9 +387,13 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
 
     def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module) -> None:
         # Reshard all FSDP modules after the backward pass is done.
-        for module in root_module.modules():
-            if isinstance(module, FSDPModule):
-                module.reshard()
+        # for module in root_module.modules():
+        for name, module in root_module.named_modules():
+            if not isinstance(module, FSDPModule):
+                continue
+            module.reshard()
+            if getattr(module, "needs_grad_reduce", False):
+                module.reduce_grad()
 
         # Reset the flag
         root_state._post_backward_callback_queued = False
@@ -300,19 +403,6 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
     Variable._execution_engine.queue_callback(
         functools.partial(_post_backward_final_callback, state, module)
     )
-
-
-def _register_post_accumulate_grad_hooks(module: FSDPModule):
-
-    def process_post_accumulate_gradients(param_list):
-        pass
-
-    for param_group in module._fsdp_param_groups:
-        for param in param_group.params:
-            if param.requires_grad:
-                param.register_post_accumulate_grad_hook(
-                    lambda p: process_post_accumulate_gradients([p])
-                )
 
 
 class RegisterFSDPBackwardFunction(torch.autograd.Function):

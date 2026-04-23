@@ -147,12 +147,7 @@ class TestMegatronFSDPE2E:
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
     )
-    @pytest.mark.parametrize(
-        "nd_topology",
-        [
-            pytest.param({"EP": 2}, id="EP2"),
-        ],
-    )
+    @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
     @pytest.mark.parametrize(
         "spec_configs",
         [
@@ -166,7 +161,7 @@ class TestMegatronFSDPE2E:
                     use_fully_shard_api=True,
                 ),
                 id="optim_grads_params_double_buffer",
-            ),
+            )
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
@@ -205,6 +200,7 @@ class TestMegatronFSDPE2E:
                         f"Loss mismatch at step {step}, FSDP Loss = {loss.item()}, "
                         f"Reference Loss = {ref_loss.item()}"
                         f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
+                        f", outputs = {outputs}, reference_outputs = {reference_outputs}"
                     ),
                 )
 

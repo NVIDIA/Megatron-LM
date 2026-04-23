@@ -1,5 +1,5 @@
-from typing import Dict, List, Optional
 import math
+from typing import Dict, List, Optional
 
 import torch
 from torch.distributed.tensor import DeviceMesh
@@ -99,29 +99,48 @@ class ParameterGroup:
         self._init_dist_params()
 
     def unshard(self):
-        self.model_weight_buffer.unshard()
+        _, async_op = self.model_weight_buffer.unshard()
+        async_op.wait()
 
     def reshard(self):
         self.model_weight_buffer.reshard()
 
-    def reduce_grad(self):
-        self.main_grad_buffer.reduce_grad()
+    def reduce_grad(self, async_op: bool = False):
+        self.main_grad_buffer.reduce_grad(async_op=async_op)
 
     def _init_dist_params(self):
         self.dist_params = []
+        self.dist_grads = []
         s = self.sharding_strategy
-        is_param_shard = s == "optim_grads_params"
+        if s == "no_shard":
+            return
+
+        is_param_shard = s in ("optim", "optim_grads", "optim_grads_params")
         if is_param_shard:
             placements = [Shard(dim=0)]
         else:
             placements = [Replicate()]
         for p in self.params:
-            if s != "no_shard":
-                wbuf = self.model_weight_buffer
-                data = wbuf.get_item(self.param_idx[p], only_shard=is_param_shard)
-            else:
-                data = p.detach()
+            wbuf = self.model_weight_buffer
+            data = wbuf.get_item(self.param_idx[p], only_shard=is_param_shard)
 
-            self.dist_params.append(
-                torch.nn.Parameter(make_uneven_dtensor(data, p.shape, self.mesh, placements))
+            dist_param = torch.nn.Parameter(
+                make_uneven_dtensor(data, p.shape, self.mesh, placements)
             )
+            setattr(
+                dist_param, "__fsdp_param__", True
+            )  # Mark the parameter as a FSDP parameter for special handling
+
+            self.dist_params.append(dist_param)
+
+        is_grad_shard = is_param_shard
+        for p in self.params:
+            if p.requires_grad:
+                gbuf = self.main_grad_buffer
+                grad_data = gbuf.get_item(self.param_idx[p], only_shard=is_grad_shard)
+
+                self.dist_grads.append(
+                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
+                )
+            else:
+                self.dist_grads.append(None)

@@ -336,6 +336,20 @@ class DataParallelBuffer:
         self.allocator.free(self.buffer_index.param_group_id)
         self._unsharded_buffer = None
 
+    def fetch_unsharded_buffer(self) -> torch.Tensor:
+        """Return the unsharded buffer, allocating it if needed."""
+        if not self.is_distributed:
+            return self.data
+        if self._unsharded_buffer is None:
+            bucket = self.allocator.allocate(
+                param_group_id=self.buffer_index.param_group_id,
+                size=self.buffer_index.bucket_meta.size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._unsharded_buffer = bucket.data
+        return self._unsharded_buffer
+
     @torch.no_grad()
     def reduce_grad(self, async_op: bool = True) -> Optional[torch.distributed.Work]:
         """Reduce gradients across the data-parallel group.
@@ -348,13 +362,7 @@ class DataParallelBuffer:
             work = torch.distributed.all_reduce(self.data, group=self.dp_group, async_op=async_op)
             return work
 
-        bucket = self.allocator.allocate(
-            param_group_id=self.buffer_index.param_group_id,
-            size=self.buffer_index.bucket_meta.size,
-            dtype=self.dtype,
-            device=self.device,
-        )
-        full_grad = bucket.data
+        full_grad = self.fetch_unsharded_buffer()
 
         sm = self.buffer_index.shard_meta
         grad_shard = full_grad[sm.bucket_data_index : sm.bucket_data_index + sm.size]
