@@ -983,12 +983,8 @@ def validate_args(args, defaults={}):
         args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
-        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
-            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
-
-    if getattr(args, 'fp8_param', False) and not args.fp8_param_gather:
-        assert not torch.is_grad_enabled(), \
-            '--fp8-param (without --fp8-param-gather) is only supported in inference mode'
+        assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp, \
+            '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, or megatron fsdp'
 
     # FP4 and FP8 are mutually exclusive
     if args.fp4 and args.fp8:
