@@ -333,33 +333,91 @@ def _get_cudart() -> ctypes.CDLL:
     return _libcudart
 
 
+class PriorityEventLoop(asyncio.SelectorEventLoop):
+    """Event loop with front-of-queue scheduling for GPU completion callbacks.
+
+    Adds `call_soon_front` and `call_soon_threadsafe_front` which prepend callbacks to the ready
+    queue, as opposed to appending them. This acts as a pseudo-interrupt.
+    """
+
+    def call_soon_front(self, callback, *args, context=None):
+        """Schedule `callback` at the front of the ready queue."""
+        self._check_closed()
+        handle = asyncio.events.Handle(callback, args, self, context)
+        self._ready.appendleft(handle)
+        return handle
+
+    def call_soon_threadsafe_front(self, callback, *args, context=None):
+        """Thread-safe variant of `call_soon_front`."""
+        self._check_closed()
+        handle = asyncio.events.Handle(callback, args, self, context)
+        self._ready.appendleft(handle)
+        self._write_to_self()  # wake select()
+        return handle
+
+
 class GPUFuture:
     """Awaitable that resolves when all preceding work on a CUDA stream completes.
 
-    Instead of blocking the CPU with ``torch.cuda.synchronize()`` or
-    ``event.synchronize()``, this uses ``cudaLaunchHostFunc`` to enqueue a
-    host-side callback on the CUDA stream.  The callback resolves an asyncio
-    ``Future`` via ``call_soon_threadsafe``, allowing other asyncio tasks to
-    run while the GPU is busy.
+    Instead of blocking on the CPU thread, this future fires a callback from CUDA's internal thread.
+    When the callback triggers, this class attempts to prepend the task to the event loop queue.
 
     Usage:
+
         gpu_done = GPUFuture(loop)
-        launch_gpu_work(...)
+        # Enqueue the main GPU work.
+        launch_long_gpu_work(...)
+        # Record the callback.
         gpu_done.record()
-        launch_more_gpu_work(...)
-        await gpu_done          # other tasks run while GPU is busy
+        # Recommendation: enqueue a short GPU workload to cover the latency of the callback.
+        launch_short_gpu_work(...)
+        await gpu_done    # resumes at front of queue as soon as GPU finishes.
     """
 
-    # Prevent garbage-collection of live ctypes callbacks.
-    # Keyed by id() because ctypes function pointers are not hashable.
     _prevent_gc: dict = {}
+    _asyncio_future_blocking = False
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
-        self._future: asyncio.Future = loop.create_future()
+        self._done = False
+        self._callbacks: list = []
+
+    def get_loop(self):
+        return self._loop
+
+    def done(self):
+        return self._done
+
+    def cancelled(self):
+        return False
+
+    def cancel(self, msg=None):
+        return False
+
+    def result(self):
+        if not self._done:
+            raise asyncio.InvalidStateError('not ready')
+        return None
+
+    def add_done_callback(self, fn, *, context=None):
+        if self._done:
+            try:
+                self._loop.call_soon_front(fn, self, context=context)
+            except AttributeError:
+                self._loop.call_soon(fn, self, context=context)
+        else:
+            self._callbacks.append((fn, context))
+
+    def __await__(self):
+        if not self._done:
+            self._asyncio_future_blocking = True
+            yield self
+        if not self._done:
+            raise RuntimeError("await wasn't used with future")
+        return self.result()
 
     def record(self, stream: Optional[torch.cuda.Stream] = None) -> None:
-        """Enqueue a host callback that resolves this future.
+        """Enqueue a host callback that resolves this future when stream drains.
 
         Args:
             stream: CUDA stream to attach to. Defaults to the current stream.
@@ -367,18 +425,17 @@ class GPUFuture:
         if stream is None:
             stream = torch.cuda.current_stream()
 
-        # This closure prevents the ctypes wrapper from being collected
-        # while the callback is in the stream.
         prevent_gc_ref: Optional[object] = None
 
         def _host_fn(_user_data: ctypes.c_void_p) -> None:
-            # Runs on CUDA's internal callback thread.
-            # MUST NOT call any CUDA API.
+            # Runs on CUDA's internal callback thread; MUST NOT call CUDA API.
             try:
-                self._loop.call_soon_threadsafe(self._future.set_result, None)
+                try:
+                    self._loop.call_soon_threadsafe_front(self._resolve)
+                except AttributeError:
+                    self._loop.call_soon_threadsafe(self._resolve)
             except RuntimeError:
-                # Event loop closed; nothing to do.
-                pass
+                pass  # event loop closed
             GPUFuture._prevent_gc.pop(id(prevent_gc_ref), None)
 
         c_fn = _CUDA_HOST_FN_T(_host_fn)
@@ -389,9 +446,15 @@ class GPUFuture:
             ctypes.c_void_p(stream.cuda_stream), c_fn, ctypes.c_void_p(0)
         )
         if err != 0:
-            # Allow the callback to be garbage-collected on failure.
             GPUFuture._prevent_gc.pop(id(c_fn), None)
             raise RuntimeError(f"cudaLaunchHostFunc failed with CUDA error {err}")
 
-    def __await__(self):
-        return self._future.__await__()
+    def _resolve(self):
+        """Mark done and fire callbacks at the front of the ready queue."""
+        self._done = True
+        cbs, self._callbacks = self._callbacks, []
+        for fn, ctx in cbs:
+            try:
+                self._loop.call_soon_front(fn, self, context=ctx)
+            except AttributeError:
+                self._loop.call_soon(fn, self, context=ctx)
