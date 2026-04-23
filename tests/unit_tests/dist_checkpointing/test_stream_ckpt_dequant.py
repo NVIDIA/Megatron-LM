@@ -20,7 +20,6 @@ instead of up-front in ``force_all_tensors_to_non_fp8``. Tests cover:
 
 import gc
 from contextlib import contextmanager
-from typing import Optional
 
 import pytest
 import torch
@@ -36,12 +35,28 @@ except ImportError:
     QuantizedTensor = None  # type: ignore
 
 try:
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+    import transformer_engine.pytorch.tensor.mxfp8_tensor  # noqa: F401
 
     HAVE_MXFP8 = True
 except ImportError:
     HAVE_MXFP8 = False
-    MXFP8Tensor = None  # type: ignore
+
+try:
+    import transformer_engine.pytorch.tensor.nvfp4_tensor  # noqa: F401
+
+    HAVE_NVFP4 = True
+except ImportError:
+    HAVE_NVFP4 = False
+
+try:
+    from megatron.training.utils import get_device_arch_version
+
+    _DEVICE_ARCH = get_device_arch_version()
+except Exception:
+    _DEVICE_ARCH = 0
+
+# NVFP4 requires Blackwell (arch 10+).
+HAVE_NVFP4_HW = HAVE_NVFP4 and _DEVICE_ARCH >= 10
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.strategies.torch import (
@@ -75,6 +90,22 @@ def _to_mxfp8(tensor: torch.Tensor):
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
     quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3)
+    return quantizer(tensor.cuda().contiguous())
+
+
+def _to_nvfp4(tensor: torch.Tensor):
+    """Convert a BF16 tensor to NVFP4Tensor (Blackwell+ only)."""
+    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
+
+    quantizer = NVFP4Quantizer(
+        rowwise=True,
+        columnwise=True,
+        with_rht=False,
+        with_post_rht_amax=False,
+        with_2d_quantization=True,
+        stochastic_rounding=False,
+        with_random_sign_mask=False,
+    )
     return quantizer(tensor.cuda().contiguous())
 
 
@@ -138,11 +169,14 @@ class TestStreamCkptDequant:
             loaded_w = loaded['w']
             if isinstance(loaded_w, QuantizedTensor):
                 loaded_w = loaded_w.dequantize()
+            # fill_val (0.5) is exactly representable in FP8 E4M3 and the per-tensor
+            # scale is a power of 2, so the round-trip is numerically lossless modulo
+            # bf16 rounding. Tight tolerance catches real regressions.
             torch.testing.assert_close(
                 loaded_w,
                 torch.full((8,), fill_val, dtype=torch.bfloat16, device='cuda'),
-                rtol=0.1,
-                atol=0.1,  # FP8 quantization tolerance
+                rtol=1e-3,
+                atol=1e-3,
             )
 
         Utils.destroy_model_parallel()
@@ -197,18 +231,26 @@ class TestStreamCkptDequant:
         """
         Utils.initialize_model_parallel(1, 1)
 
-        # 32 tensors * 4 MiB FP8 each = 128 MiB of FP8, 256 MiB of upfront BF16
+        # 32 tensors * 4 MiB FP8 per rank = 128 MiB of FP8, 256 MiB of upfront BF16
         # under the legacy path; streaming should only keep ~8 MiB scratch live at once.
         num_tensors = 32
-        numel = 4 * 1024 * 1024  # 4 Mi elements -> 4 MiB FP8, 8 MiB BF16
+        numel = 4 * 1024 * 1024  # 4 Mi elements per rank -> 4 MiB FP8, 8 MiB BF16
 
         def get_fp8_tensor():
             return _to_float8(torch.zeros(numel, dtype=torch.bfloat16, device='cuda'))
 
+        # Shard each tensor along axis 0 across ranks with replica_id=0 so every rank
+        # is the main replica of its own slice and actually materializes the load
+        # work (dequant allocations, streaming scratches). Using replica_id=Utils.rank
+        # would make only rank 0 the main replica and leave the other ranks with
+        # near-zero memory deltas that fail the comparison.
         def build_state_dict():
             return {
                 f'w{i}': ShardedTensor.from_rank_offsets(
-                    f'w{i}', get_fp8_tensor(), replica_id=Utils.rank
+                    f'w{i}',
+                    get_fp8_tensor(),
+                    (0, Utils.rank, Utils.world_size),
+                    replica_id=0,
                 )
                 for i in range(num_tensors)
             }
@@ -290,11 +332,68 @@ class TestStreamCkptDequant:
             loaded_w = loaded['w']
             if isinstance(loaded_w, QuantizedTensor):
                 loaded_w = loaded_w.dequantize()
+            # fill_val (0.25) is exactly representable in FP8 E4M3, and MXFP8 stores
+            # block scales in E8M0 (power-of-2), so the per-block scale is exact and
+            # every element encodes to the same FP8 code. Round-trip is near-lossless.
             torch.testing.assert_close(
                 loaded_w,
                 torch.full((64, 128), fill_val, dtype=torch.bfloat16, device='cuda'),
-                rtol=0.1,
-                atol=0.1,
+                rtol=1e-3,
+                atol=1e-3,
+            )
+
+        Utils.destroy_model_parallel()
+
+    # ---------------------------------------------------------------
+    # NVFP4: round-trip under both paths. Same invariants as MXFP8 but
+    # with NVFP4Tensor — validates that `is_float8tensor` (which binds to
+    # QuantizedTensor under TE 2.x) correctly covers the FP4 path, that
+    # NVFP4Tensor.view works inside _unwrap_pyt_sharded_tensor, and that
+    # BF16->NVFP4 copy through QuantizedTensor.__torch_dispatch__ -> quantize_
+    # produces correct values. Requires Blackwell+ for the FP4 kernels.
+    # ---------------------------------------------------------------
+
+    @pytest.mark.skipif(
+        not HAVE_NVFP4_HW,
+        reason="NVFP4 requires TransformerEngine NVFP4Tensor and Blackwell+ (arch 10+)",
+    )
+    @pytest.mark.parametrize('stream_ckpt_dequant', [False, True])
+    def test_nvfp4_save_load_content_equivalence(self, tmp_path_dist_ckpt, stream_ckpt_dequant):
+        Utils.initialize_model_parallel(1, 1)
+
+        # NVFP4BlockScaling uses 16-element blocks along the last dim; use a
+        # shape that's a multiple of both common block sizes.
+        fill_val = 0.25
+
+        def get_nvfp4_tensor(val):
+            return _to_nvfp4(torch.full((64, 128), val, dtype=torch.bfloat16, device='cuda'))
+
+        def get_state_dict(val):
+            return {
+                'w': ShardedTensor.from_rank_offsets(
+                    'w', get_nvfp4_tensor(val), replica_id=Utils.rank
+                )
+            }
+
+        with TempNamedDir(tmp_path_dist_ckpt / f'nvfp4_eq_{stream_ckpt_dequant}') as ckpt_dir:
+            save(get_state_dict(fill_val), ckpt_dir, TorchDistSaveShardedStrategy())
+
+            sd_to_load = get_state_dict(99.0)
+            strategy = TorchDistLoadShardedStrategy(stream_ckpt_dequant=stream_ckpt_dequant)
+            loaded = load(sd_to_load, ckpt_dir, strategy)
+            loaded_w = loaded['w']
+            if isinstance(loaded_w, QuantizedTensor):
+                loaded_w = loaded_w.dequantize()
+            # For a constant block every FP4 code is identical and the dominant error
+            # source is the per-block scale being stored in FP8 E4M3 (unlike MXFP8's
+            # power-of-2 E8M0). That rounding is bounded below ~1% relative; 1e-2 is
+            # tight enough to catch real bugs and loose enough to absorb E4M3 scale
+            # rounding + bf16 output rounding.
+            torch.testing.assert_close(
+                loaded_w,
+                torch.full((64, 128), fill_val, dtype=torch.bfloat16, device='cuda'),
+                rtol=1e-2,
+                atol=1e-2,
             )
 
         Utils.destroy_model_parallel()
