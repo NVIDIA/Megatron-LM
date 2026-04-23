@@ -1191,7 +1191,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             out=self.cu_active_sequence_lengths[1 : n + 1],
         )
 
-    def run_attn_init_graph_body(self) -> None:
+    def run_attn_init_graph_body(self, eager=False, cache_key=None):
         """Graphable portion of `initialize_attention_state`."""
         self._context_op_metadata_gpu.copy_(self._context_op_metadata_cpu, non_blocking=True)
         self.build_active_slices()
@@ -1218,6 +1218,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                     slot_alloc._intermediate_counts_gpu if slot_alloc is not None else None
                 ),
             )
+
+        return self._context_op_metadata_gpu
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
