@@ -85,6 +85,21 @@ Main's versions are missing dev-only dependencies (e.g.
 `--group no_pypi_wheels` flag needed to install them. Keep dev's versions
 of all three files.
 
+**IMPORTANT: `.github/CODEOWNERS` must NEVER be modified by the sync
+bot under any circumstances.** Dev's CODEOWNERS is intentionally
+different from main's — do not take main's version, do not merge them,
+do not touch the file. If the merge produces a conflict or a non-zero
+diff against `origin/dev` on this path, restore dev's version verbatim:
+
+```
+git checkout origin/dev -- .github/CODEOWNERS
+```
+
+Then verify with `git diff origin/dev -- .github/CODEOWNERS` — output
+must be empty. Modifying CODEOWNERS triggers spurious reviewer
+requests and conflicts with the dev team's governance; rolling back a
+CODEOWNERS change after the PR lands is painful.
+
 **NEVER manually edit `uv.lock`.** It is a machine-generated lockfile. If
 it needs to change, it must be regenerated with `uv lock` inside a CUDA
 container (see `.claude/skills/build-and-test/SKILL.md`).
@@ -205,9 +220,37 @@ Run on ALL changed Python files (relative to `origin/dev`), in this order:
 4. `pylint` on changed `megatron/core/` files — fix missing-docstring and
    line-too-long violations before pushing
 
+### Pre-push invariant checks
+
+Before every `git push` in this workflow (the initial push in Phase 1
+AND every fix-push in Phase 3), run these bash checks. If any fails,
+fix the condition and re-check before pushing:
+
+```bash
+# 1. CODEOWNERS must be identical to dev's.
+if ! git diff --quiet origin/dev -- .github/CODEOWNERS; then
+  echo "ABORT: .github/CODEOWNERS differs from origin/dev. Restore with:"
+  echo "  git checkout origin/dev -- .github/CODEOWNERS"
+  exit 1
+fi
+
+# 2. Dependency-management triple must be identical to dev's.
+for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
+  if ! git diff --quiet origin/dev -- "$f"; then
+    # pyproject.toml is allowed to differ ONLY for git source reconciliation
+    # (new [tool.uv.sources] entries from main). If you intentionally edited
+    # it for that reason, bypass this check by re-running with $f skipped.
+    echo "WARNING: $f differs from origin/dev"
+  fi
+done
+```
+
+The CODEOWNERS check is a HARD abort — never push if it fails.
+
 ### Commit and Push
 
-Commit everything and push the branch.
+After the pre-push invariant checks pass, commit everything and push
+the branch.
 
 ---
 
