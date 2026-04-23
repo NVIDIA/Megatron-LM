@@ -91,7 +91,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
           - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
             regardless of pipeline stage.
 
-        Difference from ``pretrain_mamba.py``:
+        Difference from ``pretrain_hybrid.py``:
           - Return format: GPT returns a 6-tuple
             ``(tokens, labels, loss_mask, attention_mask, position_ids,
             packed_seq_params)`` where ``packed_seq_params`` is a

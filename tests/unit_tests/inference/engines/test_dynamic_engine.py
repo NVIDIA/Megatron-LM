@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import gc
@@ -46,8 +46,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
@@ -65,7 +65,7 @@ except ImportError:
 
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
-    if model_provider == "mamba":
+    if model_provider == "hybrid":
         sequence_packing_available, reason_for_no_sequence_packing = (
             _check_mamba_sequence_packing_support()
         )
@@ -368,7 +368,7 @@ class TestDynamicInferenceEngine:
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=test_config.position_embedding_type,
             ).cuda()
-        elif test_config.model_provider == "mamba":
+        elif test_config.model_provider == "hybrid":
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
@@ -407,7 +407,7 @@ class TestDynamicInferenceEngine:
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
-            # Mamba model.
+            # Hybrid model.
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
             mtp_suffix = "/M" * test_config.num_speculative_tokens
@@ -415,9 +415,9 @@ class TestDynamicInferenceEngine:
                 mamba_pattern = "M*-" + mtp_suffix
             else:
                 mamba_pattern = "M*-|M*-" + mtp_suffix
-            model = MambaModel(
+            model = HybridModel(
                 config=transformer_config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
@@ -574,7 +574,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4, -1])
     @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
@@ -632,7 +632,7 @@ class TestDynamicInferenceEngine:
 
         if model_provider == "gpt":
             expected_generated_tokens_list = gpt_expected_generated_tokens
-        elif model_provider == "mamba":
+        elif model_provider == "hybrid":
             expected_generated_tokens_list = mamba_expected_generated_tokens
         else:
             raise ValueError(f"Invalid model_provider {model_provider}")
@@ -693,7 +693,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_block_overflow(self, model_provider: str) -> None:
         """Test block overflow."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -739,7 +739,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -749,7 +749,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_fixed_output_lengths(self, model_provider: str) -> None:
         """Test generating a fixed number of output tokens."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -792,7 +792,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @torch.inference_mode()
     def test_generate_function(self, model_provider: str) -> None:
         """Test the generate function that processes multiple prompts at once."""
@@ -886,7 +886,7 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_fp8_inference(self, model_provider: str):
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
@@ -1092,7 +1092,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("ep_size", [1, 2])
     @pytest.mark.parametrize("pp_size", [1, 2])
     @pytest.mark.parametrize("tp_size", [1, 2])
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
     @torch.inference_mode()
     def test_parallel_inference(
@@ -1131,7 +1131,7 @@ class TestDynamicInferenceEngine:
                         "when tp_size > 1."
                     )
                 )
-            if model_provider == "mamba":
+            if model_provider == "hybrid":
                 pytest.skip(
                     reason="Mamba model is not supported with the inference optimized transformer."
                 )
@@ -1299,11 +1299,11 @@ class TestDynamicInferenceEngine:
         """
         Test chunked prefill with a Mamba model.
         """
-        skip_if_mamba_sequence_packing_not_available("mamba")
+        skip_if_mamba_sequence_packing_not_available("hybrid")
 
         # Context max tokens = 50.
         test_config = DynamicEngineTestConfig(
-            model_provider="mamba",
+            model_provider="hybrid",
             num_requests=0,
             num_tokens_to_generate=None,
             num_tokens_total=200,
@@ -4319,7 +4319,7 @@ class TestDynamicInferenceEngine:
         Two requests run simultaneously to exercise batched rewind indexing
         where mamba_metadata.request_to_mamba_state_idx differs per request.
         """
-        skip_if_mamba_sequence_packing_not_available("mamba")
+        skip_if_mamba_sequence_packing_not_available("hybrid")
 
         num_tokens_to_generate = 8
         test_config = DynamicEngineTestConfig(
@@ -4329,7 +4329,7 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=num_tokens_to_generate,
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
-            model_provider="mamba",
+            model_provider="hybrid",
         )
         env = self._build_test_env(test_config)
 
@@ -4460,7 +4460,7 @@ class TestChunkedPrefillCudaGraphs:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
-        elif model_provider == "mamba":
+        elif model_provider == "hybrid":
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=3,
@@ -4476,9 +4476,9 @@ class TestChunkedPrefillCudaGraphs:
                 add_bias_linear=True,
                 is_hybrid_model=True,
             )
-            model = MambaModel(
+            model = HybridModel(
                 config=config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=CHUNKED_CG_VOCAB_SIZE,
                 max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
                 parallel_output=True,
@@ -4564,7 +4564,7 @@ class TestChunkedPrefillCudaGraphs:
 
         return finished, step_count
 
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @pytest.mark.parametrize("chunked_prefill", [False, True])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
