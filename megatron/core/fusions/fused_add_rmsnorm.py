@@ -12,12 +12,16 @@ and the normalization. At small batch sizes the launch and bandwidth saved
 across every layer boundary is worth a few percent end-to-end; at larger
 batch sizes the effect is smaller but still strictly positive.
 
-The kernel accumulates the variance in fp32 regardless of the input dtype,
-matching the TE RMSNorm convention.
+We tried replacing this with ``torch.compile`` (inductor generates Triton
+under the hood). On nano-v3 inference (hidden=2688, bf16, decode-only) the
+compiled version lost ~3% vs the hand-written kernel, so we kept Triton.
+
+Variance is accumulated in fp32 regardless of input dtype, matching the TE
+RMSNorm convention.
 
 The *cross-layer* protocol that passes ``(residual, delta)`` pairs between
 layers so this kernel can absorb the previous layer's residual-add lives in
-:mod:`megatron.core.fusions.deferred_add`.
+:mod:`megatron.core.fusions.rmsnorm_residual_fusion`.
 """
 
 from typing import Tuple
@@ -64,7 +68,7 @@ def _fused_add_rmsnorm_kernel(
     x = tl.load(x_ptr + row_offset + cols, mask=mask, other=0.0).to(tl.float32)
 
     r = r + x
-    # Store the updated residual (in the input dtype).
+    # Store the updated residual (cast down to the input dtype).
     tl.store(residual_ptr + row_offset + cols, r, mask=mask)
 
     var = tl.sum(r * r, axis=0) / n_cols
@@ -77,14 +81,11 @@ def _fused_add_rmsnorm_kernel(
 
 
 def fused_add_rmsnorm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-5,
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused ``residual + x`` then RMSNorm, computed in one Triton kernel.
 
-    Returns both the updated residual and its normalized view. The kernel
+    Returns both the normalized output and the updated residual. The kernel
     requires contiguous memory for its row-stride arithmetic; if ``residual``
     is not contiguous we make a contiguous copy and return *that* buffer as
     the updated residual. Callers must use the returned residual for any
@@ -105,12 +106,10 @@ def fused_add_rmsnorm(
     if not HAVE_TRITON:
         raise RuntimeError("fused_add_rmsnorm requires Triton >= 2.0.0")
 
-    assert x.dtype == residual.dtype, (
-        f"dtype mismatch: x {x.dtype} vs residual {residual.dtype}"
-    )
-    assert weight.ndim == 1 and weight.shape[0] == residual.shape[-1], (
-        f"weight shape {weight.shape} incompatible with hidden dim {residual.shape[-1]}"
-    )
+    assert x.dtype == residual.dtype, f"dtype mismatch: x {x.dtype} vs residual {residual.dtype}"
+    assert (
+        weight.ndim == 1 and weight.shape[0] == residual.shape[-1]
+    ), f"weight shape {weight.shape} incompatible with hidden dim {residual.shape[-1]}"
     assert x.is_cuda, "fused_add_rmsnorm only supports CUDA tensors"
 
     # Broadcast ``x`` to match ``residual``'s shape so the kernel (which
@@ -142,13 +141,6 @@ def fused_add_rmsnorm(
         num_warps = 16
 
     _fused_add_rmsnorm_kernel[(n_rows,)](
-        residual_out,
-        x,
-        weight,
-        out,
-        hidden,
-        eps,
-        BLOCK_SIZE=block_size,
-        num_warps=num_warps,
+        residual_out, x, weight, out, hidden, eps, BLOCK_SIZE=block_size, num_warps=num_warps
     )
     return out, residual_out

@@ -1,17 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Integration tests for the cross-layer deferred-add + fused RMSNorm
+"""Integration tests for the cross-layer RMSNorm + residual-add fusion
 protocol.
 
 The layer-level protocol:
 
-* ``native_defer_mode()`` -- :class:`DeferMode` the layer would use if
-  asked to skip its exit residual-add.
-* ``native_absorb_mode()`` -- :class:`AbsorbMode` the layer would use if
-  asked to fold an incoming ``DeferredAdd`` into its entry RMSNorm.
+* ``native_fusion_modes()`` -- returns ``(AbsorbMode, DeferMode)`` for
+  the entry and exit sites this layer would use if paired with a
+  compatible neighbour.
 
 These tests cover the env-var opt-out and the ``fp32_residual_connection``
-disabling path on a real inference-optimized ``TransformerLayer``.  The
+disabling path on a real inference-optimized ``TransformerLayer``. The
 main end-to-end correctness guarantee comes from
 ``tests/unit_tests/inference/engines/test_dynamic_engine.py::test_simple``
 (the mamba variants) which drives a full hybrid forward.
@@ -20,16 +19,15 @@ main end-to-end correctness guarantee comes from
 import pytest
 import torch
 
-from megatron.core.fusions.deferred_add import AbsorbMode, DeferMode
 from megatron.core.fusions.fused_add_rmsnorm import HAVE_TRITON
+from megatron.core.fusions.rmsnorm_residual_fusion import AbsorbMode, DeferMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.skipif(
-    not HAVE_TRITON or not torch.cuda.is_available(),
-    reason="Requires Triton and CUDA",
+    not HAVE_TRITON or not torch.cuda.is_available(), reason="Requires Triton and CUDA"
 )
 
 
@@ -78,21 +76,21 @@ class TestDeferredAddProtocol:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
-    def test_defer_mode_is_enum(self):
+    def test_modes_are_enums(self):
         layer = _build_layer()
-        assert isinstance(layer.native_defer_mode(), DeferMode)
-
-    def test_absorb_mode_is_enum(self):
-        layer = _build_layer()
-        assert isinstance(layer.native_absorb_mode(), AbsorbMode)
+        absorb, defer = layer.native_fusion_modes()
+        assert isinstance(absorb, AbsorbMode)
+        assert isinstance(defer, DeferMode)
 
     def test_env_var_disables_both(self, monkeypatch):
         monkeypatch.setenv("MEGATRON_DISABLE_CROSS_LAYER_ADD_FUSION", "1")
         layer = _build_layer()
-        assert layer.native_defer_mode() is DeferMode.NONE
-        assert layer.native_absorb_mode() is AbsorbMode.NONE
+        absorb, defer = layer.native_fusion_modes()
+        assert absorb is AbsorbMode.NONE
+        assert defer is DeferMode.NONE
 
     def test_fp32_residual_disables_both(self):
         layer = _build_layer(fp32_residual_connection=True)
-        assert layer.native_defer_mode() is DeferMode.NONE
-        assert layer.native_absorb_mode() is AbsorbMode.NONE
+        absorb, defer = layer.native_fusion_modes()
+        assert absorb is AbsorbMode.NONE
+        assert defer is DeferMode.NONE

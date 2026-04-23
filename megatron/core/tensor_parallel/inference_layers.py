@@ -166,7 +166,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         # When set, this layer's ``forward`` skips the input RMSNorm
         # (the previous layer's deferred add + this layer's norm were
         # already collapsed into a single Triton kernel by
-        # :mod:`megatron.core.fusions.deferred_add`). ``forward`` clears
+        # :mod:`megatron.core.fusions.rmsnorm_residual_fusion`). ``forward`` clears
         # the flag after reading it so callers don't need to reset state.
         self.skip_input_norm = False
 

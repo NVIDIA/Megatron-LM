@@ -19,7 +19,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.fusions.deferred_add import materialize, wire_add_fusion
+from megatron.core.fusions.rmsnorm_residual_fusion import DeferredAdd, wire_rmsnorm_residual_fusion
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -195,15 +195,15 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        # Enable the cross-layer deferred-add + fused RMSNorm on every
+        # Enable the cross-layer RMSNorm + residual-add fusion on every
         # adjacent layer pair that advertises support. See
-        # ``megatron.core.fusions.fused_add_rmsnorm`` for the protocol.
-        wired = wire_add_fusion(self.layers)
+        # ``megatron.core.fusions.rmsnorm_residual_fusion`` for the protocol.
+        wired = wire_rmsnorm_residual_fusion(self.layers)
         if wired:
             log_single_rank(
                 logger,
                 logging.INFO,
-                "[fused-add-rmsnorm] wired %d/%d layer boundaries",
+                "[rmsnorm-residual-fusion] wired %d/%d layer boundaries",
                 wired,
                 len(self.layers) - 1,
             )
@@ -386,8 +386,10 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
 
         # Collapse any residual ``DeferredAdd`` into a plain tensor before
         # ``final_norm``. In practice the last layer never defers because
-        # ``wire_add_fusion`` only pairs emit/absorb on adjacent layers.
-        hidden_states = materialize(hidden_states)
+        # ``wire_rmsnorm_residual_fusion`` only pairs emit/absorb on
+        # adjacent layers, but guard anyway.
+        if isinstance(hidden_states, DeferredAdd):
+            hidden_states = hidden_states.residual + hidden_states.delta
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

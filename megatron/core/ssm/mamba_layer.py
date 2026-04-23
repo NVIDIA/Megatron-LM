@@ -13,15 +13,15 @@ from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.fusions.deferred_add import (
+from megatron.core.fusions.fused_add_rmsnorm import fused_add_rmsnorm
+from megatron.core.fusions.rmsnorm_residual_fusion import (
     AbsorbMode,
     DeferMode,
     DeferredAdd,
-    add_fusion_disabled_by_env,
+    rmsnorm_fusion_disabled_by_env,
     should_absorb_add,
     should_defer_add,
 )
-from megatron.core.fusions.fused_add_rmsnorm import fused_add_rmsnorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -101,7 +101,8 @@ class MambaLayer(GraphableMegatronModule):
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
-        # Cross-layer deferred-add modes. Set by ``wire_add_fusion`` when
+        # Cross-layer RMSNorm-fusion modes. Set by
+        # ``wire_rmsnorm_residual_fusion`` when
         # this layer is paired with a compatible neighbour. Runtime guards
         # in ``forward`` still fall back to the unfused path under
         # training or grad-enabled modes.
@@ -123,24 +124,22 @@ class MambaLayer(GraphableMegatronModule):
             return self.norm
         return None
 
-    def native_defer_mode(self) -> DeferMode:
-        # ``mamba_bda`` is a plain residual-add in inference: no bias, no
-        # dropout. Deferring it is a pure transformation.
-        if add_fusion_disabled_by_env():
-            return DeferMode.NONE
-        return DeferMode.MAMBA_EXIT
+    def native_fusion_modes(self) -> Tuple[AbsorbMode, DeferMode]:
+        """Modes this layer would use if paired with a compatible neighbour.
 
-    def native_absorb_mode(self) -> AbsorbMode:
-        if add_fusion_disabled_by_env():
-            return AbsorbMode.NONE
+        ``mamba_bda`` is a plain residual-add in inference (no bias, no
+        dropout), so deferring the exit is always a pure transformation
+        when fusion is enabled. The entry absorb is available whenever we
+        can reach the entry RMSNorm weight -- either via the standalone
+        ``self.norm`` or via ``mixer.in_proj``'s fused norm (in which
+        case we'll arm its ``skip_input_norm``).
+        """
+        if rmsnorm_fusion_disabled_by_env():
+            return AbsorbMode.NONE, DeferMode.NONE
         m = self._entry_norm_module()
-        # If the norm is fused into in_proj, we need ``skip_input_norm`` so
-        # we can tell it not to re-run the norm this call.
-        if m is None:
-            return AbsorbMode.NONE
-        if m is self.norm or hasattr(m, "skip_input_norm"):
-            return AbsorbMode.MAMBA_ENTRY
-        return AbsorbMode.NONE
+        can_absorb = m is not None and (m is self.norm or hasattr(m, "skip_input_norm"))
+        absorb = AbsorbMode.MAMBA_ENTRY if can_absorb else AbsorbMode.NONE
+        return absorb, DeferMode.MAMBA_EXIT
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the mamba layer for cudagraphs."""
@@ -204,9 +203,9 @@ class MambaLayer(GraphableMegatronModule):
         if should_defer_add(self):
             return DeferredAdd(residual=residual, delta=mixer_out_with_bias[0])
         with self.bias_dropout_add_exec_handler():
-            return self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
+            return self.mamba_bda(training=self.training, fused=self.config.bias_dropout_fusion)(
+                mixer_out_with_bias, residual, self.hidden_dropout
+            )
 
     def _absorb_add_at_entry(self, incoming: DeferredAdd):
         """Consume ``incoming`` via ``fused_add_rmsnorm``; return
@@ -216,11 +215,7 @@ class MambaLayer(GraphableMegatronModule):
         ``skip_input_norm`` so the in_proj doesn't redo the norm.
         """
         norm_module = self._entry_norm_module()
-        weight = (
-            norm_module.layer_norm_weight
-            if norm_module is not self.norm
-            else self.norm.weight
-        )
+        weight = norm_module.layer_norm_weight if norm_module is not self.norm else self.norm.weight
         normed, residual = fused_add_rmsnorm(
             incoming.delta, incoming.residual, weight, eps=self.config.layernorm_epsilon
         )

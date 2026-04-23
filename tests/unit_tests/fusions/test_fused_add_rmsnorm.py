@@ -39,9 +39,7 @@ def test_matches_reference(dtype, hidden_size, n_rows):
     ref_normed, ref_residual = _reference(x, residual.clone(), weight, eps)
 
     fused_residual = residual.clone()
-    fused_normed, fused_residual_out = fused_add_rmsnorm(
-        x, fused_residual, weight, eps=eps
-    )
+    fused_normed, fused_residual_out = fused_add_rmsnorm(x, fused_residual, weight, eps=eps)
 
     if dtype is torch.float32:
         tols = dict(rtol=1e-5, atol=1e-5)
@@ -58,7 +56,8 @@ def test_matches_reference(dtype, hidden_size, n_rows):
 
 
 def test_residual_in_place_when_contiguous():
-    """Contiguous residual: returned buffer aliases the caller's tensor."""
+    """Contiguous residual: the returned buffer aliases the caller's tensor,
+    so the input ``residual`` is mutated in place with ``residual + x``."""
     torch.manual_seed(0)
     device = "cuda"
     hidden = 1024
@@ -68,24 +67,20 @@ def test_residual_in_place_when_contiguous():
 
     expected = residual + x
     _, residual_out = fused_add_rmsnorm(x, residual, weight, eps=1e-5)
-    # Same storage (no copy), so the caller's ``residual`` was mutated.
+    # Same storage -- caller's tensor sees the update.
     assert residual_out.data_ptr() == residual.data_ptr()
     torch.testing.assert_close(residual, expected, rtol=2e-2, atol=1e-2)
 
 
 def test_residual_out_of_place_when_noncontiguous():
-    """Non-contiguous residual: caller's tensor is NOT mutated; must use returned buffer."""
+    """Non-contiguous residual: the kernel allocates a contiguous copy and
+    returns *that* buffer. Callers must use the returned residual."""
     torch.manual_seed(0)
     device = "cuda"
     hidden = 1024
     x = torch.randn(4, hidden, dtype=torch.bfloat16, device=device)
-    # Build a non-contiguous residual via a strided view.
-    base = torch.randn(4, 2 * hidden, dtype=torch.bfloat16, device=device)
-    residual = base[:, ::2].contiguous().T.T  # contiguous -> transpose twice is still contig...
-    # Actually force non-contig: take every-other column.
-    base2 = torch.randn(4, 2, hidden, dtype=torch.bfloat16, device=device)
-    residual = base2[:, 0]  # shape (4, hidden), stride (2*hidden, 1) -> non-contiguous
-
+    base = torch.randn(4, 2, hidden, dtype=torch.bfloat16, device=device)
+    residual = base[:, 0]  # shape (4, hidden), stride (2*hidden, 1) -- non-contig
     assert not residual.is_contiguous()
     weight = torch.randn(hidden, dtype=torch.bfloat16, device=device)
 
@@ -93,9 +88,8 @@ def test_residual_out_of_place_when_noncontiguous():
     residual_before = residual.clone()
     _, residual_out = fused_add_rmsnorm(x, residual, weight, eps=1e-5)
 
-    # Caller's tensor is unchanged.
+    # Caller's tensor unchanged; returned buffer holds the sum.
     torch.testing.assert_close(residual, residual_before)
-    # The returned buffer holds the updated residual.
     torch.testing.assert_close(residual_out, expected, rtol=2e-2, atol=1e-2)
 
 

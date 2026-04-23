@@ -6,7 +6,7 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.distributed
@@ -15,16 +15,15 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.fusions.deferred_add import (
+from megatron.core.fusions.fused_add_rmsnorm import fused_add_rmsnorm
+from megatron.core.fusions.rmsnorm_residual_fusion import (
     AbsorbMode,
     DeferMode,
     DeferredAdd,
-    add_fusion_disabled_by_env,
-    materialize,
+    rmsnorm_fusion_disabled_by_env,
     should_absorb_add,
     should_defer_add,
 )
-from megatron.core.fusions.fused_add_rmsnorm import fused_add_rmsnorm
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -500,74 +499,77 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
-        # Cross-layer deferred-add modes. Set by ``wire_add_fusion`` when
+        # Cross-layer RMSNorm-fusion modes. Set by
+        # ``wire_rmsnorm_residual_fusion`` when
         # this layer is paired with a compatible neighbour. Runtime guards
         # in the forward path still fall back to the unfused behaviour
         # under training or grad-enabled modes.
         self._absorb_mode = AbsorbMode.NONE
         self._defer_mode = DeferMode.NONE
 
-    def native_absorb_mode(self) -> AbsorbMode:
-        """Where this layer would absorb an incoming ``DeferredAdd``.
+    def native_fusion_modes(self) -> Tuple[AbsorbMode, DeferMode]:
+        """Modes this layer would use if paired with a compatible neighbour.
 
-        Two entry sites are supported:
+        Entry (absorb) sites:
         * ``ATTN_ENTRY`` when ``self_attention`` is real and its
-          ``linear_qkv`` is an ``InferenceLayerNormColumnParallelLinear``
-          exposing ``skip_input_norm`` and ``layer_norm_weight``.
+          ``linear_qkv`` exposes ``skip_input_norm`` + ``layer_norm_weight``.
         * ``PRE_MLP_ENTRY`` when ``self_attention`` is ``IdentityOp`` and
           ``pre_mlp_layernorm`` is a real norm with a ``weight``.
-        """
-        if add_fusion_disabled_by_env():
-            return AbsorbMode.NONE
-        if getattr(self.config, "transformer_impl", None) != "inference_optimized":
-            return AbsorbMode.NONE
-        if self.recompute_input_layernorm or self.recompute_pre_mlp_layernorm:
-            return AbsorbMode.NONE
-        if self.config.fp32_residual_connection:
-            return AbsorbMode.NONE
-        if not isinstance(self.cross_attention, IdentityOp):
-            return AbsorbMode.NONE
-        if not isinstance(self.self_attention, IdentityOp):
-            lq = getattr(self.self_attention, "linear_qkv", None)
-            if (
-                lq is not None
-                and hasattr(lq, "skip_input_norm")
-                and hasattr(lq, "layer_norm_weight")
-                and lq.layer_norm_weight is not None
-            ):
-                return AbsorbMode.ATTN_ENTRY
-            return AbsorbMode.NONE
-        if (
-            not isinstance(self.mlp, IdentityOp)
-            and not isinstance(self.pre_mlp_layernorm, IdentityOp)
-            and hasattr(self.pre_mlp_layernorm, "weight")
-        ):
-            return AbsorbMode.PRE_MLP_ENTRY
-        return AbsorbMode.NONE
 
-    def native_defer_mode(self) -> DeferMode:
-        """Where this layer would defer its exit residual-add.
-
+        Exit (defer) sites:
         * ``ATTN_EXIT`` for attention-only layers (``mlp`` is ``IdentityOp``):
           skip ``self_attn_bda`` in ``_forward_attention``.
         * ``MLP_EXIT`` for layers with a real MLP: skip ``mlp_bda`` in
           ``_forward_post_mlp``.
+
+        Returns ``(NONE, NONE)`` when fusion is disabled globally or when
+        a config flag (recompute, fp32 residual, fused TP comm, etc.)
+        makes cross-layer fusion unsafe.
         """
-        if add_fusion_disabled_by_env():
-            return DeferMode.NONE
+        none = AbsorbMode.NONE, DeferMode.NONE
+        if rmsnorm_fusion_disabled_by_env():
+            return none
         if getattr(self.config, "transformer_impl", None) != "inference_optimized":
-            return DeferMode.NONE
-        if getattr(self.config, "add_bias_linear", False):
-            return DeferMode.NONE
+            return none
         if self.config.fp32_residual_connection:
-            return DeferMode.NONE
-        if getattr(self.config, "inference_fuse_tp_communication", False):
-            return DeferMode.NONE
-        if not isinstance(self.mlp, IdentityOp):
-            return DeferMode.MLP_EXIT
-        if not isinstance(self.self_attention, IdentityOp):
-            return DeferMode.ATTN_EXIT
-        return DeferMode.NONE
+            return none
+        if not isinstance(self.cross_attention, IdentityOp):
+            return none
+
+        # --- Absorb (entry) ---
+        if self.recompute_input_layernorm or self.recompute_pre_mlp_layernorm:
+            absorb = AbsorbMode.NONE
+        elif not isinstance(self.self_attention, IdentityOp):
+            lq = getattr(self.self_attention, "linear_qkv", None)
+            absorb = (
+                AbsorbMode.ATTN_ENTRY
+                if lq is not None
+                and hasattr(lq, "skip_input_norm")
+                and getattr(lq, "layer_norm_weight", None) is not None
+                else AbsorbMode.NONE
+            )
+        elif (
+            not isinstance(self.mlp, IdentityOp)
+            and not isinstance(self.pre_mlp_layernorm, IdentityOp)
+            and hasattr(self.pre_mlp_layernorm, "weight")
+        ):
+            absorb = AbsorbMode.PRE_MLP_ENTRY
+        else:
+            absorb = AbsorbMode.NONE
+
+        # --- Defer (exit) ---
+        if getattr(self.config, "add_bias_linear", False) or getattr(
+            self.config, "inference_fuse_tp_communication", False
+        ):
+            defer = DeferMode.NONE
+        elif not isinstance(self.mlp, IdentityOp):
+            defer = DeferMode.MLP_EXIT
+        elif not isinstance(self.self_attention, IdentityOp):
+            defer = DeferMode.ATTN_EXIT
+        else:
+            defer = DeferMode.NONE
+
+        return absorb, defer
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
@@ -659,9 +661,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # layer's deferred residual-add into ``linear_qkv``'s entry norm.
         # ``PRE_MLP_ENTRY`` absorbs are handled in
         # ``_forward_pre_mlp_layernorm`` -- pass the ``DeferredAdd`` through.
-        if self._absorb_mode is AbsorbMode.ATTN_ENTRY and should_absorb_add(
-            self, hidden_states
-        ):
+        if self._absorb_mode is AbsorbMode.ATTN_ENTRY and should_absorb_add(self, hidden_states):
             lq = self.self_attention.linear_qkv
             input_layernorm_output, residual = fused_add_rmsnorm(
                 hidden_states.delta,
@@ -678,7 +678,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self._absorb_mode is AbsorbMode.PRE_MLP_ENTRY
                 and should_absorb_add(self, hidden_states)
             ):
-                hidden_states = materialize(hidden_states)
+                hidden_states = hidden_states.residual + hidden_states.delta
             # Optional Input Layer norm
             if self.recompute_input_layernorm:
                 self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -757,9 +757,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # self attention module.
             hidden_states = attention_output_with_bias[0]
         elif defer_add_at_attn:
-            hidden_states = DeferredAdd(
-                residual=residual, delta=attention_output_with_bias[0]
-            )
+            hidden_states = DeferredAdd(residual=residual, delta=attention_output_with_bias[0])
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -842,9 +840,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # PRE_MLP_ENTRY absorb: attention-free layer (e.g. MoE-only) folds
         # the incoming ``DeferredAdd`` into ``pre_mlp_layernorm``.
-        if self._absorb_mode is AbsorbMode.PRE_MLP_ENTRY and should_absorb_add(
-            self, hidden_states
-        ):
+        if self._absorb_mode is AbsorbMode.PRE_MLP_ENTRY and should_absorb_add(self, hidden_states):
             with off_interface(
                 self.offload_mlp_norm, hidden_states.residual, "mlp_norm"
             ) as _offloaded_residual:
