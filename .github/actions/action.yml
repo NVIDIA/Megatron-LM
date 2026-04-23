@@ -214,7 +214,7 @@ runs:
         LOG_BASE=$([[ "$IS_UNIT_TEST" == "true" ]] && echo "assets_dir/logs" || echo "assets_dir")
         LATEST_LOG=""
         if [[ -d "$LOG_BASE" ]]; then
-          LATEST_LOG=$(find "$LOG_BASE" -maxdepth 3 -name "*.log" ! -name "nccl_debug.log" -type f 2>/dev/null \
+          LATEST_LOG=$(find "$LOG_BASE" -name "*.log" ! -name "nccl_debug.log" -type f 2>/dev/null \
                          | xargs -r ls -t 2>/dev/null | head -1 || true)
         fi
         if [[ -n "$LATEST_LOG" ]]; then
