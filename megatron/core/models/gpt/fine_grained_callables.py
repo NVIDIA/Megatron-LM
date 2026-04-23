@@ -480,7 +480,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
                 if layer.recompute_pre_mlp_layernorm:
-                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                        retain_input_tensors=layer._pre_mlp_layernorm_returns_residual,
+                    )
                     with off_interface(
                         layer.offload_mlp_norm, hidden_states, "mlp_norm"
                     ) as hidden_states:
