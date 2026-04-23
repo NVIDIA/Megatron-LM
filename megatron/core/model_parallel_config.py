@@ -293,6 +293,21 @@ class ModelParallelConfig:
     This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
     """
 
+    overlap_p2p_backward_on_comm_stream: bool = False
+    """Place backward P2P communication on the communication stream instead of the
+    computation stream, enabling overlap with the next VPP stage's forward compute."""
+
+    overlap_p2p_with_transformer_layer_wgrad: bool = False
+    """When enabled, deferred layers delay both attention and MLP weight gradient
+    computation to overlap with P2P communication. When disabled, only attention
+    weight gradients are deferred."""
+
+    overlap_p2p_wgrad_delayed_layer_number: int = 1
+    """Number of backward layers whose weight gradient computation is delayed to
+    overlap with P2P communication. Controls how many of the last backward layers
+    defer their wgrad. The type of wgrad deferred (attn only vs attn+mlp) is
+    controlled by overlap_p2p_with_transformer_layer_wgrad."""
+
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
     EP overlap can increase peak memory usage when the overlapped forward module allocates 
