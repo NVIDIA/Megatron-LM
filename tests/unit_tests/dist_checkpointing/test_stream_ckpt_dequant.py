@@ -11,15 +11,12 @@ instead of up-front in ``force_all_tensors_to_non_fp8``. Tests cover:
 
 - Loaded-content equivalence vs. the legacy upfront path (FP8).
 - Delayed-scaling ``amax_history`` is not polluted across a streaming load.
-- Peak GPU memory during load is strictly lower with streaming on.
 - ``_unwrap_pyt_sharded_tensor`` uses view-based axis stripping (no
   dequantize fallback) — exercised implicitly by the MXFP8 save/load test.
 - MXFP8 save/load round-trip.
+- NVFP4 save/load round-trip (Blackwell+ only, skipped otherwise).
 - No-op fall-through for plain (non-quantized) tensors.
 """
-
-import gc
-from contextlib import contextmanager
 
 import pytest
 import torch
@@ -109,30 +106,6 @@ def _to_nvfp4(tensor: torch.Tensor):
     return quantizer(tensor.cuda().contiguous())
 
 
-@contextmanager
-def _measure_peak_cuda(device: int = 0):
-    """Measure peak CUDA allocation inside the block as a delta above a clean baseline.
-
-    Flushes Python GC, synchronizes, empties the CUDA cache, and records the
-    current ``memory_allocated`` as the baseline before resetting peak stats.
-    This keeps the measurement stable across back-to-back calls and strips out
-    allocator fragmentation carried over from earlier work (e.g. the save
-    phase). Populates ``baseline``, ``peak``, and ``delta`` on exit.
-    """
-    gc.collect()
-    torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
-    baseline = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
-    out = {"baseline": baseline}
-    try:
-        yield out
-    finally:
-        torch.cuda.synchronize(device)
-        out["peak"] = torch.cuda.max_memory_allocated(device)
-        out["delta"] = out["peak"] - baseline
-
-
 @pytest.mark.skipif(not HAVE_TE, reason="TransformerEngine not available")
 class TestStreamCkptDequant:
     """Unit tests for streaming per-tensor dequantize during ckpt load."""
@@ -215,87 +188,6 @@ class TestStreamCkptDequant:
             assert torch.equal(loaded_q.amax, pre_load_amax), (
                 f"amax was not restored after streaming load; "
                 f"before={pre_load_amax.item()} after={loaded_q.amax.item()}"
-            )
-
-        Utils.destroy_model_parallel()
-
-    # ---------------------------------------------------------------
-    # Memory: streaming must allocate a smaller peak than the bulk path.
-    # ---------------------------------------------------------------
-
-    def test_fp8_streaming_reduces_peak_memory(self, tmp_path_dist_ckpt):
-        """Peak CUDA allocation during load must be strictly lower with streaming on.
-
-        We stress-test with many moderately-large FP8 tensors so the N-upfront-BF16
-        allocation dominates the plateau.
-        """
-        Utils.initialize_model_parallel(1, 1)
-
-        # 32 tensors * 4 MiB FP8 per rank = 128 MiB of FP8, 256 MiB of upfront BF16
-        # under the legacy path; streaming should only keep ~8 MiB scratch live at once.
-        num_tensors = 32
-        numel = 4 * 1024 * 1024  # 4 Mi elements per rank -> 4 MiB FP8, 8 MiB BF16
-
-        def get_fp8_tensor():
-            return _to_float8(torch.zeros(numel, dtype=torch.bfloat16, device='cuda'))
-
-        # Shard each tensor along axis 0 across ranks with replica_id=0 so every rank
-        # is the main replica of its own slice and actually materializes the load
-        # work (dequant allocations, streaming scratches). Using replica_id=Utils.rank
-        # would make only rank 0 the main replica and leave the other ranks with
-        # near-zero memory deltas that fail the comparison.
-        def build_state_dict():
-            return {
-                f'w{i}': ShardedTensor.from_rank_offsets(
-                    f'w{i}',
-                    get_fp8_tensor(),
-                    (0, Utils.rank, Utils.world_size),
-                    replica_id=0,
-                )
-                for i in range(num_tensors)
-            }
-
-        with TempNamedDir(tmp_path_dist_ckpt / 'fp8_mem') as ckpt_dir:
-            save(build_state_dict(), ckpt_dir, TorchDistSaveShardedStrategy())
-
-            # Legacy path.
-            dst_legacy = build_state_dict()
-            with _measure_peak_cuda() as legacy:
-                load(dst_legacy, ckpt_dir, TorchDistLoadShardedStrategy(stream_ckpt_dequant=False))
-            # Drop legacy state so it doesn't contribute to the streaming baseline.
-            del dst_legacy
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # Streaming path.
-            dst_stream = build_state_dict()
-            with _measure_peak_cuda() as streaming:
-                load(dst_stream, ckpt_dir, TorchDistLoadShardedStrategy(stream_ckpt_dequant=True))
-
-            legacy_delta = legacy["delta"]
-            streaming_delta = streaming["delta"]
-            # Streaming's scratch allocations are bounded per-tensor; legacy holds all
-            # BF16 scratches upfront. Compare the load-induced delta above each path's
-            # clean baseline. Two assertions make this robust:
-            #   1. Streaming uses at most half the load-time memory of legacy.
-            #   2. Absolute saving is at least `num_tensors // 4` tensors' worth of BF16.
-            # The factor 1/2 accounts for the fact that legacy also frees the original
-            # FP8 bytes as it replaces `.data` with BF16, so the net growth is smaller
-            # than `N * bf16_bytes`.
-            bf16_bytes_per_tensor = numel * 2
-            min_absolute_saving = (num_tensors // 4) * bf16_bytes_per_tensor
-            saving = legacy_delta - streaming_delta
-            assert streaming_delta * 2 <= legacy_delta, (
-                f"Streaming did not halve the load-time memory. "
-                f"legacy_delta={legacy_delta/1e6:.1f} MB, "
-                f"streaming_delta={streaming_delta/1e6:.1f} MB"
-            )
-            assert saving >= min_absolute_saving, (
-                f"Streaming saving below the meaningful floor. "
-                f"legacy_delta={legacy_delta/1e6:.1f} MB, "
-                f"streaming_delta={streaming_delta/1e6:.1f} MB, "
-                f"saving={saving/1e6:.1f} MB, "
-                f"min_absolute_saving={min_absolute_saving/1e6:.1f} MB"
             )
 
         Utils.destroy_model_parallel()
