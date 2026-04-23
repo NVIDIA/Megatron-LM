@@ -14,12 +14,15 @@
 
 import dataclasses
 import logging
+import operator
 import traceback
+from contextlib import nullcontext
+from functools import reduce
 from typing import Any, Callable, Optional
 
 import torch
 
-from .utils import get_global_memory_buffer, log_single_rank
+from .utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,43 @@ except ImportError:
         NCCL_ALLOCATOR = "APEX"
     except ImportError:
         nccl_allocator = None
+
+
+class GlobalMemoryBuffer:
+    """Global buffer to avoid dynamic memory allocations.
+    Caller should ensure that buffers of the same name
+    are not used concurrently."""
+
+    def __init__(self):
+        self.buffer = {}
+
+    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None):
+        """
+        Returns (potentially) a sub-tensor from the self.buffer for the given shape.
+        """
+        required_len = reduce(operator.mul, tensor_shape, 1)
+        if (
+            self.buffer.get((name, dtype), None) is None
+            or self.buffer[(name, dtype)].numel() < required_len
+        ):
+            mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
+            with mem_alloc_context():
+                self.buffer[(name, dtype)] = torch.empty(
+                    required_len,
+                    dtype=dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+
+        return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
+
+
+def get_global_memory_buffer():
+    """Return the global GlobalMemoryBuffer object"""
+    global _GLOBAL_MEMORY_BUFFER
+    if "_GLOBAL_MEMORY_BUFFER" not in globals() or _GLOBAL_MEMORY_BUFFER is None:
+        _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
+    return _GLOBAL_MEMORY_BUFFER
 
 
 def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:

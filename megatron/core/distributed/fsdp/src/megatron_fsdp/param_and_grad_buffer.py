@@ -37,6 +37,7 @@ from .allocators import (
     MultiGroupUBRAllocator,
     StorageResizeBasedBucketAllocator,
     TemporaryBucketAllocator,
+    get_global_memory_buffer,
     nccl_allocator,
 )
 from .mixed_precision import (
@@ -56,7 +57,6 @@ from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneve
 from .utils import (
     _MODEL_PARALLEL_RNG_TRACKER_NAME,
     FSDPDistributedIndex,
-    get_global_memory_buffer,
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
     log_single_rank,
