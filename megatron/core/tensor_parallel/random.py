@@ -730,6 +730,13 @@ class CheckpointWithoutOutput(object):
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
+
+        self._saved_input_ptrs = {
+            t.untyped_storage().data_ptr()
+            for t in self.ctx.saved_tensors
+            if isinstance(t, torch.Tensor)
+        }
+
         return outputs
 
     def _recompute(self, _):
@@ -811,15 +818,10 @@ class CheckpointWithoutOutput(object):
 
         # Release output tensor memory while keeping metadata for backward.
         # Skip outputs whose storage is shared with a saved input — freeing those
-        # would destroy the data needed for recomputation (e.g. TE.ops.Sequential 
-        # operations with MakeExtraOutput).
-        saved_ptrs = {
-            t.untyped_storage().data_ptr()
-            for t in self.ctx.saved_tensors
-            if isinstance(t, torch.Tensor)
-        }
+        # would destroy the data needed for recomputation (e.g. fused residual norms
+        # where MakeExtraOutput returns the input tensor itself as an extra output).
         for output in self.outputs:
-            if output.untyped_storage().data_ptr() not in saved_ptrs:
+            if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
                 output.untyped_storage().resize_(0)
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
