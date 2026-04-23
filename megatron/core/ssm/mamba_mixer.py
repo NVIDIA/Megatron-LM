@@ -1043,8 +1043,7 @@ class MambaMixer(MegatronModule):
 
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
-        if mode is True:
-            self._A_neg_exp_cache_stale = True
+        self._A_neg_exp_cache_stale = mode
         return super().train(mode)
 
     def _ssm_decode(
