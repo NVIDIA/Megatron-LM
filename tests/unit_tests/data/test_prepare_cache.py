@@ -121,6 +121,7 @@ def _build_prepare_cache_args(file_prefixes, data_cache_path, **overrides):
         skip_train=False,
         eval_iters=2,
         eval_interval=2,
+        start_eval_at_iter=None,
         global_batch_size=8,
         phase_transition_iterations=None,
         iteration=0,
