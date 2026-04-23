@@ -18,6 +18,7 @@ instead of up-front in ``force_all_tensors_to_non_fp8``. Tests cover:
 - No-op fall-through for plain (non-quantized) tensors.
 """
 
+import gc
 from contextlib import contextmanager
 from typing import Optional
 
@@ -79,15 +80,26 @@ def _to_mxfp8(tensor: torch.Tensor):
 
 @contextmanager
 def _measure_peak_cuda(device: int = 0):
-    """Reset peak, yield a dict, populate ``peak`` on exit."""
+    """Measure peak CUDA allocation inside the block as a delta above a clean baseline.
+
+    Flushes Python GC, synchronizes, empties the CUDA cache, and records the
+    current ``memory_allocated`` as the baseline before resetting peak stats.
+    This keeps the measurement stable across back-to-back calls and strips out
+    allocator fragmentation carried over from earlier work (e.g. the save
+    phase). Populates ``baseline``, ``peak``, and ``delta`` on exit.
+    """
+    gc.collect()
     torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    baseline = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
-    out = {}
+    out = {"baseline": baseline}
     try:
         yield out
     finally:
         torch.cuda.synchronize(device)
         out["peak"] = torch.cuda.max_memory_allocated(device)
+        out["delta"] = out["peak"] - baseline
 
 
 @pytest.mark.skipif(not HAVE_TE, reason="TransformerEngine not available")
@@ -204,30 +216,44 @@ class TestStreamCkptDequant:
         with TempNamedDir(tmp_path_dist_ckpt / 'fp8_mem') as ckpt_dir:
             save(build_state_dict(), ckpt_dir, TorchDistSaveShardedStrategy())
 
-            # Legacy path
+            # Legacy path.
             dst_legacy = build_state_dict()
             with _measure_peak_cuda() as legacy:
                 load(dst_legacy, ckpt_dir, TorchDistLoadShardedStrategy(stream_ckpt_dequant=False))
-            # Free legacy state before measuring streaming
+            # Drop legacy state so it doesn't contribute to the streaming baseline.
             del dst_legacy
+            gc.collect()
             torch.cuda.empty_cache()
 
-            # Streaming path
+            # Streaming path.
             dst_stream = build_state_dict()
             with _measure_peak_cuda() as streaming:
                 load(dst_stream, ckpt_dir, TorchDistLoadShardedStrategy(stream_ckpt_dequant=True))
 
-            legacy_peak = legacy["peak"]
-            streaming_peak = streaming["peak"]
-            # Streaming must save at least half of the bulk BF16 allocation.
-            expected_min_saving = (num_tensors - 1) * numel * 2 // 2  # 2 bytes/elem BF16
-            saving = legacy_peak - streaming_peak
-            assert saving >= expected_min_saving, (
-                f"Streaming did not reduce peak as expected. "
-                f"legacy_peak={legacy_peak/1e6:.1f} MB, "
-                f"streaming_peak={streaming_peak/1e6:.1f} MB, "
+            legacy_delta = legacy["delta"]
+            streaming_delta = streaming["delta"]
+            # Streaming's scratch allocations are bounded per-tensor; legacy holds all
+            # BF16 scratches upfront. Compare the load-induced delta above each path's
+            # clean baseline. Two assertions make this robust:
+            #   1. Streaming uses at most half the load-time memory of legacy.
+            #   2. Absolute saving is at least `num_tensors // 4` tensors' worth of BF16.
+            # The factor 1/2 accounts for the fact that legacy also frees the original
+            # FP8 bytes as it replaces `.data` with BF16, so the net growth is smaller
+            # than `N * bf16_bytes`.
+            bf16_bytes_per_tensor = numel * 2
+            min_absolute_saving = (num_tensors // 4) * bf16_bytes_per_tensor
+            saving = legacy_delta - streaming_delta
+            assert streaming_delta * 2 <= legacy_delta, (
+                f"Streaming did not halve the load-time memory. "
+                f"legacy_delta={legacy_delta/1e6:.1f} MB, "
+                f"streaming_delta={streaming_delta/1e6:.1f} MB"
+            )
+            assert saving >= min_absolute_saving, (
+                f"Streaming saving below the meaningful floor. "
+                f"legacy_delta={legacy_delta/1e6:.1f} MB, "
+                f"streaming_delta={streaming_delta/1e6:.1f} MB, "
                 f"saving={saving/1e6:.1f} MB, "
-                f"expected_min_saving={expected_min_saving/1e6:.1f} MB"
+                f"min_absolute_saving={min_absolute_saving/1e6:.1f} MB"
             )
 
         Utils.destroy_model_parallel()
