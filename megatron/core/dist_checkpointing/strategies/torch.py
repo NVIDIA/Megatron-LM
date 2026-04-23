@@ -363,7 +363,7 @@ def _unwrap_pyt_sharded_tensor(
             # classes without any dequantize.
             for _ in range(mcore_sh_ten.prepend_axis_num):
                 assert ten.size(0) == 1
-            ten = ten.view(ten.shape[mcore_sh_ten.prepend_axis_num:])
+            ten = ten.view(ten.shape[mcore_sh_ten.prepend_axis_num :])
         ret_tensors.append(ten)
     return ret_tensors
 
@@ -513,7 +513,9 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         # Maps id(read_item) -> (read_item, target_tensor, amax_snapshot_or_None, kind)
         # kind is "stream" for the streaming per-tensor dequant path and "noncontig"
         # for the existing contiguity-fix path.
-        self._intermediate_read_items: Dict[int, Tuple[ReadItem, torch.Tensor, Optional[torch.Tensor], str]] = {}
+        self._intermediate_read_items: Dict[
+            int, Tuple[ReadItem, torch.Tensor, Optional[torch.Tensor], str]
+        ] = {}
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -610,12 +612,13 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
                 amax_snapshot = amax.detach().clone()
 
             scratch = torch.empty(
-                target_tensor.shape,
-                dtype=target_tensor.dtype,
-                device=target_tensor.device,
+                target_tensor.shape, dtype=target_tensor.dtype, device=target_tensor.device
             )
             self._intermediate_read_items[id(read_item)] = (
-                read_item, target_tensor, amax_snapshot, "stream",
+                read_item,
+                target_tensor,
+                amax_snapshot,
+                "stream",
             )
             return scratch
 
@@ -625,7 +628,10 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
             and isinstance(target_tensor, Float8Tensor)
         ):
             self._intermediate_read_items[id(read_item)] = (
-                read_item, target_tensor, None, "noncontig",
+                read_item,
+                target_tensor,
+                None,
+                "noncontig",
             )
             target_tensor = Float8Tensor.make_like(
                 target_tensor, data=target_tensor._data.contiguous()
