@@ -16,6 +16,10 @@ name: Nightly Sync Main to Dev
 
 on:
   workflow_dispatch:
+  schedule:
+    # 21:00 UTC = 2 PM PDT (1 PM PST during winter — GitHub Actions cron
+    # is UTC-only and does not follow DST).
+    - cron: '0 21 * * *'
 
 concurrency:
   group: nightly-sync-main-to-dev
