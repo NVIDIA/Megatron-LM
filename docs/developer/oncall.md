@@ -55,4 +55,4 @@ If you do not know the answer to an issue or discussion question: that's ok! **D
 On a daily basis, track the following:
 
 - [new issues](https://github.com/NVIDIA/Megatron-LM/issues): check to see if there are any new issues before they become out of SLA!
-- [out of SLA issues](https://github.com/NVIDIA/Megatron-LM/issues): useful dashboard that tracks all out of SLA issues
+- [out of SLA issues](https://github.com/orgs/NVIDIA-NeMo/projects/20/views/4?sliceBy%5Bvalue%5D=NVIDIA%2FMegatron-LM): useful dashboard that tracks all out of SLA issues
