@@ -22,7 +22,6 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -620,16 +619,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        # Allocate NVLS symmetric buffers upfront (sized once at model init).
-        if self.expert_model_parallel_group.size() > 1 and not self._nccl_ep_dispatcher:
-            # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
-            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
-            NVLSAllGatherVDispatcher.allocate_symmetric_buffers(
-                engine_max_tokens=self.max_tokens,
-                topk=model_config.moe_router_topk,
-                hidden_size=moe_hidden_size,
-                ep_group=self.expert_model_parallel_group,
-            )
+        # Allocate per-step dispatcher buffers upfront so update_metadata never
+        # triggers an allocation inside a captured CUDA graph.
+        if self.expert_model_parallel_group.size() > 1:
+            if self._nccl_ep_dispatcher:
+                NCCLAllGatherDispatcher.allocate_buffers()
+            else:
+                # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
+                moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+                NVLSAllGatherVDispatcher.allocate_buffers(
+                    engine_max_tokens=self.max_tokens,
+                    topk=model_config.moe_router_topk,
+                    hidden_size=moe_hidden_size,
+                    ep_group=self.expert_model_parallel_group,
+                )
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1780,30 +1783,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-        if self.expert_model_parallel_group is not None:
-            self._update_moe_dispatcher_metadata()
-
-    def _update_moe_dispatcher_metadata(self) -> None:
-        """Update step metadata for the active MoE inference dispatcher.
-
-        Delegates the all-gather and barrier to the dispatcher's set_step_metadata.
-        """
-        ep_group = self.expert_model_parallel_group
-        local_tokens = self.padded_active_token_count
-
+        # Flip NCCLAllGather dispatcher's path selector to not use allgathers.
+        # _nccl_ep_dispatcher already implies ep_size > 1, so no extra EP guard.
         if self._nccl_ep_dispatcher:
-            using_cuda_graph = self.using_cuda_graph_this_step()
-            NCCLAllGatherDispatcher.set_step_metadata(
-                local_tokens, ep_group, use_allgather_v=not using_cuda_graph
-            )
-        else:
-            NVLSAllGatherVDispatcher.set_step_metadata(
-                local_tokens,
-                ep_group,
-                mask_routing_map=(
-                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                ),
-            )
+            NCCLAllGatherDispatcher._use_allgather_v = not self.using_cuda_graph_this_step()
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""

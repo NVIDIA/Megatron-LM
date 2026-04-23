@@ -43,7 +43,7 @@ from megatron.core.inference.communication.torch_symm_triton.multimem_asm import
 from megatron.core.inference.communication.torch_symm_triton.utils import sync_threads
 
 
-@triton.jit(do_not_specialize=["local_tokens"])
+@triton.jit
 def _fused_metadata_kernel(
     local_tokens,
     local_buf_ptr,
@@ -130,6 +130,5 @@ def fused_metadata_update(
         step_metadata,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
-        num_warps=max(1, (symm_mem_hdl.world_size + 31) // 32),
+        num_warps=min(max(1, (symm_mem_hdl.world_size + 31) // 32), 8),
     )
-    torch.cuda.synchronize()

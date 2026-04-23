@@ -17,8 +17,8 @@ Two dispatchers are provided, selected via config.inference_moe_token_dispatcher
 InferenceAllGatherDispatcherBase is a minimal base used solely for isinstance checks
 and to hold _valid_tokens_tensor — the shared interface that mcore_fused_moe reads to
 gate kernel work to the valid token prefix. Each dispatcher defines its own
-set_step_metadata; the inference context calls the right one based on its dispatcher
-type flag.
+update_metadata method, invoked from the first instance's token_dispatch so the
+per-step metadata kernel is captured inside the CUDA graph.
 """
 
 from typing import List, Optional
@@ -30,6 +30,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -47,7 +48,7 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     Exists for isinstance checks and to expose _valid_tokens_tensor — the single
     class-level value that mcore_fused_moe reads (via experts.py) to gate kernel
     work to the valid token prefix. Each concrete subclass owns its own metadata
-    and defines set_step_metadata independently.
+    and defines update_metadata independently.
     """
 
     # [1] int32: total valid tokens across all EP ranks this step.
@@ -56,15 +57,33 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     # so that experts.py can always call _valid_tokens() on this base class.
     _valid_tokens_tensor: Optional[torch.Tensor] = None
 
+    # Per-subclass instance counter (shadows via MRO on first mutation, so NCCL
+    # and NVLS each start from 0). The first instance created owns update_metadata.
+    _dispatcher_count: int = 0
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        cls = type(self)
+        self._runs_metadata_sync = cls._dispatcher_count == 0
+        cls._dispatcher_count += 1
+
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
         return cls._valid_tokens_tensor
+
+    def update_metadata(self, local_tokens: int) -> None:
+        """Per-step metadata refresh fired from the first instance's token_dispatch.
+
+        Must be idempotent across a step (only called once) and safe to capture
+        into a CUDA graph on the decode path.
+        """
+        raise NotImplementedError
 
 
 class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
     """AllGather token dispatcher for inference using NCCL.
 
-    Two modes selected per-step via set_step_metadata:
+    Two modes, selected by _use_allgather_v (set from the context each step):
 
     CG path (use_allgather_v=False): all EP ranks contribute the same token count,
     guaranteed by decode-only CUDA graphs. Standard AllGather/ReduceScatter.
@@ -94,45 +113,42 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         self.topk = config.moe_router_topk
 
     @classmethod
-    def set_step_metadata(
-        cls,
-        local_tokens: int,
-        ep_group: torch.distributed.ProcessGroup,
-        use_allgather_v: bool = False,
-    ) -> None:
-        """Gather per-rank token counts and set per-step metadata.
+    def allocate_buffers(cls) -> None:
+        """Allocate the per-step valid-tokens tensor read by mcore_fused_moe.
 
-        On CG steps (use_allgather_v=False), all EP ranks share the same padded token
-        count by construction — no collective needed, the tensor is filled trivially.
-        On non-CG steps (use_allgather_v=True), ranks may have different token counts
-        so a real AllGather is performed.
-
-        A barrier is issued at the end to ensure all ranks are ready before the forward.
-
-        Args:
-            local_tokens: Number of tokens on this rank this step.
-            ep_group: Expert parallel process group.
-            use_allgather_v: True on non-CG (prefill) steps with variable token counts.
+        Called once at model init from the dynamic context. Must run outside any
+        CUDA graph capture so update_metadata can write to a stable address during
+        replay without triggering allocations inside the graph.
         """
-        cls._use_allgather_v = use_allgather_v
-        ep_size = dist.get_world_size(group=ep_group)
+        device = torch.cuda.current_device()
+        InferenceAllGatherDispatcherBase._valid_tokens_tensor = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+
+    def update_metadata(self, local_tokens: int) -> None:
+        """Per-step metadata update; invoked from the first instance's token_dispatch.
+
+        CG path (_use_allgather_v=False): ranks have equal counts by construction, so
+        we only refresh _valid_tokens_tensor — a single .fill_ that is safe to capture.
+
+        Non-CG path (_use_allgather_v=True): ranks may differ, so we all-gather the
+        per-rank counts and host-sync via .tolist() for the pad/compact logic below.
+        This path never runs under graph capture.
+        """
+        cls = NCCLAllGatherDispatcher
+        ep_size = self.ep_size
         device = torch.cuda.current_device()
 
-        if use_allgather_v:
+        if cls._use_allgather_v:
             local_count = torch.tensor([local_tokens], dtype=torch.int32, device=device)
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
-            dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=ep_group)
+            dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
+            cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(
+                local_tokens_per_rank.sum()
+            )
         else:
-            local_tokens_per_rank = torch.full(
-                (ep_size,), local_tokens, dtype=torch.int32, device=device
-            )
-
-        cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
-        if InferenceAllGatherDispatcherBase._valid_tokens_tensor is None:
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor = torch.zeros(
-                1, dtype=torch.int32, device=device
-            )
-        InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(local_tokens_per_rank.sum())
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(ep_size * local_tokens)
 
     def token_dispatch(self, hidden_states, probs):
         """Gather hidden_states, probs, and routing_map from all EP ranks.
@@ -150,6 +166,9 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         """
         if self.ep_size == 1:
             return hidden_states, probs
+
+        if self._runs_metadata_sync:
+            self.update_metadata(hidden_states.shape[0])
 
         if not self.__class__._use_allgather_v:
             # CG path: equal token counts, standard gather.
@@ -277,11 +296,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _symm_agv_probs: Optional[dict] = None
     _symm_rsv: Optional[dict] = None
 
-    # When True, set_step_metadata fills the routing buffer with -1 before each
-    # step so stale rows beyond valid_tokens are pre-masked. Required by FlashInfer,
-    # which does not tolerate garbage expert IDs in unused rows.
-    _mask_routing_map: bool = False
-
     @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
         """Return the RSV symmetric buffer tensor so mcore_fused_moe can write
@@ -297,7 +311,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         return cls._step_metadata[2:3]
 
     @classmethod
-    def allocate_symmetric_buffers(
+    def allocate_buffers(
         cls,
         engine_max_tokens: int,
         topk: int,
@@ -315,9 +329,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
             ep_group: Expert parallel process group.
-            mask_routing_map: If True, set_step_metadata fills the routing buffer
-                with -1 each step so stale rows beyond valid_tokens are pre-masked.
-                Required when using the FlashInfer backend.
         """
         cls._engine_max_tokens = engine_max_tokens
         ep_size = dist.get_world_size(group=ep_group)
@@ -368,35 +379,23 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         InferenceAllGatherDispatcherBase._valid_tokens_tensor = cls._step_metadata[0:1]
         cls._ep_rank = dist.get_rank(group=ep_group)
 
-    @classmethod
-    def set_step_metadata(
-        cls,
-        local_tokens: int,
-        ep_group: torch.distributed.ProcessGroup,
-        mask_routing_map: bool = False,
-    ) -> None:
-        """All-gather per-rank token counts, update NVLS metadata, and mask routing buffer.
+    def update_metadata(self, local_tokens: int) -> None:
+        """Per-step metadata update; invoked from the first instance's token_dispatch.
 
-        Fills routing_map symmetric buffer with -1 so rows in [valid_tokens, global_max)
-        are pre-masked for FlashInfer — the AGV then overwrites only [0, valid_tokens).
-
-        A barrier is issued at the end to ensure all ranks are ready before the forward.
-
-        Args:
-            local_tokens: Number of tokens on this rank this step.
-            ep_group: Expert parallel process group.
-            mask_routing_map: If True, fill the routing buffer with -1 so stale rows
-                beyond valid_tokens are pre-masked. Required when using the FlashInfer backend.
+        Fires the fused NVLS allgather+reduce to publish
+        [valid_tokens, rank_token_offset, ep_max_tokens] into _step_metadata, then
+        (for FlashInfer) pre-masks the routing buffer with -1 so rows beyond
+        valid_tokens are ignored by the GEMM; the AGV below overwrites
+        [0, valid_tokens) in-place.
         """
+        cls = NVLSAllGatherVDispatcher
         fused_metadata_update(
             local_tokens=local_tokens,
             local_buf=cls._symm_metadata["tensor"],
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
-
-        # Mask stale rows so FlashInfer ignores them; AGV overwrites [0, valid_tokens).
-        if mask_routing_map:
+        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
 
     def __init__(
@@ -440,6 +439,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """
         if self.ep_size == 1:
             return hidden_states, probs
+
+        if self._runs_metadata_sync:
+            self.update_metadata(hidden_states.shape[0])
 
         agv_h = self.__class__._symm_agv_hidden
         agv_r = self.__class__._symm_agv_routing
