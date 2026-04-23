@@ -40,9 +40,10 @@ class MambaMetadata:
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
-        # Map from requests to slots in the static Mamba state buffer for active decode requests
+        # Map from requests to slots in the static Mamba state buffer for active decode requests.
+        # int64 so selective_state_update can index directly without a per-layer upcast kernel;
         self._batch_indices_decode_buffer = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=self.device
+            (self.max_requests,), -1, dtype=torch.int64, device=self.device
         )
 
         # Map from requests to slots in the static Mamba state buffer for active prefill requests
