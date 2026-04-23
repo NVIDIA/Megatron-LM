@@ -809,10 +809,18 @@ class CheckpointWithoutOutput(object):
         if is_graph_warmup():
             return
 
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
+        # Release output tensor memory while keeping metadata for backward.
+        # Skip outputs whose storage is shared with a saved input — freeing those
+        # would destroy the data needed for recomputation (e.g. fused residual norms
+        # where MakeExtraOutput returns the input tensor itself as an extra output).
+        saved_ptrs = {
+            t.untyped_storage().data_ptr()
+            for t in self.ctx.saved_tensors
+            if isinstance(t, torch.Tensor)
+        }
         for output in self.outputs:
-            output.untyped_storage().resize_(0)
+            if output.untyped_storage().data_ptr() not in saved_ptrs:
+                output.untyped_storage().resize_(0)
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected
