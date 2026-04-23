@@ -12,8 +12,14 @@ import torch
 
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
     mamba_state_selective_copy as mamba_state_selective_copy_pytorch,
+)
+from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
     prepare_next_forward_pass as prepare_next_forward_pass_pytorch,
+)
+from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
     rewind_kv_cache as rewind_kv_cache_pytorch,
+)
+from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
     verify_speculative_tokens as verify_speculative_tokens_pytorch,
 )
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
@@ -22,7 +28,6 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     rewind_kv_cache,
     verify_speculative_tokens,
 )
-
 
 # ---------------------------------------------------------------------------
 # Test helpers

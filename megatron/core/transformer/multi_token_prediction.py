@@ -22,7 +22,9 @@ from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.tensor_parallel.inference_layers import inference_all_gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.inference_layers import (
+    inference_all_gather_from_tensor_model_parallel_region,
+)
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -921,7 +923,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         # For tensor parallel we need to gather the tensor across the model-parallel
         # ranks after the linear projection.
         if not self.training:
-            hidden_states = inference_all_gather_from_tensor_model_parallel_region(hidden_states, self.tp_group, self.config)
+            hidden_states = inference_all_gather_from_tensor_model_parallel_region(
+                hidden_states, self.tp_group, self.config
+            )
         else:
             hidden_states = gather_from_tensor_model_parallel_region(
                 hidden_states, group=self.tp_group
