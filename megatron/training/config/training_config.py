@@ -531,13 +531,20 @@ class CheckpointConfig:
     """Number of machines storing the replica of a given rank's data."""
 
     def __post_init__(self):
-        from megatron.training.utils import has_nvrx_installed
+        from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in ["nvrx", "mcore"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
 
-        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
-            assert has_nvrx_installed(), (
-                "nvidia-resiliency-ext is not installed. "
-                "Please, install nvidia-resiliency-ext to enable async save."
+        if not self.async_save:
+            self.async_strategy = "mcore"
+
+        if (
+            self.async_save
+            and self.async_strategy == "nvrx"
+            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
+        ):
+            assert has_nvrx_checkpointing_async_support(), (
+                "A compatible nvidia-resiliency-ext installation is required to enable "
+                "async save with async_strategy='nvrx'."
             )
