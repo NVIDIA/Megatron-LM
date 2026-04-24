@@ -51,7 +51,7 @@ try:
         MegatronFSDP,
         MixedPrecisionPolicy,
     )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_v2 import FSDPModule
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import FSDPModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -216,9 +216,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if ddp_config.use_megatron_fsdp:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp import (
-                fully_shard_v2 as fully_shard,
-            )
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import fully_shard
         else:
             from torch.distributed.fsdp import fully_shard
 
