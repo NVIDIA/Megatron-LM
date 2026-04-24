@@ -47,11 +47,12 @@ logger = logging.getLogger(__name__)
 
 try:
     # Default to Megatron-LM FW.
-    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
     from megatron.core.utils import is_submodule
+
+    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
 except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")

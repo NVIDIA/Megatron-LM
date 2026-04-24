@@ -39,6 +39,16 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+export NCCL_PROTO="${NCCL_PROTO:-simple}"
+export NCCL_ALGO="${NCCL_ALGO:-Ring}"
+export NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+# Disable the EFA tuner plugin so NCCL_ALGO/NCCL_PROTO are actually respected instead of being overridden at runtime.
+export NCCL_TUNER_PLUGIN="${NCCL_TUNER_PLUGIN:-}"
+# Match the NCCL default (4 MB) so buffer-chunking behaviour is the same as on Slurm nodes.
+export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-4194304}"
+export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
+
 set +x
 # Envsubst model_params
 cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
