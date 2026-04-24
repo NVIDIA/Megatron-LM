@@ -109,7 +109,7 @@ html_theme_options = {
             "icon": "fa-brands fa-github",
         }
     ],
-    "public_docs_features": True
+    "public_docs_features": os.environ.get("SKIP_PUBLIC_DOCS_FEATURES", "false").lower() != "true",
 }
 html_extra_path = ["project.json", "versions1.json"]
 
