@@ -2,6 +2,8 @@
 
 
 from typing import cast
+import csv
+import os
 
 import pytest
 import torch
@@ -676,3 +678,43 @@ class TestCapacityPricedRouter:
         # Restore default knobs for test isolation.
         self.router.config.moe_expert_capacity_factor = None
         self.router.config.moe_pad_expert_input_to_capacity = False
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_update_prices_writes_csv_log(self, tmp_path):
+        self.router = self.router.cuda()
+        self.router.train()
+        self.router.layer_number = 3
+        self.router.config.log_interval = 50
+
+        log_path = tmp_path / "lambda_log.csv"
+        old_env = os.environ.get("CPMOE_LAMBDA_LOG")
+        os.environ["CPMOE_LAMBDA_LOG"] = str(log_path)
+
+        try:
+            # Force the 50-step logging interval twice to validate append behavior.
+            self.router.expert_prices.zero_()
+            self.router.cp_steps.fill_(49)
+            usage = torch.tensor([8.0, 0.0, 4.0, 4.0], device="cuda")
+            self.router.update_prices(usage)
+
+            assert log_path.exists()
+
+            self.router.cp_steps.fill_(99)
+            self.router.update_prices(usage)
+
+            with open(log_path, newline="") as f:
+                rows = list(csv.reader(f))
+
+            # Header should be written once, then one row per logging step.
+            assert rows[0][0:2] == ["step", "layer"]
+            assert rows[0][2:] == [f"expert_{i}" for i in range(self.router.config.num_moe_experts)]
+            assert len(rows) == 3
+            assert rows[1][0:2] == ["50", "3"]
+            assert rows[2][0:2] == ["100", "3"]
+        finally:
+            if old_env is None:
+                os.environ.pop("CPMOE_LAMBDA_LOG", None)
+            else:
+                os.environ["CPMOE_LAMBDA_LOG"] = old_env
+
