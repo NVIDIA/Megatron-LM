@@ -128,7 +128,7 @@ MODEL_ARGS:
   --ckpt-fully-parallel-save: true
   --ckpt-fully-parallel-load: true
   --ckpt-assume-constant-structure: true
-  # --async-save: true
+  --async-save: true
   --use-persistent-ckpt-worker: true
   --save-interval: 100
   --save-retain-interval: 500
