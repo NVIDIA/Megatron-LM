@@ -16,12 +16,12 @@ from tests.unit_tests.test_utilities import Utils
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-        fused_apply_mla_rope_for_kv,
-        fused_apply_mla_rope_for_q,
+        fused_mla_rope_inplace,
+        fused_mla_rope_kv_split,
     )
-except:
-    fused_apply_mla_rope_for_kv = None
-    fused_apply_mla_rope_for_q = None
+except Exception:
+    fused_mla_rope_inplace = None
+    fused_mla_rope_kv_split = None
 
 
 def dtype_tols(dtype):
@@ -43,8 +43,8 @@ class FakeCPGroup:
         return 0
 
 
-def _test_fused_apply_mla_rope_for_q(input_format):
-    assert fused_apply_mla_rope_for_q is not None
+def _test_fused_mla_rope_inplace(input_format, inverse=False):
+    assert fused_mla_rope_inplace is not None
     num_heads = 32
     q_dim = 128
     emb_dim = 64
@@ -104,12 +104,14 @@ def _test_fused_apply_mla_rope_for_q(input_format):
         mscale=mscale,
         cp_group=FakeCPGroup(),
         mla_rotary_interleaved=True,
+        inverse=inverse,
     )
     pytorch_output = torch.concat([no_pe, pe_output], dim=-1)
     pytorch_output.backward(pytorch_bwd_input, retain_graph=True)
 
-    fused_output = fused_apply_mla_rope_for_q(
-        fused_fwd_input, cos, sin, q_dim, emb_dim, cu_seqlens_q=cu_seqlens
+    fused_output = fused_mla_rope_inplace(
+        fused_fwd_input, cos, sin, q_dim, emb_dim,
+        cu_seqlens_q=cu_seqlens, inverse=inverse,
     )
     fused_output.backward(fused_bwd_input, retain_graph=True)
 
@@ -128,8 +130,8 @@ def _test_fused_apply_mla_rope_for_q(input_format):
     )
 
 
-def _test_fused_apply_mla_rope_for_kv(input_format):
-    assert fused_apply_mla_rope_for_kv is not None
+def _test_fused_mla_rope_kv_split(input_format):
+    assert fused_mla_rope_kv_split is not None
     num_heads = 32
     k_dim = 128
     v_dim = 128
@@ -214,7 +216,7 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         (pytorch_k_output, pytorch_v_output), (pytorch_bwd_k_input, pytorch_bwd_v_input)
     )
 
-    fused_k_output, fused_v_output = fused_apply_mla_rope_for_kv(
+    fused_k_output, fused_v_output = fused_mla_rope_kv_split(
         fused_fwd_kv_input,
         fused_fwd_emb_input,
         cos,
@@ -260,12 +262,15 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
-class TestFusedApplyMLARope:
-    def test_forward_backward_for_q(self, input_format):
-        _test_fused_apply_mla_rope_for_q(input_format)
+class TestFusedMLARope:
+    def test_inplace_forward_backward(self, input_format):
+        _test_fused_mla_rope_inplace(input_format, inverse=False)
 
-    def test_forward_backward_for_kv(self, input_format):
-        _test_fused_apply_mla_rope_for_kv(input_format)
+    def test_inplace_inverse_forward_backward(self, input_format):
+        _test_fused_mla_rope_inplace(input_format, inverse=True)
+
+    def test_kv_split_forward_backward(self, input_format):
+        _test_fused_mla_rope_kv_split(input_format)
 
 
 class TestApplyRotaryPosEmbMlaFusionConflict:
