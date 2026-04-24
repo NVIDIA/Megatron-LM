@@ -470,19 +470,18 @@ class TestMambaStateShapesWithFusion:
 
 @pytest.mark.internal
 class TestCanonicalShardedStateDict:
-    """Tests for `HybridStack.sharded_state_dict`'s canonical-unfused rewrite.
+    """Tests for `canonicalize_hybrid_sharded_state_dict`.
 
-    `HybridStack` emits checkpoint keys as if the pattern had no fusion
-    brackets: a fused `[XY]` block is split into two sub-layer-indexed
-    prefixes that match what stand-alone `X` and `Y` blocks would produce.
-    This makes checkpoints structurally equivalent across fusion placements,
-    so an unfused save can be loaded into a fused model (and vice versa) –
+    The helper rewrites checkpoint keys so a fused `[XY]` block looks
+    exactly as a stand-alone `X` followed by stand-alone `Y` would. This
+    makes checkpoints structurally equivalent across fusion placements,
+    so an unfused save can be loaded into a fused model (and vice versa) –
     the dist_checkpointing layer never sees the difference.
 
-    Tests are hermetic: they build a stripped-down `HybridStack` via
-    `object.__new__`, feed it fake layer modules whose `sharded_state_dict`
-    methods return bare `ShardedObject`s (no CUDA, no process group, no
-    `nn.Module` init), and inspect the resulting key set.
+    Tests are hermetic: they construct a sharded state dict from fake
+    layers whose `sharded_state_dict` methods return bare `ShardedObject`s
+    (no CUDA, no process group, no `nn.Module` init), then inspect the key
+    set after canonicalization.
     """
 
     def _make_sharded_object(self, key):
@@ -502,24 +501,34 @@ class TestCanonicalShardedStateDict:
         return FakeLayer()
 
     def _make_stub_stack(self, layer_type_list, layers, sub_layer_offset=0):
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
-
-        stub = object.__new__(HybridStack)
-        stub.layer_type_list = layer_type_list
-        stub.layers = layers
-        stub.sub_layer_offset = sub_layer_offset
-        stub.tp_group = None
-        # `sharded_state_dict` iterates `named_children()` to fold in modules
-        # other than `self.layers`. Returning only `layers` here ensures the
-        # "other modules" branch is a no-op (the `if not module is self.layers`
-        # check filters it out) – which is what we want for a hermetic test.
-        stub.named_children = lambda: [("layers", layers)]
-        return stub
+        # The canonicalization is a free function; the "stack" here is just
+        # a parameter bag tying the inputs together.
+        return {
+            "layer_type_list": layer_type_list,
+            "layers": layers,
+            "sub_layer_offset": sub_layer_offset,
+        }
 
     def _run(self, stub):
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
+        from megatron.core.models.hybrid.hybrid_layer_fusion import (
+            canonicalize_hybrid_sharded_state_dict,
+        )
 
-        return HybridStack.sharded_state_dict(stub)
+        # Reproduce the input the canonicalization sees in real runs:
+        # `HybridStack.sharded_state_dict` outputs each layer's keys at
+        # `layers.{global_physical_idx}.*`. For a single, non-pipeline-parallel
+        # segment that index equals the local module-list index, which is
+        # what the fake layers below produce.
+        state_dict = {}
+        for local_idx, layer in enumerate(stub["layers"]):
+            state_dict.update(layer.sharded_state_dict(f"layers.{local_idx}.", [], None))
+        canonicalize_hybrid_sharded_state_dict(
+            state_dict,
+            layer_prefix="layers.",
+            layer_type_list=stub["layer_type_list"],
+            sub_layer_offset=stub["sub_layer_offset"],
+        )
+        return state_dict
 
     def _keys(self, sharded_state_dict):
         return {v.key for v in sharded_state_dict.values()}

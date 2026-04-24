@@ -983,6 +983,52 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
     torch.save(dataloader_save_dict, data_state_save_path)
 
 
+def _apply_hybrid_canonicalization_if_applicable(model, model_sd):
+    """Rewrite HybridModel decoder keys into the fusion-independent layout.
+
+    A `HybridModel` whose `--hybrid-layer-pattern` contains fused groups
+    (e.g. `[*-]M[*-]M`) builds each fused group as a single
+    `TransformerLayer` in the decoder's `nn.ModuleList`. Its
+    `sharded_state_dict` therefore emits keys indexed by physical block
+    position and uses the `TransformerLayer` slot names
+    (`self_attention`, `mlp`). For the checkpoint on disk to be
+    fusion-independent – so a checkpoint saved under one fusion placement
+    can be loaded under another – those keys need to be rewritten into the
+    layout a stand-alone unfused pattern would produce (sub-layer
+    indexing, `mixer.*` for mamba sub-layers, etc.). That rewrite is a
+    serialization concern only: it happens here, at the boundary between
+    the in-memory model state and the on-disk checkpoint, and does not
+    leak into model construction or forward.
+
+    No-op when `model` is not a `HybridModel` (or does not expose the
+    introspection attributes we need).
+    """
+    from megatron.core.models.hybrid.hybrid_layer_fusion import (
+        canonicalize_hybrid_sharded_state_dict,
+    )
+
+    unwrapped = unwrap_model(model)
+    # Duck-type on the HybridModel attributes we need; avoids importing
+    # HybridModel here (and therefore avoids the heavy downstream imports
+    # its module triggers). HybridModel populates these in `__init__`, so
+    # their presence is a reliable signal.
+    decoder = getattr(unwrapped, 'decoder', None)
+    if decoder is None or not hasattr(decoder, 'layer_type_list'):
+        return
+    if not hasattr(unwrapped, '_decoder_sub_layer_offset'):
+        return
+    if not hasattr(unwrapped, '_decoder_physical_offset'):
+        return
+
+    canonicalize_hybrid_sharded_state_dict(
+        model_sd,
+        layer_prefix='decoder.layers.',
+        layer_type_list=decoder.layer_type_list,
+        physical_offset=unwrapped._decoder_physical_offset,
+        sub_layer_offset=unwrapped._decoder_sub_layer_offset,
+    )
+
+
 def generate_state_dict(
     args,
     model,
@@ -1016,6 +1062,17 @@ def generate_state_dict(
                     }
                 })
             )
+            # HybridModel with fused layer patterns emits decoder keys indexed
+            # by physical block position and with fused-TransformerLayer slot
+            # names (`self_attention`, `mlp`). Apply the fusion-independent
+            # canonicalization right here, at the serialization boundary, so
+            # that (a) the transformation is visible only in the state dict
+            # that flows into save/load and (b) the model itself stays
+            # unaware of checkpoint-specific key conventions. Runs on both
+            # the save path (via save_checkpoint) and the load path
+            # (via load_checkpoint, which also routes through generate_state_dict
+            # to build the expected state dict shape).
+            _apply_hybrid_canonicalization_if_applicable(model[i], model_sd)
         else:   # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
 

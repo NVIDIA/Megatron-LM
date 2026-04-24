@@ -194,12 +194,16 @@ class HybridModel(LanguageModule):
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
         )
-        # Sub-layer offset mirrors `layer_offset` but counts each character in a
-        # fused `[XY]` group separately. `HybridStack` uses it to emit
-        # sharded-state-dict keys in the canonical (unfused) layout so
-        # checkpoints saved under one fusion configuration load cleanly under
-        # another.
-        sub_layer_offset = get_sub_layer_offset(main_pattern, layer_offset)
+        # Read at checkpoint save/load time by
+        # `megatron.training.checkpointing._apply_hybrid_canonicalization_if_applicable`,
+        # which rewrites the decoder's sharded keys into a fusion-independent
+        # layout so checkpoints saved under one fusion configuration load
+        # cleanly under another. `_decoder_physical_offset` mirrors `layer_offset`
+        # (physical-block index where this pipeline segment starts);
+        # `_decoder_sub_layer_offset` is its sub-layer counterpart, counting
+        # each character of a fused `[XY]` group separately.
+        self._decoder_physical_offset = layer_offset
+        self._decoder_sub_layer_offset = get_sub_layer_offset(main_pattern, layer_offset)
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -263,7 +267,6 @@ class HybridModel(LanguageModule):
             pre_process=self.pre_process,
             layer_type_list=layer_type_list,
             pp_layer_offset=layer_offset,
-            sub_layer_offset=sub_layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
