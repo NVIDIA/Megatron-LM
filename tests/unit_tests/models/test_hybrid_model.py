@@ -732,6 +732,249 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
             self._build_model(spec=spec)
 
 
+class TestMLADownProjFusion:
+    """Tests `HybridStack._maybe_fuse_mla_down_proj`.
+
+    The method rewrites the MLA `ModuleSpec` in place on a deep-copied
+    `HybridStackSubmodules` when `config.mla_down_proj_fusion=True`, swapping
+    the self-attention module to `FusedMLASelfAttention` and collapsing the
+    separate q/kv down projections into a single fused `linear_qkv_down_proj`
+    that also absorbs the input layernorm.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _fresh_submodules(self):
+        """Return a deep copy of `hybrid_stack_spec.submodules` so tests don't
+        share state through `hybrid_stack_spec`.
+        """
+        import copy
+
+        return copy.deepcopy(hybrid_stack_spec.submodules)
+
+    def _call_fuse(self, submodules, *, mla_down_proj_fusion):
+        """Invoke `_maybe_fuse_mla_down_proj` as an unbound method with a
+        minimal stub for `self`. The method only reads `self.config`, so we
+        can avoid constructing a full `HybridStack`.
+        """
+        import types
+
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        stub = types.SimpleNamespace(
+            config=types.SimpleNamespace(mla_down_proj_fusion=mla_down_proj_fusion)
+        )
+        return HybridStack._maybe_fuse_mla_down_proj(stub, submodules)
+
+    def _build_model(self, pattern="M+-", **config_overrides):
+        config_kwargs = dict(
+            num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        config_kwargs.update(config_overrides)
+        config = MLATransformerConfig(**config_kwargs)
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern=pattern,
+        )
+
+    def _get_layer_with_mla(self, model):
+        """Return the layer whose self-attention is an `MLASelfAttention`
+        (which includes its `FusedMLASelfAttention` subclass).
+        """
+        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+        for layer in model.decoder.layers:
+            if hasattr(layer, 'self_attention') and isinstance(
+                layer.self_attention, MLASelfAttention
+            ):
+                return layer
+        return None
+
+    def test_disabled_returns_spec_unchanged(self):
+        """Flag off: method returns the same object, no copying or rewriting."""
+        submodules = self._fresh_submodules()
+        result = self._call_fuse(submodules, mla_down_proj_fusion=False)
+        assert result is submodules
+
+    def test_missing_attr_treated_as_disabled(self):
+        """When the config lacks the attribute, `getattr(..., False)` disables fusion."""
+        import types
+
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        submodules = self._fresh_submodules()
+        stub = types.SimpleNamespace(config=types.SimpleNamespace())
+        result = HybridStack._maybe_fuse_mla_down_proj(stub, submodules)
+        assert result is submodules
+
+    def test_enabled_rewrites_mla_spec(self):
+        """Flag on: MLA spec is swapped to the fused module and fused linear."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+        from megatron.core.transformer.identity_op import IdentityOp
+        from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
+
+        submodules = self._fresh_submodules()
+        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
+
+        mla_spec = result.mla_layer
+        assert mla_spec.submodules.input_layernorm is IdentityOp
+        assert mla_spec.submodules.self_attention.module is FusedMLASelfAttention
+
+        attn_submodules = mla_spec.submodules.self_attention.submodules
+        assert attn_submodules.linear_qkv_down_proj is TELayerNormColumnParallelLinear
+        assert attn_submodules.linear_q_down_proj is None
+        assert attn_submodules.linear_kv_down_proj is None
+
+    def test_enabled_sets_sharded_state_dict_keys_map(self):
+        """The keys map is written on the MLA layer submodules for checkpoint
+        compatibility with pre-fusion checkpoints.
+        """
+        submodules = self._fresh_submodules()
+        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
+
+        keys_map = result.mla_layer.submodules.sharded_state_dict_keys_map
+        assert keys_map == {
+            "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+        }
+
+    def test_enabled_deep_copies_input_submodules(self):
+        """The caller's submodules object must not be mutated – the method
+        deep-copies before rewriting, so callers can safely reuse their spec.
+        """
+        from megatron.core.transformer.multi_latent_attention import (
+            FusedMLASelfAttention,
+            MLASelfAttention,
+        )
+
+        submodules = self._fresh_submodules()
+        original_mla_module = submodules.mla_layer.submodules.self_attention.module
+        original_q_down_proj = (
+            submodules.mla_layer.submodules.self_attention.submodules.linear_q_down_proj
+        )
+        assert original_mla_module is MLASelfAttention  # sanity check of baseline
+
+        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
+
+        # Original is unchanged.
+        assert submodules.mla_layer.submodules.self_attention.module is original_mla_module
+        assert (
+            submodules.mla_layer.submodules.self_attention.submodules.linear_q_down_proj
+            is original_q_down_proj
+        )
+        # And result is a different object than the input.
+        assert result is not submodules
+        assert result.mla_layer is not submodules.mla_layer
+        # Plus the fused module only shows up on the returned copy.
+        assert result.mla_layer.submodules.self_attention.module is FusedMLASelfAttention
+
+    def test_enabled_leaves_dsa_layer_alone(self):
+        """DSA layer spec shares the MLA self-attention class, but fusion
+        should only rewrite `mla_layer` — not `dsa_layer`.
+        """
+        from megatron.core.transformer.multi_latent_attention import (
+            FusedMLASelfAttention,
+            MLASelfAttention,
+        )
+
+        submodules = self._fresh_submodules()
+        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
+
+        assert result.dsa_layer.submodules.self_attention.module is MLASelfAttention
+        assert result.dsa_layer.submodules.self_attention.module is not FusedMLASelfAttention
+        # DSA's down projections must remain non-`None` (they're still used
+        # via the unfused path).
+        assert result.dsa_layer.submodules.self_attention.submodules.linear_q_down_proj is not None
+        assert result.dsa_layer.submodules.self_attention.submodules.linear_kv_down_proj is not None
+
+    def test_enabled_leaves_non_mla_layers_alone(self):
+        """Unrelated layer specs (mamba, attention, mlp) must survive unchanged."""
+        submodules = self._fresh_submodules()
+        original_mamba = submodules.mamba_layer
+        original_attention = submodules.attention_layer
+        original_mlp = submodules.mlp_layer
+
+        result = self._call_fuse(submodules, mla_down_proj_fusion=True)
+
+        # Equality via deep-copy means the returned specs compare as equal to
+        # the originals (dataclass equality) even though they are fresh
+        # objects.
+        assert result.mamba_layer == original_mamba
+        assert result.attention_layer == original_attention
+        assert result.mlp_layer == original_mlp
+
+    def test_model_uses_fused_mla_when_enabled(self):
+        """Integration: a full HybridModel built with the flag uses
+        `FusedMLASelfAttention`.
+        """
+        from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
+
+        model = self._build_model(mla_down_proj_fusion=True)
+        layer = self._get_layer_with_mla(model)
+        assert layer is not None
+        assert isinstance(layer.self_attention, FusedMLASelfAttention)
+        # And the fused down projection is present on the attention module.
+        assert hasattr(layer.self_attention, "linear_qkv_down_proj")
+
+    def test_model_uses_unfused_mla_when_disabled(self):
+        """Integration: with the flag off, MLA layers use the standard
+        `MLASelfAttention` (never the fused subclass).
+        """
+        from megatron.core.transformer.multi_latent_attention import (
+            FusedMLASelfAttention,
+            MLASelfAttention,
+        )
+
+        model = self._build_model(mla_down_proj_fusion=False)
+        layer = self._get_layer_with_mla(model)
+        assert layer is not None
+        assert isinstance(layer.self_attention, MLASelfAttention)
+        assert not isinstance(layer.self_attention, FusedMLASelfAttention)
+
+    def test_enabled_replaces_input_layernorm_with_identity(self):
+        """Integration: because the fused down-proj absorbs the input
+        layernorm, the transformer layer's own `input_layernorm` must be
+        `IdentityOp`.
+        """
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        model = self._build_model(mla_down_proj_fusion=True)
+        layer = self._get_layer_with_mla(model)
+        assert layer is not None
+        assert isinstance(layer.input_layernorm, IdentityOp)
+
+    def test_forward_with_fused_mla(self):
+        """Integration: forward pass works with `mla_down_proj_fusion=True`."""
+        model = self._build_model(mla_down_proj_fusion=True)
+        model.cuda()
+
+        sequence_length = 4
+        micro_batch_size = 2
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == 100
+
+
 class TestHybridWithDynamicInference:
     """Tests HybridModel with dynamic inference."""
 
