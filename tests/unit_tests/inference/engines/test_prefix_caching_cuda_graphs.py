@@ -41,7 +41,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -72,6 +72,7 @@ class TestPrefixCachingCudaGraphs:
         )
 
     def teardown_method(self, method):
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
     def _create_model(self, model_type, num_cuda_graphs=None):
@@ -138,17 +139,6 @@ class TestPrefixCachingCudaGraphs:
         model.eval()
         return model, mamba_config
 
-    def _reset_cuda_graph_state(self, model):
-        """Reset all CUDA graph global and per-module state."""
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
-        CudaGraphManager.global_mempool = None
-        for module in model.modules():
-            if isinstance(module, CudaGraphManager):
-                module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
-
     def _build_engine(self, model, mamba_config, num_cuda_graphs):
         """Build an engine with prefix caching and optional CUDA graphs."""
         set_rounder(4)
@@ -180,7 +170,7 @@ class TestPrefixCachingCudaGraphs:
                 vocab_size=VOCAB_SIZE, detokenize=lambda tokens: "tokenized_prompt"
             ),
         )
-        self._reset_cuda_graph_state(model)
+        delete_cuda_graphs()
         return DynamicInferenceEngine(controller, context)
 
     def _create_prompts(self):
@@ -320,8 +310,12 @@ class TestHybridChunkedPrefillIntermediateState:
     def setup_class(cls):
         Utils.initialize_model_parallel()
 
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+
     @classmethod
     def teardown_class(cls):
+        delete_cuda_graphs()
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -357,17 +351,6 @@ class TestHybridChunkedPrefillIntermediateState:
             param.data = param.data.to(config.params_dtype)
         model.eval()
         return model
-
-    def _reset_cuda_graph_state(self, model):
-        """Reset all CUDA graph global and per-module state."""
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
-        CudaGraphManager.global_mempool = None
-        for module in model.modules():
-            if isinstance(module, CudaGraphManager):
-                module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
 
     def _build_engine(
         self,
@@ -413,7 +396,7 @@ class TestHybridChunkedPrefillIntermediateState:
                 vocab_size=VOCAB_SIZE, detokenize=lambda tokens: "tokenized_prompt"
             ),
         )
-        self._reset_cuda_graph_state(model)
+        delete_cuda_graphs()
         return DynamicInferenceEngine(controller, context)
 
     def _make_request(self, req_id, prompt, enable_pc):
