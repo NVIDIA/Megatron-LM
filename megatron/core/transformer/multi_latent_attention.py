@@ -65,6 +65,7 @@ if HAVE_TE:
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
+        TENorm,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
     )
@@ -74,10 +75,11 @@ else:
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
+        TENorm,
         Linear,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
-    ) = (None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None)
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
@@ -495,10 +497,14 @@ class MLASelfAttention(MultiLatentAttention):
 
         self._validate_qk_norm_spec(submodules)
 
+        # Resolve which linear class to use for Q and KV up projections,
+        # based on QK-norm selection.
+        norm_cls = self._resolve_qk_norm_config(submodules)
+
         if self.config.q_lora_rank is None:
             # Not projecting query
             self.linear_q_proj = build_module(
-                submodules.linear_q_proj,
+                norm_cls["linear_q_proj"],
                 self.config.hidden_size,
                 self.config.num_attention_heads * self.q_head_dim,
                 config=self.config,
@@ -543,7 +549,7 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
             self.linear_q_up_proj = build_module(
-                submodules.linear_q_up_proj,
+                norm_cls["linear_q_up_proj"],
                 self.config.q_lora_rank,
                 self.config.num_attention_heads * self.q_head_dim,
                 config=self.config,
@@ -588,7 +594,7 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         self.linear_kv_up_proj = build_module(
-            submodules.linear_kv_up_proj,
+            norm_cls["linear_kv_up_proj"],
             self.config.kv_lora_rank,
             self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
             config=self.config,
@@ -602,13 +608,13 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.config.q_lora_rank is not None:
-            self.q_layernorm = submodules.q_layernorm(
+            self.q_layernorm = norm_cls["q_layernorm"](
                 hidden_size=self.config.q_lora_rank,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.kv_layernorm = submodules.kv_layernorm(
+        self.kv_layernorm = norm_cls["kv_layernorm"](
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
@@ -667,6 +673,190 @@ class MLASelfAttention(MultiLatentAttention):
                 f"fused norm+linear; either unset `kv_layernorm` or use a "
                 f"linear layer without norm fusion for `linear_kv_up_proj`"
             )
+
+    def _resolve_qk_norm_config(
+        self, submodules
+    ) -> dict[str, ModuleSpec | type | LayerNormBuilder]:
+        # Resolve which linear class to use for Q and KV up projections,
+        # based on QK-norm selection. We can use a fused implementation
+        # for MLA, but not DSA. (see
+        # https://github.com/NVIDIA/Megatron-LM/pull/3026)
+        # Config selects the default class; spec overrides if set.
+        # TODO(yuzhongw, janpabloe): Support local backend.
+        if self.config.experimental_attention_variant == "dsa":
+            cls_dict = self._resolve_dsa_qk_norm_config(submodules)
+        else:
+            cls_dict = self._resolve_mla_qk_norm_config(submodules)
+        return cls_dict
+
+    def _resolve_dsa_qk_norm_config(
+        self, submodules
+    ) -> dict[str, ModuleSpec | type | LayerNormBuilder]:
+        if self.config.qk_l2_norm:
+            raise ValueError("qk_l2_norm is not supported with DSA.")
+        elif self.config.qk_layernorm:
+            # Always have to use non-fused linear layers and set
+            # Q/KV layernorms individually for DSA.
+            q_norm_cls = submodules.q_layernorm or TENorm
+            if self.config.q_lora_rank is not None:
+                linear_q_up_proj_cls = submodules.linear_q_up_proj or TEColumnParallelLinear
+
+                if linear_q_up_proj_cls is None:
+                    raise ValueError(
+                        "qk_layernorm requires TransformerEngine or "
+                        "q_layernorm/kv_layernorm to be set in the spec."
+                    )
+                elif linear_q_up_proj_cls is not TEColumnParallelLinear:
+                    raise RuntimeError(
+                        f"`linear_q_up_proj={submodules.linear_q_up_proj}` is "
+                        f"fused norm+linear, but this is not supported for DSA."
+                    )
+            else:
+                linear_q_proj_cls = submodules.linear_q_proj or TEColumnParallelLinear
+                if linear_q_proj_cls is None:
+                    raise ValueError(
+                        "qk_layernorm requires TransformerEngine or "
+                        "q_layernorm/kv_layernorm to be set in the spec."
+                    )
+                elif linear_q_proj_cls is not TEColumnParallelLinear:
+                    raise RuntimeError(
+                        f"`linear_q_proj={submodules.linear_q_proj}` is "
+                        f"fused norm+linear, but this is not supported for DSA."
+                    )
+
+            kv_norm_cls = submodules.kv_layernorm or TENorm
+            linear_kv_up_proj_cls = submodules.linear_kv_up_proj or TEColumnParallelLinear
+
+            if linear_kv_up_proj_cls is None:
+                raise ValueError(
+                    "qk_layernorm requires TransformerEngine or "
+                    "q_layernorm/kv_layernorm to be set in the spec."
+                )
+        else:
+            if self.config.q_lora_rank is not None:
+                if (
+                    submodules.linear_q_up_proj is TELayerNormColumnParallelLinear
+                    or submodules.q_layernorm not in (None, IdentityOp)
+                ):
+                    raise ValueError(
+                        f"spec sets linear_q_up_proj={submodules.linear_q_up_proj} and "
+                        f"q_layernorm={submodules.q_layernorm}, but "
+                        "qk_layernorm/qk_l2_norm are supposed to be disabled"
+                    )
+                linear_q_up_proj_cls = TEColumnParallelLinear
+            else:
+                if submodules.linear_q_proj is TELayerNormColumnParallelLinear:
+                    raise ValueError(
+                        f"spec sets linear_q_up_proj={submodules.linear_q_proj}, but "
+                        "qk_layernorm/qk_l2_norm are supposed to be disabled"
+                    )
+                linear_q_proj_cls = TEColumnParallelLinear
+            if (
+                submodules.linear_kv_up_proj is TELayerNormColumnParallelLinear
+                or submodules.kv_layernorm not in (None, IdentityOp)
+            ):
+                raise ValueError(
+                    f"spec sets linear_kv_up_proj={submodules.linear_kv_up_proj} and "
+                    f"kv_layernorm={submodules.kv_layernorm}, but "
+                    "qk_layernorm/qk_l2_norm are supposed to be disabled"
+                )
+            linear_kv_up_proj_cls = TEColumnParallelLinear
+            q_norm_cls = kv_norm_cls = IdentityOp
+        return dict(
+            linear_q_proj=linear_q_proj_cls,
+            linear_q_up_proj=linear_q_up_proj_cls,
+            linear_kv_up_proj=linear_kv_up_proj_cls,
+            q_layernorm=q_norm_cls,
+            kv_layernorm=kv_norm_cls,
+        )
+
+    def _resolve_mla_qk_norm_config(
+        self, submodules
+    ) -> dict[str, ModuleSpec | type | LayerNormBuilder]:
+        linear_q_proj_cls = linear_q_up_proj_cls = None
+        if self.config.qk_l2_norm:
+            raise ValueError("qk_l2_norm is not supported with MLA.")
+        elif self.config.qk_layernorm:
+            # Apply the fused optimization automatically, but only
+            # if the spec is either (a) a TENorm layer, which we
+            # assume to have fusion support for in
+            # TransformerEngine, or (b) unset (the default).
+            q_norm_cls = submodules.q_layernorm or TENorm
+            if self.config.q_lora_rank is not None:
+                if q_norm_cls in (TENorm, None, IdentityOp):
+                    linear_q_up_proj_cls = TELayerNormColumnParallelLinear
+                else:
+                    linear_q_up_proj_cls = TEColumnParallelLinear
+                linear_q_up_proj_cls = submodules.linear_q_up_proj or linear_q_up_proj_cls
+
+                if linear_q_up_proj_cls is None:
+                    raise ValueError(
+                        "qk_layernorm requires TransformerEngine or "
+                        "q_layernorm/kv_layernorm to be set in the spec."
+                    )
+                # Unset Q layernorm if we include it in the fused linear.
+                if linear_q_up_proj_cls is TELayerNormColumnParallelLinear:
+                    q_norm_cls = IdentityOp
+            else:
+                linear_q_proj_cls = submodules.linear_q_proj or TELayerNormColumnParallelLinear
+                if linear_q_proj_cls is None:
+                    raise ValueError(
+                        "qk_layernorm requires TransformerEngine or "
+                        "q_layernorm/kv_layernorm to be set in the spec."
+                    )
+
+            kv_norm_cls = submodules.kv_layernorm or TENorm
+            if kv_norm_cls in (TENorm, None, IdentityOp):
+                linear_kv_up_proj_cls = TELayerNormColumnParallelLinear
+            else:
+                linear_kv_up_proj_cls = TEColumnParallelLinear
+            linear_kv_up_proj_cls = submodules.linear_kv_up_proj or linear_kv_up_proj_cls
+
+            if linear_kv_up_proj_cls is None:
+                raise ValueError(
+                    "qk_layernorm requires TransformerEngine or "
+                    "q_layernorm/kv_layernorm to be set in the spec."
+                )
+            # Unset KV layernorm if we include it in the fused linear.
+            if linear_kv_up_proj_cls is TELayerNormColumnParallelLinear:
+                kv_norm_cls = IdentityOp
+        else:
+            if self.config.q_lora_rank is not None:
+                if (
+                    submodules.linear_q_up_proj is TELayerNormColumnParallelLinear
+                    or submodules.q_layernorm not in (None, IdentityOp)
+                ):
+                    raise ValueError(
+                        f"spec sets linear_q_up_proj={submodules.linear_q_up_proj} and "
+                        f"q_layernorm={submodules.q_layernorm}, but "
+                        "qk_layernorm/qk_l2_norm are supposed to be disabled"
+                    )
+                linear_q_up_proj_cls = TEColumnParallelLinear
+            else:
+                if submodules.linear_q_proj is TELayerNormColumnParallelLinear:
+                    raise ValueError(
+                        f"spec sets linear_q_up_proj={submodules.linear_q_proj}, but "
+                        "qk_layernorm/qk_l2_norm are supposed to be disabled"
+                    )
+                linear_q_proj_cls = TEColumnParallelLinear
+            if (
+                submodules.linear_kv_up_proj is TELayerNormColumnParallelLinear
+                or submodules.kv_layernorm not in (None, IdentityOp)
+            ):
+                raise ValueError(
+                    f"spec sets linear_kv_up_proj={submodules.linear_kv_up_proj} and "
+                    f"kv_layernorm={submodules.kv_layernorm}, but "
+                    "qk_layernorm/qk_l2_norm are supposed to be disabled"
+                )
+            linear_kv_up_proj_cls = TEColumnParallelLinear
+            q_norm_cls = kv_norm_cls = IdentityOp
+        return dict(
+            linear_q_proj=linear_q_proj_cls,
+            linear_q_up_proj=linear_q_up_proj_cls,
+            linear_kv_up_proj=linear_kv_up_proj_cls,
+            q_layernorm=q_norm_cls,
+            kv_layernorm=kv_norm_cls,
+        )
 
     def _qkv_down_projection(self, hidden_states):
         """Unfused q/kv down projection path."""
@@ -1291,6 +1481,10 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
         self._validate_qk_norm_spec(submodules)
 
+        # Resolve which linear class to use for Q and KV up projections,
+        # based on QK-norm selection.
+        norm_cls = self._resolve_qk_norm_config(submodules)
+
         qkv_down_proj_kwargs = {}
         if submodules.linear_qkv_down_proj in [TELinear]:
             qkv_down_proj_kwargs['parallel_mode'] = 'duplicated'
@@ -1324,7 +1518,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
 
         self.linear_q_up_proj = build_module(
-            submodules.linear_q_up_proj,
+            norm_cls["linear_q_up_proj"],
             self.config.q_lora_rank,
             self.config.num_attention_heads * self.q_head_dim,
             config=self.config,
@@ -1338,7 +1532,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
 
         self.linear_kv_up_proj = build_module(
-            submodules.linear_kv_up_proj,
+            norm_cls["linear_kv_up_proj"],
             self.config.kv_lora_rank,
             self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
             config=self.config,
@@ -1351,12 +1545,12 @@ class FusedMLASelfAttention(MLASelfAttention):
             tp_group=pg_collection.tp,
         )
 
-        self.q_layernorm = submodules.q_layernorm(
+        self.q_layernorm = norm_cls["q_layernorm"](
             hidden_size=self.config.q_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
-        self.kv_layernorm = submodules.kv_layernorm(
+        self.kv_layernorm = norm_cls["kv_layernorm"](
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
