@@ -10,6 +10,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -73,7 +74,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
             output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope,none], optional):  Position
+        position_embedding_type (Literal[learned_absolute,rope,yarn,none], optional):  Position
             embedding type. Defaults to 'none'.
         rotary_percent (float, optional): Percent of rotary dimension to use for rotary position
             embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
@@ -102,7 +103,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         # Mamba with no attention has no need for position embeddings, so none is default
-        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'none',
+        position_embedding_type: Literal['learned_absolute', 'rope', 'yarn', 'none'] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
@@ -230,7 +231,26 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-
+        elif self.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                original_max_position_embeddings=getattr(
+                    self.config, "yarn_original_max_position_embeddings"
+                ),
+                beta_fast=getattr(self.config, "yarn_beta_fast"),
+                beta_slow=getattr(self.config, "yarn_beta_slow"),
+                mscale=getattr(self.config, "yarn_mscale"),
+                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                correction_range_round_to_int=getattr(
+                    self.config, "yarn_correction_range_round_to_int"
+                ),
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -414,6 +434,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
+        elif self.position_embedding_type == 'yarn':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+            )
+            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
+            rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
             )
