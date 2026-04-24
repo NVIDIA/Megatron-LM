@@ -583,9 +583,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.model_parallel_subscriber_socket.connect(mp_req_addr)
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        self.zmq_sockets += [
-            self.model_parallel_subscriber_socket,
-        ]
+        self.zmq_sockets += [self.model_parallel_subscriber_socket]
 
         torch.distributed.barrier(mp_group)
 
@@ -2276,13 +2274,16 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.waiting_request_ids
                     )
                     global_work_from_last_consensus, _ = self._last_ep_consensus
-                    if global_work_from_last_consensus == 0 or self._ep_consensus_loop_counter % 20 == 0:
-                        # selectively enter ep_establish_consensus if 
-                        # 1. there is no global work -> engine is idle. At any step in the future 
+                    if (
+                        global_work_from_last_consensus == 0
+                        or self._ep_consensus_loop_counter % 20 == 0
+                    ):
+                        # selectively enter ep_establish_consensus if
+                        # 1. there is no global work -> engine is idle. At any step in the future
                         #    one of the ranks can receive work. So we should be eagerly checking for that
-                        # 2. it has been 100 steps since we last established consensus, and that consensus
-                        #    had some work. 
-                        # In the worst case, this delays pausing by 20 steps which is around 
+                        # 2. it has been 20 steps since we last established consensus, and that consensus
+                        #    had some work.
+                        # In the worst case, this delays pausing by 20 steps which is around
                         # 200-400 milliseconds.
                         self._last_ep_consensus = await self._ep_establish_consensus(
                             local_pending, signal_consensus=(self.state == EngineState.PAUSING)
