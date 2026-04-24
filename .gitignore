@@ -13,6 +13,7 @@ wandb/
 onelogger.log
 onelogger.err
 .venv
+cp-moe/
 runs/
 /test_cases/
 **/dist/

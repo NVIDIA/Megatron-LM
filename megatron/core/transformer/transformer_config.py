@@ -723,6 +723,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_cp_price_update_frequency: int = 1
     """Update expert prices every N routing steps."""
 
+    moe_cp_routing_offset: bool = True
+    """Apply expert price offset during dispatch (logits - prices)."""
+
     moe_cp_log_interval: int = 100
     """Logging interval for CP-MoE price logging when enabled."""
 

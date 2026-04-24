@@ -486,14 +486,17 @@ class CapacityPricedRouter(Router):
             self.expert_prices.data = self.expert_prices.data.to(torch.float32)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
-        """Route with argmax(logits - expert_prices) using top-1 dispatch."""
+        """Route with argmax(logits - expert_prices) or argmax(logits) for top-1 dispatch."""
         logits = logits.view(-1, self.config.num_moe_experts)
 
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
 
-        effective_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
-        top1_indices = torch.argmax(effective_logits, dim=-1, keepdim=True)
+        if self.config.moe_cp_routing_offset:
+            dispatch_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+        else:
+            dispatch_logits = logits
+        top1_indices = torch.argmax(dispatch_logits, dim=-1, keepdim=True)
 
         if self.config.moe_router_score_function == "sigmoid":
             scores = torch.sigmoid(logits.float()).type_as(logits)
@@ -584,7 +587,10 @@ class CapacityPricedRouter(Router):
             padding_mask = padding_mask.reshape(-1)
 
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
-        effective_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+        if self.config.moe_cp_routing_offset:
+            aux_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+        else:
+            aux_logits = logits
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
         probs, routing_map = self._apply_routing_regularization(
@@ -594,7 +600,7 @@ class CapacityPricedRouter(Router):
             padding_mask,
             seq_length,
             bsz,
-            aux_logits=effective_logits,
+            aux_logits=aux_logits,
         )
         return probs, routing_map
 

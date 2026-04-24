@@ -1711,6 +1711,13 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
 
     kw_args['moe_latent_size'] = args.moe_latent_size
+    kw_args['moe_capacity_priced_routing'] = args.moe_capacity_priced_routing
+    kw_args['moe_cp_price_learning_rate'] = args.moe_cp_price_learning_rate
+    kw_args['moe_cp_slack_capacity'] = args.moe_cp_slack_capacity
+    kw_args['moe_cp_expert_capacity'] = args.moe_cp_expert_capacity
+    kw_args['moe_cp_price_update_frequency'] = args.moe_cp_price_update_frequency
+    kw_args['moe_cp_routing_offset'] = args.moe_cp_routing_offset
+    kw_args['moe_cp_log_interval'] = args.moe_cp_log_interval
 
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
@@ -3099,6 +3106,23 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--moe-capacity-priced-routing', action='store_true', default=False,
+                       help='Enable capacity-priced routing for MoE (top-1 only).')
+    group.add_argument('--moe-cp-price-learning-rate', type=float, default=0.01,
+                       help='Tatonnement step size for updating expert prices.')
+    group.add_argument('--moe-cp-slack-capacity', type=float, default=0.9,
+                       help='Target expert utilization factor in [0, 1].')
+    group.add_argument('--moe-cp-expert-capacity', type=int, default=None,
+                       help='Per-expert target capacity. If None, uses tokens_per_batch/num_experts.')
+    group.add_argument('--moe-cp-price-update-frequency', type=int, default=1,
+                       help='Update expert prices every N routing steps.')
+    group.add_argument('--moe-cp-routing-offset', action='store_true', default=True,
+                       help='Apply expert price offset at dispatch time (Ablation D).')
+    group.add_argument('--no-moe-cp-routing-offset', action='store_false',
+                       dest='moe_cp_routing_offset',
+                       help='Disable routing offset and dispatch with raw logits (Ablation C).')
+    group.add_argument('--moe-cp-log-interval', type=int, default=100,
+                       help='Logging interval for CP-MoE diagnostics.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 
