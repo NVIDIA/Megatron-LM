@@ -35,6 +35,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -642,3 +643,51 @@ class TestDSAMoEGPTMambaEquivalence:
 
         # Verify HybridModel matches golden values
         _compare_against_golden_values(mamba_logprobs, gpt_logprobs, abs_tol=1e-3)
+
+# ---------------------------------------------------------------------------
+# mHC HybridModel smoke tests for DeepSeek proxy patterns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestDSAHybridMHCProxy:
+    """Smoke-test mHC on DeepSeek-style HybridModel patterns.
+
+    These do not assert GPT/Hybrid numerical equivalence because the current
+    HybridModel implementation wraps each split hybrid layer at the boundary,
+    whereas GPT mHC has separate attention and MLP hyper-connections inside a
+    TransformerLayer.
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _enable_mhc(self, config: MLATransformerConfig) -> MLATransformerConfig:
+        config.enable_hyper_connections = True
+        config.num_residual_streams = 4
+        config.mhc_sinkhorn_iterations = 5
+        config.mhc_init_gating_factor = 0.01
+        config.hidden_dropout = 0.0
+        return config
+
+    def _assert_mhc_model_forward(self, config: MLATransformerConfig, pattern: str) -> None:
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(42)
+        model = _build_mamba_model(self._enable_mhc(config), pattern)
+        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in model.decoder.layers)
+
+        torch.manual_seed(99)
+        tokens = torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, _SEQ_LEN), device='cuda')
+        logprobs = _forward_logprobs_pp1(model, tokens)
+        assert logprobs.shape == (_BATCH_SIZE, _SEQ_LEN - 1)
+        assert torch.isfinite(logprobs).all()
+
+    def test_dsa_dense_hybrid_mhc_forward(self) -> None:
+        """DeepSeek-V3.2-style DSA + MLP split pattern runs with mHC."""
+        config = _make_dsa_config(num_layers=_NUM_GPT_LAYERS, tp=1, pp=1)
+        self._assert_mhc_model_forward(config, _MAMBA_PATTERN)
+
+    def test_dsa_moe_hybrid_mhc_forward(self) -> None:
+        """DeepSeek-V3-style DSA + MoE split pattern runs with mHC."""
+        config = _make_dsa_moe_config(num_layers=_NUM_GPT_LAYERS, tp=1, pp=1)
+        self._assert_mhc_model_forward(config, _MOE_MAMBA_PATTERN)
