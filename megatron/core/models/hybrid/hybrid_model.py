@@ -20,7 +20,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -33,8 +34,6 @@ from megatron.core.utils import (
     is_using_quantization_scales,
     log_single_rank,
 )
-from megatron.core.transformer.module import GraphableMegatronModule
-from megatron.core.transformer.enums import CudaGraphScope
 
 logger = logging.getLogger(__name__)
 
@@ -368,10 +367,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self._should_call_local_cudagraph(*args, **kwargs):
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
-    
+
     def create_mcore_cudagraph_manager(self, config):
+        """
+        Create the cudagraph manager for the full iteration inference scope
+        """
         if CudaGraphScope.full_iteration_inference in config.cuda_graph_scope:
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
             self.cudagraph_manager = CudaGraphManager(config)
 
     def forward(
