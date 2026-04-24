@@ -592,6 +592,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # initialize zmq-based EP communicator
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        self._ep_consensus_loop_counter = 0
+        self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
@@ -1794,6 +1796,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.prefix_cache_blocks_matched = 0
 
         # Log KV cache utilization stats to W&B
+        nvtx_range_push("wandb_logging")
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
@@ -1833,13 +1836,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.metrics_writer.log(metrics, commit=True)
             else:
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
+        nvtx_range_pop("wandb_logging")
 
         # Print context state.
+        nvtx_range_push("console_logging")
         if (
             self.logging_step_interval > 0
             and self.context.step_count % self.logging_step_interval == 0
         ):
+            nvtx_range_push("cuda_memory_stats")
             mem = torch.cuda.memory_stats()
+            nvtx_range_pop("cuda_memory_stats")
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
@@ -1905,6 +1912,8 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.context.enable_prefix_caching:
                 self._prefix_cache_hits = 0
                 self._prefix_cache_blocks_matched = 0
+
+        nvtx_range_pop("console_logging")
 
         return {
             "active_request_ids": active_request_ids,
@@ -2266,9 +2275,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    global_work, all_pausing = await self._ep_establish_consensus(
-                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
-                    )
+                    global_work_from_last_consensus, _ = self._last_ep_consensus
+                    if global_work_from_last_consensus == 0 or self._ep_consensus_loop_counter % 20 == 0:
+                        # selectively enter ep_establish_consensus if 
+                        # 1. there is no global work -> engine is idle. At any step in the future 
+                        #    one of the ranks can receive work. So we should be eagerly checking for that
+                        # 2. it has been 100 steps since we last established consensus, and that consensus
+                        #    had some work. 
+                        # In the worst case, this delays pausing by 20 steps which is around 
+                        # 200-400 milliseconds.
+                        self._last_ep_consensus = await self._ep_establish_consensus(
+                            local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                        )
+                    global_work, all_pausing = self._last_ep_consensus
+                    self._ep_consensus_loop_counter += 1
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
@@ -2282,9 +2302,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         else:
                             # Dummy forward to participate in the EP collective.
                             self.step_start_event.record()
+                            nvtx_range_push("EP-dummy-forward")
                             self.controller.dummy_forward()
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
+                            nvtx_range_pop("EP-dummy-forward")
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
                     else:
