@@ -778,7 +778,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         else:
             packed_seq_params = PackedSeqParams.single_sequence(
                 seq_len=tokens.shape[1],
-                device=tokens.device, 
+                device=tokens.device,
             )
 
     nvtx_range = get_nvtx_range()

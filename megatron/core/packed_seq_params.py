@@ -7,7 +7,11 @@ import torch.distributed as dist
 from torch import Tensor
 
 def _normalize_cu_seqlens(
-    cu_seqlens: Tensor, *, allow_dummy_batch_dim: bool, require_nondecreasing: bool
+    cu_seqlens: Tensor,
+    *,
+    allow_dummy_batch_dim: bool,
+    require_nondecreasing: bool,
+    validate: bool,
 ) -> Tensor:
     if not isinstance(cu_seqlens, Tensor):
         raise TypeError("cu_seqlens must be a torch.Tensor")
@@ -24,14 +28,18 @@ def _normalize_cu_seqlens(
     if cu_seqlens.numel() == 0:
         raise ValueError("cu_seqlens must contain at least one cumulative length")
 
+    if cu_seqlens.dtype == torch.bool or cu_seqlens.is_floating_point() or cu_seqlens.is_complex():
+        raise TypeError("cu_seqlens must use an integer dtype")
+
     cu_seqlens = cu_seqlens.to(dtype=torch.int32)
 
-    if cu_seqlens[0].item() != 0:
-        raise ValueError("cu_seqlens must start at 0")
+    if validate:
+        if cu_seqlens[0].item() != 0:
+            raise ValueError("cu_seqlens must start at 0")
 
-    if require_nondecreasing and cu_seqlens.numel() > 1:
-        if torch.any(cu_seqlens[1:] < cu_seqlens[:-1]):
-            raise ValueError("cu_seqlens must be nondecreasing")
+        if require_nondecreasing and cu_seqlens.numel() > 1:
+            if torch.any(cu_seqlens[1:] < cu_seqlens[:-1]).item():
+                raise ValueError("cu_seqlens must be nondecreasing")
 
     return cu_seqlens
 
@@ -101,15 +109,23 @@ class PackedSeqParams:
         local_cp_size: int | None = None,
         cp_group: dist.ProcessGroup | None = None,
         allow_dummy_batch_dim: bool = True,
+        validate: bool = True,
     ) -> "PackedSeqParams":
-        """Construct PackedSeqParams from THD cumulative-length metadata."""
+        """Construct PackedSeqParams from THD cumulative-length metadata.
+
+        Set validate=False when the cumulative-length metadata is already trusted and
+        on-device validation overhead should be avoided.
+        """
         if qkv_format != "thd":
             raise ValueError(
                 f"PackedSeqParams.from_cu_seqlens only supports qkv_format='thd', got {qkv_format!r}"
             )
 
         cu_seqlens_q = _normalize_cu_seqlens(
-            cu_seqlens_q, allow_dummy_batch_dim=allow_dummy_batch_dim, require_nondecreasing=True
+            cu_seqlens_q,
+            allow_dummy_batch_dim=allow_dummy_batch_dim,
+            require_nondecreasing=True,
+            validate=validate,
         )
         kv_defaults_from_q = cu_seqlens_kv is None
         if kv_defaults_from_q:
@@ -119,6 +135,7 @@ class PackedSeqParams:
                 cu_seqlens_kv,
                 allow_dummy_batch_dim=allow_dummy_batch_dim,
                 require_nondecreasing=True,
+                validate=validate,
             )
 
         max_seqlen_q = _normalize_int(max_seqlen_q)
@@ -132,6 +149,7 @@ class PackedSeqParams:
                 cu_seqlens_q_padded,
                 allow_dummy_batch_dim=allow_dummy_batch_dim,
                 require_nondecreasing=False,
+                validate=validate,
             )
             _validate_padded_cu_seqlens_compatibility(cu_seqlens_q, cu_seqlens_q_padded)
 
@@ -142,6 +160,7 @@ class PackedSeqParams:
                 cu_seqlens_kv_padded,
                 allow_dummy_batch_dim=allow_dummy_batch_dim,
                 require_nondecreasing=False,
+                validate=validate,
             )
             _validate_padded_cu_seqlens_compatibility(cu_seqlens_kv, cu_seqlens_kv_padded)
 
@@ -182,6 +201,7 @@ class PackedSeqParams:
             max_seqlen_q=seq_len,
             total_tokens=seq_len,
             qkv_format=qkv_format,
+            validate=False,
         )
 
     def __post_init__(self):

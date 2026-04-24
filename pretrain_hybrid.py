@@ -243,6 +243,7 @@ def forward_step(data_iterator, model: HybridModel):
             cu_seqlens_q=cu_seqlens,
             max_seqlen_q=max_seqlen,
             total_tokens=total_tokens,
+            validate=False,
         )
 
     timers('batch-generator').stop()

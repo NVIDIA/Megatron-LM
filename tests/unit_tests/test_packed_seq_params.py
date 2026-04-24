@@ -85,6 +85,12 @@ def test_from_cu_seqlens_rejects_invalid_inputs():
             max_seqlen_q=3,
         )
 
+    with pytest.raises(TypeError, match="integer dtype"):
+        PackedSeqParams.from_cu_seqlens(
+            cu_seqlens_q=torch.tensor([0.0, 2.0, 5.0], dtype=torch.float32),
+            max_seqlen_q=3,
+        )
+
     with pytest.raises(ValueError, match="same shape"):
         PackedSeqParams.from_cu_seqlens(
             cu_seqlens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
