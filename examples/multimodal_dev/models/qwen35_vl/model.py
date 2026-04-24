@@ -8,11 +8,8 @@ layers.
 """
 
 from typing import Optional
-
+import torch
 from torch import Tensor
-
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 from examples.multimodal_dev.models.base import MultimodalModel
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
@@ -27,9 +24,9 @@ from examples.multimodal_dev.models.qwen35_vl.configuration import (
 )
 from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
-from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
-    Qwen35VLVisionEncoder,
-)
+from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class Qwen35VLModel(MultimodalModel):
@@ -109,11 +106,17 @@ class Qwen35VLModel(MultimodalModel):
         self,
         input_ids: Tensor,
         image_grid_thw: Optional[Tensor] = None,
+        packed_seq_params=None,
     ) -> Tensor:
         """Compute 3D MRoPE position IDs for Qwen3.5-VL.
 
+        In THD mode ``input_ids`` is ``[1, T]`` and ``packed_seq_params``
+        supplies per-segment boundaries; positions restart at 0 per
+        segment. In BSHD mode ``input_ids`` is ``[B, S]`` and
+        ``packed_seq_params`` should be ``None``.
+
         Returns:
-            ``[3, B, S]`` position IDs for MRoPE.
+            ``[3, B, S]`` position IDs for MRoPE (``[3, 1, T]`` in THD).
         """
         position_ids, _ = get_rope_index(
             spatial_merge_size=self.spatial_merge_size,
@@ -122,6 +125,7 @@ class Qwen35VLModel(MultimodalModel):
             vision_start_token_id=self.vision_start_token_id,
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
+            packed_seq_params=packed_seq_params,
         )
         return position_ids
 
@@ -161,8 +165,8 @@ class Qwen35VLModel(MultimodalModel):
             position_ids = self.compute_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
+                packed_seq_params=packed_seq_params,
             )
-
         vision_embeddings = None
         if (
             self.vision_model is not None
@@ -184,7 +188,6 @@ class Qwen35VLModel(MultimodalModel):
             else:
                 decoder_input = text_embeddings
 
-
         output = self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -194,4 +197,5 @@ class Qwen35VLModel(MultimodalModel):
             loss_mask=loss_mask,
             packed_seq_params=packed_seq_params,
         )
+
         return output

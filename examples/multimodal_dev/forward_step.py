@@ -2,21 +2,21 @@
 
 """Forward step, TP broadcast, and loss for multimodal_dev training."""
 
-from functools import partial
-from typing import Any, Dict, Iterator
 import math
+from functools import partial
+from itertools import accumulate
+from typing import Any, Dict, Iterator
 
 import torch
 import torch.nn.functional as F
 
+from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
-from megatron.core import mpu
-from itertools import accumulate
 from megatron.training import get_args
 
 # -------------------------------------------------------------------
@@ -190,7 +190,7 @@ def _build_packed_seq_params_from_cu_seqlens(
 
 
 
-def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=False, seq_length: int=None) -> list[Dict[str, Any]]:
+def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=False, seq_length: int=None, device = "cuda") -> list[Dict[str, Any]]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD format."""
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
@@ -234,14 +234,19 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
         # TODO, maybe pixel_values's seqlens needs to be recorded. 
         packed_batch["pixel_values"] = torch.concat(pixel_values_list)
         packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+        
+        # broadcast to all tp ranks
+        packed_batch = broadcast_data_batch(packed_batch, device=device)
 
         packed_batch["packed_seq_params"] = PackedSeqParams(
-            cu_seqlens_q=torch.tensor(cu_seqlens, dtype=torch.int32),
-            cu_seqlens_kv=torch.tensor(cu_seqlens, dtype=torch.int32),
-            cu_seqlens_q_padded=torch.tensor(cu_seqlens_padded, dtype=torch.int32),
-            cu_seqlens_kv_padded=torch.tensor(cu_seqlens_padded, dtype=torch.int32),
+            qkv_format='thd',
+            cu_seqlens_q=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
+            cu_seqlens_kv=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
+            cu_seqlens_q_padded=torch.tensor(cu_seqlens_padded, dtype=torch.int32, device=device),
+            cu_seqlens_kv_padded=torch.tensor(cu_seqlens_padded, dtype=torch.int32, device=device),
             max_seqlen_q=max(seqlens_padded_list),
             max_seqlen_kv=max(seqlens_padded_list),
+            total_tokens=cu_seqlens_padded[-1],
         )
         return packed_batch
     else:
@@ -260,6 +265,8 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
         padded_batch["loss_mask"] = torch.concat([x["loss_mask"].unsqueeze(0) for x in batch], dim=0)
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
+        # broadcast to all tp ranks
+        padded_batch = broadcast_data_batch(padded_batch, device=device)
         return padded_batch
 
 
@@ -294,8 +301,8 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     if has_data.item() == 0:
         return None
 
-    data = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length)
-    batch = broadcast_data_batch(data, device=device)
+    # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
+    batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:

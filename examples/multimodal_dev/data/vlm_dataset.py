@@ -171,6 +171,7 @@ class CordV2VLMDataset(Dataset):
         if self.image_token_id is not None:
             loss_mask[input_ids == self.image_token_id] = 0.0
         loss_mask[-1] = 0.0
+        labels[loss_mask == 0] = -100
 
         return {
             "input_ids": input_ids,
@@ -235,3 +236,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     test_ds = _make(test_examples, max(train_val_test_num_samples[2], 1))
 
     return train_ds, val_ds, test_ds
+
+
+if __name__ == "__main__":
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-35B-A3B", trust_remote_code=True)
+    examples = load_cord_v2(split="train")
+    dataset = CordV2VLMDataset(
+        examples=examples,
+        processor=processor,
+    )
+    print(dataset[0])

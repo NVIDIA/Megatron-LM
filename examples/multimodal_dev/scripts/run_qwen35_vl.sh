@@ -41,7 +41,7 @@ VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
 
 # Batch sizes
 MBS=${MBS:-2}
-GBS=${GBS:-64}
+GBS=${GBS:-16}
 
 # Parallelism
 TP=${TP:-1}
@@ -166,7 +166,7 @@ case "$MODEL_VARIANT" in
 esac
 SEQ_LEN=${SEQ_LEN:-4096}
 
-WANDB_PROJECT=${WANDB_PROJECT:-'multimodal-v2-qwen35-vl'}
+WANDB_PROJECT=${WANDB_PROJECT:-'qwen35-vl-0524'}
 EXP_NAME="qwen35vl_${MODEL_VARIANT}_tp${TP}_ep${EP}_pp${PP}"
 
 RECOMPUTE_VISION=${RECOMPUTE_VISION:-0}
@@ -218,7 +218,7 @@ MODEL_PARALLEL_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size "$MBS"
     --global-batch-size "$GBS"
-    --train-iters "${TRAIN_ITERS:-100}"
+    --train-iters "${TRAIN_ITERS:-500}"
     --adam-beta1 0.9
     --adam-beta2 0.95
     --lr 1.2e-4
