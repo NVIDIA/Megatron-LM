@@ -24,6 +24,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -45,6 +46,105 @@ class HybridStackSubmodules:
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
+
+
+class HyperConnectionHybridLayer(MegatronModule):
+    """Layer-boundary mHC wrapper for HybridStack layers.
+
+    Hybrid layers already own their local residual paths. For this initial
+    integration we treat each hybrid layer as a single function by aggregating
+    n streams to the layer input, running the existing layer, and feeding only
+    the layer delta back through mHC expansion.
+    """
+
+    def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
+        super().__init__(config=config)
+        self.inner_layer = layer
+        self.layer_number = layer.layer_number
+        self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
+        if hasattr(layer, 'tp_group'):
+            self.tp_group = layer.tp_group
+
+    def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
+        """Delegate Mamba inference state shape requests to the wrapped layer."""
+        if not hasattr(self.inner_layer, 'mamba_state_shapes_per_request'):
+            return None
+        return self.inner_layer.mamba_state_shapes_per_request()
+
+    def _call_inner_layer(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Tensor],
+        sequence_len_offset: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        original_enable_hyper_connections = self.config.enable_hyper_connections
+        self.config.enable_hyper_connections = False
+        try:
+            if isinstance(self.inner_layer, TransformerLayer):
+                output = self.inner_layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+            else:
+                output = self.inner_layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                )
+        finally:
+            self.config.enable_hyper_connections = original_enable_hyper_connections
+
+        if isinstance(output, tuple):
+            context = output[1] if len(output) > 1 else None
+            return output[0], context
+        return output, None
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[Tensor] = None,
+        mhc_recompute_manager=None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        residual = hidden_states
+        aggregated, h_res, h_post = self.hyper_connection(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
+        layer_output, context = self._call_inner_layer(
+            aggregated,
+            attention_mask,
+            inference_context,
+            rotary_pos_emb,
+            sequence_len_offset,
+            packed_seq_params,
+            padding_mask,
+        )
+        layer_delta = layer_output - aggregated
+        hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
+            h_res,
+            residual,
+            h_post,
+            (layer_delta, None),
+            dropout_prob=0.0,
+            training=False,
+            fused=False,
+            manager=None,
+        )
+        return hidden_states, context
 
 
 class HybridStack(GraphableMegatronModule, MegatronModule):
@@ -173,6 +273,8 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                     )
                 else:
                     raise ValueError("unexpected layer_type")
+            if self.config.enable_hyper_connections:
+                layer = HyperConnectionHybridLayer(config=self.config, layer=layer)
             self.layers.append(layer)
 
         # Required for activation recomputation
@@ -278,6 +380,11 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
+        if self.config.enable_hyper_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.config.num_residual_streams
+            )
+
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,
@@ -336,7 +443,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
                 with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
+                    if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -359,6 +466,11 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 # for cross-attention, and is not needed in our model.
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+
+        if self.config.enable_hyper_connections and self.post_process:
+            hidden_states = HyperConnectionModule.output_contract(
+                hidden_states, self.config.num_residual_streams
+            )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

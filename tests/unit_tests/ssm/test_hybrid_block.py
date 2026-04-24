@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer, HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -30,8 +30,13 @@ class TestHybridBlock:
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-    def get_mamba_block(self, layer_pattern):
+    def get_mamba_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
+        mhc_kwargs = (
+            {"enable_hyper_connections": True, "hidden_dropout": 0.0}
+            if enable_hyper_connections
+            else {}
+        )
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
@@ -39,6 +44,7 @@ class TestHybridBlock:
             num_layers=len(layer_type_list),
             num_attention_heads=4,
             use_cpu_initialization=True,
+            **mhc_kwargs,
         )
         modules = hybrid_stack_spec.submodules
         return HybridStack(
@@ -117,6 +123,37 @@ class TestHybridBlock:
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
+
+    def test_hyper_connection_layer_wrappers(self):
+        """mHC wraps each hybrid layer while preserving the layer type underneath."""
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(layer_pattern, enable_hyper_connections=True)
+        layers = block.layers
+        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in layers)
+        assert isinstance(layers[0].inner_layer, MambaLayer)
+        assert isinstance(layers[1].inner_layer, TransformerLayer)
+        assert isinstance(layers[1].inner_layer.self_attention, SelfAttention)
+        assert isinstance(layers[2].inner_layer, TransformerLayer)
+        assert isinstance(layers[2].inner_layer.mlp, MLP)
+
+    def test_hyper_connection_gpu_forward(self):
+        """mHC-enabled HybridStack expands internally and contracts back at the output."""
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(layer_pattern, enable_hyper_connections=True)
+        block.cuda()
+        micro_batch_size = 2
+        sequence_length = 32
+        hidden_states = torch.ones((sequence_length, micro_batch_size, block.config.hidden_size))
+        hidden_states = hidden_states.cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        )
+        attention_mask = attention_mask.cuda()
+        output = block(hidden_states, attention_mask=attention_mask)
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == block.config.hidden_size
+        assert output.dtype == torch.float32
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = '+'
