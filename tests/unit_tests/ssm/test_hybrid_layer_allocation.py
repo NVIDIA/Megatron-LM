@@ -12,6 +12,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
     get_layer_maps_from_layer_type_list,
+    get_sub_layer_offset,
     parse_fusion_groups,
     parse_hybrid_pattern,
     pattern_from_ratios,
@@ -701,6 +702,28 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mlp_map == {}
         assert moe_map == {}
 
+    def test_fused_entries(self):
+        """Fused multi-char entries contribute to each sub-type's map at the
+        same physical (global) layer index.
+        """
+        # Physical layer 0 is fused attention+MLP; layer 1 is stand-alone mamba.
+        maps = get_layer_maps_from_layer_type_list(["*-", "M"])
+        attention_map, mamba_map, mlp_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP
+        )(maps)
+        assert attention_map == {0: 0}
+        assert mlp_map == {0: 0}
+        assert mamba_map == {1: 0}
+
+        # Two fused blocks interleaved with stand-alone mamba.
+        maps = get_layer_maps_from_layer_type_list(["*-", "M", "*-", "M"])
+        attention_map, mamba_map, mlp_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP
+        )(maps)
+        assert attention_map == {0: 0, 2: 1}
+        assert mlp_map == {0: 0, 2: 1}
+        assert mamba_map == {1: 0, 3: 1}
+
 
 @pytest.mark.internal
 class TestStripBrackets:
@@ -763,9 +786,19 @@ class TestBracketValidation:
         assert result.main_pattern == "[*-]M|[*-]M"
 
     def test_valid_brackets_in_segment(self):
-        """validate_segment_layers strips brackets."""
+        """validate_segment_layers collapses each fusion group into a single entry."""
+        # Fused "[*-]" -> single multi-char entry, other layers stay single-char.
         result = validate_segment_layers("[*-]M*")
-        assert result == ['*', '-', 'M', '*']
+        assert result == ['*-', 'M', '*']
+
+        # Multiple fusion groups and mixed layers.
+        assert validate_segment_layers("[*-]M[*-]M") == ['*-', 'M', '*-', 'M']
+
+        # No brackets -> unchanged (every entry is single-character).
+        assert validate_segment_layers("M*-M") == ['M', '*', '-', 'M']
+
+        # Fused group of 3 sub-layers is still a single physical block.
+        assert validate_segment_layers("[M*-]M") == ['M*-', 'M']
 
     def test_unmatched_open_bracket(self):
         with pytest.raises(ValueError, match="unmatched '\\['"):
@@ -829,3 +862,70 @@ class TestBracketValidation:
         # Segment 0: "[*-][ME]" -> 2 fused blocks
         _, offset = select_pipeline_segment("[*-][ME]|M", pp_group=None, vp_stage=1)
         assert offset == 2
+
+
+@pytest.mark.internal
+class TestGetSubLayerOffset:
+    """Tests for `get_sub_layer_offset`.
+
+    The helper converts a physical-block offset (the value produced by
+    `select_pipeline_segment`) into the corresponding sub-layer offset –
+    i.e., what it would be if the pattern had no fusion brackets. This is
+    what `HybridStack` feeds into its canonical sharded-state-dict rewrite.
+    """
+
+    def test_zero_offset(self):
+        assert get_sub_layer_offset("M*M*", 0) == 0
+        assert get_sub_layer_offset("[M-]M", 0) == 0
+        assert get_sub_layer_offset("", 0) == 0
+
+    def test_negative_offset_returns_zero(self):
+        # Guard against the caller passing a negative physical offset – the
+        # helper should clamp rather than over-count.
+        assert get_sub_layer_offset("M*M*", -1) == 0
+
+    def test_pattern_without_fusion_is_identity(self):
+        # When no fusion groups are present, physical == sub-layer count.
+        assert get_sub_layer_offset("M*M*", 1) == 1
+        assert get_sub_layer_offset("M*M*", 2) == 2
+        assert get_sub_layer_offset("M*M*", 4) == 4
+
+    def test_fusion_group_counts_sub_layers(self):
+        # A [M-] group contributes 1 physical but 2 sub-layers.
+        assert get_sub_layer_offset("[M-]M", 1) == 2
+        assert get_sub_layer_offset("[M-]M", 2) == 3
+
+    def test_three_layer_fusion(self):
+        # A [M*-] group contributes 1 physical but 3 sub-layers.
+        assert get_sub_layer_offset("[M*-]M", 1) == 3
+        assert get_sub_layer_offset("[M*-]M", 2) == 4
+
+    def test_pipes_are_ignored(self):
+        # Sub-layer indices are global across PP segments, so pipes do not
+        # reset or contribute.
+        assert get_sub_layer_offset("M|[*-]", 1) == 1
+        assert get_sub_layer_offset("M|[*-]", 2) == 3
+
+    def test_consistent_with_count_pattern_layers(self):
+        # Feeding the full physical-block count of the (bracket-stripped,
+        # pipe-stripped) pattern should yield the full sub-layer count.
+        pattern = "[M-]M|[*-][ME]"
+        from megatron.core.models.hybrid.hybrid_layer_allocation import count_pattern_layers
+
+        total_physical = count_pattern_layers(pattern)
+        total_sub = sum(1 for ch in pattern if ch in Symbols.VALID_LAYERS)
+        assert get_sub_layer_offset(pattern, total_physical) == total_sub
+
+    def test_offset_beyond_pattern_returns_full_sub_count(self):
+        # Asking for more physical blocks than the pattern contains just
+        # walks off the end and returns the cumulative sub-layer count.
+        total_sub = sum(1 for ch in "[M-]M" if ch in Symbols.VALID_LAYERS)
+        assert get_sub_layer_offset("[M-]M", 10) == total_sub
+
+    def test_mirrors_physical_offset_for_unfused_segment(self):
+        # In a mixed pattern, segments up to the first fusion have
+        # sub_offset == physical_offset.
+        assert get_sub_layer_offset("M-M-|[*-]", 1) == 1
+        assert get_sub_layer_offset("M-M-|[*-]", 4) == 4
+        # Beyond the fusion boundary, the sub offset diverges.
+        assert get_sub_layer_offset("M-M-|[*-]", 5) == 6
