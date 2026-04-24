@@ -777,13 +777,11 @@ class MLASelfAttention(MultiLatentAttention):
         if self.config.qk_l2_norm:
             raise ValueError("qk_l2_norm is not supported with MLA.")
         elif self.config.qk_layernorm:
-            # Apply the fused optimization automatically, but only
-            # if the spec is either (a) a TENorm layer, which we
-            # assume to have fusion support for in
-            # TransformerEngine, or (b) unset (the default).
-            q_norm_cls = submodules.q_layernorm or TENorm
+            # Apply the fused norm+linear optimization automatically, but only if the layernorm spec
+            # is trivial (`None` or `IdentityOp`, the default).
+            q_norm_cls = submodules.q_layernorm or IdentityOp
             if self.config.q_lora_rank is not None:
-                if q_norm_cls in (TENorm, None, IdentityOp):
+                if q_norm_cls is IdentityOp:
                     linear_q_up_proj_cls = TELayerNormColumnParallelLinear
                 else:
                     linear_q_up_proj_cls = TEColumnParallelLinear
@@ -794,9 +792,6 @@ class MLASelfAttention(MultiLatentAttention):
                         "qk_layernorm requires TransformerEngine or "
                         "q_layernorm/kv_layernorm to be set in the spec."
                     )
-                # Unset Q layernorm if we include it in the fused linear.
-                if linear_q_up_proj_cls is TELayerNormColumnParallelLinear:
-                    q_norm_cls = IdentityOp
             else:
                 linear_q_proj_cls = submodules.linear_q_proj or TELayerNormColumnParallelLinear
                 if linear_q_proj_cls is None:
@@ -804,9 +799,14 @@ class MLASelfAttention(MultiLatentAttention):
                         "qk_layernorm requires TransformerEngine or "
                         "q_layernorm/kv_layernorm to be set in the spec."
                     )
+                elif q_norm_cls is not IdentityOp:
+                    raise ValueError(
+                        f"`q_layernorm={submodules.q_layernorm}` is non-trivial, "
+                        f"but `q_lora_rank is None`, meaning it will not be used."
+                    )
 
-            kv_norm_cls = submodules.kv_layernorm or TENorm
-            if kv_norm_cls in (TENorm, None, IdentityOp):
+            kv_norm_cls = submodules.kv_layernorm or IdentityOp
+            if kv_norm_cls is IdentityOp:
                 linear_kv_up_proj_cls = TELayerNormColumnParallelLinear
             else:
                 linear_kv_up_proj_cls = TEColumnParallelLinear
@@ -817,9 +817,6 @@ class MLASelfAttention(MultiLatentAttention):
                     "qk_layernorm requires TransformerEngine or "
                     "q_layernorm/kv_layernorm to be set in the spec."
                 )
-            # Unset KV layernorm if we include it in the fused linear.
-            if linear_kv_up_proj_cls is TELayerNormColumnParallelLinear:
-                kv_norm_cls = IdentityOp
         else:
             if self.config.q_lora_rank is not None:
                 if (
