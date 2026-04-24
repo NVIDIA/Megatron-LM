@@ -13,7 +13,7 @@ import torch
 from torch import Tensor, nn
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
@@ -31,6 +31,25 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+
+# Canonical slot name each layer symbol uses in its stand-alone
+# sharded-state-dict output – i.e., the attribute path under which the
+# primitive's weights live when the block contains just that symbol. For a
+# fused `[XY]` block, the same primitives sit under `self_attention` (for the
+# sequence mixer X) and `mlp` (for the channel mixer Y); `sharded_state_dict`
+# uses this table to rewrite fused keys back into the stand-alone layout so
+# fused and unfused patterns produce the same checkpoint keys. Only Mamba
+# needs an intra-block rename (`self_attention.` -> `mixer.`); every other
+# sequence mixer is stand-alone-hosted in a TransformerLayer whose
+# `self_attention` slot already matches the fused layout.
+_CANONICAL_SLOT_FOR_SYMBOL: dict[str, str] = {
+    LayerSymbols.MAMBA: "mixer",
+    LayerSymbols.GDN: "self_attention",
+    LayerSymbols.ATTENTION: "self_attention",
+    LayerSymbols.DS_ATTENTION: "self_attention",
+    LayerSymbols.MLP: "mlp",
+    LayerSymbols.MOE: "mlp",
+}
 
 
 @dataclass
@@ -82,7 +101,15 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             this pipeline segment. When provided (by HybridModel), pipeline stage
             selection has already been done via '|' separators in the pattern.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
-            segment. Defaults to 0.
+            segment, measured in physical blocks (fused groups count as one).
+            Defaults to 0.
+        sub_layer_offset (int, optional): the global sub-layer offset for this
+            pipeline segment, measured in unfused sub-layers (a fused `[XY]`
+            contributes 2). Used only to emit canonical-form sharded-state-dict
+            keys so fused and unfused patterns produce the same checkpoint
+            layout. When None (default), falls back to `pp_layer_offset`, which
+            is correct whenever no earlier pipeline segment contained a fusion
+            group.
         post_layer_norm (bool, optional): whether to include a final layer norm.
             Defaults to True.
         post_process (bool, optional): whether to include an output layer.
@@ -101,6 +128,7 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         pre_process: bool = True,
         layer_type_list: Optional[list[str]] = None,
         pp_layer_offset: int = 0,
+        sub_layer_offset: Optional[int] = None,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
@@ -128,6 +156,12 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
+        # Sub-layer offset defaults to pp_layer_offset, which is correct for
+        # any pattern whose earlier pipeline segments contain no fusion groups
+        # (i.e., physical-block count == sub-layer count up to that point).
+        self.sub_layer_offset = (
+            sub_layer_offset if sub_layer_offset is not None else pp_layer_offset
+        )
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -239,6 +273,11 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         """
         Returns the Mamba conv and ssm states shapes per input sequence
         if this block contains Mamba layers (this may not be the case with PP > 1).
+
+        A stand-alone Mamba block exposes `mamba_state_shapes_per_request`
+        directly (it is a `MambaLayer`). A fused `[M...]` block is a
+        `TransformerLayer` whose `self_attention` slot holds the MambaMixer,
+        so we have to descend one level.
         """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:
@@ -440,21 +479,70 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
 
-        for local_layer_idx, layer in enumerate(self.layers):
+        # Sub-layer cursor tracks the running sub-layer index across this
+        # segment; combined with `sub_layer_offset` it yields the same global
+        # sub-layer indices whether the current pattern contains fused groups
+        # or not. That is what gives checkpoints a fusion-independent layout –
+        # a pattern saved unfused can be loaded into a fused model (and vice
+        # versa) without any external translation step.
+        sub_layer_cursor = self.sub_layer_offset
 
-            global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
+        for local_layer_idx, (layer_type, layer) in enumerate(
+            zip(self.layer_type_list, self.layers)
+        ):
             state_dict_prefix = (
                 f'{layer_prefix}{local_layer_idx}.'  # module list index in HybridStack
             )
-
-            sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
             sharded_pp_offset = []
-
             layer_sharded_state_dict = layer.sharded_state_dict(
                 state_dict_prefix, sharded_pp_offset, metadata
             )
 
-            replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, sharded_prefix)
+            if len(layer_type) == 1:
+                # Stand-alone block: one physical block == one sub-layer, and
+                # the block's attribute layout already matches the canonical
+                # stand-alone layout. Only the outer block index needs to move
+                # from the local module-list index to the global sub-layer
+                # index.
+                canonical_prefix = f'{layer_prefix}{sub_layer_cursor}.'
+                replace_prefix_for_sharding(
+                    layer_sharded_state_dict, state_dict_prefix, canonical_prefix
+                )
+                sub_layer_cursor += 1
+            else:
+                # Fused block `[XY]`: split the single physical block's keys
+                # into two sub-layer prefixes so the checkpoint looks exactly
+                # as it would for stand-alone `X` followed by stand-alone `Y`.
+                # Norms attached to X (e.g. `input_layernorm` for DSA) attach
+                # to X's sub-layer index; norms attached to Y (e.g.
+                # `pre_mlp_layernorm` for MoE) attach to Y's sub-layer index.
+                x_sym, y_sym = layer_type[0], layer_type[1]
+                canonical_x_prefix = f'{layer_prefix}{sub_layer_cursor}.'
+                canonical_y_prefix = f'{layer_prefix}{sub_layer_cursor + 1}.'
+                slot_for_x = _CANONICAL_SLOT_FOR_SYMBOL[x_sym]
+                slot_for_y = _CANONICAL_SLOT_FOR_SYMBOL[y_sym]
+
+                # Order matters: `apply_prefix_mapping` picks the first
+                # matching prefix, so list each specific sub-prefix before
+                # the bare block prefix fallback.
+                prefix_map = {
+                    f'{state_dict_prefix}input_layernorm.': (
+                        f'{canonical_x_prefix}input_layernorm.'
+                    ),
+                    f'{state_dict_prefix}self_attention.': (f'{canonical_x_prefix}{slot_for_x}.'),
+                    f'{state_dict_prefix}self_attn_bda.': (f'{canonical_x_prefix}self_attn_bda.'),
+                    f'{state_dict_prefix}pre_mlp_layernorm.': (
+                        f'{canonical_y_prefix}pre_mlp_layernorm.'
+                    ),
+                    f'{state_dict_prefix}mlp.': f'{canonical_y_prefix}{slot_for_y}.',
+                    f'{state_dict_prefix}mlp_bda.': f'{canonical_y_prefix}mlp_bda.',
+                    # Fallback for any stray top-level fused-block keys (e.g.,
+                    # `_extra_state` attached to the TransformerLayer itself);
+                    # attach them to X's sub-layer index by convention.
+                    state_dict_prefix: canonical_x_prefix,
+                }
+                apply_prefix_mapping(layer_sharded_state_dict, prefix_map)
+                sub_layer_cursor += 2
 
             sharded_state_dict.update(layer_sharded_state_dict)
 

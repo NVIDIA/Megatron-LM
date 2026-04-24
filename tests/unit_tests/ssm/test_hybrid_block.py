@@ -466,3 +466,200 @@ class TestMambaStateShapesWithFusion:
 
         stub = self._make_stub_stack(["ME"], [FakeTransformerLayer()])
         assert HybridStack.mamba_state_shapes_per_request(stub) == "me-fused"
+
+
+@pytest.mark.internal
+class TestCanonicalShardedStateDict:
+    """Tests for `HybridStack.sharded_state_dict`'s canonical-unfused rewrite.
+
+    `HybridStack` emits checkpoint keys as if the pattern had no fusion
+    brackets: a fused `[XY]` block is split into two sub-layer-indexed
+    prefixes that match what stand-alone `X` and `Y` blocks would produce.
+    This makes checkpoints structurally equivalent across fusion placements,
+    so an unfused save can be loaded into a fused model (and vice versa) –
+    the dist_checkpointing layer never sees the difference.
+
+    Tests are hermetic: they build a stripped-down `HybridStack` via
+    `object.__new__`, feed it fake layer modules whose `sharded_state_dict`
+    methods return bare `ShardedObject`s (no CUDA, no process group, no
+    `nn.Module` init), and inspect the resulting key set.
+    """
+
+    def _make_sharded_object(self, key):
+        """Construct a minimal ShardedObject carrying just the key under test."""
+        from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+        return ShardedObject(key=key, data=None, global_shape=(1,), global_offset=(0,))
+
+    def _fake_layer(self, sub_keys):
+        """Fake layer whose `sharded_state_dict` yields a ShardedObject per sub_key."""
+        maker = self._make_sharded_object
+
+        class FakeLayer:
+            def sharded_state_dict(self, prefix, sharded_pp_offset, metadata):
+                return {f"{prefix}{sub_key}": maker(f"{prefix}{sub_key}") for sub_key in sub_keys}
+
+        return FakeLayer()
+
+    def _make_stub_stack(self, layer_type_list, layers, sub_layer_offset=0):
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        stub = object.__new__(HybridStack)
+        stub.layer_type_list = layer_type_list
+        stub.layers = layers
+        stub.sub_layer_offset = sub_layer_offset
+        stub.tp_group = None
+        # `sharded_state_dict` iterates `named_children()` to fold in modules
+        # other than `self.layers`. Returning only `layers` here ensures the
+        # "other modules" branch is a no-op (the `if not module is self.layers`
+        # check filters it out) – which is what we want for a hermetic test.
+        stub.named_children = lambda: [("layers", layers)]
+        return stub
+
+    def _run(self, stub):
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        return HybridStack.sharded_state_dict(stub)
+
+    def _keys(self, sharded_state_dict):
+        return {v.key for v in sharded_state_dict.values()}
+
+    def test_unfused_pattern_is_pure_index_passthrough(self):
+        # Stand-alone entries map 1:1 from local module-list index to global
+        # sub-layer index. With `sub_layer_offset=0` they are identity.
+        mamba = self._fake_layer(["mixer.weight"])
+        attn = self._fake_layer(["self_attention.linear_qkv.weight"])
+        stub = self._make_stub_stack(["M", "*"], [mamba, attn])
+        assert self._keys(self._run(stub)) == {
+            "layers.0.mixer.weight",
+            "layers.1.self_attention.linear_qkv.weight",
+        }
+
+    def test_fused_mamba_mlp_splits_and_renames(self):
+        # `[M-]`: TransformerLayer with self_attention=MambaMixer, mlp=MLP.
+        # Canonical: `layers.0.mixer.*` (renamed from self_attention) and
+        # `layers.1.mlp.*` (split into the next sub-layer index).
+        fused = self._fake_layer(
+            [
+                "self_attention.in_proj.weight",
+                "self_attention.out_proj.weight",
+                "mlp.linear_fc1.weight",
+                "mlp.linear_fc2.weight",
+            ]
+        )
+        stub = self._make_stub_stack(["M-"], [fused])
+        assert self._keys(self._run(stub)) == {
+            "layers.0.mixer.in_proj.weight",
+            "layers.0.mixer.out_proj.weight",
+            "layers.1.mlp.linear_fc1.weight",
+            "layers.1.mlp.linear_fc2.weight",
+        }
+
+    def test_fused_attention_mlp_splits_without_rename(self):
+        # `[*-]`: stand-alone attention also lives under `self_attention.*`,
+        # so only the outer block index needs to split – no intra-block rename.
+        fused = self._fake_layer(["self_attention.linear_qkv.weight", "mlp.linear_fc1.weight"])
+        stub = self._make_stub_stack(["*-"], [fused])
+        assert self._keys(self._run(stub)) == {
+            "layers.0.self_attention.linear_qkv.weight",
+            "layers.1.mlp.linear_fc1.weight",
+        }
+
+    def test_fused_dsa_preserves_input_layernorm_on_x(self):
+        # `[D-]` fuses DSA (whose stand-alone block ships with a TENorm
+        # `input_layernorm`) with MLP. The norm belongs to the X sub-layer.
+        fused = self._fake_layer(
+            ["input_layernorm.weight", "self_attention.linear_proj.weight", "mlp.linear_fc1.weight"]
+        )
+        stub = self._make_stub_stack(["D-"], [fused])
+        assert self._keys(self._run(stub)) == {
+            "layers.0.input_layernorm.weight",
+            "layers.0.self_attention.linear_proj.weight",
+            "layers.1.mlp.linear_fc1.weight",
+        }
+
+    def test_fused_moe_preserves_pre_mlp_layernorm_on_y(self):
+        # `[*E]` fuses attention with MoE (whose stand-alone block ships a
+        # TENorm `pre_mlp_layernorm`). That norm belongs to the Y sub-layer.
+        fused = self._fake_layer(
+            ["self_attention.linear_qkv.weight", "pre_mlp_layernorm.weight", "mlp.router.weight"]
+        )
+        stub = self._make_stub_stack(["*E"], [fused])
+        assert self._keys(self._run(stub)) == {
+            "layers.0.self_attention.linear_qkv.weight",
+            "layers.1.pre_mlp_layernorm.weight",
+            "layers.1.mlp.router.weight",
+        }
+
+    def test_mixed_pattern_cursor_advances_per_sub_layer(self):
+        # `M[*-]M`: stand-alone M at sub 0, fused at sub 1+2, stand-alone M
+        # at sub 3. Physical indices 0, 1, 2 compress to sub 0, 1, 2, 3.
+        mamba0 = self._fake_layer(["mixer.A"])
+        fused = self._fake_layer(["self_attention.Q", "mlp.W"])
+        mamba1 = self._fake_layer(["mixer.B"])
+        stub = self._make_stub_stack(["M", "*-", "M"], [mamba0, fused, mamba1])
+        assert self._keys(self._run(stub)) == {
+            "layers.0.mixer.A",
+            "layers.1.self_attention.Q",
+            "layers.2.mlp.W",
+            "layers.3.mixer.B",
+        }
+
+    def test_sub_layer_offset_is_added_to_every_entry(self):
+        # Second PP segment: earlier segments contributed 4 sub-layers.
+        mamba = self._fake_layer(["mixer.A"])
+        fused = self._fake_layer(["self_attention.Q", "mlp.W"])
+        stub = self._make_stub_stack(["M", "M-"], [mamba, fused], sub_layer_offset=4)
+        assert self._keys(self._run(stub)) == {
+            "layers.4.mixer.A",
+            "layers.5.mixer.Q",
+            "layers.6.mlp.W",
+        }
+
+    def test_unfused_and_fused_produce_identical_keys(self):
+        # The central compatibility guarantee: a pattern containing fused
+        # groups and its bracket-stripped twin, fed the same sub-layer
+        # contents, yield identical sharded keys. That is what makes a
+        # checkpoint saved unfused loadable into a fused model and vice versa.
+        unfused_mamba = self._fake_layer(["mixer.W"])
+        unfused_mlp = self._fake_layer(["mlp.W"])
+        unfused_stub = self._make_stub_stack(["M", "-"], [unfused_mamba, unfused_mlp])
+
+        fused = self._fake_layer(["self_attention.W", "mlp.W"])
+        fused_stub = self._make_stub_stack(["M-"], [fused])
+
+        assert self._keys(self._run(unfused_stub)) == self._keys(self._run(fused_stub))
+
+    def test_fused_and_another_fusion_layout_produce_identical_keys(self):
+        # Fused-to-fused with different placement: `[M-][M-]` vs `M[-M]-`...
+        # but that's not valid (-M is sequence-mixer-second). Use a
+        # three-layer equivalent: `[M-]M-` vs `M-[M-]`. Sub-layer sequence is
+        # M, -, M, - in both cases.
+        left_fused = self._fake_layer(["self_attention.A", "mlp.B"])
+        left_mamba = self._fake_layer(["mixer.C"])
+        left_mlp = self._fake_layer(["mlp.D"])
+        left_stub = self._make_stub_stack(["M-", "M", "-"], [left_fused, left_mamba, left_mlp])
+
+        right_mamba = self._fake_layer(["mixer.A"])
+        right_mlp = self._fake_layer(["mlp.B"])
+        right_fused = self._fake_layer(["self_attention.C", "mlp.D"])
+        right_stub = self._make_stub_stack(["M", "-", "M-"], [right_mamba, right_mlp, right_fused])
+
+        assert self._keys(self._run(left_stub)) == self._keys(self._run(right_stub))
+
+    def test_stray_top_level_block_key_falls_back_to_x(self):
+        # A bare top-level key on a fused block (e.g., a hypothetical
+        # `_extra_state` attached to the TransformerLayer itself) falls back
+        # to the X sub-layer's index, not the Y one.
+        fused = self._fake_layer(
+            [
+                "_extra_state",  # stray top-level key
+                "self_attention.linear_qkv.weight",
+                "mlp.linear_fc1.weight",
+            ]
+        )
+        stub = self._make_stub_stack(["*-"], [fused])
+        keys = self._keys(self._run(stub))
+        assert "layers.0._extra_state" in keys
+        assert "layers.0.self_attention.linear_qkv.weight" in keys
+        assert "layers.1.mlp.linear_fc1.weight" in keys

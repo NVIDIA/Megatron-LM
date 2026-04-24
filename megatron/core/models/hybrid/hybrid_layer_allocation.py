@@ -492,6 +492,69 @@ def count_pattern_layers(pattern: str) -> int:
     return count
 
 
+def get_sub_layer_offset(main_pattern: str, physical_offset: int) -> int:
+    """Count sub-layers corresponding to the first `physical_offset` physical blocks.
+
+    A fused group `[XY]` counts as one physical block but contains `len(XY)`
+    sub-layers; a stand-alone symbol counts as one of each. Pipe '|' separators
+    are ignored – sub-layer indices are global across pipeline segments, so
+    this helper returns the value `HybridStack` needs to emit checkpoint keys
+    in the canonical unfused layout regardless of fusion placement.
+
+    This is the sub-layer analogue of the physical-block offset returned by
+    `select_pipeline_segment`.
+
+    Args:
+        main_pattern: Main decoder pattern (may contain '|' and '[...]').
+            Assumed already validated (`_validate_pattern` with
+            `allow_pipe=True, allow_brackets=True`).
+        physical_offset: Number of physical blocks preceding the point of
+            interest (e.g., the value returned by `select_pipeline_segment`
+            for the current pipeline segment). Must be non-negative.
+
+    Returns:
+        Sub-layer count across the `physical_offset` earliest physical blocks.
+
+    Examples:
+        >>> get_sub_layer_offset("M*M*", 0)
+        0
+        >>> get_sub_layer_offset("M*M*", 2)
+        2
+        >>> get_sub_layer_offset("[M-]M", 1)
+        2
+        >>> get_sub_layer_offset("[M-]M", 2)
+        3
+        >>> get_sub_layer_offset("M|[*-]", 2)
+        3
+    """
+    if physical_offset <= 0:
+        return 0
+
+    sub_count = 0
+    physical_count = 0
+    in_group = False
+    group_sub_count = 0
+
+    for char in main_pattern:
+        if physical_count >= physical_offset:
+            break
+        if char == Symbols.FUSION_START:
+            in_group = True
+            group_sub_count = 0
+        elif char == Symbols.FUSION_END:
+            in_group = False
+            sub_count += group_sub_count
+            physical_count += 1
+        elif char == Symbols.PIPE:
+            continue
+        elif in_group:
+            group_sub_count += 1
+        elif char in Symbols.VALID_LAYERS:
+            sub_count += 1
+            physical_count += 1
+    return sub_count
+
+
 def parse_fusion_groups(pattern: str) -> List[Tuple[int, int]]:
     """Extract fusion groups from a bracket-annotated pattern string.
 
