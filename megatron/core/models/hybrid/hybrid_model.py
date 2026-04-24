@@ -1,0 +1,531 @@
+# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+
+import logging
+from typing import Literal, Optional
+
+from torch import Tensor
+
+from megatron.core import tensor_parallel
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    mtp_on_this_rank,
+    process_mtp_loss,
+)
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    is_using_quantization_scales,
+    log_single_rank,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class HybridModel(LanguageModule):
+    """Hybrid language model.
+
+    Args:
+        config (TransformerConfig): Model config
+        hybrid_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
+        vocab_size (int): Vocabulary size
+        max_sequence_length (int): maximum size of sequence.
+            This is used for positional embedding
+        hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
+            pipeline stage boundaries.
+            Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+            The main pattern may contain "|" to define pipeline stage boundaries.
+            Examples:
+                - "M*M*" -> main decoder only, no MTP
+                - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
+                - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
+        hybrid_attention_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
+            generated from the ratio with a deprecation warning.
+        hybrid_mlp_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
+            generated from the ratio with a deprecation warning.
+        hybrid_override_pattern (str, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set and hybrid_layer_pattern is None, the value is copied to hybrid_layer_pattern
+            with a deprecation warning.
+        pre_process (bool, optional): Include embedding layer
+            (used with pipeline parallelism). Defaults to True.
+        post_process (bool, optional): Include an output layer (used with pipeline parallelism).
+            Defaults to True.
+        fp16_lm_cross_entropy (bool, optional): Defaults to False.
+        parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor
+            parallel ranks. Defaults to True.
+        share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
+            output logit weights are shared. Defaults to False.
+        position_embedding_type (Literal[learned_absolute,rope,yarn,none], optional):  Position
+            embedding type. Defaults to 'none'.
+        rotary_percent (float, optional): Percent of rotary dimension to use for rotary position
+            embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
+        rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless
+            position_embedding_type is 'rope'. Defaults to 10000.
+        seq_len_interpolation_factor (Optional[float], optional): scale of linearly
+            interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
+             Defaults to None.
+        pg_collection (ProcessGroupCollection, optional): Model communication process groups.
+        vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        hybrid_stack_spec: ModuleSpec,
+        vocab_size: int,
+        max_sequence_length: int,
+        hybrid_layer_pattern: Optional[str] = None,
+        hybrid_attention_ratio: Optional[float] = None,
+        hybrid_mlp_ratio: Optional[float] = None,
+        hybrid_override_pattern: Optional[str] = None,
+        pre_process: bool = True,
+        post_process: bool = True,
+        fp16_lm_cross_entropy: bool = False,
+        parallel_output: bool = True,
+        share_embeddings_and_output_weights: bool = False,
+        # Mamba with no attention has no need for position embeddings, so none is default
+        position_embedding_type: Literal['learned_absolute', 'rope', 'yarn', 'none'] = 'none',
+        rotary_percent: float = 1.0,
+        rotary_base: int = 10000,
+        scatter_embedding_sequence_parallel: bool = True,
+        seq_len_interpolation_factor: Optional[float] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection)
+
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
+        if self.config.use_mup and not getattr(HybridModel, "mup_warning_printed", False):
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "MuP for HybridModel is experimental and not fully validated yet.",
+            )
+            HybridModel.mup_warning_printed = True
+
+        self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
+        self.vocab_size = vocab_size
+        self.max_sequence_length = max_sequence_length
+        self.hybrid_layer_pattern = hybrid_layer_pattern
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.parallel_output = parallel_output
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.position_embedding_type = position_embedding_type
+        self.vp_stage = vp_stage
+        self.disable_param_offloading = True
+
+        # Backward compatibility for deprecated hybrid parameters
+        if hybrid_override_pattern is not None:
+            if self.hybrid_layer_pattern is None:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "hybrid_override_pattern has been deprecated. "
+                    "Use hybrid_layer_pattern instead.",
+                )
+                self.hybrid_layer_pattern = hybrid_override_pattern
+            else:
+                raise ValueError(
+                    "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
+                    "hybrid_override_pattern has been deprecated; use hybrid_layer_pattern instead."
+                )
+        if (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0) or (
+            hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0
+        ):
+            if hybrid_layer_pattern is not None:
+                raise ValueError(
+                    "hybrid_layer_pattern cannot be used together with "
+                    "hybrid_attention_ratio or hybrid_mlp_ratio. "
+                    "These ratios have been deprecated; use hybrid_layer_pattern alone."
+                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "hybrid_attention_ratio and hybrid_mlp_ratio have been deprecated. "
+                "Use hybrid_layer_pattern instead.",
+            )
+            if self.hybrid_layer_pattern is None:
+                from megatron.core.models.hybrid.hybrid_layer_allocation import pattern_from_ratios
+
+                attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
+                mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
+                self.hybrid_layer_pattern = pattern_from_ratios(
+                    config.num_layers, attn_ratio, mlp_ratio
+                )
+
+        # Parse unified pattern to extract main and MTP components, and
+        # determine the pipeline segment for this model instance.
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            parse_hybrid_pattern,
+            select_pipeline_segment,
+        )
+
+        parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
+        self.mtp_pattern = parsed.mtp_pattern
+        self.mtp_num_depths = parsed.mtp_num_depths
+
+        layer_type_list, layer_offset = select_pipeline_segment(
+            parsed.main_pattern or '',
+            self.pg_collection.pp,
+            vp_stage,
+            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+        )
+
+        # Determine if MTP is needed (based on pattern parsing)
+        self.mtp_process = (
+            self.mtp_pattern is not None
+            and self.mtp_num_depths > 0
+            # The following forces MTP to be on the final pipeline stage. It might be more optimal
+            # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
+            # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
+            # stage separate from loss) to be supported in the hybrid model.
+            and mtp_on_this_rank(self.config, ignore_virtual=False, vp_stage=self.vp_stage)
+        )
+
+        # megatron core pipelining currently depends on model type
+        # TODO: remove this dependency ?
+        self.model_type = ModelType.encoder_or_decoder
+
+        if self.pre_process or self.mtp_process:
+            self.embedding = LanguageModelEmbedding(
+                config=self.config,
+                vocab_size=self.vocab_size,
+                max_sequence_length=self.max_sequence_length,
+                position_embedding_type=position_embedding_type,
+                scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
+                tp_group=self.pg_collection.tp,
+            )
+
+        # MLA (also used by DeepSeek Sparse Attention) uses its own decoupled RoPE, therefore we do
+        # not build standard RoPE here when using MLA.
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = RotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
+        elif self.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                original_max_position_embeddings=getattr(
+                    self.config, "yarn_original_max_position_embeddings"
+                ),
+                beta_fast=getattr(self.config, "yarn_beta_fast"),
+                beta_slow=getattr(self.config, "yarn_beta_slow"),
+                mscale=getattr(self.config, "yarn_mscale"),
+                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                correction_range_round_to_int=getattr(
+                    self.config, "yarn_correction_range_round_to_int"
+                ),
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
+        self.decoder = build_module(
+            hybrid_stack_spec,
+            self.config,
+            pre_process=self.pre_process,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=layer_offset,
+            post_process=self.post_process,
+            dtype=config.params_dtype,
+            pg_collection=self.pg_collection,
+        )
+
+        # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
+        if self.mtp_process:
+            hybrid_submodules = hybrid_stack_spec.submodules
+            mtp_block_spec = hybrid_submodules.mtp_block_spec
+            assert mtp_block_spec is not None, (
+                "MTP pattern specified but mtp_block_spec is None in hybrid_stack_spec.submodules. "
+                "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
+            )
+
+            self.mtp = MultiTokenPredictionBlock(
+                config=self.config,
+                spec=mtp_block_spec,
+                pg_collection=self.pg_collection,
+                vp_stage=self.vp_stage,
+                mtp_layer_pattern=self.mtp_pattern,
+                mtp_num_depths=self.mtp_num_depths,
+                hybrid_submodules=hybrid_submodules,
+            )
+
+        # Output
+        if post_process or self.mtp_process:
+            self.output_layer = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                self.vocab_size,
+                config=config,
+                init_method=(
+                    config.embedding_init_method
+                    if config.use_mup and not self.share_embeddings_and_output_weights
+                    else config.init_method
+                ),
+                bias=False,
+                skip_bias_add=False,
+                gather_output=not self.parallel_output,
+                skip_weight_param_allocation=self.pre_process
+                and self.share_embeddings_and_output_weights,
+                tp_group=self.pg_collection.tp,
+            )
+
+        if self.pre_process or self.post_process or self.mtp_process:
+            self.setup_embeddings_and_output_layer()
+
+        for name, module in self.named_modules():
+            if hasattr(module, 'finish_init'):
+                quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
+                module.finish_init(quant_config)
+
+    def set_input_tensor(self, input_tensor: Tensor) -> None:
+        """Sets input tensor to the model.
+
+        See megatron.model.transformer.set_input_tensor()
+
+        Args:
+            input_tensor (Tensor): Sets the input tensor for the model.
+        """
+        # This is usually handled in schedules.py but some inference code still
+        # gives us non-lists or None
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+
+        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        self.decoder.set_input_tensor(input_tensor[0])
+
+    def preprocess_for_fine_grained_offloading(self):
+        """Preprocess for fine-grained activation offloading."""
+        off_interface.init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size,
+            vp_stage=self.vp_stage,
+            min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+        )
+        if self.disable_param_offloading:
+            for param in self.decoder.parameters():
+                off_interface.mark_not_offloadable(param)
+            if self.mtp_process:
+                for param in self.mtp.parameters():
+                    off_interface.mark_not_offloadable(param)
+            if self.post_process:
+                for param in self.output_layer.parameters():
+                    off_interface.mark_not_offloadable(param)
+            self.disable_param_offloading = False
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[Tensor] = None,
+        is_spec_decode: Optional[bool] = None,
+    ) -> Tensor:
+        """Forward function of the Hybrid model. This function passes the input tensors
+        through the embedding layer, and then the decoder and finally into the post
+        processing layer (optional).
+
+        It either returns the Loss values if labels are given or the final hidden units
+        """
+        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
+        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+
+        if self.config.fine_grained_activation_offloading:
+            self.preprocess_for_fine_grained_offloading()
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        in_inference_mode = inference_context is not None and not self.training
+
+        if in_inference_mode:
+            assert runtime_gather_output, "Inference must always gather TP logits"
+
+        # Decoder embedding.
+        if decoder_input is not None:
+            pass
+        elif self.pre_process:
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
+            if (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
+            ):
+                decoder_input[inference_context.padding_slice] = 0.0
+        else:
+            # intermediate stage of pipeline
+            # decoder will get hidden_states from encoder.input_tensor
+            decoder_input = None
+
+        rotary_pos_emb = None
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+            )
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
+        elif self.position_embedding_type == 'yarn':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+            )
+            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
+            rotary_pos_emb, _ = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
+
+        # Wrap decoder_input to allow the decoder (HybridStack) to delete the
+        # reference held by this caller function, enabling early garbage collection
+        # for inference.
+        if in_inference_mode:
+            decoder_input = WrappedTensor(decoder_input)
+
+        # The following assert will currently fail when running inference.
+        # Commented out for now.
+        # TODO (duncan/rwaleffe): (1) confirm that the externally-generated
+        #   attention mask is not needed and is ignored by the model in
+        #   inference mode, (2) reduce the size of the externally-generated
+        #   attention mask to prevent CPU OOM (as we did for training), (3)
+        #   force the attention mask passed to the model in inference mode to
+        #   be None, so this assert will succeed.
+        # assert attention_mask is None, "The attention mask is ignored and should be set to None"
+
+        # Run decoder.
+        hidden_states = self.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        # Check if speculative decoding is active. When it is, MTP must be
+        # computed *after* verification so that it is conditioned on verified
+        # tokens rather than stale speculative tokens from the previous step.
+        if is_spec_decode is None:
+            is_spec_decode = (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.num_speculative_tokens > 0
+            )
+
+        mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
+        if mtp_forward_ran:
+            hidden_states = self.mtp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                embedding=self.embedding,
+            )
+
+        if not self.post_process:
+            return hidden_states
+
+        if self.config.mtp_num_layers is not None and self.mtp_process:
+            assert self.config.mtp_num_layers > 0
+            if in_inference_mode or is_spec_decode:
+                self._decoder_hidden_states_cache = hidden_states
+            else:
+                hidden_states = process_mtp_loss(
+                    hidden_states=hidden_states,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    output_layer=self.output_layer,
+                    output_weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                    is_training=self.training,
+                    compute_language_model_loss=self.compute_language_model_loss,
+                    config=self.config,
+                    cp_group=self.pg_collection.cp,
+                    packed_seq_params=packed_seq_params,
+                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                )
+        sequence_parallel_override = False
+        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+            if inference_context.is_static_batching():
+                hidden_states = hidden_states[-1:, :, :]
+            else:
+                if self.output_layer.sequence_parallel:
+                    # Perform the sequence parallel gather here instead of after the output layer
+                    # because we need to slice the last token logits from the full view of the
+                    # packed logits across all requests.
+                    hidden_states = gather_from_sequence_parallel_region(
+                        hidden_states, group=self.pg_collection.tp
+                    )
+                    self.output_layer.sequence_parallel = False
+                    sequence_parallel_override = True
+
+                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+                # then back to [S', B, H] for the output layer.
+                reshaped = hidden_states.squeeze(1).unsqueeze(0)
+                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        logits = self._scale_logits(logits)
+
+        # Restore sequence parallel execution to the output layer if necessary.
+        if sequence_parallel_override:
+            assert (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.config.materialize_only_last_token_logits
+            )
+            self.output_layer.sequence_parallel = True
+
+        if labels is None:
+            # [s b h] => [b s h]
+            return logits.transpose(0, 1).contiguous()
+
+        loss = self.compute_language_model_loss(labels, logits)
+
+        return loss

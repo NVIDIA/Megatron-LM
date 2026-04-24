@@ -8,11 +8,12 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.utils import experimental_api
+from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
 
 
 def serialize_tensor(tensor: torch.Tensor) -> List:
@@ -24,12 +25,12 @@ def serialize_tensor(tensor: torch.Tensor) -> List:
     Returns:
         (List) Tensor as a list
     """
-    torch.cuda.nvtx.range_push("serialize_tensor")
+    nvtx_range_push("serialize_tensor")
 
     # simply convert tensor into a list
     tensor = tensor.cpu().tolist()
 
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("serialize_tensor")
     return tensor
 
 
@@ -44,6 +45,16 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     """
     tensor = torch.tensor(tensor_as_list)
     return tensor
+
+
+def serialize_ndarray(arr: np.ndarray) -> dict:
+    """Serialize numpy array to a JSON-compatible dict."""
+    return {"data": arr.tolist(), "dtype": str(arr.dtype)}
+
+
+def deserialize_ndarray(obj: dict) -> np.ndarray:
+    """Deserialize numpy array from dict."""
+    return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
 
 
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
@@ -170,9 +181,13 @@ class InferenceRequest:
             self.inference_parameters.serialize() if self.inference_parameters else None
         )
 
-        # Serialize tensors.
+        # Serialize tensors and numpy arrays.
         obj = {
-            k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
+            k: (
+                ("tensor", serialize_tensor(v))
+                if isinstance(v, torch.Tensor)
+                else ("ndarray", serialize_ndarray(v)) if isinstance(v, np.ndarray) else v
+            )
             for k, v in obj.items()
         }
         return obj
@@ -211,10 +226,12 @@ class InferenceRequest:
             else SamplingParams.deserialize(obj["inference_parameters"])
         )
 
-        # Deserialize tensors and sampling params.
+        # Deserialize tensors, numpy arrays, and sampling params.
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
+            elif isinstance(v, list) and len(v) == 2 and v[0] == "ndarray":
+                setattr(self, k, deserialize_ndarray(v[1]))
 
 
 class DynamicInferenceEventType(Enum):
@@ -289,7 +306,7 @@ class DynamicInferenceEvent:
         Returns:
             dict: Full event dict.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
+        nvtx_range_push("DynamicInferenceEvent.serialize")
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__.copy()
@@ -305,7 +322,7 @@ class DynamicInferenceEvent:
 
                 obj["payload"] = ContextErrorFactory.serialize(self.payload)
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceEvent.serialize")
         return obj
 
     @classmethod
@@ -351,9 +368,8 @@ class DynamicInferenceRequest(InferenceRequest):
     policy_epoch: Optional[list[tuple[int, int]]] = None
     kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
-    # routing_indices stores MoE routing decisions for all tokens generated so far.
-    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
-    routing_indices: Optional[torch.Tensor] = None
+    # routing_indices is reconstructed from per-block storage when a request finishes.
+    routing_indices: Optional[np.ndarray] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
@@ -419,12 +435,12 @@ class DynamicInferenceRequest(InferenceRequest):
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
+        nvtx_range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
 
-        # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
+        # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
             total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
             # the last generated token does not undergo a forward pass
@@ -434,7 +450,7 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"total tokens {total_tokens-1}."
             )
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
 
     def _post_deserialize(self, obj):
@@ -685,8 +701,9 @@ class DynamicInferenceRequestRecord:
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
-        if self.requests[0].routing_indices is not None:
-            routing_indices = torch.cat([r.routing_indices for r in self.requests])
+        routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        if routing_parts:
+            routing_indices = np.concatenate(routing_parts)
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -731,10 +748,10 @@ class DynamicInferenceRequestRecord:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
+        nvtx_range_push("DynamicInferenceRequestRecord.serialize")
         obj = self.__dict__.copy()  # shallow dict copy
         obj["requests"] = [r.serialize() for r in obj["requests"]]
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceRequestRecord.serialize")
         return obj
 
     @classmethod

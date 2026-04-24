@@ -16,7 +16,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -1570,7 +1570,7 @@ class TestDynamicContext:
 
         # --- reset and run fast path ---
         ctx.reset()
-        ctx.add_dummy_requests_for_expert_parallel_step()
+        ctx.add_dummy_requests_for_expert_parallel_step(smallest)
 
         # 1. Scalar counts
         assert ctx.total_request_count == slow_total_request_count
@@ -2838,6 +2838,67 @@ class TestDynamicContext:
         assert ctx.paused_speculative_tokens is not None
         assert ctx.paused_speculative_tokens[0, 0].item() == 100
         assert ctx.paused_speculative_tokens[1, 0].item() == 101
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_speculative_boundary_crossing_at_max_kv_block_count(self):
+        """Test that speculative pre-allocation works when a request has already
+        filled all ceil(max_seq_len / block_size) KV blocks.
+        """
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=32,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            num_speculative_tokens=2,
+            unified_memory_level=0,
+            max_tokens=512,
+            max_requests=512,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+        bs = ctx.block_size_tokens
+
+        # Setup 1 active decode request that has already filled all
+        # ceil(32/16) = 2 blocks, with the last block at offset 13.
+        # needs_new_block triggers at offset >= block_size - 1 - num_spec = 13.
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.active_token_count = 1
+
+        ctx.request_ids[0] = 10
+        ctx.request_query_lengths[0] = 1
+        ctx.request_kv_block_counts[0] = 2
+        ctx.request_kv_length_offsets[0] = bs + 14  # 16 + 14 = 30 tokens total
+        ctx.request_last_kv_block_offset[0] = 13  # 0-indexed, 14 tokens in last block
+
+        # Allocate 2 blocks manually.
+        blocks = ctx.kv_block_allocator.allocate_memory_blocks(2)
+        ctx.request_to_kv_block_ids[0, 0] = blocks[0]
+        ctx.request_to_kv_block_ids[0, 1] = blocks[1]
+        ctx.request_last_kv_block_id[0] = blocks[1]
+
+        active_requests_mask = torch.tensor([1], device='cuda')
+        new_tokens = torch.tensor([50], device='cuda')
+        new_speculative_tokens = torch.tensor([[51], [52]], device='cuda')
+
+        # This will pause the request (offset 13 >= 13), then resume it by
+        # allocating a 3rd block at col_idx=2. Without the fix, this raises
+        # an IndexError because request_to_kv_block_ids only has 2 columns.
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # Verify the 3rd block was allocated and assigned.
+        assert ctx.request_kv_block_counts[0] == 3
+        third_block = ctx.request_to_kv_block_ids[0, 2]
+        assert third_block != -1
+        assert third_block != blocks[0]
+        assert third_block != blocks[1]
 
     @pytest.mark.internal
     @rounder_override(64)
