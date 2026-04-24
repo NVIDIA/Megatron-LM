@@ -893,7 +893,7 @@ class TransformerConfig(ModelParallelConfig):
     """When set to True, clone the output of scatter_to_sequence_parallel_region in embedding layer
     to facilitate garbage collection of input."""
 
-    log_interval: int = 100
+    cp_moe_log_interval: int = 100
     """Generic logging interval propagated from training args (e.g., --log-interval)."""
 
     disable_parameter_transpose_cache: bool = False

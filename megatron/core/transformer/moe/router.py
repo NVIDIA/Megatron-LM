@@ -539,8 +539,8 @@ class CapacityPricedRouter(Router):
         self.expert_prices.clamp_(min=0.0)
 
         # --- logging ---
-        log_interval = max(int(getattr(self.config, 'log_interval', 50)), 1)
-        if int(self.cp_steps.item()) % log_interval == 0:
+        cp_moe_log_interval = max(int(getattr(self.config, 'cp_moe_log_interval', 50)), 1)
+        if int(self.cp_steps.item()) % cp_moe_log_interval == 0:
             self._log_prices_to_csv()
 
     def _log_prices_to_csv(self):

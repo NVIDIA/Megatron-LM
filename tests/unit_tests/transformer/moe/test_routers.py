@@ -685,7 +685,7 @@ class TestCapacityPricedRouter:
         self.router = self.router.cuda()
         self.router.train()
         self.router.layer_number = 3
-        self.router.config.log_interval = 50
+        self.router.config.cp_moe_log_interval = 50
 
         log_path = tmp_path / "lambda_log.csv"
         old_env = os.environ.get("CPMOE_LAMBDA_LOG")
