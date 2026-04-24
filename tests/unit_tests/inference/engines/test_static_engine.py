@@ -27,6 +27,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -112,6 +113,7 @@ class StaticInferenceEngineTestHarness:
             )
 
     def teardown_method(self, method):
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
 
