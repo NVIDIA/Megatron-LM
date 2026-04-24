@@ -46,11 +46,6 @@ class StaticInferenceEngineTestHarness:
         buffer_size_gb=10,
         inference_config_params_dtype=torch.float,
     ):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tensor_model_parallel_size,
-            pipeline_model_parallel_size=pipeline_model_parallel_size,
-        )
-
         model_parallel_cuda_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 32
@@ -112,12 +107,24 @@ class StaticInferenceEngineTestHarness:
                 buffer_size_gb=buffer_size_gb,
             )
 
+
+class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+
     def teardown_method(self, method):
+        delete_cuda_graphs()
+
+    @classmethod
+    def teardown_class(cls):
         delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
-
-class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
     @pytest.mark.parametrize(
         "batch_size,num_trials,empty_prompt",
         [(4, 1, False), (4, 1, True), (4, 3, False), (2, 1, False), (8, 1, False)],
@@ -295,6 +302,48 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
                 f"result.generated_log_probs={result.generated_log_probs}, "
                 f"final_streamed_token.generated_log_probs={final_streamed_token.generated_log_probs}"
             )
+
+
+
+class TestStaticInferenceEngineParallel(StaticInferenceEngineTestHarness):
+    """Tests that require non-default parallel configs (varying tp/pp/ep).
+
+    Each test initializes its own parallel state and tears it down afterward,
+    so these are separated from TestStaticInferenceEngine to avoid
+    accumulating NCCL communicator memory from repeated init/destroy cycles.
+    """
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    def setup_engine(
+        self,
+        engine_max_batch_size=None,
+        vocab_size=100,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=1,
+        sequence_parallel=False,
+        legacy=False,
+        buffer_size_gb=10,
+        inference_config_params_dtype=torch.float,
+    ):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+        )
+        super().setup_engine(
+            engine_max_batch_size=engine_max_batch_size,
+            vocab_size=vocab_size,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            sequence_parallel=sequence_parallel,
+            legacy=legacy,
+            buffer_size_gb=buffer_size_gb,
+            inference_config_params_dtype=inference_config_params_dtype,
+        )
 
     @pytest.mark.parametrize("sequence_parallel", [False, True])
     @pytest.mark.parametrize("ep_size", [1, 2])
