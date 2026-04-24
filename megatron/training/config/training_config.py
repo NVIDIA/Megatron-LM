@@ -630,7 +630,7 @@ class TokenizerConfig:
     metadata_path: str | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-metadata"]}})
     """Path to the tokenizer metadata file in json format."""
 
-    special_tokens: list[str] | None = field(default_factory=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-special-tokens"]}})
+    special_tokens: Optional[list[str]] = field(default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-special-tokens"]}})
     """List of special tokens. For TikTokenizer needs to have 
     ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]"""
 
