@@ -834,7 +834,7 @@ class RerunStateMachine:
         # state to a sharded object.
         # In NOT_RUNNING_YET this is all zero/None defaults (a sentinel);
         # in WILL_RERUN_FROM_CHECKPOINT it carries the real fault context. The
-        # ShardedObject key/shape/offset are identical in both cases. This is keep the
+        # ShardedObject key/shape/offset are identical in both cases. This keeps the
         # checkpoint's sharded structure constant across saves (a
         # requirement of ``--ckpt-assume-constant-structure``)
         # For details, see GitHub issue NVIDIA/Megatron-LM#4378.
