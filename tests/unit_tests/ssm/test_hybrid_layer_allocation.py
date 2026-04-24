@@ -691,6 +691,28 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mlp_map == {}
         assert moe_map == {}
 
+    def test_fused_entries(self):
+        """Fused multi-char entries contribute to each sub-type's map at the
+        same physical (global) layer index.
+        """
+        # Physical layer 0 is fused attention+MLP; layer 1 is stand-alone mamba.
+        maps = get_layer_maps_from_layer_type_list(["*-", "M"])
+        attention_map, mamba_map, mlp_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP
+        )(maps)
+        assert attention_map == {0: 0}
+        assert mlp_map == {0: 0}
+        assert mamba_map == {1: 0}
+
+        # Two fused blocks interleaved with stand-alone mamba.
+        maps = get_layer_maps_from_layer_type_list(["*-", "M", "*-", "M"])
+        attention_map, mamba_map, mlp_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP
+        )(maps)
+        assert attention_map == {0: 0, 2: 1}
+        assert mlp_map == {0: 0, 2: 1}
+        assert mamba_map == {1: 0, 3: 1}
+
 
 @pytest.mark.internal
 class TestStripBrackets:
@@ -753,9 +775,19 @@ class TestBracketValidation:
         assert result.main_pattern == "[*-]M|[*-]M"
 
     def test_valid_brackets_in_segment(self):
-        """validate_segment_layers strips brackets."""
+        """validate_segment_layers collapses each fusion group into a single entry."""
+        # Fused "[*-]" -> single multi-char entry, other layers stay single-char.
         result = validate_segment_layers("[*-]M*")
-        assert result == ['*', '-', 'M', '*']
+        assert result == ['*-', 'M', '*']
+
+        # Multiple fusion groups and mixed layers.
+        assert validate_segment_layers("[*-]M[*-]M") == ['*-', 'M', '*-', 'M']
+
+        # No brackets -> unchanged (every entry is single-character).
+        assert validate_segment_layers("M*-M") == ['M', '*', '-', 'M']
+
+        # Fused group of 3 sub-layers is still a single physical block.
+        assert validate_segment_layers("[M*-]M") == ['M*-', 'M']
 
     def test_unmatched_open_bracket(self):
         with pytest.raises(ValueError, match="unmatched '\\['"):

@@ -20,6 +20,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_layer_fusion import build_fused_layer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -36,8 +37,19 @@ from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_
 class HybridStackSubmodules:
     """
     A class for the module specs for the HybridStack.
+
+    The `*_layer` fields specify the full block used for a stand-alone layer
+    (a single symbol in the hybrid layer pattern).
+
+    The `*_mixer` fields specify the primitive module plugged into a
+    `TransformerLayer` when two layers are fused via the `[XY]` syntax
+    in the hybrid layer pattern. For a fused group `[XY]`, the sequence mixer
+    corresponding to `X` is used as `self_attention` and the channel mixer
+    corresponding to `Y` is used as `mlp` inside a freshly-built
+    `TransformerLayer` spec.
     """
 
+    # Stand-alone layer specs – one block per pattern symbol.
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
@@ -45,6 +57,16 @@ class HybridStackSubmodules:
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
+
+    # Primitive specs used when building a fused TransformerLayer at runtime.
+    # Sequence mixers fill the `self_attention` slot:
+    mamba_mixer: Union[ModuleSpec, type] = IdentityOp
+    gdn_mixer: Union[ModuleSpec, type] = IdentityOp
+    attention_mixer: Union[ModuleSpec, type] = IdentityOp
+    dsa_mixer: Union[ModuleSpec, type] = IdentityOp
+    # Channel mixers fill the `mlp` slot:
+    mlp_mixer: Union[ModuleSpec, type] = IdentityOp
+    moe_mixer: Union[ModuleSpec, type] = IdentityOp
 
 
 class HybridStack(GraphableMegatronModule, MegatronModule):
@@ -118,7 +140,24 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if layer_type == LayerSymbols.MAMBA:
+                if len(layer_type) > 1:
+                    # Multi-character entries come from bracketed fusion groups
+                    # in the hybrid layer pattern, e.g., "[*-]" -> "*-".
+                    # `layer_number` already includes `pp_layer_offset` (see
+                    # the computation at the top of this loop), so the outer
+                    # TransformerLayer must not add it again – same contract
+                    # as the stand-alone TransformerLayer dispatches below.
+                    layer = build_fused_layer(
+                        layer_type,
+                        submodules,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        pp_layer_offset=pp_layer_offset,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                    )
+                elif layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
@@ -204,6 +243,10 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:
                 return layer.mamba_state_shapes_per_request()
+            # Fused Mamba is surfaced via the enclosing TransformerLayer's `self_attention`
+            # attribute.
+            elif LayerSymbols.MAMBA in layer_type:
+                return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
     def _should_call_local_cudagraph(self, *args, **kwargs):

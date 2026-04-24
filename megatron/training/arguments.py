@@ -685,11 +685,18 @@ def validate_args(args, defaults={}):
     if args.hybrid_layer_pattern is not None:
         # Derive num_layers from pattern; hybrid_layer_pattern always overrides --num-layers when
         # both are present (e.g. when loading from checkpoint with --use-checkpoint-args).
+        # NOTE: `num_layers_in_pattern` counts physical transformer blocks: a fusion group
+        # `[XY]` in the pattern contributes 1 (one fused TransformerLayer), not 2. This is the
+        # right count for --pipeline-model-parallel-size divisibility and for sizing nn.Module
+        # containers, but it is not the sub-layer / compute-unit count: FLOPs or parameter
+        # budgeting should count sub-symbols (see `get_hybrid_layer_counts()` for per-type
+        # sub-layer counts).
         num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_layer_pattern)
         if args.num_layers is not None and args.num_layers != num_layers_in_pattern:
             warn_rank_0(
                 f'--hybrid-layer-pattern is set; ignoring --num-layers ({args.num_layers}) and '
-                f'using the layer count derived from the pattern ({num_layers_in_pattern}).',
+                f'using the physical-block count derived from the pattern '
+                f'({num_layers_in_pattern}). Fusion groups "[...]" each count as one block.',
                 args.rank,
             )
         args.num_layers = num_layers_in_pattern
@@ -708,6 +715,25 @@ def validate_args(args, defaults={}):
                 'If --hybrid-layer-pattern contains pipe separators, '
                 '--decoder-last-pipeline-num-layers should not be specified '
                 'as the pipeline layout is explicitly defined.'
+            )
+        # Uneven PP + fusion: warn the user that first/last stage layer counts
+        # are measured in physical blocks, not compute units. A stage
+        # consisting of fused blocks does more work per block than one of
+        # stand-alone blocks, so a value picked against compute targets will
+        # under-count the actual load on the uneven stages.
+        pattern_has_fusion = Symbols.FUSION_START in args.hybrid_layer_pattern
+        if pattern_has_fusion and (
+            args.decoder_first_pipeline_num_layers is not None
+            or args.decoder_last_pipeline_num_layers is not None
+        ):
+            warn_rank_0(
+                'Using --decoder-first/last-pipeline-num-layers with a '
+                '--hybrid-layer-pattern that contains fusion groups "[...]": '
+                'the arguments count physical blocks, not sub-layer compute '
+                'units, so fused stages will do more work per block than '
+                'stand-alone stages. Adjust the values to compensate if '
+                'balancing by compute rather than by block count.',
+                args.rank,
             )
         assert args.num_layers_per_virtual_pipeline_stage is None, (
             '--num-layers-per-virtual-pipeline-stage should not be used with '
