@@ -773,7 +773,7 @@ class MLASelfAttention(MultiLatentAttention):
     def _resolve_mla_qk_norm_config(
         self, submodules
     ) -> dict[str, ModuleSpec | type | LayerNormBuilder]:
-        linear_q_proj_cls = linear_q_up_proj_cls = None
+        linear_q_proj_cls = linear_q_up_proj_cls = IdentityOp
         if self.config.qk_l2_norm:
             raise ValueError("qk_l2_norm is not supported with MLA.")
         elif self.config.qk_layernorm:
