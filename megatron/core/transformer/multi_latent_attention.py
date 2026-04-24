@@ -29,6 +29,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.inference_layers import InferenceColumnParallelLinear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -37,6 +38,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -491,6 +493,8 @@ class MLASelfAttention(MultiLatentAttention):
             pp_layer_offset=pp_layer_offset,
         )
 
+        self._validate_qk_norm_spec(submodules)
+
         if self.config.q_lora_rank is None:
             # Not projecting query
             self.linear_q_proj = build_module(
@@ -609,6 +613,60 @@ class MLASelfAttention(MultiLatentAttention):
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
+
+    def _validate_qk_norm_spec(self, submodules):
+        """Check whether the Q/KV norm is configured twice from the spec.
+        This can occur when both a primitive norm submodule and a fused
+        norm+linear layer is used.
+        """
+        if (
+            self.config.q_lora_rank is None
+            # Q layernorm is not trivial
+            and submodules.q_layernorm not in (None, IdentityOp)
+        ):
+            help_msg = ""
+            # Q projection does not include a norm
+            if submodules.linear_q_proj in (
+                TEColumnParallelLinear,
+                InferenceColumnParallelLinear,
+                ColumnParallelLinear,
+            ):
+                help_msg = (
+                    f"Please use a fused norm+linear for "
+                    f"`linear_q_proj={submodules.linear_q_proj}` if "
+                    f"you intend to have a Q-norm."
+                )
+            raise RuntimeError(
+                f"`q_layernorm={submodules.q_layernorm}` is non-trivial, "
+                f"but `q_lora_rank is None`, meaning it will not be used."
+                f"{help_msg}"
+            )
+        if (
+            # Q layernorm is not trivial
+            submodules.q_layernorm not in (None, IdentityOp)
+            # Q up projection includes a norm
+            and submodules.linear_q_up_proj
+            not in (TEColumnParallelLinear, InferenceColumnParallelLinear, ColumnParallelLinear)
+        ):
+            raise RuntimeError(
+                f"`q_layernorm={submodules.q_layernorm}` is non-trivial "
+                f"and `linear_q_up_proj={submodules.linear_q_up_proj}` is a "
+                f"fused norm+linear; either unset `q_layernorm` or use a "
+                f"linear layer without norm fusion for `linear_q_up_proj`"
+            )
+        if (
+            # KV layernorm is not trivial
+            submodules.kv_layernorm not in (None, IdentityOp)
+            # KV up projection includes a norm
+            and submodules.linear_kv_up_proj
+            not in (TEColumnParallelLinear, InferenceColumnParallelLinear, ColumnParallelLinear)
+        ):
+            raise RuntimeError(
+                f"`kv_layernorm={submodules.kv_layernorm}` is non-trivial "
+                f"and `linear_kv_up_proj={submodules.linear_kv_up_proj}` is a "
+                f"fused norm+linear; either unset `kv_layernorm` or use a "
+                f"linear layer without norm fusion for `linear_kv_up_proj`"
+            )
 
     def _qkv_down_projection(self, hidden_states):
         """Unfused q/kv down projection path."""
@@ -1231,6 +1289,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             "FusedMLASelfAttention requires q_lora_rank to be set; "
             "fallback to MLASelfAttention for q_lora_rank=None."
         )
+        self._validate_qk_norm_spec(submodules)
 
         qkv_down_proj_kwargs = {}
         if submodules.linear_qkv_down_proj in [TELinear]:
