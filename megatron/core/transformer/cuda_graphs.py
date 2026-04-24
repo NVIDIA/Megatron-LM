@@ -531,6 +531,7 @@ def delete_cuda_graphs():
             runner.mempool = None
         mgr.cudagraph_runners.clear()
         mgr.inference_cudagraphs_lookup_table.clear()
+    _CudagraphGlobalRecord.mtp_cudagraph_managers.clear()
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False

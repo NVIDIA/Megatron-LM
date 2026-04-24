@@ -39,7 +39,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
@@ -134,6 +134,7 @@ class TestMTPCudaGraphInference:
         The engine's `__init__` calls `create_cuda_graphs()` which captures
         both decoder and MTP CUDA graphs, matching production warmup exactly.
         """
+        delete_cuda_graphs()
         model = self._build_model(
             sequence_parallel=sequence_parallel,
             mtp_num_layers=mtp_num_layers,
@@ -156,7 +157,6 @@ class TestMTPCudaGraphInference:
         wrapped.model_is_pipeline_parallel = False
         mock_tokenizer = mock.Mock()
         ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
-        delete_cuda_graphs()
         engine = DynamicInferenceEngine(ctrl, context)
         return engine
 
@@ -660,19 +660,23 @@ class TestMTPCudaGraphInference:
 
         MTP runners are excluded from the global inference record, so they
         require special handling in `delete_cuda_graphs()`.  After deletion,
-        no MTP runners should have `fwd_graph_recorded=True`.
+        no MTP runners should have `fwd_graph_recorded=True` and the global
+        manager list should be cleared.
         """
         engine = self._build_engine()
         model = engine.controller.inference_wrapped_model.model
 
         self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
-        delete_cuda_graphs()
-
         unwrapped = unwrap_model(model)
         manager = getattr(unwrapped, '_mtp_cudagraph_manager', None)
         assert manager is not None
+        assert len(manager.inference_cudagraphs_lookup_table) > 0
+
+        delete_cuda_graphs()
+
         assert len(manager.inference_cudagraphs_lookup_table) == 0
+        assert len(_CudagraphGlobalRecord.mtp_cudagraph_managers) == 0
 
 
 # --------------------------------------------------------------------------- #
