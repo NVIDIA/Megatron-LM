@@ -62,6 +62,8 @@ class HyperConnectionHybridLayer(MegatronModule):
         self.inner_layer = layer
         self.layer_number = layer.layer_number
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
+        if config.params_dtype is not None:
+            self.hyper_connection.to(dtype=config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
 

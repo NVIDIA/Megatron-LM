@@ -33,7 +33,11 @@ class TestHybridBlock:
     def get_mamba_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
         mhc_kwargs = (
-            {"enable_hyper_connections": True, "hidden_dropout": 0.0}
+            {
+                "enable_hyper_connections": True,
+                "hidden_dropout": 0.0,
+                "mhc_sinkhorn_iterations": 5,
+            }
             if enable_hyper_connections
             else {}
         )
@@ -55,8 +59,17 @@ class TestHybridBlock:
             pg_collection=self.get_pg_collection(),
         )
 
-    def get_dsa_mamba_block(self, layer_pattern):
+    def get_dsa_mamba_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
+        mhc_kwargs = (
+            {
+                "enable_hyper_connections": True,
+                "hidden_dropout": 0.0,
+                "mhc_sinkhorn_iterations": 5,
+            }
+            if enable_hyper_connections
+            else {}
+        )
         transformer_config = MLATransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
@@ -77,6 +90,7 @@ class TestHybridBlock:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
+            **mhc_kwargs,
         )
         modules = hybrid_stack_spec.submodules
         return HybridStack(
@@ -154,6 +168,102 @@ class TestHybridBlock:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == block.config.hidden_size
         assert output.dtype == torch.float32
+
+    def test_hyper_connection_gdn_gpu_forward(self):
+        """mHC runs through GDN, attention, and Mamba hybrid layers."""
+        layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
+        layer_type_list = validate_segment_layers(layer_pattern)
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            activation_func=torch.nn.functional.silu,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+        )
+        block = HybridStack(
+            transformer_config,
+            hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        )
+        block.cuda()
+        micro_batch_size = 2
+        sequence_length = 32
+        hidden_states = torch.ones((sequence_length, micro_batch_size, block.config.hidden_size))
+        hidden_states = hidden_states.cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+        output = block(hidden_states, attention_mask=attention_mask)
+        assert output.shape == (sequence_length, micro_batch_size, block.config.hidden_size)
+
+    def test_hyper_connection_dsa_layer_wrappers(self):
+        """mHC wraps DeepSeek-style DSA and MLP split layers."""
+        layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MLP
+        block = self.get_dsa_mamba_block(layer_pattern, enable_hyper_connections=True)
+        layers = block.layers
+        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in layers)
+        assert isinstance(layers[0].inner_layer, MambaLayer)
+        assert isinstance(layers[1].inner_layer, TransformerLayer)
+        assert isinstance(layers[1].inner_layer.self_attention, MLASelfAttention)
+        assert isinstance(layers[1].inner_layer.self_attention.core_attention, DSAttention)
+        assert isinstance(layers[2].inner_layer, TransformerLayer)
+        assert isinstance(layers[2].inner_layer.mlp, MLP)
+
+    def test_hyper_connection_pipeline_boundary_shapes(self):
+        """HybridStack keeps n-stream tensors between PP stages and contracts at the end."""
+        layer_type_list = validate_segment_layers(Symbols.MAMBA)
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+        )
+        modules = hybrid_stack_spec.submodules
+        first_stage = HybridStack(
+            transformer_config,
+            modules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            post_process=False,
+            pg_collection=self.get_pg_collection(),
+        ).cuda()
+        last_stage = HybridStack(
+            transformer_config,
+            modules,
+            pre_process=False,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=1,
+            post_process=True,
+            pg_collection=self.get_pg_collection(),
+        ).cuda()
+
+        micro_batch_size = 2
+        sequence_length = 32
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, transformer_config.hidden_size), device='cuda'
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device='cuda'
+        )
+
+        pp_hidden = first_stage(hidden_states, attention_mask=attention_mask)
+        assert pp_hidden.shape == (
+            sequence_length,
+            micro_batch_size,
+            transformer_config.hidden_size * transformer_config.num_residual_streams,
+        )
+
+        last_stage.set_input_tensor(pp_hidden.detach())
+        output = last_stage(hidden_states, attention_mask=attention_mask)
+        assert output.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size)
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = '+'
