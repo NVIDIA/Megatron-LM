@@ -16,6 +16,8 @@ encounters a multi-character entry in its `layer_type_list`.
 
 from typing import TYPE_CHECKING
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
@@ -223,3 +225,125 @@ def build_fused_layer(
         build_kwargs["pp_layer_offset"] = pp_layer_offset
 
     return build_module(fused_spec, **build_kwargs)
+
+
+# Canonical slot name each layer symbol uses in its stand-alone
+# sharded-state-dict output – i.e., the attribute path under which the
+# primitive's weights live when the block contains just that symbol. For a
+# fused `[XY]` block, the same primitives sit under `self_attention` (for the
+# sequence mixer X) and `mlp` (for the channel mixer Y); canonicalization
+# uses this table to rewrite fused keys back into the stand-alone layout so
+# fused and unfused patterns produce the same checkpoint keys. Only Mamba
+# needs an intra-block rename (`self_attention.` -> `mixer.`); every other
+# sequence mixer is stand-alone-hosted in a TransformerLayer whose
+# `self_attention` slot already matches the fused layout.
+_CANONICAL_SLOT_FOR_SYMBOL: dict[str, str] = {
+    LayerSymbols.MAMBA: "mixer",
+    LayerSymbols.GDN: "self_attention",
+    LayerSymbols.ATTENTION: "self_attention",
+    LayerSymbols.DS_ATTENTION: "self_attention",
+    LayerSymbols.MLP: "mlp",
+    LayerSymbols.MOE: "mlp",
+}
+
+
+def canonicalize_hybrid_sharded_state_dict(
+    sharded_state_dict: ShardedStateDict,
+    layer_prefix: str,
+    layer_type_list: list[str],
+    physical_offset: int = 0,
+    sub_layer_offset: int = 0,
+) -> None:
+    """Rewrite HybridStack layer keys into the canonical (unfused) layout, in place.
+
+    `HybridStack.sharded_state_dict` emits keys indexed by global physical
+    block position within the model (a fused `[XY]` group still occupies a
+    single physical block). Fused blocks are realized as `TransformerLayer`s
+    whose `self_attention` slot holds the sequence mixer and `mlp` slot
+    holds the channel mixer, so their keys do not match what a stand-alone
+    `X` followed by stand-alone `Y` would produce. This function rewrites
+    each fused block's keys into two sub-layer-indexed prefixes that
+    do match: `layers.{sub_layer_offset + i}.mixer.*` for mamba sub-layers,
+    `layers.{sub_layer_offset + i}.mlp.*` for MLP, etc. Stand-alone blocks
+    are simply re-indexed from physical to sub-layer index.
+
+    The resulting keys are fusion-independent – a checkpoint written with
+    `[*-]M` and one written with `*-M` end up with the same set of keys, so
+    the dist_checkpointing layer can load either into either.
+
+    Args:
+        sharded_state_dict: The sharded state dict to rewrite in place. Only
+            entries whose keys start with `layer_prefix` are touched.
+        layer_prefix: The full prefix up to and including `"layers."`, e.g.
+            `"decoder.layers."`. Keys outside this prefix are left alone.
+        layer_type_list: The per-physical-block layer-type symbols for this
+            pipeline segment (a single `"M"`, `"*"`, etc. for a stand-alone
+            block; a two-char string like `"*-"` for a fused group).
+        physical_offset: The global physical-block index at which this
+            pipeline segment starts (i.e., the value `HybridStack` uses to
+            derive each layer's `layer_number`). Defaults to 0, which is
+            correct for non-pipeline-parallel runs.
+        sub_layer_offset: The global sub-layer index at which this pipeline
+            segment starts. Accounts for sub-layers contributed by earlier
+            pipeline segments so that fused groups in those segments are
+            correctly counted. When the model is not pipeline-parallel (or
+            no earlier segment contains a fusion group), this is equal to
+            `physical_offset` and may be left at its default.
+
+    Notes:
+        - Build up a combined prefix map across all layers and apply it in
+          one `apply_prefix_mapping` pass. This keeps the rewrite narrow
+          (sibling keys outside `layer_prefix` are untouched) and lets the
+          function safely run on the full model state dict without tripping
+          on embedding or output-layer entries.
+        - Order matters inside the combined prefix map: `apply_prefix_mapping`
+          picks the first matching prefix, so the specific sub-prefixes
+          (e.g. `"input_layernorm."`) are inserted before the bare block
+          prefix fallback.
+        - Norms attached to the X sub-layer (e.g. `input_layernorm` for DSA)
+          stay with X's sub-layer index; norms attached to Y (e.g.
+          `pre_mlp_layernorm` for MoE) attach to Y's sub-layer index.
+    """
+    prefix_map: dict[str, str] = {}
+    sub_layer_cursor = sub_layer_offset
+
+    for local_layer_idx, layer_type in enumerate(layer_type_list):
+        physical_prefix = f'{layer_prefix}{physical_offset + local_layer_idx}.'
+
+        if len(layer_type) == 1:
+            # Stand-alone block: one physical block == one sub-layer, and the
+            # block's attribute layout already matches the canonical
+            # stand-alone layout. Only the outer block index needs to move
+            # from the local module-list index to the global sub-layer index.
+            canonical_prefix = f'{layer_prefix}{sub_layer_cursor}.'
+            prefix_map[physical_prefix] = canonical_prefix
+            sub_layer_cursor += 1
+        else:
+            # Fused block `[XY]`: split the single physical block's keys into
+            # two sub-layer prefixes so the checkpoint looks exactly as it
+            # would for stand-alone `X` followed by stand-alone `Y`.
+            x_sym, y_sym = layer_type[0], layer_type[1]
+            canonical_x_prefix = f'{layer_prefix}{sub_layer_cursor}.'
+            canonical_y_prefix = f'{layer_prefix}{sub_layer_cursor + 1}.'
+            slot_for_x = _CANONICAL_SLOT_FOR_SYMBOL[x_sym]
+            slot_for_y = _CANONICAL_SLOT_FOR_SYMBOL[y_sym]
+
+            # Specific sub-prefixes before the bare block prefix fallback.
+            prefix_map[f'{physical_prefix}input_layernorm.'] = (
+                f'{canonical_x_prefix}input_layernorm.'
+            )
+            prefix_map[f'{physical_prefix}self_attention.'] = f'{canonical_x_prefix}{slot_for_x}.'
+            prefix_map[f'{physical_prefix}self_attn_bda.'] = f'{canonical_x_prefix}self_attn_bda.'
+            prefix_map[f'{physical_prefix}pre_mlp_layernorm.'] = (
+                f'{canonical_y_prefix}pre_mlp_layernorm.'
+            )
+            prefix_map[f'{physical_prefix}mlp.'] = f'{canonical_y_prefix}{slot_for_y}.'
+            prefix_map[f'{physical_prefix}mlp_bda.'] = f'{canonical_y_prefix}mlp_bda.'
+            # Fallback for any stray top-level fused-block keys (e.g.,
+            # `_extra_state` attached to the TransformerLayer itself);
+            # attach them to X's sub-layer index by convention.
+            prefix_map[physical_prefix] = canonical_x_prefix
+            sub_layer_cursor += 2
+
+    if prefix_map:
+        apply_prefix_mapping(sharded_state_dict, prefix_map)
