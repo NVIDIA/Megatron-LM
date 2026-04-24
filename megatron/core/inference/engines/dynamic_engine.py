@@ -17,7 +17,6 @@ from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 from torch import Tensor
 
@@ -260,10 +259,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
-
-        # Routing indices dtype for numpy storage.
-        _num_experts = model_config.num_moe_experts or 0
-        self._routing_indices_dtype = np.int16 if _num_experts <= 32768 else np.int32
 
         # Create cuda graphs.
         self.create_cuda_graphs()
