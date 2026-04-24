@@ -70,6 +70,7 @@ class MambaContextParallel:
         A_log_cp1: torch.Tensor,
         D_cp1: torch.Tensor,
         D_has_hdim: bool,
+        mixer=None,
     ) -> None:
         if not HAVE_EINOPS:
             raise ImportError("einops is required by the Mamba model but cannot be imported")
@@ -84,6 +85,7 @@ class MambaContextParallel:
         self.A_log_cp1 = A_log_cp1
         self.D_cp1 = D_cp1
         self.D_has_hdim = D_has_hdim
+        self._mixer = mixer
 
         self.cp_size = self.cp_group.size()
 
@@ -231,24 +233,29 @@ class MambaContextParallel:
     def get_conv1d_weight(self) -> torch.Tensor:
         """Returns a slice of the conv1d weight relevant to the current context parallel rank"""
         # weight shape: [conv_dim, 1, d_conv]
-        return self._slice_conv_param(self.conv1d_cp1.weight)
+        conv1d = self._mixer.conv1d if self._mixer is not None else self.conv1d_cp1
+        return self._slice_conv_param(conv1d.weight)
 
     def get_conv1d_bias(self) -> torch.Tensor:
         """Returns a slice of the conv1d bias relevant to the current context parallel rank"""
         # bias shape: [conv_dim]
-        return self._slice_conv_param(self.conv1d_cp1.bias)
+        conv1d = self._mixer.conv1d if self._mixer is not None else self.conv1d_cp1
+        return self._slice_conv_param(conv1d.bias)
 
     def get_dt_bias(self) -> torch.Tensor:
         """Returns a slice of dt_bias relevant to the current context parallel rank"""
-        return self._slice_vector_param(self.dt_bias_cp1)
+        param = self._mixer.dt_bias if self._mixer is not None else self.dt_bias_cp1
+        return self._slice_vector_param(param)
 
     def get_A_log(self) -> torch.Tensor:
         """Returns a slice of A_log relevant to the current context parallel rank"""
-        return self._slice_vector_param(self.A_log_cp1)
+        param = self._mixer.A_log if self._mixer is not None else self.A_log_cp1
+        return self._slice_vector_param(param)
 
     def get_D(self) -> torch.Tensor:
         """Returns a slice of D relevant to the current context parallel rank"""
-        return self._slice_vector_param(self.D_cp1, has_hdim=self.D_has_hdim)
+        param = self._mixer.D if self._mixer is not None else self.D_cp1
+        return self._slice_vector_param(param, has_hdim=self.D_has_hdim)
 
     def _slice_conv_param(self, param: torch.Tensor) -> torch.Tensor:
         """
