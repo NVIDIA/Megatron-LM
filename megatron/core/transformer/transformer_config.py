@@ -723,6 +723,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_cp_price_update_frequency: int = 1
     """Update expert prices every N routing steps."""
 
+    moe_cp_log_interval: int = 100
+    """Logging interval for CP-MoE price logging when enabled."""
+
     moe_router_bias_update_rate: float = 1e-3
     """The expert bias is updated based on the number of assigned tokens to each expert
     in a global batch, where the bias is increased for the experts with less assigned tokens
@@ -892,9 +895,6 @@ class TransformerConfig(ModelParallelConfig):
     clone_scatter_output_in_embedding: bool = True
     """When set to True, clone the output of scatter_to_sequence_parallel_region in embedding layer
     to facilitate garbage collection of input."""
-
-    cp_moe_log_interval: int = 100
-    """Generic logging interval propagated from training args (e.g., --log-interval)."""
 
     disable_parameter_transpose_cache: bool = False
     """When set to true, the parameter transposes are not cached for subsequent iterations."""

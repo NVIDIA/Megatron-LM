@@ -539,23 +539,32 @@ class CapacityPricedRouter(Router):
         self.expert_prices.clamp_(min=0.0)
 
         # --- logging ---
-        cp_moe_log_interval = max(int(getattr(self.config, 'cp_moe_log_interval', 50)), 1)
-        if int(self.cp_steps.item()) % cp_moe_log_interval == 0:
-            self._log_prices_to_csv()
+        moe_cp_log_interval = max(int(getattr(self.config, 'moe_cp_log_interval', 50)), 1)
+        if int(self.cp_steps.item()) % moe_cp_log_interval == 0:
+            self._log_prices_to_wandb()
 
-    def _log_prices_to_csv(self):
-        """Append current expert prices to a CSV file."""
-        log_path = os.environ.get('CPMOE_LAMBDA_LOG', 'lambda_log.csv')
-        prices = self.expert_prices.detach().cpu().tolist()
+    def _log_prices_to_wandb(self):
+        """Log per-expert lambda values to WandB."""
+        try:
+            import wandb
+            if wandb.run is None:
+                return
+        except ImportError:
+            return
+
+        prices = self.expert_prices.detach().cpu()
         step = int(self.cp_steps.item())
 
-        write_header = not os.path.exists(log_path)
-        with open(log_path, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if write_header:
-                header = ['step', 'layer'] + [f'expert_{i}' for i in range(len(prices))]
-                writer.writerow(header)
-            writer.writerow([step, self.layer_number] + prices)
+        log_dict = {
+            f'lambda/layer_{self.layer_number}/expert_{i}': prices[i].item()
+            for i in range(len(prices))
+        }
+        log_dict.update({
+            f'lambda/layer_{self.layer_number}/mean': prices.mean().item(),
+            f'lambda/layer_{self.layer_number}/max': prices.max().item(),
+            f'lambda/layer_{self.layer_number}/norm': prices.norm().item(),
+        })
+        wandb.log(log_dict, step=step)
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         self._maintain_float32_expert_prices()

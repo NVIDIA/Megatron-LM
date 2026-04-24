@@ -529,6 +529,49 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    def _log_routing_stats(self, routing_map: torch.Tensor):
+        """Log Gini and entropy to WandB."""
+        import math
+        try:
+            import wandb
+            if wandb.run is None:
+                return
+        except ImportError:
+            return
+
+        step = self._get_step()
+        log_interval = 50
+        if step % log_interval != 0:
+            return
+
+        with torch.no_grad():
+            usage = routing_map.float().sum(dim=0).cpu()
+            n = len(usage)
+
+            # Gini
+            if usage.sum() == 0:
+                gini = 0.0
+            else:
+                u_sorted, _ = torch.sort(usage)
+                cumsum = torch.cumsum(u_sorted, dim=0)
+                gini = float((n + 1 - 2 * cumsum.sum() / cumsum[-1]) / n)
+
+            # Entropy
+            probs = usage / (usage.sum() + 1e-8)
+            entropy = float(-sum(p * math.log(p + 1e-8) for p in probs.tolist()))
+            normalized_entropy = entropy / math.log(n) if math.log(n) > 0 else 0.0
+
+            log_dict = {
+                f'routing/layer_{self.layer_number}/gini': gini,
+                f'routing/layer_{self.layer_number}/entropy': normalized_entropy,
+            }
+
+            # Per-expert usage
+            for i, u in enumerate(usage.tolist()):
+                log_dict[f'routing/layer_{self.layer_number}/usage_expert_{i}'] = u
+
+            wandb.log(log_dict, step=step)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -573,6 +616,8 @@ class MoELayer(BaseMoELayer):
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
+                    if self.training:
+                        self._log_routing_stats(routing_map)
                     if update_cp_prices:
                         expert_usage_counts = routing_map.sum(dim=0).to(dtype=torch.float32)
                         expert_usage_counts = reduce_from_tensor_model_parallel_region(
