@@ -16,7 +16,7 @@ import contextlib
 import inspect
 import logging
 from importlib.metadata import version
-from typing import Callable, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 
 try:
     import einops
