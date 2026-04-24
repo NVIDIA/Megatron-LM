@@ -972,7 +972,7 @@ jobs:
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || github.event == 'merge_group'
+        || github.event_name == 'merge_group'
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
