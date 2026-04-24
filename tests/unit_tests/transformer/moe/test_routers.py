@@ -2,8 +2,8 @@
 
 
 from typing import cast
-import csv
-import os
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -681,40 +681,29 @@ class TestCapacityPricedRouter:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_update_prices_writes_csv_log(self, tmp_path):
+    def test_log_prices_to_wandb(self, monkeypatch):
         self.router = self.router.cuda()
-        self.router.train()
         self.router.layer_number = 3
-        self.router.config.cp_moe_log_interval = 50
+        self.router.cp_steps.fill_(123)
+        with torch.no_grad():
+            self.router.expert_prices.copy_(torch.tensor([0.5, 1.5, 2.5, 3.5], device="cuda"))
 
-        log_path = tmp_path / "lambda_log.csv"
-        old_env = os.environ.get("CPMOE_LAMBDA_LOG")
-        os.environ["CPMOE_LAMBDA_LOG"] = str(log_path)
+        wandb_log = Mock()
+        fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+        monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
 
-        try:
-            # Force the 50-step logging interval twice to validate append behavior.
-            self.router.expert_prices.zero_()
-            self.router.cp_steps.fill_(49)
-            usage = torch.tensor([8.0, 0.0, 4.0, 4.0], device="cuda")
-            self.router.update_prices(usage)
+        self.router._log_prices_to_wandb()
 
-            assert log_path.exists()
-
-            self.router.cp_steps.fill_(99)
-            self.router.update_prices(usage)
-
-            with open(log_path, newline="") as f:
-                rows = list(csv.reader(f))
-
-            # Header should be written once, then one row per logging step.
-            assert rows[0][0:2] == ["step", "layer"]
-            assert rows[0][2:] == [f"expert_{i}" for i in range(self.router.config.num_moe_experts)]
-            assert len(rows) == 3
-            assert rows[1][0:2] == ["50", "3"]
-            assert rows[2][0:2] == ["100", "3"]
-        finally:
-            if old_env is None:
-                os.environ.pop("CPMOE_LAMBDA_LOG", None)
-            else:
-                os.environ["CPMOE_LAMBDA_LOG"] = old_env
-
+        expected = {
+            "lambda/layer_3/expert_0": 0.5,
+            "lambda/layer_3/expert_1": 1.5,
+            "lambda/layer_3/expert_2": 2.5,
+            "lambda/layer_3/expert_3": 3.5,
+            "lambda/layer_3/mean": 2.0,
+            "lambda/layer_3/max": 3.5,
+            "lambda/layer_3/norm": torch.tensor([0.5, 1.5, 2.5, 3.5]).norm().item(),
+        }
+        wandb_log.assert_called_once()
+        args, kwargs = wandb_log.call_args
+        assert args == (expected,)
+        assert kwargs == {"step": 123}
