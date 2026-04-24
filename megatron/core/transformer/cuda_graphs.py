@@ -797,6 +797,10 @@ class _CudaGraphRunner(torch.nn.Module):
         self.outputs = outputs
 
         # save grads and other variables that may be affected by graph warmup
+        buffer_backup = []
+        for buf in self.base_module.buffers():
+            buffer_backup.append(buf.clone())
+
         if self.training and torch.is_grad_enabled():
             grad_backup = []
             for param in self.base_module.parameters():
@@ -842,7 +846,6 @@ class _CudaGraphRunner(torch.nn.Module):
         def _resolve_input_buffer(ten):
             if not isinstance(ten, ArgMetadata):
                 return ten
-
             # the input tensor is resued from another cudagraph's input or output
             if (
                 hasattr(ten, "cg_buffer_metadata")
@@ -913,7 +916,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     def clone_ten(ten):
                         if not torch.is_tensor(ten):
                             return ten
-                        return torch.zeros_like(ten).requires_grad_(ten.requires_grad)
+                        return torch.clone(ten).detach().requires_grad_(ten.requires_grad)
 
                     warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
                     warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
@@ -986,17 +989,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 o.cg_buffer_metadata.fwd_cudagraph_buffer = fwd_graph_out
                 fwd_buffer_reuse_ref_count += 1
 
-        # if an input buffer requires a copy, and does not have metadata attached to it at this
-        # point, it will not be reused after this forward pass, so return it to the pool
-        for buf in self.fwd_graph_input_surface:
-            if (
-                hasattr(buf, "can_skip_replay_copy")
-                and not buf.can_skip_replay_copy
-                and not hasattr(buf, "cg_buffer_metadata")
-            ):
-                assert _CudagraphGlobalRecord.tensor_reuse_pool.owns(buf)
-                _CudagraphGlobalRecord.tensor_reuse_pool.insert(buf)
-
         if self.training and torch.is_grad_enabled():
             assert (
                 len(self.fwd_graph_output_surface) > 0
@@ -1011,7 +1003,9 @@ class _CudaGraphRunner(torch.nn.Module):
 
             if self.fp8_enabled:
                 restore_fp8_tensors([self.base_module], saved_fp8_tensors)
-            # restore cached grads
+            # restore cached grads and buffers
+            for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
+                buf.copy_(buf_copy)
             for main_grad_copy, param in zip(grad_backup, self.base_module.parameters()):
                 if main_grad_copy is not None:
                     param.main_grad.copy_(main_grad_copy)
@@ -1625,10 +1619,6 @@ class CudaGraphManager(torch.nn.Module):
                 runner = self.get_cudagraph_runner(
                     megatron_module, args, kwargs, self.reuse_cudagraphs
                 )
-                # check if a layer is frozen during training.
-                if not torch.is_grad_enabled():
-                    # If the layer is frozen, we need to set the runner to eval mode.
-                    runner.eval()
                 out = runner.record_graph_capture(args, kwargs)
             else:
                 # No cudagraphs were found in training mode with grad disabled, so fallback to
