@@ -1,12 +1,13 @@
 """Unit tests for TemporaryBucketAllocator. Pure CPU, no torch.distributed."""
 
 import sys
+from pathlib import Path
 
 import pytest
 import torch
 
-sys.path.insert(0, "/home/tongliu/tongliu/megatron/fsdp/Megatron-LM")
-from megatron.core.distributed.fsdp_refactor.src.allocator import Bucket, TemporaryBucketAllocator
+sys.path.insert(0, str(Path(__file__).parents[2]))
+from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.allocator import Bucket, TemporaryBucketAllocator
 
 
 def _run_allocator_tests(allocator: TemporaryBucketAllocator) -> None:

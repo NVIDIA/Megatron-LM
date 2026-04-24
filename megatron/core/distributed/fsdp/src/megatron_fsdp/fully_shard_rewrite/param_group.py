@@ -7,7 +7,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from .allocator import TemporaryBucketAllocator
 from .dp_buffer import DataParallelBuffer
-from .uneven_dtensor import make_uneven_dtensor
+from ..uneven_dtensor import make_uneven_dtensor
 
 
 class ParameterGroup:

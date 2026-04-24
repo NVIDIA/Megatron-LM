@@ -5,17 +5,18 @@ two ParameterGroups, and validates shard / unshard / reshard / reduce_grad
 across all four sharding strategies.
 
 Run with:
-    torchrun --nproc_per_node=4 -m pytest megatron/core/distributed/fsdp_refactor/src/test_param_group.py -v
+    torchrun --nproc_per_node=4 -m pytest megatron.core.distributed.fsdp.src.megatron_fsdp.tests.test_param_group -v
 """
 
 import sys
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, "/home/tongliu/tongliu/megatron/fsdp/Megatron-LM")
-from megatron.core.distributed.fsdp_refactor.src.param_group import ParameterGroup
+sys.path.insert(0, str(Path(__file__).parents[2]))
+from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.param_group import ParameterGroup
 
 # ------------------------------------------------------------------ #
 #  Process group — init once per pytest session, shared by all tests
@@ -88,12 +89,10 @@ def _build_groups(strategy):
         pg = ParameterGroup(
             params=params,
             fsdp_unit_id=0,
-            dp_group=dp_group,
-            device=device,
+            mesh=None,
             sharding_strategy=strategy,
             param_group_id=gid,
         )
-        pg.init_buffers()
         groups.append(pg)
         # Snapshot original (pre-shard) values for later comparison
         originals.append([p.detach().clone() for p in params])
