@@ -465,6 +465,273 @@ class TestHybridDSAQKLayernorm(TestHybridQKLayernorm):
             super().test_qk_l2_norm_from_config()
 
 
+class _MLAQKNormTestBase:
+    """Common machinery for MLA/DSA QK-norm spec tests.
+
+    Subclasses override `experimental_attention_variant` and
+    `hybrid_layer_pattern` to target the MLA vs. DSA code path.
+    """
+
+    experimental_attention_variant = None
+    hybrid_layer_pattern = "M+-"
+    mla_layer_attr = "mla_layer"
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _make_spec(self, **submodule_overrides):
+        """Return a copy of `hybrid_stack_spec` with MLA/DSA submodule overrides."""
+        import copy
+
+        spec = copy.deepcopy(hybrid_stack_spec)
+        mla_submodules = getattr(
+            spec.submodules, self.mla_layer_attr
+        ).submodules.self_attention.submodules
+        for key, value in submodule_overrides.items():
+            setattr(mla_submodules, key, value)
+        return spec
+
+    def _build_model(self, spec=None, **config_overrides):
+        if spec is None:
+            spec = hybrid_stack_spec
+        config_kwargs = dict(
+            num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        if self.experimental_attention_variant is not None:
+            config_kwargs["experimental_attention_variant"] = self.experimental_attention_variant
+        config_kwargs.update(config_overrides)
+        config = MLATransformerConfig(**config_kwargs)
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern=self.hybrid_layer_pattern,
+        )
+
+    def _get_mla_attention(self, model):
+        """Return the MLA self-attention submodule, or None."""
+        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+        for layer in model.decoder.layers:
+            if hasattr(layer, 'self_attention') and isinstance(
+                layer.self_attention, MLASelfAttention
+            ):
+                return layer.self_attention
+        return None
+
+
+class TestMLAQKNormSpecValidation(_MLAQKNormTestBase):
+    """Tests `_validate_qk_norm_spec` in `MLASelfAttention`.
+
+    These errors guard against silently ignoring a configured norm or
+    double-applying one through a fused norm+linear.
+    """
+
+    experimental_attention_variant = None
+    hybrid_layer_pattern = "M+-"
+    mla_layer_attr = "mla_layer"
+
+    def test_q_norm_without_q_lora_rank_raises(self):
+        """When `q_lora_rank is None`, a non-trivial `q_layernorm` would
+        never be reached and must error out.
+        """
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        spec = self._make_spec(q_layernorm=TENorm)
+        with pytest.raises(RuntimeError, match=r"q_lora_rank is None"):
+            self._build_model(spec=spec, q_lora_rank=None)
+
+    def test_q_norm_without_q_lora_rank_hint_for_non_fused_linear(self):
+        """Error message hints at fused linear when `linear_q_proj` is non-fused."""
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        spec = self._make_spec(q_layernorm=TENorm)
+        with pytest.raises(RuntimeError, match=r"fused norm\+linear for"):
+            self._build_model(spec=spec, q_lora_rank=None)
+
+    def test_fused_linear_q_up_with_q_norm_raises(self):
+        """Non-trivial `q_layernorm` combined with a fused `linear_q_up_proj`
+        would apply the norm twice.
+        """
+        from megatron.core.extensions.transformer_engine import (
+            TELayerNormColumnParallelLinear,
+            TENorm,
+        )
+
+        spec = self._make_spec(q_layernorm=TENorm, linear_q_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(RuntimeError, match=r"fused norm\+linear"):
+            self._build_model(spec=spec)
+
+    def test_fused_linear_kv_up_with_kv_norm_raises(self):
+        """Non-trivial `kv_layernorm` combined with a fused `linear_kv_up_proj`
+        would apply the norm twice.
+        """
+        from megatron.core.extensions.transformer_engine import (
+            TELayerNormColumnParallelLinear,
+            TENorm,
+        )
+
+        spec = self._make_spec(
+            kv_layernorm=TENorm, linear_kv_up_proj=TELayerNormColumnParallelLinear
+        )
+        with pytest.raises(RuntimeError, match=r"fused norm\+linear"):
+            self._build_model(spec=spec)
+
+
+class TestMLAQKNormResolution(_MLAQKNormTestBase):
+    """Tests `_resolve_mla_qk_norm_config` branches.
+
+    Covers fusion auto-selection, spec overrides, and the "disabled"-path
+    guards that reject fused/explicit norms when `qk_layernorm` is off.
+    """
+
+    experimental_attention_variant = None
+    hybrid_layer_pattern = "M+-"
+    mla_layer_attr = "mla_layer"
+
+    def test_qk_layernorm_fuses_kv_up_by_default(self):
+        """With default (trivial) `kv_layernorm`, enabling `qk_layernorm`
+        auto-selects the fused `TELayerNormColumnParallelLinear` for KV up.
+        """
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        model = self._build_model(qk_layernorm=True)
+        attn = self._get_mla_attention(model)
+        assert attn is not None
+        assert isinstance(attn.linear_kv_up_proj, TELayerNormColumnParallelLinear)
+        assert isinstance(attn.kv_layernorm, IdentityOp)
+
+    def test_spec_q_norm_disables_q_up_fusion(self):
+        """A non-trivial `q_layernorm` from the spec must force a non-fused
+        `linear_q_up_proj` so the norm isn't applied on top of a fused one.
+        """
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+            TENorm,
+        )
+
+        spec = self._make_spec(q_layernorm=TENorm)
+        model = self._build_model(spec=spec, qk_layernorm=True)
+        attn = self._get_mla_attention(model)
+        assert attn is not None
+        assert isinstance(attn.linear_q_up_proj, TEColumnParallelLinear)
+        assert not isinstance(attn.linear_q_up_proj, TELayerNormColumnParallelLinear)
+        # The spec's norm is actually used; it's not reset to IdentityOp.
+        assert attn.q_layernorm is not None
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        assert not isinstance(attn.q_layernorm, IdentityOp)
+
+    def test_spec_kv_norm_disables_kv_up_fusion(self):
+        """Mirror of `test_spec_q_norm_disables_q_up_fusion` for KV."""
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+            TENorm,
+        )
+
+        spec = self._make_spec(kv_layernorm=TENorm)
+        model = self._build_model(spec=spec, qk_layernorm=True)
+        attn = self._get_mla_attention(model)
+        assert attn is not None
+        assert isinstance(attn.linear_kv_up_proj, TEColumnParallelLinear)
+        assert not isinstance(attn.linear_kv_up_proj, TELayerNormColumnParallelLinear)
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        assert not isinstance(attn.kv_layernorm, IdentityOp)
+
+    def test_disabled_qk_layernorm_rejects_fused_linear_q_up(self):
+        """When `qk_layernorm` is off, spec must not force fused linear_q_up_proj."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_q_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"supposed to be disabled"):
+            self._build_model(spec=spec)
+
+    def test_disabled_qk_layernorm_rejects_fused_linear_kv_up(self):
+        """When `qk_layernorm` is off, spec must not force fused linear_kv_up_proj."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_kv_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"supposed to be disabled"):
+            self._build_model(spec=spec)
+
+    def test_disabled_qk_layernorm_rejects_spec_kv_norm(self):
+        """When `qk_layernorm` is off, spec must not carry an explicit kv_layernorm."""
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        spec = self._make_spec(kv_layernorm=TENorm)
+        with pytest.raises(ValueError, match=r"supposed to be disabled"):
+            self._build_model(spec=spec)
+
+
+class TestDSAQKNormResolution(_MLAQKNormTestBase):
+    """Tests `_resolve_dsa_qk_norm_config`.
+
+    DSA requires non-fused Q/KV up projections and explicit norms;
+    the fused optimization valid for MLA must be rejected here.
+    """
+
+    experimental_attention_variant = "dsa"
+    hybrid_layer_pattern = "MD-"
+    mla_layer_attr = "dsa_layer"
+
+    def test_qk_layernorm_uses_unfused_linear_and_te_norm(self):
+        """With default spec, DSA + `qk_layernorm=True` uses non-fused
+        `TEColumnParallelLinear` and `TENorm` for Q/KV.
+        """
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+        )
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        model = self._build_model(qk_layernorm=True)
+        attn = self._get_mla_attention(model)
+        assert attn is not None
+        assert isinstance(attn.linear_q_up_proj, TEColumnParallelLinear)
+        assert not isinstance(attn.linear_q_up_proj, TELayerNormColumnParallelLinear)
+        assert isinstance(attn.linear_kv_up_proj, TEColumnParallelLinear)
+        assert not isinstance(attn.linear_kv_up_proj, TELayerNormColumnParallelLinear)
+        assert not isinstance(attn.q_layernorm, IdentityOp)
+        assert not isinstance(attn.kv_layernorm, IdentityOp)
+
+    def test_qk_layernorm_rejects_fused_linear_q_up(self):
+        """DSA does not support the fused norm+linear optimization."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_q_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(
+            RuntimeError, match=r"fused norm\+linear, but this is not supported for DSA"
+        ):
+            self._build_model(spec=spec, qk_layernorm=True)
+
+    def test_qk_layernorm_without_q_lora_rejects_fused_linear_q(self):
+        """DSA does not support fused `linear_q_proj` when `q_lora_rank=None`."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_q_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(
+            RuntimeError, match=r"fused norm\+linear, but this is not supported for DSA"
+        ):
+            self._build_model(spec=spec, qk_layernorm=True, q_lora_rank=None)
+
+    def test_disabled_qk_layernorm_rejects_fused_linear_kv_up(self):
+        """When `qk_layernorm` is off, spec must not force fused linear_kv_up_proj."""
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        spec = self._make_spec(linear_kv_up_proj=TELayerNormColumnParallelLinear)
+        with pytest.raises(ValueError, match=r"supposed to be disabled"):
+            self._build_model(spec=spec)
+
+
 class TestHybridWithDynamicInference:
     """Tests HybridModel with dynamic inference."""
 
