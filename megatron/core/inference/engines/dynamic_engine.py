@@ -115,10 +115,6 @@ DEPRECATED_ARGS = [
     "pg_collection",
 ]
 
-# Used to turn a synchronous CUDA event wait into an asynchronous yielding poll.
-# Should be set to <1% of the forward step time. A value of 0 is safe, but may be inefficient.
-CUDA_EVENT_POLL_INTERVAL_S = 1e-4
-
 
 class EngineState(Enum):
     """State machine for the inference engine."""
@@ -1078,7 +1074,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return self._add_request(request)
 
     def _prepare_bookkeep_work_item(
-        self, step_result: Optional[Dict], context_state: Dict, step_time: float
+        self, step_result: Optional[Dict], context_state: Dict
     ) -> Dict:
         """Capture mutable state and handle actions that must precede the next forward.
 
@@ -1086,6 +1082,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Everything else runs in the `_bookkeep` coroutine during forward(N+1).
 
         Synchronous responsibilities:
+        - CUDA event timing (events are reused each step).
         - Eviction (scheduler needs `waiting_request_ids` updated).
         - Snapshot block-allocator stats (scheduler allocates blocks).
         - Snapshot-and-clear mutable counters that the next step would overwrite.
@@ -1096,10 +1093,15 @@ class DynamicInferenceEngine(AbstractEngine):
             "step_result": step_result,
             "context_state": context_state,
             "sync_time": sync_time,
-            "step_time": step_time,
+            "step_time": 0.0,
         }
 
         if step_result is not None:
+            # CUDA timing: events are reused each step, so compute now.
+            # Stream has already synchronized because controller's .tolist() calls
+            # force an implicit sync before this point.
+            work["step_time"] = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+
             # Snapshot chunked_prefill_request_id (scheduler may change it).
             work["chunked_prefill_request_id"] = self.context.chunked_prefill_request_id
 
@@ -1491,10 +1493,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
-        # Poll the CUDA event instead of blocking the event loop on synchronize().
-        while not self.step_end_event.query():
-            await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
-        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
@@ -1527,7 +1525,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context_state = {**pre_step_context_state, **post_step_context_state}
 
-        return result, context_state, step_time
+        return result, context_state
 
     async def _bookkeep(self, work: Dict) -> Dict:
         """Combined bookkeeping for one forward step.
@@ -1966,8 +1964,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
-        step_result, context_state, step_time = await self.async_forward()
-        work = self._prepare_bookkeep_work_item(step_result, context_state, step_time)
+        step_result, context_state = await self.async_forward()
+        work = self._prepare_bookkeep_work_item(step_result, context_state)
         return await self._bookkeep(work)
 
     @trace_async_exceptions
@@ -2402,8 +2400,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_start_event.record()
                             self.controller.dummy_forward()
                             self.step_end_event.record()
-                            while not self.step_end_event.query():
-                                await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
+                            self.step_end_event.synchronize()
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
                     else:
