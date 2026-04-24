@@ -195,6 +195,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
+from megatron.training.config import FaultInjectorConfig
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
@@ -2712,9 +2713,17 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+    fault_injector_kwargs = {}
+    for f in dataclasses.fields(FaultInjectorConfig):
+        if hasattr(args, f.name):
+            fault_injector_kwargs[f.name] = getattr(args, f.name)
+    fault_injector_config = FaultInjectorConfig(**fault_injector_kwargs)
 
     _maybe_raise_workload_exception = None
-    if args.fault_injector_ranks is not None or args.fault_injector_num_ranks is not None:
+    if (
+        fault_injector_config.fault_injector_ranks is not None
+        or fault_injector_config.fault_injector_num_ranks is not None
+    ):
         from megatron.core.fault_injector import (
             maybe_raise_workload_exception as _maybe_raise_workload_exception,
         )
@@ -2724,8 +2733,8 @@ def train(
             should_setup_fault_injection_at_start,
         )
 
-        if should_setup_fault_injection_at_start(args):
-            setup_fault_injection(args)
+        if should_setup_fault_injection_at_start(fault_injector_config):
+            setup_fault_injection(fault_injector_config)
 
     if args.perform_rl_step:
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
@@ -3141,8 +3150,10 @@ def train(
             # Fault delay timing can start at the end of iteration N. Self-firing faults
             # (signals, GIL, GPU) may then manifest in iteration N or N+1 depending on the
             # configured delay; workload-exception faults manifest on a later poll.
-            if _maybe_raise_workload_exception is not None and should_setup_fault_injection_at_iteration(args, iteration):
-                setup_fault_injection(args)
+            if _maybe_raise_workload_exception is not None and should_setup_fault_injection_at_iteration(
+                fault_injector_config, iteration
+            ):
+                setup_fault_injection(fault_injector_config)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
