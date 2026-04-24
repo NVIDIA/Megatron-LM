@@ -50,7 +50,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -468,10 +468,7 @@ class DynamicInferenceEngineTestBase:
             ),
         )
 
-        # Reset global cuda graph state.
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
 
         # Inference engine.
         engine = DynamicInferenceEngine(text_generation_controller, inference_context)
@@ -588,6 +585,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @classmethod
     def teardown_class(cls):
+        delete_cuda_graphs()
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -4324,11 +4322,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     """
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
-    @classmethod
-    def teardown_class(cls):
-        set_rounder(64)
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
     @classmethod
@@ -4470,6 +4464,7 @@ class TestChunkedPrefillCudaGraphs:
 
     @classmethod
     def teardown_class(cls):
+        delete_cuda_graphs()
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -4534,17 +4529,6 @@ class TestChunkedPrefillCudaGraphs:
         model.eval()
         return model
 
-    def _reset_cuda_graph_state(self, model):
-        """Reset all CUDA graph global and per-module state."""
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
-        CudaGraphManager.global_mempool = None
-        for module in model.modules():
-            if isinstance(module, CudaGraphManager):
-                module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
-
     def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
         set_rounder(4)
@@ -4577,7 +4561,7 @@ class TestChunkedPrefillCudaGraphs:
                 vocab_size=CHUNKED_CG_VOCAB_SIZE, detokenize=lambda tokens: "tokenized_prompt"
             ),
         )
-        self._reset_cuda_graph_state(model)
+        delete_cuda_graphs()
         return DynamicInferenceEngine(controller, context)
 
     def _run_to_completion(self, engine, prompts, num_tokens_to_generate):

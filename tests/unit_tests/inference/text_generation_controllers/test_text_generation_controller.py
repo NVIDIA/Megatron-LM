@@ -34,8 +34,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
@@ -108,9 +108,9 @@ class TextGenerationControllerTestBase:
 
         mamba_inference_state_config = None
         if hybrid_layer_pattern:
-            model = MambaModel(
+            model = HybridModel(
                 config=transformer_config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.sequence_length,
                 parallel_output=True,
@@ -1599,10 +1599,6 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
     """
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
-    @classmethod
-    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     def setup_model(
