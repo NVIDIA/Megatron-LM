@@ -20,7 +20,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
@@ -411,6 +411,58 @@ class TestHybridQKLayernorm:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == 100
+
+
+class TestHybridMLAQKLayernorm(TestHybridQKLayernorm):
+    """Tests QK norm configuration of HybridModel with MLA."""
+
+    def _build_model(self, spec=None, **config_overrides):
+        if spec is None:
+            spec = hybrid_stack_spec
+        config = MLATransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            **config_overrides,
+        )
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M+-",
+        )
+
+    def test_qk_l2_norm_from_config(self):
+        with pytest.raises(ValueError, match="qk_l2_norm is not supported"):
+            super().test_qk_l2_norm_from_config()
+
+
+class TestHybridDSAQKLayernorm(TestHybridQKLayernorm):
+    """Tests QK norm configuration of HybridModel with DSA."""
+
+    def _build_model(self, spec=None, **config_overrides):
+        if spec is None:
+            spec = hybrid_stack_spec
+        config = MLATransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            **config_overrides,
+        )
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="MD-",
+        )
+
+    def test_qk_l2_norm_from_config(self):
+        with pytest.raises(ValueError, match="qk_l2_norm is not supported"):
+            super().test_qk_l2_norm_from_config()
 
 
 class TestHybridWithDynamicInference:
