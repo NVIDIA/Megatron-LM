@@ -30,7 +30,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 
 class StaticInferenceEngineTestHarness:
@@ -46,6 +46,7 @@ class StaticInferenceEngineTestHarness:
         buffer_size_gb=10,
         inference_config_params_dtype=torch.float,
     ):
+        clear_nvte_env_vars()
         model_parallel_cuda_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 32

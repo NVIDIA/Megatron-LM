@@ -54,7 +54,7 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 try:
     from torch_memory_saver import torch_memory_saver  # noqa: F401
@@ -71,13 +71,6 @@ def skip_if_mamba_sequence_packing_not_available(model_provider: str):
         )
         if not sequence_packing_available:
             pytest.skip(reason_for_no_sequence_packing)
-
-
-def clear_nvte_env_vars():
-    """Clear NVTE env vars set by conftest set_env fixture."""
-    os.environ.pop('NVTE_FLASH_ATTN', None)
-    os.environ.pop('NVTE_FUSED_ATTN', None)
-    os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
 
 def set_rounder(value):
