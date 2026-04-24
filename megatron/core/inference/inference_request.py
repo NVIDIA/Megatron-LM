@@ -87,6 +87,7 @@ class Status(Enum):
 # Hash computation for prefix caching
 # =========================================================================
 
+
 def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
     """Compute SHA-256 based hashes for all complete blocks in a prompt.
 
