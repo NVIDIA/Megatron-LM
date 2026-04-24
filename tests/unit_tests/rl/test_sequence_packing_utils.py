@@ -409,6 +409,50 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
     assert group_stats.mean_piold_to_inf_prob is None
 
 
+def test_packing_observability_metrics():
+    """Test various observability metrics related to sequence packing."""
+
+    # 4 sequences with known lengths packed into 2 bins of size 16.
+    # Bin 0 holds seqs 0 (len 5) and 1 (len 3) → 8 actual tokens
+    # Bin 1 holds seqs 2 (len 10) and 3 (len 4) → 14 actual tokens
+    seq_lengths = [5, 3, 10, 4]
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[[0, 1], [2, 3]],
+        seq_starts={0: [0, 5], 1: [0, 10]},
+        seq_lengths=seq_lengths,
+        seq_to_bin_idx=[0, 0, 1, 1],
+        packing_algo='fifo',
+    )
+
+    num_bins, bin_size = 2, 16
+    packed_trajs = torch.zeros(num_bins, bin_size, dtype=torch.long)
+    ctx = sequence_packing_utils.PackingContext(
+        bin_size=bin_size,
+        packer=None,
+        packing_info=packing_info,
+        original_generation_masks=None,
+        original_trajs=None,
+        packed_trajs=packed_trajs,
+        packed_position_ids=None,
+        packed_loss_mask=None,
+    )
+
+    # actual tokens = sum of all seq_lengths referenced by bin_seq_indices
+    assert sequence_packing_utils.get_packing_actual_tokens(ctx) == 5 + 3 + 10 + 4
+
+    # compute tokens = num_bins * bin_size
+    assert sequence_packing_utils.get_packing_compute_tokens(ctx) == 2 * 16
+
+    # avg seq length = mean of seq_lengths
+    assert sequence_packing_utils.get_packing_avg_seq_length(ctx) == pytest.approx(22 / 4)
+
+    # efficiency = total_actual / (bins_per_rank * bin_size * num_ranks)
+    with patch('megatron.core.mpu.get_data_parallel_world_size', return_value=4):
+        eff = sequence_packing_utils.get_packing_efficiency(ctx)
+        # total_actual = sum(seq_lengths) = 22, capacity = 2 * 16 * 4 = 128
+        assert eff == pytest.approx(22 / 128)
+
+
 @pytest.mark.parametrize("num_sequences", [1, 10, 48, 49, 50])
 def test_cu_seqlens_size(num_sequences):
     """Test that cu_seqlens always has a fixed size regardless of how many sequences are packed."""
