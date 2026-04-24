@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
 from megatron.training.config.common_config import RNGConfig, DistributedInitConfig, ProfilingConfig
-from megatron.training.config.training_config import TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
+from megatron.training.config.training_config import TokenizerConfig, TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.training.config.resilience_config import RerunStateMachineConfig, StragglerDetectionConfig
@@ -23,6 +23,7 @@ class PretrainConfigContainer:
     logger: LoggerConfig
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
