@@ -33,8 +33,6 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
-    DynamicInferenceEvent,
-    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -45,6 +43,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import (
     Counter,
+    asyncio_Queue,
+    asyncio_QueueShutDown,
     await_process_call,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
@@ -114,6 +114,10 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
+
+# Used to turn a synchronous CUDA event wait into an asynchronous yielding poll.
+# Should be set to <1% of the forward step time. A value of 0 is safe, but may be inefficient.
+CUDA_EVENT_POLL_INTERVAL_S = 1e-4
 
 
 class EngineState(Enum):
@@ -225,6 +229,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
+        self.deferred_request_bookkeeping = inference_config.deferred_request_bookkeeping
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
@@ -279,7 +284,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
         self._generation_epoch: Optional[int] = None
-        # Track requests that should stop due to stop words (detected in post_process_requests)
+        # Track requests that should stop due to stop words (detected in _bookkeep)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
         self.stop_word_being_finished_ids: set[int] = set()
@@ -294,6 +299,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
         self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        # Deferred: bookkeeping runs one step behind. Synchronous: join after each put.
+        self._bookkeep_queue: asyncio_Queue = asyncio_Queue(maxsize=1)
         self.state = EngineState.RUNNING
         self._state_events[EngineState.RUNNING].set()
         self._pending_signals = deque()
@@ -1070,314 +1077,93 @@ class DynamicInferenceEngine(AbstractEngine):
         # Add request.
         return self._add_request(request)
 
-    def post_process_requests(
-        self,
-        request_ids: torch.Tensor,
-        finished_request_ids: torch.Tensor,
-        evict_request_ids: torch.Tensor,
-        step_time: float,
-        sample: torch.Tensor,
-        accepted_tokens: torch.Tensor,
-        log_probs: torch.Tensor,
-        top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
-        pre_fwd_active_token_count: Optional[int] = None,
-        pre_fwd_step_count: Optional[int] = None,
-        finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
+    def _prepare_bookkeep_work_item(
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float
+    ) -> Dict:
+        """Capture mutable state and handle actions that must precede the next forward.
+
+        This is the only synchronous work between forward(N) and forward(N+1).
+        Everything else runs in the `_bookkeep` coroutine during forward(N+1).
+
+        Synchronous responsibilities:
+        - Eviction (scheduler needs `waiting_request_ids` updated).
+        - Snapshot block-allocator stats (scheduler allocates blocks).
+        - Snapshot-and-clear mutable counters that the next step would overwrite.
         """
-        Handles post-processing for requests after a step.
+        sync_time = time.time()
 
-        Args:
-            request_ids (torch.Tensor): A list of request_ids
-            finished_request_ids (torch.Tensor): A list of finished request ids
-            evict_request_ids (torch.Tensor): A list of evicted request ids.
-            step_time (float): The latency of the last step
-            sample: Tensor: The newly generated token for each request
-            accepted_tokens: Tensor: The additional accepted tokens for each request
-            log_probs: (List): Log probs for each request
-            top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
-                list of (top_n_logprobs, top_n_indices) tuples.
-            finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
-                finished requests, saved before update_requests released them.
-                Used for per-block routing reconstruction.
+        work: Dict = {
+            "step_result": step_result,
+            "context_state": context_state,
+            "sync_time": sync_time,
+            "step_time": step_time,
+        }
 
-        Returns:
-            A list of active requests and completed requests as `DynamicInferenceRequest` objects
-        """
-        active_request_ids: list[int] = []
-        finished_request_ids = set(finished_request_ids.tolist())
-        finished_request_records: list[DynamicInferenceRequestRecord] = []
-        self.finished_request_count += len(finished_request_ids)
-        if evict_request_ids is not None:
-            self.evicted_request_count += evict_request_ids.numel()
+        if step_result is not None:
+            # Snapshot chunked_prefill_request_id (scheduler may change it).
+            work["chunked_prefill_request_id"] = self.context.chunked_prefill_request_id
 
-        log_probs_iter = log_probs if log_probs else repeat(None)
-        block_allocator = self.context.kv_block_allocator
+            # Eviction: must update waiting_request_ids before next schedule.
+            evict_request_ids = step_result.get("evict_request_ids")
+            if evict_request_ids is not None and evict_request_ids.numel() > 0:
+                evict_list = evict_request_ids.tolist()
+                self.waiting_request_ids.extendleft(evict_list)
+                if self.context.chunked_prefill_request_id != -1:
+                    cpid = self.waiting_request_ids[len(evict_list)]
+                    del self.waiting_request_ids[len(evict_list)]
+                    self.waiting_request_ids.appendleft(cpid)
+                work["evict_list"] = evict_list
 
-        # Pre-compute step-level block stats (before the per-request loop)
-        if self.track_generated_token_events:
-            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
-            if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
-            else:
-                blocks_hashed_active = blocks_allocated
-                blocks_ref_count = None
+            # Snapshot block-allocator stats (scheduler allocates blocks for new requests).
+            block_allocator = self.context.kv_block_allocator
+            if self.track_generated_token_events:
+                blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+                if block_allocator.enable_prefix_caching:
+                    work["blocks_hashed_active"] = int(
+                        (block_allocator.block_ref_counts > 0).sum().item()
+                    )
+                    work["blocks_ref_count"] = block_allocator.block_ref_counts.sum().item()
+                else:
+                    work["blocks_hashed_active"] = blocks_allocated
+                    work["blocks_ref_count"] = None
+                work["blocks_total"] = block_allocator.total_count
+                work["blocks_allocated"] = blocks_allocated
 
-        # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
-        # empty lists for each request, so the zip produces the correct number of iterations
-        accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
+            # Snapshot newly-paused request refs.
+            newly_paused_request_ids = step_result.get("newly_paused_request_ids")
+            if newly_paused_request_ids is not None and self.track_paused_request_events:
+                work["newly_paused_refs"] = [
+                    self.get_request(i) for i in newly_paused_request_ids.tolist()
+                ]
 
-        if self.num_speculative_tokens > 0 and accepted_tokens is not None:
-            self._spec_steps += 1
+        # Snapshot-and-clear mutable counters.
+        work["failed_request_ids"] = list(self.failed_request_ids)
+        self.failed_request_ids.clear()
 
-        for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
+        work["prefix_cache_hits_delta"] = 0
+        work["prefix_cache_blocks_matched_delta"] = 0
+        if self.context.enable_prefix_caching:
+            work["prefix_cache_hits_delta"] = self.context.prefix_cache_hits
+            work["prefix_cache_blocks_matched_delta"] = self.context.prefix_cache_blocks_matched
+            self.context.prefix_cache_hits = 0
+            self.context.prefix_cache_blocks_matched = 0
+
+        # Memory stats snapshot (only if we are logging this step).
+        post_forward_step_count = context_state.get("post_forward_step_count", 0)
+        work["mem_stats"] = None
+        if (
+            self.logging_step_interval > 0
+            and post_forward_step_count % self.logging_step_interval == 0
         ):
+            work["mem_stats"] = torch.cuda.memory_stats()
 
-            # Ensure tokens is always a list for consistent handling
-            if not isinstance(tokens, list):
-                tokens = [tokens]
-
-            request: DynamicInferenceRequest = self.get_request(request_id)
-
-            if self.num_speculative_tokens > 0:
-                accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
-
-                # The order `accepted_tokens + tokens` is correct here.
-                # `accepted_tokens` contains the sequence of
-                # successfully verified draft tokens. `tokens` (from `sample`) is the
-                # brand new token generated by the target model based on that accepted prefix.
-                # Therefore, the newly sampled token must go at the end of the sequence.
-                tokens = accepted_tokens + tokens
-
-            num_stop_word_trim = 0
-            if request_id != self.context.chunked_prefill_request_id:
-                # Skip appending token for requests being finished due to stop words
-                # (they already have their final token from the previous step)
-                # If the request already has more tokens, then we only append as much as is necessary
-                if (
-                    len(request.generated_tokens) + len(tokens)
-                    >= request.sampling_params.num_tokens_to_generate
-                ):
-                    keep = request.sampling_params.num_tokens_to_generate - len(
-                        request.generated_tokens
-                    )
-                    tokens = tokens[:keep]
-                    # Trim log probs / top-n to match so the counts stay in sync.
-                    if request_log_probs is not None:
-                        request_log_probs = request_log_probs[:keep]
-                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
-                if request_id not in self.stop_word_being_finished_ids:
-                    is_first_token = len(request.generated_tokens) == 0
-                    request.generated_tokens += tokens
-                    first_token_event = None
-                    if self.track_generated_token_events:
-                        for token in tokens:
-                            if block_allocator.enable_prefix_caching:
-                                event = request.add_event_generated_token(
-                                    token,
-                                    blocks_total=block_allocator.total_count,
-                                    blocks_hashed_total=blocks_allocated,
-                                    blocks_hashed_active=blocks_hashed_active,
-                                    blocks_ref_count=blocks_ref_count,
-                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
-                                    pre_fwd_step_count=pre_fwd_step_count,
-                                )
-                            else:
-                                event = request.add_event_generated_token(
-                                    token,
-                                    blocks_total=block_allocator.total_count,
-                                    blocks_hashed_total=blocks_allocated,
-                                    blocks_hashed_active=blocks_hashed_active,
-                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
-                                    pre_fwd_step_count=pre_fwd_step_count,
-                                )
-                            if first_token_event is None:
-                                first_token_event = event
-                    if is_first_token:
-                        if not self.track_generated_token_events:
-                            first_token_event = DynamicInferenceEvent(
-                                type=DynamicInferenceEventType.GENERATED_TOKEN,
-                                payload={"token_id": tokens[0]},
-                            )
-                        request.ttft = (
-                            first_token_event.timestamp - request.event_add_engine.timestamp
-                        )
-                    if request.tpot is None:
-                        request.tpot = []
-                    per_token_step_time = step_time / len(tokens)
-                    request.tpot.extend([per_token_step_time] * len(tokens))
-
-                # Check for stop words (after token is appended).
-                # With speculative decoding, a stop word may end before the last
-                # appended token. The check truncates generated_tokens in-place and
-                # returns how many trailing tokens were removed so we can also trim
-                # the corresponding log probs below.
-                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
-                    request
-                )
-
-                # Track acceptance statistics for logging.
-                if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
-                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
-
-                    self._spec_tokens_proposed += actual_proposed
-                    self._spec_tokens_accepted += actual_accepted
-
-                if request_id in finished_request_ids:
-                    # Reconstruct routing from per-block storage before popping.
-                    if (
-                        finished_routing_block_ids
-                        and request_id in finished_routing_block_ids
-                        and len(self.requests[request_id].record.requests) == 1
-                    ):
-                        block_ids = finished_routing_block_ids[request_id]
-                        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-                        request.routing_indices = (
-                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
-                            )
-                        )
-
-                    # Request finished by normal means (termination_id, max_length, or stop word from previous step)
-                    request.generated_length = len(request.generated_tokens)
-                    request.status = Status.COMPLETED
-                    request.add_event_finish()
-                    finished_entry = self.requests.pop(request_id)
-                    finished_request = finished_entry.record[-1]
-                    finished_request.generated_length = len(finished_request.generated_tokens)
-                    finished_request_records.append(finished_entry.record)
-                    finished_entry.future.set_result(finished_entry.record)
-                elif stop_word_hit:
-                    # Stop word detected - mark for removal in next step's bookkeeping
-                    # Don't pop yet; let the next step handle it properly via callback
-                    self.stop_word_finished_request_ids.add(request_id)
-                    active_request_ids.append(request_id)
-                else:
-                    active_request_ids.append(request_id)
-            else:
-                # The chunked prefill produces useless tokens
-                # so we are not appending them to the generated tokens.
-                # Additionally, chunked prefill request do not finish.
-                active_request_ids.append(request_id)
-
-            # When a stop word was found mid-speculative-batch, trim log probs
-            # and top_n_logprobs to match the truncated generated_tokens.
-            if num_stop_word_trim > 0:
-                if request_log_probs is not None:
-                    request_log_probs = request_log_probs[:-num_stop_word_trim]
-                if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
-
-            # Process log_probs if available (unified for both regular and chunked prefill)
-            # Skip for requests being finished due to stop words — tokens are not
-            # appended for these requests, so log probs must also be skipped to keep
-            # the two lists in sync.
-            if (
-                request_log_probs is not None
-                and request_id not in self.stop_word_being_finished_ids
-            ):
-                # Initialize lists if they don't exist
-                if not request.prompt_log_probs:
-                    request.prompt_log_probs = []
-                if not request.generated_log_probs:
-                    request.generated_log_probs = []
-
-                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
-                is_prefill = len(request.generated_log_probs) == 0
-
-                if request.sampling_params.skip_prompt_log_probs:
-                    # We only want decode log probs.
-                    if is_chunked_prefill:
-                        pass
-                    elif is_prefill:
-                        request.generated_log_probs.append(request_log_probs[-1])
-                    else:
-                        request.generated_log_probs.extend(request_log_probs)
-                else:
-                    # Split log probs between prompt and generated based on remaining prompt slots.
-                    prompt_length = len(request.prompt_tokens)
-                    total_accumulated = len(request.prompt_log_probs) + len(
-                        request.generated_log_probs
-                    )
-                    remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
-                    split_idx = min(remaining_prompt_slots, len(request_log_probs))
-
-                    if split_idx > 0:
-                        request.prompt_log_probs.extend(request_log_probs[:split_idx])
-                    if split_idx < len(request_log_probs):
-                        request.generated_log_probs.extend(request_log_probs[split_idx:])
-
-            # Process top_n_logprobs if available (unified for both regular and chunked prefill)
-            # Same stop-word guard as log probs above.
-            if (
-                top_n_logprobs is not None
-                and req_idx in top_n_logprobs
-                and request_id not in self.stop_word_being_finished_ids
-            ):
-                # Initialize lists if they don't exist
-                if request.prompt_top_n_logprobs is None:
-                    request.prompt_top_n_logprobs = []
-                if request.generated_top_n_logprobs is None:
-                    request.generated_top_n_logprobs = []
-
-                top_n_data_list = top_n_logprobs[req_idx]
-                prompt_length = len(request.prompt_tokens)
-
-                # Process each token's top-n logprobs
-                for top_n_values, top_n_indices in top_n_data_list:
-                    logit_dict = {}
-                    for logprob, logprob_index in zip(
-                        top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
-                    ):
-                        key = self.controller.tokenizer.detokenize([logprob_index])
-                        logit_dict[key] = logprob
-
-                    # Simple decision: check total count accumulated so far
-                    total_accumulated = len(request.prompt_top_n_logprobs) + len(
-                        request.generated_top_n_logprobs
-                    )
-
-                    # If skip_prompt_log_probs is False and we haven't reached prompt end,
-                    # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
-                    if (
-                        not request.sampling_params.skip_prompt_log_probs
-                        and total_accumulated < prompt_length - 1
-                    ):
-                        request.prompt_top_n_logprobs.append(logit_dict)
-                    else:
-                        request.generated_top_n_logprobs.append(logit_dict)
-
-        # Handle evicted requests.
-        if evict_request_ids is not None and evict_request_ids.numel() > 0:
-
-            evict_request_ids = evict_request_ids.tolist()
-
-            # Insert into waiting_request_ids after any chunk prefill request.
-            self.waiting_request_ids.extendleft(evict_request_ids)
-            if self.context.chunked_prefill_request_id != -1:
-                chunked_prefill_id = self.waiting_request_ids[len(evict_request_ids)]
-                del self.waiting_request_ids[len(evict_request_ids)]
-                self.waiting_request_ids.appendleft(chunked_prefill_id)
-
-            # Checkpoint requests (i.e., prompt += generations) + add eviction event.
-            for request_id in evict_request_ids:
-                self.requests[request_id].record.checkpoint()
-                self.get_request(request_id).add_event_evict()
-
-        # Clear the stop word being finished set after processing
-        self.stop_word_being_finished_ids.clear()
-
-        return active_request_ids, finished_request_records
+        return work
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.
 
         This callback is called from the controller during bookkeeping to get request IDs
-        that were detected as hitting stop words in the previous step's post_process_requests.
+        that were detected as hitting stop words in the previous step's _bookkeep.
 
         Args:
             active_request_ids: List of currently active request IDs.
@@ -1390,7 +1176,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Find which stop word finished IDs are in the current active requests
         result = self.stop_word_finished_request_ids & set(active_request_ids)
-        # Move to "being finished" set so post_process_requests can skip the extra token
+        # Move to "being finished" set so _bookkeep can skip the extra token
         self.stop_word_being_finished_ids = result
         # Clear the IDs that we're returning (they'll be marked as finished)
         self.stop_word_finished_request_ids -= result
@@ -1401,7 +1187,7 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> Tuple[bool, int]:
         """Check if a request should stop due to stop words (after token is appended).
 
-        This method is called from post_process_requests after the token has already
+        This method is called from _bookkeep after the token has already
         been appended to request.generated_tokens. In the speculative decoding case,
         multiple tokens may have been appended at once. If a stop word is found in the
         middle of the speculative tokens, the trailing tokens after the stop word are
@@ -1677,7 +1463,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_result (Optional[Dict]): The result of the step.
                 context_state (Dict): A tuple consisting of the state of the context.
                 is_decode_only, total/paused request count, active token count.
-                step_time (float): How long this step took.
         """
 
         # If suspended, no stepping.
@@ -1706,7 +1491,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
-        self.step_end_event.synchronize()
+        # Poll the CUDA event instead of blocking the event loop on synchronize().
+        while not self.step_end_event.query():
+            await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
@@ -1725,8 +1512,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
-            "finished_request_count": self.finished_request_count,
-            "evicted_request_count": self.evicted_request_count,
             "kv_stats": kvcache_util_stats,
             "padded_active_token_count": self.context.padded_active_token_count,
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
@@ -1734,84 +1519,293 @@ class DynamicInferenceEngine(AbstractEngine):
             "total_paused_block_count": self.context.kv_block_allocator.paused_count,
             "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
             "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            "post_forward_step_count": self.context.step_count,
+            "batch_dimensions": self.context.batch_dimensions,
+            "padded_batch_dimensions": self.context.padded_batch_dimensions,
+            "requests_dict_size": len(self.requests),
         }
 
         context_state = {**pre_step_context_state, **post_step_context_state}
 
         return result, context_state, step_time
 
-    async def async_bookkeep(
-        self, step_result: Optional[Dict], context_state: Dict, step_time: float
-    ):
-        """Uses `asyncio` for continuous bookkeeping.
+    async def _bookkeep(self, work: Dict) -> Dict:
+        """Combined bookkeeping for one forward step.
 
-        Args:
-            step_result (Optional[Dict]): The result of the step.
-            context_state (Dict): is_decode_only, total/paused request count, active token count.
-            step_time (float): How long this step took.
+        Runs as the queue consumer during the next forward step's event loop yield.
+        This will finish before the next `_dynamic_step_context_bookkeeping` fires.
 
-        Returns:
-            A dictionary containing:
-                active_requests (List): Requests that ran in the last step and are still active.
-                finished_requests (List): Requests that ran in the last step and have now finished.
-                step_time (float): The step time in seconds.
-                cuda_graph_request_count (int): The CUDA graph batch size matching this step.
+        The per-request loop intentionally has NO yield points so that stop-word state
+        is fully committed before control returns to the forward coroutine.
         """
-        # Increment finished_request_count.
         nvtx_range_push("bookkeeping")
+
+        step_result = work["step_result"]
+        context_state = work["context_state"]
+        sync_time = work["sync_time"]
+        step_time = work["step_time"]
+
+        active_request_ids: list[int] = []
+        finished_request_records: list[DynamicInferenceRequestRecord] = []
         cuda_graph_request_count = None
 
         if step_result is not None:
-            active_request_ids = step_result["active_request_ids"]
+            request_ids = step_result["active_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
-            newly_paused_request_ids = step_result.get("newly_paused_request_ids")
-            evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
-            accepted_tokens = step_result["accepted_tokens"]
+            accepted_tokens_tensor = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
+            chunked_prefill_request_id = work["chunked_prefill_request_id"]
 
-            # Add paused events.
-            if newly_paused_request_ids is not None and self.track_paused_request_events:
-                newly_paused_request_ids = newly_paused_request_ids.tolist()
-                [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
+            finished_request_ids_set = set(finished_request_ids.tolist())
+            skip_for_stop_word = frozenset(self.stop_word_being_finished_ids)
 
-            # Process finished requests (adds FINISH events and returns records).
-            (active_request_ids, finished_request_records) = self.post_process_requests(
-                active_request_ids,
-                finished_request_ids,
-                evict_request_ids,
-                step_time,
-                sample,
-                accepted_tokens,
-                log_probs,
-                top_n_logprobs,
-                pre_fwd_active_token_count=context_state.get("active_token_count"),
-                pre_fwd_step_count=context_state.get("step_count"),
-                finished_routing_block_ids=finished_routing_block_ids,
+            log_probs_iter = log_probs if log_probs else repeat(None)
+            accepted_tokens_iter = (
+                repeat([]) if accepted_tokens_tensor is None else accepted_tokens_tensor.tolist()
             )
 
-        else:
-            active_request_ids: list[int] = []
-            finished_request_records: list[DynamicInferenceRequestRecord] = []
+            # Block stats from prepare (snapshotted before scheduler ran).
+            blocks_total = work.get("blocks_total")
+            blocks_allocated = work.get("blocks_allocated")
+            blocks_hashed_active = work.get("blocks_hashed_active")
+            blocks_ref_count = work.get("blocks_ref_count")
+            pre_fwd_active_token_count = context_state.get("active_token_count")
+            pre_fwd_step_count = context_state.get("step_count")
 
-        # Failed requests. Status and events were already set in _handle_failed_request;
-        # here we just clean up the entry and include it in finished_request_records.
-        for failed_request_id in self.failed_request_ids:
+            # Pause events.
+            for req in work.get("newly_paused_refs", []):
+                req.add_event_pause(timestamp=sync_time)
+
+            step_spec_tokens_proposed = 0
+            step_spec_tokens_accepted = 0
+            step_spec_steps = 0
+            if self.num_speculative_tokens > 0 and accepted_tokens_tensor is not None:
+                step_spec_steps = 1
+
+            block_allocator = self.context.kv_block_allocator
+
+            for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
+                zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
+            ):
+                if not isinstance(tokens, list):
+                    tokens = [tokens]
+
+                request: DynamicInferenceRequest = self.get_request(request_id)
+
+                if self.num_speculative_tokens > 0:
+                    accepted_tokens_filtered = list(
+                        filter(lambda tok: tok != -1, accepted_tokens_list)
+                    )
+                    tokens = accepted_tokens_filtered + tokens
+
+                num_stop_word_trim = 0
+                is_chunked_prefill = request_id == chunked_prefill_request_id
+                is_being_stop_word_finished = request_id in skip_for_stop_word
+                is_finished = request_id in finished_request_ids_set
+
+                if not is_chunked_prefill:
+                    # Trim to max generation length.
+                    if (
+                        len(request.generated_tokens) + len(tokens)
+                        >= request.sampling_params.num_tokens_to_generate
+                    ):
+                        keep = request.sampling_params.num_tokens_to_generate - len(
+                            request.generated_tokens
+                        )
+                        tokens = tokens[:keep]
+                        if request_log_probs is not None:
+                            request_log_probs = request_log_probs[:keep]
+                        if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                            top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+
+                    stop_word_hit = False
+                    if not is_being_stop_word_finished:
+                        was_first_token = len(request.generated_tokens) == 0
+                        request.generated_tokens += tokens
+                        stop_word_hit, num_stop_word_trim = (
+                            self._check_stop_words_for_request_post_append(request)
+                        )
+
+                        # Token events.
+                        if self.track_generated_token_events:
+                            for token in tokens:
+                                if block_allocator.enable_prefix_caching:
+                                    request.add_event_generated_token(
+                                        token,
+                                        blocks_total=blocks_total,
+                                        blocks_hashed_total=blocks_allocated,
+                                        blocks_hashed_active=blocks_hashed_active,
+                                        blocks_ref_count=blocks_ref_count,
+                                        pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                        pre_fwd_step_count=pre_fwd_step_count,
+                                        timestamp=sync_time,
+                                    )
+                                else:
+                                    request.add_event_generated_token(
+                                        token,
+                                        blocks_total=blocks_total,
+                                        blocks_hashed_total=blocks_allocated,
+                                        blocks_hashed_active=blocks_hashed_active,
+                                        pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                        pre_fwd_step_count=pre_fwd_step_count,
+                                        timestamp=sync_time,
+                                    )
+
+                        if was_first_token and tokens:
+                            request.ttft = sync_time - request.event_add_engine.timestamp
+
+                        if tokens:
+                            if request.tpot is None:
+                                request.tpot = []
+                            per_token_step_time = step_time / len(tokens)
+                            request.tpot.extend([per_token_step_time] * len(tokens))
+
+                    # Track acceptance statistics.
+                    if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
+                        actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
+                        actual_accepted = max(
+                            0, len(accepted_tokens_filtered) - num_stop_word_trim
+                        )
+                        step_spec_tokens_proposed += actual_proposed
+                        step_spec_tokens_accepted += actual_accepted
+
+                    if is_finished:
+                        request.generated_length = len(request.generated_tokens)
+                        request.status = Status.COMPLETED
+                        request.add_event_finish(timestamp=sync_time)
+                        finished_entry = self.requests.pop(request_id)
+                        finished_request_snapshot = finished_entry.record[-1]
+                        finished_request_snapshot.generated_length = len(
+                            finished_request_snapshot.generated_tokens
+                        )
+                        finished_request_records.append(finished_entry.record)
+                        finished_entry.future.set_result(finished_entry.record)
+                    elif stop_word_hit:
+                        self.stop_word_finished_request_ids.add(request_id)
+                        active_request_ids.append(request_id)
+                    else:
+                        active_request_ids.append(request_id)
+                else:
+                    active_request_ids.append(request_id)
+
+                # Trim log probs / top-n for stop-word mid-speculative-batch.
+                if num_stop_word_trim > 0:
+                    if request_log_probs is not None:
+                        request_log_probs = request_log_probs[:-num_stop_word_trim]
+                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+
+                # Routing indices concat.
+                if (
+                    routing_indices_per_request is not None
+                    and request_id in routing_indices_per_request
+                ):
+                    step_routing = routing_indices_per_request[request_id]
+                    if request.routing_indices is None:
+                        request.routing_indices = step_routing.clone()
+                    else:
+                        request.routing_indices = torch.cat(
+                            [request.routing_indices, step_routing], dim=0
+                        )
+
+                # Log probs accumulation.
+                if request_log_probs is not None and not is_being_stop_word_finished:
+                    if not request.prompt_log_probs:
+                        request.prompt_log_probs = []
+                    if not request.generated_log_probs:
+                        request.generated_log_probs = []
+
+                    is_prefill = len(request.generated_log_probs) == 0
+
+                    if request.sampling_params.skip_prompt_log_probs:
+                        if is_chunked_prefill:
+                            pass
+                        elif is_prefill:
+                            request.generated_log_probs.append(request_log_probs[-1])
+                        else:
+                            request.generated_log_probs.extend(request_log_probs)
+                    else:
+                        prompt_length = len(request.prompt_tokens)
+                        total_accumulated = len(request.prompt_log_probs) + len(
+                            request.generated_log_probs
+                        )
+                        remaining_prompt_slots = max(0, prompt_length - 1 - total_accumulated)
+                        split_idx = min(remaining_prompt_slots, len(request_log_probs))
+
+                        if split_idx > 0:
+                            request.prompt_log_probs.extend(request_log_probs[:split_idx])
+                        if split_idx < len(request_log_probs):
+                            request.generated_log_probs.extend(request_log_probs[split_idx:])
+
+                # Top-N logprobs (CPU-bound).
+                if (
+                    top_n_logprobs is not None
+                    and req_idx in top_n_logprobs
+                    and not is_being_stop_word_finished
+                ):
+                    if request.prompt_top_n_logprobs is None:
+                        request.prompt_top_n_logprobs = []
+                    if request.generated_top_n_logprobs is None:
+                        request.generated_top_n_logprobs = []
+
+                    top_n_data_list = top_n_logprobs[req_idx]
+                    prompt_length = len(request.prompt_tokens)
+
+                    for top_n_values, top_n_indices in top_n_data_list:
+                        logit_dict = {}
+                        for logprob, logprob_index in zip(
+                            top_n_values.cpu().tolist(), top_n_indices.cpu().tolist()
+                        ):
+                            key = self.controller.tokenizer.detokenize([logprob_index])
+                            logit_dict[key] = logprob
+
+                        total_accumulated = len(request.prompt_top_n_logprobs) + len(
+                            request.generated_top_n_logprobs
+                        )
+                        if (
+                            not request.sampling_params.skip_prompt_log_probs
+                            and total_accumulated < prompt_length - 1
+                        ):
+                            request.prompt_top_n_logprobs.append(logit_dict)
+                        else:
+                            request.generated_top_n_logprobs.append(logit_dict)
+
+            # Eviction bookkeeping (waiting_request_ids was already updated in prepare).
+            for evicted_id in work.get("evict_list", []):
+                self.requests[evicted_id].record.checkpoint()
+                self.get_request(evicted_id).add_event_evict(timestamp=sync_time)
+
+            self.stop_word_being_finished_ids.clear()
+
+            num_finished = len(finished_request_ids_set)
+            num_evicted = len(work.get("evict_list", []))
+            self.finished_request_count += num_finished
+            self.evicted_request_count += num_evicted
+
+            # Accumulate speculative decoding deltas.
+            self._spec_tokens_proposed += step_spec_tokens_proposed
+            self._spec_tokens_accepted += step_spec_tokens_accepted
+            self._spec_steps += step_spec_steps
+
+        # Failed requests.
+        for failed_request_id in work["failed_request_ids"]:
             failed_entry = self.requests.pop(failed_request_id)
             finished_request_records.append(failed_entry.record)
             assert (
                 failed_entry.future.done()
             ), f"Failed request {failed_request_id} future has not been properly resolved."
-        self.failed_request_ids.clear()
 
-        nvtx_range_pop("bookkeeping")
+        # Accumulate prefix-cache deltas.
+        self._prefix_cache_hits += work["prefix_cache_hits_delta"]
+        self._prefix_cache_blocks_matched += work["prefix_cache_blocks_matched_delta"]
 
-        # Detokenize all finished requests if not using
-        # the coordinator. Otherwise, the coordinator will
-        # overlap detokenization with the engine.
+        await asyncio.sleep(0)
+
+        # Detokenize finished requests (unless using coordinator).
         if not self.use_coordinator:
             nvtx_range_push("detokenization")
             for record in finished_request_records:
@@ -1827,11 +1821,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_tokens,
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
+                await asyncio.sleep(0)
             nvtx_range_pop("detokenization")
 
-        # Handle necessary ZMQ DP coordinator communication.
-        # Failed request replies were already sent in _handle_failed_request,
-        # so only send completed records here.
+        # ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator:
             records_to_send = [
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
@@ -1844,36 +1837,25 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
                 self.socket_for_receiving_requests.send(payload)
                 nvtx_range_pop("coordinator_communication")
+            await asyncio.sleep(0)
 
-        # Drain prefix cache hit counters from context into engine accumulators.
-        if self.context.enable_prefix_caching:
-            self._prefix_cache_hits += self.context.prefix_cache_hits
-            self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
-            self.context.prefix_cache_hits = 0
-            self.context.prefix_cache_blocks_matched = 0
+        post_forward_step_count = context_state["post_forward_step_count"]
 
-        # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
-            # Prepare metrics dictionary with all stats
-            # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
                 'inference/inference_step': int(
-                    self.inference_step_offset + int(self.context.step_count)
+                    self.inference_step_offset + int(post_forward_step_count)
                 ),
                 'inference/step_time_s': float(step_time),
-                'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
-                'inference/total_requests_dict_size': int(len(self.requests)),
+                'inference/waiting_queue_len': int(context_state["waiting_request_count"]),
+                'inference/total_requests_dict_size': int(context_state["requests_dict_size"]),
             }
-            # Add KV stats with inference/ prefix
-            # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
             for key, value in context_state["kv_stats"].items():
                 if 'utilization' in key:
-                    # Convert to percentage (0-100) and group under kvcache_utilization
                     metrics[f'inference/{key}'] = float(value * 100.0)
                 else:
                     metrics[f'inference/{key}'] = value
 
-            # Add speculative decoding acceptance metrics.
             if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
                 acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
                 metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
@@ -1881,7 +1863,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
                 metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
 
-            # Add prefix caching metrics.
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
                 metrics['inference/prefix_cache_hits'] = int(self._prefix_cache_hits)
                 metrics['inference/prefix_cache_blocks_matched'] = int(
@@ -1893,12 +1874,11 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
 
-        # Print context state.
         if (
             self.logging_step_interval > 0
-            and self.context.step_count % self.logging_step_interval == 0
+            and post_forward_step_count % self.logging_step_interval == 0
         ):
-            mem = torch.cuda.memory_stats()
+            mem = work["mem_stats"]
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
@@ -1907,18 +1887,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.rank,
-                    self.context.step_count,
-                    datetime.now().strftime("%H:%M:%S"),
+                    post_forward_step_count,
+                    datetime.fromtimestamp(sync_time).strftime("%H:%M:%S"),
                     step_time * 1000,
                     (
                         " [%s + real config %s + cuda graph %s]"
                         % (
                             step_type,
-                            self.context.batch_dimensions,
+                            context_state["batch_dimensions"],
                             (
                                 "OFF"
-                                if not self.context.using_cuda_graph_this_step()
-                                else self.context.padded_batch_dimensions
+                                if not context_state["using_cuda_graph_this_step"]
+                                else context_state["padded_batch_dimensions"]
                             ),
                         )
                     ),
@@ -1926,8 +1906,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     context_state["max_requests"],
                     context_state["paused_request_count"],
                     context_state["waiting_request_count"],
-                    context_state["finished_request_count"],
-                    context_state["evicted_request_count"],
+                    self.finished_request_count,
+                    self.evicted_request_count,
                     context_state["total_active_used_blocks"],
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],
@@ -1954,16 +1934,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
 
-            # Reset speculative decoding accumulators after both wandb and console logging.
             if self.num_speculative_tokens > 0:
                 self._spec_tokens_proposed = 0
                 self._spec_tokens_accepted = 0
                 self._spec_steps = 0
 
-            # Reset prefix caching accumulators after both wandb and console logging.
             if self.context.enable_prefix_caching:
                 self._prefix_cache_hits = 0
                 self._prefix_cache_blocks_matched = 0
+
+        nvtx_range_pop("bookkeeping")
 
         return {
             "active_request_ids": active_request_ids,
@@ -1986,10 +1966,27 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
-        last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data)
-        # Keep for compatibility with current test suite.
-        return ret
+        step_result, context_state, step_time = await self.async_forward()
+        work = self._prepare_bookkeep_work_item(step_result, context_state, step_time)
+        return await self._bookkeep(work)
+
+    @trace_async_exceptions
+    async def _bookkeep_loop(self):
+        """Continuously dequeue work items and run combined bookkeeping."""
+        try:
+            while True:
+                work = await self._bookkeep_queue.get()
+                try:
+                    await self._bookkeep(work)
+                except Exception:
+                    logging.error("bookkeep failed; work keys=%s", list(work.keys()))
+                    raise
+                finally:
+                    self._bookkeep_queue.task_done()
+        except asyncio_QueueShutDown:
+            pass
+        except asyncio.CancelledError:
+            pass
 
     def _run_coroutine_sync(self, coro):
         """Run a coroutine synchronously, handling the case when already in an event loop.
@@ -2197,12 +2194,39 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return len(all_messages)
 
+    async def _drain_bookkeep_queue(
+        self, bookkeep_task: asyncio.Task, *, signal_exit: bool = True
+    ) -> None:
+        """Drain the deferred bookkeeping snapshot queue, bringing it back in sync.
+
+        Args:
+            bookkeep_task (asyncio.Task): The task running the bookkeeping loop to monitor.
+            signal_exit (bool): Whether to shutdown the queue after draining.
+                Ignored when the bookkeep loop task has already died; in that case the
+                queue has already been shutdown.
+        """
+        join_task = asyncio.ensure_future(self._bookkeep_queue.join())
+        await asyncio.wait({join_task, bookkeep_task}, return_when=asyncio.FIRST_COMPLETED)
+        if not join_task.done():
+            join_task.cancel()
+            try:
+                await join_task
+            except asyncio.CancelledError:
+                pass
+        if signal_exit or bookkeep_task.done():
+            self._bookkeep_queue.shutdown()
+
     async def shutdown(self):
         """Shut down the engine and clean up ZMQ resources.
 
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
+
+        # Drain any pending bookkeep work and signal the loop to exit.
+        bookkeep_task = getattr(self, "_bookkeep_task", None)
+        if bookkeep_task is not None and not bookkeep_task.done():
+            await self._drain_bookkeep_queue(bookkeep_task)
 
         # Cleanup the request futures.
         for entry in self.requests.values():
@@ -2230,11 +2254,18 @@ class DynamicInferenceEngine(AbstractEngine):
         # Set the stopped state at the very end.
         self._state_events[EngineState.STOPPED].set()
 
+        if bookkeep_task is not None:
+            try:
+                await bookkeep_task
+            except asyncio.CancelledError:
+                pass
+
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = False
+        self._bookkeep_task = self._loop.create_task(self._bookkeep_loop())
         try:
             while True:
                 # Wait until there are active requests before proceeding.
@@ -2248,9 +2279,15 @@ class DynamicInferenceEngine(AbstractEngine):
                             )
                         )
                     )
-                await self.async_step()
+                step_data = await self.async_forward()
+                work = self._prepare_bookkeep_work_item(*step_data)
+                await self._bookkeep_queue.put(work)
+                if not self.deferred_request_bookkeeping:
+                    await self._bookkeep_queue.join()
         except asyncio.CancelledError:
             pass
+        finally:
+            await self._drain_bookkeep_queue(self._bookkeep_task)
 
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
@@ -2324,14 +2361,15 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously.
 
         State-dependent behavior:
-        - RUNNING: EP all-reduce to check for work, then step or idle.
-        - PAUSING: EP all-reduce to reach consensus, then world barrier.
+        - RUNNING: EP all-reduce to check for work, then forward or idle.
+        - PAUSING: EP all-reduce to reach consensus, drain bookkeep queue, then world barrier.
         - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
         - UNPAUSING / SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
         - STOPPED: Teardown and exit.
         """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
+        self._bookkeep_task = self._loop.create_task(self._bookkeep_loop())
 
         try:
             while True:
@@ -2346,20 +2384,26 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
 
                     if all_pausing:
-                        # All EP peers are PAUSING: pause immediately.
+                        # All EP peers are PAUSING: drain bookkeep, then pause.
+                        await self._drain_bookkeep_queue(self._bookkeep_task, signal_exit=False)
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_pending > 0:
-                            await self.async_step()
+                            step_data = await self.async_forward()
+                            work = self._prepare_bookkeep_work_item(*step_data)
+                            await self._bookkeep_queue.put(work)
+                            if not self.deferred_request_bookkeeping:
+                                await self._bookkeep_queue.join()
                         else:
                             # Dummy forward to participate in the EP collective.
                             self.step_start_event.record()
                             self.controller.dummy_forward()
                             self.step_end_event.record()
-                            self.step_end_event.synchronize()
+                            while not self.step_end_event.query():
+                                await asyncio.sleep(CUDA_EVENT_POLL_INTERVAL_S)
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
                     else:

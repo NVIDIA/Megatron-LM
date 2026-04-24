@@ -145,6 +145,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
+    deferred_request_bookkeeping: bool = True
 
     def __post_init__(self):
 
@@ -273,6 +274,7 @@ class DynamicInferenceEngineTestBase:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                deferred_request_bookkeeping=test_config.deferred_request_bookkeeping,
             ),
         )
 
@@ -895,6 +897,206 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 )
 
             engine_task.cancel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("deferred_request_bookkeeping", [False, True])
+    async def test_run_engine_with_deferred_bookkeeping(self, deferred_request_bookkeeping: bool):
+        """Correctness of the async bookkeep path in both sync and deferred modes.
+
+        Exercises length-based termination, stop words, eviction,
+        failed-request cleanup, and deferred log-prob accumulation all in a
+        single engine run. A deterministic mock forward produces an ascending
+        token sequence so stop-word hits and generated tokens are predictable.
+        A tight KV budget forces eviction so all code paths fire in one run.
+
+        Log-prob correctness is verified by checking count alignment (prompt
+        log probs == prompt_length - 1, generated log probs == generated
+        tokens) and value sanity (finite, <= 0, >= -50).
+        """
+        with torch.inference_mode():
+            # Tight KV budget forces eviction while allowing all requests to
+            # eventually complete. materialize_only_last_token_logits=False is
+            # required for prompt log probs.
+            num_tokens_to_generate = 16
+            prompt_length = 4
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,  # All requests added manually below.
+                min_prompt_length=prompt_length,
+                max_prompt_length=prompt_length,
+                num_tokens_to_generate=num_tokens_to_generate,
+                context_block_size_tokens=16,
+                context_buffer_size_gb=0.00064,
+                context_paused_buffer_size_gb=0.0,
+                model_provider="gpt",
+                materialize_only_last_token_logits=False,
+                deferred_request_bookkeeping=deferred_request_bookkeeping,
+            )
+            env = self._build_test_env(test_config)
+
+            # Deterministic forward: token N produces token N+1.
+            unwrapped_model = env.engine.controller.inference_wrapped_model.model
+            vocab_size = test_config.vocab_size
+
+            def mock_deterministic_forward(*args, **kwargs):
+                tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+                b, s = tokens.shape
+                base_logits = torch.zeros(
+                    b, s, vocab_size, device=tokens.device, dtype=torch.bfloat16
+                )
+                next_toks = (tokens + 1).clamp(max=vocab_size - 1)
+                base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
+                return base_logits
+
+            unwrapped_model.forward = mock_deterministic_forward
+
+            engine_task = asyncio.create_task(env.engine.run_engine())
+
+            try:
+                futs: Dict[int, asyncio.Future] = {}
+                expected: Dict[int, Dict] = {}
+
+                # --- Length-based requests (with log probs) ---
+                # Prompts start high enough to avoid hitting stop word [8, 9].
+                for rid in range(3):
+                    start = 20 + rid * 5
+                    prompt = torch.tensor(
+                        [start + i for i in range(prompt_length)], device='cuda', dtype=torch.int64
+                    )
+                    futs[rid] = env.engine.add_request(
+                        request_id=rid,
+                        prompt=prompt,
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=num_tokens_to_generate,
+                            termination_id=-1,
+                            return_log_probs=True,
+                        ),
+                    )
+                    last_prompt_tok = start + prompt_length - 1
+                    expected[rid] = {
+                        "status": Status.COMPLETED,
+                        "generated": [
+                            min(last_prompt_tok + 1 + i, vocab_size - 1)
+                            for i in range(num_tokens_to_generate)
+                        ],
+                        "check_log_probs": True,
+                    }
+
+                # --- Stop-word requests (with log probs) ---
+                # Three requests hit stop word [8, 9] at different offsets.
+                stop_word_configs = [(100, 1), (101, 2), (102, 3)]
+                stop_word_expected_generated = {
+                    100: [5, 6, 7, 8, 9],  # prompt [1,2,3,4]
+                    101: [6, 7, 8, 9],  # prompt [2,3,4,5]
+                    102: [7, 8, 9],  # prompt [3,4,5,6]
+                }
+                for rid, start in stop_word_configs:
+                    prompt = torch.tensor(
+                        [start + i for i in range(prompt_length)], device='cuda', dtype=torch.int64
+                    )
+                    futs[rid] = env.engine.add_request(
+                        request_id=rid,
+                        prompt=prompt,
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=num_tokens_to_generate,
+                            termination_id=-1,
+                            return_log_probs=True,
+                            detokenize_stop_sequence=True,
+                        ),
+                    )
+                    env.engine.get_request(rid).stop_word_ids = [[8, 9]]
+                    expected[rid] = {
+                        "status": Status.COMPLETED,
+                        "generated": stop_word_expected_generated[rid],
+                        "check_log_probs": True,
+                    }
+
+                # --- Failed request ---
+                max_seq_len = env.engine.context.max_sequence_length
+                failed_rid = 9999
+                failed_fut = env.engine.add_request(
+                    request_id=failed_rid,
+                    prompt=torch.tensor([1, 2, 3, 4], device='cuda', dtype=torch.int64),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=max_seq_len + 100, termination_id=-1
+                    ),
+                )
+
+                # Failed future resolves immediately.
+                failed_record = (await failed_fut).merge()
+                assert (
+                    failed_record.status == Status.FAILED
+                ), f"Expected FAILED for oversized request, got {failed_record.status}"
+
+                # --- Wait for all normal requests ---
+                records = await asyncio.wait_for(asyncio.gather(*futs.values()), timeout=120.0)
+
+                # --- Verify all normal requests ---
+                for rid, record in zip(futs.keys(), records):
+                    req = record.merge()
+                    exp = expected[rid]
+
+                    assert req.status == exp["status"], (
+                        f"Request {rid}: expected {exp['status']}, got {req.status} "
+                        f"(deferred={deferred_request_bookkeeping})"
+                    )
+                    assert req.generated_tokens == exp["generated"], (
+                        f"Request {rid}: expected tokens {exp['generated']}, "
+                        f"got {req.generated_tokens} (deferred={deferred_request_bookkeeping})"
+                    )
+
+                    if exp.get("check_log_probs"):
+                        # Prompt log probs: one per prompt token except the first.
+                        assert (
+                            req.prompt_log_probs is not None
+                        ), f"Request {rid}: prompt_log_probs is None"
+                        assert len(req.prompt_log_probs) == len(req.prompt_tokens) - 1, (
+                            f"Request {rid}: expected {len(req.prompt_tokens) - 1} "
+                            f"prompt log probs, got {len(req.prompt_log_probs)}"
+                        )
+                        for i, lp in enumerate(req.prompt_log_probs):
+                            assert not math.isnan(lp) and not math.isinf(
+                                lp
+                            ), f"Request {rid}, prompt log_prob[{i}] = {lp}"
+                            assert (
+                                -50.0 <= lp <= 0.0
+                            ), f"Request {rid}, prompt log_prob[{i}] = {lp} out of range"
+
+                        # Generated log probs: one per generated token.
+                        assert (
+                            req.generated_log_probs is not None
+                        ), f"Request {rid}: generated_log_probs is None"
+                        assert len(req.generated_log_probs) == len(req.generated_tokens), (
+                            f"Request {rid}: expected {len(req.generated_tokens)} "
+                            f"generated log probs, got {len(req.generated_log_probs)}"
+                        )
+                        for i, lp in enumerate(req.generated_log_probs):
+                            assert not math.isnan(lp) and not math.isinf(
+                                lp
+                            ), f"Request {rid}, generated log_prob[{i}] = {lp}"
+                            assert (
+                                -50.0 <= lp <= 0.0
+                            ), f"Request {rid}, generated log_prob[{i}] = {lp} out of range"
+
+                # --- Verify eviction fired ---
+                assert (
+                    env.engine.evicted_request_count > 0
+                ), f"No evictions triggered (deferred={deferred_request_bookkeeping})"
+
+                # --- Verify failed request was cleaned up ---
+                await env.engine._bookkeep_queue.join()
+                assert (
+                    failed_rid not in env.engine.requests
+                ), f"Failed request {failed_rid} not popped from self.requests"
+            finally:
+                engine_task.cancel()
+                try:
+                    await engine_task
+                except asyncio.CancelledError:
+                    pass
 
     @pytest.mark.internal
     @pytest.mark.skipif(
