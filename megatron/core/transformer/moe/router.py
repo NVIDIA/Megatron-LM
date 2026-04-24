@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from typing import Optional, Union
 
 import torch
+import csv
+import os
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -535,6 +537,25 @@ class CapacityPricedRouter(Router):
 
         self.expert_prices.add_(self.price_learning_rate * (usage - target_capacity))
         self.expert_prices.clamp_(min=0.0)
+
+        # --- logging ---
+        cp_moe_log_interval = max(int(getattr(self.config, 'cp_moe_log_interval', 50)), 1)
+        if int(self.cp_steps.item()) % cp_moe_log_interval == 0:
+            self._log_prices_to_csv()
+
+    def _log_prices_to_csv(self):
+        """Append current expert prices to a CSV file."""
+        log_path = os.environ.get('CPMOE_LAMBDA_LOG', 'lambda_log.csv')
+        prices = self.expert_prices.detach().cpu().tolist()
+        step = int(self.cp_steps.item())
+
+        write_header = not os.path.exists(log_path)
+        with open(log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                header = ['step', 'layer'] + [f'expert_{i}' for i in range(len(prices))]
+                writer.writerow(header)
+            writer.writerow([step, self.layer_number] + prices)
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         self._maintain_float32_expert_prices()
