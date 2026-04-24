@@ -654,3 +654,10 @@ class TokenizerConfig:
 
     trust_remote_code: bool = False
     """Whether or not to allow PreTrainedTokenizer to execute remote code."""
+
+    null_tokenizer_eod_id: int = None
+    """EOD token id for NullTokenizer. Defaults to `vocab_size - 1`."""
+
+    null_tokenizer_pad_id: int = -1
+    """Pad token id for NullTokenizer. Defaults to -1 (no pad token). 
+    Set to a value outside the dataset to avoid masking real tokens."""
