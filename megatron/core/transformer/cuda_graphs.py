@@ -796,7 +796,10 @@ class _CudaGraphRunner(torch.nn.Module):
         self.kwargs = kwargs
         self.outputs = outputs
 
-        # save grads and other variables that may be affected by graph warmup
+        # Save buffers, grads, and other variables that may be affected by graph warmup.
+        # For example, megatron/core/transformer/moe/router.py's expert_bias is a persistent
+        # buffer updated each forward pass by '_apply_expert_bias()'. So we need to ensure
+        # graph capture's forward passes do not corrupt its value.
         buffer_backup = []
         for buf in self.base_module.buffers():
             buffer_backup.append(buf.clone())
@@ -1003,12 +1006,14 @@ class _CudaGraphRunner(torch.nn.Module):
 
             if self.fp8_enabled:
                 restore_fp8_tensors([self.base_module], saved_fp8_tensors)
-            # restore cached grads and buffers
-            for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
-                buf.copy_(buf_copy)
+            # restore cached grads
             for main_grad_copy, param in zip(grad_backup, self.base_module.parameters()):
                 if main_grad_copy is not None:
                     param.main_grad.copy_(main_grad_copy)
+
+        # restore cached buffers
+        for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
+            buf.copy_(buf_copy)
 
         if is_moe:
             for name in tracker:
