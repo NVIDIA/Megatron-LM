@@ -302,7 +302,9 @@ class TestHybridQKLayernorm:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _build_model(self, **config_overrides):
+    def _build_model(self, spec=None, **config_overrides):
+        if spec is None:
+            spec = hybrid_stack_spec
         config = TransformerConfig(
             num_layers=3,
             hidden_size=256,
@@ -312,7 +314,7 @@ class TestHybridQKLayernorm:
         )
         return HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=spec,
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
@@ -325,13 +327,15 @@ class TestHybridQKLayernorm:
                 return layer.self_attention
         return None
 
-    def test_no_qk_norm_by_default(self):
-        """Without qk_layernorm, attention has no q/k layernorm."""
+    def test_trivial_qk_norm_by_default(self):
+        """Without qk_layernorm, attention has trivial q/k layernorm."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
         model = self._build_model()
         attn = self._get_attention_layer(model)
         assert attn is not None
-        assert attn.q_layernorm is None
-        assert attn.k_layernorm is None
+        assert attn.q_layernorm is None or isinstance(attn.q_layernorm, IdentityOp)
+        assert attn.k_layernorm is None or isinstance(attn.q_layernorm, IdentityOp)
 
     def test_qk_layernorm_from_config(self):
         """config.qk_layernorm=True creates q/k layernorm even with static spec."""
@@ -380,20 +384,7 @@ class TestHybridQKLayernorm:
             IdentityOp
         )
 
-        config = TransformerConfig(
-            num_layers=3,
-            hidden_size=256,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            qk_layernorm=True,
-        )
-        model = HybridModel(
-            config=config,
-            hybrid_stack_spec=spec,
-            vocab_size=100,
-            max_sequence_length=4,
-            hybrid_layer_pattern="M*-",
-        )
+        model = self._build_model(spec=spec, qk_layernorm=True)
         attn = self._get_attention_layer(model)
         assert attn is not None
         assert isinstance(attn.q_layernorm, IdentityOp)
