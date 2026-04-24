@@ -8,7 +8,7 @@ from functools import partial
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
@@ -392,7 +392,7 @@ if __name__ == "__main__":
         args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
     ):
         if is_hybrid_model(args):
-            return mamba_builder(
+            return hybrid_builder(
                 args,
                 pre_process,
                 post_process,
