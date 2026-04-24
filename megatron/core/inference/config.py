@@ -300,6 +300,10 @@ class InferenceConfig:
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
+    deferred_request_bookkeeping: bool = True
+    """Whether bookkeeping runs asynchronously, one step behind the forward loop.
+    When False, bookkeeping runs synchronously after each forward step."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
