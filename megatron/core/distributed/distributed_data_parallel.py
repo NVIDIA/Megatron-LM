@@ -7,15 +7,15 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..fp4_utils import is_nvfp4tensor
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
+from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,9 @@ class DistributedDataParallel(_BaseDataParallel):
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
         pg_collection: Optional unified process group for distributed training.
+        full_param_layout: Optional FullParamLayout providing pre-computed layouts for all
+            dtype groups. When provided, each buffer uses the corresponding PerBufferParamLayout
+            instead of computing a default one.
 
     """
 
@@ -46,6 +49,7 @@ class DistributedDataParallel(_BaseDataParallel):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        full_param_layout: Optional[FullParamLayout] = None,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -104,11 +108,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
         self.param_to_bucket_group = {}
 
-        # Group parameters by their gradient type.
+        # Collect all trainable parameters.
         param_to_name = {}
-        dense_params = []
-        expert_parallel_params = []
         self.params_with_grad = []
+        all_params = []
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
                 continue
@@ -119,142 +122,50 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
+            all_params.append(param)
 
-            if getattr(param, 'allreduce', True):
-                dense_params.append((param, name))
-            else:
-                expert_parallel_params.append((param, name))
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
+        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
 
-        def _allocate_buffers_for_parameters(
-            input_params, data_parallel_group, gradient_scaling_factor
-        ):
-            param_and_grad_dtype_to_params = {}
-            param_and_grad_dtype_to_offsets = {}
-            param_and_grad_dtype_to_indices = {}
+        # Auto-compute layouts when using distributed optimizer but no layout was provided.
+        # This maintains backward compatibility for callers that create DDP directly
+        # without pre-computing layouts (e.g., tests, external code).
+        if full_param_layout is None and self.ddp_config.use_distributed_optimizer:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "DistributedDataParallel: full_param_layout not provided with "
+                "use_distributed_optimizer=True. Auto-computing layout inside DDP. "
+                "Callers should pre-compute layouts via "
+                "DistributedOptimizer.compute_full_param_layout() and pass them in.",
+            )
+            from ..optimizer.distrib_optimizer import DistributedOptimizer
 
-            # Group parameters by their gradient type.
-            for param, param_name in input_params:
-                assert param.requires_grad
+            full_param_layout = DistributedOptimizer.compute_full_param_layout(
+                all_params,
+                self.bucket_size,
+                self.intra_dp_cp_group.size(),
+                self.ddp_config,
+                expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
+            )
 
-                param_dtype = param.dtype
-                if is_float8tensor(param) or is_nvfp4tensor(param):
-                    # Currently TE's Float8Tensor is a wrapper of torch.Tensor. It has a "fake"
-                    # dtype (usually a higher precision dtype such as bfloat16), but its actual
-                    # data is stored in the form of a torch uint8 tensor within the Float8Tensor's
-                    # ".data" attribute. Therefore, when creating the param buffer for fp8/fp4
-                    # params,it is necessary to use torch.uint8, not the "fake" dtype got from
-                    # "param.dtype".
-                    param_dtype = torch.uint8
-                grad_dtype = torch.float if self.ddp_config.grad_reduce_in_fp32 else param.dtype
-
-                params = param_and_grad_dtype_to_params.get((param_dtype, grad_dtype), [])
-                params.append((param, param_name))
-                param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
-
-                # Get the index of each param among the params with same dtype, if a param is fp8,
-                # use its "fake" high precision dtype to find which params have same dtype with it.
-                # For example:
-                #     Case 1:
-                #         params = [p1(bf16), p2(bf16), p3(bf16), p4(bf16)]
-                #         param_and_grad_dtype_to_indices = {
-                #             (torch.bfloat16, torch.float32): [0, 1, 2, 3],
-                #         }
-                #     Case 2:
-                #         params = [p1(bf16), p2(fp8), p3(fp8), p4(bf16)]
-                #         param_and_grad_dtype_to_indices = {
-                #             (torch.bfloat16, torch.float32): [0, 3],
-                #             (torch.uint8, torch.float32): [1, 2],
-                #         }
-                # We need these indices to load a non-native-fp8 checkpoint in native-fp8 mode.
-                offset = param_and_grad_dtype_to_offsets.get((param.dtype, grad_dtype), 0)
-                param_and_grad_dtype_to_offsets[(param.dtype, grad_dtype)] = offset + 1
-                indices = param_and_grad_dtype_to_indices.get((param_dtype, grad_dtype), [])
-                indices.append(offset)
-                param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)] = indices
-
-            if not config.calculate_per_token_loss:
-                target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
-                if self.ddp_config.average_in_collective:
-                    if self.ddp_config.num_distributed_optimizer_instances == 1:
-                        # Collective is averaging gradients in collective with data_parallel_group.
-                        assert (
-                            gradient_scaling_factor / data_parallel_group.size()
-                            == target_gradient_scaling_factor
-                        )
-                    else:
-                        # For non-expert parameters, gradient_scaling_factor is 1.
-                        # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
-                        assert (gradient_scaling_factor == 1) or (
-                            gradient_scaling_factor
-                            == (self.expt_dp_group.size() / self.dp_cp_group.size())
-                        )
-                else:
-                    assert gradient_scaling_factor == target_gradient_scaling_factor
-
-            # Allocate the grad buffers and map the grads.
-            buffers = []
-            pg_collection = ProcessGroupCollection()
-            pg_collection.tp = self.tp_group
-            pg_collection.dp_cp = self.dp_cp_group
-            for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
-                buffers.append(
-                    _ParamAndGradBuffer(
-                        self.ddp_config,
-                        param_dtype,
-                        grad_dtype,
-                        params,
-                        data_parallel_group,
-                        self.bucket_size,
-                        param_to_name,
-                        gradient_scaling_factor,
-                        param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
-                        self.ddp_config.nccl_ub,
-                        pg_collection,
-                    )
-                )
-
-            # In some scenarios, we want to put buckets from different buffers into a group so that
-            # their communication can be aggregated. For example, when there are both fp8 buffers
-            # and bf16 buffers in the model and vpp is enabled, each model chunk will have an fp8
-            # bucket and a bf16 bucket, which doubles the number of communication kernels, and
-            # because of the use of CUDA_DEVICE_MAX_CONNECTIONS=1, having multiple back-to-back
-            # communications will prevent the overlap of the communication kernels with computation
-            # kernels.
-            # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
-            # bucket group.
-            bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
-
-            if self.ddp_config.num_distributed_optimizer_instances > 1:
+        # When a full_param_layout is provided, verify that the grouping is consistent
+        # with the layout (same buffer keys, same params per key, same param_indices).
+        if full_param_layout is not None:
+            assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
+                f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
+                f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
+            )
+            for buffer_key, (params, param_indices) in buffer_groups.items():
+                layout = full_param_layout.layouts[buffer_key]
+                assert set(params) == set(
+                    layout.param_index_map.keys()
+                ), f"Params for {buffer_key} do not match between grouping and layout"
                 assert (
-                    self.ddp_config.use_distributed_optimizer
-                ), 'Partial DistOpt cannot be used without DistOpt'
-                communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
-                for bucket_group in bucket_groups:
-                    bucket_group.inter_distributed_optimizer_instance_group = (
-                        self.inter_dist_opt_group
-                    )
-                    bucket_group.communication_stream = communication_stream
+                    param_indices == layout.param_indices
+                ), f"param_indices for {buffer_key} do not match between grouping and layout"
 
-            # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
-            # buckets in reverse order (since all-gathers happen in reverse order of buckets).
-            # Note: overlap_param_gather covers both the distributed optimizer and the
-            # layer-wise optimizer cases; the latter sets overlap_param_gather=True
-            # without use_distributed_optimizer.
-            if self.ddp_config.overlap_param_gather:
-                num_bucket_groups = len(bucket_groups)
-                for i in range(1, num_bucket_groups):
-                    bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
-                        bucket_groups[num_bucket_groups - i - 1]
-                    )
-
-            # Create map from param to bucket group, used in pre_hook.
-            for bucket_group in bucket_groups:
-                for bucket in bucket_group.buckets:
-                    for param in bucket.params_list:
-                        self.param_to_bucket_group[param] = bucket_group
-
-            return buffers, bucket_groups
-
+        # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
             assert (
                 not self.ddp_config.average_in_collective
@@ -291,19 +202,106 @@ class DistributedDataParallel(_BaseDataParallel):
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
-        # Allocate the param+grad buffers for dense params' grads.
-        self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
-            dense_params, self.intra_dp_cp_group, gradient_scaling_factor=gradient_scaling_factor
+        # Allocate buffers for each group.
+        self.buffers = []
+        self.expert_parallel_buffers = []
+        pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
+        for buffer_key, (params, param_indices) in buffer_groups.items():
+            if buffer_key.is_expert_parallel:
+                data_parallel_group = self.intra_expt_dp_group
+                scaling_factor = expert_gradient_scaling_factor
+            else:
+                data_parallel_group = self.intra_dp_cp_group
+                scaling_factor = gradient_scaling_factor
+
+            if not config.calculate_per_token_loss:
+                target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
+                if self.ddp_config.average_in_collective:
+                    if self.ddp_config.num_distributed_optimizer_instances == 1:
+                        # Collective is averaging gradients in collective with data_parallel_group.
+                        assert (
+                            scaling_factor / data_parallel_group.size()
+                            == target_gradient_scaling_factor
+                        )
+                    else:
+                        # For non-expert parameters, gradient_scaling_factor is 1.
+                        # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
+                        assert (scaling_factor == 1) or (
+                            scaling_factor == (self.expt_dp_group.size() / self.dp_cp_group.size())
+                        )
+                else:
+                    assert scaling_factor == target_gradient_scaling_factor
+
+            param_layout = (
+                full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
+            )
+            params_with_names = [(p, param_to_name[p]) for p in params]
+            buffer = _ParamAndGradBuffer(
+                self.ddp_config,
+                buffer_key.param_dtype,
+                buffer_key.grad_dtype,
+                params_with_names,
+                data_parallel_group,
+                self.bucket_size,
+                param_to_name,
+                scaling_factor,
+                param_indices,
+                self.ddp_config.nccl_ub,
+                pg_collection,
+                param_layout=param_layout,
+            )
+            if buffer_key.is_expert_parallel:
+                self.expert_parallel_buffers.append(buffer)
+            else:
+                self.buffers.append(buffer)
+
+        # In some scenarios, we want to put buckets from different buffers into a group so that
+        # their communication can be aggregated. For example, when there are both fp8 buffers
+        # and bf16 buffers in the model and vpp is enabled, each model chunk will have an fp8
+        # bucket and a bf16 bucket, which doubles the number of communication kernels, and
+        # because of the use of CUDA_DEVICE_MAX_CONNECTIONS=1, having multiple back-to-back
+        # communications will prevent the overlap of the communication kernels with computation
+        # kernels.
+        # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
+        # bucket group.
+        self.bucket_groups = partition_buckets(
+            self.buffers, force_single_bucket_group=disable_bucketing
+        )
+        self.expert_parallel_bucket_groups = partition_buckets(
+            self.expert_parallel_buffers, force_single_bucket_group=disable_bucketing
         )
 
-        # Allocate separate param+grad buffers for expert parallel params' grads.
-        self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
-            _allocate_buffers_for_parameters(
-                expert_parallel_params,
-                self.intra_expt_dp_group,
-                gradient_scaling_factor=expert_gradient_scaling_factor,
-            )
-        )
+        if self.ddp_config.num_distributed_optimizer_instances > 1:
+            assert (
+                self.ddp_config.use_distributed_optimizer
+            ), 'Partial DistOpt cannot be used without DistOpt'
+            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+                communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+                for bucket_group in bucket_groups:
+                    bucket_group.inter_distributed_optimizer_instance_group = (
+                        self.inter_dist_opt_group
+                    )
+                    bucket_group.communication_stream = communication_stream
+
+        # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
+        # buckets in reverse order (since all-gathers happen in reverse order of buckets).
+        # Note: overlap_param_gather covers both the distributed optimizer and the
+        # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+        # without use_distributed_optimizer.
+        if self.ddp_config.overlap_param_gather:
+            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+                num_bucket_groups = len(bucket_groups)
+                for i in range(1, num_bucket_groups):
+                    bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
+                        bucket_groups[num_bucket_groups - i - 1]
+                    )
+
+        # Create map from param to bucket group, used in pre_hook.
+        for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_group in bucket_groups:
+                for bucket in bucket_group.buckets:
+                    for param in bucket.params_list:
+                        self.param_to_bucket_group[param] = bucket_group
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
