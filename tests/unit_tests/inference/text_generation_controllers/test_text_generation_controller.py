@@ -177,13 +177,13 @@ class TextGenerationControllerTestBase:
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
+
 class TestTextGenerationController(TextGenerationControllerTestBase):
 
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=2,
-            pipeline_model_parallel_size=1,
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
         )
 
     @classmethod

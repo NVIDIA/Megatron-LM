@@ -114,8 +114,7 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
 
     def teardown_method(self, method):
@@ -303,7 +302,6 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
                 f"result.generated_log_probs={result.generated_log_probs}, "
                 f"final_streamed_token.generated_log_probs={final_streamed_token.generated_log_probs}"
             )
-
 
 
 class TestStaticInferenceEngineParallel(StaticInferenceEngineTestHarness):
