@@ -25,7 +25,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}
   --split: 949,50,1
   --tokenizer-type: NullTokenizer
-  --vocab-size: 8192
+  --vocab-size: 8193
   --distributed-backend: nccl
   --lr: 0.00015
   --lr-decay-style: cosine
