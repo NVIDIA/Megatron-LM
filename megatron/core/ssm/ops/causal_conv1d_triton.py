@@ -152,21 +152,15 @@ def causal_conv1d_update_kernel(
             out_dtype = conv_state_ptrs.dtype.element_ty
             if WIDTH >= 2:
                 tl.store(
-                    conv_state_ptrs + 0 * conv_state_l_stride,
-                    x_val_0.to(out_dtype),
-                    mask=mask,
+                    conv_state_ptrs + 0 * conv_state_l_stride, x_val_0.to(out_dtype), mask=mask
                 )
             if WIDTH >= 3:
                 tl.store(
-                    conv_state_ptrs + 1 * conv_state_l_stride,
-                    x_val_1.to(out_dtype),
-                    mask=mask,
+                    conv_state_ptrs + 1 * conv_state_l_stride, x_val_1.to(out_dtype), mask=mask
                 )
             if WIDTH >= 4:
                 tl.store(
-                    conv_state_ptrs + 2 * conv_state_l_stride,
-                    x_val_2.to(out_dtype),
-                    mask=mask,
+                    conv_state_ptrs + 2 * conv_state_l_stride, x_val_2.to(out_dtype), mask=mask
                 )
         else:
             i = 0
@@ -191,26 +185,12 @@ def causal_conv1d_update_kernel(
                 )
                 out_dtype = int_base.dtype.element_ty
                 if WIDTH >= 2:
-                    tl.store(
-                        int_base + 0 * int_state_l_stride,
-                        x_val_0.to(out_dtype),
-                        mask=mask,
-                    )
+                    tl.store(int_base + 0 * int_state_l_stride, x_val_0.to(out_dtype), mask=mask)
                 if WIDTH >= 3:
-                    tl.store(
-                        int_base + 1 * int_state_l_stride,
-                        x_val_1.to(out_dtype),
-                        mask=mask,
-                    )
+                    tl.store(int_base + 1 * int_state_l_stride, x_val_1.to(out_dtype), mask=mask)
                 if WIDTH >= 4:
-                    tl.store(
-                        int_base + 2 * int_state_l_stride,
-                        x_val_2.to(out_dtype),
-                        mask=mask,
-                    )
-                tl.store(
-                    int_base + (state_len - 1) * int_state_l_stride, x_val, mask=mask
-                )
+                    tl.store(int_base + 2 * int_state_l_stride, x_val_2.to(out_dtype), mask=mask)
+                tl.store(int_base + (state_len - 1) * int_state_l_stride, x_val, mask=mask)
             else:
                 i = 0
                 while i < state_len:
