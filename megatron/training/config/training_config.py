@@ -627,10 +627,10 @@ class TokenizerConfig:
     tokenizer_model: str = None
     """Path to the tokenizer model."""
 
-    tokenizer_metadata: str = None
+    metadata_path: str | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-metadata"]}})
     """Path to the tokenizer metadata file in json format."""
 
-    tokenizer_special_tokens: list[str] = field(default_factory=list)
+    special_tokens: list[str] | None = field(default_factory=None, metadata={"argparse_meta": {"arg_names": ["--tokenizer-special-tokens"]}})
     """List of special tokens. For TikTokenizer needs to have 
     ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]"""
 
@@ -661,3 +661,6 @@ class TokenizerConfig:
     null_tokenizer_pad_id: int = -1
     """Pad token id for NullTokenizer. Defaults to -1 (no pad token). 
     Set to a value outside the dataset to avoid masking real tokens."""
+
+    chat_template: Optional[str] = None
+    """Custom chat template in jinja format for conversation formatting."""

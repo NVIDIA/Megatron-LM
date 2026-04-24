@@ -21,7 +21,7 @@ def build_tokenizer(args, **kwargs):
         tokenizer_library = 'megatron'
         tokenizer_path = args.tokenizer_type
         kwargs['additional_special_tokens'] = (
-            args.tokenizer_special_tokens if args.tokenizer_special_tokens else []
+            args.special_tokens if args.special_tokens else []
         )
         if tokenizer_path == 'BertWordPieceCase':
             special_tokens = {}
@@ -36,7 +36,7 @@ def build_tokenizer(args, **kwargs):
         tokenizer_library = 'sentencepiece'
         tokenizer_path = args.tokenizer_model
         kwargs['legacy'] = args.tokenizer_sentencepiece_legacy
-        kwargs['special_tokens'] = args.tokenizer_special_tokens
+        kwargs['special_tokens'] = args.special_tokens
     elif args.tokenizer_type == 'TikTokenizer':
         tokenizer_library = 'tiktoken'
         tokenizer_path = args.tokenizer_model
@@ -45,14 +45,14 @@ def build_tokenizer(args, **kwargs):
         if args.vocab_size:
             kwargs['vocab_size'] = args.vocab_size
         kwargs['num_special_tokens'] = args.tiktoken_num_special_tokens
-        kwargs['special_tokens'] = args.tokenizer_special_tokens
+        kwargs['special_tokens'] = args.special_tokens
     elif args.tokenizer_type == 'HuggingFaceTokenizer':
         tokenizer_library = 'huggingface'
         tokenizer_path = args.tokenizer_model
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
         kwargs['additional_special_tokens'] = (
-            args.tokenizer_special_tokens if args.tokenizer_special_tokens else []
+            args.special_tokens if args.special_tokens else []
         )
         kwargs['use_fast'] = not args.tokenizer_hf_no_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
@@ -88,8 +88,8 @@ def build_tokenizer(args, **kwargs):
 
         return tokenizer
 
-    if args.tokenizer_metadata:
-        metadata = args.tokenizer_metadata
+    if args.metadata_path:
+        metadata = args.metadata_path
     else:
         metadata = {'library': tokenizer_library}
     tokenizer = MegatronTokenizer.from_pretrained(
