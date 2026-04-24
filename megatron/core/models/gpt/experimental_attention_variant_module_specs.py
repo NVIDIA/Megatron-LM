@@ -2,6 +2,7 @@
 
 from typing import List, Optional
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
@@ -29,14 +30,10 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 
-try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TESpecProvider = None
 
 try:
     import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import

@@ -14,6 +14,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     is_pipeline_last_stage,
@@ -42,16 +43,6 @@ from megatron.core.utils import (
     get_pg_size,
     unwrap_model,
 )
-
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
-    HAVE_TE = True
-
-except ImportError:
-    HAVE_TE = False
-
-from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
 
 # pylint: disable=line-too-long
