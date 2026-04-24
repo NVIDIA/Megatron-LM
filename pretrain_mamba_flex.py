@@ -345,7 +345,10 @@ def forward_step(data_iterator, model: HybridModel):
         trainable_sq = frozen_sq = total_sq = 0.0
         for name, param in model.named_parameters():
             # Use fp32 main_param when distributed optimizer is active (matches WandB metric).
-            p = getattr(param, 'main_param', param.detach()).float()
+            # Note: main_param can be None for some params under DistOpt; getattr's default
+            # only applies when the attr is missing, so handle the None case explicitly.
+            main = getattr(param, 'main_param', None)
+            p = (main if main is not None else param.detach()).float()
             norm_sq = p.norm(2).item() ** 2
             # Strip DDP 'module.' wrappers to get the logical top-level name.
             clean = name
