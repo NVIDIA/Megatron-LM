@@ -6,7 +6,6 @@ import logging
 import math
 import multiprocessing
 import socket
-import struct
 import time
 import warnings
 from collections import deque
@@ -549,20 +548,16 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
-            mp_len_sock = self.zmq_context.socket(zmq.PUB)
-            mp_len_sock.bind_to_random_port(f"tcp://{local_ip}")
-            mp_len_addr = mp_len_sock.getsockopt_string(zmq.LAST_ENDPOINT)
         else:
             mp_req_addr = None
-            mp_len_addr = None
 
         # Broadcast addresses to respective ranks.
         bcast = [dp_addr]
         torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
         [dp_addr] = bcast
-        bcast = [mp_req_addr, mp_len_addr]
+        bcast = [mp_req_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
-        [mp_req_addr, mp_len_addr] = bcast
+        [mp_req_addr] = bcast
 
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
@@ -579,26 +574,17 @@ class DynamicInferenceEngine(AbstractEngine):
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
             self.model_parallel_publisher_socket = mp_req_sock
-
-            # 3. Create another publisher socket to broadcast the number of messages to receive.
-            self.model_parallel_num_msgs_publisher_socket = mp_len_sock
             self.zmq_sockets += [
                 self.socket_for_receiving_requests,
-                self.model_parallel_num_msgs_publisher_socket,
                 self.model_parallel_publisher_socket,
             ]
-        # All MP ranks subscribe to the two publisher sockets
+        # All MP ranks subscribe to the publisher socket
         self.model_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
         self.model_parallel_subscriber_socket.connect(mp_req_addr)
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr)
-        self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-
         self.zmq_sockets += [
             self.model_parallel_subscriber_socket,
-            self.model_parallel_num_msgs_subscriber_socket,
         ]
 
         torch.distributed.barrier(mp_group)
@@ -2048,28 +2034,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
-            messages_to_dequeue = len(all_messages)
-            # First publish the number of messages to dequeue.
-            # This is important because we want all tensor parallel ranks
-            # to dequeue the same number of messages.
-            self.model_parallel_num_msgs_publisher_socket.send(
-                struct.pack('!i', messages_to_dequeue)
+            self.model_parallel_publisher_socket.send_multipart(
+                [bytes([Headers.TP_BROADCAST.value])] + all_messages
             )
-            # Now publish the actual messages to all model parallel ranks
-            if messages_to_dequeue > 0:
-                self.model_parallel_publisher_socket.send_multipart(all_messages)
         else:
-            # First, receive the number of messages to dequeue from mp-rank 0
-            messages_to_dequeue = struct.unpack(
-                '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
-            )[0]
-            # Now, dequeue the same number of messages from the subscriber socket.
-            # Note that these receives are blocking, because the messages
-            # are guaranteed to be available after the tp-rank 0 has sent them.
-            if messages_to_dequeue > 0:
-                all_messages = self.model_parallel_subscriber_socket.recv_multipart()
-            else:
-                all_messages = []
+            frames = self.model_parallel_subscriber_socket.recv_multipart()
+            all_messages = frames[1:]
 
         nvtx_range_pop("drain_zmq_socket")
 
