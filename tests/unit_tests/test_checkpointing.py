@@ -140,6 +140,7 @@ def create_ckpt_load_args(create_args):
     args.ckpt_assume_constant_structure = False
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
+    args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
