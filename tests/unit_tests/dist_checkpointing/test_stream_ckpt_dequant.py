@@ -52,7 +52,8 @@ try:
 except Exception:
     _DEVICE_ARCH = 0
 
-# NVFP4 requires Blackwell (arch 10+).
+# MXFP8 and NVFP4 require Blackwell (arch 10+).
+HAVE_MXFP8_HW = HAVE_MXFP8 and _DEVICE_ARCH >= 10
 HAVE_NVFP4_HW = HAVE_NVFP4 and _DEVICE_ARCH >= 10
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
@@ -110,6 +111,9 @@ def _to_nvfp4(tensor: torch.Tensor):
 class TestStreamCkptDequant:
     """Unit tests for streaming per-tensor dequantize during ckpt load."""
 
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
     # ---------------------------------------------------------------
     # Baseline: FP8 (delayed scaling) save/load equivalence + amax safety
     # ---------------------------------------------------------------
@@ -152,8 +156,6 @@ class TestStreamCkptDequant:
                 atol=1e-3,
             )
 
-        Utils.destroy_model_parallel()
-
     def test_fp8_amax_history_not_polluted(self, tmp_path_dist_ckpt):
         """Delayed-scaling amax must be snapshotted & restored across a streaming load."""
         Utils.initialize_model_parallel(1, 1)
@@ -190,14 +192,15 @@ class TestStreamCkptDequant:
                 f"before={pre_load_amax.item()} after={loaded_q.amax.item()}"
             )
 
-        Utils.destroy_model_parallel()
-
     # ---------------------------------------------------------------
     # MXFP8: exercises both the streaming dequant AND the view-based
     # _unwrap_pyt_sharded_tensor fix (without it, ten[0] on MXFP8 OOMs).
     # ---------------------------------------------------------------
 
-    @pytest.mark.skipif(not HAVE_MXFP8, reason="MXFP8Tensor not available in this TE build")
+    @pytest.mark.skipif(
+        not HAVE_MXFP8_HW,
+        reason="MXFP8 requires TransformerEngine MXFP8Tensor and Blackwell+ (arch 10+)",
+    )
     @pytest.mark.parametrize('stream_ckpt_dequant', [False, True])
     def test_mxfp8_save_load_content_equivalence(self, tmp_path_dist_ckpt, stream_ckpt_dequant):
         Utils.initialize_model_parallel(1, 1)
@@ -233,8 +236,6 @@ class TestStreamCkptDequant:
                 rtol=1e-3,
                 atol=1e-3,
             )
-
-        Utils.destroy_model_parallel()
 
     # ---------------------------------------------------------------
     # NVFP4: round-trip under both paths. Same invariants as MXFP8 but
@@ -288,8 +289,6 @@ class TestStreamCkptDequant:
                 atol=1e-2,
             )
 
-        Utils.destroy_model_parallel()
-
     # ---------------------------------------------------------------
     # Corner cases
     # ---------------------------------------------------------------
@@ -316,8 +315,6 @@ class TestStreamCkptDequant:
             loaded = load(dst, ckpt_dir, strategy)
             # Plain BF16 must round-trip exactly.
             torch.testing.assert_close(loaded['w'], src)
-
-        Utils.destroy_model_parallel()
 
     def test_default_is_off(self):
         """The default for stream_ckpt_dequant must be False (old behaviour preserved)."""
@@ -374,8 +371,6 @@ class TestStreamCkptDequant:
                 f"Planner left intermediate state after load: "
                 f"{list(captured[0]._intermediate_read_items.keys())}"
             )
-
-        Utils.destroy_model_parallel()
 
     def test_streaming_flag_forwards_through_fpsl_wrapper(self):
         """FullyParallelLoadStrategyWrapper must surface the base strategy's flag."""
