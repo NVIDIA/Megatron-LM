@@ -1247,6 +1247,7 @@ def _load_global_dist_base_checkpoint(
         sharded_state_dict,
         checkpoint_name,
         load_strategy,
+        validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL

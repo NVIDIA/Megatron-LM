@@ -10,6 +10,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -19,7 +20,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -36,7 +38,7 @@ from megatron.core.utils import (
 logger = logging.getLogger(__name__)
 
 
-class HybridModel(LanguageModule):
+class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
     Args:
@@ -71,7 +73,7 @@ class HybridModel(LanguageModule):
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
             output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope,none], optional):  Position
+        position_embedding_type (Literal[learned_absolute,rope,yarn,none], optional):  Position
             embedding type. Defaults to 'none'.
         rotary_percent (float, optional): Percent of rotary dimension to use for rotary position
             embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
@@ -100,7 +102,7 @@ class HybridModel(LanguageModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         # Mamba with no attention has no need for position embeddings, so none is default
-        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'none',
+        position_embedding_type: Literal['learned_absolute', 'rope', 'yarn', 'none'] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
@@ -228,7 +230,26 @@ class HybridModel(LanguageModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-
+        elif self.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                original_max_position_embeddings=getattr(
+                    self.config, "yarn_original_max_position_embeddings"
+                ),
+                beta_fast=getattr(self.config, "yarn_beta_fast"),
+                beta_slow=getattr(self.config, "yarn_beta_slow"),
+                mscale=getattr(self.config, "yarn_mscale"),
+                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                correction_range_round_to_int=getattr(
+                    self.config, "yarn_correction_range_round_to_int"
+                ),
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -320,6 +341,42 @@ class HybridModel(LanguageModule):
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if (
+            not self.training
+            and hasattr(self, 'cudagraph_manager')
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+
+    def __call__(self, *args, **kwargs):
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            return super().__call__(*args, **kwargs)[0]
+        return super().__call__(*args, **kwargs)
+
+    def create_mcore_cudagraph_manager(self, config):
+        """
+        Create the cudagraph manager for the full iteration inference scope
+        """
+        if CudaGraphScope.full_iteration_inference in config.cuda_graph_scope:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+            self.cudagraph_manager = CudaGraphManager(config)
+
     def forward(
         self,
         input_ids: Tensor,
@@ -380,6 +437,15 @@ class HybridModel(LanguageModule):
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
+        elif self.position_embedding_type == 'yarn':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+            )
+            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
+            rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
             )

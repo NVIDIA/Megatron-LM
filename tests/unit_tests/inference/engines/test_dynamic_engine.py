@@ -600,8 +600,11 @@ class TestDynamicInferenceEngine:
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
             if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
-                # check if cudagraph runners are created at the decoder level
-                assert model.decoder.cudagraph_manager.cudagraph_runners
+                # hybrid models attach cudagraph_manager to the model; others attach to the decoder
+                if model_provider == "hybrid":
+                    assert model.cudagraph_manager.cudagraph_runners
+                else:
+                    assert model.decoder.cudagraph_manager.cudagraph_runners
             else:
                 # check if cudagraph runners are created at the layer level
                 for layer in model.decoder.layers:
@@ -4503,7 +4506,7 @@ class TestChunkedPrefillCudaGraphs:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
 
     def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
