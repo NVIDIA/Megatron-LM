@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer, HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -33,11 +33,7 @@ class TestHybridBlock:
     def get_mamba_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
         mhc_kwargs = (
-            {
-                "enable_hyper_connections": True,
-                "hidden_dropout": 0.0,
-                "mhc_sinkhorn_iterations": 5,
-            }
+            {"enable_hyper_connections": True, "hidden_dropout": 0.0, "mhc_sinkhorn_iterations": 5}
             if enable_hyper_connections
             else {}
         )
@@ -62,11 +58,7 @@ class TestHybridBlock:
     def get_dsa_mamba_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
         mhc_kwargs = (
-            {
-                "enable_hyper_connections": True,
-                "hidden_dropout": 0.0,
-                "mhc_sinkhorn_iterations": 5,
-            }
+            {"enable_hyper_connections": True, "hidden_dropout": 0.0, "mhc_sinkhorn_iterations": 5}
             if enable_hyper_connections
             else {}
         )
