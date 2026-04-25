@@ -3,7 +3,6 @@ import copy
 import functools
 import inspect
 import logging
-import os
 from enum import Enum
 from textwrap import dedent
 from typing import Any, Callable, Sequence
@@ -59,16 +58,6 @@ class TargetAllowlist:
         self._allowed_prefixes: list[str] = list(_DEFAULT_ALLOWED_PREFIXES)
         self._allowed_exact: set[str] = set(_DEFAULT_ALLOWED_EXACT)
         self._enabled: bool = True
-        self._check_env_override()
-
-    def _check_env_override(self) -> None:
-        if os.environ.get("MEGATRON_ALLOW_ALL_TARGETS", "").strip() == "1":
-            logging.warning(
-                "MEGATRON_ALLOW_ALL_TARGETS=1 is set. Target allowlist is DISABLED. "
-                "This allows arbitrary code execution from YAML configs. "
-                "Do NOT use this in production."
-            )
-            self._enabled = False
 
     def is_allowed(self, target: str) -> bool:
         """Check whether *target* is permitted by the allowlist."""

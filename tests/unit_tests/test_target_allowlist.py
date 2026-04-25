@@ -1,8 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import os
-from unittest.mock import patch
-
 import pytest
 
 from megatron.training.config.instantiate_utils import (
@@ -150,22 +147,6 @@ class TestTargetAllowlistEnableDisable:
         al.enable()
         assert not al.is_allowed("os.system")
         assert al.enabled
-
-    def test_env_var_override(self):
-        with patch.dict(os.environ, {"MEGATRON_ALLOW_ALL_TARGETS": "1"}):
-            al = TargetAllowlist()
-            assert not al.enabled
-            assert al.is_allowed("os.system")
-
-    def test_env_var_not_set(self):
-        with patch.dict(os.environ, {}, clear=True):
-            al = TargetAllowlist()
-            assert al.enabled
-
-    def test_env_var_set_to_zero(self):
-        with patch.dict(os.environ, {"MEGATRON_ALLOW_ALL_TARGETS": "0"}):
-            al = TargetAllowlist()
-            assert al.enabled
 
     def test_properties(self):
         al = TargetAllowlist()
