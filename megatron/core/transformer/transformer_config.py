@@ -692,8 +692,10 @@ class TransformerConfig(ModelParallelConfig):
     By default, softmax is done after top-k."""
 
     moe_router_topk_scaling_factor: Optional[float] = None
-    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
-    enabled. Defaults to None, which means no scaling."""
+    """Scaling factor applied to the routing probabilities after the top-k selection.
+    The scaling is applied unconditionally whenever this value is not None, for every
+    `moe_router_score_function` (softmax/sigmoid/sqrtsoftplus) and regardless of whether
+    `moe_router_pre_softmax` is enabled. Defaults to None, which means no scaling."""
 
     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
     """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
