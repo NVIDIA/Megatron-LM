@@ -17,9 +17,9 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.hybrid.hybrid_block import (
-    HyperConnectionHybridLayer,
     HybridStack,
     HybridStackSubmodules,
+    HyperConnectionHybridLayer,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -176,9 +176,7 @@ class TestHybridModel:
             parallel_output=False,
         )
 
-        assert all(
-            isinstance(layer, HyperConnectionHybridLayer) for layer in model.decoder.layers
-        )
+        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in model.decoder.layers)
         assert all(
             isinstance(layer.inner_layer, _DummyHybridLayer) for layer in model.decoder.layers
         )
@@ -190,11 +188,7 @@ class TestHybridModel:
         input_ids = data.repeat((micro_batch_size, 1))
         position_ids = data.repeat((micro_batch_size, 1))
 
-        logits = model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=None,
-        )
+        logits = model.forward(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
 
         assert logits.shape == (micro_batch_size, sequence_length, model.vocab_size)
         assert torch.isfinite(logits).all()

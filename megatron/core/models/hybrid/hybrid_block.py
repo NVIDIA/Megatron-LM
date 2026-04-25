@@ -122,6 +122,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         padding_mask: Optional[Tensor] = None,
         mhc_recompute_manager=None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Run the wrapped hybrid layer through one layer-boundary mHC update."""
         residual = hidden_states
         aggregated, h_res, h_post = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager

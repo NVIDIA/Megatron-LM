@@ -644,6 +644,7 @@ class TestDSAMoEGPTMambaEquivalence:
         # Verify HybridModel matches golden values
         _compare_against_golden_values(mamba_logprobs, gpt_logprobs, abs_tol=1e-3)
 
+
 # ---------------------------------------------------------------------------
 # mHC HybridModel smoke tests for DeepSeek proxy patterns
 # ---------------------------------------------------------------------------
