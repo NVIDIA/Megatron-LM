@@ -612,8 +612,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
             if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
-                # check if cudagraph runners are created at the decoder level
-                assert model.decoder.cudagraph_manager.cudagraph_runners
+                # hybrid models attach cudagraph_manager to the model; others attach to the decoder
+                if model_provider == "hybrid":
+                    assert model.cudagraph_manager.cudagraph_runners
+                else:
+                    assert model.decoder.cudagraph_manager.cudagraph_runners
             else:
                 # check if cudagraph runners are created at the layer level
                 for layer in model.decoder.layers:

@@ -201,7 +201,7 @@ class TestMTPCudaGraphInference:
         if manager is None:
             assert not expect_replayed, "No MTP CudaGraphManager found on the model"
             return
-        table = manager.inference_cudagraphs_lookup_table
+        table = manager.custom_cudagraphs_lookup_table
         mtp_runners = [v for k, v in table.items() if isinstance(k, tuple) and k[0] == 'mtp']
         if expect_replayed:
             assert (
@@ -671,11 +671,11 @@ class TestMTPCudaGraphInference:
         unwrapped = unwrap_model(model)
         manager = getattr(unwrapped, '_mtp_cudagraph_manager', None)
         assert manager is not None
-        assert len(manager.inference_cudagraphs_lookup_table) > 0
+        assert len(manager.custom_cudagraphs_lookup_table) > 0
 
         delete_cuda_graphs()
 
-        assert len(manager.inference_cudagraphs_lookup_table) == 0
+        assert len(manager.custom_cudagraphs_lookup_table) == 0
         assert len(_CudagraphGlobalRecord.mtp_cudagraph_managers) == 0
 
 
