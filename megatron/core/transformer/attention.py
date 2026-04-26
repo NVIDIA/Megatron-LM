@@ -418,7 +418,7 @@ class Attention(MegatronModule, ABC):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-        elif self.position_embedding_type == 'yarn':
+        elif self.config.position_embedding_type == 'yarn':
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=self.config.rotary_percent,
@@ -438,7 +438,7 @@ class Attention(MegatronModule, ABC):
                 ),
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
-        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+        elif self.config.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = MultimodalRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=self.config.rotary_percent,
