@@ -17,6 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
@@ -604,3 +605,123 @@ class TestLayerWiseOptimizer:
                 check_equal(optim_param_state_A, optim_param_state_B)
 
         Utils.destroy_model_parallel()
+
+
+class TestMuonCPUOffload:
+    """Tests for Muon CPU offloading in LayerWiseDistributedOptimizer."""
+
+    def setup_method(self, method):
+        pass
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _create_cpu_offload_optimizer(self, tp=2, pp=2, seed=2):
+        """Helper: build a Muon LayerWise optimizer with CPU offloading."""
+        from megatron.core.optimizer import get_megatron_optimizer
+        from megatron.core.optimizer.optimizer_config import OptimizerConfig
+
+        Utils.initialize_model_parallel(tp, pp)
+        model = initialize_real_model(
+            seed=seed,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
+        )
+        model.cuda(torch.cuda.current_device())
+
+        config = OptimizerConfig(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            use_layer_wise_distributed_optimizer=True,
+            optimizer='muon',
+            lr=0.0,
+            optimizer_cpu_offload=True,
+        )
+
+        optimizer = get_megatron_optimizer(config, [model])
+
+        if isinstance(optimizer, LayerWiseDistributedOptimizer):
+            for opt in optimizer.chained_optimizers:
+                if not hasattr(opt, 'optimizer'):
+                    opt.init_state_fn(opt)
+                else:
+                    opt.init_state_fn(opt.optimizer)
+        return model, optimizer
+
+    def test_cpu_offload_states_on_cpu(self):
+        """After init, Muon fp32 master weights and momentum are on CPU."""
+        model, optimizer = self._create_cpu_offload_optimizer()
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+        assert optimizer._cpu_offload
+
+        for opt in optimizer.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if not isinstance(opt, Float16OptimizerWithFloat16Params):
+                continue
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    assert not param.data.is_cuda, (
+                        f"fp32 master weight should be on CPU, got {param.data.device}"
+                    )
+            for state_vals in opt.optimizer.state.values():
+                for key, val in state_vals.items():
+                    if isinstance(val, torch.Tensor):
+                        assert not val.is_cuda, (
+                            f"optimizer state '{key}' should be on CPU, got {val.device}"
+                        )
+
+    def test_cpu_offload_roundtrip_correctness(self):
+        """Offload -> reload preserves fp32 master weight values."""
+        model, optimizer = self._create_cpu_offload_optimizer()
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+
+        snapshots = {}
+        for opt in optimizer.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if not isinstance(opt, Float16OptimizerWithFloat16Params):
+                continue
+            for gidx, group in enumerate(opt.fp32_from_float16_groups):
+                for pidx, param in enumerate(group):
+                    snapshots[(id(opt), gidx, pidx)] = param.data.clone()
+
+        optimizer.reload_optimizer_states()
+
+        for opt in optimizer.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if not isinstance(opt, Float16OptimizerWithFloat16Params):
+                continue
+            for gidx, group in enumerate(opt.fp32_from_float16_groups):
+                for pidx, param in enumerate(group):
+                    assert param.data.is_cuda, "After reload, param should be on GPU"
+                    key = (id(opt), gidx, pidx)
+                    expected = snapshots[key].to(param.data.device)
+                    assert torch.equal(param.data, expected), (
+                        "Master weight mismatch after offload->reload roundtrip"
+                    )
+
+        optimizer.offload_optimizer_states()
+
+        for opt in optimizer.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if not isinstance(opt, Float16OptimizerWithFloat16Params):
+                continue
+            for gidx, group in enumerate(opt.fp32_from_float16_groups):
+                for pidx, param in enumerate(group):
+                    assert not param.data.is_cuda, "After offload, param should be on CPU"
+
+    def test_cpu_offload_step_runs(self):
+        """A full optimizer step works with CPU offloading enabled."""
+        model, optimizer = self._create_cpu_offload_optimizer()
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+
+        for param in model.parameters():
+            if param.requires_grad:
+                param.grad = torch.randn_like(param.data)
+
+        update_successful, grad_norm, num_zeros = optimizer.step()
+        assert isinstance(update_successful, bool)

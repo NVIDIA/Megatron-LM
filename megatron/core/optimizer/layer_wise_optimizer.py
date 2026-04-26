@@ -91,6 +91,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         super().__init__(optimizers)
 
+        self._cpu_offload = getattr(config, 'optimizer_cpu_offload', False)
+        if self._cpu_offload:
+            self.offload_optimizer_states()
+            logger.info('[layerwise] optimizer states CPU offloading enabled')
+
         # TODO(kunlun, deyuf): potential future perf optimization
         # since allreduce is unchanged and handled by megatron DDP, they're already in
         # contiguous gbuf. So instead of shard param by layer randomly, we can shard by
@@ -279,6 +284,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     @torch.no_grad()
     def step(self):  # type: ignore[no-untyped-def]
         """step function for layer-wise optimizer."""
+        if self._cpu_offload:
+            self.reload_optimizer_states()
+
         update_successful, grad_norm, num_zeros_in_grad = super().step()
 
         # All gather updated params. If overlap_param_gather is True, the allgather
@@ -286,7 +294,46 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if not self.overlap_param_gather:
             self.allgather_params()
 
+        if self._cpu_offload:
+            self.offload_optimizer_states()
+
         return update_successful, grad_norm, num_zeros_in_grad
+
+    @torch.no_grad()
+    def offload_optimizer_states(self):
+        """Move fp32 master weights and optimizer states to CPU pinned memory."""
+        torch.cuda.synchronize()
+        for opt in self.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if not isinstance(opt, Float16OptimizerWithFloat16Params):
+                continue
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    if param.data.is_cuda:
+                        param.data = param.data.cpu().pin_memory()
+            for state_vals in opt.optimizer.state.values():
+                for key, val in state_vals.items():
+                    if isinstance(val, torch.Tensor) and val.is_cuda:
+                        state_vals[key] = val.cpu().pin_memory()
+
+    @torch.no_grad()
+    def reload_optimizer_states(self):
+        """Move fp32 master weights and optimizer states back to GPU."""
+        for opt in self.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if not isinstance(opt, Float16OptimizerWithFloat16Params):
+                continue
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    if not param.data.is_cuda:
+                        param.data = param.data.to('cuda')
+            for state_vals in opt.optimizer.state.values():
+                for key, val in state_vals.items():
+                    if isinstance(val, torch.Tensor) and not val.is_cuda:
+                        state_vals[key] = val.to('cuda')
+        torch.cuda.synchronize()
 
     # TODO(deyuf): need to improve dist checkpointing design to properly handle this
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty

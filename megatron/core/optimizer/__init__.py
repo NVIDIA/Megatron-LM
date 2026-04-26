@@ -492,8 +492,8 @@ def _get_megatron_optimizer_based_on_param_groups(
         raise ValueError(
             "skip_megatron_wrapping=True is incompatible with use_precision_aware_optimizer."
         )
-    if skip_megatron_wrapping and config.optimizer_cpu_offload:
-        raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
+    # NOTE: skip_megatron_wrapping + optimizer_cpu_offload is allowed for Muon,
+    # where LayerWiseDistributedOptimizer handles CPU offloading itself.
 
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
@@ -822,6 +822,8 @@ def _get_megatron_emerging_optimizer(
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
             fallback_config.use_distributed_optimizer = False
+            if use_layer_wise:
+                fallback_config.optimizer_cpu_offload = False
             result = _get_megatron_optimizer_based_on_param_groups(
                 config=fallback_config,
                 model_chunks=model_chunks,
