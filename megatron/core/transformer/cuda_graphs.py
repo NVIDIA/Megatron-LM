@@ -1798,6 +1798,7 @@ class TECudaGraphHelper:
         #   layers found)
         self._capture_finished = False
         self._graphs_created = False
+        self._fsdp_capture_param_states = []
 
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
@@ -2460,6 +2461,46 @@ class TECudaGraphHelper:
 
         return sample_args, kwargs, restore_hooks
 
+    def _get_megatron_fsdp_instances(self):
+        """Find Megatron-FSDP instances from possibly wrapped model chunks."""
+        fsdp_instances = []
+        for model_chunk in self.model:
+            try:
+                obj = get_attr_wrapped_model(
+                    model_chunk, '_replace_param_with_raw_if_needed', return_model_obj=True
+                )
+            except RuntimeError:
+                continue
+            if hasattr(obj, '_replace_param_with_distributed_if_needed'):
+                fsdp_instances.append(obj)
+        return fsdp_instances
+
+    def _prepare_fsdp_params_for_capture(self):
+        """
+        Switch Megatron-FSDP modules to raw parameters before TE capture.
+
+        TE captures graphable submodules directly, so it may not enter
+        MegatronFSDP.forward(), which normally switches module parameters from
+        optimizer DTensors back to raw parameters before all-gather hooks run.
+        Make that precondition explicit so TE records the raw parameter storage
+        that FSDP fetch_bucket updates, and remember the original state so the
+        capture lifecycle can restore it afterward.
+        """
+        self._fsdp_capture_param_states = []
+        for fsdp_module in self._get_megatron_fsdp_instances():
+            was_distributed = getattr(fsdp_module, 'is_param_fsdp_distributed', False)
+            self._fsdp_capture_param_states.append((fsdp_module, was_distributed))
+            fsdp_module._replace_param_with_raw_if_needed()
+
+    def _restore_fsdp_params_after_capture(self):
+        """Restore Megatron-FSDP parameter exposure after CUDA graph capture."""
+        for fsdp_module, was_distributed in reversed(self._fsdp_capture_param_states):
+            if was_distributed:
+                fsdp_module._replace_param_with_distributed_if_needed()
+            else:
+                fsdp_module._replace_param_with_raw_if_needed()
+        self._fsdp_capture_param_states = []
+
     def _start_capturing(self):
         """
         Start capturing CUDA Graphs.
@@ -2472,6 +2513,7 @@ class TECudaGraphHelper:
         if FREEZE_GC:
             gc.freeze()
 
+        self._prepare_fsdp_params_for_capture()
         _set_capture_start()
         log_single_rank(logger, logging.INFO, f'Start CUDA Graphs capture...')
         return time.time()
@@ -2522,6 +2564,7 @@ class TECudaGraphHelper:
 
         torch.cuda.synchronize()
         self._reset_after_capture()
+        self._restore_fsdp_params_after_capture()
 
         if FREEZE_GC:
             gc.unfreeze()
