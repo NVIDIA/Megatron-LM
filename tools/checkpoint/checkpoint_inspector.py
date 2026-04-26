@@ -31,7 +31,7 @@ from torch.distributed.checkpoint import (
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_saver import _save_state_dict
-from torch.distributed.tensor import DeviceMesh, Replicate, Shard
+from torch.distributed.tensor import DeviceMesh, Shard
 
 from megatron.core.dist_checkpointing.strategies.common import load_common
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
