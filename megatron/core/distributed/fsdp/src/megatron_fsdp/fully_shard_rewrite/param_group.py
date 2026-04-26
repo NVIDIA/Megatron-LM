@@ -13,9 +13,9 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from ..uneven_dtensor import make_uneven_dtensor
 from .allocator import TemporaryBucketAllocator
 from .dp_buffer import DataParallelBuffer
-from ..uneven_dtensor import make_uneven_dtensor
 
 
 class ParameterGroup:
@@ -43,6 +43,7 @@ class ParameterGroup:
         sharding_strategy: str = "optim_grads_params",
         param_group_id: int = 0,
         main_params_dtype: Optional[torch.dtype] = None,
+        main_grads_dtype: Optional[torch.dtype] = None,
         gradient_scaling_factor: Optional[float] = None,
         allocator: Optional[TemporaryBucketAllocator] = None,
     ):
@@ -74,6 +75,7 @@ class ParameterGroup:
             self.chunk_size_factor = 1
 
         self.main_params_dtype = main_params_dtype
+        self.main_grads_dtype = main_grads_dtype
         self.gradient_scaling_factor = gradient_scaling_factor
         self.allocator = allocator
 
@@ -89,9 +91,7 @@ class ParameterGroup:
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
-    def _create_buffer(
-        self, dtype: torch.dtype, is_distributed: bool
-    ) -> DataParallelBuffer:
+    def _create_buffer(self, dtype: torch.dtype, is_distributed: bool) -> DataParallelBuffer:
         """Create a DataParallelBuffer with the given settings."""
         return DataParallelBuffer(
             params=self.params,
@@ -139,34 +139,42 @@ class ParameterGroup:
 
         # Create gradient buffer
         if self.requires_grad:
-            gbuf = self._create_buffer(self.dtype, shard_grads)
+            gbuf = self._create_buffer(
+                self.main_grads_dtype if self.main_grads_dtype is not None else self.dtype,
+                shard_grads,
+            )
             gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
             self.main_grad_buffer = gbuf
 
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self):
+    def unshard(self, async_op: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
         After unshard, self.params.data points to full (unsharded) tensors.
         """
-        _, async_op = self.model_weight_buffer.unshard()
-        async_op.wait()
+        _, work = self.model_weight_buffer.unshard(async_op=async_op)
+        return work
 
     def reshard(self):
         """Reshard model weights by releasing unsharded buffer."""
         self.model_weight_buffer.reshard()
 
-    def reduce_grad(self, async_op: bool = False):
+    def reduce_grad(self):
         """
         Reduce gradients across DP ranks.
 
         For distributed buffers: reduce-scatter the full gradient
         For non-distributed buffers: all-reduce in-place
         """
-        self.main_grad_buffer.reduce_grad(async_op=async_op)
+        self.main_grad_buffer.reduce_grad()
+
+    def release_grad_buffer(self):
+        """Release the main gradient buffer to free memory."""
+        if self.main_grad_buffer is not None:
+            self.main_grad_buffer.reshard()
 
     def _init_dist_params(self):
         """
@@ -190,14 +198,18 @@ class ParameterGroup:
         placements = [Shard(dim=0)] if is_param_shard else [Replicate()]
 
         # Create parameter DTensor views
-        for p in self.params:
-            wbuf = self.model_weight_buffer
-            data = wbuf.get_item(self.param_idx[p], only_shard=is_param_shard)
+        for param in self.params:
+            if self.main_weight_buffer is not None:
+                wbuf = self.main_weight_buffer
+            else:
+                wbuf = self.model_weight_buffer
+            data = wbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
 
             dist_param = torch.nn.Parameter(
-                make_uneven_dtensor(data, p.shape, self.mesh, placements)
+                make_uneven_dtensor(data, param.shape, self.mesh, placements)
             )
             # Mark as FSDP parameter for special handling
+            setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             self.dist_params.append(dist_param)
 

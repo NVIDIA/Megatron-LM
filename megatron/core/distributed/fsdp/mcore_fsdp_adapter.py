@@ -216,7 +216,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if ddp_config.use_megatron_fsdp:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import fully_shard
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import (
+                fully_shard,
+            )
         else:
             from torch.distributed.fsdp import fully_shard
 
@@ -229,16 +231,33 @@ class FullyShardedDataParallel(_BaseDataParallel):
         edp_mesh = _init_dp_mesh(pg_collection, edp=True)
         dp_mesh = _init_dp_mesh(pg_collection, edp=False)
 
+        mp_policy = MixedPrecisionPolicy(
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
+            # Grandfathered Argument: grad_reduce_in_fp32
+            main_grads_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_main_grads_dtype
+            ),
+            grad_comm_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
+        )
+        kwargs = {"mp_policy": mp_policy}
+
         for m in module.modules():
             if isinstance(m, (TEGroupedMLP, SequentialMLP)):
-                fully_shard(m, mesh=edp_mesh)
+                fully_shard(m, mesh=edp_mesh, **kwargs)
         if fsdp_unit_modules is not None:
             for m in module.modules():
                 if isinstance(m, tuple(fsdp_unit_modules)):
-                    fully_shard(m, mesh=dp_mesh)
-        fully_shard(module, mesh=dp_mesh)
+                    fully_shard(m, mesh=dp_mesh, **kwargs)
+        fully_shard(module, mesh=dp_mesh, **kwargs)
 
-        module._set_nan_check(True)
+        if ddp_config.check_for_nan_in_grad:
+            module._set_nan_check(True)
 
         super().__init__(config=config, module=module)
 
@@ -257,7 +276,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.module._copy_main_weights_to_model_weights
         )
         self.ddp_config = ddp_config
-        self.no_sync = nullcontext()
+        self.no_sync = nullcontext
         self.start_param_sync = noop
         self.start_grad_sync = noop
         self.finish_grad_sync = noop

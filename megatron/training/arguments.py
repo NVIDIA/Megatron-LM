@@ -2786,6 +2786,9 @@ def _add_distributed_args(parser):
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
+    group.add_argument('--use-fully-shard-api', action='store_true', dest='use_fully_shard_api',
+                       help='Use PyTorch fully shard API for FSDP implementation. '
+                       'This option is only effective when use-megatron-fsdp is set. ')
     group.add_argument('--create-all-gather-group', action='store_true',
                        help='Create a separate process group for all-gather operations '
                        'to overlap reduce-scatter and all-gather operations.')

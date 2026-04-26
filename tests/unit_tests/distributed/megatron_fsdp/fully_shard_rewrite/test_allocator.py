@@ -7,7 +7,10 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.allocator import Bucket, TemporaryBucketAllocator
+from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.allocator import (
+    Bucket,
+    TemporaryBucketAllocator,
+)
 
 
 def _run_allocator_tests(allocator: TemporaryBucketAllocator) -> None:

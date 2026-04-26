@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fully_shard import FSDPModule, fully_shard
-from .param_group import ParameterGroup
-from .dp_buffer import BufferIndex, DataParallelBuffer
-from .allocator import Bucket, TemporaryBucketAllocator
 from ..uneven_dtensor import (
-    make_uneven_dtensor,
-    get_state_dict,
-    preprocess_state_dict_for_uneven_dtensor,
     gather_and_compute_chunk_metadata,
+    get_state_dict,
+    make_uneven_dtensor,
+    preprocess_state_dict_for_uneven_dtensor,
+    redistribute_uneven_dtensor_to_replicated,
     split_dtensor,
     uneven_dtensor_to_full_tensor,
-    redistribute_uneven_dtensor_to_replicated,
 )
+from .allocator import Bucket, TemporaryBucketAllocator
+from .dp_buffer import BufferIndex, DataParallelBuffer
+from .fully_shard import FSDPModule, fully_shard
+from .param_group import ParameterGroup
 
 __all__ = [
     "FSDPModule",

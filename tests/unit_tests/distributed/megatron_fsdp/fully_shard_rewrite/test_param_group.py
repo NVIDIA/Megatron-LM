@@ -16,7 +16,9 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.param_group import ParameterGroup
+from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.param_group import (
+    ParameterGroup,
+)
 
 # ------------------------------------------------------------------ #
 #  Process group — init once per pytest session, shared by all tests
@@ -87,11 +89,7 @@ def _build_groups(strategy):
         if not params:
             continue
         pg = ParameterGroup(
-            params=params,
-            fsdp_unit_id=0,
-            mesh=None,
-            sharding_strategy=strategy,
-            param_group_id=gid,
+            params=params, fsdp_unit_id=0, mesh=None, sharding_strategy=strategy, param_group_id=gid
         )
         groups.append(pg)
         # Snapshot original (pre-shard) values for later comparison

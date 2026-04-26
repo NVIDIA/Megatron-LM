@@ -351,7 +351,7 @@ class DataParallelBuffer:
         return self._unsharded_buffer
 
     @torch.no_grad()
-    def reduce_grad(self, async_op: bool = True) -> Optional[torch.distributed.Work]:
+    def reduce_grad(self):
         """Reduce gradients across the data-parallel group.
 
         For distributed buffers: reduce-scatter the full gradient into each
@@ -359,20 +359,18 @@ class DataParallelBuffer:
         For non-distributed buffers: all-reduce in-place.
         """
         if not self.is_distributed:
-            work = torch.distributed.all_reduce(self.data, group=self.dp_group, async_op=async_op)
-            return work
+            torch.distributed.all_reduce(self.data, group=self.dp_group)
+            return
 
         full_grad = self.fetch_unsharded_buffer()
 
         sm = self.buffer_index.shard_meta
         grad_shard = full_grad[sm.bucket_data_index : sm.bucket_data_index + sm.size]
 
-        work = torch.distributed.reduce_scatter_tensor(
-            output=grad_shard, input=full_grad, group=self.dp_group, async_op=async_op
+        torch.distributed.reduce_scatter_tensor(
+            output=grad_shard, input=full_grad, group=self.dp_group
         )
 
-        if not async_op:
-            self.data[sm.local_data_index : sm.local_data_index + sm.size] += grad_shard
-            self.allocator.free(self.buffer_index.param_group_id)
-
-        return work
+        # Accumulate the reduced shard into the persistent local shard buffer. This is needed
+        # to support gradient accumulation across multiple backward passes.
+        self.data[sm.local_data_index : sm.local_data_index + sm.size] += grad_shard
