@@ -1208,6 +1208,9 @@ def validate_args(args, defaults={}):
             assert not args.overlap_param_gather
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
+    # --log-energy-csv-dir implies --log-energy
+    if args.log_energy_csv_dir is not None:
+        args.log_energy = True
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
