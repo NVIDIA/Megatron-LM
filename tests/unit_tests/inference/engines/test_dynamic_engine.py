@@ -50,11 +50,11 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 try:
     from torch_memory_saver import torch_memory_saver  # noqa: F401
@@ -178,7 +178,7 @@ class DynamicEngineTestEnv:
     )
 
 
-class TestDynamicInferenceEngine:
+class DynamicInferenceEngineTestBase:
 
     @classmethod
     def _build_requests(cls, test_config: DynamicEngineTestConfig) -> List[DynamicInferenceRequest]:
@@ -281,11 +281,7 @@ class TestDynamicInferenceEngine:
     @classmethod
     @torch.inference_mode()
     def _build_test_env(cls, test_config):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=test_config.tensor_model_parallel_size,
-            pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
-        )
-
+        clear_nvte_env_vars()
         set_rounder(4)
 
         # Random state.
@@ -398,12 +394,18 @@ class TestDynamicInferenceEngine:
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
-                add_bias_linear=test_config.expert_model_parallel_size == 1,
+                add_bias_linear=test_config.expert_model_parallel_size == 1
+                and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_scope=test_config.cuda_graph_scope,
                 transformer_impl=test_config.transformer_impl,
+                normalization=(
+                    "RMSNorm"
+                    if test_config.transformer_impl == "inference_optimized"
+                    else "LayerNorm"
+                ),
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
@@ -459,10 +461,7 @@ class TestDynamicInferenceEngine:
             ),
         )
 
-        # Reset global cuda graph state.
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
 
         # Inference engine.
         engine = DynamicInferenceEngine(text_generation_controller, inference_context)
@@ -565,8 +564,21 @@ class TestDynamicInferenceEngine:
 
         return env
 
+
+class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
     @classmethod
     def teardown_class(cls):
+        delete_cuda_graphs()
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -600,8 +612,11 @@ class TestDynamicInferenceEngine:
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
             if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
-                # check if cudagraph runners are created at the decoder level
-                assert model.decoder.cudagraph_manager.cudagraph_runners
+                # hybrid models attach cudagraph_manager to the model; others attach to the decoder
+                if model_provider == "hybrid":
+                    assert model.cudagraph_manager.cudagraph_runners
+                else:
+                    assert model.decoder.cudagraph_manager.cudagraph_runners
             else:
                 # check if cudagraph runners are created at the layer level
                 for layer in model.decoder.layers:
@@ -1082,88 +1097,6 @@ class TestDynamicInferenceEngine:
                 for i, log_prob in enumerate(request.prompt_log_probs):
                     assert not math.isnan(log_prob) and not math.isinf(log_prob)
                     assert -100.0 <= log_prob <= 0.0
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
-    @pytest.mark.parametrize("sequence_parallel", [False, True])
-    @pytest.mark.parametrize("ep_size", [1, 2])
-    @pytest.mark.parametrize("pp_size", [1, 2])
-    @pytest.mark.parametrize("tp_size", [1, 2])
-    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
-    @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
-    @torch.inference_mode()
-    def test_parallel_inference(
-        self,
-        model_provider,
-        tp_size,
-        pp_size,
-        ep_size,
-        sequence_parallel,
-        materialize_only_last_token_logits,
-        transformer_impl,
-    ):
-        skip_if_mamba_sequence_packing_not_available(model_provider)
-
-        if tp_size == 1 and pp_size == 1 and ep_size == 1:
-            pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
-        elif not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
-        world_size = torch.distributed.get_world_size()
-        min_world_size = tp_size * pp_size * ep_size
-        if world_size < min_world_size:
-            pytest.skip(f"Test requires at least {min_world_size} GPUs")
-        elif tp_size == 1 and sequence_parallel:
-            pytest.skip(reason="Sequence parallelism requires tp_size > 1")
-        elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
-            pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
-        elif transformer_impl == "inference_optimized":
-            if ep_size > 1:
-                pytest.skip(
-                    reason="MoE models are not supported with the inference optimized transformer."
-                )
-            if tp_size > 1 and not sequence_parallel:
-                pytest.skip(
-                    reason=(
-                        "The inference optimized transformer requires sequence parallelism "
-                        "when tp_size > 1."
-                    )
-                )
-            if model_provider == "hybrid":
-                pytest.skip(
-                    reason="Mamba model is not supported with the inference optimized transformer."
-                )
-
-        env = self._run_test(
-            model_provider=model_provider,
-            tensor_model_parallel_size=tp_size,
-            pipeline_model_parallel_size=pp_size,
-            expert_model_parallel_size=ep_size,
-            sequence_parallel=sequence_parallel,
-            materialize_only_last_token_logits=materialize_only_last_token_logits,
-            transformer_impl=transformer_impl,
-        )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
-    def test_sequence_parallel_fp8_inference(self, materialize_only_last_token_logits: bool):
-        fp8_available, reason_for_no_fp8 = check_fp8_support()
-        if not fp8_available:
-            pytest.skip(reason_for_no_fp8)
-
-        self._run_test(
-            min_prompt_length=19,
-            max_prompt_length=19,
-            tensor_model_parallel_size=4,
-            sequence_parallel=True,
-            materialize_only_last_token_logits=True,
-            fp8=True,
-        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -2361,7 +2294,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -2484,7 +2417,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2568,7 +2501,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -2653,7 +2586,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             # Predict next_token_ids + 1 (continuing the ascending sequence)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
@@ -3007,7 +2940,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.zeros(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3220,7 +3153,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3340,7 +3273,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3470,7 +3403,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             logits = torch.randn(
                 n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
@@ -3819,7 +3752,7 @@ class TestDynamicInferenceEngine:
             )
             return base_logits
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
             n = hidden_states.size(0)
             pred_toks = (next_token_ids + 1).clamp(max=test_config.vocab_size - 1)
             logits = torch.zeros(
@@ -4261,40 +4194,6 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @torch.inference_mode()
-    def test_speculative_decoding_pipeline_parallel(self):
-        """Test speculative decoding with pipeline parallelism (pp_size=2).
-
-        Verifies that MTP logit broadcasts across pipeline stages don't hang
-        or produce incorrect results. Each PP stage must participate in the
-        same number of MTP broadcast rounds.
-        """
-        if not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
-        world_size = torch.distributed.get_world_size()
-        pp_size = 2
-        if world_size < pp_size:
-            pytest.skip(f"Test requires at least {pp_size} GPUs")
-
-        env = self._run_test(
-            model_provider="gpt",
-            pipeline_model_parallel_size=pp_size,
-            num_speculative_tokens=2,
-            num_tokens_to_generate=6,
-            materialize_only_last_token_logits=False,
-        )
-
-        for request in env.requests:
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Request {request.request_id}: status={request.status}"
-            num_expected = request.sampling_params.num_tokens_to_generate
-            assert len(request.generated_tokens) <= num_expected
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
     @pytest.mark.parametrize(
         "rejection_mode",
         ["all_accepted", "all_rejected", "partial"],
@@ -4410,6 +4309,137 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.total_request_count == 0
 
 
+class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
+    """Tests that require non-default parallel configs (tp>1, pp>1, or ep>1).
+
+    Each test initializes its own parallel state and tears it down afterward,
+    so these are separated from TestDynamicInferenceEngine to avoid accumulating
+    NCCL communicator memory from repeated init/destroy cycles.
+    """
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    @classmethod
+    @torch.inference_mode()
+    def _build_test_env(cls, test_config):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
+            expert_model_parallel_size=test_config.expert_model_parallel_size,
+            expert_tensor_parallel_size=1,
+        )
+        return super()._build_test_env(test_config)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
+    @torch.inference_mode()
+    def test_parallel_inference(
+        self,
+        model_provider,
+        tp_size,
+        pp_size,
+        ep_size,
+        sequence_parallel,
+        materialize_only_last_token_logits,
+        transformer_impl,
+    ):
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+
+        if tp_size == 1 and pp_size == 1 and ep_size == 1:
+            pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
+        elif not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        world_size = torch.distributed.get_world_size()
+        min_world_size = tp_size * pp_size * ep_size
+        if world_size < min_world_size:
+            pytest.skip(f"Test requires at least {min_world_size} GPUs")
+        elif tp_size == 1 and sequence_parallel:
+            pytest.skip(reason="Sequence parallelism requires tp_size > 1")
+        elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
+            pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
+        elif transformer_impl == "inference_optimized":
+            if ep_size > 1:
+                pytest.skip(
+                    reason="MoE models are not supported with the inference optimized transformer."
+                )
+            if tp_size > 1 and not sequence_parallel:
+                pytest.skip(
+                    reason=(
+                        "The inference optimized transformer requires sequence parallelism "
+                        "when tp_size > 1."
+                    )
+                )
+
+        env = self._run_test(
+            model_provider=model_provider,
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=sequence_parallel,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+            transformer_impl=transformer_impl,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
+    def test_sequence_parallel_fp8_inference(self, materialize_only_last_token_logits: bool):
+        fp8_available, reason_for_no_fp8 = check_fp8_support()
+        if not fp8_available:
+            pytest.skip(reason_for_no_fp8)
+
+        self._run_test(
+            min_prompt_length=19,
+            max_prompt_length=19,
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            materialize_only_last_token_logits=True,
+            fp8=True,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_pipeline_parallel(self):
+        """Test speculative decoding with pipeline parallelism (pp_size=2)."""
+        if not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        world_size = torch.distributed.get_world_size()
+        pp_size = 2
+        if world_size < pp_size:
+            pytest.skip(f"Test requires at least {pp_size} GPUs")
+
+        env = self._run_test(
+            model_provider="gpt",
+            pipeline_model_parallel_size=pp_size,
+            num_speculative_tokens=2,
+            num_tokens_to_generate=6,
+            materialize_only_last_token_logits=False,
+        )
+
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+            num_expected = request.sampling_params.num_tokens_to_generate
+            assert len(request.generated_tokens) <= num_expected
+
+
 CHUNKED_CG_BLOCK_SIZE = 256
 CHUNKED_CG_VOCAB_SIZE = 10000
 CHUNKED_CG_MAX_SEQ_LEN = 2048
@@ -4430,6 +4460,7 @@ class TestChunkedPrefillCudaGraphs:
 
     @classmethod
     def teardown_class(cls):
+        delete_cuda_graphs()
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -4494,17 +4525,6 @@ class TestChunkedPrefillCudaGraphs:
         model.eval()
         return model
 
-    def _reset_cuda_graph_state(self, model):
-        """Reset all CUDA graph global and per-module state."""
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
-        CudaGraphManager.global_mempool = None
-        for module in model.modules():
-            if isinstance(module, CudaGraphManager):
-                module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
-
     def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
         set_rounder(4)
@@ -4537,7 +4557,7 @@ class TestChunkedPrefillCudaGraphs:
                 vocab_size=CHUNKED_CG_VOCAB_SIZE, detokenize=lambda tokens: "tokenized_prompt"
             ),
         )
-        self._reset_cuda_graph_state(model)
+        delete_cuda_graphs()
         return DynamicInferenceEngine(controller, context)
 
     def _run_to_completion(self, engine, prompts, num_tokens_to_generate):
@@ -4572,10 +4592,7 @@ class TestChunkedPrefillCudaGraphs:
         """Verify generated tokens match across chunked prefill and CUDA graph configs."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
-        # Clear NVTE env vars set by conftest set_env fixture.
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        clear_nvte_env_vars()
 
         random.seed(123)
         torch.manual_seed(123)
