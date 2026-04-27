@@ -83,28 +83,24 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
     ) -> Tuple[Tensor, Optional[Tensor]]:
-        original_enable_hyper_connections = self.config.enable_hyper_connections
-        self.config.enable_hyper_connections = False
-        try:
-            if isinstance(self.inner_layer, TransformerLayer):
-                output = self.inner_layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    sequence_len_offset=sequence_len_offset,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                )
-            else:
-                output = self.inner_layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    packed_seq_params=packed_seq_params,
-                )
-        finally:
-            self.config.enable_hyper_connections = original_enable_hyper_connections
+        if isinstance(self.inner_layer, TransformerLayer):
+            output = self.inner_layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                _called_from_hybrid_mhc_wrapper=True,
+            )
+        else:
+            output = self.inner_layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
 
         if isinstance(output, tuple):
             context = output[1] if len(output) > 1 else None
@@ -137,6 +133,8 @@ class HyperConnectionHybridLayer(MegatronModule):
             padding_mask,
         )
         layer_delta = layer_output - aggregated
+        # The inner hybrid layer already applied its own local residual/dropout.
+        # mHC only mixes the deterministic layer delta back into the n-stream state.
         hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
             h_res,
             residual,
@@ -145,7 +143,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             dropout_prob=0.0,
             training=False,
             fused=False,
-            manager=None,
+            manager=mhc_recompute_manager,
         )
         return hidden_states, context
 

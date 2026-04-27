@@ -17,12 +17,14 @@ if TYPE_CHECKING:
 
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
-    row_max = input_logits.max(dim=-1, keepdim=True).values
-    M = torch.exp(input_logits - row_max)
+    output_dtype = input_logits.dtype
+    input_logits_fp32 = input_logits.float()
+    row_max = input_logits_fp32.max(dim=-1, keepdim=True).values
+    M = torch.exp(input_logits_fp32 - row_max)
     for _ in range(num_iterations):
         M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
         M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
-    return M
+    return M.to(output_dtype)
 
 
 class SinkhornKnopp(torch.autograd.Function):
@@ -44,7 +46,7 @@ class SinkhornKnopp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        """Recompute forward under enable_grad and back-propagate."""
+        """Recompute forward under enable_grad for memory-efficient backward."""
         (input_logits,) = ctx.saved_tensors
         with torch.enable_grad():
             logits = input_logits.detach().requires_grad_(True)
@@ -215,7 +217,7 @@ class HyperConnectionModule(MegatronModule):
             ],
             dim=-1,
         )
-        h = r * proj * alpha_ + self.bias
+        h = proj * alpha_ * r + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
         h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
 
@@ -294,7 +296,9 @@ class HyperConnectionModule(MegatronModule):
         Apply H_post to x and optionally bias, with optional checkpointing.
 
         This is the unified entry point that handles both normal execution
-        and checkpoint-based execution for memory efficiency.
+        and checkpoint-based execution for memory efficiency. The TransformerLayer
+        path currently uses fused_h_res_h_post_bda directly, but this helper is
+        kept for callers that need standalone H_post expansion.
 
         Args:
             x_with_bias: Tuple of (x, bias) where:
@@ -685,32 +689,3 @@ class HyperConnectionModule(MegatronModule):
                 output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x)
 
         return output
-
-
-# ==================== Checkpoint utilities for mHC ====================
-
-
-class HyperConnectionCheckpoint:
-    """
-    Checkpoint utility for mHC intermediate activations.
-
-    Implements the paper's "recomputing strategy" to reduce memory footprint
-    by discarding intermediate n-stream activations and recomputing on-the-fly.
-    """
-
-    @staticmethod
-    def compute_optimal_block_size(num_layers: int, num_streams: int) -> int:
-        """
-        Compute optimal recomputation block size.
-
-        From paper Eq. (20): L_r^* ≈ sqrt(nL/(n+2))
-
-        Args:
-            num_layers: Total number of transformer layers
-            num_streams: Number of residual streams (n)
-
-        Returns:
-            block_size: Optimal block size for checkpointing
-        """
-        block_size = int(math.sqrt(num_streams * num_layers / (num_streams + 2)))
-        return max(1, block_size)

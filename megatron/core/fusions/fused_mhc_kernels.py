@@ -333,8 +333,8 @@ if _CUTILE_AVAILABLE:
                 orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
             orig_2d = ct.reshape(orig_tile, (N, TILE_C))
-            g_x_2d = ct.full((1, TILE_C), 0, dtype=hp.dtype)
-            g_orig_2d = ct.full((N, TILE_C), 0, dtype=hp.dtype)
+            g_x_2d = ct.full((1, TILE_C), 0, dtype=ct.float32)
+            g_orig_2d = ct.full((N, TILE_C), 0, dtype=ct.float32)
             for j in range(N):
                 g_x_2d += ct.extract(hp_2d, (0, j), shape=(1, 1)).item() * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
@@ -403,8 +403,8 @@ if _CUTILE_AVAILABLE:
                 orig, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
             )
             orig_2d = ct.reshape(orig_tile, (N, TILE_C))
-            g_x_2d = ct.full((1, TILE_C), 0, dtype=hp.dtype)
-            g_orig_2d = ct.full((N, TILE_C), 0, dtype=hp.dtype)
+            g_x_2d = ct.full((1, TILE_C), 0, dtype=ct.float32)
+            g_orig_2d = ct.full((N, TILE_C), 0, dtype=ct.float32)
             for j in range(N):
                 g_x_2d += ct.extract(hp_2d, (0, j), shape=(1, 1)).item() * ct.extract(
                     go_2d, (j, 0), shape=(1, TILE_C)
@@ -581,10 +581,11 @@ if _CUTILE_AVAILABLE:
                 A, index=(tile_m_id, tile_k_id), shape=(TILE_M, TILE_K), padding_mode=PAD_ZERO
             )
             b_tile = ct.load(B, index=(0, tile_k_id), shape=(TILE_N, TILE_K), padding_mode=PAD_ZERO)
+            a_tile_fp32 = a_tile.astype(ct.float32)
             acc = ct.mma(
-                a_tile.astype(ct.tfloat32), b_tile.transpose().astype(ct.tfloat32), acc=acc
+                a_tile_fp32.astype(ct.tfloat32), b_tile.transpose().astype(ct.tfloat32), acc=acc
             )
-            sum_sq += ct.sum(a_tile * a_tile, axis=1, keepdims=True)
+            sum_sq += ct.sum(a_tile_fp32 * a_tile_fp32, axis=1, keepdims=True)
         norm_tile = ct.sqrt(sum_sq)
         v = norm_tile / ct.sqrt(K) + eps
         r_tile = 1.0 / v
@@ -626,7 +627,9 @@ if _CUTILE_AVAILABLE:
             dr_tile = ct.load(
                 DR, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=zero_pad
             )
-            accumulator_da = accumulator_da + _ct_rms_dnorm(a_tile, norm_tile, dr_tile, K)
+            accumulator_da = accumulator_da + _ct_rms_dnorm(
+                a_tile.astype(ct.float32), norm_tile, dr_tile, K
+            )
             b_tile = ct.load(
                 B, index=(0, tile_k_id), shape=(TILE_SIZE_N, TILE_SIZE_K), padding_mode=zero_pad
             )

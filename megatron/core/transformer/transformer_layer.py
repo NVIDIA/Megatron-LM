@@ -45,6 +45,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_identity_op_spec(spec_or_module: Union[ModuleSpec, type]) -> bool:
+    """Return True when a module spec resolves directly to IdentityOp."""
+    return spec_or_module is IdentityOp or (
+        isinstance(spec_or_module, ModuleSpec) and spec_or_module.module is IdentityOp
+    )
+
+
 def get_transformer_layer_offset(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ):
@@ -706,8 +713,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         # Injected by __call__ for cuda graph keying; not a real forward arg.
         kwargs.pop("dynamic_inference_decode_only", None)
+        called_from_hybrid_mhc_wrapper = kwargs.pop("_called_from_hybrid_mhc_wrapper", False)
         assert (
-            not self.config.enable_hyper_connections
+            not self.config.enable_hyper_connections or called_from_hybrid_mhc_wrapper
         ), "Please use HyperConnectionTransformerLayer instead"
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
@@ -1302,7 +1310,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Extract mhc_recompute_manager before CUDA graph manager processes kwargs,
         # since CheckpointManager is not a CUDA-graph-supported type.
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-        kwargs.pop("is_last_layer_in_recompute_block", None)
 
         if self._should_call_local_cudagraph(*args, **kwargs):
             # Inference mode.
@@ -1314,7 +1321,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     'inference_context'
                 ].is_decode_only()
 
-        return super().__call__(*args, **kwargs)
+        try:
+            return super().__call__(*args, **kwargs)
+        finally:
+            self._mhc_recompute_manager = None
 
     def get_layer_norm_weights(self):
         """
@@ -1335,6 +1345,16 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     Cross-attention hyper connection is not supported.
     """
 
+    @staticmethod
+    def _require_tensor_layernorm_output(output, layernorm_name: str):
+        if isinstance(output, tuple):
+            raise ValueError(
+                "HyperConnectionTransformerLayer does not support layernorms that "
+                "return (output, residual) tuples. Use a standard layernorm for "
+                f"{layernorm_name}."
+            )
+        return output
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1353,17 +1373,28 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             vp_stage=vp_stage,
         )
 
-        if submodules.cross_attention_hyper_connection is not IdentityOp:
+        if not _is_identity_op_spec(submodules.cross_attention_hyper_connection):
             raise ValueError(
                 "HyperConnectionTransformerLayer does not support cross-attention "
                 "hyper connections. Use IdentityOp for cross_attention_hyper_connection."
             )
+        if not _is_identity_op_spec(submodules.cross_attention):
+            raise ValueError(
+                "HyperConnectionTransformerLayer does not support cross-attention. "
+                "Use IdentityOp for cross_attention when hyper connections are enabled."
+            )
+        if self.is_moe_layer:
+            raise ValueError(
+                "HyperConnectionTransformerLayer does not support MoE MLP submodules. "
+                "Use TransformerLayer/MoETransformerLayer without hyper connections, or wrap "
+                "MoE as a single HybridStack layer with HyperConnectionHybridLayer."
+            )
 
-        assert submodules.self_attention_hyper_connection is not IdentityOp, (
+        assert not _is_identity_op_spec(submodules.self_attention_hyper_connection), (
             "HyperConnectionTransformerLayer requires self_attention_hyper_connection. "
             "Use TransformerLayer instead if hyper connections are not needed."
         )
-        assert submodules.mlp_hyper_connection is not IdentityOp, (
+        assert not _is_identity_op_spec(submodules.mlp_hyper_connection), (
             "HyperConnectionTransformerLayer requires mlp_hyper_connection. "
             "Use TransformerLayer instead if hyper connections are not needed."
         )
@@ -1425,6 +1456,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
+        kwargs.pop("_called_from_hybrid_mhc_wrapper", None)
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
@@ -1467,6 +1499,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post = self.self_attention_hyper_connection(
@@ -1489,6 +1523,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
+        input_layernorm_output = self._require_tensor_layernorm_output(
+            input_layernorm_output, "input_layernorm"
+        )
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
@@ -1526,7 +1563,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
 
         if self.offload_attn_norm:
-            hidden_states = off_interface.group_commit(hidden_states, name="attn_norm")
+            hidden_states = off_interface.group_commit(
+                hidden_states, name="attn_norm", forced_released_tensors=[residual]
+            )
 
         # Cross-attention (no hyper connection support).
         residual = hidden_states
@@ -1568,6 +1607,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mhc_mlp_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
 
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         nvtx_range_push(suffix="mlp_hyper_connection")
         hidden_states, mlp_h_res, mlp_hc_h_post = self.mlp_hyper_connection(
@@ -1590,6 +1631,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         else:
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output = self._require_tensor_layernorm_output(
+            pre_mlp_layernorm_output, "pre_mlp_layernorm"
+        )
 
         nvtx_range_push(suffix="mlp")
         should_chunk_mlp_for_prefill = (
@@ -1684,7 +1728,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            hidden_states = off_interface.group_commit(hidden_states, name="mlp_norm")
+            hidden_states = off_interface.group_commit(
+                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+            )
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True

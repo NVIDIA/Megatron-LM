@@ -764,7 +764,7 @@ class TestPPForwardWithMHC:
                 attention_dropout=0.0,
             )
 
-            spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=enable_mhc)
+            spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connections=enable_mhc)
 
             models = []
             for i in range(vp_size or 1):

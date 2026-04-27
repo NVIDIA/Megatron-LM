@@ -1555,6 +1555,13 @@ class TransformerConfig(ModelParallelConfig):
                 "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
             )
 
+        if self.enable_hyper_connections and self.inference_fuse_tp_communication:
+            raise ValueError(
+                "enable_hyper_connections is not compatible with "
+                "inference_fuse_tp_communication. The fused inference TP path assumes "
+                "single-stream residual tensors."
+            )
+
         if self.fine_grained_activation_offloading:
             assert (
                 not self.cpu_offloading

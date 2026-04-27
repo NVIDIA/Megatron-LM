@@ -22,28 +22,28 @@ _ID = IdentityOp
 
 
 class TestGptLayerSpecsHyperConnection:
-    """Test that enable_hyper_connection controls module types in layer specs."""
+    """Test that enable_hyper_connections controls module types in layer specs."""
 
     @pytest.mark.parametrize(
         "factory,kwargs,expected_module,expected_hc",
         [
             (_TE, {}, _TL, _ID),
-            (_TE, {"enable_hyper_connection": True}, _HC, _HC_MOD),
-            (_TE, {"enable_hyper_connection": False}, _TL, _ID),
-            (_TE, {"multi_latent_attention": True, "enable_hyper_connection": False}, _TL, _ID),
-            (_TE, {"multi_latent_attention": True, "enable_hyper_connection": True}, _HC, _HC_MOD),
+            (_TE, {"enable_hyper_connections": True}, _HC, _HC_MOD),
+            (_TE, {"enable_hyper_connections": False}, _TL, _ID),
+            (_TE, {"multi_latent_attention": True, "enable_hyper_connections": False}, _TL, _ID),
+            (_TE, {"multi_latent_attention": True, "enable_hyper_connections": True}, _HC, _HC_MOD),
             (_LOCAL, {}, _TL, _ID),
-            (_LOCAL, {"enable_hyper_connection": True}, _HC, _HC_MOD),
-            (_LOCAL, {"enable_hyper_connection": False}, _TL, _ID),
-            (_LOCAL, {"multi_latent_attention": True, "enable_hyper_connection": False}, _TL, _ID),
+            (_LOCAL, {"enable_hyper_connections": True}, _HC, _HC_MOD),
+            (_LOCAL, {"enable_hyper_connections": False}, _TL, _ID),
+            (_LOCAL, {"multi_latent_attention": True, "enable_hyper_connections": False}, _TL, _ID),
             (
                 _LOCAL,
-                {"multi_latent_attention": True, "enable_hyper_connection": True},
+                {"multi_latent_attention": True, "enable_hyper_connections": True},
                 _HC,
                 _HC_MOD,
             ),
-            (_LOCAL, {"normalization": "RMSNorm", "enable_hyper_connection": False}, _TL, _ID),
-            (_LOCAL, {"normalization": "RMSNorm", "enable_hyper_connection": True}, _HC, _HC_MOD),
+            (_LOCAL, {"normalization": "RMSNorm", "enable_hyper_connections": False}, _TL, _ID),
+            (_LOCAL, {"normalization": "RMSNorm", "enable_hyper_connections": True}, _HC, _HC_MOD),
         ],
         ids=[
             "te_default",
