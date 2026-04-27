@@ -345,10 +345,11 @@ def _invoke_fused_moe_kernel(
 # ---------------------------------------------------------------------------
 
 
-def _apply_activation(activation_type: ActivationType, x: torch.Tensor) -> torch.Tensor:
-    """Element-wise activation, returns new tensor."""
+def _apply_activation_inplace(activation_type: ActivationType, x: torch.Tensor) -> None:
+    """Element-wise activation, applied in-place."""
     if activation_type == ActivationType.SQUARED_RELU:
-        return torch.nn.functional.relu(x).square()
+        x.clamp_(min=0)
+        x.mul_(x)
     else:
         raise ValueError(f"Unsupported activation: {activation_type}")
 
@@ -411,7 +412,9 @@ def vllm_fused_moe(
     topk_weights_flat = probs.reshape(-1).contiguous()
 
     # FC1: [max_tokens, K] → [max_tokens*topk, N]
-    intermediate1 = torch.zeros(
+    # torch.empty is safe: FC2 reads the same indirection positions FC1 writes,
+    # so unwritten rows (non-local / beyond valid_tokens) are never consumed.
+    intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
     _invoke_fused_moe_kernel(
@@ -426,15 +429,18 @@ def vllm_fused_moe(
         top_k=topk,
     )
 
-    # Activation
-    intermediate2 = _apply_activation(activation_type, intermediate1)
+    # Activation (in-place to avoid allocating a second buffer)
+    _apply_activation_inplace(activation_type, intermediate1)
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights
+    # torch.zeros required: the topk reduction sums ALL slots per token, and
+    # slots routed to non-local experts are not in the indirection table,
+    # so they must be zero.
     intermediate3 = torch.zeros(
         num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
     )
     _invoke_fused_moe_kernel(
-        intermediate2,
+        intermediate1,
         fc2_weight,
         intermediate3,
         topk_weights_flat,
@@ -446,7 +452,9 @@ def vllm_fused_moe(
     )
 
     # Reduce over topk: [max_tokens, topk, K] → [max_tokens, K]
-    result = intermediate3.view(max_tokens, topk, K).float().sum(dim=1).to(hidden_states.dtype)
+    # bf16 sum is sufficient — each value is already bf16 from the kernel,
+    # and summing topk (typically 6-8) values loses <1 bit of precision.
+    result = intermediate3.view(max_tokens, topk, K).sum(dim=1)
     if out is not None:
         out.copy_(result)
         return out
