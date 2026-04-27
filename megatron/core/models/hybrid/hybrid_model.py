@@ -279,6 +279,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
             )
+            self._setup_mtp_cuda_graphs()
 
         # Output
         if post_process or self.mtp_process:

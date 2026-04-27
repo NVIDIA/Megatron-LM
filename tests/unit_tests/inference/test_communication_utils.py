@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -21,6 +23,9 @@ class TestCommunicationWithCustomPPGroup:
         """Set up test parameters."""
         self.size = [16, 8]
         self.dtype = torch.float32
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
@@ -65,7 +70,8 @@ class TestCommunicationWithCustomPPGroup:
         assert torch.allclose(
             tensor_received_global, tensor_received_custom
         ), "broadcast_from_last_pipeline_stage should be the same with or without custom pp_group"
-        Utils.destroy_model_parallel()
+
+        grid.destroy()
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
@@ -126,4 +132,5 @@ class TestCommunicationWithCustomPPGroup:
         assert torch.allclose(
             local_recv_buffer_global, local_recv_buffer_custom
         ), "Custom and global recv buffers should be the same."
-        Utils.destroy_model_parallel()
+
+        grid.destroy()
