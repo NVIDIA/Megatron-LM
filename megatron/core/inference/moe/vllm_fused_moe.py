@@ -36,7 +36,21 @@ from megatron.core.inference.moe.permute import compute_expert_offsets, compute_
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
 # ---------------------------------------------------------------------------
 
+BLOCK_SIZE_M = 64
 
+_AUTOTUNE_CONFIGS = [
+    # BLOCK_SIZE_M is fixed — must match indirection table padding.
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=4),
+]
+
+
+@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=['N', 'K'])
 @triton.jit
 def _fused_moe_kernel(
     # Pointers
@@ -296,9 +310,6 @@ def _moe_align_block_size_cuda_graphable(
 # Kernel launcher
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CONFIG = dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, GROUP_SIZE_M=8)
-
-
 def _invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -310,12 +321,8 @@ def _invoke_fused_moe_kernel(
     mul_routed_weight: bool,
     top_k: int,
     fuse_squared_relu: bool = False,
-    config: Optional[dict] = None,
 ):
     """Launch the Triton fused-MoE kernel for one GEMM pass."""
-    if config is None:
-        config = _DEFAULT_CONFIG
-
     M = A.size(0)
     num_tokens = M * top_k
     EM = sorted_token_ids.size(0)
@@ -346,7 +353,6 @@ def _invoke_fused_moe_kernel(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_SQUARED_RELU=fuse_squared_relu,
         top_k=top_k,
-        **config,
     )
 
 
@@ -393,7 +399,6 @@ def vllm_fused_moe(
         f"vllm_fused_moe requires bf16 input, got {hidden_states.dtype}"
     )
 
-    BLOCK_SIZE_M = _DEFAULT_CONFIG["BLOCK_SIZE_M"]
     max_tokens = hidden_states.size(0)
     topk = routing_map.shape[1]
 
