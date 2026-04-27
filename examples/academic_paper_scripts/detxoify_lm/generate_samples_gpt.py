@@ -14,6 +14,7 @@ from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.core import mpu
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
 from megatron.inference.text_generation import generate_and_post_process
@@ -221,11 +222,12 @@ def generate_and_write_samples_conditional(model):
 def main():
     """Main program."""
 
-    initialize_megatron(extra_args_provider=add_text_generate_args,
-                        args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
-                                       'no_load_rng': True,
-                                       'no_load_optim': True,
-                                       'seq_length': 2048})
+    parse_and_validate_args(extra_args_provider=add_text_generate_args,
+                            args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
+                                           'no_load_rng': True,
+                                           'no_load_optim': True,
+                                           'seq_length': 2048})
+    initialize_megatron()
 
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)
