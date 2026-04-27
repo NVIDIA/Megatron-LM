@@ -87,6 +87,30 @@ class TestParallelTransformerLayer:
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
 
+    def test_gpu_forward_ignores_mhc_recompute_manager_kwarg(self):
+        """Non-HC layers must tolerate TransformerBlock's mHC recompute kwarg."""
+        parallel_transformer_layer = self.parallel_transformer_layer
+        config: TransformerConfig = parallel_transformer_layer.config
+        sequence_length = 8
+        micro_batch_size = 2
+        parallel_transformer_layer.cuda()
+
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, config.hidden_size), device='cuda'
+        )
+        attention_mask = torch.ones(
+            (1, 1, sequence_length, sequence_length), dtype=bool, device='cuda'
+        )
+
+        hidden_states, context = parallel_transformer_layer(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            mhc_recompute_manager=None,
+        )
+
+        assert context is None
+        assert hidden_states.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
     def test_chunked_mlp(self):
         with torch.no_grad():
 
@@ -378,6 +402,34 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             HyperConnectionTransformerLayer(config, layer_spec.submodules)
 
         layer_spec.submodules.cross_attention = IdentityOp
+
+    def test_layernorm_tuple_outputs_are_unpacked(self):
+        """HC layers should mirror base-layer tuple handling for fused layernorms."""
+
+        class TupleLayerNorm(torch.nn.Module):
+            def forward(self, hidden_states):
+                return hidden_states, hidden_states
+
+        layer, config = self._create_layer_with_hyper_connection()
+        layer.input_layernorm = TupleLayerNorm().cuda()
+        layer.pre_mlp_layernorm = TupleLayerNorm().cuda()
+        layer.train()
+
+        seq_len = 8
+        batch_size = 2
+        hidden_states = torch.randn(
+            seq_len,
+            batch_size,
+            config.num_residual_streams * config.hidden_size,
+            device='cuda',
+            requires_grad=True,
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        assert context is None
+        assert output.shape == hidden_states.shape
 
     def test_forward_with_hyper_connection_recompute(self):
         """

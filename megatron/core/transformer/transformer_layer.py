@@ -707,6 +707,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         # Injected by __call__ for cuda graph keying; not a real forward arg.
         kwargs.pop("dynamic_inference_decode_only", None)
+        # mHC recompute is consumed by HyperConnectionTransformerLayer only.
+        kwargs.pop("mhc_recompute_manager", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -1336,6 +1338,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        add_layer_offset: bool = True,
+        pp_layer_offset: Optional[int] = None,
     ):
         if submodules.cross_attention is not IdentityOp:
             raise ValueError(
@@ -1355,6 +1360,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            is_mtp_layer=is_mtp_layer,
+            add_layer_offset=add_layer_offset,
+            pp_layer_offset=pp_layer_offset,
         )
 
         assert submodules.self_attention_hyper_connection is not IdentityOp, (
@@ -1498,11 +1506,20 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    self.input_layernorm, hidden_states
+                    apply_module(self.input_layernorm), hidden_states
                 )
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = self.input_layernorm(hidden_states)
+                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+
+        if isinstance(input_layernorm_output, tuple):
+            if len(input_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of input_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(input_layernorm_output)}"
+                )
+            input_layernorm_output, _ = input_layernorm_output
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
@@ -1546,7 +1563,19 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         residual = hidden_states
         if self.config.fp32_residual_connection:
             residual = residual.float()
-        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
+        pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(
+            hidden_states
+        )
+
+        if isinstance(pre_cross_attn_layernorm_output, tuple):
+            if len(pre_cross_attn_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of pre_cross_attn_layernorm_output "
+                    f"is a tuple, it is expected to have 2 elements "
+                    f"(output, residual), but "
+                    f"got {len(pre_cross_attn_layernorm_output)}"
+                )
+            pre_cross_attn_layernorm_output, _ = pre_cross_attn_layernorm_output
 
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
@@ -1603,11 +1632,20 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    self.pre_mlp_layernorm, hidden_states
+                    apply_module(self.pre_mlp_layernorm), hidden_states
                 )
         else:
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            if len(pre_mlp_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of pre_mlp_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(pre_mlp_layernorm_output)}"
+                )
+            pre_mlp_layernorm_output, _ = pre_mlp_layernorm_output
 
         nvtx_range_push(suffix="mlp")
         should_chunk_mlp_for_prefill = (

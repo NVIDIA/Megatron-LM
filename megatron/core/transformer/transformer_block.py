@@ -902,23 +902,28 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_is_last_in_recompute_block[l_no]
                         )
 
+                    layer_kwargs = dict(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        context=context,
+                        context_mask=context_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        rotary_pos_cos=rotary_pos_cos,
+                        rotary_pos_sin=rotary_pos_sin,
+                        rotary_pos_cos_sin=rotary_pos_cos_sin,
+                        attention_bias=attention_bias,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                        sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
+                    )
+                    if mhc_manager is not None and hasattr(
+                        layer, "self_attention_hyper_connection"
+                    ):
+                        layer_kwargs["mhc_recompute_manager"] = mhc_manager
+
                     with self.offload_context, inner_quantization_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            rotary_pos_cos=rotary_pos_cos,
-                            rotary_pos_sin=rotary_pos_sin,
-                            rotary_pos_cos_sin=rotary_pos_cos_sin,
-                            attention_bias=attention_bias,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                            sequence_len_offset=sequence_len_offset,
-                            padding_mask=padding_mask,
-                            mhc_recompute_manager=mhc_manager,
-                        )
+                        hidden_states, context = layer(**layer_kwargs)
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,
