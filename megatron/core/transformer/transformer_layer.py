@@ -236,6 +236,7 @@ class TransformerLayerSubmodules:
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
+    # Reserved for future cross-attention hyper-connection support.
     cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
@@ -1432,6 +1433,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
 
+        # Direct forward() calls can pass the manager normally. __call__ stores
+        # it on self first so CUDA graph argument processing never sees the
+        # unsupported CheckpointManager object.
         mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         if mhc_recompute_manager is None:
             mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)

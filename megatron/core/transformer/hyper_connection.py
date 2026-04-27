@@ -70,7 +70,7 @@ def reference_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 def reference_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
-    """Reference H_res @ residual + H_post * (x [+ bias])."""
+    """Reference H_res @ residual + H_post * (x [+ bias]), flattened to [s, b, n*C]."""
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, C)
@@ -78,8 +78,8 @@ def reference_h_post_bda(
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
-        return x_expanded + bias_expanded + mixed
-    return x_expanded + mixed
+        return (x_expanded + bias_expanded + mixed).view(s, b, n * C)
+    return (x_expanded + mixed).view(s, b, n * C)
 
 
 @torch.compile
@@ -127,7 +127,7 @@ class HyperConnectionModule(MegatronModule):
 
         # Projection weights for dynamic mappings. The reference implementation
         # keeps this as a full, non-TP-partitioned linear projection over n*C;
-        # fused/partitioned variants are expected to replace it in follow-up work.
+        # TODO: replace with fused/partitioned variants in the fused mHC follow-up.
         # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
         # - H_pre: n values
         # - H_post: n values
@@ -591,8 +591,7 @@ class HyperConnectionModule(MegatronModule):
             n = self.n
             C = self.hidden_size
             orig_reshaped = original_residual.view(s, b, n, C)
-            output = self._h_post_bda_op(h_res, orig_reshaped, h_post, x, bias)
-            return output.view(s, b, n * C)
+            return self._h_post_bda_op(h_res, orig_reshaped, h_post, x, bias)
 
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 
@@ -652,7 +651,7 @@ class HyperConnectionModule(MegatronModule):
                 s, b, _ = original_residual.shape
                 orig_reshaped = original_residual.view(s, b, n, C)
                 b_arg = optional_bias[0] if optional_bias else None
-                return self._h_post_bda_op(h_res, orig_reshaped, h_post, x, b_arg).view(s, b, n * C)
+                return self._h_post_bda_op(h_res, orig_reshaped, h_post, x, b_arg)
 
             ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
             if bias is not None:

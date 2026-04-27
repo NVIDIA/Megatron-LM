@@ -371,6 +371,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+        self._mhc_recompute_block_end_plan = self._build_mhc_recompute_block_end_plan()
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
@@ -646,20 +647,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
-    def _build_mhc_recompute_layer_plan(
-        self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
-        """Pre-build per-layer MHC recompute managers and block-end markers."""
+    def _build_mhc_recompute_block_end_plan(self) -> List[bool]:
+        """Precompute deterministic mHC recompute block-end markers."""
         num_layers = len(self.layers)
-        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
-        is_recompute_block_end: List[bool] = [False] * num_layers
+        is_recompute_block_end: List[bool] = []
 
-        if not use_mhc_recompute or num_layers == 0:
-            return layer_managers, is_recompute_block_end
+        if num_layers == 0:
+            return is_recompute_block_end
 
         mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
-        mhc_manager = CheckpointManager()
-
         for l_no in range(num_layers):
             is_last_in_transformer_block = l_no == num_layers - 1
             is_last_in_recompute_block = is_last_in_transformer_block
@@ -668,8 +664,26 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     (l_no + 1) % mhc_recompute_layer_num == 0
                 )
 
+            is_recompute_block_end.append(is_last_in_recompute_block)
+
+        return is_recompute_block_end
+
+    def _build_mhc_recompute_layer_plan(
+        self, use_mhc_recompute: bool
+    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+        """Build fresh per-forward MHC managers using cached block-end topology."""
+        num_layers = len(self.layers)
+        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
+        is_recompute_block_end = self._mhc_recompute_block_end_plan
+
+        if not use_mhc_recompute or num_layers == 0:
+            return layer_managers, is_recompute_block_end
+
+        mhc_manager = CheckpointManager()
+
+        for l_no, is_last_in_recompute_block in enumerate(is_recompute_block_end):
+            is_last_in_transformer_block = l_no == num_layers - 1
             layer_managers[l_no] = mhc_manager
-            is_recompute_block_end[l_no] = is_last_in_recompute_block
 
             if is_last_in_recompute_block and not is_last_in_transformer_block:
                 mhc_manager = CheckpointManager()

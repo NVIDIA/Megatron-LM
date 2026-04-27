@@ -2111,6 +2111,16 @@ class TransformerConfig(ModelParallelConfig):
                     "To use full iteration cuda graph, please use "
                     "cuda_graph_impl=local instead of cuda_graph_impl=transformer_engine."
                 )
+                if (
+                    self.enable_hyper_connections
+                    and self.num_moe_experts is not None
+                    and self.num_moe_experts > 1
+                    and CudaGraphScope.moe_router in self.cuda_graph_scope
+                ):
+                    raise ValueError(
+                        "enable_hyper_connections is not yet compatible with "
+                        "MoE router CUDA graphs."
+                    )
             assert (
                 CudaGraphScope.moe not in self.cuda_graph_scope
                 or CudaGraphScope.moe_router not in self.cuda_graph_scope

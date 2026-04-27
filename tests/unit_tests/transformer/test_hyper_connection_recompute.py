@@ -437,6 +437,24 @@ class TestTransformerConfigRecomputeMhc:
                 inference_fuse_tp_communication=True,
             )
 
+    def test_config_rejects_moe_router_cuda_graph_hyper_connections(self):
+        """mHC MoE layers do not implement the TE moe_router CUDA graph path yet."""
+        with pytest.raises(
+            ValueError,
+            match="enable_hyper_connections is not yet compatible with "
+            "MoE router CUDA graphs",
+        ):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_hyper_connections=True,
+                num_residual_streams=4,
+                num_moe_experts=4,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_scope=["moe_router"],
+            )
+
     def test_hyper_connection_recompute_warning_requires_recompute(self):
         """Do not warn about missing 'mhc' recompute when recompute is disabled."""
         with warnings.catch_warnings(record=True) as caught:
