@@ -385,3 +385,107 @@ class TestMoELayerRecompute:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+
+class TestMoELayerFP8Flow:
+    """Test MoE fp8_flow with DeepEP dispatcher and moe_expert recompute."""
+
+    @staticmethod
+    def _is_deep_ep_available():
+        from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
+
+        return HAVE_DEEP_EP
+
+    def setup_method(self, method):
+        pass
+
+    @pytest.mark.parametrize("num_moe_experts", [2, 4])
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 2)])
+    def test_moe_layer_fp8_flow_with_deepep_and_moe_expert_recompute(
+        self, num_moe_experts, tp_size, ep_size
+    ):
+
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        if not self._is_deep_ep_available():
+            pytest.skip("DeepEP is not available")
+
+        from contextlib import nullcontext
+
+        from megatron.core.fp8_utils import get_fp8_context
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+        hidden_size = 64
+        sequence_length = 32
+        micro_batch_size = 2
+
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=num_moe_experts,
+            use_cpu_initialization=False,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="deepep",
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.01,
+            moe_grouped_gemm=False,
+            moe_ffn_hidden_size=256,
+            add_bias_linear=False,
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=tp_size > 1,
+            # Enable fp8 flow + moe expert recompute.
+            fp8="e4m3",
+            fp8_recipe="blockwise",
+            moe_fp8_flow=True,
+            moe_permute_fusion=True,
+            recompute_granularity="selective",
+            recompute_modules=["moe_expert"],
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+
+        transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=True
+        )
+        moe_layer = MoELayer(transformer_config, transformer_layer_submodules.mlp.submodules).cuda()
+
+        hidden_states = torch.randn(
+            sequence_length,
+            micro_batch_size,
+            hidden_size,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        fp8_context = (
+            get_fp8_context(transformer_config, 0) if transformer_config.fp8 else nullcontext()
+        )
+        with fp8_context:
+            output, _ = moe_layer(hidden_states)
+        assert output.dtype == torch.bfloat16, f"Expected bf16 output, got {output.dtype}"
+        assert output.shape == hidden_states.shape, "Output shape mismatch"
+
+        loss = output.sum()
+        loss.backward()
+
+        assert hidden_states.grad is not None, "Input gradients should exist"
+        assert (
+            hidden_states.grad.dtype == torch.bfloat16
+        ), f"Expected bf16 gradients, got {hidden_states.grad.dtype}"
+
+        for name, param in moe_layer.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"Gradient for {name} should exist"
+
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
