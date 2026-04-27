@@ -102,10 +102,6 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     if "mcore_gpt" in config:
         config["use_mcore_models"] = config["mcore_gpt"]
 
-    config["enable_router"] = False
-    config["flextron"] = False
-    config["freeze_model"] = False
-
     args_dict = vars(get_args()).copy()
     del args_dict["kv_channels"]  # not recalculated if present
     args_dict.update(config)
