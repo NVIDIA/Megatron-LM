@@ -348,6 +348,14 @@ class MambaMixer(MegatronModule):
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
             setattr(self.A_log, "partition_dim", 0)
+            # Persistent inference cache for -exp(A_log.float()). Allocated
+            # here (outside any later CUDA-graph capture) so its address
+            # lives in the default memory pool and stays valid across every
+            # graph capture and replay, including across RL train/eval
+            # cycles. Never freed -- the memory cost is ``nheads * 4B`` per
+            # layer (a few KB across a full model).
+            self._A_neg_exp_cache = torch.empty_like(A_log, dtype=torch.float32)
+            self._A_neg_exp_cache_stale = True
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
@@ -1016,6 +1024,29 @@ class MambaMixer(MegatronModule):
 
         return y
 
+    def _get_decode_A_neg_exp(self) -> torch.Tensor:
+        """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
+
+        A_log is frozen during inference; recomputing it per token otherwise
+        launches three small elementwise kernels (float cast, exp, neg) that
+        rival ``selective_state_update`` itself in the decode profile. The
+        stride-0 expand view also triggers the kernel's TIE_HDIM fast path.
+        """
+        if self.training or torch.is_grad_enabled():
+            base = -torch.exp(self.A_log.float())
+            return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+        # Inference path. Refill when stale
+        if torch.cuda.is_current_stream_capturing() or self._A_neg_exp_cache_stale:
+            with torch.no_grad():
+                self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+            self._A_neg_exp_cache_stale = False
+        return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+
+    def train(self, mode: bool = True):
+        """Mark the decode cache stale; weights may have updated."""
+        self._A_neg_exp_cache_stale = True
+        return super().train(mode)
+
     def _ssm_decode(
         self,
         zxBCdt: torch.Tensor,
@@ -1094,10 +1125,10 @@ class MambaMixer(MegatronModule):
             ],
             dim=-1,
         )
-        A = -torch.exp(self.A_log.float())
-
         # SSM step
         if selective_state_update is None:
+            # Fallback uses 1D A; the decode cache is pre-expanded for Triton.
+            A = -torch.exp(self.A_log.float())
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
 
@@ -1155,7 +1186,7 @@ class MambaMixer(MegatronModule):
 
             y = y.unsqueeze(1)  # Restore seq dimension
         else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+            A = self._get_decode_A_neg_exp()
 
             # Incorporate sequence dimension in einops rearrengements
             dt = repeat(dt, "b s h -> b s h p", p=self.headdim)
@@ -1166,11 +1197,6 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b s (h p) -> b s h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b s (h p) -> b s h p", p=self.headdim)
-
-            # Upcast the batch_indices to prevent integer overflow errors in the case of
-            # large max request counts.
-            if batch_indices is not None:
-                batch_indices = batch_indices.to(torch.int64)
 
             y = selective_state_update(
                 ssm_state,

@@ -680,6 +680,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                          content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
                                                          async_strategy=args.async_strategy,
                                                          use_dtensor_format=args.dist_ckpt_use_dtensor_format)
+                                                         verify_integrity=args.verify_integrity)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -1254,8 +1255,10 @@ def _load_global_dist_base_checkpoint(
         sharded_state_dict,
         checkpoint_name,
         load_strategy,
+        validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
         use_dtensor_format=args.dist_ckpt_use_dtensor_format,
+        verify_integrity=args.verify_integrity,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
