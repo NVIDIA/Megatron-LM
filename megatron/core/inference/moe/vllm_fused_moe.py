@@ -182,6 +182,7 @@ def _scatter_token_indices_kernel(
     routing_map_ptr,
     sorted_token_ids_ptr,
     counters_ptr,
+    nonlocal_counter_ptr,
     valid_tokens_ptr,
     topk: tl.constexpr,
     local_expert_start,
@@ -191,8 +192,10 @@ def _scatter_token_indices_kernel(
 ):
     """Scatter flat token indices into the padded indirection table.
 
-    For each valid (token, topk) pair routed to a local expert, atomically
-    claim a position in the expert's padded block and write the flat index.
+    For each valid (token, topk) pair, atomically claim a position and write
+    the flat index. Local expert pairs go to their expert's padded block;
+    non-local expert pairs go to a trailing section (expert_ids stays -1,
+    so the GEMM kernel writes zeros for those output positions).
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -207,6 +210,9 @@ def _scatter_token_indices_kernel(
             lid = eid - local_expert_start
             if lid >= 0 and lid < num_local_experts:
                 pos = tl.atomic_add(counters_ptr + lid, 1)
+                tl.store(sorted_token_ids_ptr + pos, pair)
+            else:
+                pos = tl.atomic_add(nonlocal_counter_ptr, 1)
                 tl.store(sorted_token_ids_ptr + pos, pair)
 
 
@@ -232,7 +238,7 @@ def _moe_align_block_size_cuda_graphable(
     num_local_experts: int,
     local_expert_start: int,
     valid_tokens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build indirection tables for the vLLM kernel, fully on-device.
 
     Replaces the original _moe_align_block_size which used .item() calls
@@ -249,12 +255,13 @@ def _moe_align_block_size_cuda_graphable(
     Returns:
         sorted_token_ids: [max_sorted] int32 indirection table.
         expert_ids: [max_blocks] int32 expert per block.
-        num_tokens_post_padded: [1] int32 view (total padded token count).
+        num_tokens_post_padded_local: [1] int32 (local expert padded count).
+        num_tokens_post_padded_all: [1] int32 (including non-local expert slots).
     """
     max_tokens, topk = routing_map.shape
     device = routing_map.device
 
-    max_sorted = max_tokens * topk + block_size * num_local_experts
+    max_sorted = max_tokens * topk + block_size * (num_local_experts + 1)
     max_blocks = _ceil_div(max_sorted, block_size)
     sentinel = max_tokens * topk
 
@@ -288,12 +295,14 @@ def _moe_align_block_size_cuda_graphable(
     )
 
     counters = exclusive_offsets.clone()
+    nonlocal_counter = inclusive_offsets[-1:].clone()
     max_pairs = max_tokens * topk
     NUM_BLOCKS = min(max_pairs, 512)
     _scatter_token_indices_kernel[(NUM_BLOCKS,)](
         routing_map,
         sorted_token_ids,
         counters,
+        nonlocal_counter,
         valid_tokens,
         topk,
         local_expert_start,
@@ -302,8 +311,11 @@ def _moe_align_block_size_cuda_graphable(
         NUM_BLOCKS=NUM_BLOCKS,
     )
 
-    num_tokens_post_padded = inclusive_offsets[-1:]
-    return sorted_token_ids, expert_ids, num_tokens_post_padded
+    num_tokens_post_padded_local = inclusive_offsets[-1:]
+    num_tokens_post_padded_all = torch.full(
+        (1,), max_sorted, dtype=torch.int32, device=device
+    )
+    return sorted_token_ids, expert_ids, num_tokens_post_padded_local, num_tokens_post_padded_all
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +414,10 @@ def vllm_fused_moe(
     max_tokens = hidden_states.size(0)
     topk = routing_map.shape[1]
 
-    sorted_token_ids, expert_ids, num_post = _moe_align_block_size_cuda_graphable(
-        routing_map, BLOCK_SIZE_M, num_local_experts, local_expert_start, valid_tokens
+    sorted_token_ids, expert_ids, num_post_local, num_post_all = (
+        _moe_align_block_size_cuda_graphable(
+            routing_map, BLOCK_SIZE_M, num_local_experts, local_expert_start, valid_tokens
+        )
     )
     num_valid = max_tokens * topk
 
@@ -413,10 +427,6 @@ def vllm_fused_moe(
     topk_weights_flat = probs.reshape(-1).contiguous()
 
     # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
-    # Activation is fused into the GEMM kernel — squared_relu is applied
-    # in-register before writing, avoiding a separate pass over the buffer.
-    # torch.empty is safe: FC2 reads the same indirection positions FC1 writes,
-    # so unwritten rows (non-local / beyond valid_tokens) are never consumed.
     assert activation_type == ActivationType.SQUARED_RELU
     intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
@@ -428,17 +438,17 @@ def vllm_fused_moe(
         topk_weights_flat,
         sorted_token_ids,
         expert_ids,
-        num_post,
+        num_post_local,
         mul_routed_weight=False,
         top_k=topk,
         fuse_squared_relu=True,
     )
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights
-    # torch.zeros required: the topk reduction sums ALL slots per token, and
-    # slots routed to non-local experts are not in the indirection table,
-    # so they must be zero.
-    intermediate3 = torch.zeros(
+    # num_post_all covers the full indirection table including non-local expert
+    # pairs (expert_ids=-1), so the kernel writes zeros to those output positions.
+    # This eliminates the need for torch.zeros on intermediate3.
+    intermediate3 = torch.empty(
         num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
     )
     _invoke_fused_moe_kernel(
@@ -448,7 +458,7 @@ def vllm_fused_moe(
         topk_weights_flat,
         sorted_token_ids,
         expert_ids,
-        num_post,
+        num_post_all,
         mul_routed_weight=True,
         top_k=1,
     )

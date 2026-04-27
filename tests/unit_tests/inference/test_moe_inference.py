@@ -496,7 +496,7 @@ class TestVllmFusedMoe:
         )
         valid_tokens = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
 
-        sorted_ids, expert_ids, num_post = _moe_align_block_size_cuda_graphable(
+        sorted_ids, expert_ids, num_post, _ = _moe_align_block_size_cuda_graphable(
             routing_map, BLOCK_SIZE_M, num_local_experts, local_expert_start, valid_tokens
         )
 
