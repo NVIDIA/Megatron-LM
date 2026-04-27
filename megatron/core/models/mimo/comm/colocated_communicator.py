@@ -260,6 +260,7 @@ class _ColocatedCommunicate(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, comm: ColocatedBridgeCommunicator) -> torch.Tensor:
+        """Reshape the batch dim across the bridge: narrow on fan-out, all-gather on fan-in."""
         ctx.comm = comm
         ctx.batch_dim = comm.dim_mapping['b']
 
