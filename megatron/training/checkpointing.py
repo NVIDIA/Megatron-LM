@@ -1013,11 +1013,12 @@ def _apply_hybrid_canonicalization_if_applicable(model, model_sd):
     # its module triggers). HybridModel populates these in `__init__`, so
     # their presence is a reliable signal.
     decoder = getattr(unwrapped, 'decoder', None)
-    if decoder is None or not hasattr(decoder, 'layer_type_list'):
-        return
-    if not hasattr(unwrapped, '_decoder_sub_layer_offset'):
-        return
-    if not hasattr(unwrapped, '_decoder_physical_offset'):
+    if (
+        decoder is None
+        or not hasattr(decoder, 'layer_type_list')
+        or not hasattr(unwrapped, '_decoder_sub_layer_offset')
+        or not hasattr(unwrapped, '_decoder_physical_offset')
+    ):
         return
 
     canonicalize_hybrid_sharded_state_dict(
