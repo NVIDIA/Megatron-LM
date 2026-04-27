@@ -1248,7 +1248,7 @@ class TextGenerationController:
         else:
             self._log_probs_prefill.indexing(context, eager=eager)
 
-    def _dynamic_step_logprobs_spec_softmax(self):
+    def _dynamic_step_log_probs_softmax(self):
         """Conditionally launch the speculative softmax kernel on the bookkeeping stream."""
         if self._log_prob_count_pinned.item() == 0 and self._top_n_max_pinned.item() == 0:
             return
@@ -1654,7 +1654,7 @@ class TextGenerationController:
             # it only needs logits and overlaps with verification/sampling on the main stream.
             self._post_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._post_forward_bookkeeping_stream):
-                self._dynamic_step_logprobs_spec_softmax()
+                self._dynamic_step_log_probs_softmax()
                 self._post_forward_bookkeeping_event.record()
 
             # Commit Mamba intermediate states before update_requests, which
