@@ -404,6 +404,8 @@ class GPTModel(LanguageModule):
                     position_ids,
                     self.mrope_section,
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE

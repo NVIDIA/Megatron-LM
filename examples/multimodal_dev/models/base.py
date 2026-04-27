@@ -11,7 +11,6 @@ Subclasses override ``compute_position_ids()`` for model-specific
 position encoding (e.g. MRoPE for Qwen3.5-VL).
 """
 
-import contextlib
 from typing import Optional
 
 import torch
@@ -54,10 +53,9 @@ def _cp_split_tensor(tensor, seq_dim, cp_size, cp_rank):
 
 
 class _NoCPGroup:
-    """Dummy size-1 process group used to bypass MRoPE's BSHD-style
-    zigzag of pre-computed THD freqs (Megatron-Core gap:
-    ``MultimodalRotaryEmbedding.forward`` lacks the ``not packed_seq``
-    skip that plain ``RotaryEmbedding`` has).
+    """Dummy size-1 process group used by the vision encoder so its
+    THD RoPE ignores the language-side CP group (the language CP group
+    has no business splitting variable-resolution image seqlens).
     """
 
     def size(self):
@@ -68,6 +66,7 @@ class _NoCPGroup:
 
 
 _NO_CP_GROUP = _NoCPGroup()
+
 
 # Note: reported ``mtp_1 loss`` drifts ~1.3% from the CP=1 baseline under
 # THD+CP. Megatron-Core's logging averages per-rank pre-divided ratios
@@ -285,30 +284,6 @@ class MultimodalModel(MegatronModule):
             attention_mask, position_ids,
         )
 
-    @contextlib.contextmanager
-    def _thd_mrope_no_cp_override(self, packed_seq_params):
-        """Force ``rotary_pos_emb.cp_group`` to size 1 for the wrapped
-        forward call so MRoPE returns full-length freqs in THD mode.
-        Attention then applies per-sample CP zigzag itself via
-        ``_apply_rotary_pos_emb_thd``.  Done by direct mutation rather
-        than via ``packed_seq_params.cp_group`` so MTP's CP-aware roll
-        (which reads that field) still sees the real CP group.
-        """
-        mrope = (
-            getattr(self.language_model, "rotary_pos_emb", None)
-            if packed_seq_params is not None
-            and parallel_state.get_context_parallel_world_size() > 1
-            else None
-        )
-        saved = getattr(mrope, "cp_group", None) if mrope is not None else None
-        if mrope is not None:
-            mrope.cp_group = _NO_CP_GROUP
-        try:
-            yield
-        finally:
-            if mrope is not None:
-                mrope.cp_group = saved
-
     def forward(
         self,
         input_ids: Tensor,
@@ -380,13 +355,12 @@ class MultimodalModel(MegatronModule):
             packed_seq_params=packed_seq_params,
         )
 
-        with self._thd_mrope_no_cp_override(packed_seq_params):
-            return self.language_model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                decoder_input=decoder_input,
-                labels=labels,
-                loss_mask=loss_mask,
-                packed_seq_params=packed_seq_params,
-            )
+        return self.language_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
