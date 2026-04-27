@@ -1053,6 +1053,10 @@ def validate_args(args, defaults={}):
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
 
+    if args.nccl_ub and args.use_megatron_fsdp and args.expert_model_parallel_size > 1 \
+        and not args.disable_symmetric_registration:
+        raise NotImplementedError('NCCL userbuffer registration is currently not supported with expert parallelism')
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
