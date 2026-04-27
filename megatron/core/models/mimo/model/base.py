@@ -496,6 +496,16 @@ class MimoModel(MegatronModule):
 
     def _build_colocated_communicators(self):
         grid_map = self.mimo_config.module_to_grid_map
+        if any(
+            'tp' not in grid.dim_names or 'dp' not in grid.dim_names
+            for grid in grid_map.values()
+        ):
+            logger.info(
+                "Skipping colocated communicator setup because module_to_grid_map "
+                "does not define TP/DP topology for every module."
+            )
+            return
+
         lang_key = MIMO_LANGUAGE_MODULE_KEY
         lang_grid = grid_map[lang_key]
         for mod_name in self.mimo_config.modality_submodules_spec:

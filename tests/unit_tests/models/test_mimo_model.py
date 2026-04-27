@@ -568,6 +568,7 @@ class TestMimoModelNonColocated:
         )
         assert model_pp.role.is_first_stage("images") is False
         assert model_pp.role.is_last_stage("images") is False
+        assert model_pp.colocated_comms == {}
 
     def test_selective_init_encoder_only(self):
         """Test encoder-only rank initializes encoder but not language model."""
