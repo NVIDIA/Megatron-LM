@@ -1336,6 +1336,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
+        if submodules.cross_attention is not IdentityOp:
+            raise ValueError(
+                "HyperConnectionTransformerLayer does not support cross-attention. "
+                "Use IdentityOp for cross_attention."
+            )
+        if submodules.cross_attention_hyper_connection is not IdentityOp:
+            raise ValueError(
+                "HyperConnectionTransformerLayer does not support cross-attention "
+                "hyper connections. Use IdentityOp for cross_attention_hyper_connection."
+            )
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -1344,12 +1355,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
-
-        if submodules.cross_attention_hyper_connection is not IdentityOp:
-            raise ValueError(
-                "HyperConnectionTransformerLayer does not support cross-attention "
-                "hyper connections. Use IdentityOp for cross_attention_hyper_connection."
-            )
 
         assert submodules.self_attention_hyper_connection is not IdentityOp, (
             "HyperConnectionTransformerLayer requires self_attention_hyper_connection. "
@@ -1427,7 +1432,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
 
-        mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
+        mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        if mhc_recompute_manager is None:
+            mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
         hidden_states, context = self._forward_attention(
             *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
@@ -1468,6 +1475,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post = self.self_attention_hyper_connection(
@@ -1531,6 +1540,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         # Cross-attention (no hyper connection support).
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
         attention_output_with_bias = self.cross_attention(
@@ -1569,6 +1580,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mhc_mlp_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
 
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         nvtx_range_push(suffix="mlp_hyper_connection")
         hidden_states, mlp_h_res, mlp_hc_h_post = self.mlp_hyper_connection(

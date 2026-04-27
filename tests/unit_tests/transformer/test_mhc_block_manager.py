@@ -128,6 +128,22 @@ class TestCheckpointWithoutOutputManagerAPI:
         with pytest.raises(ValueError):
             manager.add_checkpoint(ckpt)
 
+    def test_unified_recompute_keeps_outputs_when_hook_has_no_grad(self):
+        """Do not discard outputs if no hook can be registered for recompute."""
+        manager = CheckpointManager()
+
+        def func(x):
+            return x * 2
+
+        input_t = torch.randn(4, 4, device='cuda', requires_grad=True)
+        ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+        y = ckpt.checkpoint(func, input_t)
+
+        hook_tensor = torch.zeros((), device='cuda', requires_grad=False)
+        manager.discard_all_outputs_and_register_unified_recompute(hook_tensor)
+
+        assert y.untyped_storage().size() > 0
+
 
 class TestCheckpointManagerSequentialChain:
     """Test CheckpointManager with sequential checkpoint chains."""

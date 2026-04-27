@@ -12,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import CheckpointManager, model_parallel_cuda_manual_seed
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -366,6 +367,17 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         )
         layer.cuda()
         return layer, config
+
+    def test_rejects_cross_attention_with_hyper_connection(self):
+        """mHC transformer layers are decoder-only until cross-attention is implemented."""
+        config = _make_mhc_config()
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connections=True)
+        layer_spec.submodules.cross_attention = torch.nn.Linear
+
+        with pytest.raises(ValueError, match="does not support cross-attention"):
+            HyperConnectionTransformerLayer(config, layer_spec.submodules)
+
+        layer_spec.submodules.cross_attention = IdentityOp
 
     def test_forward_with_hyper_connection_recompute(self):
         """

@@ -421,6 +421,22 @@ class TestTransformerConfigRecomputeMhc:
                 pipeline_dtype=torch.float32,
             )
 
+    def test_config_rejects_fused_tp_inference_hyper_connections(self):
+        """mHC does not implement the fused TP inference residual path."""
+        with pytest.raises(
+            ValueError,
+            match="enable_hyper_connections is not compatible with "
+            "inference_fuse_tp_communication",
+        ):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_hyper_connections=True,
+                num_residual_streams=4,
+                inference_fuse_tp_communication=True,
+            )
+
     def test_hyper_connection_recompute_warning_requires_recompute(self):
         """Do not warn about missing 'mhc' recompute when recompute is disabled."""
         with warnings.catch_warnings(record=True) as caught:

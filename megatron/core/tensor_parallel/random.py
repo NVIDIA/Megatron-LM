@@ -784,13 +784,14 @@ class CheckpointManager:
 
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
         """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+        if not hook_tensor.requires_grad:
+            return
+
         for ckpt in self.checkpoints:
             for output in ckpt.outputs:
                 output.untyped_storage().resize_(0)
 
-        # Register unified recompute hook
-        if hook_tensor.requires_grad:
-            hook_tensor.register_hook(self._unified_recompute_hook)
+        hook_tensor.register_hook(self._unified_recompute_hook)
 
     def _unified_recompute_hook(self, grad_output):
         # Chained checkpoints rely on forward-order recomputation. Each
@@ -826,8 +827,9 @@ class CheckpointWithoutOutput(object):
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
         """
-        # Treat the default fp8=False as disabled. The old "fp8 is not None"
-        # behavior entered the TE FP8 recompute path for non-FP8 callers.
+        # Intentional bug fix: the default fp8=False must not enter the TE FP8
+        # recompute context. The old "fp8 is not None" behavior did that for
+        # every default CheckpointWithoutOutput() caller.
         self.fp8 = bool(fp8)
         self.ckpt_manager = ckpt_manager
         self.run_function = None

@@ -83,14 +83,14 @@ def reference_h_post_bda(
 
 
 @torch.compile
-def reference_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
-    """Reference fused projection + RMS normalization."""
+def reference_proj_inv_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+    """Reference fused projection + inverse-RMS normalization scale."""
     proj = torch.matmul(x, weight.t())
     norm = x.norm(dim=-1, keepdim=True)
     K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
-    return proj, r
+    rms = norm / math.sqrt(K) + eps
+    inv_rms = 1.0 / rms
+    return proj, inv_rms
 
 
 # ============================================================================
@@ -160,12 +160,12 @@ class HyperConnectionModule(MegatronModule):
             self._sinkhorn_op = fused_sinkhorn
             self._h_aggregate_op = fused_h_aggregate
             self._h_post_bda_op = fused_h_post_bda
-            self._proj_rms_op = fused_proj_rms
+            self._proj_inv_rms_op = fused_proj_rms
         else:
             self._sinkhorn_op = reference_sinkhorn
             self._h_aggregate_op = reference_h_aggregate
             self._h_post_bda_op = reference_h_post_bda
-            self._proj_rms_op = reference_proj_rms
+            self._proj_inv_rms_op = reference_proj_inv_rms
 
         self._init_weights()
 
@@ -193,17 +193,17 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, nC = x.shape
         x_2d = x.reshape(s * b, nC)
-        proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
-        return proj.view(s, b, -1), r.view(s, b, 1)
+        proj, inv_rms = self._proj_inv_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
+        return proj.view(s, b, -1), inv_rms.view(s, b, 1)
 
     @torch.compile
-    def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    def _compute_h(self, proj: Tensor, inv_rms: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
 
         Args:
             proj: [s, b, n^2 + 2n] - projected hidden states
-            r: [s, b, 1] - scaling factors
+            inv_rms: [s, b, 1] - inverse-RMS scaling factors
 
         Returns:
             h_pre: [s, b, n] - aggregation weights
@@ -218,7 +218,7 @@ class HyperConnectionModule(MegatronModule):
             ],
             dim=-1,
         )
-        h = r * proj * alpha_ + self.bias
+        h = inv_rms * proj * alpha_ + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
         h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
 
@@ -244,9 +244,9 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, _ = x.shape
         with torch.cuda.nvtx.range("HyperConnection::projection_and_get_norm"):
-            proj, r = self._projection_and_get_norm(x)
+            proj, inv_rms = self._projection_and_get_norm(x)
         with torch.cuda.nvtx.range("HyperConnection::compute_h"):
-            h_pre, h_post, h_res = self._compute_h(proj, r)
+            h_pre, h_post, h_res = self._compute_h(proj, inv_rms)
         h_res = self._sinkhorn_op(
             h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations, self.norm_eps
         )  # [s, b, n, n]

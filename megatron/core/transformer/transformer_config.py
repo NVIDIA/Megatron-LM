@@ -1564,6 +1564,12 @@ class TransformerConfig(ModelParallelConfig):
                 "for a follow-up PR."
             )
 
+        if self.enable_hyper_connections and self.inference_fuse_tp_communication:
+            raise ValueError(
+                "enable_hyper_connections is not compatible with "
+                "inference_fuse_tp_communication."
+            )
+
         if self.fine_grained_activation_offloading:
             assert (
                 not self.cpu_offloading
