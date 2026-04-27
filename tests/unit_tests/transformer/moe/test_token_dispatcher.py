@@ -147,8 +147,9 @@ class MoEModelTestContainer:
             num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
         )
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = MoELayer(new_config, submodules.mlp.submodules).cuda().to(dtype=self.test_dtype)
-        moe_layer.set_layer_number(0)
+        moe_layer = MoELayer(
+            new_config, submodules.mlp.submodules, layer_number=0,
+        ).cuda().to(dtype=self.test_dtype)
         return moe_layer
 
     def __del__(self):

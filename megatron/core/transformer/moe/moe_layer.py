@@ -119,13 +119,6 @@ class RouterInterface(Protocol):
         """
         ...
 
-    def set_layer_number(self, layer_number: int) -> None:
-        """Set the layer number for the router.
-
-        Called from transformer_layer during initialization.
-        """
-        ...
-
 
 class RouterBuilder(Protocol):
     """Protocol for building a Router."""
@@ -191,11 +184,6 @@ class BaseMoELayer(MegatronModule, ABC):
         """Forward method for the MoE layer."""
         pass
 
-    def set_layer_number(self, layer_number: int):
-        """Set the layer number for the MoE layer."""
-        self.layer_number = layer_number
-        self.router.set_layer_number(layer_number)
-
 
 class MoELayer(BaseMoELayer):
     """Mixture of Experts layer.
@@ -240,7 +228,10 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router.
         self.router = self.submodules.router(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            layer_number=layer_number,
         )
         self.tp_group = pg_collection.tp
 
@@ -421,13 +412,18 @@ class MoELayer(BaseMoELayer):
             self.shared_expert_overlap = self._saved_shared_expert_overlap
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, input_ids)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -599,6 +595,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ):
         """Forward pass for the MoE layer.
 
@@ -613,6 +610,8 @@ class MoELayer(BaseMoELayer):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            input_ids (torch.Tensor, optional): The input IDs tensor. Shape [seq_length, bsz].
+                                                Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -634,7 +633,7 @@ class MoELayer(BaseMoELayer):
                         self._overload_log_num_local_tokens = (
                             self._num_token_rows_from_moe_hidden_states(hidden_states)
                         )
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:

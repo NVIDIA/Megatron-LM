@@ -48,6 +48,21 @@ def weighted_swiglu(y, weights):
     return res.to(dtype)
 
 
+@jit_fuser
+def clamped_swiglu(y, clamp_value):
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    y_1 = y_1.clamp(min=None, max=clamp_value)
+    y_2 = y_2.clamp(min=-clamp_value, max=clamp_value)
+    return F.silu(y_1) * y_2
+
+
+@jit_fuser
+def clamped_weighted_swiglu(y, weights, clamp_value):
+    dtype = y.dtype
+    res = clamped_swiglu(y, clamp_value) * weights
+    return res.to(dtype)
+
+
 # gradient of tanh approximation of gelu
 # gradient of actual gelu is:
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
@@ -93,6 +108,34 @@ def weighted_swiglu_back(g, y, weights):
     input_grad = swiglu_back(g * weights, y)
     # precison of w may be higher than y and g, so we need to cast g to w_dtype
     weights_grad = swiglu(y) * g.to(w_dtype)
+    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
+    return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
+@jit_fuser
+def clamped_swiglu_back(g, y, clamp_value):
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    y_1c = y_1.clamp(min=None, max=clamp_value)
+    y_2c = y_2.clamp(min=-clamp_value, max=clamp_value)
+    return torch.cat(
+        (
+            g
+            * torch.sigmoid(y_1c)
+            * (1 + y_1c * (1 - torch.sigmoid(y_1c)))
+            * y_2c
+            * (y_1 <= clamp_value).to(g.dtype),
+            g * F.silu(y_1c) * ((y_2 >= -clamp_value) & (y_2 <= clamp_value)).to(g.dtype),
+        ),
+        -1,
+    )
+
+
+@jit_fuser
+def clamped_weighted_swiglu_back(g, y, weights, clamp_value):
+    input_dtype = y.dtype
+    w_dtype = weights.dtype
+    input_grad = clamped_swiglu_back(g * weights, y, clamp_value)
+    weights_grad = clamped_swiglu(y, clamp_value) * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
@@ -190,20 +233,29 @@ class SwiGLUFunction(torch.autograd.Function):
 
 class WeightedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
-    # bias is an optional argument
-    def forward(ctx, input, weights, fp8_input_store):
+    def forward(ctx, input, weights, fp8_input_store, clamp_value):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
-        return weighted_swiglu(input, weights)
+        ctx.clamp_value = clamp_value
+        if clamp_value is not None and clamp_value > 0:
+            res = clamped_weighted_swiglu(input, weights, clamp_value)
+        else:
+            res = weighted_swiglu(input, weights)
+        return res
 
     @staticmethod
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
-        return tmp, wgrad, None
+        if ctx.clamp_value is not None and ctx.clamp_value > 0:
+            tmp, wgrad = clamped_weighted_swiglu_back(
+                grad_output, input, weights, ctx.clamp_value
+            )
+        else:
+            tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
+        return tmp, wgrad, None, None
 
 
 def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
@@ -236,7 +288,7 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
-def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, clamp_value=None):
     """
     Token-wise-weighted bias swiglu fusion.
     """

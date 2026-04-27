@@ -551,6 +551,10 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        # Pass input_ids to decoder for hash-based MoE routing
+        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+            extra_block_kwargs = {**(extra_block_kwargs or {}), 'input_ids': input_ids}
+
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
