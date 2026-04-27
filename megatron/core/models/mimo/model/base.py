@@ -497,8 +497,7 @@ class MimoModel(MegatronModule):
     def _build_colocated_communicators(self):
         grid_map = self.mimo_config.module_to_grid_map
         if any(
-            'tp' not in grid.dim_names or 'dp' not in grid.dim_names
-            for grid in grid_map.values()
+            'tp' not in grid.dim_names or 'dp' not in grid.dim_names for grid in grid_map.values()
         ):
             logger.info(
                 "Skipping colocated communicator setup because module_to_grid_map "
