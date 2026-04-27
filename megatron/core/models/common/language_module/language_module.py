@@ -75,7 +75,7 @@ class LanguageModule(MegatronModule):
                 base_module=self,
                 function_name="compute_mtp_single_step",
                 need_backward=False,
-                is_mtp_inference=True,
+                inline_capture=True,
             )
 
     def _is_in_embd_group(self):

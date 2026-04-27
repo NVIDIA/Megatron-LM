@@ -50,7 +50,7 @@ from megatron.core.inference.utils import (
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs, graph_capture
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -370,12 +370,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
         unwrapped = unwrap_model(controller.inference_wrapped_model.model)
-        mtp_warmup_enabled = (
-            controller.num_mtp_heads > 0
-            and (controller.num_speculative_tokens or 0) > 0
-            and hasattr(unwrapped, 'mtp')
-        )
-        if mtp_warmup_enabled:
+        mtp_warmup_depths = None
+        if hasattr(unwrapped, 'mtp') and (controller.num_speculative_tokens or 0) > 0:
             tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
             sp_enabled = model_config.sequence_parallel and tp_size > 1
             mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
@@ -408,7 +404,7 @@ class DynamicInferenceEngine(AbstractEngine):
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
             # MTP CUDA graph warmup for this batch dimension.
-            if mtp_warmup_enabled:
+            if mtp_warmup_depths is not None:
                 n = cuda_graph_batch_dimension.req_count
                 if sp_enabled:
                     n = round_up_to_nearest_multiple(n, tp_size)
@@ -418,17 +414,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     batch_dim = n // tp_size if sp_enabled else n
                     # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
                     for depth in mtp_warmup_depths:
-                        with graph_capture():
-                            unwrapped.compute_mtp_single_step(
-                                hidden_states=torch.zeros(
-                                    (batch_dim, 1, model_config.hidden_size),
-                                    device=device,
-                                    dtype=model_config.params_dtype,
-                                ),
-                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
-                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
-                                depth=depth,
-                            )
+                        unwrapped.compute_mtp_single_step(
+                            hidden_states=torch.zeros(
+                                (batch_dim, 1, model_config.hidden_size),
+                                device=device,
+                                dtype=model_config.params_dtype,
+                            ),
+                            next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                            position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                            depth=depth,
+                            cache_key=("mtp", n, depth),
+                        )
 
             context.reset()
 
@@ -436,8 +432,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-        if mtp_warmup_enabled and mtp_seen_batch_sizes:
-            controller.has_mtp_cuda_graphs = True
+        if mtp_warmup_depths is not None and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
