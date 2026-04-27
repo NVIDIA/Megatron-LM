@@ -21,7 +21,7 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
 
 ## Contributing
 
-If you'd like to contribute a guide or tutorial, please follow this structure:
+To contribute a guide or tutorial, follow this structure:
 
 1. Create a new directory: `docs/discussions/your-guide-name/`
 2. Add your main guide: `docs/discussions/your-guide-name/your-guide-name.md`

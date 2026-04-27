@@ -133,7 +133,7 @@ Shard optimizer state, weight gradients, and compute weights.
 - Large models with large or fused compute kernels to hide communications under.
 - Integrated with TP, CP, EP, and easily composable with heterogeneous parallelisms.
 - With SM-reducing optimizations from NCCL and activation offloading from TransformerEngine.
-- Via `fully_shard` without depending on Megatron-LM!
+- Using `fully_shard` without depending on Megatron-LM.
 
 ## Parallelism Selection Guide
 
