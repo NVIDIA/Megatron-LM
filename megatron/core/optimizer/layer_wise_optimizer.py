@@ -198,17 +198,24 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
         def _allgather_helper(params_list, group):
+            # For Megatron-FSDP, params are DTensors whose local storage lives in
+            # `_local_tensor`. Plain DDP params fall back to `.data`.
+            def _get_local(p):
+                local = getattr(p, "_local_tensor", None)
+                return local if local is not None else p.data
+
             device = params_list[0][0].device
             dtype = params_list[0][0].dtype
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
-            # Flatten this rank's params.
+            local_params = [[_get_local(p) for p in params] for params in params_list]
+            # Flatten this rank's local tensors.
             src = (
-                _flatten_dense_tensors(params_list[rank])
-                if len(params_list[rank]) > 0
+                _flatten_dense_tensors(local_params[rank])
+                if len(local_params[rank]) > 0
                 else torch.empty(0, device=device, dtype=dtype)
             )
-            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
+            flat_sizes = [sum(t.numel() for t in lp) for lp in local_params]
             if max(flat_sizes) == 0:
                 return
 
@@ -224,13 +231,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
             torch.distributed.all_gather(gather_list, src, group=group)
 
-            # Unflatten and copy gathered params for each rank.
-            for idx, params in enumerate(params_list):
-                if len(params) == 0 or idx == rank:
+            # Unflatten and copy gathered params back into local storage.
+            for idx, lp in enumerate(local_params):
+                if len(lp) == 0 or idx == rank:
                     continue
-                updated_params = _unflatten_dense_tensors(gather_list[idx], params)
-                for updated_p, model_p in zip(updated_params, params):
-                    model_p.data.copy_(updated_p)
+                updated_params = _unflatten_dense_tensors(gather_list[idx], lp)
+                for updated_p, local_t in zip(updated_params, lp):
+                    local_t.copy_(updated_p)
 
         if self.pg_collection is None:
             return
