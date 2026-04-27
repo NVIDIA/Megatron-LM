@@ -3114,6 +3114,141 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_speculative_decoding_stats_exclude_prefill(self):
+        """Test that MTP acceptance stats are cumulative and exclude prefill requests.
+
+        Prefill requests don't get MTP speculative proposals (MTP heads only run for
+        decode requests). Verify that:
+        1. Stats accumulate across the engine lifetime (no reset between logging).
+        2. Prefill steps don't inflate _spec_tokens_proposed.
+        3. The acceptance rate reflects only decode steps.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,  # Added manually below to stagger prefill vs decode
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
+
+        # Mock forward: all tokens get the same high-probability logit so every
+        # speculative token is accepted (acceptance rate should be 100%).
+        def mock_mtp_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            base_logits = torch.zeros(
+                tokens.size(0),
+                tokens.size(1),
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            base_logits[:, :, 0] = 100.0
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            return base_logits
+
+        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth):
+            n = hidden_states.size(0)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
+            logits[:, :, 0] = 100.0
+            return hidden_states, logits
+
+
+        unwrapped_model.forward = mock_mtp_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
+
+        # Verify counters start at zero.
+        assert sum(env.engine._spec_tokens_proposed_per_pos) == 0
+        assert sum(env.engine._spec_tokens_accepted_per_pos) == 0
+        assert env.engine._spec_steps == 0
+
+        # Add first request and run through prefill + some decode steps.
+        env.engine.add_request(
+            request_id=0,
+            prompt=torch.randint(0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+        )
+
+        # Step 1: prefill for request 0 — should NOT count as a spec step.
+        env.engine.step_modern()
+        proposed_after_prefill = sum(env.engine._spec_tokens_proposed_per_pos)
+        accepted_after_prefill = sum(env.engine._spec_tokens_accepted_per_pos)
+
+        # Step 2: decode for request 0 — should count spec tokens.
+        env.engine.step_modern()
+        assert sum(env.engine._spec_tokens_proposed_per_pos) > proposed_after_prefill, (
+            "Decode step should have incremented _spec_tokens_proposed_per_pos"
+        )
+        assert sum(env.engine._spec_tokens_accepted_per_pos) > accepted_after_prefill, (
+            "With deterministic mock, decode step should have accepted spec tokens"
+        )
+
+        # Now add a second request while request 0 is decoding.
+        # The next step is a mixed prefill (req 1) + decode (req 0) step.
+        env.engine.add_request(
+            request_id=1,
+            prompt=torch.randint(0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+        )
+
+        proposed_before_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
+        env.engine.step_modern()
+        proposed_after_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
+
+        # In the mixed step, only the decode request (req 0) should contribute to
+        # proposed count, NOT the prefilling request (req 1). With 2 spec tokens and
+        # 1 decode request, proposed should increase by exactly 2.
+        proposed_delta = proposed_after_mixed - proposed_before_mixed
+        assert proposed_delta == test_config.num_speculative_tokens, (
+            f"Mixed prefill+decode step: expected proposed delta of "
+            f"{test_config.num_speculative_tokens} (1 decode request), got {proposed_delta}"
+        )
+
+        # Run to completion.
+        while env.engine.has_unfinished_requests():
+            env.engine.step_modern()
+
+        # Stats should be cumulative (non-zero after all requests finish).
+        total_proposed = sum(env.engine._spec_tokens_proposed_per_pos)
+        total_accepted = sum(env.engine._spec_tokens_accepted_per_pos)
+        assert total_proposed > 0
+        assert total_accepted > 0
+        assert env.engine._spec_steps > 0
+
+        # With deterministic mock (all tokens accepted), acceptance rate should be 100%.
+        acceptance_rate = total_accepted / total_proposed
+        assert acceptance_rate == 1.0, (
+            f"Expected 100% acceptance with deterministic mock, got {acceptance_rate * 100:.1f}%"
+        )
+
+        # With deterministic mock, every position should have 100% acceptance.
+        for pos in range(test_config.num_speculative_tokens):
+            assert env.engine._spec_tokens_proposed_per_pos[pos] > 0, (
+                f"Position {pos} should have proposals"
+            )
+            pos_rate = (
+                env.engine._spec_tokens_accepted_per_pos[pos]
+                / env.engine._spec_tokens_proposed_per_pos[pos]
+            )
+            assert pos_rate == 1.0, (
+                f"Expected 100% acceptance at position {pos} with deterministic mock, "
+                f"got {pos_rate * 100:.1f}%"
+            )
+
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
     def test_speculative_decoding_logprobs(self, skip_prompt_log_probs: bool):
@@ -3410,6 +3545,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             logits[:, :, 0] = 100.0
             return hidden_states, logits
+
 
         unwrapped_model.forward = mock_deterministic_forward
         unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step

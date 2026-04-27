@@ -300,9 +300,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.resume_request_ids = None
 
-        # Speculative decoding acceptance tracking.
-        self._spec_tokens_proposed = 0
-        self._spec_tokens_accepted = 0
+        # Speculative decoding acceptance tracking (per-position).
+        # Each list has length num_speculative_tokens; index i tracks position i+1
+        # (i.e. the i-th draft token proposed by the MTP head).
+        self._spec_tokens_proposed_per_pos = [0] * self.num_speculative_tokens
+        self._spec_tokens_accepted_per_pos = [0] * self.num_speculative_tokens
         self._spec_steps = 0
 
         # Prefix caching tracking.
@@ -1151,6 +1153,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            is_prefill = len(request.generated_tokens) == 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
@@ -1218,13 +1221,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     request
                 )
 
-                # Track acceptance statistics for logging.
-                if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
+                # Track per-position acceptance statistics for logging.
+                # Skip prefill requests: MTP heads only propose speculative tokens
+                # for decode requests, so counting prefill requests would inflate
+                # the denominator and artificially deflate the acceptance rate.
+                if not is_prefill and len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
                     actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
-
-                    self._spec_tokens_proposed += actual_proposed
-                    self._spec_tokens_accepted += actual_accepted
+                    for pos in range(actual_proposed):
+                        self._spec_tokens_proposed_per_pos[pos] += 1
+                        if pos < len(accepted_tokens_list) and accepted_tokens_list[pos] != -1:
+                            self._spec_tokens_accepted_per_pos[pos] += 1
 
                 if request_id in finished_request_ids:
                     # Reconstruct routing from per-block storage before popping.
@@ -1872,13 +1878,24 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
-            # Add speculative decoding acceptance metrics.
-            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
-                acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
+            # Add speculative decoding acceptance metrics (aggregate + per-position).
+            total_proposed = sum(self._spec_tokens_proposed_per_pos)
+            total_accepted = sum(self._spec_tokens_accepted_per_pos)
+            if self.num_speculative_tokens > 0 and total_proposed > 0:
+                acceptance_rate = total_accepted / total_proposed
                 metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
-                metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
-                metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
+                metrics['inference/spec_decode_tokens_proposed'] = int(total_proposed)
+                metrics['inference/spec_decode_tokens_accepted'] = int(total_accepted)
                 metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
+                for pos in range(self.num_speculative_tokens):
+                    if self._spec_tokens_proposed_per_pos[pos] > 0:
+                        pos_rate = (
+                            self._spec_tokens_accepted_per_pos[pos]
+                            / self._spec_tokens_proposed_per_pos[pos]
+                        )
+                        metrics[f'inference/spec_decode_acceptance_rate_pos{pos + 1}'] = float(
+                            pos_rate * 100.0
+                        )
 
             # Add prefix caching metrics.
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
@@ -1936,33 +1953,37 @@ class DynamicInferenceEngine(AbstractEngine):
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
-            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
-                spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
-                output_str += " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
-                    spec_rate,
-                    self._spec_tokens_accepted,
-                    self._spec_tokens_proposed,
-                    self._spec_steps,
+            total_proposed = sum(self._spec_tokens_proposed_per_pos)
+            total_accepted = sum(self._spec_tokens_accepted_per_pos)
+            if self.num_speculative_tokens > 0 and total_proposed > 0:
+                spec_rate = total_accepted / total_proposed * 100.0
+                per_pos_rates = []
+                for pos in range(self.num_speculative_tokens):
+                    if self._spec_tokens_proposed_per_pos[pos] > 0:
+                        pos_rate = (
+                            self._spec_tokens_accepted_per_pos[pos]
+                            / self._spec_tokens_proposed_per_pos[pos]
+                            * 100.0
+                        )
+                        per_pos_rates.append("t%d=%.1f%%" % (pos + 1, pos_rate))
+                output_str += (
+                    " ... spec (cumul): accept %.1f%% (%d/%d in %d steps) [%s]"
+                    % (
+                        spec_rate,
+                        total_accepted,
+                        total_proposed,
+                        self._spec_steps,
+                        ", ".join(per_pos_rates),
+                    )
                 )
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
-                output_str += " ... prefix cache: %d hits, %d blocks matched" % (
+                output_str += " ... prefix cache (cumul): %d hits, %d blocks matched" % (
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
-
-            # Reset speculative decoding accumulators after both wandb and console logging.
-            if self.num_speculative_tokens > 0:
-                self._spec_tokens_proposed = 0
-                self._spec_tokens_accepted = 0
-                self._spec_steps = 0
-
-            # Reset prefix caching accumulators after both wandb and console logging.
-            if self.context.enable_prefix_caching:
-                self._prefix_cache_hits = 0
-                self._prefix_cache_blocks_matched = 0
 
         return {
             "active_request_ids": active_request_ids,
