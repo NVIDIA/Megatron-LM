@@ -142,6 +142,34 @@ class TestHybridBlock:
         assert isinstance(layers[2].inner_layer, TransformerLayer)
         assert isinstance(layers[2].inner_layer.mlp, MLP)
 
+    def test_hyper_connection_recompute_plan_for_hybrid_layers(self):
+        """HybridStack creates per-layer mHC recompute managers when requested."""
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        layer_type_list = validate_segment_layers(layer_pattern)
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+            recompute_granularity="selective",
+            recompute_modules=["core_attn", "mhc"],
+        )
+        block = HybridStack(
+            transformer_config,
+            hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        )
+
+        managers, block_ends = block._build_mhc_recompute_layer_plan(use_mhc_recompute=True)
+        assert len(managers) == len(block.layers)
+        assert all(manager is not None for manager in managers)
+        assert block_ends[-1] is True
+
     def test_hyper_connection_gpu_forward(self):
         """mHC-enabled HybridStack expands internally and contracts back at the output."""
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP

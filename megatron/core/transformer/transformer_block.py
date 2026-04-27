@@ -294,6 +294,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # required for pipeline parallel schedules
         self.input_tensor = None
 
+        # Lazily populated mHC recompute layout cache (deterministic from config
+        # and num_layers); see `_build_mhc_recompute_layer_plan`.
+        self._mhc_block_end_plan: Optional[List[bool]] = None
+
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
@@ -646,20 +650,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
-    def _build_mhc_recompute_layer_plan(
-        self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
-        """Pre-build per-layer MHC recompute managers and block-end markers."""
+    def _compute_mhc_block_end_plan(self) -> List[bool]:
+        """Compute the per-layer block-end markers (deterministic from config)."""
         num_layers = len(self.layers)
-        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
         is_recompute_block_end: List[bool] = [False] * num_layers
-
-        if not use_mhc_recompute or num_layers == 0:
-            return layer_managers, is_recompute_block_end
-
+        if num_layers == 0:
+            return is_recompute_block_end
         mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
-        mhc_manager = CheckpointManager()
-
         for l_no in range(num_layers):
             is_last_in_transformer_block = l_no == num_layers - 1
             is_last_in_recompute_block = is_last_in_transformer_block
@@ -667,13 +664,32 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 is_last_in_recompute_block = is_last_in_transformer_block or (
                     (l_no + 1) % mhc_recompute_layer_num == 0
                 )
-
-            layer_managers[l_no] = mhc_manager
             is_recompute_block_end[l_no] = is_last_in_recompute_block
+        return is_recompute_block_end
 
-            if is_last_in_recompute_block and not is_last_in_transformer_block:
+    def _build_mhc_recompute_layer_plan(
+        self, use_mhc_recompute: bool
+    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+        """Pre-build per-layer MHC recompute managers and block-end markers.
+
+        The block-end plan is deterministic from config and cached on the
+        instance; only the per-block ``CheckpointManager`` instances are
+        allocated fresh per forward pass (managers are single-use).
+        """
+        num_layers = len(self.layers)
+        if not use_mhc_recompute or num_layers == 0:
+            return [None] * num_layers, [False] * num_layers
+
+        if self._mhc_block_end_plan is None:
+            self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
+        is_recompute_block_end = self._mhc_block_end_plan
+
+        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
+        mhc_manager = CheckpointManager()
+        for l_no in range(num_layers):
+            layer_managers[l_no] = mhc_manager
+            if is_recompute_block_end[l_no] and l_no != num_layers - 1:
                 mhc_manager = CheckpointManager()
-
         return layer_managers, is_recompute_block_end
 
     @staticmethod
@@ -919,10 +935,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
-                        intermediate_hidden_states.append(hidden_states)
+                        intermediate_hidden_state = hidden_states
+                        if self.config.enable_hyper_connections:
+                            intermediate_hidden_state = HyperConnectionModule.output_contract(
+                                intermediate_hidden_state, self.num_residual_streams
+                            )
+                        intermediate_hidden_states.append(intermediate_hidden_state)
 
-        # Only contract if the final layer norm is in this stage
-        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+        # Contract at the model boundary. Final layernorm may be disabled, but
+        # downstream output layers and feature consumers still expect [s, b, C].
+        if self.config.enable_hyper_connections and self.post_process:
             hidden_states = HyperConnectionModule.output_contract(
                 hidden_states, self.num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]

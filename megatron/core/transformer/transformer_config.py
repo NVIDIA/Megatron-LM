@@ -882,10 +882,21 @@ class TransformerConfig(ModelParallelConfig):
     """Enable mHC residual connections."""
 
     num_residual_streams: int = 4
-    """Number of residual streams (n in paper)."""
+    """Number of residual streams (n in paper).
+
+    Within each hyper-connection transformer block, hidden states are expanded
+    from [s, b, C] to [s, b, n*C], so activation memory in the block scales
+    roughly linearly with this value.
+    """
 
     mhc_sinkhorn_iterations: int = 20
-    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection.
+
+    20 is a conservative default that converges robustly across all tested
+    configurations. For typical small ``num_residual_streams`` (n=4, giving 4×4
+    matrices), 8–10 iterations are usually sufficient and reduce per-layer
+    Sinkhorn cost. Tune downward only after verifying convergence quality on
+    the target model."""
 
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
@@ -902,15 +913,22 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_recompute_layer_num: Optional[int] = None
     """Number of layers per MHC recompute block.
-    
+
     When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
     in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
     layer in the transformer block) will:
     - NOT checkpoint its final MLP BDA
     - Register the unified recompute hook on its MLP BDA output
     - A new CheckpointManager is created for subsequent layers
-    
+
     If None, all layers in the transformer block share a single recompute block.
+
+    Memory/compute tradeoff: a single ``CheckpointManager`` retains references to every
+    per-sublayer ``CheckpointWithoutOutput`` until its unified backward hook fires.
+    Smaller blocks (e.g. 4) recompute more frequently but hold fewer checkpoint contexts
+    simultaneously; larger blocks (or ``None``) save recompute overhead at the cost of
+    holding more contexts at peak. As a starting point, try
+    ``mhc_recompute_layer_num=4`` for deep stacks and tune based on observed peak memory.
 
     Must be a positive integer when set."""
 
@@ -1489,6 +1507,11 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
+        if self.enable_hyper_connections and self.num_residual_streams < 2:
+            raise ValueError(
+                "num_residual_streams must be >= 2 when hyper connections are enabled."
+            )
+
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
             if not self.enable_hyper_connections:
@@ -1517,8 +1540,16 @@ class TransformerConfig(ModelParallelConfig):
                     "tensor_pop on a None chunk. Disable one of them."
                 )
 
-        if self.enable_hyper_connections and not (
-            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        if self.enable_hyper_connections and self.recompute_granularity == "full":
+            raise ValueError(
+                "enable_hyper_connections is not yet compatible with full activation "
+                "recompute. Use selective recompute with 'mhc' in recompute_modules "
+                "or disable activation recompute."
+            )
+        if (
+            self.enable_hyper_connections
+            and self.recompute_granularity == "selective"
+            and "mhc" not in self.recompute_modules
         ):
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
@@ -1547,6 +1578,13 @@ class TransformerConfig(ModelParallelConfig):
                     UserWarning,
                 )
                 self.use_fused_mhc = False
+            fused_proj_dim = self.num_residual_streams**2 + 2 * self.num_residual_streams
+            if self.use_fused_mhc and fused_proj_dim > 256:
+                raise ValueError(
+                    "use_fused_mhc supports num_residual_streams values whose "
+                    "n^2 + 2n projection dimension is <= 256. Disable use_fused_mhc "
+                    "or choose fewer residual streams."
+                )
 
         # Validation for hyper_connections with MTP
         if self.enable_hyper_connections and self.mtp_num_layers is not None:
@@ -1554,6 +1592,47 @@ class TransformerConfig(ModelParallelConfig):
                 "enable_hyper_connections is not compatible with Multi-Token Prediction (MTP). "
                 "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
             )
+
+        if self.enable_hyper_connections and self.inference_fuse_tp_communication:
+            raise ValueError(
+                "enable_hyper_connections is not compatible with "
+                "inference_fuse_tp_communication. The fused inference TP path assumes "
+                "single-stream residual tensors."
+            )
+
+        if (
+            self.enable_hyper_connections
+            and self.virtual_pipeline_model_parallel_size is not None
+        ):
+            # The interleaved schedule allocates a single tensor_shape for all P2P
+            # exchanges per physical rank, but VPP straddles pre/post-process
+            # boundaries on each physical rank — intermediate virtual chunks need
+            # n*C while embedding/loss chunks use C. Block until per-virtual-chunk
+            # shapes are wired through. (A second, layout-derived path is caught
+            # at schedule-execution time in `forward_backward_pipelining_with_interleaving`.)
+            raise ValueError(
+                "enable_hyper_connections is not yet supported with "
+                "virtual_pipeline_model_parallel_size set. Disable VPP or wait for "
+                "per-virtual-chunk shape support."
+            )
+
+        if self.enable_hyper_connections and (self.num_moe_experts or 0) > 0:
+            raise ValueError(
+                "enable_hyper_connections is not yet supported with MoE layers. "
+                "Disable MoE (set num_moe_experts=None or 0) or disable mHC."
+            )
+
+        if self.enable_hyper_connections:
+            if self.mhc_sinkhorn_iterations < 1:
+                raise ValueError(
+                    f"mhc_sinkhorn_iterations must be >= 1; got "
+                    f"{self.mhc_sinkhorn_iterations}."
+                )
+            if self.mhc_init_gating_factor < 0:
+                raise ValueError(
+                    f"mhc_init_gating_factor must be non-negative; got "
+                    f"{self.mhc_init_gating_factor}."
+                )
 
         if self.fine_grained_activation_offloading:
             assert (

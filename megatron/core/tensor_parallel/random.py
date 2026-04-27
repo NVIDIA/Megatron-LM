@@ -598,8 +598,14 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
+        # Deferred import: cuda_graphs imports from this module, so a top-level
+        # import would be circular.
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
+        # `_is_checkpoint_valid()` returns False during cuda graph capture because
+        # PyTorch invokes backward via .grad() rather than .backward() while
+        # tracing the backward graph. Suppress the guard only in that path; the
+        # check still fires for genuine .grad() callers outside graph capture.
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
@@ -693,6 +699,14 @@ def _load_args_from_ctx(ctx):
             reconstructed_args.append(non_tensor_map[index])
         else:
             reconstructed_args.append(next(tensor_iter))
+    # Postcondition: every saved tensor must have been consumed. A mismatch here
+    # means `_save_args_to_ctx` and `_load_args_from_ctx` disagree on argument
+    # positions, which would otherwise silently feed wrong tensors to recompute.
+    remaining = list(tensor_iter)
+    assert not remaining, (
+        f"_load_args_from_ctx left {len(remaining)} saved tensors unconsumed; "
+        "tensor/non-tensor index mismatch between save and load."
+    )
     return tuple(reconstructed_args)
 
 
@@ -764,6 +778,16 @@ class CheckpointManager:
         ckpt_function.checkpoint(run_function, *args)
         # other checkpointed operations
         ckpt_manager.discard_all_outputs_and_register_unified_recompute(final_output)
+
+    Lifetime / memory tradeoff:
+        A manager is single-use: it accumulates references to every
+        ``CheckpointWithoutOutput`` (and transitively each one's saved tensors,
+        ``ctx`` and ``run_function``) until the unified backward hook fires and
+        runs the recompute. Larger recompute blocks therefore hold more checkpoint
+        contexts simultaneously — this offsets some of the memory savings from
+        discarding outputs. ``_build_mhc_recompute_layer_plan`` allocates a fresh
+        manager per recompute block; managers should not be reused across blocks
+        or across training steps.
     """
 
     def __init__(self):
@@ -771,9 +795,15 @@ class CheckpointManager:
         # Set by TransformerBlock before each layer forward.
         # When True, the layer should keep block-boundary output uncheckpointed.
         self.is_last_layer_in_recompute_block = False
+        self._finalized = False
 
     def add_checkpoint(self, ckpt):
         """Add a checkpoint to the manager."""
+        if self._finalized:
+            raise RuntimeError(
+                "CheckpointManager is single-use; cannot add checkpoints after "
+                "discard_all_outputs_and_register_unified_recompute()."
+            )
         if not isinstance(ckpt, CheckpointWithoutOutput):
             raise TypeError("Expected CheckpointWithoutOutput object")
         if ckpt.outputs is None:
@@ -782,6 +812,26 @@ class CheckpointManager:
 
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
         """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+        if self._finalized:
+            raise RuntimeError(
+                "CheckpointManager is single-use; "
+                "discard_all_outputs_and_register_unified_recompute() already called."
+            )
+        # Refuse to discard checkpoint outputs when no recompute hook can be
+        # registered (`hook_tensor.requires_grad=False`, e.g. inference or a
+        # `no_grad` context). Otherwise the discarded storages would never be
+        # restored and any later access would either read garbage or crash.
+        # Upstream callers (`_build_mhc_recompute_layer_plan`) already guard
+        # via `self.training`; this check turns a silent corruption into a
+        # loud failure if a future caller bypasses that guard.
+        if self.checkpoints and not hook_tensor.requires_grad:
+            raise RuntimeError(
+                "CheckpointManager.discard_all_outputs_and_register_unified_recompute "
+                "called with hook_tensor.requires_grad=False but checkpoints are "
+                "registered. Outputs would never be recomputed; this is likely a "
+                "bug (calling during inference or inside a no_grad context)."
+            )
+        self._finalized = True
         for ckpt in self.checkpoints:
             for output in ckpt.outputs:
                 output.untyped_storage().resize_(0)
@@ -822,6 +872,12 @@ class CheckpointWithoutOutput(object):
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
         """
+        # Coerce to bool so the default `fp8=False` does not enter the fp8 recompute
+        # context. The previous expression `fp8 is not None` was True for `fp8=False`,
+        # which silently activated `fp8_autocast` for every default-constructed
+        # checkpoint. Existing call sites pass `quantization` (truthy str when
+        # active, None/False otherwise), so `bool()` preserves their intended
+        # behavior while fixing the default-False path.
         self.fp8 = bool(fp8)
         self.ckpt_manager = ckpt_manager
         self.run_function = None

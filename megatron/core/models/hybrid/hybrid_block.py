@@ -7,7 +7,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -22,6 +22,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
@@ -54,7 +55,19 @@ class HyperConnectionHybridLayer(MegatronModule):
     Hybrid layers already own their local residual paths. For this initial
     integration we treat each hybrid layer as a single function by aggregating
     n streams to the layer input, running the existing layer, and feeding only
-    the layer delta back through mHC expansion.
+    the layer delta back through mHC expansion. The expansion path intentionally
+    uses zero additional dropout because the wrapped hybrid layer has already
+    applied its local dropout/residual update before the delta is computed.
+
+    Checkpoint compatibility: this is a *wrapper* (the inner layer is held as
+    `self.inner_layer`), so wrapped-layer state_dict keys are nested under
+    `inner_layer.` (e.g. `layers.0.inner_layer.input_layernorm.weight` instead
+    of `layers.0.input_layernorm.weight`). HybridStack checkpoints saved with
+    `enable_hyper_connections=False` cannot be loaded into a model with
+    `enable_hyper_connections=True` (and vice versa) without a key-mapping
+    migration. Note: this differs from `HyperConnectionTransformerLayer`,
+    which subclasses `TransformerLayer` and only adds new sibling fields,
+    keeping all base keys stable.
     """
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
@@ -83,28 +96,30 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
     ) -> Tuple[Tensor, Optional[Tensor]]:
-        original_enable_hyper_connections = self.config.enable_hyper_connections
-        self.config.enable_hyper_connections = False
-        try:
-            if isinstance(self.inner_layer, TransformerLayer):
-                output = self.inner_layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    sequence_len_offset=sequence_len_offset,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                )
-            else:
-                output = self.inner_layer(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    packed_seq_params=packed_seq_params,
-                )
-        finally:
-            self.config.enable_hyper_connections = original_enable_hyper_connections
+        if isinstance(self.inner_layer, TransformerLayer):
+            output = self.inner_layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                _called_from_hybrid_mhc_wrapper=True,
+            )
+        else:
+            # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
+            # accept `sequence_len_offset` is currently always wrapped inside a
+            # TransformerLayer spec, so it takes the branch above) do not accept
+            # rotary_pos_emb / sequence_len_offset / padding_mask — pass only
+            # the common arguments. New layer types that consume any of these
+            # must add explicit handling here.
+            output = self.inner_layer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
 
         if isinstance(output, tuple):
             context = output[1] if len(output) > 1 else None
@@ -136,17 +151,53 @@ class HyperConnectionHybridLayer(MegatronModule):
             packed_seq_params,
             padding_mask,
         )
+        # The inner hybrid layer already applied its own local residual/dropout, so
+        # it returns `aggregated + f(aggregated)`. We feed only the function
+        # delta `f(aggregated)` into the n-stream BDA so it does not double-count
+        # the residual that mHC owns. The temporary [s, b, C] tensor here is the
+        # simplest correct form; a future optimization could fuse the subtraction
+        # into `h_res_h_post_bda` to avoid the allocation.
+        # Sanity check: this contract requires the inner layer to preserve shape;
+        # any mismatch indicates a future layer type is breaking the residual
+        # assumption and would silently corrupt the n-stream state.
+        assert layer_output.shape == aggregated.shape, (
+            "HyperConnectionHybridLayer requires inner layers to preserve "
+            f"hidden-state shape. Got {tuple(layer_output.shape)} from inner layer "
+            f"vs {tuple(aggregated.shape)} input — layer must add its own residual."
+        )
+        # `fp32_residual_connection=True` may cause some inner layers (e.g.,
+        # MambaLayer) to return `layer_output` in fp32 while `aggregated` is in
+        # compute dtype; explicitly upcast `aggregated` so the subtraction stays
+        # in fp32 instead of relying on PyTorch's implicit promotion.
+        if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
+            aggregated = aggregated.to(layer_output.dtype)
         layer_delta = layer_output - aggregated
-        hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
+        # `dropout_prob=0.0` already disables dropout regardless of training mode;
+        # `training=self.training` is more semantically accurate than hard-coding
+        # False during a training-mode forward.
+        hidden_states = self.hyper_connection.h_res_h_post_bda(
             h_res,
             residual,
             h_post,
             (layer_delta, None),
             dropout_prob=0.0,
-            training=False,
+            training=self.training,
             fused=False,
-            manager=None,
+            manager=mhc_recompute_manager,
         )
+        # In `HyperConnectionTransformerLayer` the n-stream output stays in compute
+        # dtype because the post-attention `x` is in compute dtype. In the hybrid
+        # wrapper, `layer_delta` may be fp32 (when `fp32_residual_connection=True`
+        # or an inner layer upcasts), so `h_post_bda`'s `output.to(x.dtype)` would
+        # leave the result in fp32 and silently propagate fp32 n-stream hidden
+        # states to every subsequent layer (~2x activation memory). Restore the
+        # compute-dtype contract here.
+        if (
+            self.config.fp32_residual_connection
+            and self.config.params_dtype is not None
+            and hidden_states.dtype != self.config.params_dtype
+        ):
+            hidden_states = hidden_states.to(self.config.params_dtype)
         return hidden_states, context
 
 
@@ -203,6 +254,10 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         # Required for pipeline parallel schedules
         self.input_tensor = None
         self.pg_collection = pg_collection
+
+        # Lazily populated mHC recompute layout cache (deterministic from config
+        # and num_layers); see `_build_mhc_recompute_layer_plan`.
+        self._mhc_block_end_plan: Optional[List[bool]] = None
 
         assert layer_type_list is not None, (
             "layer_type_list must be provided. It should be pre-computed from "
@@ -344,6 +399,59 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
+    def _compute_mhc_block_end_plan(self) -> List[bool]:
+        """Compute per-layer block-end markers (deterministic from config)."""
+        num_layers = len(self.layers)
+        is_recompute_block_end: List[bool] = [False] * num_layers
+        if num_layers == 0:
+            return is_recompute_block_end
+        mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
+        for l_no in range(num_layers):
+            is_last_in_stack = l_no == num_layers - 1
+            is_last_in_recompute_block = is_last_in_stack
+            if mhc_recompute_layer_num is not None:
+                is_last_in_recompute_block = is_last_in_stack or (
+                    (l_no + 1) % mhc_recompute_layer_num == 0
+                )
+            is_recompute_block_end[l_no] = is_last_in_recompute_block
+        return is_recompute_block_end
+
+    def _build_mhc_recompute_layer_plan(
+        self, use_mhc_recompute: bool
+    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+        """Pre-build per-layer MHC recompute managers and block-end markers.
+
+        The block-end plan is deterministic from config and cached on the
+        instance; only the per-block ``CheckpointManager`` instances are
+        allocated fresh per forward pass (managers are single-use). Mirrors
+        the caching scheme used by ``TransformerBlock``.
+        """
+        num_layers = len(self.layers)
+        if not use_mhc_recompute or num_layers == 0:
+            return [None] * num_layers, [False] * num_layers
+
+        if self._mhc_block_end_plan is None:
+            self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
+        is_recompute_block_end = self._mhc_block_end_plan
+
+        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
+        mhc_manager = CheckpointManager()
+        for l_no in range(num_layers):
+            layer_managers[l_no] = mhc_manager
+            if is_recompute_block_end[l_no] and l_no != num_layers - 1:
+                mhc_manager = CheckpointManager()
+        return layer_managers, is_recompute_block_end
+
+    @staticmethod
+    def _finalize_mhc_recompute_layer(
+        mhc_manager: Optional[CheckpointManager],
+        hidden_states: Tensor,
+        is_last_in_recompute_block: bool,
+    ) -> None:
+        """Finalize MHC recompute state for the current layer when a block ends."""
+        if mhc_manager is not None and is_last_in_recompute_block:
+            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -441,13 +549,29 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
 
+        use_mhc_recompute = (
+            self.training
+            and self.config.enable_hyper_connections
+            and self.config.recompute_granularity == 'selective'
+            and "mhc" in self.config.recompute_modules
+        )
+        mhc_layer_managers, mhc_is_last_in_recompute_block = self._build_mhc_recompute_layer_plan(
+            use_mhc_recompute
+        )
+
         with outer_fp8_context:
-            for layer in self.layers:
+            for l_no, layer in enumerate(self.layers):
                 # Layers have 1-indexed layer numbers attribute.
                 inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
+                mhc_manager = mhc_layer_managers[l_no]
+                if mhc_manager is not None:
+                    mhc_manager.is_last_layer_in_recompute_block = (
+                        mhc_is_last_in_recompute_block[l_no]
+                    )
+
                 with inner_quant_context:
                     if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
-                        hidden_states, _ = layer(
+                        layer_kwargs = dict(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,
@@ -456,6 +580,11 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
                         )
+                        if mhc_manager is not None and isinstance(
+                            layer, HyperConnectionHybridLayer
+                        ):
+                            layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                        hidden_states, _ = layer(**layer_kwargs)
                     else:  # MambaLayer, Expert, or MLP
                         hidden_states = layer(
                             hidden_states=hidden_states,
@@ -469,6 +598,12 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 # for cross-attention, and is not needed in our model.
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+
+                self._finalize_mhc_recompute_layer(
+                    mhc_manager=mhc_manager,
+                    hidden_states=hidden_states,
+                    is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
+                )
 
         if self.config.enable_hyper_connections and self.post_process:
             hidden_states = HyperConnectionModule.output_contract(

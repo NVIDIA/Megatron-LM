@@ -1065,13 +1065,23 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    # Determine hidden dimension for P2P communication
-    # For hyper connections with multiple PP stages, use n-stream dimension
+    # Determine hidden dimension for P2P communication.
+    # `forward_backward_pipelining_with_interleaving` is only reached when VPP is
+    # set (see `get_forward_backward_func` selection logic). VPP + mHC is rejected
+    # in `TransformerConfig.__post_init__` for explicit-VPP and re-checked here as
+    # a layout-VPP backstop; either way, mHC never reaches the n*C path inside
+    # this function.
+    if (
+        config.enable_hyper_connections
+        and pipeline_parallel_size > 1
+        and config.virtual_pipeline_model_parallel_size is not None
+    ):
+        raise ValueError(
+            "enable_hyper_connections is not yet supported with "
+            "virtual_pipeline_model_parallel_size set in the interleaved pipeline "
+            "schedule. Disable VPP or wait for per-virtual-chunk shape support."
+        )
     hidden_dim = config.hidden_size
-    if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
-        # For interleaved PP with hyper connections, all intermediate communications use n-stream
-        # Note: This is a simplified approach - proper VPP support may need more complex logic
-        hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
@@ -2046,23 +2056,51 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    # Determine hidden dimension based on hyper connections and pipeline stage
+    if (
+        getattr(config, 'enable_hyper_connections', False)
+        and getattr(config, 'virtual_pipeline_model_parallel_size', None) is not None
+        and pp_group is not None
+    ):
+        # Backstop in case `TransformerConfig.__post_init__`'s VPP+mHC check is
+        # skipped (e.g., when callers pass a non-TransformerConfig object). The
+        # config-level guard remains the user-facing error; this duplicate keeps
+        # the schedule path safe against silently producing wrong shapes.
+        raise ValueError(
+            "enable_hyper_connections is not yet supported with "
+            "virtual_pipeline_model_parallel_size set. Disable VPP or wait for "
+            "per-virtual-chunk shape support. (Same constraint enforced in "
+            "TransformerConfig.__post_init__.)"
+        )
+
+    if (
+        getattr(config, 'enable_hyper_connections', False)
+        and getattr(config, 'pipeline_model_parallel_size', 1) > 1
+        and pp_group is None
+    ):
+        raise ValueError("pp_group must be provided when enable_hyper_connections=True")
+
+    # Determine hidden dimension based on hyper connections and pipeline stage.
+    #
+    # mHC keeps the n-stream tensor `[s, b, n*C]` only at *intermediate* layer
+    # boundaries. The first PP stage receives a single-stream `[s, b, C]` from
+    # the embedding layer and expands to n*C for its first transformer layer;
+    # the last PP stage contracts back to C before the output. So the boundary
+    # shapes are asymmetric:
+    #   - rank 0:           recv = C,    send = n*C
+    #   - middle ranks:     recv = n*C,  send = n*C
+    #   - rank pp_size-1:   recv = n*C,  send = C
+    # `is_recv` selects the correct dimension at each boundary.
+    # TODO: make this more robust, including flexible VPP layout.
     hidden_size = config.hidden_size
-    # TODO: make this more robust, including flexible VPP layout
     if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
         pp_rank = pp_group.rank()
         pp_size = pp_group.size()
-        # For hyper connections:
-        # - recv: stages with rank > 0 receive n-stream (n*C) from previous stage
-        # - send: stages with rank < pp_size-1 send n-stream (n*C) to next stage
-        use_nstream = False
-        if is_recv and pp_rank > 0:
-            # Receiving from previous stage (which sends n*C)
-            use_nstream = True
-        elif not is_recv and pp_rank < pp_size - 1:
-            # Sending to next stage (send n*C)
-            use_nstream = True
-
+        is_first_stage = pp_rank == 0
+        is_last_stage = pp_rank == pp_size - 1
+        # First stage's recv comes from the embedding (single-stream); last
+        # stage's send goes to the output (single-stream). Everything else is
+        # the n-stream tensor.
+        use_nstream = (not is_first_stage) if is_recv else (not is_last_stage)
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
 
