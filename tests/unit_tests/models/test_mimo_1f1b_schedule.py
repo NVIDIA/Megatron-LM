@@ -717,9 +717,9 @@ def run_mimo_1f1b_test(
         # Optimizer step with global gradient clipping
         success, grad_norm, num_zeros = optimizer.step()
         assert success, "Optimizer step failed"
-        assert grad_norm is not None and grad_norm > 0, (
-            f"Expected positive grad norm, got {grad_norm}"
-        )
+        assert (
+            grad_norm is not None and grad_norm > 0
+        ), f"Expected positive grad norm, got {grad_norm}"
 
         # Verify results on last LLM stage
         if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):

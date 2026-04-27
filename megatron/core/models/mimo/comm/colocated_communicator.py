@@ -175,10 +175,7 @@ class ColocatedBridgeCommunicator:
 
     @staticmethod
     def _build_gather_groups(
-        iter_size: int,
-        sibling_tp_size: int,
-        scale: int,
-        rank_to_pos: Dict[int, Tuple[int, int]],
+        iter_size: int, sibling_tp_size: int, scale: int, rank_to_pos: Dict[int, Tuple[int, int]]
     ) -> List[List[int]]:
         """Build ``iter_size * sibling_tp_size`` gather groups of ``scale`` ranks.
 

@@ -207,9 +207,7 @@ class TestValidateGrids:
 
     def _grid_missing_tp(self, offset=0, dp=1):
         # Build a grid without a 'tp' dim to exercise the "missing 'tp'" raise.
-        grid = HyperCommGrid(
-            shape=[dp], dim_names=["dp"], rank_offset=offset, backend="nccl"
-        )
+        grid = HyperCommGrid(shape=[dp], dim_names=["dp"], rank_offset=offset, backend="nccl")
         grid.create_pg(["dp"])
         _active_grids.append(grid)
         return grid
@@ -268,6 +266,7 @@ class TestValidateGrids:
         with pytest.raises(ValueError, match="evenly divisible"):
             make_comm(src_grid, dest_grid)
 
+
 # ── Test 3c: communicate() runtime preconditions ──────────────────────────────
 
 
@@ -304,6 +303,7 @@ class TestCommunicatePreconditions:
         comm = make_comm(src_grid, dest_grid)
         with pytest.raises(ValueError, match="not divisible by fan_in"):
             comm.get_slice_info(batch_size=3)
+
 
 # ── Test 3d: destroy() releases PGs ──────────────────────────────────────────
 
@@ -403,13 +403,9 @@ class TestBridgeGradients:
         destroy_all_grids()
 
     # ── Test 1: fan-in forward = torch.cat of sibling inputs ─────────────────
-    @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp", [(2, 4, 4, 2)], ids=["2x_fan_in"]
-    )
+    @pytest.mark.parametrize("src_tp,src_dp,dest_tp,dest_dp", [(2, 4, 4, 2)], ids=["2x_fan_in"])
     @pytest.mark.parametrize("dim_mapping", _DIM_MAPPINGS, ids=_DIM_MAPPING_IDS)
-    def test_fan_in_forward_equals_torch_cat(
-        self, src_tp, src_dp, dest_tp, dest_dp, dim_mapping
-    ):
+    def test_fan_in_forward_equals_torch_cat(self, src_tp, src_dp, dest_tp, dest_dp, dim_mapping):
         src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
         dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
         comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
@@ -434,13 +430,9 @@ class TestBridgeGradients:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     # ── Test 2: fan-in backward = grad_output.narrow for this rank's slot ────
-    @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp", [(2, 4, 4, 2)], ids=["2x_fan_in"]
-    )
+    @pytest.mark.parametrize("src_tp,src_dp,dest_tp,dest_dp", [(2, 4, 4, 2)], ids=["2x_fan_in"])
     @pytest.mark.parametrize("dim_mapping", _DIM_MAPPINGS, ids=_DIM_MAPPING_IDS)
-    def test_fan_in_backward_equals_narrow(
-        self, src_tp, src_dp, dest_tp, dest_dp, dim_mapping
-    ):
+    def test_fan_in_backward_equals_narrow(self, src_tp, src_dp, dest_tp, dest_dp, dim_mapping):
         src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
         dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)
         comm = make_comm(src_grid, dest_grid, dim_mapping=dim_mapping)
@@ -467,9 +459,7 @@ class TestBridgeGradients:
         torch.testing.assert_close(local_input.grad, expected, rtol=0, atol=0)
 
     # ── Test 3: fan-out forward = input.narrow for this rank's slot ─────────
-    @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 2, 4)], ids=["2x_fan_out"]
-    )
+    @pytest.mark.parametrize("src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 2, 4)], ids=["2x_fan_out"])
     def test_fan_out_forward_equals_narrow(self, src_tp, src_dp, dest_tp, dest_dp):
         dim_mapping = {'b': 0, 's': 1, 'h': 2}
         src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
@@ -490,15 +480,11 @@ class TestBridgeGradients:
         actual = comm.communicate(input_tensor)
 
         slot = comm.rank_to_dest_pos[rank][0] % comm.scale
-        expected = input_tensor.narrow(
-            batch_dim, slot * b_per_dest, b_per_dest
-        ).contiguous()
+        expected = input_tensor.narrow(batch_dim, slot * b_per_dest, b_per_dest).contiguous()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     # ── Test 4 (CRITICAL): fan-out backward = concat of all sibling grads ──
-    @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 2, 4)], ids=["2x_fan_out"]
-    )
+    @pytest.mark.parametrize("src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 2, 4)], ids=["2x_fan_out"])
     def test_fan_out_backward_equals_concat_of_sibling_grads(
         self, src_tp, src_dp, dest_tp, dest_dp
     ):
@@ -533,18 +519,13 @@ class TestBridgeGradients:
 
         slot_shape = _shape_for_dim_mapping(dim_mapping, b_per_dest, self.S, self.H)
         expected = torch.cat(
-            [(i + 1) * torch.ones(*slot_shape, device='cuda') for i in range(scale)],
-            dim=batch_dim,
+            [(i + 1) * torch.ones(*slot_shape, device='cuda') for i in range(scale)], dim=batch_dim
         )
         torch.testing.assert_close(input_tensor.grad, expected, rtol=0, atol=0)
 
     # ── Test 5: equal DP is a pure identity forward and backward ────────────
-    @pytest.mark.parametrize(
-        "src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 4, 2)], ids=["tp4_dp2"]
-    )
-    def test_equal_dp_is_bitwise_identity_fwd_and_bwd(
-        self, src_tp, src_dp, dest_tp, dest_dp
-    ):
+    @pytest.mark.parametrize("src_tp,src_dp,dest_tp,dest_dp", [(4, 2, 4, 2)], ids=["tp4_dp2"])
+    def test_equal_dp_is_bitwise_identity_fwd_and_bwd(self, src_tp, src_dp, dest_tp, dest_dp):
         dim_mapping = {'b': 0, 's': 1, 'h': 2}
         src_grid = create_hypercomm_grid(tp=src_tp, dp=src_dp)
         dest_grid = create_hypercomm_grid(tp=dest_tp, dp=dest_dp)

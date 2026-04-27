@@ -282,32 +282,18 @@ def _generate_and_broadcast_global_batches(
     for batch_idx in range(num_batches):
         if rank == 0:
             encoder_hidden_states = torch.randn(
-                image_seq_length,
-                global_mbs,
-                hidden_size,
-                device='cuda',
-                dtype=torch.float32,
+                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=torch.float32
             )
             image_tokens = torch.full(
-                (global_mbs, image_seq_length),
-                image_token_id,
-                dtype=torch.long,
-                device='cuda',
+                (global_mbs, image_seq_length), image_token_id, dtype=torch.long, device='cuda'
             )
             text_tokens = torch.randint(
-                1,
-                vocab_size,
-                (global_mbs, seq_length - image_seq_length),
-                device='cuda',
+                1, vocab_size, (global_mbs, seq_length - image_seq_length), device='cuda'
             )
             input_ids = torch.cat([image_tokens, text_tokens], dim=1)
         else:
             encoder_hidden_states = torch.empty(
-                image_seq_length,
-                global_mbs,
-                hidden_size,
-                device='cuda',
-                dtype=torch.float32,
+                image_seq_length, global_mbs, hidden_size, device='cuda', dtype=torch.float32
             )
             input_ids = torch.empty(global_mbs, seq_length, dtype=torch.long, device='cuda')
 
@@ -330,10 +316,7 @@ def _generate_and_broadcast_global_batches(
                 loss_mask[sample_idx, seq_length - n_drop :] = 0.0
                 labels[sample_idx, seq_length - n_drop :] = -100
         position_ids = (
-            torch.arange(seq_length, device='cuda')
-            .unsqueeze(0)
-            .expand(global_mbs, -1)
-            .clone()
+            torch.arange(seq_length, device='cuda').unsqueeze(0).expand(global_mbs, -1).clone()
         )
 
         batches.append(
@@ -375,9 +358,7 @@ def _slice_batch(global_batch, split_dp, split_rank):
             for key, tensor in enc_data.items():
                 if tensor is not None and isinstance(tensor, torch.Tensor):
                     # modality hidden_states is [seq, batch, hidden] — slice dim 1
-                    mod_inputs_new[mod_name][enc_name][key] = tensor[
-                        :, start:end, :
-                    ].contiguous()
+                    mod_inputs_new[mod_name][enc_name][key] = tensor[:, start:end, :].contiguous()
                 else:
                     mod_inputs_new[mod_name][enc_name][key] = tensor
     per_rank['modality_inputs'] = mod_inputs_new
@@ -452,16 +433,12 @@ def _copy_ref_params_to_dist(ref_module, dist_module, ref_tp_group, dist_tp_grou
             )
 
             # Different TP sizes: gather ref shards, then slice for dist.
-            shards = [
-                torch.empty_like(ref_param.data) for _ in range(ref_tp_size)
-            ]
-            dist.all_gather(
-                shards, ref_param.data.contiguous(), group=ref_tp_group
-            )
+            shards = [torch.empty_like(ref_param.data) for _ in range(ref_tp_size)]
+            dist.all_gather(shards, ref_param.data.contiguous(), group=ref_tp_group)
             full_weight = torch.cat(shards, dim=partition_dim)
-            dist_slice = torch.tensor_split(
-                full_weight, dist_tp_size, dim=partition_dim
-            )[dist_tp_rank]
+            dist_slice = torch.tensor_split(full_weight, dist_tp_size, dim=partition_dim)[
+                dist_tp_rank
+            ]
 
             assert dist_slice.shape == dist_param.shape, (
                 f"Param '{name}': sliced.shape={tuple(dist_slice.shape)} != "
@@ -635,12 +612,7 @@ def _gather_bs_dp(local_tensor, llm_dp_pg):
 
 
 def _assert_llm_input_match(
-    ref_captures,
-    dist_captures,
-    ref_llm_grid,
-    dist_llm_grid,
-    rtol=1e-3,
-    atol=1e-3,
+    ref_captures, dist_captures, ref_llm_grid, dist_llm_grid, rtol=1e-3, atol=1e-3
 ):
     """Post-bridge oracle: hidden states entering the LLM decoder match.
 
@@ -648,16 +620,13 @@ def _assert_llm_input_match(
     across the LLM DP group is needed to reconstruct the full-batch tensor.
     """
     assert len(ref_captures) == len(dist_captures), (
-        f"Microbatch count mismatch: ref={len(ref_captures)}, "
-        f"dist={len(dist_captures)}"
+        f"Microbatch count mismatch: ref={len(ref_captures)}, " f"dist={len(dist_captures)}"
     )
     ref_dp_pg = ref_llm_grid.get_pg("dp")
     dist_dp_pg = dist_llm_grid.get_pg("dp")
 
     mismatches = []
-    for mbs_idx, (ref_local, dist_local) in enumerate(
-        zip(ref_captures, dist_captures)
-    ):
+    for mbs_idx, (ref_local, dist_local) in enumerate(zip(ref_captures, dist_captures)):
         ref_full = _gather_bs_dp(ref_local, ref_dp_pg)
         dist_full = _gather_bs_dp(dist_local, dist_dp_pg)
         assert ref_full.shape == dist_full.shape, (
@@ -670,9 +639,7 @@ def _assert_llm_input_match(
             f"{_fmt_diff_stats(stats)}"
         )
         try:
-            torch.testing.assert_close(
-                dist_full, ref_full, rtol=rtol, atol=atol
-            )
+            torch.testing.assert_close(dist_full, ref_full, rtol=rtol, atol=atol)
         except AssertionError as e:
             mismatches.append((mbs_idx, str(e)))
 
@@ -680,8 +647,7 @@ def _assert_llm_input_match(
         rank = dist.get_rank()
         details = "\n".join(f"  mbs[{i}]: {msg}" for i, msg in mismatches)
         raise AssertionError(
-            f"Rank {rank}: llm-input diverged on {len(mismatches)} microbatch(es):\n"
-            f"{details}"
+            f"Rank {rank}: llm-input diverged on {len(mismatches)} microbatch(es):\n" f"{details}"
         )
 
 
@@ -711,12 +677,7 @@ def _gather_logits_full_batch(local_logits, llm_tp_pg, llm_dp_pg):
 
 
 def _assert_llm_logits_match(
-    ref_captures,
-    dist_captures,
-    ref_llm_grid,
-    dist_llm_grid,
-    rtol=1e-2,
-    atol=1e-2,
+    ref_captures, dist_captures, ref_llm_grid, dist_llm_grid, rtol=1e-2, atol=1e-2
 ):
     """Logits oracle: TP+DP-gathered full-batch logits match microbatch-by-microbatch.
 
@@ -729,8 +690,7 @@ def _assert_llm_logits_match(
     loose ``rtol=atol=1e-2`` default.
     """
     assert len(ref_captures) == len(dist_captures), (
-        f"Microbatch count mismatch: ref={len(ref_captures)}, "
-        f"dist={len(dist_captures)}"
+        f"Microbatch count mismatch: ref={len(ref_captures)}, " f"dist={len(dist_captures)}"
     )
     ref_tp_pg = ref_llm_grid.get_pg("tp")
     ref_dp_pg = ref_llm_grid.get_pg("dp")
@@ -738,9 +698,7 @@ def _assert_llm_logits_match(
     dist_dp_pg = dist_llm_grid.get_pg("dp")
 
     mismatches = []
-    for mbs_idx, (ref_local, dist_local) in enumerate(
-        zip(ref_captures, dist_captures)
-    ):
+    for mbs_idx, (ref_local, dist_local) in enumerate(zip(ref_captures, dist_captures)):
         ref_full = _gather_logits_full_batch(ref_local, ref_tp_pg, ref_dp_pg)
         dist_full = _gather_logits_full_batch(dist_local, dist_tp_pg, dist_dp_pg)
         assert ref_full.shape == dist_full.shape, (
@@ -756,9 +714,7 @@ def _assert_llm_logits_match(
             f"{_fmt_diff_stats(stats)}"
         )
         try:
-            torch.testing.assert_close(
-                dist_full, ref_full, rtol=rtol, atol=atol
-            )
+            torch.testing.assert_close(dist_full, ref_full, rtol=rtol, atol=atol)
         except AssertionError as e:
             mismatches.append((mbs_idx, str(e)))
 
@@ -766,8 +722,7 @@ def _assert_llm_logits_match(
         rank = dist.get_rank()
         details = "\n".join(f"  mbs[{i}]: {msg}" for i, msg in mismatches)
         raise AssertionError(
-            f"Rank {rank}: logits diverged on {len(mismatches)} microbatch(es):\n"
-            f"{details}"
+            f"Rank {rank}: logits diverged on {len(mismatches)} microbatch(es):\n" f"{details}"
         )
 
 
@@ -820,8 +775,7 @@ def _assert_first_layer_grads_match(ref_snap, dist_snap, rtol=1e-3, atol=1e-3):
         # across all shards.
         stats = _global_abs_diff_stats(dist_g, ref_g, pg=dist.group.WORLD)
         _print_from_rank0(
-            f"[grad-diff] {name} shape={tuple(ref_g.shape)} "
-            f"{_fmt_diff_stats(stats)}"
+            f"[grad-diff] {name} shape={tuple(ref_g.shape)} " f"{_fmt_diff_stats(stats)}"
         )
         try:
             torch.testing.assert_close(dist_g, ref_g, rtol=rtol, atol=atol)
@@ -837,9 +791,7 @@ def _assert_first_layer_grads_match(ref_snap, dist_snap, rtol=1e-3, atol=1e-3):
         )
 
 
-def _assert_encoder_weights_match(
-    ref_module, dist_module, rtol=1e-3, atol=1e-3
-):
+def _assert_encoder_weights_match(ref_module, dist_module, rtol=1e-3, atol=1e-3):
     """Assert every dist encoder shard matches the ref encoder shard.
 
     Caller is responsible for ensuring ref and dist have the same encoder TP
@@ -858,17 +810,12 @@ def _assert_encoder_weights_match(
             f"Param '{name}': ref.shape={tuple(ref_param.shape)} != "
             f"dist.shape={tuple(dist_param.shape)} — caller must match encoder TP."
         )
-        stats = _global_abs_diff_stats(
-            dist_param.data, ref_param.data, pg=dist.group.WORLD
-        )
+        stats = _global_abs_diff_stats(dist_param.data, ref_param.data, pg=dist.group.WORLD)
         _print_from_rank0(
-            f"[weight-diff] {name} shape={tuple(ref_param.shape)} "
-            f"{_fmt_diff_stats(stats)}"
+            f"[weight-diff] {name} shape={tuple(ref_param.shape)} " f"{_fmt_diff_stats(stats)}"
         )
         try:
-            torch.testing.assert_close(
-                dist_param.data, ref_param.data, rtol=rtol, atol=atol
-            )
+            torch.testing.assert_close(dist_param.data, ref_param.data, rtol=rtol, atol=atol)
         except AssertionError as e:
             mismatches.append((name, str(e)))
 
@@ -913,10 +860,7 @@ def _run_forward_backward(
     """One forward/backward pass through the mimo schedule."""
     return schedule.forward_backward_no_pipelining(
         forward_step_func=partial(
-            forward_step,
-            encoder_grid=enc_grid,
-            llm_grid=llm_grid,
-            encoder_name=encoder_name,
+            forward_step, encoder_grid=enc_grid, llm_grid=llm_grid, encoder_name=encoder_name
         ),
         data_iterator=_BatchIterator(batches),
         model=[mimo_model],
@@ -972,13 +916,10 @@ class TestColocatedGradientScalingCorrectness:
         destroy_all_grids()
 
     @pytest.mark.skipif(
-        version.parse(torch.__version__) < version.parse("2.3.0"),
-        reason="Requires PyTorch 2.3+",
+        version.parse(torch.__version__) < version.parse("2.3.0"), reason="Requires PyTorch 2.3+"
     )
     @pytest.mark.parametrize(
-        "enc_tp,enc_dp,llm_tp,llm_dp",
-        [(2, 4, 4, 2), (4, 2, 2, 4)],
-        ids=["fan_in", "fan_out"],
+        "enc_tp,enc_dp,llm_tp,llm_dp", [(2, 4, 4, 2), (4, 2, 2, 4)], ids=["fan_in", "fan_out"]
     )
     @pytest.mark.parametrize(
         "mask_pattern", ["uniform", "asymmetric"], ids=["uniform", "asymmetric"]
@@ -1035,9 +976,7 @@ class TestColocatedGradientScalingCorrectness:
         dist_llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, cp=1, pp=1, dp=llm_dp)
         ref_enc_grid = create_hypercomm_grid(offset=0, tp=enc_tp, cp=1, pp=1, dp=enc_dp)
         ref_llm_grid = create_hypercomm_grid(offset=0, tp=enc_tp, cp=1, pp=1, dp=enc_dp)
-        create_all_embedding_groups(
-            [dist_enc_grid, dist_llm_grid, ref_enc_grid, ref_llm_grid]
-        )
+        create_all_embedding_groups([dist_enc_grid, dist_llm_grid, ref_enc_grid, ref_llm_grid])
 
         # Both sub-model TransformerConfigs set calculate_per_token_loss=True
         # (via per_token_loss=True on get_mimo_model), which pins DDP's
@@ -1046,9 +985,7 @@ class TestColocatedGradientScalingCorrectness:
         # _wire_training_hooks, grads are divided uniformly by N_global,
         # which is the true global per-token mean on every shard.
         ddp_config = DistributedDataParallelConfig(
-            overlap_grad_reduce=True,
-            bucket_size=10000,
-            use_distributed_optimizer=True,
+            overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
         )
 
         # Build dist first (heterogeneous TP/DP).
@@ -1136,15 +1073,13 @@ class TestColocatedGradientScalingCorrectness:
             mask_pattern=mask_pattern,
         )
         dist_batches = [
-            _slice_global_batch_for_dist(b, dist_enc_grid, dist_llm_grid)
-            for b in global_batches
+            _slice_global_batch_for_dist(b, dist_enc_grid, dist_llm_grid) for b in global_batches
         ]
         # Ref is uniform (enc_dp == llm_dp), so _slice_global_batch_for_dist
         # returns the full batch; slice explicitly by enc_dp so each rank
         # sees the same per-rank batch size as dist's encoder does.
         ref_batches = [
-            _slice_global_batch_by_dp(b, ref_enc_grid.get_pg("dp"))
-            for b in global_batches
+            _slice_global_batch_by_dp(b, ref_enc_grid.get_pg("dp")) for b in global_batches
         ]
         ref_per_rank_batch_size = global_batch_size // enc_dp
 
@@ -1172,9 +1107,7 @@ class TestColocatedGradientScalingCorrectness:
             )
             # Snapshot encoder first-layer grads AFTER backward and BEFORE
             # optimizer.step() consumes/zeros the grad buffer.
-            dist_first_layer_grads = _snapshot_first_layer_encoder_grads(
-                dist_mimo, encoder_name
-            )
+            dist_first_layer_grads = _snapshot_first_layer_encoder_grads(dist_mimo, encoder_name)
             dist_success, dist_grad_norm, _ = dist_optimizer.step()
             assert dist_success, "Dist optimizer step failed"
             assert dist_grad_norm is not None and dist_grad_norm > 0, (
@@ -1195,14 +1128,10 @@ class TestColocatedGradientScalingCorrectness:
                 seq_length=seq_length,
                 num_microbatches=num_microbatches,
             )
-            ref_first_layer_grads = _snapshot_first_layer_encoder_grads(
-                ref_mimo, encoder_name
-            )
+            ref_first_layer_grads = _snapshot_first_layer_encoder_grads(ref_mimo, encoder_name)
             ref_success, ref_grad_norm, _ = ref_optimizer.step()
             assert ref_success, "Ref optimizer step failed"
-            assert ref_grad_norm is not None and ref_grad_norm > 0, (
-                f"Ref grad_norm={ref_grad_norm}"
-            )
+            assert ref_grad_norm is not None and ref_grad_norm > 0, f"Ref grad_norm={ref_grad_norm}"
         finally:
             dist_logits_hook.remove()
             ref_logits_hook.remove()
@@ -1230,42 +1159,25 @@ class TestColocatedGradientScalingCorrectness:
 
         try:
             _assert_first_layer_grads_match(
-                ref_first_layer_grads,
-                dist_first_layer_grads,
-                rtol=1e-3,
-                atol=1e-3,
+                ref_first_layer_grads, dist_first_layer_grads, rtol=1e-3, atol=1e-3
             )
         except AssertionError as e:
             failures.append(('first_layer_grads', str(e)))
 
         try:
             _assert_llm_input_match(
-                ref_llm_input,
-                dist_llm_input,
-                ref_llm_grid,
-                dist_llm_grid,
-                rtol=1e-3,
-                atol=1e-3,
+                ref_llm_input, dist_llm_input, ref_llm_grid, dist_llm_grid, rtol=1e-3, atol=1e-3
             )
         except AssertionError as e:
             failures.append(('llm_input', str(e)))
 
         try:
             _assert_llm_logits_match(
-                ref_logits,
-                dist_logits,
-                ref_llm_grid,
-                dist_llm_grid,
-                rtol=1e-2,
-                atol=1e-2,
+                ref_logits, dist_logits, ref_llm_grid, dist_llm_grid, rtol=1e-2, atol=1e-2
             )
         except AssertionError as e:
             failures.append(('llm_logits', str(e)))
 
         if failures:
-            summary = "\n\n".join(
-                f"== {oracle} ==\n{msg}" for oracle, msg in failures
-            )
-            raise AssertionError(
-                f"{len(failures)} oracle(s) failed:\n{summary}"
-            )
+            summary = "\n\n".join(f"== {oracle} ==\n{msg}" for oracle, msg in failures)
+            raise AssertionError(f"{len(failures)} oracle(s) failed:\n{summary}")

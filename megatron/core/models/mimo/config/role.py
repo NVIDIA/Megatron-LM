@@ -86,9 +86,7 @@ class RankRole:
     def _all_grids_colocated(module_to_grid_map: Dict[str, 'HyperCommGrid']) -> bool:
         grids = list(module_to_grid_map.values())
         first = grids[0]
-        return all(
-            g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:]
-        )
+        return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
 
     @classmethod
     def _colocated(cls, modality_module_names: List[str]) -> 'RankRole':
