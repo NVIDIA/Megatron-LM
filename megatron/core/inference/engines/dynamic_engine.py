@@ -368,6 +368,21 @@ class DynamicInferenceEngine(AbstractEngine):
             mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
 
+        # MTP warmup preparation: capture MTP CUDA graphs alongside the
+        # decoder graphs within the same loop rather than in a separate pass.
+        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        mtp_warmup_enabled = (
+            controller.num_mtp_heads > 0
+            and (controller.num_speculative_tokens or 0) > 0
+            and hasattr(unwrapped, 'mtp')
+        )
+        if mtp_warmup_enabled:
+            tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
+            sp_enabled = model_config.sequence_parallel and tp_size > 1
+            mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
+            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
+            mtp_seen_batch_sizes = set()
+
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -417,6 +432,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             )
 
             context.reset()
+
+        if mtp_warmup_enabled and mtp_seen_batch_sizes:
+            controller.has_mtp_cuda_graphs = True
+            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             controller.has_mtp_cuda_graphs = True

@@ -323,7 +323,6 @@ class TestNVLSAllGatherVDispatcher:
         torch.cuda.empty_cache()
 
     def _make_dispatcher(self):
-        from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,

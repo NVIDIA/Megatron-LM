@@ -924,12 +924,14 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch'] = "flashinfer"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "flashinfer"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe. Not compatible with MXFP8.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
+    - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
+      permutation via indirect addressing.
     """
 
     inference_moe_disable_fused_quant_kernels: bool = False
@@ -1209,7 +1211,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
             except ValueError:
                 raise ValueError(
-                    f"inference_grouped_gemm_backend must be 'flashinfer' or 'torch' "
+                    f"inference_grouped_gemm_backend must be 'flashinfer', 'torch', or 'vllm', "
                     f"got '{self.inference_grouped_gemm_backend}'"
                 )
 
