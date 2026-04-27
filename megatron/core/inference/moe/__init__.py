@@ -5,6 +5,7 @@ import enum
 import torch
 
 from .fused_moe import ActivationType, mcore_fused_moe
+from .vllm_fused_moe import vllm_fused_moe
 
 
 class InferenceGroupedGemmBackend(enum.Enum):
@@ -13,6 +14,7 @@ class InferenceGroupedGemmBackend(enum.Enum):
     FLASHINFER = "flashinfer"
     TORCH = "torch"
     TE = "te"
+    VLLM = "vllm"
 
 
 def resolve_inference_grouped_gemm_backend(
@@ -24,7 +26,7 @@ def resolve_inference_grouped_gemm_backend(
     simply maps (backend, is_cuda_graphed) to the concrete backend enum.
 
     Args:
-        backend: One of 'auto', 'torch', 'te'.
+        backend: One of 'auto', 'torch', 'te', 'vllm'.
         is_cuda_graphed: Whether this is a CUDA-graphed iteration.
         is_mxfp8: Whether the model is using MXFP8 quantization (affects auto backend choice).
     Returns:
@@ -49,8 +51,10 @@ def resolve_inference_grouped_gemm_backend(
         return InferenceGroupedGemmBackend.TORCH
     elif backend == 'te':
         return InferenceGroupedGemmBackend.TE
+    elif backend == 'vllm':
+        return InferenceGroupedGemmBackend.VLLM
     else:
         raise ValueError(
             f"Unknown inference_grouped_gemm_backend: '{backend}'. "
-            "Must be 'auto', 'torch', or 'te'."
+            "Must be 'auto', 'torch', 'te', or 'vllm'."
         )

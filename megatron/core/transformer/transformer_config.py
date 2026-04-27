@@ -923,7 +923,7 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
+    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te', 'vllm'] = "auto"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
@@ -933,6 +933,8 @@ class TransformerConfig(ModelParallelConfig):
     - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
       mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
     - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
+    - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
+      permutation via indirect addressing. Not supported with CUDA graphs.
     """
 
     inference_moe_disable_fused_quant_kernels: bool = False
@@ -1201,8 +1203,8 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
-                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
+            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te', 'vllm'), (
+                f"inference_grouped_gemm_backend must be 'auto', 'torch', 'te', or 'vllm', "
                 f"got '{self.inference_grouped_gemm_backend}'"
             )
 
@@ -1210,6 +1212,12 @@ class TransformerConfig(ModelParallelConfig):
                 if self.inference_grouped_gemm_backend == "te":
                     raise ValueError(
                         "TE GroupedGEMM is not supported with CUDA graphs. Please set "
+                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
+                        "CUDA graphs (--cuda-graph-impl=none)."
+                    )
+                if self.inference_grouped_gemm_backend == "vllm":
+                    raise ValueError(
+                        "vLLM Triton fused MoE is not supported with CUDA graphs. Please set "
                         "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
                         "CUDA graphs (--cuda-graph-impl=none)."
                     )
