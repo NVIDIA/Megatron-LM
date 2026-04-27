@@ -82,10 +82,7 @@ class TestJitWarmupSkippedWhenFusionDisabled:
     ):
         # Even with bias_gelu_fusion True, quick_geglu skips gelu and geglu warmups.
         mock_get_args.return_value = _args(
-            swiglu=False,
-            quick_geglu=True,
-            bias_gelu_fusion=True,
-            gated_linear_unit=True,
+            swiglu=False, quick_geglu=True, bias_gelu_fusion=True, gated_linear_unit=True
         )
         _warmup_jit_function()
         mock_gelu.assert_not_called()
@@ -105,13 +102,7 @@ class TestJitWarmupSkippedWhenFusionDisabled:
     @mock.patch("megatron.training.initialize.bias_gelu")
     @mock.patch("megatron.training.initialize.bias_swiglu")
     def test_te_activation_skips_activation_warmups(
-        self,
-        mock_swiglu,
-        mock_gelu,
-        mock_geglu,
-        mock_dropout,
-        mock_get_args,
-        _empty_cache,
+        self, mock_swiglu, mock_gelu, mock_geglu, mock_dropout, mock_get_args, _empty_cache
     ):
         # bias_dropout_fusion is independent of use_te_activation_func; keep False
         # so this test stays CPU-only without mocking the dropout path + mpu.
@@ -138,13 +129,7 @@ class TestJitWarmupSkippedWhenFusionDisabled:
 @mock.patch("megatron.training.initialize.bias_swiglu")
 @mock.patch("megatron.training.initialize.get_args")
 def test_calls_bias_swiglu_when_fusion_enabled(
-    mock_get_args,
-    mock_swiglu,
-    mock_torch_rand,
-    _empty_cache,
-    mock_gelu,
-    mock_geglu,
-    mock_dropout,
+    mock_get_args, mock_swiglu, mock_torch_rand, _empty_cache, mock_gelu, mock_geglu, mock_dropout
 ):
     mock_get_args.return_value = _args(swiglu=True, bias_swiglu_fusion=True)
     mock_swiglu.return_value = torch.tensor(0.0)
