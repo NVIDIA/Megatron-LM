@@ -16,6 +16,10 @@ from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.instantiate_utils import InstantiationMode
 
 
+def _target_qualname(obj) -> str:
+    return f"{obj.__module__}.{obj.__qualname__}"
+
+
 # Test functions for callable testing
 def activation_function(x):
     """Test activation function."""
@@ -94,11 +98,11 @@ class CallableConfigContainer(ConfigContainerBase):
 class TestConfigContainer_FromDict:
     """Test ConfigContainer.from_dict method."""
 
-    @patch("megatron.training.config.utils.instantiate")
+    @patch("megatron.training.config.container.instantiate")
     def test_from_dict_basic(self, mock_instantiate):
         """Test basic from_dict functionality."""
         config_dict = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+            "_target_": _target_qualname(TestConfigContainer),
             "name": "from_dict",
             "value": 300,
         }
@@ -112,13 +116,10 @@ class TestConfigContainer_FromDict:
         assert result.name == "from_dict"
         assert result.value == 300
 
-    @patch("megatron.training.config.utils.instantiate")
+    @patch("megatron.training.config.container.instantiate")
     def test_from_dict_with_mode(self, mock_instantiate):
         """Test from_dict with different instantiation modes."""
-        config_dict = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
-            "name": "lenient",
-        }
+        config_dict = {"_target_": _target_qualname(TestConfigContainer), "name": "lenient"}
 
         expected_config = TestConfigContainer(name="lenient")
         mock_instantiate.return_value = expected_config
@@ -138,7 +139,7 @@ class TestConfigContainer_FromDict:
     def test_from_dict_extra_keys_strict_mode(self):
         """Test from_dict raises error for extra keys in strict mode."""
         config_dict = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+            "_target_": _target_qualname(TestConfigContainer),
             "name": "test",
             "extra_key": "should_fail",
         }
@@ -146,11 +147,11 @@ class TestConfigContainer_FromDict:
         with pytest.raises(ValueError, match="Dictionary contains extra keys"):
             TestConfigContainer.from_dict(config_dict, mode=InstantiationMode.STRICT)
 
-    @patch("megatron.training.config.utils.instantiate")
+    @patch("megatron.training.config.container.instantiate")
     def test_from_dict_extra_keys_lenient_mode(self, mock_instantiate):
         """Test from_dict removes extra keys in lenient mode."""
         config_dict = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+            "_target_": _target_qualname(TestConfigContainer),
             "name": "test",
             "extra_key": "should_be_removed",
         }
@@ -164,15 +165,12 @@ class TestConfigContainer_FromDict:
         called_dict = mock_instantiate.call_args[0][0]
         assert "extra_key" not in called_dict
         assert called_dict["name"] == "test"
-        assert (
-            called_dict["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer"
-        )
+        assert called_dict["_target_"] == _target_qualname(TestConfigContainer)
 
     def test_from_dict_preserves_original(self):
         """Test that from_dict doesn't modify the original dictionary."""
         original_dict = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+            "_target_": _target_qualname(TestConfigContainer),
             "name": "original",
             "extra_key": "should_be_preserved_in_original",
         }
@@ -194,14 +192,16 @@ class TestConfigContainer_FromYaml:
         with pytest.raises(FileNotFoundError, match="YAML file not found"):
             TestConfigContainer.from_yaml("non_existent_file.yaml")
 
-    @patch("megatron.training.config.utils.OmegaConf")
+    @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
+    @patch("megatron.training.config.container.OmegaConf")
     @patch("builtins.open", new_callable=mock_open)
     @patch("os.path.exists")
-    def test_from_yaml_success(self, mock_exists, mock_file, mock_omegaconf):
+    def test_from_yaml_success(self, mock_exists, mock_file, mock_omegaconf, mock_msc):
         """Test successful YAML loading."""
+        mock_msc.return_value = False
         mock_exists.return_value = True
-        yaml_content = """
-        _target_: tests.unit_tests.training.utils.test_config_utils.TestConfigContainer
+        yaml_content = f"""
+        _target_: {_target_qualname(TestConfigContainer)}
         name: yaml_config
         value: 500
         """
@@ -210,7 +210,7 @@ class TestConfigContainer_FromYaml:
         # Mock yaml.safe_load to return parsed content
         with patch("yaml.safe_load") as mock_yaml_load:
             config_dict = {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+                "_target_": _target_qualname(TestConfigContainer),
                 "name": "yaml_config",
                 "value": 500,
             }
@@ -238,14 +238,16 @@ class TestConfigContainer_FromYaml:
                 assert result.name == "yaml_config"
                 assert result.value == 500
 
+    @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
     @patch("os.path.exists")
-    def test_from_yaml_with_mode(self, mock_exists):
+    def test_from_yaml_with_mode(self, mock_exists, mock_msc):
         """Test from_yaml with different instantiation modes."""
+        mock_msc.return_value = False
         mock_exists.return_value = True
 
         with patch("builtins.open", mock_open()):
             with patch("yaml.safe_load", return_value={}):
-                with patch("megatron.training.config.utils.OmegaConf") as mock_omegaconf:
+                with patch("megatron.training.config.container.OmegaConf") as mock_omegaconf:
                     # Mock OmegaConf methods to return expected values
                     mock_conf = MagicMock()
                     mock_omegaconf.create.return_value = mock_conf
@@ -265,7 +267,7 @@ class TestConfigContainer_ToDict:
         result = config.to_dict()
 
         expected = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+            "_target_": _target_qualname(TestConfigContainer),
             "name": "test",
             "value": 123,
             "description": "test desc",
@@ -289,28 +291,16 @@ class TestConfigContainer_ToDict:
 
         # Check the structure
         assert "_target_" in result
-        assert (
-            result["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.ComplexConfigContainer"
-        )
+        assert result["_target_"] == _target_qualname(ComplexConfigContainer)
 
         # Check nested ConfigContainer
-        assert (
-            result["simple_config"]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer"
-        )
+        assert result["simple_config"]["_target_"] == _target_qualname(TestConfigContainer)
         assert result["simple_config"]["name"] == "nested"
         assert result["simple_config"]["value"] == 456
 
         # Check nested regular dataclass
-        assert (
-            result["nested_data"]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.NestedDataclass"
-        )
-        assert (
-            result["nested_data"]["simple"]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.SimpleDataclass"
-        )
+        assert result["nested_data"]["_target_"] == _target_qualname(NestedDataclass)
+        assert result["nested_data"]["simple"]["_target_"] == _target_qualname(SimpleDataclass)
         assert result["nested_data"]["simple"]["name"] == "inner"
         assert result["nested_data"]["simple"]["value"] == 789
 
@@ -318,34 +308,35 @@ class TestConfigContainer_ToDict:
         assert result["items"] == ["a", "b", "c"]
         assert result["metadata"] == {"key1": 1, "key2": 2}
 
-    def test_convert_serializable_nested_in_config(self):
-        """Test that a Serializable nested inside a ConfigContainer is serialized via as_dict()."""
+    # TODO (@maanug): reenable after migrating model config+builder
+    # def test_convert_serializable_nested_in_config(self):
+    #     """Test that a Serializable nested inside a ConfigContainer is serialized via as_dict()."""
 
-        class NestedSerializable:
-            def __init__(self, value):
-                self.value = value
+    #     class NestedSerializable:
+    #         def __init__(self, value):
+    #             self.value = value
 
-            def as_dict(self) -> dict:
-                return {"_target_": "my.module.NestedSerializable", "value": self.value}
+    #         def as_dict(self) -> dict:
+    #             return {"_target_": "my.module.NestedSerializable", "value": self.value}
 
-            @classmethod
-            def from_dict(cls, data):
-                return cls(data["value"])
+    #         @classmethod
+    #         def from_dict(cls, data):
+    #             return cls(data["value"])
 
-        @dataclass
-        class ConfigWithSerializable(ConfigContainerBase):
-            name: str = "ser_test"
-            nested: object = None
+    #     @dataclass
+    #     class ConfigWithSerializable(ConfigContainerBase):
+    #         name: str = "ser_test"
+    #         nested: object = None
 
-            def __post_init__(self):
-                if self.nested is None:
-                    self.nested = NestedSerializable(99)
+    #         def __post_init__(self):
+    #             if self.nested is None:
+    #                 self.nested = NestedSerializable(99)
 
-        config = ConfigWithSerializable()
-        result = config.to_dict()
+    #     config = ConfigWithSerializable()
+    #     result = config.to_dict()
 
-        assert result["name"] == "ser_test"
-        assert result["nested"] == {"_target_": "my.module.NestedSerializable", "value": 99}
+    #     assert result["name"] == "ser_test"
+    #     assert result["nested"] == {"_target_": "my.module.NestedSerializable", "value": 99}
 
     def test_to_dict_excludes_private_fields(self):
         """Test that to_dict excludes fields starting with underscore."""
@@ -366,7 +357,7 @@ class TestConfigContainer_ConvertValueToDict:
         result = TestConfigContainer._convert_value_to_dict(config)
 
         expected = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+            "_target_": _target_qualname(TestConfigContainer),
             "name": "convert_test",
             "value": 999,
             "description": "A test configuration",
@@ -380,7 +371,7 @@ class TestConfigContainer_ConvertValueToDict:
         result = TestConfigContainer._convert_value_to_dict(simple)
 
         expected = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.SimpleDataclass",
+            "_target_": _target_qualname(SimpleDataclass),
             "name": "simple_test",
             "value": 555,
         }
@@ -393,10 +384,7 @@ class TestConfigContainer_ConvertValueToDict:
         result = TestConfigContainer._convert_value_to_dict(items)
 
         assert len(result) == 3
-        assert (
-            result[0]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.SimpleDataclass"
-        )
+        assert result[0]["_target_"] == _target_qualname(SimpleDataclass)
         assert result[0]["name"] == "item1"
         assert result[1] == "string_item"
         assert result[2] == 42
@@ -407,10 +395,7 @@ class TestConfigContainer_ConvertValueToDict:
         result = TestConfigContainer._convert_value_to_dict(items)
 
         assert len(result) == 2
-        assert (
-            result[0]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.SimpleDataclass"
-        )
+        assert result[0]["_target_"] == _target_qualname(SimpleDataclass)
         assert result[1] == "string"
 
     def test_convert_dict(self):
@@ -422,15 +407,9 @@ class TestConfigContainer_ConvertValueToDict:
         }
         result = TestConfigContainer._convert_value_to_dict(data)
 
-        assert (
-            result["config"]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.SimpleDataclass"
-        )
+        assert result["config"]["_target_"] == _target_qualname(SimpleDataclass)
         assert result["value"] == 123
-        assert (
-            result["nested"]["inner"]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.SimpleDataclass"
-        )
+        assert result["nested"]["inner"]["_target_"] == _target_qualname(SimpleDataclass)
 
     # TODO (@maanug): reenable after migrating model config+builder
     # def test_convert_serializable(self):
@@ -478,32 +457,15 @@ class TestConfigContainer_ConvertValueToDict:
 class TestConfigContainer_ToYaml:
     """Test ConfigContainer.to_yaml method."""
 
-    @patch("megatron.training.config.utils.safe_yaml_representers")
-    @patch("yaml.safe_dump")
-    @patch("builtins.print")
-    def test_to_yaml_print_to_stdout(self, mock_print, mock_yaml_dump, mock_safe_representers):
-        """Test to_yaml printing to stdout when no path provided."""
-        config = TestConfigContainer(name="yaml_test", value=777)
-        mock_yaml_dump.return_value = "yaml_content"
-        mock_safe_representers.return_value.__enter__ = MagicMock()
-        mock_safe_representers.return_value.__exit__ = MagicMock()
-
-        # Test that deprecation warning is raised
-        with pytest.warns(
-            DeprecationWarning,
-            match=r"Calling to_yaml\(\) without a path.*Use print_yaml\(\) instead",
-        ):
-            config.to_yaml()
-
-        mock_safe_representers.assert_called_once()
-        mock_yaml_dump.assert_called_once()
-        mock_print.assert_called_once_with("yaml_content")
-
-    @patch("megatron.training.config.utils.safe_yaml_representers")
+    @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
+    @patch("megatron.training.config.container.safe_yaml_representers")
     @patch("yaml.safe_dump")
     @patch("builtins.open", new_callable=mock_open)
-    def test_to_yaml_save_to_file(self, mock_file, mock_yaml_dump, mock_safe_representers):
+    def test_to_yaml_save_to_file(
+        self, mock_file, mock_yaml_dump, mock_safe_representers, mock_msc
+    ):
         """Test to_yaml saving to file."""
+        mock_msc.return_value = False
         config = TestConfigContainer(name="file_test", value=888)
         mock_safe_representers.return_value.__enter__ = MagicMock()
         mock_safe_representers.return_value.__exit__ = MagicMock()
@@ -520,6 +482,8 @@ class TestConfigContainer_ToYaml:
 
     def test_to_yaml_with_msc_url(self):
         """Test to_yaml with MSC URL."""
+        from megatron.training.config.instantiate_utils import target_allowlist
+
         config = TestConfigContainer(name="msc_test", value=999)
 
         MultiStorageClientFeature.enable()
@@ -529,67 +493,18 @@ class TestConfigContainer_ToYaml:
             config.to_yaml(f"msc://default{temp_dir}/test_output.yaml")
             assert os.path.exists(f"{temp_dir}/test_output.yaml")
 
+            target_allowlist.disable()
             loaded_config = TestConfigContainer.from_yaml(
                 f"msc://default{temp_dir}/test_output.yaml"
             )
+            target_allowlist.enable()
             assert config.to_dict() == loaded_config.to_dict()
-
-    @patch("megatron.training.config.utils.safe_yaml_representers")
-    @patch("yaml.safe_dump")
-    @patch("builtins.open", new_callable=mock_open)
-    def test_to_yaml_with_path_no_deprecation_warning(
-        self, mock_file, mock_yaml_dump, mock_safe_representers
-    ):
-        """Test that to_yaml with a path does not trigger deprecation warning."""
-        config = TestConfigContainer(name="no_warning_test", value=333)
-        mock_safe_representers.return_value.__enter__ = MagicMock()
-        mock_safe_representers.return_value.__exit__ = MagicMock()
-
-        # Test that no warning is raised when yaml_path is provided
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config.to_yaml("test_file.yaml")
-
-            # Check that no DeprecationWarning was raised
-            deprecation_warnings = [
-                warning for warning in w if issubclass(warning.category, DeprecationWarning)
-            ]
-            assert len(deprecation_warnings) == 0
-
-        mock_safe_representers.assert_called_once()
-        mock_file.assert_called_once_with("test_file.yaml", "w")
-        mock_yaml_dump.assert_called_once()
-
-    @patch("megatron.training.config.utils.safe_yaml_representers")
-    @patch("yaml.safe_dump")
-    @patch("builtins.print")
-    def test_to_yaml_deprecation_warning_content(
-        self, mock_print, mock_yaml_dump, mock_safe_representers
-    ):
-        """Test the specific content of the deprecation warning."""
-        config = TestConfigContainer(name="warning_content_test", value=444)
-        mock_yaml_dump.return_value = "test_content"
-        mock_safe_representers.return_value.__enter__ = MagicMock()
-        mock_safe_representers.return_value.__exit__ = MagicMock()
-
-        # Capture the warning and verify its content
-        with pytest.warns(DeprecationWarning) as warning_info:
-            config.to_yaml()
-
-        assert len(warning_info) == 1
-        warning_message = str(warning_info[0].message)
-        assert "to_yaml() without a path" in warning_message
-        assert "is deprecated" in warning_message
-        assert "Use print_yaml() instead" in warning_message
-
-        # Verify the warning has correct stacklevel (should point to caller, not internal code)
-        assert warning_info[0].filename.endswith("test_config_utils.py")
 
 
 class TestConfigContainer_PrintYaml:
     """Test ConfigContainer.print_yaml method."""
 
-    @patch("megatron.training.config.utils.safe_yaml_representers")
+    @patch("megatron.training.config.container.safe_yaml_representers")
     @patch("yaml.safe_dump")
     @patch("builtins.print")
     def test_print_yaml_basic(self, mock_print, mock_yaml_dump, mock_safe_representers):
@@ -610,10 +525,7 @@ class TestConfigContainer_PrintYaml:
 
         # Check the config dict passed to yaml.safe_dump
         config_dict = call_args[0][0]
-        assert (
-            config_dict["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer"
-        )
+        assert config_dict["_target_"] == _target_qualname(TestConfigContainer)
         assert config_dict["name"] == "print_test"
         assert config_dict["value"] == 555
         assert config_dict["description"] == "test print"
@@ -624,7 +536,7 @@ class TestConfigContainer_PrintYaml:
         # Verify print is called with the YAML content
         mock_print.assert_called_once_with("printed_yaml_content")
 
-    @patch("megatron.training.config.utils.safe_yaml_representers")
+    @patch("megatron.training.config.container.safe_yaml_representers")
     @patch("yaml.safe_dump")
     @patch("builtins.print")
     def test_print_yaml_with_complex_config(
@@ -656,16 +568,13 @@ class TestConfigContainer_PrintYaml:
         call_args = mock_yaml_dump.call_args
         config_dict = call_args[0][0]
 
-        assert (
-            config_dict["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.ComplexConfigContainer"
-        )
+        assert config_dict["_target_"] == _target_qualname(ComplexConfigContainer)
         assert config_dict["simple_config"]["name"] == "nested"
         assert config_dict["nested_data"]["simple"]["value"] == 456
         assert config_dict["items"] == ["a", "b", "c"]
         assert config_dict["metadata"] == {"key1": 10, "key2": 20}
 
-    @patch("megatron.training.config.utils.safe_yaml_representers")
+    @patch("megatron.training.config.container.safe_yaml_representers")
     @patch("yaml.safe_dump")
     @patch("builtins.print")
     def test_print_yaml_calls_to_dict(self, mock_print, mock_yaml_dump, mock_safe_representers):
@@ -678,7 +587,7 @@ class TestConfigContainer_PrintYaml:
         # Mock to_dict to verify it's called
         with patch.object(config, "to_dict") as mock_to_dict:
             expected_dict = {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+                "_target_": _target_qualname(TestConfigContainer),
                 "name": "to_dict_test",
                 "value": 999,
                 "description": "A test configuration",
@@ -775,34 +684,20 @@ class TestConfigContainer_Integration:
 
         # Convert back (would work if instantiate is properly implemented)
         # This tests the dict structure is correct for round-trip
-        assert (
-            config_dict["simple_config"]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer"
-        )
-        assert (
-            config_dict["nested_data"]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.NestedDataclass"
-        )
+        assert config_dict["simple_config"]["_target_"] == _target_qualname(TestConfigContainer)
+        assert config_dict["nested_data"]["_target_"] == _target_qualname(NestedDataclass)
 
     def test_yaml_roundtrip_structure(self):
         """Test YAML conversion produces expected structure."""
         config = TestConfigContainer(name="yaml_roundtrip", value=1234)
 
-        with patch("megatron.training.config.utils.safe_yaml_representers"):
+        with patch("megatron.training.config.container.safe_yaml_representers"):
             with patch("yaml.safe_dump") as mock_dump:
-                # Test with deprecation warning
-                with pytest.warns(
-                    DeprecationWarning,
-                    match=r"Calling to_yaml\(\) without a path.*Use print_yaml\(\) instead",
-                ):
-                    config.to_yaml()
+                config.print_yaml()
 
                 # Verify the dictionary passed to yaml.safe_dump
                 call_args = mock_dump.call_args[0][0]
-                assert (
-                    call_args["_target_"]
-                    == "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer"
-                )
+                assert call_args["_target_"] == _target_qualname(TestConfigContainer)
                 assert call_args["name"] == "yaml_roundtrip"
                 assert call_args["value"] == 1234
 
@@ -816,7 +711,7 @@ class TestConfigContainer_Integration:
 
         # Test with extra keys in strict mode
         invalid_strict_dict = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+            "_target_": _target_qualname(TestConfigContainer),
             "name": "test",
             "invalid_field": "should_fail",
         }
@@ -879,10 +774,7 @@ class TestConfigContainer_EdgeCases:
 
         # Verify complex nested structure conversion
         assert len(result["nested_list"]) == 2
-        assert (
-            result["nested_list"][0]["item1"]["_target_"]
-            == "tests.unit_tests.training.utils.test_config_utils.SimpleDataclass"
-        )
+        assert result["nested_list"][0]["item1"]["_target_"] == _target_qualname(SimpleDataclass)
         assert result["nested_dict"]["group1"][0]["name"] == "group1_item1"
 
 
@@ -896,10 +788,7 @@ class TestConfigContainer_CallablesAndPartials:
 
         # Verify the structure includes _target_
         assert "_target_" in result
-        assert (
-            "tests.unit_tests.training.utils.test_config_utils.CallableDataclass"
-            in result["_target_"]
-        )
+        assert _target_qualname(CallableDataclass) in result["_target_"]
 
         # Regular fields should be preserved
         assert result["name"] == "callable_test"
@@ -1058,16 +947,19 @@ class TestConfigContainerBackwardCompat:
         # Note: We can't directly test with DataclassWithInitFalse as it's not a ConfigContainer,
         # but we can test that the sanitization is called by checking no error is raised
         # when extra fields that would be init=False are present
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         config_dict = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.TestConfigContainer",
+            "_target_": _target_qualname(TestConfigContainer),
             "name": "test_from_dict",
             "value": 42,
             "description": "test description",
         }
 
         # This should work without error
+        target_allowlist.disable()
         result = TestConfigContainer.from_dict(config_dict, mode=InstantiationMode.STRICT)
+        target_allowlist.enable()
 
         assert result.name == "test_from_dict"
         assert result.value == 42

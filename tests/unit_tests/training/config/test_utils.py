@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from megatron.training.config.container import ConfigContainerBase
+import pytest
 
 
 # Test dataclasses for testing
@@ -64,9 +65,7 @@ class TestBackwardCompatibility:
         """Test _resolve_target_class resolves valid class path."""
         from megatron.training.config.utils import _resolve_target_class
 
-        result = _resolve_target_class(
-            "megatron.bridge.training.utils.config_utils.ConfigContainerBase"
-        )
+        result = _resolve_target_class("megatron.training.config.container.ConfigContainerBase")
         assert result is ConfigContainerBase
 
     def test_resolve_target_class_invalid(self):
@@ -86,15 +85,18 @@ class TestBackwardCompatibility:
     def test_sanitize_dataclass_config_removes_init_false_fields(self):
         """Test sanitize_dataclass_config removes init=False fields."""
         from megatron.training.config.utils import sanitize_dataclass_config
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         config = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
+            "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
             "name": "test_name",
             "value": 123,
             "computed_field": "should_be_removed",
         }
 
+        target_allowlist.disable()
         result = sanitize_dataclass_config(config)
+        target_allowlist.enable()
 
         assert "name" in result
         assert "value" in result
@@ -104,14 +106,17 @@ class TestBackwardCompatibility:
     def test_sanitize_dataclass_config_preserves_normal_fields(self):
         """Test sanitize_dataclass_config preserves fields without init=False."""
         from megatron.training.config.utils import sanitize_dataclass_config
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         config = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.SimpleDataclass",
+            "_target_": "tests.unit_tests.training.config.test_utils.SimpleDataclass",
             "name": "preserved",
             "value": 999,
         }
 
+        target_allowlist.disable()
         result = sanitize_dataclass_config(config)
+        target_allowlist.enable()
 
         assert result["name"] == "preserved"
         assert result["value"] == 999
@@ -120,11 +125,12 @@ class TestBackwardCompatibility:
     def test_sanitize_dataclass_config_handles_nested_configs(self):
         """Test sanitize_dataclass_config recursively processes nested configs."""
         from megatron.training.config.utils import sanitize_dataclass_config
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         config = {
-            "_target_": "tests.unit_tests.training.utils.test_config_utils.NestedDataclassWithInitFalse",
+            "_target_": "tests.unit_tests.training.config.test_utils.NestedDataclassWithInitFalse",
             "inner": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
+                "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
                 "name": "inner_test",
                 "value": 42,
                 "computed_field": "nested_computed_should_be_removed",
@@ -133,7 +139,9 @@ class TestBackwardCompatibility:
             "cached_result": ["should", "be", "removed"],
         }
 
+        target_allowlist.disable()
         result = sanitize_dataclass_config(config)
+        target_allowlist.enable()
 
         # Top-level init=False field removed
         assert "cached_result" not in result
@@ -146,24 +154,27 @@ class TestBackwardCompatibility:
     def test_sanitize_dataclass_config_handles_lists_of_configs(self):
         """Test sanitize_dataclass_config processes lists containing configs."""
         from megatron.training.config.utils import sanitize_dataclass_config
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         config = {
             "_target_": "some.module.ListContainer",
             "items": [
                 {
-                    "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
+                    "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
                     "name": "item1",
                     "computed_field": "remove_me",
                 },
                 {
-                    "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
+                    "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
                     "name": "item2",
                     "computed_field": "remove_me_too",
                 },
             ],
         }
 
+        target_allowlist.disable()
         result = sanitize_dataclass_config(config)
+        target_allowlist.enable()
 
         assert "computed_field" not in result["items"][0]
         assert "computed_field" not in result["items"][1]
@@ -190,10 +201,13 @@ class TestBackwardCompatibility:
     def test_sanitize_dataclass_config_unresolvable_target(self):
         """Test sanitize_dataclass_config handles unresolvable _target_."""
         from megatron.training.config.utils import sanitize_dataclass_config
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         config = {"_target_": "nonexistent.module.Class", "field1": "value1", "field2": "value2"}
 
+        target_allowlist.disable()
         result = sanitize_dataclass_config(config)
+        target_allowlist.enable()
 
         # All fields preserved when target can't be resolved
         assert result == config
@@ -201,10 +215,11 @@ class TestBackwardCompatibility:
     def test_sanitize_dataclass_config_sanitizes_model(self):
         """Test sanitize_dataclass_config sanitizes model section with init=False fields."""
         from megatron.training.config.utils import sanitize_dataclass_config
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         run_config = {
             "model": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
+                "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
                 "name": "model_name",
                 "value": 100,
                 "computed_field": "should_be_removed",
@@ -213,7 +228,9 @@ class TestBackwardCompatibility:
             "tokenizer": {"type": "sentencepiece"},
         }
 
+        target_allowlist.disable()
         result = sanitize_dataclass_config(run_config)
+        target_allowlist.enable()
 
         assert "computed_field" not in result["model"]
         assert result["model"]["name"] == "model_name"
@@ -239,26 +256,29 @@ class TestBackwardCompatibility:
     def test_sanitize_dataclass_config_sanitizes_all_sections(self):
         """Test sanitize_dataclass_config sanitizes all sections, not just model."""
         from megatron.training.config.utils import sanitize_dataclass_config
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         run_config = {
             "model": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
+                "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
                 "name": "model_name",
                 "computed_field": "should_be_removed_from_model",
             },
             "training": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
+                "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
                 "name": "training_config",
                 "computed_field": "should_be_removed_from_training",
             },
             "data": {
-                "_target_": "tests.unit_tests.training.utils.test_config_utils.DataclassWithInitFalse",
+                "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
                 "name": "data_config",
                 "computed_field": "should_be_removed_from_data",
             },
         }
 
+        target_allowlist.disable()
         result = sanitize_dataclass_config(run_config)
+        target_allowlist.enable()
 
         # All sections should have init=False fields removed
         assert "computed_field" not in result["model"]
