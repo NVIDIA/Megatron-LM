@@ -351,12 +351,26 @@ class HybridEPDispatch(torch.autograd.Function):
         Forward pass of fused dispatch of the HybridEP backend
         '''
         if _hybrid_ep_buffer is None:
-            seq_len, hidden_dim = x.shape[-2:]
+            num_tokens, hidden_dim = x.shape[-2:]
+
+            # --- Hardware Limit Gaurdrail ---
+            # DeepEP calculates tx_depth = 3 * num_tokens + 1.
+            # # InfiniBand strictly asserts tx_depth < 65536.
+            tx_depth = 3 * num_tokens + 1
+            if tx_depth >= 65536:
+                raise ValueError(
+                    f"HybridEP RDMA Queue Pair depth ({tx_depth}) exceeds the InfiniBand "
+                    f"hardware limit of 65535. This occurs because the total tokens per rank "
+                    f"({num_tokens}) is too high. Please reduce sequence length or micro-batch size, "
+                    f"or increase Tensor Parallelism (TP) / Context Parallelism (CP) to reduce "
+                    f"the number of tokens processed per rank."
+                )
+            
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
                 hidden_dim,
-                seq_len,
+                num_tokens,
                 num_local_experts,
                 num_sms_dispatch_api,
                 num_sms_combine_api,
