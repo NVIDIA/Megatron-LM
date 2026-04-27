@@ -231,7 +231,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
     # backward post process
-    if b_model_chunk_id:
+    if b_model_chunk_id is not None:
         # The same as the backward_step_helper
         backward_step_helper_postprocess(b_virtual_microbatch_id)
         # Verify backward grad: if backward microbatch received activation from upstream
