@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -43,8 +43,16 @@ def get_model_for_inference() -> MegatronModule:
 
     if args.model_provider == "gpt":
         model_builder = gpt_builder
-    elif args.model_provider == "mamba":
-        model_builder = mamba_builder
+    elif args.model_provider in ("hybrid", "mamba"):
+        if args.model_provider == "mamba":
+            import warnings
+
+            warnings.warn(
+                '--model-provider "mamba" is deprecated. Use --model-provider "hybrid" instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        model_builder = hybrid_builder
     else:
         raise ValueError(f"Invalid model provider {args.model_provider}")
 
@@ -158,7 +166,11 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "total number of requests. Set to -1 to add all requests together.",
     )
     group.add_argument(
-        "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
+        "--model-provider",
+        choices=["hybrid", "mamba", "gpt"],
+        default="gpt",
+        help='Model provider. Use "hybrid" for HybridModel (formerly MambaModel). '
+        '"mamba" is accepted for backward compatibility but deprecated.',
     )
     group.add_argument(
         "--skip-prompt-log-probs", action='store_true', default=False, help='Skip prompt log probs.'
@@ -349,7 +361,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
-        materialize_only_last_token_logits=(not args.return_log_probs and args.num_speculative_tokens == 0),
+        materialize_only_last_token_logits=(not args.return_log_probs),
         track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,

@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -512,6 +511,3 @@ def select_src_metadata_balanced(
     within_group_idx = (dst_rank // len(sorted_dp_groups)) % len(group_metadata)
     selected = group_metadata[within_group_idx]
     return selected
-
-
-logger = logging.getLogger(__name__)
