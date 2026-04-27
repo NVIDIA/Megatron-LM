@@ -182,35 +182,6 @@ def _is_last_layers(name: str, num_layers: int = 1, num_layers_to_disable: int =
     return layer_idx >= num_layers - num_layers_to_disable
 
 
-def _set_quant_cfg_entry(quant_cfg, quantizer_name, entry_cfg):
-    """Set a quantizer config entry by name, handling both dict and list formats.
-
-    ModelOpt PR #1094 changed quant_cfg from a flat dict keyed by quantizer name
-    to an ordered list of QuantizerCfgEntry dicts with an explicit "quantizer_name"
-    field.  This helper writes to either format so callers don't need to branch.
-    """
-    if isinstance(quant_cfg, list):
-        for entry in quant_cfg:
-            if entry.get("quantizer_name") == quantizer_name:
-                entry.update(entry_cfg)
-                return
-        new_entry = {"quantizer_name": quantizer_name}
-        new_entry.update(entry_cfg)
-        quant_cfg.append(new_entry)
-    else:
-        quant_cfg[quantizer_name] = entry_cfg
-
-
-def _get_quant_cfg_entry(quant_cfg, quantizer_name):
-    """Get a quantizer config entry by name, handling both dict and list formats."""
-    if isinstance(quant_cfg, list):
-        for entry in quant_cfg:
-            if entry.get("quantizer_name") == quantizer_name:
-                return entry
-        return None
-    return quant_cfg.get(quantizer_name)
-
-
 def get_first_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
     """Get a config for `mtq.quantize` with first & last `num_layers_to_disable` layers disabled.
 
@@ -254,6 +225,10 @@ def get_modelopt_torch_quantization_config():
         raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
 
+    if isinstance(mtq_config["quant_cfg"], dict):
+        # Normalize old dict format to new list format
+        mtq_config["quant_cfg"] = mtq.normalize_quant_cfg_list(mtq_config["quant_cfg"])
+
     fp8_config = {"enable": True, "cfg": {"num_bits": (4, 3), "axis": None}}
     fp4_config = {
         "enable": True,
@@ -265,20 +240,18 @@ def get_modelopt_torch_quantization_config():
     }
     if args.export_quant_cfg == "FP8_DEFAULT_CFG":
         # Enable Medusa heads and kv-cache quantization
-        _set_quant_cfg_entry(mtq_config["quant_cfg"], "*medusa_heads**", fp8_config)
+        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp8_config})
     if "FP4" in args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
-        _set_quant_cfg_entry(mtq_config["quant_cfg"], "*medusa_heads**", fp4_config)
+        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp4_config})
     if "AWQ" in args.export_quant_cfg:
-        weight_quantizer = _get_quant_cfg_entry(mtq_config["quant_cfg"], "*weight_quantizer")
-        if isinstance(weight_quantizer, list):
-            weight_quantizer = weight_quantizer[0]
+        weight_quantizer = mtq._get_quant_cfg_entry(mtq_config["quant_cfg"], "*weight_quantizer")
         if weight_quantizer is not None:
             weight_quantizer["block_sizes"][-1] = 128
 
     # Customization
     if args.disable_qkv_quant:
-        _set_quant_cfg_entry(mtq_config["quant_cfg"], "*self_attention*", {"enable": False})
+        mtq_config["quant_cfg"].append({"quantizer_name": "*self_attention*", "enable": False})
 
     # KV Cache Quantization
     enable_quant_kv_cache = args.export_kv_cache_quant != "none"
@@ -290,7 +263,7 @@ def get_modelopt_torch_quantization_config():
 
     # Weight Only Quantization
     if args.weight_only:
-        _set_quant_cfg_entry(mtq_config["quant_cfg"], "*input_quantizer", {"enable": False})
+        mtq_config["quant_cfg"].append({"quantizer_name": "*input_quantizer", "enable": False})
     if args.num_first_layers_to_skip_quant is not None:
         mtq_config = get_first_layers_disabled_config(
             mtq_config,
