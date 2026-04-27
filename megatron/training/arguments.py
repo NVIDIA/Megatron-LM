@@ -1020,8 +1020,11 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
-        # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
+        # Optimizer compatibility check. Muon is supported via the
+        # _build_megatron_fsdp_emerging_optimizer path; other emerging
+        # optimizers (Lion, SOAP, adaptive_muon) don't yet have the
+        # FSDP-aware step contract wired up.
+        assert args.optimizer in ('sgd', 'adam', 'muon'), \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
@@ -1468,8 +1471,15 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
 
         if args.use_distributed_optimizer:
-            args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
+            # Megatron-FSDP already shards optimizer state itself (ZeRO-1/2/3
+            # via `--data-parallel-sharding-strategy`). Layering
+            # `LayerWiseDistributedOptimizer` on top would double-shard and,
+            # in practice, trips `TypeErrors` in its constructor call from
+            # `_build_megatron_fsdp_emerging_optimizer`. The M-FSDP factory
+            # already handles the "distributed" part via `FSDPMuonChainedOptimizer`.
+            if not args.use_megatron_fsdp:
+                args.use_layer_wise_distributed_optimizer = True
+                args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         if args.use_megatron_fsdp:
@@ -1480,7 +1490,15 @@ def validate_args(args, defaults={}):
                 "Emerging optimizer with Megatron-FSDP does not support HSDP "
                 "(--outer-dp-sharding-strategy != no_shard) yet."
             )
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+            # Megatron-FSDP itself requires `fsdp_dtensor` (asserted above), so
+            # the emerging-optimizer path must accept it here to avoid a
+            # contradictory assertion pair.
+            assert args.ckpt_format == "fsdp_dtensor", (
+                "Emerging optimizer with Megatron-FSDP requires "
+                "--ckpt-format fsdp_dtensor."
+            )
+        else:
+            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
 
     # Make sure all functionality that requires Gloo process groups is disabled.

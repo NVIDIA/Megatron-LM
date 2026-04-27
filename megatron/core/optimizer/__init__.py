@@ -850,8 +850,15 @@ def _build_megatron_fsdp_emerging_optimizer(
     config.optimizer = "adam"
     config.use_layer_wise_distributed_optimizer = False
     try:
+        # `pg_collection` is always provided here, so Gloo process groups
+        # must be disabled on the recursive call (setup_process_groups_for_optimizer
+        # rejects the combination).
         chained_adam = get_megatron_optimizer(
-            config, model_chunks, config_overrides=config_overrides, pg_collection=pg_collection
+            config,
+            model_chunks,
+            config_overrides=config_overrides,
+            pg_collection=pg_collection,
+            use_gloo_process_groups=False,
         )
     finally:
         config.optimizer = saved_optimizer
@@ -881,7 +888,6 @@ def _build_megatron_fsdp_emerging_optimizer(
         # Float16OptimizerWithFloat16Params is incompatible with FSDP DTensor
         # params (no .main_grad), so temporarily clear bf16 to prevent the
         # LayerWiseDistributedOptimizer from re-wrapping each sub-optimizer.
-        # async_allgather=False because FSDP doesn't expose DDP buckets.
         log_single_rank(
             logger,
             logging.INFO,
@@ -895,7 +901,6 @@ def _build_megatron_fsdp_emerging_optimizer(
                 config,
                 pg_collection,
                 init_state_fn_list=init_fns,
-                async_allgather=False,
             )
         finally:
             config.bf16 = saved_bf16

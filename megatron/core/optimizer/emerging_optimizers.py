@@ -390,34 +390,128 @@ class FSDPZeROTensorParallelMuon(TensorParallelMuon):
         self.dp_group = dp_group
         super().__init__(params, **kwargs)
 
-    def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        """Orthogonalize with DP-shard allgather for FSDP ZeRO >= 1."""
-        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
-            return super().orthogonalize(p, grad, **kwargs)
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Muon step for Megatron-FSDP ZeRO-1/2/3.
 
+        M-FSDP shards a flat grad buffer across DP, so the per-param local
+        shard can be empty on some ranks (`p.grad is None`) or variable in
+        size – unlike a uniform `Shard(0)` DTensor. The standard
+        `OrthogonalizedOptimizer.step` skips params with `grad is None`,
+        which desyncs the DP collective inside `orthogonalize` (different
+        ranks process different params → allgather mismatch → hang).
+
+        We fix that here by processing every param on every rank in lockstep.
+        Each param's full gradient is reconstructed via a DP-wide all-gather
+        (supports variable-size local shards), but Newton-Schulz is run on a
+        single owner rank (round-robin by param index) and broadcast back,
+        so NS compute is amortised across DP rather than duplicated 8×.
+        """
+        if closure is None:
+            loss = None
+        else:
+            loss = closure()
+
+        for group in self.param_groups:
+            # `skip_non_grad_params=False`: we must create momentum buffers
+            # for every param, because even params with empty local grad shards
+            # on this rank need to participate in the DP-collective orthogonalize.
+            self._init_group(group, skip_non_grad_params=False)
+
+            for p in group["params"]:
+                self._muon_step_one(p, group)
+
+        return loss
+
+    @torch.no_grad()  # type: ignore[misc]
+    def _muon_step_one(self, p: torch.Tensor, group: Dict[str, Any]) -> None:
+        """Per-param Muon update that participates in DP collectives on every rank."""
+        # Fall back to the plain parent step for the single-rank / unsharded case.
+        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
+            if p.grad is None:
+                return
+            return self._local_muon_update(p, p.grad, group)
+
+        # Skip params that aren't DTensors (shouldn't happen in M-FSDP).
+        if not (_HAVE_DTENSOR and isinstance(p, _DTensor)):
+            if p.grad is None:
+                return
+            return self._local_muon_update(p, p.grad, group)
+
+        # Every rank processes every param in lockstep (regardless of whether
+        # the local grad shard is empty) so the DP collectives below stay in
+        # sync. M-FSDP's flat-buffer sharding means local shard sizes vary
+        # per rank and per param, so we operate on DTensors and use
+        # `full_tensor()` to reconstruct the full matrix.
+
+        # Use local views to mutate momentum and param. Momentum is kept
+        # per-shard (same size as p.to_local()); the initial buffer was
+        # allocated via `torch.zeros_like(p.data)` in `_init_group` which,
+        # for a DTensor p, yields a Shard(0) DTensor with the correct local
+        # shape on this rank.
+        state = self.state[p]
+        mom_buffer = state["momentum_buffer"]
+        mom_local = mom_buffer.to_local() if isinstance(mom_buffer, _DTensor) else mom_buffer
+
+        # Derive this rank's local grad. If p.grad is None (empty shard on
+        # this rank), use a zero tensor of the expected local shape so the
+        # local lerp_ / weight-decay math is a no-op while still letting us
+        # participate in the full_tensor() allgather below.
+        grad = p.grad
+        if grad is None:
+            local_grad = torch.zeros_like(mom_local)
+        else:
+            local_grad = grad.to_local() if isinstance(grad, _DTensor) else grad
+
+        p_local = p.to_local()
+
+        # Local weight decay on this rank's param/grad slice.
+        wd = group["weight_decay"]
+        lr = group["lr"]
+        if wd != 0.0:
+            # Decoupled weight decay: p *= (1 - lr * wd)
+            p_local.mul_(1.0 - lr * wd)
+
+        # Local momentum EMA update.
+        mom_local.lerp_(local_grad, 1 - group["momentum"])
+
+        # Assemble the pre-NS gradient (local).
+        if self.nesterov:
+            pre_local = local_grad.lerp(mom_local, group["momentum"])
+        else:
+            pre_local = mom_local
+
+        # Gather per-rank local row counts so we can allocate a per-rank
+        # destination for the allgather. M-FSDP uses a flat-buffer grad
+        # sharding → local shard sizes vary per rank, which
+        # `all_gather_into_tensor` (equal-size) and DTensor `full_tensor`
+        # (assumes uniform Shard(0)) both handle poorly. We use
+        # `all_gather(tensor_list, input)`, which supports variable sizes.
         dp_size = get_pg_size(self.dp_group)
         dp_rank = get_pg_rank(self.dp_group)
+        row_counts = torch.zeros(dp_size, dtype=torch.long, device=p_local.device)
+        row_counts[dp_rank] = pre_local.shape[0]
+        torch.distributed.all_reduce(row_counts, group=self.dp_group)
+        row_counts_cpu = row_counts.tolist()
 
-        # The momentum buffer (grad) and param (p) may be Shard(0) DTensors whose
-        # `.shape[0]` is the global row count. Always extract the local shard so
-        # "shard_rows" reflects the per-rank row count.
-        grad_local = grad.to_local() if (_HAVE_DTENSOR and isinstance(grad, _DTensor)) else grad
-        shard_rows = grad_local.shape[0]
-
-        # Allgather DP row-shards to reconstruct the TP-local, DP-full grad.
-        # FSDP guarantees equal shard sizes across DP ranks (buckets are padded
-        # to `dp_size * inner_dim`), so a single all_gather_into_tensor works.
-        full_grad = torch.empty(
-            shard_rows * dp_size,
-            *grad_local.shape[1:],
-            device=grad_local.device,
-            dtype=grad_local.dtype,
+        # Build per-rank output buffers of the right row count.
+        gathered = [
+            torch.empty(
+                (row_counts_cpu[r], *pre_local.shape[1:]),
+                device=pre_local.device,
+                dtype=pre_local.dtype,
+            )
+            for r in range(dp_size)
+        ]
+        torch.distributed.all_gather(
+            gathered, pre_local.contiguous(), group=self.dp_group
         )
-        torch.distributed.all_gather_into_tensor(
-            full_grad, grad_local.contiguous(), group=self.dp_group
-        )
+        full_grad = torch.cat(gathered, dim=0)
 
-        # Trim FSDP bucket-padding rows back to the param's TP-local row count.
+        # Trim any trailing FSDP bucket padding rows so NS sees only the real
+        # parameter. `p.shape[0]` is the FSDP-declared global row count
+        # (= sum of per-rank shard rows, possibly including padding at the
+        # tail); the true param row count is the global shape from the DTensor.
         tp_group = (
             (
                 self.pg_collection.expt_tp
@@ -430,60 +524,68 @@ class FSDPZeROTensorParallelMuon(TensorParallelMuon):
         partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
             partition_dim = None
+        tp_size_dim0 = (
+            get_pg_size(tp_group) if (partition_dim == 0 and tp_group is not None) else 1
+        )
+        tp_local_rows = p.shape[0] // max(tp_size_dim0, 1)
+        if full_grad.shape[0] > tp_local_rows:
+            full_grad = full_grad[:tp_local_rows]
 
-        tp_size_dim0 = get_pg_size(tp_group) if (partition_dim == 0 and tp_group is not None) else 1
+        # Newton-Schulz on the full matrix. We run it on every rank (duplicated
+        # compute across DP) intentionally. A partition-and-broadcast scheme
+        # was tried (owner does NS; others bcast) but the per-param serial
+        # loop turns the broadcast into a per-param sync, negating the
+        # parallelism across ranks – it measured slightly slower in practice.
+        # An effective scheme would need to pipeline NS with the allgather/
+        # broadcast for the *next* param; left as future work.
+        from emerging_optimizers import utils
 
-        if _HAVE_DTENSOR and isinstance(p, _DTensor):
-            # Production: `p.shape[0]` is the FSDP-declared global row count
-            # (already includes bucket padding); divide by `tp_size_dim0`
-            # to get the TP-local row count.
-            tp_local_rows = p.shape[0] // max(tp_size_dim0, 1)
-        else:
-            # Plain-tensor unit-test path: `p` is treated as the per-rank
-            # shard (`p.shape[0] == shard_rows`), so the TP-local row count
-            # must be reconstructed from the allgather, not read from `p`.
-            tp_local_rows = shard_rows * dp_size
+        with utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            group_kwargs = {k: v for k, v in group.items() if k != "params"}
+            orth_full_grad = super(FSDPZeROTensorParallelMuon, self).orthogonalize(
+                p, full_grad, **group_kwargs
+            )
 
-        full_grad = full_grad[:tp_local_rows]
-
-        # Apply NS to the TP-local, DP-full gradient. `super().orthogonalize`
-        # re-derives `tp_group` / `partition_dim` internally; the TP
-        # dimension of the reconstructed `full_grad` is unchanged.
-        orth_full_grad = super().orthogonalize(p, full_grad, **kwargs)
-
-        # Extract this rank's DP row-shard. If the last rank held fewer real
-        # rows than `shard_rows` (FSDP padding), zero-fill the extra rows so
-        # padded slots get a no-op update.
-        start_row = dp_rank * shard_rows
-        end_row = min(start_row + shard_rows, tp_local_rows)
-        orth_shard = orth_full_grad[start_row:end_row]
-
-        if orth_shard.shape[0] < shard_rows:
-            pad_rows = shard_rows - orth_shard.shape[0]
+        # Slice out this rank's contribution. Exclusive prefix sum of
+        # row_counts gives the offset; we saved it above.
+        start = sum(row_counts_cpu[:dp_rank])
+        end = start + row_counts_cpu[dp_rank]
+        # Guard against the last rank holding only padding rows: clamp end.
+        end = min(end, orth_full_grad.shape[0])
+        orth_local = orth_full_grad[start:end].to(dtype=p_local.dtype)
+        # If this rank's shard was purely padding (no real rows), orth_local
+        # may be shorter than p_local; pad with zeros so the add_ lines up.
+        if orth_local.shape[0] < p_local.shape[0]:
             pad = torch.zeros(
-                pad_rows, *grad_local.shape[1:], device=grad_local.device, dtype=grad_local.dtype
+                (p_local.shape[0] - orth_local.shape[0], *p_local.shape[1:]),
+                device=p_local.device,
+                dtype=p_local.dtype,
             )
-            orth_shard = torch.cat([orth_shard, pad], dim=0)
+            orth_local = torch.cat([orth_local, pad], dim=0)
 
-        # Wrap the plain result back into a DTensor if the input was a DTensor.
-        # `OrthogonalizedOptimizer.step` does `p.add_(grad, alpha=-lr)`; for
-        # a Shard(0) DTensor `p` the update tensor must also be a DTensor with
-        # matching placements, otherwise PyTorch promotes it to `Replicate`
-        # and fails the global-shape check. Recent PyTorch versions require
-        # `shape` and `stride` to be passed together; for a Shard(0)
-        # contiguous local the global stride matches the local stride.
-        if _HAVE_DTENSOR and isinstance(grad, _DTensor):
-            local_contig = orth_shard.contiguous()
-            orth_shard = _DTensor.from_local(
-                local_contig,
-                device_mesh=grad.device_mesh,
-                placements=grad.placements,
-                shape=grad.shape,
-                stride=local_contig.stride(),
-                run_check=False,
-            )
+        # In-place weight update on this rank's local shard.
+        p_local.add_(orth_local, alpha=-lr)
 
-        return orth_shard
+    @torch.no_grad()  # type: ignore[misc]
+    def _local_muon_update(
+        self, p: torch.Tensor, grad: torch.Tensor, group: Dict[str, Any]
+    ) -> None:
+        """Local (non-DP) Muon update – identical to OrthogonalizedOptimizer.step body."""
+        from emerging_optimizers import utils
+
+        state = self.state[p]
+        self._apply_weight_decay_inplace(p, grad, group["lr"], group["weight_decay"])
+        state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
+        if self.nesterov:
+            grad = grad.lerp(state["momentum_buffer"], group["momentum"])
+        else:
+            grad = state["momentum_buffer"]
+        with utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            group_kwargs = {k: v for k, v in group.items() if k != "params"}
+            orth_grad = self.orthogonalize(p, grad, **group_kwargs)
+        self.pre_weight_update_fn_inplace(p, orth_grad)
+        p.add_(orth_grad, alpha=-group["lr"])
+        self.post_weight_update_fn_inplace(p)
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
