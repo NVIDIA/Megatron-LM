@@ -236,15 +236,6 @@ def tensor_swap(x, src_idxs, dst_idxs):
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
 
 
-async def torch_awaitable(stream: torch.cuda.Stream | None = None):
-    """Syntactic sugar for returning an awaitable handle for non-distributed torch."""
-    if stream is None:
-        stream = torch.cuda.current_stream()
-    event = stream.record_event()
-    while not event.query():
-        await asyncio.sleep(0)
-
-
 async def await_process_call(call, process: multiprocessing.Process, timeout: float = 1.0):
     """Repeatedly wait for a multiprocessing callable to resolve, aborting upon process failure.
 
