@@ -4,7 +4,6 @@
 import inspect
 import io
 import os
-import pickle
 import warnings
 from abc import ABC
 from collections import defaultdict
@@ -1004,7 +1003,7 @@ class TorchDistLoadShardedStrategy:
         )
         ## save the new metadata
         with fs_writer.fs.create_stream(tmp_path, "wb") as metadata_file:
-            pickle.dump(metadata, metadata_file)
+            torch.save(metadata, metadata_file)
             try:
                 os.fsync(metadata_file.fileno())
             except AttributeError:
