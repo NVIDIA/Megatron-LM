@@ -8,6 +8,7 @@ Both the standalone and MIMO training paths import from here.
 
 from typing import Optional
 
+from examples.multimodal_dev.models.base import _NO_CP_GROUP
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
@@ -16,26 +17,6 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-
-# ---------------------------------------------------------------------------
-# fp32 RoPE helper — mirrors Bridge's apply_rotary_pos_emb_in_fp32=True
-# ---------------------------------------------------------------------------
-
-class _NoCPGroup:
-    """Dummy process group reporting ``size()=1, rank()=0``.
-
-    Used by the vision encoder so that ``_apply_rotary_pos_emb_thd``
-    processes the full packed sequence without CP splitting.
-    """
-
-    def size(self):
-        return 1
-
-    def rank(self):
-        return 0
-
-
-_NO_CP_GROUP = _NoCPGroup()
 
 
 def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
