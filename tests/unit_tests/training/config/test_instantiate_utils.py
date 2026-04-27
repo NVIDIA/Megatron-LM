@@ -25,6 +25,20 @@ from megatron.training.config.instantiate_utils import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _disable_allowlist():
+    """Temporarily disable allowlist to fully test instantiate logic with local test targets."""
+    from megatron.training.config.instantiate_utils import target_allowlist
+
+    target_allowlist.disable()
+    yield
+    target_allowlist.enable()
+
+
+def _target_qualname(obj) -> str:
+    return f"{obj.__module__}.{obj.__qualname__}"
+
+
 # Test classes and functions for instantiation testing
 class TestClass:
     """Test class for instantiation."""
@@ -82,11 +96,7 @@ class TestInstantiate:
 
     def test_instantiate_simple_class(self):
         """Test instantiating a simple class."""
-        config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.TestClass",
-            "arg1": "value1",
-            "arg2": "value2",
-        }
+        config = {"_target_": _target_qualname(TestClass), "arg1": "value1", "arg2": "value2"}
         result = instantiate(config)
         assert isinstance(result, TestClass)
         assert result.arg1 == "value1"
@@ -94,32 +104,21 @@ class TestInstantiate:
 
     def test_instantiate_function(self):
         """Test instantiating a function."""
-        config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-            "arg1": "value1",
-            "arg2": "value2",
-        }
+        config = {"_target_": _target_qualname(test_function), "arg1": "value1", "arg2": "value2"}
         result = instantiate(config)
         expected = {"arg1": "value1", "arg2": "value2", "kwargs": {}}
         assert result == expected
 
     def test_instantiate_with_args(self):
         """Test instantiate with positional args."""
-        config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-            "_args_": ["pos1", "pos2"],
-        }
+        config = {"_target_": _target_qualname(test_function), "_args_": ["pos1", "pos2"]}
         result = instantiate(config)
         expected = {"arg1": "pos1", "arg2": "pos2", "kwargs": {}}
         assert result == expected
 
     def test_instantiate_with_partial(self):
         """Test instantiate with partial=True."""
-        config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-            "_partial_": True,
-            "arg1": "value1",
-        }
+        config = {"_target_": _target_qualname(test_function), "_partial_": True, "arg1": "value1"}
         result = instantiate(config)
         assert isinstance(result, functools.partial)
         actual_result = result(arg2="value2")
@@ -128,10 +127,7 @@ class TestInstantiate:
 
     def test_instantiate_with_call_false(self):
         """Test instantiate with _call_=False."""
-        config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-            "_call_": False,
-        }
+        config = {"_target_": _target_qualname(test_function), "_call_": False}
         result = instantiate(config)
         assert callable(result)
         assert result == test_function
@@ -139,7 +135,7 @@ class TestInstantiate:
     def test_instantiate_with_call_false_and_extra_keys(self):
         """Test instantiate with _call_=False and extra keys raises error."""
         config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
+            "_target_": _target_qualname(test_function),
             "_call_": False,
             "extra_key": "value",
         }
@@ -148,10 +144,7 @@ class TestInstantiate:
 
     def test_instantiate_with_kwargs_override(self):
         """Test instantiate with kwargs override."""
-        config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-            "arg1": "original",
-        }
+        config = {"_target_": _target_qualname(test_function), "arg1": "original"}
         result = instantiate(config, arg1="override", arg2="new")
         expected = {"arg1": "override", "arg2": "new", "kwargs": {}}
         assert result == expected
@@ -159,14 +152,8 @@ class TestInstantiate:
     def test_instantiate_list_config(self):
         """Test instantiate with list config."""
         config = [
-            {
-                "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-                "arg1": "item1",
-            },
-            {
-                "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-                "arg1": "item2",
-            },
+            {"_target_": _target_qualname(test_function), "arg1": "item1"},
+            {"_target_": _target_qualname(test_function), "arg1": "item2"},
         ]
         result = instantiate(config)
         assert len(result) == 2
@@ -187,7 +174,7 @@ class TestInstantiate:
     def test_instantiate_strict_mode_error(self):
         """Test instantiate in strict mode with error."""
         config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.TestClass",
+            "_target_": _target_qualname(TestClass),
             "nested": {"_target_": "non.existent.module.Class"},
         }
         with pytest.raises(InstantiationException):
@@ -196,7 +183,7 @@ class TestInstantiate:
     def test_instantiate_lenient_mode_error(self):
         """In lenient mode, nested resolution errors now propagate (no auto-None)."""
         config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.TestClass",
+            "_target_": _target_qualname(TestClass),
             "nested": {"_target_": "non.existent.module.Class"},
         }
         with pytest.raises(InstantiationException, match="Error locating target"):
@@ -204,26 +191,14 @@ class TestInstantiate:
 
     def test_instantiate_with_omegaconf_dict(self):
         """Test instantiate with OmegaConf DictConfig."""
-        config = OmegaConf.create(
-            {
-                "_target_": "tests.unit_tests.utils.test_instantiate_utils.TestClass",
-                "arg1": "value1",
-            }
-        )
+        config = OmegaConf.create({"_target_": _target_qualname(TestClass), "arg1": "value1"})
         result = instantiate(config)
         assert isinstance(result, TestClass)
         assert result.arg1 == "value1"
 
     def test_instantiate_with_omegaconf_list(self):
         """Test instantiate with OmegaConf ListConfig."""
-        config = OmegaConf.create(
-            [
-                {
-                    "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-                    "arg1": "item1",
-                }
-            ]
-        )
+        config = OmegaConf.create([{"_target_": _target_qualname(test_function), "arg1": "item1"}])
         result = instantiate(config)
         assert len(result) == 1
         assert result[0] == {"arg1": "item1", "arg2": None, "kwargs": {}}
@@ -486,11 +461,8 @@ class TestComplexScenarios:
     def test_nested_instantiation(self):
         """Test nested instantiation scenario."""
         config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.TestClass",
-            "arg1": {
-                "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-                "arg1": "nested_value",
-            },
+            "_target_": _target_qualname(TestClass),
+            "arg1": {"_target_": _target_qualname(test_function), "arg1": "nested_value"},
             "arg2": "simple_value",
         }
         result = instantiate(config)
@@ -502,11 +474,8 @@ class TestComplexScenarios:
         """Test list with nested target instantiation."""
         config = [
             {
-                "_target_": "tests.unit_tests.utils.test_instantiate_utils.TestClass",
-                "arg1": {
-                    "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
-                    "arg1": "item1",
-                },
+                "_target_": _target_qualname(TestClass),
+                "arg1": {"_target_": _target_qualname(test_function), "arg1": "item1"},
             },
             "simple_item",
         ]
@@ -520,7 +489,7 @@ class TestComplexScenarios:
         """Test missing values with partial instantiation."""
         config = OmegaConf.create(
             {
-                "_target_": "tests.unit_tests.utils.test_instantiate_utils.test_function",
+                "_target_": _target_qualname(test_function),
                 "_partial_": True,
                 "arg1": "value1",
                 "missing_arg": "???",  # OmegaConf missing value
@@ -603,19 +572,13 @@ class TestInstantiateEnum:
 
     def test_instantiate_enum_with_args(self):
         """Test instantiating an Enum with _args_."""
-        config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.TestEnum",
-            "_args_": [1],
-        }
+        config = {"_target_": _target_qualname(TestEnum), "_args_": [1]}
         result = instantiate(config)
         assert result == TestEnum.A
 
     def test_instantiate_enum_with_args_lenient(self):
         """Test instantiating an Enum with _args_ in lenient mode (default)."""
-        config = {
-            "_target_": "tests.unit_tests.utils.test_instantiate_utils.TestEnum",
-            "_args_": [2],
-        }
+        config = {"_target_": _target_qualname(TestEnum), "_args_": [2]}
         # This previously failed because _args_ was dropped in lenient mode
         result = instantiate(config)
         assert result == TestEnum.B
