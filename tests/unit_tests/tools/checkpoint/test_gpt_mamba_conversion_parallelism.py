@@ -34,10 +34,10 @@ sys.path.insert(0, _THIS_DIR)
 
 from gpt_mamba_conversion import main as conversion_main
 
-
 # ---------------------------------------------------------------------------
 # Synthetic-checkpoint helpers
 # ---------------------------------------------------------------------------
+
 
 def make_checkpoint_args(
     num_layers=4,
@@ -83,12 +83,8 @@ def make_gpt_state_dict(num_layers, hidden_size, vocab_size=1024, dtype=torch.fl
             hidden_size, hidden_size, dtype=dtype
         )
         sd[p + 'pre_mlp_layernorm.weight'] = torch.randn(hidden_size, dtype=dtype)
-        sd[p + 'mlp.linear_fc1.weight'] = torch.randn(
-            4 * hidden_size, hidden_size, dtype=dtype
-        )
-        sd[p + 'mlp.linear_fc2.weight'] = torch.randn(
-            hidden_size, 4 * hidden_size, dtype=dtype
-        )
+        sd[p + 'mlp.linear_fc1.weight'] = torch.randn(4 * hidden_size, hidden_size, dtype=dtype)
+        sd[p + 'mlp.linear_fc2.weight'] = torch.randn(hidden_size, 4 * hidden_size, dtype=dtype)
 
     sd['decoder.final_layernorm.weight'] = torch.randn(hidden_size, dtype=dtype)
     sd['output_layer.weight'] = torch.randn(vocab_size, hidden_size, dtype=dtype)
@@ -99,8 +95,10 @@ def make_gpt_state_dict(num_layers, hidden_size, vocab_size=1024, dtype=torch.fl
 # Dist (torch_dist / fsdp_dtensor) fixture builders
 # ---------------------------------------------------------------------------
 
-def _save_dist_checkpoint(root_dir, full_sd, ckpt_args, iteration=100,
-                          prefix='model.', backend='torch_dist'):
+
+def _save_dist_checkpoint(
+    root_dir, full_sd, ckpt_args, iteration=100, prefix='model.', backend='torch_dist'
+):
     """Write a full state dict as a single-rank DCP checkpoint.
 
     From the converter's POV, this is indistinguishable from a multi-rank
@@ -122,16 +120,14 @@ def _save_dist_checkpoint(root_dir, full_sd, ckpt_args, iteration=100,
         'checkpoint_version': 3.0,
         'iteration': iteration,
     }
-    save_dist_checkpoint_full(
-        full_sd, common_state, iter_dir,
-        model_prefix=prefix, backend=backend,
-    )
+    save_dist_checkpoint_full(full_sd, common_state, iter_dir, model_prefix=prefix, backend=backend)
     write_latest_iteration_marker(iter_dir, iteration)
 
 
 def _load_converted_dist(ckpt_dir):
     """Read a dist-format converted checkpoint back into a full state dict."""
     from dist_checkpoint_io import load_dist_checkpoint_full
+
     sd, common, prefix, backend, iteration = load_dist_checkpoint_full(ckpt_dir)
     return sd, common.get('args', None)
 
@@ -139,6 +135,7 @@ def _load_converted_dist(ckpt_dir):
 # ---------------------------------------------------------------------------
 # Core scenario runner
 # ---------------------------------------------------------------------------
+
 
 def _run_scenario(
     label,
@@ -164,8 +161,7 @@ def _run_scenario(
         gpt_sd = make_gpt_state_dict(num_layers, hidden_size)
 
         _save_dist_checkpoint(
-            src_gpt_dir, gpt_sd, ckpt_args,
-            prefix=source_prefix, backend=source_format,
+            src_gpt_dir, gpt_sd, ckpt_args, prefix=source_prefix, backend=source_format
         )
 
         common_kwargs = dict(
@@ -183,20 +179,18 @@ def _run_scenario(
         )
 
         # --- GPT -> Mamba ---
-        conversion_main(argparse.Namespace(
-            direction='gpt-to-mamba',
-            load_dir=src_gpt_dir,
-            save_dir=mamba_dir,
-            **common_kwargs,
-        ))
+        conversion_main(
+            argparse.Namespace(
+                direction='gpt-to-mamba', load_dir=src_gpt_dir, save_dir=mamba_dir, **common_kwargs
+            )
+        )
 
         # --- Mamba -> GPT ---
-        conversion_main(argparse.Namespace(
-            direction='mamba-to-gpt',
-            load_dir=mamba_dir,
-            save_dir=dst_gpt_dir,
-            **common_kwargs,
-        ))
+        conversion_main(
+            argparse.Namespace(
+                direction='mamba-to-gpt', load_dir=mamba_dir, save_dir=dst_gpt_dir, **common_kwargs
+            )
+        )
 
         # --- Verify ---
         recovered_sd, _ = _load_converted_dist(dst_gpt_dir)
@@ -216,14 +210,13 @@ def _run_scenario(
         if mismatches:
             for m in mismatches[:10]:
                 print(f"  FAIL: {m}")
-            raise AssertionError(
-                f"{label} failed with {len(mismatches)} weight mismatches"
-            )
+            raise AssertionError(f"{label} failed with {len(mismatches)} weight mismatches")
 
         # SSM keys must be absent in the final GPT output.
-        assert not any('mixer.' in k for k in recovered_sd), \
-            f"SSM keys leaked into final GPT output: " \
+        assert not any('mixer.' in k for k in recovered_sd), (
+            f"SSM keys leaked into final GPT output: "
             f"{[k for k in recovered_sd if 'mixer.' in k][:5]}"
+        )
 
         print(f"PASSED: {label}")
     finally:
@@ -233,6 +226,7 @@ def _run_scenario(
 # ---------------------------------------------------------------------------
 # Test cases — one per (source backend, target backend, pattern) combo
 # ---------------------------------------------------------------------------
+
 
 def test_torch_dist_roundtrip():
     _run_scenario("torch_dist roundtrip", 'torch_dist', 'torch_dist')
@@ -246,25 +240,18 @@ def test_fsdp_dtensor_prefix():
     """fsdp_dtensor backend uses the 'model.module.' key prefix — verify we
     auto-detect and strip it correctly."""
     _run_scenario(
-        "fsdp_dtensor prefix", 'fsdp_dtensor', 'fsdp_dtensor',
-        source_prefix='model.module.',
+        "fsdp_dtensor prefix", 'fsdp_dtensor', 'fsdp_dtensor', source_prefix='model.module.'
     )
 
 
 def test_torch_dist_alternating_pattern():
     """Pure transformer pattern (no SSM) round-trips."""
-    _run_scenario(
-        "torch_dist alternating", 'torch_dist', 'torch_dist',
-        pattern="*-*-*-*-",
-    )
+    _run_scenario("torch_dist alternating", 'torch_dist', 'torch_dist', pattern="*-*-*-*-")
 
 
 def test_torch_dist_dense_ssm_pattern():
     """Dense SSM pattern still round-trips on the attn/MLP layers."""
-    _run_scenario(
-        "torch_dist dense SSM", 'torch_dist', 'torch_dist',
-        pattern="MM*-MM*-MM*-MM*-",
-    )
+    _run_scenario("torch_dist dense SSM", 'torch_dist', 'torch_dist', pattern="MM*-MM*-MM*-MM*-")
 
 
 # ---------------------------------------------------------------------------

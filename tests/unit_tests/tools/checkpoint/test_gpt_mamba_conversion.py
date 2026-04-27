@@ -25,8 +25,7 @@ import torch
 
 # Add the tools/checkpoint directory to the path so we can import the module
 sys.path.insert(
-    0,
-    os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'tools', 'checkpoint'),
+    0, os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'tools', 'checkpoint')
 )
 
 from gpt_mamba_conversion import (
@@ -44,10 +43,10 @@ from gpt_mamba_conversion import (
     validate_source_args_gpt_compatible,
 )
 
-
 # ---------------------------------------------------------------------------
 # Pattern parsing tests
 # ---------------------------------------------------------------------------
+
 
 class TestPatternParsing:
     def test_simple_pattern(self):
@@ -89,13 +88,12 @@ class TestPatternParsing:
 # Layer index mapping tests
 # ---------------------------------------------------------------------------
 
+
 class TestLayerIndexMapping:
     def test_gpt_to_mamba_basic(self):
         # Pattern: M*-M*- (2 attn at pos 1,4; 2 MLP at pos 2,5)
         layer_types = ['M', '*', '-', 'M', '*', '-']
-        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(
-            layer_types, 'gpt-to-mamba'
-        )
+        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'gpt-to-mamba')
         # 2 GPT layers -> attn at [1,4], MLP at [2,5]
         assert attn_map == {0: 1, 1: 4}
         assert mlp_map == {0: 2, 1: 5}
@@ -103,9 +101,7 @@ class TestLayerIndexMapping:
 
     def test_mamba_to_gpt_basic(self):
         layer_types = ['M', '*', '-', 'M', '*', '-']
-        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(
-            layer_types, 'mamba-to-gpt'
-        )
+        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'mamba-to-gpt')
         # attn at mamba layer 1 -> GPT layer 0, attn at 4 -> GPT layer 1
         assert attn_map == {1: 0, 4: 1}
         assert mlp_map == {2: 0, 5: 1}
@@ -113,9 +109,7 @@ class TestLayerIndexMapping:
 
     def test_alternating_pattern(self):
         layer_types = ['*', '-', '*', '-', '*', '-']
-        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(
-            layer_types, 'gpt-to-mamba'
-        )
+        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'gpt-to-mamba')
         assert attn_map == {0: 0, 1: 2, 2: 4}
         assert mlp_map == {0: 1, 1: 3, 2: 5}
         assert ssm_indices == []
@@ -134,6 +128,7 @@ class TestLayerIndexMapping:
 # ---------------------------------------------------------------------------
 # Key helper tests
 # ---------------------------------------------------------------------------
+
 
 class TestKeyHelpers:
     def test_get_layer_num(self):
@@ -172,6 +167,7 @@ class TestKeyHelpers:
 # ---------------------------------------------------------------------------
 # SSM initialization tests
 # ---------------------------------------------------------------------------
+
 
 class TestSSMInitialization:
     def test_shapes(self):
@@ -311,6 +307,7 @@ class TestSSMInitialization:
 # Synthetic GPT checkpoint builder
 # ---------------------------------------------------------------------------
 
+
 def make_synthetic_gpt_checkpoint(num_layers, d_model, dtype=torch.float32):
     """Create a minimal synthetic GPT state dict for testing."""
     state_dict = OrderedDict()
@@ -351,14 +348,13 @@ def make_synthetic_gpt_checkpoint(num_layers, d_model, dtype=torch.float32):
 # Full conversion tests
 # ---------------------------------------------------------------------------
 
+
 class TestGPTToMambaConversion:
     def setup_method(self):
         self.d_model = 64
         self.num_gpt_layers = 2
         self.pattern = "M*-M*-"  # 6 total: 2 SSM, 2 attn, 2 MLP
-        self.gpt_state = make_synthetic_gpt_checkpoint(
-            self.num_gpt_layers, self.d_model
-        )
+        self.gpt_state = make_synthetic_gpt_checkpoint(self.num_gpt_layers, self.d_model)
         self.args = argparse.Namespace(
             d_model=self.d_model,
             mamba_d_inner=self.d_model * 2,
@@ -381,10 +377,7 @@ class TestGPTToMambaConversion:
             self.gpt_state['embedding.word_embeddings.weight'],
         )
         # Output layer
-        assert torch.equal(
-            result['output_layer.weight'],
-            self.gpt_state['output_layer.weight'],
-        )
+        assert torch.equal(result['output_layer.weight'], self.gpt_state['output_layer.weight'])
 
     def test_final_norm_renamed(self):
         layer_types = parse_hybrid_layer_pattern(self.pattern)
@@ -393,8 +386,7 @@ class TestGPTToMambaConversion:
         assert 'decoder.final_norm.weight' in result
         assert 'decoder.final_layernorm.weight' not in result
         assert torch.equal(
-            result['decoder.final_norm.weight'],
-            self.gpt_state['decoder.final_layernorm.weight'],
+            result['decoder.final_norm.weight'], self.gpt_state['decoder.final_layernorm.weight']
         )
 
     def test_attention_params_mapped(self):
@@ -484,8 +476,7 @@ class TestMambaToGPTConversion:
             if lt == 'M':
                 # SSM params
                 ssm = initialize_ssm_layer_params(
-                    i, self.d_model, d_inner, d_state, n_groups, n_heads,
-                    self.args.mamba2_head_dim,
+                    i, self.d_model, d_inner, d_state, n_groups, n_heads, self.args.mamba2_head_dim
                 )
                 state_dict.update(ssm)
             elif lt == '*':
@@ -569,6 +560,7 @@ class TestMambaToGPTConversion:
 # Round-trip test: GPT -> Mamba -> GPT
 # ---------------------------------------------------------------------------
 
+
 class TestRoundTrip:
     def test_gpt_mamba_gpt_preserves_weights(self):
         """Converting GPT -> Mamba -> GPT should preserve all attention & MLP weights."""
@@ -603,9 +595,9 @@ class TestRoundTrip:
             if 'final_layernorm' in key:
                 continue
             assert key in recovered_gpt, f"Missing key after round-trip: {key}"
-            assert torch.equal(original_gpt[key], recovered_gpt[key]), (
-                f"Weight mismatch after round-trip for {key}"
-            )
+            assert torch.equal(
+                original_gpt[key], recovered_gpt[key]
+            ), f"Weight mismatch after round-trip for {key}"
 
         # Check final_layernorm was properly renamed back
         assert torch.equal(
@@ -641,14 +633,13 @@ class TestRoundTrip:
             if 'final_layernorm' in key:
                 continue
             assert key in recovered_gpt, f"Missing key: {key}"
-            assert torch.equal(original_gpt[key], recovered_gpt[key]), (
-                f"Mismatch for {key}"
-            )
+            assert torch.equal(original_gpt[key], recovered_gpt[key]), f"Mismatch for {key}"
 
 
 # ---------------------------------------------------------------------------
 # GPT compatibility whitelist tests
 # ---------------------------------------------------------------------------
+
 
 class TestPatternWhitelist:
     """validate_pattern_gpt_compatible rejects hybrid patterns GPTModel can't express."""
@@ -730,34 +721,27 @@ class TestSourceArgsWhitelist:
 
     def test_rejects_moe(self):
         with pytest.raises(ValueError, match="MoE"):
-            validate_source_args_gpt_compatible(
-                self._ok_args(num_moe_experts=8), 'gpt-to-mamba'
-            )
+            validate_source_args_gpt_compatible(self._ok_args(num_moe_experts=8), 'gpt-to-mamba')
 
     def test_rejects_shared_expert(self):
         with pytest.raises(ValueError, match="shared expert"):
             validate_source_args_gpt_compatible(
-                self._ok_args(moe_shared_expert_intermediate_size=4096),
-                'gpt-to-mamba',
+                self._ok_args(moe_shared_expert_intermediate_size=4096), 'gpt-to-mamba'
             )
 
     def test_rejects_moe_layer_freq_list(self):
         with pytest.raises(ValueError, match="MoE layers"):
             validate_source_args_gpt_compatible(
-                self._ok_args(moe_layer_freq=[1, 0, 1, 0]),
-                'gpt-to-mamba',
+                self._ok_args(moe_layer_freq=[1, 0, 1, 0]), 'gpt-to-mamba'
             )
 
     def test_accepts_moe_layer_freq_1(self):
-        validate_source_args_gpt_compatible(
-            self._ok_args(moe_layer_freq=1), 'gpt-to-mamba'
-        )
+        validate_source_args_gpt_compatible(self._ok_args(moe_layer_freq=1), 'gpt-to-mamba')
 
     def test_rejects_experimental_attention(self):
         with pytest.raises(ValueError, match="experimental attention"):
             validate_source_args_gpt_compatible(
-                self._ok_args(experimental_attention_variant='gated_delta_net'),
-                'gpt-to-mamba',
+                self._ok_args(experimental_attention_variant='gated_delta_net'), 'gpt-to-mamba'
             )
 
     def test_rejects_linear_attention(self):
@@ -769,15 +753,13 @@ class TestSourceArgsWhitelist:
     def test_rejects_heterogeneous_block_specs(self):
         with pytest.raises(ValueError, match="heterogeneous"):
             validate_source_args_gpt_compatible(
-                self._ok_args(heterogeneous_block_specs=True),
-                'mamba-to-gpt',
+                self._ok_args(heterogeneous_block_specs=True), 'mamba-to-gpt'
             )
 
     def test_rejects_heterogeneous_config_path(self):
         with pytest.raises(ValueError, match="heterogeneous"):
             validate_source_args_gpt_compatible(
-                self._ok_args(heterogeneous_layers_config_path='/tmp/x.json'),
-                'gpt-to-mamba',
+                self._ok_args(heterogeneous_layers_config_path='/tmp/x.json'), 'gpt-to-mamba'
             )
 
     def test_rejects_mla(self):
@@ -788,16 +770,13 @@ class TestSourceArgsWhitelist:
 
     def test_rejects_mtp(self):
         with pytest.raises(ValueError, match="Multi-Token Prediction"):
-            validate_source_args_gpt_compatible(
-                self._ok_args(mtp_num_layers=2), 'gpt-to-mamba'
-            )
+            validate_source_args_gpt_compatible(self._ok_args(mtp_num_layers=2), 'gpt-to-mamba')
 
     def test_reports_multiple_reasons(self):
         # Both MoE and MLA set: the error should surface both.
         with pytest.raises(ValueError) as exc:
             validate_source_args_gpt_compatible(
-                self._ok_args(num_moe_experts=8, multi_latent_attention=True),
-                'gpt-to-mamba',
+                self._ok_args(num_moe_experts=8, multi_latent_attention=True), 'gpt-to-mamba'
             )
         msg = str(exc.value)
         assert 'MoE' in msg
