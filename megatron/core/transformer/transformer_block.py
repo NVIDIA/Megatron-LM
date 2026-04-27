@@ -795,9 +795,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
-        # Expand hidden states for hyper connections at the start of the block
-        # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
-        if self.config.enable_hyper_connections and self.pre_process:
+        # Expand hidden states for hyper connections at the start of the block.
+        # Pipeline-parallel HC support is blocked in TransformerConfig until P2P
+        # tensor shapes carry the n-stream hidden dimension.
+        if self.config.enable_hyper_connections:
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
@@ -921,8 +922,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
-        # Only contract if the final layer norm is in this stage
-        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+        # Contract n-stream hidden states at the block boundary even when the
+        # final layernorm is disabled; downstream output layers expect [s, b, C].
+        if self.config.enable_hyper_connections:
             hidden_states = HyperConnectionModule.output_contract(
                 hidden_states, self.num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]

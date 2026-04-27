@@ -17,12 +17,14 @@ if TYPE_CHECKING:
 
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
+    input_dtype = input_logits.dtype
+    input_logits = input_logits.float()
     row_max = input_logits.max(dim=-1, keepdim=True).values
     M = torch.exp(input_logits - row_max)
     for _ in range(num_iterations):
         M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
         M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
-    return M
+    return M.to(dtype=input_dtype)
 
 
 class SinkhornKnopp(torch.autograd.Function):
@@ -53,22 +55,22 @@ class SinkhornKnopp(torch.autograd.Function):
         return logits.grad, None, None
 
 
-def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
-    """Native Sinkhorn-Knopp (autograd.Function wrapper)."""
+def reference_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
+    """Reference Sinkhorn-Knopp (autograd.Function wrapper)."""
     return SinkhornKnopp.apply(input_logits, num_iterations, eps)
 
 
 @torch.compile
-def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
-    """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
+def reference_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
+    """Reference n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
 @torch.compile
-def native_h_post_bda(
+def reference_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
-    """Native H_res @ residual + H_post * (x [+ bias])."""
+    """Reference H_res @ residual + H_post * (x [+ bias])."""
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, C)
@@ -81,8 +83,8 @@ def native_h_post_bda(
 
 
 @torch.compile
-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
-    """Native fused projection + RMS normalization."""
+def reference_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
+    """Reference fused projection + RMS normalization."""
     proj = torch.matmul(x, weight.t())
     norm = x.norm(dim=-1, keepdim=True)
     K = x.shape[-1]
@@ -96,7 +98,6 @@ def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tenso
 # ============================================================================
 
 
-# TODO: keep hyper connection in fp32 computation
 class HyperConnectionModule(MegatronModule):
     """
     Unified mHC (Manifold-Constrained Hyper-Connections) module.
@@ -124,7 +125,9 @@ class HyperConnectionModule(MegatronModule):
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
 
-        # Projection weights for dynamic mappings
+        # Projection weights for dynamic mappings. The reference implementation
+        # keeps this as a full, non-TP-partitioned linear projection over n*C;
+        # fused/partitioned variants are expected to replace it in follow-up work.
         # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
         # - H_pre: n values
         # - H_post: n values
@@ -159,10 +162,10 @@ class HyperConnectionModule(MegatronModule):
             self._h_post_bda_op = fused_h_post_bda
             self._proj_rms_op = fused_proj_rms
         else:
-            self._sinkhorn_op = native_sinkhorn
-            self._h_aggregate_op = native_h_aggregate
-            self._h_post_bda_op = native_h_post_bda
-            self._proj_rms_op = native_proj_rms
+            self._sinkhorn_op = reference_sinkhorn
+            self._h_aggregate_op = reference_h_aggregate
+            self._h_post_bda_op = reference_h_post_bda
+            self._proj_rms_op = reference_proj_rms
 
         self._init_weights()
 
@@ -665,7 +668,7 @@ class HyperConnectionModule(MegatronModule):
             bda_func = get_bias_dropout_add(training, fused)
             has_bias = bias is not None
 
-            def _native_wrapper(h_res, original_residual, h_post, x, *optional_bias):
+            def _reference_wrapper(h_res, original_residual, h_post, x, *optional_bias):
                 with torch.cuda.nvtx.range("HyperConnection::apply_h_res"):
                     mixed = self.apply_h_res(h_res, original_residual)
                 with torch.cuda.nvtx.range("HyperConnection::apply_h_post"):
@@ -680,37 +683,8 @@ class HyperConnectionModule(MegatronModule):
 
             ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
             if has_bias:
-                output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x, bias)
+                output = ckpt.checkpoint(_reference_wrapper, h_res, original_residual, h_post, x, bias)
             else:
-                output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x)
+                output = ckpt.checkpoint(_reference_wrapper, h_res, original_residual, h_post, x)
 
         return output
-
-
-# ==================== Checkpoint utilities for mHC ====================
-
-
-class HyperConnectionCheckpoint:
-    """
-    Checkpoint utility for mHC intermediate activations.
-
-    Implements the paper's "recomputing strategy" to reduce memory footprint
-    by discarding intermediate n-stream activations and recomputing on-the-fly.
-    """
-
-    @staticmethod
-    def compute_optimal_block_size(num_layers: int, num_streams: int) -> int:
-        """
-        Compute optimal recomputation block size.
-
-        From paper Eq. (20): L_r^* ≈ sqrt(nL/(n+2))
-
-        Args:
-            num_layers: Total number of transformer layers
-            num_streams: Number of residual streams (n)
-
-        Returns:
-            block_size: Optimal block size for checkpointing
-        """
-        block_size = int(math.sqrt(num_streams * num_layers / (num_streams + 2)))
-        return max(1, block_size)

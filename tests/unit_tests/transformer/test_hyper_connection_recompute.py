@@ -11,6 +11,8 @@ Tests the following functionality:
 5. TransformerConfig 'mhc' in recompute_modules option
 """
 
+import warnings
+
 import pytest
 import torch
 
@@ -402,6 +404,48 @@ class TestTransformerConfigRecomputeMhc:
         )
         assert "mhc" in config.recompute_modules
         assert config.enable_hyper_connections is True
+
+    def test_config_rejects_pipeline_parallel_hyper_connections(self):
+        """Pipeline-parallel tensor shapes do not support n-stream hidden states yet."""
+        with pytest.raises(
+            ValueError,
+            match="enable_hyper_connections is not yet compatible with pipeline parallelism",
+        ):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_hyper_connections=True,
+                num_residual_streams=4,
+                pipeline_model_parallel_size=2,
+                pipeline_dtype=torch.float32,
+            )
+
+    def test_hyper_connection_recompute_warning_requires_recompute(self):
+        """Do not warn about missing 'mhc' recompute when recompute is disabled."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_hyper_connections=True,
+                num_residual_streams=4,
+            )
+
+        assert not any("HyperConnections are enabled" in str(w.message) for w in caught)
+
+    def test_hyper_connection_recompute_warning_for_selective_without_mhc(self):
+        """Still warn when selective recompute is on but 'mhc' is omitted."""
+        with pytest.warns(UserWarning, match="HyperConnections are enabled"):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_hyper_connections=True,
+                num_residual_streams=4,
+                recompute_granularity="selective",
+            )
 
 
 if __name__ == "__main__":

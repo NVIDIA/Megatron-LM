@@ -747,6 +747,8 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         torch.autograd.backward(outputs, args)
         ctx.outputs = None
         ctx.inputs = None
+        # Autograd expects None for non-tensor inputs; returning the original
+        # non-tensor value as a "gradient" is invalid once args are restored.
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
         return (None, None) + grads
 
@@ -791,9 +793,11 @@ class CheckpointManager:
             hook_tensor.register_hook(self._unified_recompute_hook)
 
     def _unified_recompute_hook(self, grad_output):
+        # Chained checkpoints rely on forward-order recomputation. Each
+        # _recompute() restores output storage in-place on the original tensor
+        # objects, so a later checkpoint sees its saved input storage restored
+        # before it recomputes.
         for ckpt in self.checkpoints:
-            # Call _recompute for each checkpoint in forward order
-            # The _recompute method will restore the output tensor storage
             ckpt._recompute(None)
 
 
@@ -822,6 +826,8 @@ class CheckpointWithoutOutput(object):
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
         """
+        # Treat the default fp8=False as disabled. The old "fp8 is not None"
+        # behavior entered the TE FP8 recompute path for non-FP8 callers.
         self.fp8 = bool(fp8)
         self.ckpt_manager = ckpt_manager
         self.run_function = None

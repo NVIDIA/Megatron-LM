@@ -1517,8 +1517,10 @@ class TransformerConfig(ModelParallelConfig):
                     "tensor_pop on a None chunk. Disable one of them."
                 )
 
-        if self.enable_hyper_connections and not (
-            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        if (
+            self.enable_hyper_connections
+            and self.recompute_granularity is not None
+            and not (self.recompute_granularity == "selective" and "mhc" in self.recompute_modules)
         ):
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
@@ -1553,6 +1555,13 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "enable_hyper_connections is not compatible with Multi-Token Prediction (MTP). "
                 "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
+            )
+
+        if self.enable_hyper_connections and self.pipeline_model_parallel_size > 1:
+            raise ValueError(
+                "enable_hyper_connections is not yet compatible with pipeline parallelism "
+                "(pipeline_model_parallel_size > 1). Pipeline-parallel support is planned "
+                "for a follow-up PR."
             )
 
         if self.fine_grained_activation_offloading:

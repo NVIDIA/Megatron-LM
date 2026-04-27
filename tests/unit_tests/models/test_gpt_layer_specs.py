@@ -22,28 +22,28 @@ _ID = IdentityOp
 
 
 class TestGptLayerSpecsHyperConnection:
-    """Test that enable_hyper_connection controls module types in layer specs."""
+    """Test that enable_hyper_connections controls module types in layer specs."""
 
     @pytest.mark.parametrize(
         "factory,kwargs,expected_module,expected_hc",
         [
             (_TE, {}, _TL, _ID),
-            (_TE, {"enable_hyper_connection": True}, _HC, _HC_MOD),
-            (_TE, {"enable_hyper_connection": False}, _TL, _ID),
-            (_TE, {"multi_latent_attention": True, "enable_hyper_connection": False}, _TL, _ID),
-            (_TE, {"multi_latent_attention": True, "enable_hyper_connection": True}, _HC, _HC_MOD),
+            (_TE, {"enable_hyper_connections": True}, _HC, _HC_MOD),
+            (_TE, {"enable_hyper_connections": False}, _TL, _ID),
+            (_TE, {"multi_latent_attention": True, "enable_hyper_connections": False}, _TL, _ID),
+            (_TE, {"multi_latent_attention": True, "enable_hyper_connections": True}, _HC, _HC_MOD),
             (_LOCAL, {}, _TL, _ID),
-            (_LOCAL, {"enable_hyper_connection": True}, _HC, _HC_MOD),
-            (_LOCAL, {"enable_hyper_connection": False}, _TL, _ID),
-            (_LOCAL, {"multi_latent_attention": True, "enable_hyper_connection": False}, _TL, _ID),
+            (_LOCAL, {"enable_hyper_connections": True}, _HC, _HC_MOD),
+            (_LOCAL, {"enable_hyper_connections": False}, _TL, _ID),
+            (_LOCAL, {"multi_latent_attention": True, "enable_hyper_connections": False}, _TL, _ID),
             (
                 _LOCAL,
-                {"multi_latent_attention": True, "enable_hyper_connection": True},
+                {"multi_latent_attention": True, "enable_hyper_connections": True},
                 _HC,
                 _HC_MOD,
             ),
-            (_LOCAL, {"normalization": "RMSNorm", "enable_hyper_connection": False}, _TL, _ID),
-            (_LOCAL, {"normalization": "RMSNorm", "enable_hyper_connection": True}, _HC, _HC_MOD),
+            (_LOCAL, {"normalization": "RMSNorm", "enable_hyper_connections": False}, _TL, _ID),
+            (_LOCAL, {"normalization": "RMSNorm", "enable_hyper_connections": True}, _HC, _HC_MOD),
         ],
         ids=[
             "te_default",
@@ -65,3 +65,9 @@ class TestGptLayerSpecsHyperConnection:
         assert spec.module is expected_module
         assert spec.submodules.self_attention_hyper_connection is expected_hc
         assert spec.submodules.mlp_hyper_connection is expected_hc
+
+    @pytest.mark.parametrize("factory", [_TE, _LOCAL], ids=["te", "local"])
+    def test_singular_hyper_connection_keyword_rejected(self, factory):
+        """The spec keyword should match TransformerConfig.enable_hyper_connections."""
+        with pytest.raises(TypeError, match="enable_hyper_connection"):
+            factory(enable_hyper_connection=True)

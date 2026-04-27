@@ -706,9 +706,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         # Injected by __call__ for cuda graph keying; not a real forward arg.
         kwargs.pop("dynamic_inference_decode_only", None)
-        assert (
-            not self.config.enable_hyper_connections
-        ), "Please use HyperConnectionTransformerLayer instead"
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -1299,11 +1296,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.cuda_graphs[cg_index].backward_dw()
 
     def __call__(self, *args, **kwargs):
-        # Extract mhc_recompute_manager before CUDA graph manager processes kwargs,
-        # since CheckpointManager is not a CUDA-graph-supported type.
-        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-        kwargs.pop("is_last_layer_in_recompute_block", None)
-
         if self._should_call_local_cudagraph(*args, **kwargs):
             # Inference mode.
             if kwargs.get('inference_context') is not None:
@@ -1421,6 +1413,15 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         ):
             submodules.append(self.mlp_hyper_connection)
         return submodules
+
+    def __call__(self, *args, **kwargs):
+        # Extract before CUDA graph manager processes kwargs; CheckpointManager
+        # is not a CUDA-graph-supported argument type.
+        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        try:
+            return super().__call__(*args, **kwargs)
+        finally:
+            self._mhc_recompute_manager = None
 
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
