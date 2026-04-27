@@ -222,51 +222,6 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
 
         for i in range(len(corrected_budget_list)):
             report[f"logits distillation loss {corrected_budget_list[i]:.3f}"] = (all_budget_logit[i], all_budget_tokens[i])
-        
-        # Add per-budget lm loss tracking following same pattern as logits distillation loss
-        # Only do this if lm loss is enabled (not being skipped by distillation config)
-
-        # current_lm_loss = reporting_loss_lm[0] - param_loss_item.clone().detach()
-        # lm_loss_enabled = current_lm_loss.abs() > 1e-8  # Check if lm loss is meaningful (not just zeros)
-        
-        # if lm_loss_enabled:
-        #     for temp_budget in corrected_budget_list:
-        #         report[f"lm loss {temp_budget:.3f}"] = (
-        #             torch.tensor(0.0, device=logits_loss.device, dtype=logits_loss.dtype),
-        #             torch.tensor(0.0, device=logits_loss.device, dtype=logits_loss.dtype)
-        #         )
-            
-        #     # All-gather lm loss across all data parallel ranks
-        #     lm_loss_gathered = [torch.zeros_like(current_lm_loss) for _ in range(dp_world_size)]
-        #     torch.distributed.all_gather(
-        #         lm_loss_gathered,
-        #         current_lm_loss,
-        #         group=parallel_state.get_data_parallel_group()
-        #     )
-        #     lm_loss_gathered = torch.stack(lm_loss_gathered)
-            
-        #     # Select lm loss for current budget
-        #     lm_loss_gathered_selected = lm_loss_gathered[budget_mask].sum()/budget_mask.sum()
-            
-        #     # Create tensors to track lm loss values per budget
-        #     all_budget_lm_loss = torch.zeros(len(corrected_budget_list), device=logits_loss.device, dtype=logits_loss.dtype)
-        #     all_budget_lm_tokens = torch.zeros(len(corrected_budget_list), device=logits_loss.device, dtype=logits_loss.dtype)
-            
-        #     # Set values for current selected budget
-        #     all_budget_lm_loss[index_of_selected_budget] = lm_loss_gathered_selected
-        #     all_budget_lm_tokens[index_of_selected_budget] = budget_num_tokens
-            
-        #     # All-reduce across data parallel group
-        #     torch.distributed.all_reduce(all_budget_lm_loss, group=parallel_state.get_data_parallel_group(), op=torch.distributed.ReduceOp.SUM)
-        #     torch.distributed.all_reduce(all_budget_lm_tokens, group=parallel_state.get_data_parallel_group(), op=torch.distributed.ReduceOp.SUM)
-            
-        #     # Update report with per-budget lm loss values
-        #     for i in range(len(corrected_budget_list)):
-        #         report[f"lm loss {corrected_budget_list[i]:.3f}"] = (all_budget_lm_loss[i], all_budget_lm_tokens[i])
-
-        # # added by Sharath
-        # report["param loss"] = param_loss_item_avg
-        # report["lm loss"] = reporting_loss_lm[0]
 
     # Convert all items in report dict to torch.tensor
     for key, val in report.items():
