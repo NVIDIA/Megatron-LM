@@ -1248,9 +1248,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         getattr(args, 'parameter_sharding_size', 1) > 1
         or getattr(args, 'expert_parameter_sharding_size', 1) > 1
     ):
-        if getattr(args, 'fp8_recipe', None) == 'mxfp8':
-            update_etp_config(pad_for_alignment=32)
-        elif getattr(args, 'fp4', None) is not None or getattr(args, 'fp8', None) is not None:
+        if getattr(args, 'fp4', None) is not None:
+            update_etp_config(pad_for_alignment=16)
+        elif getattr(args, 'fp8_recipe', None) == 'mxfp8':
+            update_etp_config(pad_for_alignment=32, coalesce_amax_allreduce=False)
+        elif getattr(args, 'fp8', None) is not None:
             update_etp_config(pad_for_alignment=16)
 
     # Build model.
