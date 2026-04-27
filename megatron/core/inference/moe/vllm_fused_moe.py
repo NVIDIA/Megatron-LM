@@ -62,6 +62,7 @@ def _fused_moe_kernel(
     stride_cn,
     # Flags / constexprs
     MUL_ROUTED_WEIGHT: tl.constexpr,
+    FUSE_SQUARED_RELU: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -73,6 +74,9 @@ def _fused_moe_kernel(
     A: [num_tokens, K]           – input hidden states (unpermuted)
     B: [num_local_experts, N, K] – stacked expert weights
     C: [num_tokens * topk, N]    – output (one row per topk slot)
+
+    When FUSE_SQUARED_RELU is True, applies squared_relu to the GEMM
+    output in-register before writing, avoiding a separate activation pass.
     """
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -118,6 +122,10 @@ def _fused_moe_kernel(
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if FUSE_SQUARED_RELU:
+        accumulator = tl.maximum(accumulator, 0.0)
+        accumulator *= accumulator
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -301,6 +309,7 @@ def _invoke_fused_moe_kernel(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
+    fuse_squared_relu: bool = False,
     config: Optional[dict] = None,
 ):
     """Launch the Triton fused-MoE kernel for one GEMM pass."""
@@ -335,23 +344,10 @@ def _invoke_fused_moe_kernel(
         C.stride(0),
         C.stride(1),
         MUL_ROUTED_WEIGHT=mul_routed_weight,
+        FUSE_SQUARED_RELU=fuse_squared_relu,
         top_k=top_k,
         **config,
     )
-
-
-# ---------------------------------------------------------------------------
-# Activation helper
-# ---------------------------------------------------------------------------
-
-
-def _apply_activation_inplace(activation_type: ActivationType, x: torch.Tensor) -> None:
-    """Element-wise activation, applied in-place."""
-    if activation_type == ActivationType.SQUARED_RELU:
-        x.clamp_(min=0)
-        x.mul_(x)
-    else:
-        raise ValueError(f"Unsupported activation: {activation_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -411,9 +407,12 @@ def vllm_fused_moe(
 
     topk_weights_flat = probs.reshape(-1).contiguous()
 
-    # FC1: [max_tokens, K] → [max_tokens*topk, N]
+    # FC1 + activation: [max_tokens, K] → [max_tokens*topk, N]
+    # Activation is fused into the GEMM kernel — squared_relu is applied
+    # in-register before writing, avoiding a separate pass over the buffer.
     # torch.empty is safe: FC2 reads the same indirection positions FC1 writes,
     # so unwritten rows (non-local / beyond valid_tokens) are never consumed.
+    assert activation_type == ActivationType.SQUARED_RELU
     intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
@@ -427,10 +426,8 @@ def vllm_fused_moe(
         num_post,
         mul_routed_weight=False,
         top_k=topk,
+        fuse_squared_relu=True,
     )
-
-    # Activation (in-place to avoid allocating a second buffer)
-    _apply_activation_inplace(activation_type, intermediate1)
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights
     # torch.zeros required: the topk reduction sums ALL slots per token, and
