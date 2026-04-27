@@ -18,36 +18,6 @@ import torch
 _buffer = None
 
 
-def _drain_etp_side_streams(chain_id: str = None):
-    """Drain ETP ag/rs side streams before an eager NCCL collective.
-
-    Eager NCCL ops on main_stream (dispatch all-to-all, combine, etc.) can deadlock
-    at scale over IB if concurrent NCCL ops are still running on ag/rs side streams.
-
-    Args:
-        chain_id: ETPChain.GRAPHED.value, ETPChain.UNGRAPHED.value, or None
-                  (drain all chains).
-    """
-    from megatron.core.etp_utils import (
-        HAVE_ETP,
-        get_ag_streams_for_chain,
-        get_all_ag_streams,
-        get_all_rs_streams,
-        get_rs_streams_for_chain,
-    )
-    if not HAVE_ETP:
-        return
-    if chain_id is not None:
-        for s in get_ag_streams_for_chain(chain_id):
-            torch.cuda.current_stream().wait_stream(s)
-        for s in get_rs_streams_for_chain(chain_id):
-            torch.cuda.current_stream().wait_stream(s)
-    else:
-        for s in get_all_ag_streams():
-            torch.cuda.current_stream().wait_stream(s)
-        for s in get_all_rs_streams():
-            torch.cuda.current_stream().wait_stream(s)
-
 
 
 def get_hidden_bytes(x: torch.Tensor) -> int:

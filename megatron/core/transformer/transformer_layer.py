@@ -1337,14 +1337,6 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        # Drain all in-flight ETP AG/RS side streams before eager expert
-        # compute. UNGRAPHED prefetches can cross MoE layer boundaries and
-        # still be running when the eager MoE AllToAll dispatches; draining
-        # both chains here serializes them against the AllToAll.
-        if self.config.parameter_sharding_size > 1 or self.config.expert_parameter_sharding_size > 1:
-            from megatron.core.transformer.moe.fused_a2a import _drain_etp_side_streams
-            _drain_etp_side_streams()
-
         # Restore token dispatcher attributes that were captured during CUDA graph recording.
         # After router graph replay, Python code does not re-run, so any attribute that was
         # mutated by eager expert_compute (e.g. tokens_per_expert set to None by
