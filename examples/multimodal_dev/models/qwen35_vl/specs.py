@@ -11,20 +11,32 @@ from typing import Optional
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.models.vision.vit_layer_specs import (
-    get_vit_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import (
-    TransformerBlockSubmodules,
-)
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-
 
 # ---------------------------------------------------------------------------
 # fp32 RoPE helper — mirrors Bridge's apply_rotary_pos_emb_in_fp32=True
 # ---------------------------------------------------------------------------
+
+class _NoCPGroup:
+    """Dummy process group reporting ``size()=1, rank()=0``.
+
+    Used by the vision encoder so that ``_apply_rotary_pos_emb_thd``
+    processes the full packed sequence without CP splitting.
+    """
+
+    def size(self):
+        return 1
+
+    def rank(self):
+        return 0
+
+
+_NO_CP_GROUP = _NoCPGroup()
+
 
 def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
@@ -64,6 +76,19 @@ def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=Non
     return out.to(orig_dtype)
 
 
+def _apply_rope_fp32_no_cp(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+    """Same as ``_apply_rope_fp32`` but forces CP-size=1.
+
+    The vision encoder uses THD packed sequences for variable-resolution
+    images.  When the language model uses CP>1, the global CP group would
+    incorrectly split the vision seqlens.  This wrapper substitutes a
+    trivial group so the vision RoPE sees the full packed sequence.
+    """
+    return _apply_rope_fp32(
+        t, freqs, config, cu_seqlens, mscale, cp_group=_NO_CP_GROUP,
+    )
+
+
 class Qwen35VLVisionSelfAttention(SelfAttention):
     """ViT self-attention with RoPE applied in fp32.
 
@@ -78,7 +103,7 @@ class Qwen35VLVisionSelfAttention(SelfAttention):
         import megatron.core.transformer.attention as _attn_mod
 
         _orig = _attn_mod.apply_rotary_pos_emb
-        _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32
+        _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32_no_cp
         try:
             return super().forward(*args, **kwargs)
         finally:

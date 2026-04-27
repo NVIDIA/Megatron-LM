@@ -8,10 +8,17 @@ layers.
 """
 
 from typing import Optional
+
 import torch
 from torch import Tensor
 
-from examples.multimodal_dev.models.base import MultimodalModel
+from examples.multimodal_dev.models.base import (
+    _NO_CP_GROUP,
+    MultimodalModel,
+    _cp_debug_dump,
+    _cp_split_tensor,
+    _thd_cp_partition_index,
+)
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     MROPE_SECTION,
     QWEN35_VL_IMAGE_TOKEN_ID,
@@ -188,14 +195,113 @@ class Qwen35VLModel(MultimodalModel):
             else:
                 decoder_input = text_embeddings
 
-        output = self.language_model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            decoder_input=decoder_input,
-            labels=labels,
-            loss_mask=loss_mask,
-            packed_seq_params=packed_seq_params,
+        # --- Context Parallelism: split along sequence dimension ---
+        # BSHD path: zigzag-split tensors along seq dim. position_ids is
+        #   left alone — the MRoPE/RoPE embedding handles its own CP
+        #   slicing via ``get_pos_emb_on_this_cp_rank()``.
+        # THD path: use TE's ``thd_get_partitioned_indices`` so each
+        #   packed sub-sample is split per-sample. MRoPE position_ids
+        #   were pre-computed on the full [1, T] layout above and MUST
+        #   be sliced with the same per-rank index here.
+        from megatron.core import parallel_state
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size > 1:
+            cp_rank = parallel_state.get_context_parallel_rank()
+            if packed_seq_params is not None:
+                total_tokens = (
+                    decoder_input.shape[0]
+                    if decoder_input is not None
+                    else input_ids.shape[1]
+                )
+                idx = _thd_cp_partition_index(
+                    packed_seq_params.cu_seqlens_q_padded,
+                    total_tokens, cp_size, cp_rank,
+                )
+                if decoder_input is not None:
+                    decoder_input = decoder_input.index_select(0, idx)
+                if input_ids is not None:
+                    input_ids = input_ids.index_select(1, idx)
+                if labels is not None:
+                    labels = labels.index_select(1, idx)
+                if loss_mask is not None:
+                    loss_mask = loss_mask.index_select(1, idx)
+                # position_ids is left at full length [3, 1, T]. MRoPE
+                # returns full freqs; attention's _apply_rotary_pos_emb_thd
+                # does per-sample CP zigzag via _get_thd_freqs_on_this_cp_rank
+                # using cu_seqlens. We do NOT set packed_seq_params.cp_group
+                # here — MTP reads it at runtime and would lose CP-aware
+                # rolling of labels/loss_mask if forced to size-1.
+                # MRoPE's BSHD-style zigzag is bypassed by mutating
+                # mrope.cp_group directly below.
+                # attention_mask is None in THD; skip.
+            else:
+                if decoder_input is not None:
+                    decoder_input = _cp_split_tensor(
+                        decoder_input, seq_dim=0,
+                        cp_size=cp_size, cp_rank=cp_rank,
+                    )
+                if input_ids is not None:
+                    input_ids = _cp_split_tensor(
+                        input_ids, seq_dim=1,
+                        cp_size=cp_size, cp_rank=cp_rank,
+                    )
+                if labels is not None:
+                    labels = _cp_split_tensor(
+                        labels, seq_dim=1,
+                        cp_size=cp_size, cp_rank=cp_rank,
+                    )
+                if loss_mask is not None:
+                    loss_mask = _cp_split_tensor(
+                        loss_mask, seq_dim=1,
+                        cp_size=cp_size, cp_rank=cp_rank,
+                    )
+                if attention_mask is not None:
+                    attention_mask = _cp_split_tensor(
+                        attention_mask, seq_dim=1,
+                        cp_size=cp_size, cp_rank=cp_rank,
+                    )
+
+            _cp_debug_dump(
+                "Qwen35VLModel.forward post-CP",
+                decoder_input=decoder_input,
+                input_ids=input_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                position_ids=position_ids,
+                cu_seqlens_q_padded=(
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params is not None
+                    else None
+                ),
+            )
+
+        # In THD mode, temporarily override MRoPE's cp_group on the
+        # language_model so it skips its BSHD-style zigzag of pre-computed
+        # MRoPE embeddings.  Only affects ``MultimodalRotaryEmbedding``;
+        # attention's RoPE / CP path and MTP both keep their real cp_group.
+        _mrope = (
+            getattr(self.language_model, "rotary_pos_emb", None)
+            if packed_seq_params is not None
+            and parallel_state.get_context_parallel_world_size() > 1
+            else None
         )
+        _saved_mrope_cp_group = (
+            getattr(_mrope, "cp_group", None) if _mrope is not None else None
+        )
+        if _mrope is not None:
+            _mrope.cp_group = _NO_CP_GROUP
+        try:
+            output = self.language_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                decoder_input=decoder_input,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+        finally:
+            if _mrope is not None:
+                _mrope.cp_group = _saved_mrope_cp_group
 
         return output

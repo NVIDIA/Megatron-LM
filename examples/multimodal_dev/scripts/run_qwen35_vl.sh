@@ -20,7 +20,7 @@ set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
-# export NVTE_FUSED_ATTN=1
+export NVTE_FUSED_ATTN=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 DRY_RUN=${DRY_RUN:-1}
@@ -47,6 +47,7 @@ GBS=${GBS:-16}
 TP=${TP:-1}
 EP=${EP:-2}
 PP=${PP:-1}
+CP=${CP:-1}
 
 # Variant-aware architecture defaults.
 # The model provider builds configs from the variant dict in
@@ -167,7 +168,7 @@ esac
 SEQ_LEN=${SEQ_LEN:-4096}
 
 WANDB_PROJECT=${WANDB_PROJECT:-'qwen35-vl-0524'}
-EXP_NAME="qwen35vl_${MODEL_VARIANT}_tp${TP}_ep${EP}_pp${PP}"
+EXP_NAME="qwen35vl_${MODEL_VARIANT}_tp${TP}_ep${EP}_pp${PP}_cp${CP}"
 
 RECOMPUTE_VISION=${RECOMPUTE_VISION:-0}
 if [ "$RECOMPUTE_VISION" -eq 1 ]; then
@@ -208,7 +209,8 @@ MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size "$TP"
     --pipeline-model-parallel-size "$PP"
     --expert-model-parallel-size "$EP"
-    --context-parallel-size 1
+    --context-parallel-size "$CP"
+    --cp-comm-type "a2a"
     --expert-tensor-parallel-size 1
     --use-distributed-optimizer
     --sequence-parallel
@@ -230,7 +232,6 @@ TRAINING_ARGS=(
     --clip-grad 1.0
     --bf16
     --use-mcore-models
-    --use-flash-attn
     --transformer-impl transformer_engine
     --cross-entropy-loss-fusion
     --cross-entropy-fusion-impl te
@@ -240,8 +241,9 @@ TRAINING_ARGS=(
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
     --sft
-    --attention-backend flash
-    # --calculate-per-token-loss
+    --use-flash-attn
+    # --attention-backend flash
+    --calculate-per-token-loss
 )
 
 PROFILE_ARGS=()
@@ -446,7 +448,7 @@ echo "  Variant:       $MODEL_VARIANT"
 echo "  Vision layers: $VISION_NUM_LAYERS"
 echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
-echo "  TP=$TP  EP=$EP  PP=$PP  CP=1"
+echo "  TP=$TP  EP=$EP  PP=$PP  CP=$CP"
 echo "  MBS=$MBS  GBS=$GBS"
 echo "  Launcher:      $LAUNCHER"
 echo "  FSDP:          $USE_FSDP"
