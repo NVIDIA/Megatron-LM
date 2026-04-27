@@ -1242,6 +1242,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # For distillation ckpts without ModelOpt state
             args.modelopt_enabled = True
 
+    # Configure ETP padding alignment based on quantization recipe before model construction.
+    from megatron.core.etp_utils import HAVE_ETP, update_etp_config
+    if HAVE_ETP and (
+        getattr(args, 'parameter_sharding_size', 1) > 1
+        or getattr(args, 'expert_parameter_sharding_size', 1) > 1
+    ):
+        if getattr(args, 'fp8_recipe', None) == 'mxfp8':
+            update_etp_config(pad_for_alignment=32)
+        elif getattr(args, 'fp4', None) is not None or getattr(args, 'fp8', None) is not None:
+            update_etp_config(pad_for_alignment=16)
+
     # Build model.
     def build_model():
         if (

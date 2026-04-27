@@ -21,6 +21,7 @@ try:
         reallocate_etp_cache_to_mempool,
         set_cuda_graph_scope,
         tag_etp_params_with_names,
+        update_config as update_etp_config,
         wait_async_comms,
         wrap_module_params_etp,
     )
@@ -41,6 +42,7 @@ except ImportError:
     set_cuda_graph_scope = None
     tag_etp_params_with_names = None
     wait_async_comms = None
+    update_etp_config = None
     wrap_module_params_etp = None
     HAVE_ETP = False
 
