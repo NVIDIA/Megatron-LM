@@ -192,10 +192,7 @@ def get_first_layers_disabled_config(config, num_layers: int = 1, num_layers_to_
     predicate = functools.partial(
         _is_first_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
     )
-    if isinstance(quant_cfg, list):
-        quant_cfg.append({"quantizer_name": predicate, "enable": False})
-    else:
-        quant_cfg.update({predicate: {"enable": False}})
+    quant_cfg.append({"quantizer_name": predicate, "enable": False})
     config["quant_cfg"] = quant_cfg
     return config
 
@@ -210,10 +207,7 @@ def get_last_layers_disabled_config(config, num_layers: int = 1, num_layers_to_d
     predicate = functools.partial(
         _is_last_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
     )
-    if isinstance(quant_cfg, list):
-        quant_cfg.append({"quantizer_name": predicate, "enable": False})
-    else:
-        quant_cfg.update({predicate: {"enable": False}})
+    quant_cfg.append({"quantizer_name": predicate, "enable": False})
     config["quant_cfg"] = quant_cfg
     return config
 
