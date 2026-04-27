@@ -1,6 +1,6 @@
 # Megatron-FSDP Examples
 
-Example scripts for training and checkpoint conversion using [Megatron-FSDP](../../docs/user-guide/features/megatron_fsdp.md). These demonstrate recommended configurations for Llama 3 8B and DeepSeek-V3 models, as well as checkpoint format conversion between `torch_dist` (N-D parallel) and `fsdp_dtensor` formats.
+Example scripts for training and checkpoint conversion using [Megatron-FSDP](../../docs/user-guide/features/megatron_fsdp.md). These demonstrate recommended configurations for Llama 3 8B and DeepSeek-V3 671B models, as well as checkpoint format conversion between `torch_dist` (N-D parallel) and `fsdp_dtensor` formats.
 
 ## Scripts
 
@@ -87,13 +87,13 @@ Before running, update the `#SBATCH` directives and `--container-mounts` in the 
 | `GBS` | `2048` | Global batch size. |
 | `PROFILE` | `0` | Set to `1` to enable Nsight Systems profiling (steps 10–12). |
 | `WANDB` | `1` | Set to `1` to enable Weights & Biases logging. Requires `WANDB_API_KEY`. |
-| `COMMENT` | `hybridep-selective-recompute` | Tag appended to W&B experiment names and Nsight profile filenames. |
+| `COMMENT` | N/A | Tag appended to W&B experiment names and Nsight profile filenames. |
 
 #### Configuration Summary
 
 - **Model**: DeepSeek-V3 (61 layers, 256 routed experts, top-8 routing, Multi-Latent Attention, MTP)
 - **Parallelism**: TP=1, EP=8, CP=1, FSDP ZeRO-3
-- **Precision**: BF16 with BF16 gradient reduction
+- **Precision**: BF16
 - **MoE**: Flex dispatcher with HybridEP backend, grouped GEMM, sigmoid routing with expert bias, auxiliary sequence loss
 - **Recomputation**: Selective recomputation of `mlp`, `moe`, `mla_up_proj`, and `layernorm` modules
 - **Optimizations**: NCCL user buffers, FSDP double buffering, meta-device initialization, per-token loss, overlapped grad-reduce and param-gather

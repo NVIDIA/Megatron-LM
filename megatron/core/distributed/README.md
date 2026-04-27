@@ -13,6 +13,7 @@ To use Megatron-FSDP in Megatron-LM, enable the following arguments:
 ```
 --use-megatron-fsdp
 --ckpt-format fsdp_dtensor
+--init-model-with-meta-device
 ```
 
 ## FSDP2
@@ -24,5 +25,3 @@ To use FSDP2 in Megatron-LM, enable the following arguments:
 --no-gradient-accumulation-fusion
 --ckpt-format torch_dist
 ```
-
-_**Note: FSDP2 is currently on a deprecation path, there may be functionality issues!**_

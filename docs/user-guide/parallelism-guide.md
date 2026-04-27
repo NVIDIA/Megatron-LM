@@ -22,13 +22,13 @@ The following table summarizes supported parallelism strategies.
 | **Pipeline Parallelism (PP)** | Model Depth | Very Deep Models |
 | **Context Parallelism (CP)** | Sequence Length | Long Sequences (8K+ Tokens) |
 | **Expert Parallelism (EP)** | MoE Experts | Mixture-of-Experts Models |
-| **Fully-Sharded Data Parallelism (FSDP)** | Model State | Larger Depthwise Model State & Activation Offloading |
+| **Fully-Sharded Data Parallelism (Megatron-FSDP)** | Model State | Larger Depthwise Model State & Activation Offloading |
 
 ## Data Parallelism (DP)
 
-Replicate the model across GPUs and split the batch.
+### Standard Distributed Data Parallel (DDP)
 
-### Standard Data Parallel (DDP)
+Replicate the model across GPUs and split the batch.
 
 ```bash
 torchrun --nproc_per_node=8 pretrain_gpt.py \
@@ -37,21 +37,39 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 
 Each GPU has a full copy of the model and processes a portion of the batch.
 
-### Fully Sharded Data Parallel (FSDP)
+### Megatron Fully-Sharded Data Parallel (Megatron-FSDP)
 
-Shard model parameters, gradients, and optimizer states to reduce memory:
+Shard model parameters, gradients, and optimizer states across GPUs to reduce memory utilization.
 
-```bash
-# Megatron FSDP (~15% faster than PyTorch FSDP2)
---use-megatron-fsdp \
+```
+--use-megatron-fsdp
 --data-parallel-sharding-strategy optim_grads_params
+--ckpt-format fsdp_dtensor
+--init-model-with-meta-device
 ```
 
-**Sharding strategies**
+**Sharding Strategies**
+
+`--data-parallel-sharding-strategy` supports the following options:
 
 - `optim` - Shard optimizer states only (ZeRO-1)
 - `optim_grads` - Shard gradients + optimizer (ZeRO-2)
 - `optim_grads_params` - Shard parameters + gradients + optimizer (ZeRO-3)
+
+If `--num-distributed-optimizer-instances` is > 1, then hierarchical data parallelism is enabled.
+
+`--outer-dp-sharding-strategy` supports the following options:
+
+- `no_shard` (**Hybrid-Sharded Data Parallelism**) - Replicate the model state across outer data parallel ranks.
+- `optim` (**Hybrid-FSDP**) - Shard the optimizer state across the outer data parallel ranks.
+  - Requires `--data-parallel-sharding-strategy optim_grads_params`.
+
+**When to Use**
+
+- Large models with large or fused compute kernels to hide communications under.
+- Integrated with TP, CP, EP, and easily composable with heterogeneous parallelisms.
+- With SM-reducing optimizations from NCCL and activation offloading from TransformerEngine.
+- Using `fully_shard` without depending on Megatron-LM.
 
 ## Tensor Parallelism (TP)
 
@@ -117,23 +135,6 @@ Distribute experts across GPUs in Mixture-of-Experts models.
 --expert-model-parallel-size 8
 --sequence-parallel  # Required when using TP + EP
 ```
-
-## Fully-Sharded Data Parallelism
-
-Shard optimizer state, weight gradients, and compute weights.
-
-```
---use-megatron-fsdp
---ckpt-format fsdp_dtensor
---init-model-with-meta-device
-```
-
-**When to Use**
-
-- Large models with large or fused compute kernels to hide communications under.
-- Integrated with TP, CP, EP, and easily composable with heterogeneous parallelisms.
-- With SM-reducing optimizations from NCCL and activation offloading from TransformerEngine.
-- Using `fully_shard` without depending on Megatron-LM.
 
 ## Parallelism Selection Guide
 
