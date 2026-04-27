@@ -44,7 +44,6 @@ from megatron.core.dist_checkpointing.strategies.common import (
 )
 
 
-FORMAT_LEGACY = 'legacy'
 FORMAT_TORCH_DIST = 'torch_dist'
 FORMAT_FSDP_DTENSOR = 'fsdp_dtensor'
 DIST_FORMATS = (FORMAT_TORCH_DIST, FORMAT_FSDP_DTENSOR)
@@ -89,7 +88,12 @@ def resolve_checkpoint_subdir(load_dir):
 
 
 def detect_checkpoint_format(load_dir):
-    """Return one of ``{'legacy', 'torch_dist', 'fsdp_dtensor'}``."""
+    """Return one of ``{'torch_dist', 'fsdp_dtensor'}``.
+
+    Raises ``ValueError`` if the directory looks like the legacy
+    ``mp_rank_XX`` layout (no longer supported) or doesn't match any known
+    dist-checkpoint metadata.
+    """
     ckpt_dir, _ = resolve_checkpoint_subdir(load_dir)
     config = maybe_load_config(ckpt_dir)
     if config is not None:
@@ -98,7 +102,10 @@ def detect_checkpoint_format(load_dir):
     if os.path.isdir(ckpt_dir) and any(
         name.startswith('mp_rank_') for name in os.listdir(ckpt_dir)
     ):
-        return FORMAT_LEGACY
+        raise ValueError(
+            f"{load_dir} looks like a legacy mp_rank_XX checkpoint. "
+            f"Legacy format is no longer supported — convert to torch_dist first."
+        )
 
     raise ValueError(f"Unrecognized checkpoint format at {load_dir}")
 

@@ -41,14 +41,15 @@ What happens to SSM parameters:
     mamba-to-gpt: SSM layers are discarded with a warning.
 
 Supported checkpoint formats:
-    - legacy       : mp_rank_XX[_YYY]/model_optim_rng.pt (TP + PP, no FSDP).
     - torch_dist   : Megatron distributed checkpoint (TP + PP + FSDP).
     - fsdp_dtensor : FSDP DTensor export (TP + PP + FSDP).
 
-    For distributed formats, PyTorch DCP gathers TP/PP/FSDP shards via the
-    checkpoint's global-shape metadata, so no explicit TP/PP/DP config is
-    needed on input. The input format is auto-detected; the output format
-    defaults to the input format.
+    PyTorch DCP gathers TP/PP/FSDP shards via the checkpoint's global-shape
+    metadata, so no explicit TP/PP/DP config is needed on input. The input
+    format is auto-detected; the output format defaults to the input format.
+
+    The legacy ``mp_rank_XX/model_optim_rng.pt`` layout is not supported —
+    convert old checkpoints to ``torch_dist`` first.
 
 GPT compatibility whitelist (safeguard):
     GPTModel is a strict homogeneous transformer (self-attention + MLP per
@@ -73,19 +74,6 @@ GPT compatibility whitelist (safeguard):
     `validate_source_args_gpt_compatible` for the exact rules.
 
 Example commands:
-    # GPT -> Mamba (legacy TP+PP checkpoint)
-    python tools/checkpoint/gpt_mamba_conversion.py \\
-        --direction gpt-to-mamba \\
-        --load-dir /path/to/gpt-checkpoint \\
-        --save-dir /path/to/mamba-checkpoint \\
-        --hybrid-layer-pattern "M*-M*-M*-M*-" \\
-        --target-tp-size 1 \\
-        --target-pp-size 1 \\
-        --d-model 4096 \\
-        --mamba-d-state 128 \\
-        --mamba2-n-groups 8 \\
-        --mamba2-head-dim 64
-
     # GPT -> Mamba (TP+PP+FSDP dist checkpoint)
     python tools/checkpoint/gpt_mamba_conversion.py \\
         --direction gpt-to-mamba \\
@@ -97,14 +85,12 @@ Example commands:
         --mamba2-n-groups 8 \\
         --mamba2-head-dim 64
 
-    # Mamba -> GPT (legacy)
+    # Mamba -> GPT (dist checkpoint)
     python tools/checkpoint/gpt_mamba_conversion.py \\
         --direction mamba-to-gpt \\
-        --load-dir /path/to/mamba-checkpoint \\
-        --save-dir /path/to/gpt-checkpoint \\
+        --load-dir /path/to/mamba-dist-checkpoint \\
+        --save-dir /path/to/gpt-dist-checkpoint \\
         --hybrid-layer-pattern "M*-M*-M*-M*-" \\
-        --target-tp-size 1 \\
-        --target-pp-size 1 \\
         --d-model 4096 \\
         --mamba-d-state 128 \\
         --mamba2-n-groups 8 \\
@@ -122,241 +108,12 @@ import torch
 
 from dist_checkpoint_io import (
     DIST_FORMATS,
-    FORMAT_LEGACY,
     FORMAT_TORCH_DIST,
     detect_checkpoint_format,
     load_dist_checkpoint_full,
     save_dist_checkpoint_full,
     write_latest_iteration_marker,
 )
-
-
-# ---------------------------------------------------------------------------
-# TP split-dim mapping (reused from hybrid_conversion.py)
-# ---------------------------------------------------------------------------
-
-# Maps parameter-name substrings to the tensor dimension along which they are
-# sharded across TP ranks.  -1 means "replicated" (not sharded).
-TP_SPLIT_DIM = {
-    # embeddings / output
-    'word_embeddings.weight': 0,
-    'output_layer.weight': 0,
-    # norms (replicated)
-    'norm.weight': -1,
-    'final_norm.weight': -1,
-    'final_layernorm.weight': -1,
-    'final_layernorm.bias': -1,
-    # mamba SSM params
-    'A_log': 0,
-    'D': 0,
-    'dt_bias': 0,
-    'in_proj.weight': 0,
-    'conv1d.weight': 0,
-    'conv1d.bias': 0,
-    'x_proj.weight': 1,
-    'dt_proj.weight': 0,
-    'dt_proj.bias': 0,
-    'out_proj.weight': 1,
-    'mixer.norm.weight': 0,
-    # MLP (transformer-style)
-    'linear_fc1.layer_norm_weight': -1,
-    'linear_fc1.weight': 0,
-    'linear_fc2.weight': 1,
-    # attention (transformer-style)
-    'self_attention.linear_proj.weight': 1,
-    'self_attention.linear_qkv.layer_norm_weight': -1,
-    'self_attention.linear_qkv.weight': 0,
-    # standalone layer norms (used in non-TE / "local" transformer impl)
-    'input_layernorm.weight': -1,
-    'input_layernorm.bias': -1,
-    'pre_mlp_layernorm.weight': -1,
-    'pre_mlp_layernorm.bias': -1,
-    # TE-fused layer norms in Mamba in_proj
-    'in_proj.layer_norm_weight': -1,
-    'in_proj.layer_norm_bias': -1,
-}
-
-
-def get_split_dim(tensor_name):
-    """Determine the TP-split dimension for a given parameter name."""
-    # Disambiguate mixer.norm.weight vs generic norm.weight
-    if 'norm.weight' in tensor_name:
-        if 'mixer.norm.weight' in tensor_name:
-            return TP_SPLIT_DIM['mixer.norm.weight']
-        elif 'final_norm.weight' in tensor_name:
-            return TP_SPLIT_DIM['final_norm.weight']
-        elif 'final_layernorm.weight' in tensor_name:
-            return TP_SPLIT_DIM['final_layernorm.weight']
-        elif 'layer_norm_weight' in tensor_name:
-            # TE-fused layer norm weights
-            for key in TP_SPLIT_DIM:
-                if key in tensor_name:
-                    return TP_SPLIT_DIM[key]
-            return -1
-        else:
-            return TP_SPLIT_DIM['norm.weight']
-
-    for key in TP_SPLIT_DIM:
-        if key in tensor_name:
-            return TP_SPLIT_DIM[key]
-    raise ValueError(f"Unknown tensor name for TP splitting: {tensor_name}")
-
-
-# ---------------------------------------------------------------------------
-# TP combine / split  (reused from hybrid_conversion.py)
-# ---------------------------------------------------------------------------
-
-def combine_tp_tensors(params, key, dim, tensors):
-    """Combine TP-sharded tensors back into one full tensor.
-
-    Handles special Mamba v2 in_proj and conv1d interleaved layouts.
-    """
-    tp_size = len(tensors)
-
-    if 'mixer.in_proj.weight' in key and params.mamba_version == 1:
-        xs, zs = [], []
-        for tensor in tensors:
-            x, z = torch.split(
-                tensor,
-                [params.mamba_d_inner // tp_size, params.mamba_d_inner // tp_size],
-                dim=dim,
-            )
-            xs.append(x)
-            zs.append(z)
-        return torch.cat([torch.cat(xs, dim=dim), torch.cat(zs, dim=dim)], dim=dim)
-
-    elif 'mixer.in_proj.weight' in key and params.mamba_version == 2:
-        xs, zs, Bs, Cs, dts = [], [], [], [], []
-        for tensor in tensors:
-            x, z, B, C, dt = torch.split(
-                tensor,
-                [
-                    params.mamba_d_inner // tp_size,
-                    params.mamba_d_inner // tp_size,
-                    (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
-                    (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
-                    params.mamba2_n_heads // tp_size,
-                ],
-                dim=dim,
-            )
-            xs.append(x)
-            zs.append(z)
-            Bs.append(B)
-            Cs.append(C)
-            dts.append(dt)
-
-        for ii in range(len(Bs)):
-            Bs[ii] = Bs[ii].reshape(-1, params.mamba_d_state, Bs[ii].shape[-1])
-            Cs[ii] = Cs[ii].reshape(-1, params.mamba_d_state, Cs[ii].shape[-1])
-        B = torch.cat(Bs, dim=dim)
-        C = torch.cat(Cs, dim=dim)
-        x = torch.cat(xs, dim=dim)
-        z = torch.cat(zs, dim=dim)
-        dt = torch.cat(dts, dim=dim)
-        return torch.cat([x, z, B.flatten(0, 1), C.flatten(0, 1), dt], dim=dim)
-
-    elif 'mixer.conv1d' in key and params.mamba_version == 2:
-        xs, Bs, Cs = [], [], []
-        for tensor in tensors:
-            x, B, C = torch.split(
-                tensor,
-                [
-                    params.mamba_d_inner // tp_size,
-                    (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
-                    (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
-                ],
-                dim=dim,
-            )
-            xs.append(x)
-            Bs.append(B)
-            Cs.append(C)
-
-        for ii in range(len(Bs)):
-            if 'weight' in key:
-                Bs[ii] = Bs[ii].reshape(-1, params.mamba_d_state, Bs[ii].shape[-2], Bs[ii].shape[-1])
-                Cs[ii] = Cs[ii].reshape(-1, params.mamba_d_state, Cs[ii].shape[-2], Cs[ii].shape[-1])
-            elif 'bias' in key:
-                Bs[ii] = Bs[ii].reshape(-1, params.mamba_d_state)
-                Cs[ii] = Cs[ii].reshape(-1, params.mamba_d_state)
-            else:
-                raise ValueError(f"Unknown conv1d key: {key}")
-        B = torch.cat(Bs, dim=dim)
-        C = torch.cat(Cs, dim=dim)
-        x = torch.cat(xs, dim=dim)
-        return torch.cat([x, B.flatten(0, 1), C.flatten(0, 1)], dim=dim)
-
-    else:
-        return torch.cat(tensors, dim=dim)
-
-
-def split_tensor_for_tp(params, key, dim, tensor):
-    """Split a full tensor into TP shards.
-
-    Handles special Mamba v2 in_proj and conv1d interleaved layouts.
-    """
-    tp_size = params.target_tp_size
-
-    if 'mixer.in_proj.weight' in key and params.mamba_version == 1:
-        x, z = torch.split(
-            tensor, [params.mamba_d_inner, params.mamba_d_inner], dim=dim
-        )
-        x_sliced = torch.chunk(x, tp_size, dim=dim)
-        z_sliced = torch.chunk(z, tp_size, dim=dim)
-        return [torch.cat((xi, zi), dim=dim) for xi, zi in zip(x_sliced, z_sliced)]
-
-    elif 'mixer.in_proj.weight' in key and params.mamba_version == 2:
-        x, z, B, C, dt = torch.split(
-            tensor,
-            [
-                params.mamba_d_inner,
-                params.mamba_d_inner,
-                params.mamba2_n_groups * params.mamba_d_state,
-                params.mamba2_n_groups * params.mamba_d_state,
-                params.mamba2_n_heads,
-            ],
-            dim=dim,
-        )
-        B = B.reshape(-1, params.mamba_d_state, B.shape[-1])
-        C = C.reshape(-1, params.mamba_d_state, C.shape[-1])
-        x_s = torch.chunk(x, tp_size, dim=dim)
-        z_s = torch.chunk(z, tp_size, dim=dim)
-        B_s = torch.chunk(B, tp_size, dim=dim)
-        C_s = torch.chunk(C, tp_size, dim=dim)
-        dt_s = torch.chunk(dt, tp_size, dim=dim)
-        return [
-            torch.cat((xi, zi, Bi.flatten(0, 1), Ci.flatten(0, 1), dti), dim=dim)
-            for xi, zi, Bi, Ci, dti in zip(x_s, z_s, B_s, C_s, dt_s)
-        ]
-
-    elif 'mixer.conv1d' in key and params.mamba_version == 2:
-        x, B, C = torch.split(
-            tensor,
-            [
-                params.mamba_d_inner,
-                params.mamba2_n_groups * params.mamba_d_state,
-                params.mamba2_n_groups * params.mamba_d_state,
-            ],
-            dim=dim,
-        )
-        if 'weight' in key:
-            B = B.reshape(-1, params.mamba_d_state, B.shape[-2], B.shape[-1])
-            C = C.reshape(-1, params.mamba_d_state, C.shape[-2], C.shape[-1])
-        elif 'bias' in key:
-            B = B.reshape(-1, params.mamba_d_state)
-            C = C.reshape(-1, params.mamba_d_state)
-        else:
-            raise ValueError(f"Unknown conv1d key: {key}")
-
-        x_s = torch.chunk(x, tp_size, dim=dim)
-        B_s = torch.chunk(B, tp_size, dim=dim)
-        C_s = torch.chunk(C, tp_size, dim=dim)
-        return [
-            torch.cat((xi, Bi.flatten(0, 1), Ci.flatten(0, 1)), dim=dim)
-            for xi, Bi, Ci in zip(x_s, B_s, C_s)
-        ]
-
-    else:
-        return list(torch.chunk(tensor, tp_size, dim=dim))
 
 
 # ---------------------------------------------------------------------------
@@ -697,211 +454,6 @@ def initialize_ssm_layer_params(
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint I/O helpers (patterns from hybrid_conversion.py)
-# ---------------------------------------------------------------------------
-
-def get_checkpoint_iteration(load_dir):
-    """Read the latest iteration number from a checkpoint directory."""
-    tracker_file = os.path.join(load_dir, 'latest_checkpointed_iteration.txt')
-    with open(tracker_file, 'r') as f:
-        metastring = f.read().strip()
-        try:
-            iteration = int(metastring)
-        except ValueError:
-            raise ValueError(
-                f"Invalid iteration in {tracker_file}: '{metastring}'"
-            )
-    return iteration
-
-
-def load_checkpoint_shards(load_dir, iteration, input_tp_size, input_pp_size):
-    """Load all TP/PP shards of a checkpoint.
-
-    Returns:
-        list[list[dict]]: models[pp_rank][tp_rank] = checkpoint dict
-        dict: sample_model (first shard, for metadata)
-    """
-    model_dir = os.path.join(load_dir, f'iter_{iteration:07d}')
-    sample_model = None
-    all_shards = []
-
-    for pp in range(input_pp_size):
-        tp_shards = []
-        for tp in range(input_tp_size):
-            dir_name = f"mp_rank_{tp:02d}"
-            if input_pp_size > 1:
-                dir_name += f"_{pp:03d}"
-            model_file = os.path.join(model_dir, dir_name, "model_optim_rng.pt")
-            checkpoint = torch.load(model_file, map_location='cpu', weights_only=False)
-            tp_shards.append(checkpoint)
-            if sample_model is None:
-                sample_model = checkpoint
-            print(f"  Loaded {model_file}")
-        all_shards.append(tp_shards)
-
-    return all_shards, sample_model
-
-
-def combine_tp_shards(tp_models, params):
-    """Combine TP-sharded models into a single state dict with full tensors."""
-    input_tp_size = len(tp_models)
-    if input_tp_size == 1:
-        return OrderedDict(tp_models[0]['model'])
-
-    combined = OrderedDict()
-    for key, original_tensor in tp_models[0]['model'].items():
-        if '_extra_state' in key:
-            combined[key] = original_tensor
-            continue
-
-        split_dim = get_split_dim(key)
-        if split_dim != -1:
-            tensors = [tp_models[j]['model'][key].cpu() for j in range(input_tp_size)]
-            combined[key] = combine_tp_tensors(params, key, split_dim, tensors)
-        else:
-            combined[key] = original_tensor
-
-    return combined
-
-
-def stitch_pp_shards(all_combined_shards, num_layers_per_pp_rank):
-    """Stitch PP shards into one flat model with globally-indexed layers."""
-    full_model = OrderedDict()
-
-    for pp, combined_shard in enumerate(all_combined_shards):
-        for key, tensor in combined_shard.items():
-            try:
-                layer_num = int(re.findall(r'\d+', key)[0])
-                new_key = key.replace(
-                    str(layer_num),
-                    str(layer_num + pp * num_layers_per_pp_rank),
-                    1,
-                )
-            except (IndexError, ValueError):
-                new_key = key
-            full_model[new_key] = tensor
-
-    return full_model
-
-
-def finalize_checkpoint(sample_model, model, params, verbose=False):
-    """Finalize checkpoint metadata from a sample source checkpoint."""
-    reset_iterations = params.reset_iterations
-
-    model['args'] = copy.deepcopy(sample_model['args'])
-    model['args'].tensor_model_parallel_size = params.target_tp_size
-    model['args'].pipeline_model_parallel_size = params.target_pp_size
-    if reset_iterations:
-        model['args'].iteration = 0
-        model['args'].consumed_valid_samples = 0
-        model['args'].consumed_train_samples = 0
-        model['args'].train_iters = 0
-        model['args'].train_samples = 0
-
-    model['checkpoint_version'] = copy.deepcopy(sample_model['checkpoint_version'])
-
-    model['iteration'] = copy.deepcopy(sample_model['iteration'])
-    if reset_iterations:
-        model['iteration'] = 0
-
-    if 'opt_param_scheduler' in sample_model:
-        model['opt_param_scheduler'] = copy.deepcopy(sample_model['opt_param_scheduler'])
-
-    model['rng_state'] = copy.deepcopy(sample_model['rng_state'])
-
-    if verbose:
-        original_args = sample_model['args'].__dict__
-        final_args = model['args'].__dict__
-        for key in original_args:
-            if key in final_args:
-                if final_args[key] != original_args[key]:
-                    print(f"  ARG MISMATCH: {key}")
-                    print(f"    original: {original_args[key]}")
-                    print(f"    final:    {final_args[key]}")
-            else:
-                print(f"  ARG MISSING from final: {key} = {original_args[key]}")
-        for key in final_args:
-            if key not in original_args:
-                print(f"  ARG ADDED to final: {key} = {final_args[key]}")
-
-    return model
-
-
-def save_checkpoint_shards(target_state_dicts, sample_model, params, save_dir, iteration):
-    """Split and save checkpoint for target TP/PP configuration.
-
-    Args:
-        target_state_dicts: OrderedDict with globally-indexed layer keys (full tensors).
-        sample_model: Source checkpoint dict for metadata.
-        params: argparse namespace with target_tp_size, target_pp_size, etc.
-        save_dir: Output directory.
-        iteration: Iteration number to write.
-    """
-    total_layers = params.target_num_layers
-    num_layers_per_pp_rank = total_layers // params.target_pp_size
-
-    out_iteration = iteration if not params.reset_iterations else 0
-
-    pp_offset = 0
-    # Build a list of (key, tensor) for iteration
-    all_items = list(target_state_dicts.items())
-
-    for pp in range(params.target_pp_size):
-        print(f"  Saving PP rank {pp}")
-        tp_models = [{'model': OrderedDict()} for _ in range(params.target_tp_size)]
-
-        for idx in range(pp_offset, len(all_items)):
-            key, tensor = all_items[idx]
-
-            # Determine if this key belongs to this PP rank
-            try:
-                layer_num = int(re.findall(r'\d+', key)[0])
-                if layer_num >= num_layers_per_pp_rank * (pp + 1):
-                    break
-                new_key = key.replace(
-                    str(layer_num),
-                    str(layer_num - pp * num_layers_per_pp_rank),
-                    1,
-                )
-            except (IndexError, ValueError):
-                new_key = key
-
-            pp_offset += 1
-
-            if '_extra_state' in new_key:
-                for j in range(params.target_tp_size):
-                    tp_models[j]['model'][new_key] = tensor
-                continue
-
-            split_dim = get_split_dim(new_key)
-            if split_dim != -1:
-                slices = split_tensor_for_tp(params, new_key, split_dim, tensor)
-                for j in range(params.target_tp_size):
-                    tp_models[j]['model'][new_key] = slices[j]
-            else:
-                for j in range(params.target_tp_size):
-                    tp_models[j]['model'][new_key] = tensor
-
-        for tp in range(params.target_tp_size):
-            dir_name = f"mp_rank_{tp:02d}"
-            if params.target_pp_size > 1:
-                dir_name += f"_{pp:03d}"
-
-            model = finalize_checkpoint(sample_model, tp_models[tp], params, verbose=False)
-
-            out_dir = os.path.join(save_dir, f'iter_{out_iteration:07d}', dir_name)
-            os.makedirs(out_dir, exist_ok=True)
-            model_file = os.path.join(out_dir, "model_optim_rng.pt")
-            torch.save(model, model_file)
-            print(f"    Saved {model_file}")
-
-    # Write iteration tracker
-    tracker_file = os.path.join(save_dir, 'latest_checkpointed_iteration.txt')
-    with open(tracker_file, 'w') as f:
-        f.write(str(out_iteration))
-
-
-# ---------------------------------------------------------------------------
 # Key name helpers
 # ---------------------------------------------------------------------------
 
@@ -1138,54 +690,8 @@ def _sort_state_dict(state_dict):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Format-aware save
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Format-aware load / save
-# ---------------------------------------------------------------------------
-
-def _load_legacy_full(args):
-    """Load a legacy mp_rank_XX checkpoint and return a full (TP+PP gathered)
-    state dict plus a sample shard for metadata.
-
-    Returns:
-        full_model (OrderedDict): globally-indexed, TP-combined state dict.
-        sample_model (dict): one source shard (for args/iteration/etc.).
-        iteration (int): source iteration.
-    """
-    iteration = get_checkpoint_iteration(args.load_dir)
-    print(f"  Iteration: {iteration}")
-
-    model_dir = os.path.join(args.load_dir, f'iter_{iteration:07d}')
-    sub_models = os.listdir(model_dir)
-    sample_file = os.path.join(model_dir, sub_models[0], "model_optim_rng.pt")
-    sample_model = torch.load(sample_file, map_location='cpu', weights_only=False)
-
-    input_tp_size = sample_model['args'].tensor_model_parallel_size
-    input_pp_size = sample_model['args'].pipeline_model_parallel_size
-    input_num_layers = sample_model['args'].num_layers
-    num_layers_per_pp_rank = input_num_layers // input_pp_size
-
-    print(f"  Source: TP={input_tp_size}, PP={input_pp_size}, "
-          f"num_layers={input_num_layers}")
-
-    all_shards, sample_model = load_checkpoint_shards(
-        args.load_dir, iteration, input_tp_size, input_pp_size
-    )
-
-    print("  Combining TP shards into full tensors...")
-    combined_pp_shards = []
-    for pp in range(input_pp_size):
-        combined = combine_tp_shards(all_shards[pp], args)
-        combined_pp_shards.append(combined)
-
-    print("  Stitching PP shards into flat model...")
-    full_model = stitch_pp_shards(combined_pp_shards, num_layers_per_pp_rank)
-    print(f"  Full model: {len(full_model)} parameters")
-
-    return full_model, sample_model, iteration
-
 
 def _save_dist_full(target_state_dict, common_state, model_prefix, backend,
                     args, iteration):
@@ -1261,35 +767,29 @@ def main(args):
         output_format = input_format
     print(f"\n  Input format:  {input_format}")
     print(f"  Output format: {output_format}")
-    if output_format == FORMAT_LEGACY:
-        print(f"  Target TP size: {args.target_tp_size}")
-        print(f"  Target PP size: {args.target_pp_size}")
+
+    if input_format not in DIST_FORMATS:
+        raise ValueError(
+            f"Unsupported input format: {input_format}. "
+            f"Only dist formats are supported: {DIST_FORMATS}."
+        )
+    if output_format not in DIST_FORMATS:
+        raise ValueError(
+            f"Unsupported output format: {output_format}. "
+            f"Only dist formats are supported: {DIST_FORMATS}."
+        )
 
     # 2. Load source checkpoint into a fully-gathered state dict
     print("\n[Step 1] Loading source checkpoint...")
-    sample_model = None
-    common_state = {}
-    model_prefix = 'model.'
-    dist_backend = FORMAT_TORCH_DIST
-
-    if input_format == FORMAT_LEGACY:
-        full_model, sample_model, iteration = _load_legacy_full(args)
-    elif input_format in DIST_FORMATS:
-        full_model, common_state, model_prefix, dist_backend, iteration = (
-            load_dist_checkpoint_full(args.load_dir)
-        )
-        print(f"  Source: dist backend={dist_backend}, prefix='{model_prefix}', "
-              f"iteration={iteration}, params={len(full_model)}")
-    else:
-        raise ValueError(f"Unsupported input format: {input_format}")
+    full_model, common_state, model_prefix, dist_backend, iteration = (
+        load_dist_checkpoint_full(args.load_dir)
+    )
+    print(f"  Source: dist backend={dist_backend}, prefix='{model_prefix}', "
+          f"iteration={iteration}, params={len(full_model)}")
 
     # Args-level GPT compatibility whitelist: reject MoE, MLA, MTP, linear /
     # experimental attention, heterogeneous block specs, etc. See module header.
-    source_args = None
-    if sample_model is not None and 'args' in sample_model:
-        source_args = sample_model['args']
-    elif common_state and 'args' in common_state:
-        source_args = common_state['args']
+    source_args = common_state.get('args') if common_state else None
     validate_source_args_gpt_compatible(source_args, args.direction)
 
     # 3. Convert
@@ -1306,24 +806,10 @@ def main(args):
 
     # 4. Save
     print(f"\n[Step 3] Saving to {args.save_dir}...")
-    if output_format == FORMAT_LEGACY:
-        if sample_model is None:
-            raise ValueError(
-                "Legacy output requires a legacy source checkpoint for metadata. "
-                "Use --output-format torch_dist when loading a dist checkpoint."
-            )
-        sample_model['args'].num_layers = args.target_num_layers
-        save_checkpoint_shards(
-            target_state_dict, sample_model, args, args.save_dir,
-            iteration if iteration is not None else 0,
-        )
-    elif output_format in DIST_FORMATS:
-        _save_dist_full(
-            target_state_dict, common_state, model_prefix, output_format,
-            args, iteration,
-        )
-    else:
-        raise ValueError(f"Unsupported output format: {output_format}")
+    _save_dist_full(
+        target_state_dict, common_state, model_prefix, output_format,
+        args, iteration,
+    )
 
     print("\n====CONVERSION COMPLETE====\n")
 
@@ -1345,22 +831,15 @@ if __name__ == "__main__":
                         help='Path to target checkpoint directory.')
     parser.add_argument('--hybrid-layer-pattern', type=str, required=True,
                         help='Hybrid layer pattern string, e.g. "M*-M*-M*-M*-".')
-    parser.add_argument('--target-tp-size', type=int, default=1,
-                        help='Target tensor parallel size (legacy output only; '
-                             'dist formats are saved fully-replicated and '
-                             'resharded at training load time).')
-    parser.add_argument('--target-pp-size', type=int, default=1,
-                        help='Target pipeline parallel size (legacy output only).')
 
     parser.add_argument(
         '--input-format', type=str, default='auto',
-        choices=['auto', FORMAT_LEGACY, FORMAT_TORCH_DIST, 'fsdp_dtensor'],
-        help='Source checkpoint format. "auto" detects from metadata.json / '
-             'mp_rank_XX layout.',
+        choices=('auto',) + DIST_FORMATS,
+        help='Source checkpoint format. "auto" detects from metadata.json.',
     )
     parser.add_argument(
         '--output-format', type=str, default='auto',
-        choices=['auto', FORMAT_LEGACY, FORMAT_TORCH_DIST, 'fsdp_dtensor'],
+        choices=('auto',) + DIST_FORMATS,
         help='Target checkpoint format. "auto" matches the input format. '
              'Dist formats (torch_dist / fsdp_dtensor) transparently support '
              'TP+PP+FSDP training checkpoints.',

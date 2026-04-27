@@ -31,18 +31,15 @@ sys.path.insert(
 
 from gpt_mamba_conversion import (
     build_layer_index_mapping,
-    combine_tp_tensors,
     convert_gpt_to_mamba,
     convert_mamba_to_gpt,
     get_layer_num_from_key,
-    get_split_dim,
     initialize_ssm_layer_params,
     is_attention_param,
     is_mlp_param,
     is_ssm_param,
     parse_hybrid_layer_pattern,
     replace_layer_num,
-    split_tensor_for_tp,
     validate_pattern_gpt_compatible,
     validate_source_args_gpt_compatible,
 )
@@ -170,52 +167,6 @@ class TestKeyHelpers:
         assert is_ssm_param('decoder.layers.0.mixer.out_proj.weight')
         assert not is_ssm_param('decoder.layers.0.mlp.linear_fc1.weight')
         assert not is_ssm_param('decoder.layers.0.self_attention.linear_qkv.weight')
-
-
-# ---------------------------------------------------------------------------
-# TP split dim tests
-# ---------------------------------------------------------------------------
-
-class TestTPSplitDim:
-    def test_embedding_split(self):
-        assert get_split_dim('embedding.word_embeddings.weight') == 0
-
-    def test_output_layer_split(self):
-        assert get_split_dim('output_layer.weight') == 0
-
-    def test_norm_replicated(self):
-        assert get_split_dim('decoder.layers.0.input_layernorm.weight') == -1
-
-    def test_final_layernorm(self):
-        assert get_split_dim('decoder.final_layernorm.weight') == -1
-
-    def test_final_norm(self):
-        assert get_split_dim('decoder.final_norm.weight') == -1
-
-    def test_qkv_weight_column(self):
-        assert get_split_dim('decoder.layers.0.self_attention.linear_qkv.weight') == 0
-
-    def test_proj_weight_row(self):
-        assert get_split_dim('decoder.layers.0.self_attention.linear_proj.weight') == 1
-
-    def test_mlp_fc1_column(self):
-        assert get_split_dim('decoder.layers.0.mlp.linear_fc1.weight') == 0
-
-    def test_mlp_fc2_row(self):
-        assert get_split_dim('decoder.layers.0.mlp.linear_fc2.weight') == 1
-
-    def test_mamba_mixer_norm(self):
-        assert get_split_dim('decoder.layers.0.mixer.norm.weight') == 0
-
-    def test_mamba_A_log(self):
-        assert get_split_dim('decoder.layers.0.mixer.A_log') == 0
-
-    def test_mamba_out_proj(self):
-        assert get_split_dim('decoder.layers.0.mixer.out_proj.weight') == 1
-
-    def test_unknown_key(self):
-        with pytest.raises(ValueError, match="Unknown tensor name"):
-            get_split_dim('decoder.layers.0.some_unknown_param')
 
 
 # ---------------------------------------------------------------------------
@@ -693,99 +644,6 @@ class TestRoundTrip:
             assert torch.equal(original_gpt[key], recovered_gpt[key]), (
                 f"Mismatch for {key}"
             )
-
-
-# ---------------------------------------------------------------------------
-# TP combine/split round-trip tests
-# ---------------------------------------------------------------------------
-
-class TestTPCombineSplit:
-    def test_simple_tensor_roundtrip(self):
-        params = argparse.Namespace(
-            mamba_d_inner=256, mamba_d_state=64, mamba2_n_groups=4,
-            mamba2_n_heads=8, mamba_version=2, target_tp_size=2,
-        )
-        tensor = torch.randn(512, 128)
-        key = 'decoder.layers.0.mlp.linear_fc1.weight'
-        dim = 0
-
-        # Split into 2
-        slices = split_tensor_for_tp(params, key, dim, tensor)
-        assert len(slices) == 2
-        assert slices[0].shape == (256, 128)
-
-        # Combine back
-        combined = combine_tp_tensors(params, key, dim, slices)
-        assert torch.equal(combined, tensor)
-
-    def test_mamba_in_proj_v2_roundtrip(self):
-        d_inner = 256
-        n_groups = 4
-        d_state = 64
-        n_heads = 8
-        d_model = 128
-        tp_size = 2
-
-        params = argparse.Namespace(
-            mamba_d_inner=d_inner, mamba_d_state=d_state,
-            mamba2_n_groups=n_groups, mamba2_n_heads=n_heads,
-            mamba_version=2, target_tp_size=tp_size,
-        )
-
-        # Full in_proj: [2*d_inner + 2*n_groups*d_state + n_heads, d_model]
-        out_dim = 2 * d_inner + 2 * n_groups * d_state + n_heads
-        tensor = torch.randn(out_dim, d_model)
-        key = 'decoder.layers.0.mixer.in_proj.weight'
-        dim = 0
-
-        slices = split_tensor_for_tp(params, key, dim, tensor)
-        assert len(slices) == tp_size
-
-        combined = combine_tp_tensors(params, key, dim, slices)
-        assert torch.allclose(combined, tensor), "Mamba v2 in_proj round-trip failed"
-
-    def test_mamba_conv1d_weight_v2_roundtrip(self):
-        d_inner = 256
-        n_groups = 4
-        d_state = 64
-        d_conv = 4
-        tp_size = 2
-
-        params = argparse.Namespace(
-            mamba_d_inner=d_inner, mamba_d_state=d_state,
-            mamba2_n_groups=n_groups, mamba2_n_heads=8,
-            mamba_version=2, target_tp_size=tp_size,
-        )
-
-        conv_dim = d_inner + 2 * n_groups * d_state
-        tensor = torch.randn(conv_dim, 1, d_conv)
-        key = 'decoder.layers.0.mixer.conv1d.weight'
-        dim = 0
-
-        slices = split_tensor_for_tp(params, key, dim, tensor)
-        combined = combine_tp_tensors(params, key, dim, slices)
-        assert torch.allclose(combined, tensor), "conv1d weight round-trip failed"
-
-    def test_mamba_conv1d_bias_v2_roundtrip(self):
-        d_inner = 256
-        n_groups = 4
-        d_state = 64
-        tp_size = 2
-
-        params = argparse.Namespace(
-            mamba_d_inner=d_inner, mamba_d_state=d_state,
-            mamba2_n_groups=n_groups, mamba2_n_heads=8,
-            mamba_version=2, target_tp_size=tp_size,
-        )
-
-        conv_dim = d_inner + 2 * n_groups * d_state
-        tensor = torch.randn(conv_dim)
-        key = 'decoder.layers.0.mixer.conv1d.bias'
-        dim = 0
-
-        slices = split_tensor_for_tp(params, key, dim, tensor)
-        combined = combine_tp_tensors(params, key, dim, slices)
-        assert torch.allclose(combined, tensor), "conv1d bias round-trip failed"
 
 
 # ---------------------------------------------------------------------------
