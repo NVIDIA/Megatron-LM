@@ -1,0 +1,3 @@
+# Tensor parallel test files.
+test_buckets:
+  - tensor_parallel

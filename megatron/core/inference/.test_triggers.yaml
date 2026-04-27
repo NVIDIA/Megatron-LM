@@ -1,0 +1,15 @@
+# Core inference module (contexts, engines, wrappers, sampling).
+#
+# Test imports traced:
+#   transformer*    → inference.contexts.StaticInferenceContext
+#   models          → inference.config, contexts, engines, wrappers, sampling_params
+#   inference       → inference.* (test suite)
+#   post_training   → inference.contexts
+#   core_unit       → test_inference.py (inference.text_generation_server)
+test_buckets:
+  - transformer
+  - transformer_moe
+  - models
+  - inference
+  - post_training
+  - core_unit

@@ -1,0 +1,3 @@
+# Optimizer test files.
+test_buckets:
+  - optimizer
