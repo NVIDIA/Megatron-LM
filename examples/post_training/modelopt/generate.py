@@ -14,7 +14,7 @@ from datasets import load_dataset
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args, get_model, initialize_megatron
 from utils import get_hf_tokenizer
@@ -100,7 +100,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
