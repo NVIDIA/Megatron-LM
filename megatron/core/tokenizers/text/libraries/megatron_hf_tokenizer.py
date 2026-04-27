@@ -95,7 +95,7 @@ class MegatronHFTokenizer(HuggingFaceTokenizer):
             )
 
         vocab_file = self._get_vocab_file(tokenizer_name, vocab_file)
-        merges_file = self._get_merges_file(tokenizer_name, vocab_file)
+        merges_file = self._get_merges_file(tokenizer_name, merges_file)
         tokenizer_path = MEGATRON_CONFIG_MAP[tokenizer_name]["tokenizer_name"]
         super().__init__(tokenizer_path, vocab_file, merges_file, **kwargs)
 
