@@ -1044,7 +1044,7 @@ class MambaMixer(MegatronModule):
             base = -torch.exp(self.A_log.float())
             return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
         # Inference path. Refill when stale
-        if torch.cuda.is_current_stream_capturing() or self._A_neg_exp_cache_stale:
+        if self._A_neg_exp_cache_stale:
             with torch.no_grad():
                 self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
             self._A_neg_exp_cache_stale = False
@@ -1052,7 +1052,10 @@ class MambaMixer(MegatronModule):
 
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
-        self._A_neg_exp_cache_stale = True
+        if mode:
+            # only mark stale when switching to training mode.
+            # otherwise retain the staleness state.
+            self._A_neg_exp_cache_stale = True
         return super().train(mode)
 
     def _ssm_decode(
