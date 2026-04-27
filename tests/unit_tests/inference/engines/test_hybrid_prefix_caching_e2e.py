@@ -226,7 +226,7 @@ class TestMambaPrefixCachingE2E:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
         return DynamicInferenceEngine(controller, context)
 
     def _make_request(self, req_id, prompt, enable_pc, num_tokens=NUM_TOKENS_TO_GENERATE):

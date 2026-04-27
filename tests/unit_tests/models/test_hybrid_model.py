@@ -15,6 +15,7 @@ from megatron.core.inference.contexts import BaseInferenceContext, StaticInferen
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -523,3 +524,106 @@ class TestHybridWithDynamicInference:
 
         # Assert that all padding logits are zero.
         assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
+
+
+def _make_yarn_config(**kwargs):
+    """Build a TransformerConfig with yarn positional embedding attributes."""
+    cfg = TransformerConfig(
+        num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
+        hidden_size=256,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        **kwargs,
+    )
+    # Yarn-specific attributes are set dynamically on the config (not TransformerConfig fields).
+    cfg.yarn_rotary_scaling_factor = 2.0
+    cfg.yarn_original_max_position_embeddings = 4
+    cfg.yarn_beta_fast = 32.0
+    cfg.yarn_beta_slow = 1.0
+    cfg.yarn_mscale = 1.0
+    cfg.yarn_mscale_all_dim = 0.0
+    cfg.yarn_correction_range_round_to_int = True
+    return cfg
+
+
+class TestHybridModelWithYarn:
+    """Tests for HybridModel with YaRN positional embeddings."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        model_config = _make_yarn_config()
+        self.model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
+            position_embedding_type='yarn',
+            rotary_base=10000,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_constructor(self):
+        assert isinstance(self.model, HybridModel)
+        assert self.model.max_sequence_length == 4
+        assert self.model.position_embedding_type == 'yarn'
+        # YaRN creates a YarnRotaryEmbedding rather than a plain RotaryEmbedding.
+        assert isinstance(self.model.rotary_pos_emb, YarnRotaryEmbedding)
+
+    def test_forward(self):
+        sequence_length = self.model.max_sequence_length
+        micro_batch_size = 2
+
+        self.model.cuda()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = self.model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == self.model.vocab_size
+
+    def test_inference(self):
+        micro_batch_size = 2
+        inference_context: BaseInferenceContext = StaticInferenceContext(
+            max_batch_size=micro_batch_size, max_sequence_length=self.model.max_sequence_length
+        )
+        prompt_length = self.model.max_sequence_length - 1
+
+        self.model.cuda()
+
+        # load-context/first-output-token, step/generate
+        for offset in (0, prompt_length):
+            sequence_length = prompt_length if offset == 0 else 1
+            inference_context.sequence_len_offset = offset
+
+            data = list(range(sequence_length))
+            input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            position_ids = (
+                torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+            )
+            attention_mask = torch.ones(
+                (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+            ).cuda()
+
+            logits = self.model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+            )
+
+            assert logits.shape[0] == micro_batch_size
+            assert logits.shape[1] == sequence_length
+            assert logits.shape[2] == self.model.vocab_size
