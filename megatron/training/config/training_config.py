@@ -25,12 +25,24 @@ class TrainingConfig:
     will start with global batch size 16 and over (1024 - 16) / 8 = 126 intervals will increase
     the batch size linearly to 1024. In each interval we will use approximately
     300000 / 126 = 2380 samples.
+    Deprecated. Use step_batch_size_schedule instead.
     """
+
+    step_batch_size_schedule: str | None = None
+    """Step-wise batch size schedule in format "THRESHOLD:BS THRESHOLD:BS ...".
+    Thresholds support suffixes: K (1e3), M (1e6), B (1e9), T (1e12).
+    If sequence length is provided, thresholds are interpreted as tokens; otherwise as samples.
+    Example:
+        step_batch_size_schedule = "0:768 250B:1536 500B:3072 750B:6144"
+    Cannot be used together with decrease_batch_size_if_needed.
+    """
+
 
     decrease_batch_size_if_needed: bool = False
     """If set, decrease batch size if microbatch_size * dp_size does not 
     divide batch_size. Old batch_size will be restored if training is re-started 
-    with dp_size that divides batch_size // microbatch_size."""
+    with dp_size that divides batch_size // microbatch_size. Not supported with
+    step-batch-size-schedule."""
 
     empty_unused_memory_level: Literal[0, 1, 2] = 0
     """Call torch.cuda.empty_cache() each iteration (training and eval), to reduce fragmentation.
@@ -517,6 +529,11 @@ class CheckpointConfig:
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
+    ckpt_load_validate_sharding_integrity: bool = True
+    """Whether to validate sharding access integrity when loading a distributed checkpoint.
+    When True (default), each tensor shard is checked to be accessed exactly once as main
+    replica by some rank. Disabling skips this validation"""
+
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
@@ -562,6 +579,9 @@ class CheckpointConfig:
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
 
+    verify_integrity: bool = False
+    """Whether to hash checkpointing files during save and validate their integrity during load."""
+
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_installed
 
@@ -573,3 +593,7 @@ class CheckpointConfig:
                 "nvidia-resiliency-ext is not installed. "
                 "Please, install nvidia-resiliency-ext to enable async save."
             )
+
+        if self.verify_integrity:
+            assert self.ckpt_format == "torch_dist", \
+                f"`verify_integrity` is only supported with torch_dist checkpoint format."

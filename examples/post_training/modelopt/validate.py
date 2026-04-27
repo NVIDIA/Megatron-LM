@@ -14,7 +14,7 @@ from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidati
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
@@ -115,7 +115,7 @@ if __name__ == "__main__":
         ground_truth = [None for _ in range(len(prompts))]
 
     tokenizer = get_hf_tokenizer()
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
 
     report_current_memory_info()
 

@@ -19,7 +19,7 @@ from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import (
     report_current_memory_info,
     to_empty_if_meta,
@@ -128,7 +128,7 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
     )
     report_current_memory_info()
 

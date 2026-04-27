@@ -19,7 +19,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
 from megatron.training.utils import (
@@ -492,7 +492,7 @@ if __name__ == "__main__":
     )
     pretrain(
         train_valid_test_sft_datasets_provider,
-        partial(model_provider, modelopt_gpt_mamba_builder),
+        partial(model_provider, modelopt_gpt_hybrid_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         non_loss_data_func=non_loss_data_func,

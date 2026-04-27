@@ -39,7 +39,7 @@ from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import (
     print_distributed_quant_summary,
     report_current_memory_info,
@@ -361,7 +361,7 @@ if __name__ == "__main__":
     tokenizer = get_hf_tokenizer()
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
     )
 
     report_current_memory_info()
