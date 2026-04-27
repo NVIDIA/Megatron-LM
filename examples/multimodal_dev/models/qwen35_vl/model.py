@@ -8,11 +8,8 @@ layers.
 """
 
 from typing import Optional
-
+import torch
 from torch import Tensor
-
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 from examples.multimodal_dev.models.base import MultimodalModel
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
@@ -27,9 +24,9 @@ from examples.multimodal_dev.models.qwen35_vl.configuration import (
 )
 from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
-from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
-    Qwen35VLVisionEncoder,
-)
+from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class Qwen35VLModel(MultimodalModel):
@@ -109,11 +106,17 @@ class Qwen35VLModel(MultimodalModel):
         self,
         input_ids: Tensor,
         image_grid_thw: Optional[Tensor] = None,
+        packed_seq_params=None,
     ) -> Tensor:
         """Compute 3D MRoPE position IDs for Qwen3.5-VL.
 
+        In THD mode ``input_ids`` is ``[1, T]`` and ``packed_seq_params``
+        supplies per-segment boundaries; positions restart at 0 per
+        segment. In BSHD mode ``input_ids`` is ``[B, S]`` and
+        ``packed_seq_params`` should be ``None``.
+
         Returns:
-            ``[3, B, S]`` position IDs for MRoPE.
+            ``[3, B, S]`` position IDs for MRoPE (``[3, 1, T]`` in THD).
         """
         position_ids, _ = get_rope_index(
             spatial_merge_size=self.spatial_merge_size,
@@ -122,5 +125,77 @@ class Qwen35VLModel(MultimodalModel):
             vision_start_token_id=self.vision_start_token_id,
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
+            packed_seq_params=packed_seq_params,
         )
         return position_ids
+
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        **kwargs,
+    ):
+        """Forward pass.
+
+        Args:
+            input_ids: ``[B, S]`` token IDs (or ``[1, T]`` in THD mode).
+            position_ids: ``[3, B, S]`` for MRoPE or ``[B, S]``
+                (``[3, 1, T]`` / ``[1, T]`` in THD mode).
+            attention_mask: ``[B, S]`` attention mask (None in THD).
+            labels: ``[B, S]`` target token IDs (``[1, T]`` in THD).
+            loss_mask: ``[B, S]`` mask for loss (``[1, T]`` in THD).
+            pixel_values: Preprocessed image pixels.
+            image_grid_thw: ``[num_images, 3]`` grid dimensions.
+            decoder_input: Pre-computed decoder input (skip embed).
+            packed_seq_params: ``PackedSeqParams`` for THD attention.
+
+        Returns:
+            Loss tensor (post_process=True) or hidden states.
+        """
+        # Compute position_ids before packing (MRoPE needs [B, S] input_ids).
+        if position_ids is None:
+            position_ids = self.compute_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                packed_seq_params=packed_seq_params,
+            )
+        vision_embeddings = None
+        if (
+            self.vision_model is not None
+            and pixel_values is not None
+        ):
+            vision_embeddings = self.vision_model(
+                pixel_values, image_grid_thw,
+            )
+
+        if decoder_input is None and self.language_model is not None:
+            text_embeddings = self.language_model.embedding(
+                input_ids=input_ids, position_ids=None,
+            )
+
+            if vision_embeddings is not None:
+                decoder_input = self._scatter_vision_embeddings(
+                    input_ids, text_embeddings, vision_embeddings,
+                )
+            else:
+                decoder_input = text_embeddings
+
+        output = self.language_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+        return output
