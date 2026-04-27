@@ -239,10 +239,11 @@ def get_modelopt_torch_quantization_config():
         # Enable Medusa heads and kv-cache quantization
         mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp4_config})
     if "AWQ" in args.export_quant_cfg:
-        weight_quantizer = mtq._get_quant_cfg_entry(mtq_config["quant_cfg"], "*weight_quantizer")
-        if weight_quantizer is not None:
+        try:
+            weight_quantizer = mtq.find_quant_cfg_entry_by_path(mtq_config["quant_cfg"], "*weight_quantizer")
             weight_quantizer["block_sizes"][-1] = 128
-
+        except KeyError:
+            weight_quantizer = None
     # Customization
     if args.disable_qkv_quant:
         mtq_config["quant_cfg"].append({"quantizer_name": "*self_attention*", "enable": False})
