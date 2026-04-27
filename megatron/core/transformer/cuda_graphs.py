@@ -79,6 +79,17 @@ _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
+_ETP_PHASE2_COMPLETION_EVENTS: List[torch.cuda.Event] = []
+
+
+def get_etp_phase2_completion_events() -> List[torch.cuda.Event]:
+    """Return all ETP bwd Phase 2 completion events from CG runners.
+
+    finalize_model_grads waits on these before reading main_grad,
+    ensuring captured main_grad.add_ on runner.stream has completed.
+    """
+    return _ETP_PHASE2_COMPLETION_EVENTS
+
 # Freeze GC during capture.
 # TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
 FREEZE_GC = os.getenv("CUDA_GRAPH_CAPTURE_FREEZE_GC") != "0"
@@ -529,6 +540,7 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _ETP_PHASE2_COMPLETION_EVENTS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -580,17 +592,26 @@ class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
     cudagraph io and fp8/fp4 if used."""
 
-    ## 1-event scheme (fwd and bwd):
-    #   runner_N.stream:  GEMM ──▶ wait_async_comms ▶ _wait_side_streams ──completion_event.record
-    #   ag_stream:        AG ──────────────────────▶ ag_event.record
-    #   main_stream:                                                   completion_event.wait ▶ [next work]
-    #                                                                   ↑ serialized after AG ↑
+    ## Capture-time sync schemes (wait_async_comms is called INSIDE the captured
+    #  graph so the drain ops are embedded in the graph itself, not before replay).
     #
-    # main_stream only unblocks after ag/rs streams are fully drained, so eager ops that
-    # follow (e.g. expert GEMMs reading the weight buffer) are guaranteed to see completed data.
+    #  Fwd — single-phase drain (full join before completion_event):
+    #    runner_N.stream:  GEMM ──▶ wait_async_comms ▶ _wait_side_streams ──fwd_completion_event.record
+    #    ag_stream:        AG ──────────────────────▶ ag_event.record
+    #    main_stream:                                                       fwd_completion_event.wait ▶ [next runner]
+    #    main_stream unblocks after ag/rs streams are fully drained, so eager
+    #    ops that follow see completed data.
     #
-    # wait_async_comms() is called INSIDE the captured graph (not before replay) so that
-    # ag_event.record() is embedded in the graph and fires at the right moment on ag_stream.
+    #  Bwd — phased drain (cross-graph RS overlap, see _CudaGraphRunner.backward):
+    #    runner_N.stream:  GEMM ─▶ Phase 1 (drain AG) ─▶ fence ─▶ bwd_completion_event.record ─▶ Phase 2 (wait_side_streams) ─▶ phase2_event
+    #    ag_stream:        AG ──────────────────▶ ag_event.record ▶ fence_event.record
+    #    rs_stream:        RS_issue ──▶ handle.wait ▶ rs_event.record ▶ main_grad.add_ ─────────────────────────────────────────────────────┐
+    #    main_stream:                                              bwd_completion_event.wait ▶ [next runner]                                  │
+    #                                                                                                              phase2_event.wait (in finalize_model_grads) ◀─┘
+    #    main_grad.add_ runs on rs_stream right after NCCL RS — concurrent with
+    #    Phase 1 AG drain. By the time bwd_completion_event fires and the next
+    #    runner launches, the add_ is done (no SM saturation blocking overlap).
+    #    finalize_model_grads waits phase2_completion_event before DP grad sync.
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
@@ -822,6 +843,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 self._register_side_stream(self.fwd_side_streams, graphed_ag)
                 self._register_side_stream(self.bwd_side_streams, graphed_ag)
                 self._register_side_stream(self.bwd_side_streams, graphed_rs)
+                # Bridges Phase 1 (AG drain on ag_stream) into runner_stream
+                # so bwd_completion_event records past NCCL_AG completion.
+                self.bwd_ag_fence_event = torch.cuda.Event()
+                # Records after Phase 2 (RS drain + main_grad.add_) completes
+                # on runner.stream. finalize_model_grads waits on this before
+                # reading main_grad for the DP gradient sync.
+                self.bwd_phase2_completion_event = torch.cuda.Event(external=True, interprocess=True)
+                _ETP_PHASE2_COMPLETION_EVENTS.append(self.bwd_phase2_completion_event)
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -853,16 +882,26 @@ class _CudaGraphRunner(torch.nn.Module):
             torch.cuda.current_stream().wait_stream(s)
 
     def _compute_finalized_during_bwd_capture(self):
-        """Analytically compute ETP params whose _finalize_wgrad is captured in THIS graph.
+        """Return ETP params whose DDP grad-ready hook is fired post-replay.
 
-        Derived from the ETP chain structure, not from runtime grad_added_to_main_grad state
-        (which doesn't work because deferred create_bwd_graph runs after the warmup bwd already
-        set grad_added=True for every finalized param globally).
+        NOT a literal "main_grad.add_ captured in THIS graph" set. Hook fire
+        timing intentionally lags one graph behind the actual main_grad.add_
+        site, exploiting the natural delay between graphs to ensure the
+        producer's main_grad.add_ is done before the hook marks the param ready
+        (otherwise --overlap-grad-reduce could fire DP RS on stale main_grad).
 
-        For each weight p in this runner's params_to_backprop, p.wgrad_reduce_scatter captures:
-          - p itself if p.prev_w is None  (sync path: "last weight in chain" finalizes self)
-          - p.next_w._weights if p.next_w is not None  (next_w-deferred finalize; next_w may
-            live in a different module than self.base_module — that's the cross-graph case)
+        Concretely, with the cross-graph RS overlap design:
+          - p.prev_w is None     → p sync-finalized in p's own graph; hook fires post-p's-graph
+          - p.prev_w not None    → next_w-deferred finalize lives in prev_w's graph
+                                   (with _already_finalized skip if cross-graph) or in
+                                   Phase 2 of p's own graph; either way, hook fires post-
+                                   p's-prev_w-graph, which always replays AFTER p's graph
+                                   in bwd order, giving a full graph of slack for the
+                                   producer's main_grad.add_ to complete.
+
+        Iteration logic (unchanged): for each p in params_to_backprop,
+          - if p.prev_w is None: add p (sync RS path)
+          - if p.next_w is not None: add p.next_w (will fire its hook here)
         """
         if not HAVE_ETP or ETPShardedParam is None:
             return []
@@ -1232,13 +1271,43 @@ class _CudaGraphRunner(torch.nn.Module):
                 allow_unused=True,
             )
 
+            # ETP cross-graph RS overlap, two phases:
+            #  Phase 1 — drain AG, fence runner_stream past ag_stream's tail,
+            #            then record bwd_completion_event. main_stream proceeds
+            #            to the next runner while this runner's RS finishes.
+            #  Phase 2 — drain RS + main_grad.add_ on rs_stream (starts right
+            #            after NCCL RS, concurrent with Phase 1 AG drain).
+            # Drain flags (_already_ag_drained / _already_finalized) tell the
+            # consumer graph to skip its captured cross-graph waits, which would
+            # be CUDA no-ops anyway. See TE wait_async_comms docstring.
             if self.parameter_sharding:
-                wait_async_comms(ETPChain.GRAPHED.value)
+                # Phase 1: drain AG; fence runner_stream past ag_stream so
+                # bwd_completion_event records AFTER NCCL_AG completion.
+                wait_async_comms(ETPChain.GRAPHED.value, skip_rs=True)
+                from megatron.core.parallel_state import get_parameter_sharding_group
+                etp_group = get_parameter_sharding_group()
+                graphed_ag = get_ag_stream(ETPChain.GRAPHED.value, etp_group)
+                self.bwd_ag_fence_event.record(graphed_ag)
+                torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
+
+                # Record completion AFTER AG drain + fence but BEFORE RS drain,
+                # so main_stream can trigger the next runner while RS is still
+                # in flight on rs_stream.
+                self.bwd_completion_event.record()
+
+                # Phase 2: in-graph RS drain + finalize.
+                wait_async_comms(ETPChain.GRAPHED.value, finalize_after_drain=True)
 
             if self.bwd_side_streams:
                 self._wait_side_streams(self.bwd_side_streams)
 
-            if self.use_stream:
+            if self.parameter_sharding:
+                # Phase 2 + side-stream join done — record so
+                # finalize_model_grads can wait for main_grad.add_ completion.
+                self.bwd_phase2_completion_event.record()
+
+            if self.use_stream and not self.parameter_sharding:
+                # Non-ETP path: record after the side-stream join.
                 self.bwd_completion_event.record()
 
         # Unfreeze GC.

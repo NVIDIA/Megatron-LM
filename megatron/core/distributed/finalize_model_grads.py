@@ -459,6 +459,15 @@ def finalize_model_grads(
             for s in get_all_rs_streams():
                 torch.cuda.current_stream().wait_stream(s)
 
+    # Wait for captured bwd Phase 2 (main_grad.add_) on each CG runner's
+    # stream.  bwd_completion_event only covers Phase 1; Phase 2 runs after
+    # it on runner.stream with no other sync to main_stream.
+    if config.parameter_sharding_size > 1:
+        from megatron.core.transformer.cuda_graphs import get_etp_phase2_completion_events
+
+        for evt in get_etp_phase2_completion_events():
+            torch.cuda.current_stream().wait_event(evt)
+
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
