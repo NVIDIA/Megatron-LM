@@ -3,7 +3,11 @@
 # Some of this code was adopted from https://github.com/vllm-project/vllm.
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
-"""vLLM-style Triton fused MoE kernel (BF16) for Megatron inference."""
+"""vLLM-style Triton fused MoE kernel (BF16) for Megatron inference.
+
+CUDA-graph compatible: all indirection table construction happens on-device
+via Triton kernels with fixed-size buffers and valid_tokens gating.
+"""
 
 from typing import Optional
 from unittest.mock import MagicMock
@@ -26,6 +30,7 @@ if not HAVE_TRITON:
     tl = MagicMock()
 
 from megatron.core.inference.moe.fused_moe import ActivationType
+from megatron.core.inference.moe.permute import compute_expert_offsets, compute_local_tokens_per_expert
 
 # ---------------------------------------------------------------------------
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
@@ -65,18 +70,9 @@ def _fused_moe_kernel(
 ):
     """Fused MoE grouped GEMM with indirect token addressing.
 
-    Each Triton program computes a [BLOCK_SIZE_M, BLOCK_SIZE_N] tile of
-    output C.  Tokens are NOT physically permuted; instead the kernel reads
-    from original positions via *sorted_token_ids* and selects expert
-    weights via *expert_ids*.
-
-    A: [num_tokens, K]          – input hidden states (unpermuted)
+    A: [num_tokens, K]           – input hidden states (unpermuted)
     B: [num_local_experts, N, K] – stacked expert weights
-    C: [num_tokens * topk, N]   – output (one row per topk slot)
-
-    sorted_token_ids maps each padded slot to a flat (token * topk + k)
-    index.  ``offs_token // top_k`` recovers the original token index for
-    reading A.
+    C: [num_tokens * topk, N]    – output (one row per topk slot)
     """
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -99,7 +95,6 @@ def _fused_moe_kernel(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
-        # Non-local expert block – write zeros
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
@@ -109,7 +104,6 @@ def _fused_moe_kernel(
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    # A reads use (token // top_k) so the same input row serves all topk slots
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + off_experts * stride_be + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -137,86 +131,163 @@ def _fused_moe_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Token-to-expert alignment (pure-torch, no C++ dependency)
+# Indirection table construction (CUDA-graph safe, fully on-device)
 # ---------------------------------------------------------------------------
 
 
-def _moe_align_block_size(
-    topk_ids: torch.Tensor,
+def _ceil_div(a, b):
+    return (a + b - 1) // b
+
+
+@triton.jit
+def _init_sorted_ids_kernel(
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    max_sorted,
+    max_blocks,
+    SENTINEL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Initialize sorted_token_ids to SENTINEL and expert_ids to -1."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    tl.store(sorted_token_ids_ptr + offs, SENTINEL, mask=offs < max_sorted)
+    tl.store(expert_ids_ptr + offs, -1, mask=offs < max_blocks)
+
+
+@triton.jit
+def _scatter_token_indices_kernel(
+    routing_map_ptr,
+    sorted_token_ids_ptr,
+    counters_ptr,
+    valid_tokens_ptr,
+    topk: tl.constexpr,
+    local_expert_start,
+    num_local_experts: tl.constexpr,
+    max_pairs,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """Scatter flat token indices into the padded indirection table.
+
+    For each valid (token, topk) pair routed to a local expert, atomically
+    claim a position in the expert's padded block and write the flat index.
+    """
+    pid = tl.program_id(0)
+    valid_tokens = tl.load(valid_tokens_ptr)
+    valid_pairs = valid_tokens * topk
+    if pid >= valid_pairs:
+        return
+    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
+        tok = pair // topk
+        if tok < valid_tokens:
+            k = pair % topk
+            eid = tl.load(routing_map_ptr + tok * topk + k)
+            lid = eid - local_expert_start
+            if lid >= 0 and lid < num_local_experts:
+                pos = tl.atomic_add(counters_ptr + lid, 1)
+                tl.store(sorted_token_ids_ptr + pos, pair)
+
+
+@triton.jit
+def _fill_expert_block_ids_kernel(
+    expert_ids_ptr,
+    exclusive_offsets_ptr,
+    inclusive_offsets_ptr,
+    NUM_LOCAL_EXPERTS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    """Fill expert_ids with expert index for each BLOCK_SIZE_M block."""
+    for e in range(NUM_LOCAL_EXPERTS):
+        start_block = tl.load(exclusive_offsets_ptr + e) // BLOCK_SIZE_M
+        end_block = tl.load(inclusive_offsets_ptr + e) // BLOCK_SIZE_M
+        for b in tl.range(start_block, end_block):
+            tl.store(expert_ids_ptr + b, e)
+
+
+def _moe_align_block_size_cuda_graphable(
+    routing_map: torch.Tensor,
     block_size: int,
     num_local_experts: int,
+    local_expert_start: int,
+    valid_tokens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sort tokens by expert and pad each group to *block_size*.
+    """Build indirection tables for the vLLM kernel, fully on-device.
+
+    Replaces the original _moe_align_block_size which used .item() calls
+    and host-side loops. All buffers are allocated at fixed max sizes so
+    the function is safe for CUDA graph capture.
 
     Args:
-        topk_ids: [M, topk] **local** expert indices (−1 for non-local).
-        block_size: BLOCK_SIZE_M used by the Triton kernel.
-        num_local_experts: number of experts on this rank.
+        routing_map: [max_tokens, topk] expert assignments.
+        block_size: BLOCK_SIZE_M for the vLLM kernel.
+        num_local_experts: experts on this rank.
+        local_expert_start: first global expert index on this rank.
+        valid_tokens: scalar int32 CUDA tensor.
 
     Returns:
-        sorted_token_ids  – [total_padded] int32 flat (token·topk + k) index
-                            per slot; padding slots = num_valid.
-        expert_ids        – [total_padded // block_size] int32 expert per block.
-        num_tokens_post_padded – [1] int32 scalar tensor.
+        sorted_token_ids: [max_sorted] int32 indirection table.
+        expert_ids: [max_blocks] int32 expert per block.
+        num_tokens_post_padded: [1] int32 view (total padded token count).
     """
-    M, topk = topk_ids.shape
-    num_valid = M * topk
-    device = topk_ids.device
+    max_tokens, topk = routing_map.shape
+    device = routing_map.device
 
-    flat_ids = topk_ids.reshape(-1)
-    flat_indices = torch.arange(num_valid, dtype=torch.int32, device=device)
+    max_sorted = max_tokens * topk + block_size * num_local_experts
+    max_blocks = _ceil_div(max_sorted, block_size)
+    sentinel = max_tokens * topk
 
-    # Push non-local (−1) tokens to the end during sort
-    sort_keys = flat_ids.clone()
-    sort_keys[flat_ids < 0] = num_local_experts
-    _, sort_order = sort_keys.sort(stable=True)
+    sorted_token_ids = torch.empty(max_sorted, dtype=torch.int32, device=device)
+    expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
 
-    sorted_flat_indices = flat_indices[sort_order]
-    sorted_expert_ids = flat_ids[sort_order]
-
-    # Tokens per local expert
-    valid_mask = sorted_expert_ids >= 0
-    num_valid_sorted = valid_mask.sum().item()
-    tokens_per_expert = torch.zeros(num_local_experts, dtype=torch.int32, device=device)
-    if num_valid_sorted > 0:
-        valid_experts = sorted_expert_ids[:num_valid_sorted].long()
-        tokens_per_expert.scatter_add_(
-            0, valid_experts, torch.ones(num_valid_sorted, dtype=torch.int32, device=device)
-        )
-
-    padded_counts = ((tokens_per_expert + block_size - 1) // block_size) * block_size
-    padded_offsets = torch.zeros(num_local_experts + 1, dtype=torch.int32, device=device)
-    padded_offsets[1:] = torch.cumsum(padded_counts, 0)
-    total_padded = padded_offsets[-1].item()
-
-    unpadded_offsets = torch.zeros(num_local_experts + 1, dtype=torch.int32, device=device)
-    unpadded_offsets[1:] = torch.cumsum(tokens_per_expert, 0)
-
-    padded_sorted = torch.full((total_padded,), num_valid, dtype=torch.int32, device=device)
-    expert_ids_out = torch.full(
-        (total_padded // block_size,), -1, dtype=torch.int32, device=device
+    INIT_BLOCK = 1024
+    init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
+    _init_sorted_ids_kernel[(init_grid,)](
+        sorted_token_ids,
+        expert_ids,
+        max_sorted,
+        max_blocks,
+        SENTINEL=sentinel,
+        BLOCK=INIT_BLOCK,
     )
 
-    for e in range(num_local_experts):
-        count = tokens_per_expert[e].item()
-        padded = padded_counts[e].item()
-        if padded == 0:
-            continue
-        src = unpadded_offsets[e].item()
-        dst = padded_offsets[e].item()
-        padded_sorted[dst : dst + count] = sorted_flat_indices[src : src + count]
-        num_blocks = padded // block_size
-        expert_ids_out[dst // block_size : dst // block_size + num_blocks] = e
+    tokens_per_expert = compute_local_tokens_per_expert(
+        routing_map, local_expert_start, num_local_experts, valid_tokens
+    )
+    exclusive_offsets, inclusive_offsets = compute_expert_offsets(
+        tokens_per_expert, alignment=block_size
+    )
 
-    num_post = torch.tensor([total_padded], dtype=torch.int32, device=device)
-    return padded_sorted, expert_ids_out, num_post
+    _fill_expert_block_ids_kernel[(1,)](
+        expert_ids,
+        exclusive_offsets,
+        inclusive_offsets,
+        NUM_LOCAL_EXPERTS=num_local_experts,
+        BLOCK_SIZE_M=block_size,
+    )
+
+    counters = exclusive_offsets.clone()
+    max_pairs = max_tokens * topk
+    NUM_BLOCKS = min(max_pairs, 512)
+    _scatter_token_indices_kernel[(NUM_BLOCKS,)](
+        routing_map,
+        sorted_token_ids,
+        counters,
+        valid_tokens,
+        topk,
+        local_expert_start,
+        num_local_experts,
+        max_pairs,
+        NUM_BLOCKS=NUM_BLOCKS,
+    )
+
+    num_tokens_post_padded = inclusive_offsets[-1:]
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
 # ---------------------------------------------------------------------------
 # Kernel launcher
 # ---------------------------------------------------------------------------
 
-# Default tile sizes — reasonable starting point for H100 / BF16.
 _DEFAULT_CONFIG = dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=32, GROUP_SIZE_M=8)
 
 
@@ -284,7 +355,7 @@ def _apply_activation(activation_type: ActivationType, output: torch.Tensor, inp
 
 
 # ---------------------------------------------------------------------------
-# Public API – drop-in replacement for mcore_fused_moe
+# Public API
 # ---------------------------------------------------------------------------
 
 
@@ -296,188 +367,91 @@ def vllm_fused_moe(
     activation_type: ActivationType,
     num_local_experts: int,
     local_expert_start: int,
-    routing_map: Optional[torch.Tensor] = None,
-    tokens_per_expert: Optional[torch.Tensor] = None,
-    skip_permute: bool = False,
+    valid_tokens: torch.Tensor,
+    routing_map: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
-    Two modes — same interface as ``mcore_fused_moe``:
-
-    * ``skip_permute=False``: tokens are **unpermuted**.  Requires
-      *routing_map* ``[M, topk]``.  The kernel reads from original token
-      positions via indirection — **no physical permutation needed**.
-
-    * ``skip_permute=True``: tokens are **already permuted** by the
-      dispatcher.  Requires *tokens_per_expert* ``[num_local_experts]``.
-      A thin adapter builds the indirection table from the already-
-      contiguous layout.
+    CUDA-graph compatible: indirection tables are built entirely on-device
+    using fixed-size buffers gated by valid_tokens.
 
     Args:
-        hidden_states: [num_tokens, hidden_size] BF16 input.
-        probs: routing probabilities.
-            [num_tokens, topk] when skip_permute=False,
-            [num_tokens] when skip_permute=True.
+        hidden_states: [max_tokens, hidden_size] BF16 input. Only the first
+            valid_tokens rows are valid; the rest are ignored.
+        probs: [max_tokens, topk] fp32 routing probabilities.
         fc1_weight: [num_local_experts, fc1_out, hidden_size] BF16.
         fc2_weight: [num_local_experts, hidden_size, fc1_out] BF16.
         activation_type: ActivationType enum.
         num_local_experts: experts on this rank.
         local_expert_start: first global expert index on this rank.
-        routing_map: [num_tokens, topk] global expert assignments.
-        tokens_per_expert: [num_local_experts] int32 counts.
-        skip_permute: whether tokens are already in expert order.
+        valid_tokens: scalar int32 CUDA tensor with number of valid tokens.
+        routing_map: [max_tokens, topk] int expert assignments.
+        out: optional [max_tokens, hidden_size] bf16 output buffer (e.g. RSV
+            symmetric memory tensor). If None, a local buffer is allocated.
 
     Returns:
-        [num_tokens, hidden_size] BF16 output.
+        [max_tokens, hidden_size] BF16 output.
     """
     assert hidden_states.dtype == torch.bfloat16, (
         f"vllm_fused_moe requires bf16 input, got {hidden_states.dtype}"
     )
 
     BLOCK_SIZE_M = _DEFAULT_CONFIG["BLOCK_SIZE_M"]
+    max_tokens = hidden_states.size(0)
+    topk = routing_map.shape[1]
 
-    if not skip_permute:
-        # ── Mode 1: unpermuted tokens, use indirect-addressing kernel ──
-        assert routing_map is not None
-        M, topk = routing_map.shape
+    sorted_token_ids, expert_ids, num_post = _moe_align_block_size_cuda_graphable(
+        routing_map, BLOCK_SIZE_M, num_local_experts, local_expert_start, valid_tokens
+    )
+    num_valid = max_tokens * topk
 
-        # Map global expert IDs → local (−1 for non-local)
-        local_topk_ids = routing_map.int() - local_expert_start
-        non_local = (local_topk_ids < 0) | (local_topk_ids >= num_local_experts)
-        local_topk_ids[non_local] = -1
+    N = fc1_weight.size(1)
+    K = fc1_weight.size(2)
 
-        sorted_token_ids, expert_ids, num_post = _moe_align_block_size(
-            local_topk_ids, BLOCK_SIZE_M, num_local_experts
-        )
-        num_valid = M * topk
+    topk_weights_flat = probs.reshape(-1).contiguous()
 
-        N = fc1_weight.size(1)  # fc1 output dim
-        K = fc1_weight.size(2)  # hidden_size
+    # FC1: [max_tokens, K] → [max_tokens*topk, N]
+    intermediate1 = torch.zeros(
+        num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
+    )
+    _invoke_fused_moe_kernel(
+        hidden_states,
+        fc1_weight,
+        intermediate1,
+        topk_weights_flat,
+        sorted_token_ids,
+        expert_ids,
+        num_post,
+        mul_routed_weight=False,
+        top_k=topk,
+    )
 
-        # Flatten topk_weights to [M * topk] in the same token-major order
-        topk_weights_flat = probs.reshape(-1).contiguous()
+    # Activation
+    intermediate2 = torch.empty(
+        num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
+    )
+    _apply_activation(activation_type, intermediate2, intermediate1)
 
-        # FC1: [M, K] → [M*topk, N]
-        intermediate1 = torch.zeros(M * topk, N, dtype=hidden_states.dtype, device=hidden_states.device)
-        _invoke_fused_moe_kernel(
-            hidden_states,
-            fc1_weight,
-            intermediate1,
-            topk_weights_flat,
-            sorted_token_ids,
-            expert_ids,
-            num_post,
-            mul_routed_weight=False,
-            top_k=topk,
-        )
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights
+    intermediate3 = torch.zeros(
+        num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
+    )
+    _invoke_fused_moe_kernel(
+        intermediate2,
+        fc2_weight,
+        intermediate3,
+        topk_weights_flat,
+        sorted_token_ids,
+        expert_ids,
+        num_post,
+        mul_routed_weight=True,
+        top_k=1,
+    )
 
-        # Activation
-        activation_out_dim = N  # non-gated: same size
-        intermediate2 = torch.empty(
-            M * topk, activation_out_dim, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        _apply_activation(activation_type, intermediate2, intermediate1)
-
-        # FC2: [M*topk, activation_out_dim] → [M*topk, K], with routing weights
-        intermediate3 = torch.zeros(
-            M * topk, K, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        _invoke_fused_moe_kernel(
-            intermediate2,
-            fc2_weight,
-            intermediate3,
-            topk_weights_flat,
-            sorted_token_ids,
-            expert_ids,
-            num_post,
-            mul_routed_weight=True,
-            top_k=1,  # FC2 input already has one row per topk slot
-        )
-
-        # Reduce over topk: [M, topk, K] → [M, K]
-        output = intermediate3.view(M, topk, K).float().sum(dim=1).to(hidden_states.dtype)
-        return output
-
-    else:
-        # ── Mode 2: already-permuted tokens (eager / dispatcher path) ──
-        assert tokens_per_expert is not None
-        tokens_per_expert = tokens_per_expert.int().cuda()
-
-        total_tokens = hidden_states.size(0)
-        N = fc1_weight.size(1)
-        K = fc1_weight.size(2)
-
-        # Build trivial indirection: tokens are already in expert order
-        sorted_token_ids = torch.arange(total_tokens, dtype=torch.int32, device=hidden_states.device)
-        # Pad each expert group to BLOCK_SIZE_M
-        padded_counts = ((tokens_per_expert + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M) * BLOCK_SIZE_M
-        padded_offsets = torch.zeros(num_local_experts + 1, dtype=torch.int32, device=hidden_states.device)
-        padded_offsets[1:] = torch.cumsum(padded_counts, 0)
-        total_padded = padded_offsets[-1].item()
-
-        padded_sorted = torch.full(
-            (total_padded,), total_tokens, dtype=torch.int32, device=hidden_states.device
-        )
-        expert_ids_out = torch.full(
-            (total_padded // BLOCK_SIZE_M,), -1, dtype=torch.int32, device=hidden_states.device
-        )
-
-        unpadded_offsets = torch.zeros(num_local_experts + 1, dtype=torch.int32, device=hidden_states.device)
-        unpadded_offsets[1:] = torch.cumsum(tokens_per_expert, 0)
-
-        for e in range(num_local_experts):
-            count = tokens_per_expert[e].item()
-            padded = padded_counts[e].item()
-            if padded == 0:
-                continue
-            src = unpadded_offsets[e].item()
-            dst = padded_offsets[e].item()
-            padded_sorted[dst : dst + count] = sorted_token_ids[src : src + count]
-            num_blocks = padded // BLOCK_SIZE_M
-            expert_ids_out[dst // BLOCK_SIZE_M : dst // BLOCK_SIZE_M + num_blocks] = e
-
-        num_post = torch.tensor([total_padded], dtype=torch.int32, device=hidden_states.device)
-
-        # Probs — already gathered; expand to per-token for the kernel
-        if probs.dim() > 1:
-            probs_flat = probs.squeeze(-1)
-        else:
-            probs_flat = probs
-
-        # FC1: [total_tokens, K] → [total_tokens, N]  (top_k=1)
-        intermediate1 = torch.zeros(
-            total_tokens, N, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        _invoke_fused_moe_kernel(
-            hidden_states,
-            fc1_weight,
-            intermediate1,
-            probs_flat,
-            padded_sorted,
-            expert_ids_out,
-            num_post,
-            mul_routed_weight=False,
-            top_k=1,
-        )
-
-        # Activation
-        intermediate2 = torch.empty_like(intermediate1)
-        _apply_activation(activation_type, intermediate2, intermediate1)
-
-        # FC2: [total_tokens, N] → [total_tokens, K], with probs
-        output = torch.zeros(
-            total_tokens, K, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        _invoke_fused_moe_kernel(
-            intermediate2,
-            fc2_weight,
-            output,
-            probs_flat,
-            padded_sorted,
-            expert_ids_out,
-            num_post,
-            mul_routed_weight=True,
-            top_k=1,
-        )
-
-        return output
+    # Reduce over topk: [max_tokens, topk, K] → [max_tokens, K]
+    result = intermediate3.view(max_tokens, topk, K).float().sum(dim=1).to(hidden_states.dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result

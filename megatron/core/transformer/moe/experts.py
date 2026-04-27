@@ -648,10 +648,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
-    def _vllm_forward(
-        self, hidden_states, probs, routing_map=None, tokens_per_expert=None, skip_permute=False
-    ):
-        """vLLM Triton fused MoE kernel forward (BF16)."""
+    def _vllm_forward(self, hidden_states, probs, routing_map):
+        """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = vllm_fused_moe(
             hidden_states,
@@ -661,9 +659,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._mcore_activation_type,
             num_local_experts=self.num_local_experts,
             local_expert_start=local_expert_start,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
-            tokens_per_expert=tokens_per_expert,
-            skip_permute=skip_permute,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )
         return output, None
 

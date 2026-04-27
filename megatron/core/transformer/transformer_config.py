@@ -1224,6 +1224,15 @@ class TransformerConfig(ModelParallelConfig):
                     "Set inference_grouped_gemm_backend to 'torch'."
                 )
 
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
+                and self.fp8 == "mxfp8"
+            ):
+                raise ValueError(
+                    "vLLM Triton fused MoE only supports BF16. "
+                    "Set inference_grouped_gemm_backend to 'torch' for MXFP8."
+                )
+
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
 
