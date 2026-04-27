@@ -36,26 +36,41 @@ from megatron.core.inference.moe.permute import compute_expert_offsets, compute_
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
 # ---------------------------------------------------------------------------
 
-BLOCK_SIZE_M = 64
 
+def _select_block_size_m(max_tokens: int) -> int:
+    """Select BLOCK_SIZE_M based on the token buffer size.
+
+    Smaller tiles reduce padding waste in the indirection table when each
+    expert sees few tokens (decode). Larger tiles improve compute density
+    for large batches (prefill). Minimum is 16 (tl.dot requirement on NVIDIA).
+    """
+    if max_tokens <= 32:
+        return 16
+    if max_tokens <= 96:
+        return 32
+    if max_tokens <= 512:
+        return 64
+    return 128
+
+
+# BLOCK_SIZE_M is NOT in these configs — it is selected on the Python side by
+# _select_block_size_m and passed as a caller-provided constexpr. Each unique
+# BLOCK_SIZE_M value triggers independent autotuning over these configs.
 _AUTOTUNE_CONFIGS = [
     # GROUP_SIZE_M=1: better when each expert has few tokens (decode, sparse activation).
-    # With few tokens per expert, adjacent M-blocks belong to different experts, so
-    # grouping them for L2 weight-tile reuse is counterproductive.
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=3),
-    # GROUP_SIZE_M=8: better for large batches where experts see many tokens and
-    # adjacent M-blocks can share weight tiles in L2 cache.
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
-    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=3),
+    # GROUP_SIZE_M=8: better for large batches where experts see many tokens.
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=4),
 ]
 
 
@@ -341,6 +356,7 @@ def _invoke_fused_moe_kernel(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
+    block_size_m: int,
     fuse_squared_relu: bool = False,
 ):
     """Launch the Triton fused-MoE kernel for one GEMM pass."""
@@ -374,6 +390,7 @@ def _invoke_fused_moe_kernel(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_SQUARED_RELU=fuse_squared_relu,
         top_k=top_k,
+        BLOCK_SIZE_M=block_size_m,
     )
 
 
@@ -493,10 +510,11 @@ def vllm_fused_moe(
 
     max_tokens = hidden_states.size(0)
     topk = routing_map.shape[1]
+    block_size_m = _select_block_size_m(max_tokens)
 
     sorted_token_ids, expert_ids, num_post_local, num_post_all = (
         _moe_align_block_size_cuda_graphable(
-            routing_map, BLOCK_SIZE_M, num_local_experts, local_expert_start, valid_tokens
+            routing_map, block_size_m, num_local_experts, local_expert_start, valid_tokens
         )
     )
     num_valid = max_tokens * topk
@@ -521,6 +539,7 @@ def vllm_fused_moe(
         num_post_local,
         mul_routed_weight=False,
         top_k=topk,
+        block_size_m=block_size_m,
         fuse_squared_relu=True,
     )
 
@@ -541,6 +560,7 @@ def vllm_fused_moe(
         num_post_all,
         mul_routed_weight=True,
         top_k=1,
+        block_size_m=block_size_m,
     )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
