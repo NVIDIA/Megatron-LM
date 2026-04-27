@@ -79,7 +79,15 @@ class DeferredReleaseRegistry:
 
     @classmethod
     def get_instance(cls) -> "DeferredReleaseRegistry":
-        """Get the singleton instance, creating it if necessary."""
+        """Get the singleton instance, creating it if necessary.
+
+        Note: reset() is intentionally not called on exception paths.
+        This registry is only active during CUDA graph capture, and an
+        exception mid-capture leaves the graph itself in an unrecoverable
+        state — the stale registry is dominated by that larger failure.
+        drain_all() clears the registry at the end of every successful
+        capture pass.
+        """
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
@@ -175,10 +183,12 @@ class DeferredReleaseRegistry:
         Also resets the seen-streams record so the two-stream invariant is
         checked afresh for the next iteration / capture.
         """
-        for key in list(self._registry.keys()):
-            tensors = self._registry.pop(key)
-            for t in tensors:
-                t.untyped_storage().resize_(0)
+        stream = torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            for key in list(self._registry.keys()):
+                tensors = self._registry.pop(key)
+                for t in tensors:
+                    t.untyped_storage().resize_(0)
         self._seen_streams.clear()
 
     def clear(self):
@@ -445,14 +455,9 @@ class ScheduleNode:
         # output_grad maybe from another stream
         if output_grad:
             if torch.cuda.is_current_stream_capturing():
-                # During CUDA graph capture, defer the output_grad release instead of
-                # using record_stream. The grads were produced on a different stream
-                # and consumed on self.stream inside stream_acquire_context above.
-                # They become safe to free when the next node on the OTHER stream
-                # waits on self.event.
-                # When delay_grads_release is True, the grads are kept alive by
-                # self.output_grads for backward_dw() — do NOT defer those, as
-                # backward_dw() still needs them and will free them itself.
+                # Note: unlike the eager path, we do NOT check manual_release_grads here.  
+                # That flag suppresses resize_(0) for per-scope CG (e.g. CudaGraphScope.attn),  
+                # but during full-iteration capture we must reclaim memory in the private pool. 
                 if not self.delay_grads_release:
                     deferred = [g for g in output_grad if g is not None]
                     if deferred:
