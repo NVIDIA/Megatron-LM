@@ -345,11 +345,10 @@ def _invoke_fused_moe_kernel(
 # ---------------------------------------------------------------------------
 
 
-def _apply_activation(activation_type: ActivationType, output: torch.Tensor, input: torch.Tensor):
-    """Element-wise activation, writing into *output*."""
+def _apply_activation(activation_type: ActivationType, x: torch.Tensor) -> torch.Tensor:
+    """Element-wise activation, returns new tensor."""
     if activation_type == ActivationType.SQUARED_RELU:
-        torch.nn.functional.relu(input, inplace=False, out=output)
-        output.mul_(output)
+        return torch.nn.functional.relu(x).square()
     else:
         raise ValueError(f"Unsupported activation: {activation_type}")
 
@@ -428,10 +427,7 @@ def vllm_fused_moe(
     )
 
     # Activation
-    intermediate2 = torch.empty(
-        num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
-    )
-    _apply_activation(activation_type, intermediate2, intermediate1)
+    intermediate2 = _apply_activation(activation_type, intermediate1)
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights
     intermediate3 = torch.zeros(
