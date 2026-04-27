@@ -1472,7 +1472,14 @@ def validate_args(args, defaults={}):
             args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
+        if args.use_megatron_fsdp:
+            assert args.optimizer == "muon", (
+                "Emerging optimizer with Megatron-FSDP is currently only supported for Muon."
+            )
+            assert args.outer_dp_sharding_strategy == "no_shard", (
+                "Emerging optimizer with Megatron-FSDP does not support HSDP "
+                "(--outer-dp-sharding-strategy != no_shard) yet."
+            )
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
 

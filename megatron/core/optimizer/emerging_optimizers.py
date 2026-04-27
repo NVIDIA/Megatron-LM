@@ -147,6 +147,67 @@ _EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 
 
 # ===========================================================================
+# Megatron-FSDP integration
+# ===========================================================================
+
+
+def _get_mfsdp_models(model_chunks):
+    """Extract list of MegatronFSDP instances from FSDP-wrapped model chunks."""
+    mfsdp_models = []
+    for chunk in model_chunks:
+        # FullyShardedDataParallel delegates finish_grad_sync / start_param_sync
+        # from its .module (MegatronFSDP). install_optimized_model_weights lives
+        # directly on MegatronFSDP, so we need the inner module reference.
+        if hasattr(chunk, "finish_grad_sync") and hasattr(chunk, "module"):
+            mfsdp_models.append(chunk.module)
+    if not mfsdp_models:
+        raise RuntimeError(
+            "Could not find any MegatronFSDP instances in model_chunks. "
+            "Ensure the model is wrapped with FullyShardedDataParallel."
+        )
+    return mfsdp_models
+
+
+class FSDPMuonChainedOptimizer:
+    """Thin FSDP-protocol adapter wrapping a Muon-based MegatronOptimizer.
+
+    Injects the MegatronFSDP step contract around the inner optimizer:
+      1. `finish_grad_sync()` – waits for async grad sync, attaches grads
+         (allreduces for `no_shard`; reduce-scatters for ZeRO-1/2/3).
+      2. `inner_optimizer.step()` – Muon NS + weight update + Adam.
+      3. `install_optimized_model_weights()` – copies fp32 main weights
+         back into the model's bf16 (sharded for ZeRO-3) buffer.
+
+    All other attribute accesses are delegated to the inner optimizer via
+    `__getattr__`, making this class transparent to the training loop.
+    """
+
+    def __init__(self, inner: Any, mfsdp_models: list) -> None:
+        # Use object.__setattr__ to avoid triggering our own __getattr__ during init.
+        object.__setattr__(self, "inner", inner)
+        object.__setattr__(self, "_mfsdp_models", mfsdp_models)
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self) -> Any:
+        """FSDP-aware optimizer step: sync grads -> inner step -> install weights."""
+        for mfsdp in self._mfsdp_models:
+            if not mfsdp.model_auto_sync:
+                mfsdp.finish_grad_sync()
+        result = self.inner.step()
+        for mfsdp in self._mfsdp_models:
+            mfsdp.install_optimized_model_weights()
+        return result
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Zero optimizer gradients. FSDP grad buffer is zeroed by the training loop."""
+        self.inner.zero_grad(set_to_none)
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate all other attribute accesses to the inner optimizer."""
+        return getattr(object.__getattribute__(self, "inner"), name)
+
+
+# ===========================================================================
 # Muon
 # ===========================================================================
 
