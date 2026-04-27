@@ -19,7 +19,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
-from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
@@ -51,7 +50,7 @@ from megatron.core.inference.utils import (
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs, graph_capture
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -62,7 +61,11 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    nvtx_range_pop,
+    nvtx_range_push,
+    round_up_to_nearest_multiple,
     trace_async_exceptions,
+    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator
@@ -364,6 +367,21 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
+        # MTP warmup preparation: capture MTP CUDA graphs alongside the
+        # decoder graphs within the same loop rather than in a separate pass.
+        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
+        mtp_warmup_enabled = (
+            controller.num_mtp_heads > 0
+            and (controller.num_speculative_tokens or 0) > 0
+            and hasattr(unwrapped, 'mtp')
+        )
+        if mtp_warmup_enabled:
+            tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
+            sp_enabled = model_config.sequence_parallel and tp_size > 1
+            mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
+            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
+            mtp_seen_batch_sizes = set()
+
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -389,11 +407,38 @@ class DynamicInferenceEngine(AbstractEngine):
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
+            # MTP CUDA graph warmup for this batch dimension.
+            if mtp_warmup_enabled:
+                n = cuda_graph_batch_dimension.req_count
+                if sp_enabled:
+                    n = round_up_to_nearest_multiple(n, tp_size)
+                if n > 0 and n not in mtp_seen_batch_sizes:
+                    mtp_seen_batch_sizes.add(n)
+                    device = torch.cuda.current_device()
+                    batch_dim = n // tp_size if sp_enabled else n
+                    # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                    for depth in mtp_warmup_depths:
+                        with graph_capture():
+                            unwrapped.compute_mtp_single_step(
+                                hidden_states=torch.zeros(
+                                    (batch_dim, 1, model_config.hidden_size),
+                                    device=device,
+                                    dtype=model_config.params_dtype,
+                                ),
+                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                                depth=depth,
+                            )
+
             context.reset()
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+
+        if mtp_warmup_enabled and mtp_seen_batch_sizes:
+            controller.has_mtp_cuda_graphs = True
+            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
         time_end = time.time()
@@ -650,14 +695,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
-            range_push(f"{key}-inference-context")
+            nvtx_range_push(f"{key}-inference-context")
             torch.cuda.synchronize()
 
             yield
 
         finally:
 
-            range_pop()
+            nvtx_range_pop(f"{key}-inference-context")
             end_time = time.time()
 
             end_mem = torch.cuda.memory_stats()
@@ -1034,9 +1079,9 @@ class DynamicInferenceEngine(AbstractEngine):
         accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
-        routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
+        finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1051,9 +1096,9 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
-            routing_indices_per_request: (Dict[int, Tensor]): MoE routing indices
-                pre-mapped by request_id. Each value is a tensor of shape
-                [num_tokens_this_step, num_layers, topk].
+            finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
+                finished requests, saved before update_requests released them.
+                Used for per-block routing reconstruction.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -1182,6 +1227,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._spec_tokens_accepted += actual_accepted
 
                 if request_id in finished_request_ids:
+                    # Reconstruct routing from per-block storage before popping.
+                    if (
+                        finished_routing_block_ids
+                        and request_id in finished_routing_block_ids
+                        and len(self.requests[request_id].record.requests) == 1
+                    ):
+                        block_ids = finished_routing_block_ids[request_id]
+                        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
+                        request.routing_indices = (
+                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
+                                block_ids, total_tokens - 1
+                            )
+                        )
+
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
@@ -1290,23 +1349,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
-
-            # Process routing indices if available (keyed by request_id)
-            # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
-            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
-            if (
-                routing_indices_per_request is not None
-                and request_id in routing_indices_per_request
-            ):
-                step_routing = routing_indices_per_request[
-                    request_id
-                ]  # [num_tokens, num_layers, topk]
-                if request.routing_indices is None:
-                    request.routing_indices = step_routing.clone()
-                else:
-                    request.routing_indices = torch.cat(
-                        [request.routing_indices, step_routing], dim=0
-                    )
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1656,7 +1698,7 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
         # Generate tokens.
-        range_push("Prefill" if not is_decode_only else "Decode")
+        nvtx_range_push("Prefill" if not is_decode_only else "Decode")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
@@ -1668,7 +1710,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
-        range_pop()
+        nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
         if (
             self.logging_step_interval > 0
@@ -1715,7 +1757,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
         # Increment finished_request_count.
-        range_push("bookkeeping")
+        nvtx_range_push("bookkeeping")
         cuda_graph_request_count = None
 
         if step_result is not None:
@@ -1727,7 +1769,7 @@ class DynamicInferenceEngine(AbstractEngine):
             accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
-            routing_indices_per_request = step_result.get("routing_indices_per_request", None)
+            finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -1745,9 +1787,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 accepted_tokens,
                 log_probs,
                 top_n_logprobs,
-                routing_indices_per_request,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
+                finished_routing_block_ids=finished_routing_block_ids,
             )
 
         else:
@@ -1764,13 +1806,13 @@ class DynamicInferenceEngine(AbstractEngine):
             ), f"Failed request {failed_request_id} future has not been properly resolved."
         self.failed_request_ids.clear()
 
-        range_pop()
+        nvtx_range_pop("bookkeeping")
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will
         # overlap detokenization with the engine.
         if not self.use_coordinator:
-            range_push("detokenization")
+            nvtx_range_push("detokenization")
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
@@ -1784,7 +1826,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_tokens,
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
-            range_pop()
+            nvtx_range_pop("detokenization")
 
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,
@@ -1794,13 +1836,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
             if records_to_send:
-                range_push("coordinator_communication")
+                nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
                     [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
                     use_bin_type=True,
                 )
                 self.socket_for_receiving_requests.send(payload)
-                range_pop()
+                nvtx_range_pop("coordinator_communication")
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
@@ -2040,7 +2082,7 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
-        range_push("drain_zmq_socket")
+        nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
             while True:
@@ -2073,7 +2115,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 all_messages = []
 
-        range_pop()
+        nvtx_range_pop("drain_zmq_socket")
 
         # First pass: add requests.
         # Control signals are queued for the second pass.
@@ -2084,9 +2126,9 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                range_push("add_request")
+                nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
-                range_pop()
+                nvtx_range_pop("add_request")
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:
@@ -2230,7 +2272,7 @@ class DynamicInferenceEngine(AbstractEngine):
             (global_work, all_pausing): max work across EP, and whether
             all peers signaled consensus.
         """
-        range_push("_ep_establish_consensus")
+        nvtx_range_push("_ep_establish_consensus")
 
         consensus_val = -1 if signal_consensus else 0
 
@@ -2255,7 +2297,7 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             global_work, global_consensus = local_work, consensus_val
 
-        range_pop()
+        nvtx_range_pop("_ep_establish_consensus")
         return global_work, global_consensus == -1
 
     async def _world_barrier(self):
@@ -2267,12 +2309,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         No-op when world_size == 1 (communicator is not created).
         """
-        range_push("world_barrier")
+        nvtx_range_push("world_barrier")
         if hasattr(self, 'world_zmq_communicator'):
             await self.world_zmq_communicator.all_reduce_max(
                 1, async_op=(not self.use_synchronous_zmq_collectives)
             )
-        range_pop()
+        nvtx_range_pop("world_barrier")
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(

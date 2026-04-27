@@ -26,7 +26,8 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_transformer_engine_block_spec,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from pretrain_gpt import loss_func
 
 """
@@ -269,12 +270,14 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
+    args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    full_config = pretrain_cfg_container_from_args(args)
     pretrain(
+        full_config,
         train_valid_test_datasets_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'},
         get_embedding_ranks=t5_embedding_ranks,
         get_position_embedding_ranks=t5_position_embedding_ranks,
     )
