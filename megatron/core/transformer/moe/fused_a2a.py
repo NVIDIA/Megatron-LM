@@ -278,7 +278,7 @@ _hybrid_ep_buffer = None
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
-    seq_len: int,
+    num_tokens: int,
     num_local_experts: int,
     num_sms_dispatch_api: int,
     num_sms_combine_api: int,
@@ -313,7 +313,7 @@ def init_hybrid_ep_buffer(
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
-        max_num_of_tokens_per_rank=seq_len,
+        max_num_of_tokens_per_rank=num_tokens,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
         num_sms_dispatch_api=num_sms_dispatch_api,
