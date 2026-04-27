@@ -5,11 +5,12 @@ import functools
 import logging
 import warnings
 from abc import ABC
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import CheckpointManager
+    from megatron.core.tensor_parallel.random import MHCRecomputeManager
 
 import torch
 import torch.distributed
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+_MHC_RECOMPUTE_MANAGER_CONTEXT = ContextVar("mhc_recompute_manager", default=None)
 
 
 def get_transformer_layer_offset(
@@ -1429,24 +1431,28 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         return submodules
 
     def __call__(self, *args, **kwargs):
-        # Extract before CUDA graph manager processes kwargs; CheckpointManager
-        # is not a CUDA-graph-supported argument type.
-        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        # Extract before CUDA graph manager processes kwargs; MHCRecomputeManager
+        # is not a CUDA-graph-supported argument type. MCore CUDA graph capture
+        # executes forward synchronously inside __call__, so this context-local
+        # handoff is visible during capture without storing per-call state on the
+        # module instance.
+        mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        token = _MHC_RECOMPUTE_MANAGER_CONTEXT.set(mhc_recompute_manager)
         try:
             return super().__call__(*args, **kwargs)
         finally:
-            self._mhc_recompute_manager = None
+            _MHC_RECOMPUTE_MANAGER_CONTEXT.reset(token)
 
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
 
-        # Direct forward() calls can pass the manager normally. __call__ stores
-        # it on self first so CUDA graph argument processing never sees the
-        # unsupported CheckpointManager object.
+        # Direct forward() calls can pass the manager normally. __call__ uses a
+        # context-local handoff so CUDA graph argument processing never sees the
+        # unsupported MHCRecomputeManager object.
         mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         if mhc_recompute_manager is None:
-            mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
+            mhc_recompute_manager = _MHC_RECOMPUTE_MANAGER_CONTEXT.get()
 
         hidden_states, context = self._forward_attention(
             *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
@@ -1475,7 +1481,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_recompute_manager: Optional['MHCRecomputeManager'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -1599,7 +1605,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         hidden_states,
         inference_context=None,
         padding_mask=None,
-        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_recompute_manager: Optional['MHCRecomputeManager'] = None,
     ):
         """Forward MLP with hyper connection pre/post processing."""
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -1697,7 +1703,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mlp_h_res,
         residual,
         mlp_hc_h_post,
-        mhc_mlp_bda_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_mlp_bda_recompute_manager: Optional['MHCRecomputeManager'] = None,
     ):
         """
         Perform operations after the MLP computation with fused hyper connection kernel.
@@ -1709,7 +1715,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_h_res (Tensor): [s, b, n, n] - residual mixing matrix from hyper connection.
             residual (Tensor): [s, b, n*C] - original residual (n-stream hidden states).
             mlp_hc_h_post (Tensor): [s, b, n] - expansion weights from hyper connection.
-            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
+            mhc_recompute_manager: Optional MHCRecomputeManager for checkpoint management.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, n*C].

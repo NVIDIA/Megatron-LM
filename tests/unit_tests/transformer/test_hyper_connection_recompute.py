@@ -5,8 +5,8 @@ Unit tests for HyperConnection block-level recomputation.
 
 Tests the following functionality:
 1. HyperConnectionModule._forward_with_checkpoint correctness
-2. HyperConnectionModule.apply_h_post with CheckpointManager
-3. Multiple HyperConnectionModules chained with a single CheckpointManager
+2. HyperConnectionModule.apply_h_post with MHCRecomputeManager
+3. Multiple HyperConnectionModules chained with a single MHCRecomputeManager
 4. Partial checkpoint (last layer not checkpointed)
 5. TransformerConfig 'mhc' in recompute_modules option
 """
@@ -16,8 +16,11 @@ import warnings
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.random import CheckpointManager, model_parallel_cuda_manual_seed
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.tensor_parallel.random import (
+    MHCRecomputeManager,
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.hyper_connection import HyperConnectionModule, reference_proj_inv_rms
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -47,6 +50,17 @@ class TestHyperConnectionCheckpoint:
         module = HyperConnectionModule(config=config, layer_number=1)
         module.cuda()
         return module
+
+    def test_reference_proj_inv_rms_upcasts_norm_for_fp16(self):
+        width = 16384
+        x = torch.full((1, width), 256.0, device='cuda', dtype=torch.float16)
+        weight = torch.zeros((1, width), device='cuda', dtype=torch.float16)
+
+        _, inv_rms = reference_proj_inv_rms(x, weight)
+
+        assert inv_rms.dtype == torch.float16
+        assert torch.isfinite(inv_rms).all()
+        assert inv_rms.item() > 0
 
     def test_forward_normal_vs_checkpoint_correctness(self):
         """
@@ -84,7 +98,7 @@ class TestHyperConnectionCheckpoint:
         # Forward with checkpoint
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointManager()
+        manager = MHCRecomputeManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module._forward_with_checkpoint(
             hidden_states_ckpt, manager
         )
@@ -144,7 +158,7 @@ class TestHyperConnectionCheckpoint:
 
         # With checkpoint (manager provided)
         torch.manual_seed(42)
-        manager = CheckpointManager()
+        manager = MHCRecomputeManager()
         x_out_ckpt, bias_out_ckpt = module.apply_h_post(
             (x_ckpt, bias), h_post_ckpt, manager=manager
         )
@@ -193,7 +207,7 @@ class TestHyperConnectionCheckpoint:
         # With manager (uses _forward_with_checkpoint)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointManager()
+        manager = MHCRecomputeManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
@@ -208,7 +222,7 @@ class TestHyperConnectionCheckpoint:
 
 
 class TestMHCBlockRecomputeIntegration:
-    """Test CheckpointManager integration with HyperConnection."""
+    """Test MHCRecomputeManager integration with HyperConnection."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -220,7 +234,7 @@ class TestMHCBlockRecomputeIntegration:
     def test_multiple_hyper_connections_in_chain(self):
         """
         Test that multiple HyperConnectionModules can be chained together
-        with a single CheckpointManager.
+        with a single MHCRecomputeManager.
         """
         hidden_size = 64
         num_streams = 4
@@ -277,7 +291,7 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        manager = CheckpointManager()
+        manager = MHCRecomputeManager()
 
         h = hidden_states_ckpt
         r = residual_ckpt
@@ -358,7 +372,7 @@ class TestMHCBlockRecomputeIntegration:
         # With manager - checkpoint everything except final output
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointManager()
+        manager = MHCRecomputeManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )

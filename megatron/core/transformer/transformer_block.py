@@ -20,7 +20,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import CheckpointManager
+from megatron.core.tensor_parallel.random import MHCRecomputeManager
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
@@ -670,29 +670,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+    ) -> Tuple[List[Optional[MHCRecomputeManager]], List[bool]]:
         """Build fresh per-forward MHC managers using cached block-end topology."""
         num_layers = len(self.layers)
-        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
+        layer_managers: List[Optional[MHCRecomputeManager]] = [None] * num_layers
         is_recompute_block_end = self._mhc_recompute_block_end_plan
 
         if not use_mhc_recompute or num_layers == 0:
             return layer_managers, is_recompute_block_end
 
-        mhc_manager = CheckpointManager()
+        mhc_manager = MHCRecomputeManager()
 
         for l_no, is_last_in_recompute_block in enumerate(is_recompute_block_end):
             is_last_in_transformer_block = l_no == num_layers - 1
             layer_managers[l_no] = mhc_manager
 
             if is_last_in_recompute_block and not is_last_in_transformer_block:
-                mhc_manager = CheckpointManager()
+                mhc_manager = MHCRecomputeManager()
 
         return layer_managers, is_recompute_block_end
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
-        mhc_manager: Optional[CheckpointManager],
+        mhc_manager: Optional[MHCRecomputeManager],
         hidden_states: Tensor,
         is_last_in_recompute_block: bool,
     ) -> None:

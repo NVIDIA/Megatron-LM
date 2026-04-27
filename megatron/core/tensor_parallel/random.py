@@ -753,19 +753,21 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-class CheckpointManager:
+class MHCRecomputeManager:
     """
-    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock
-    cross layer recomputations, enabling unified recomputation during backward pass.
-    This is particularly useful for scenarios where multiple checkpoint operations have
-    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
+    Manages cross-layer mHC CheckpointWithoutOutput recomputation blocks.
+
+    This is particularly useful when multiple checkpointed operations have sequential
+    dependencies (i.e., the output of one checkpoint is the input of the next).
+    The manager recomputes checkpoints in forward order so each checkpoint restores
+    its output storage before the next checkpoint consumes it during recomputation.
 
     Usage:
-        ckptManager = CheckpointManager()
-        ckpt_function = CheckpointWithoutOutput(ckpt_manager=ckptManager)
+        mhc_manager = MHCRecomputeManager()
+        ckpt_function = CheckpointWithoutOutput(ckpt_manager=mhc_manager)
         ckpt_function.checkpoint(run_function, *args)
         # other checkpointed operations
-        ckpt_manager.discard_all_outputs_and_register_unified_recompute(final_output)
+        mhc_manager.discard_all_outputs_and_register_unified_recompute(final_output)
     """
 
     def __init__(self):
@@ -802,6 +804,10 @@ class CheckpointManager:
             ckpt._recompute(None)
 
 
+# Backward-compatible alias for earlier internal users of the generic name.
+CheckpointManager = MHCRecomputeManager
+
+
 class CheckpointWithoutOutput(object):
     """
     Checkpoint a model or part of the model and release the output.
@@ -822,7 +828,7 @@ class CheckpointWithoutOutput(object):
 
         Args:
             fp8: Whether to use FP8 mode. Defaults to False.
-            ckpt_manager: Optional CheckpointManager instance. When provided,
+            ckpt_manager: Optional MHCRecomputeManager instance. When provided,
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.

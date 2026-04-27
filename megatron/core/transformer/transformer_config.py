@@ -493,7 +493,7 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "mhc": recompute HyperConnection intermediate activations via
-            CheckpointWithoutOutput + CheckpointManager. Requires
+            CheckpointWithoutOutput + MHCRecomputeManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
     "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
@@ -908,7 +908,7 @@ class TransformerConfig(ModelParallelConfig):
     layer in the transformer block) will:
     - NOT checkpoint its final MLP BDA
     - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointManager is created for subsequent layers
+    - A new MHCRecomputeManager is created for subsequent layers
 
     If None, all layers in the transformer block share a single recompute block.
 
@@ -1500,6 +1500,7 @@ class TransformerConfig(ModelParallelConfig):
                     "'mhc' and 'mlp' in recompute_modules cannot be used together. "
                     "They use different checkpoint mechanisms that may conflict."
                 )
+            # bool is a subclass of int, so reject it explicitly.
             if self.mhc_recompute_layer_num is not None and (
                 isinstance(self.mhc_recompute_layer_num, bool)
                 or not isinstance(self.mhc_recompute_layer_num, int)

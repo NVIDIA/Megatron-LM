@@ -200,6 +200,13 @@ def test_checkpoint():
     Utils.destroy_model_parallel()
 
 
+def test_checkpoint_without_output_fp8_flag_is_explicit():
+    assert CheckpointWithoutOutput().fp8 is False
+    assert CheckpointWithoutOutput(fp8=False).fp8 is False
+    assert CheckpointWithoutOutput(fp8=None).fp8 is False
+    assert CheckpointWithoutOutput(fp8="e4m3").fp8 is True
+
+
 def test_checkpoint_without_output():
     def normal_forward(input):
         x = torch.nn.functional.gelu(input)
