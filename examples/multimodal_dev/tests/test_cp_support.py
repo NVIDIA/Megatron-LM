@@ -4,8 +4,8 @@
 
 Tests cover:
   1. _cp_split_tensor — zigzag split correctness, reconstruction, and edge cases
-  2. _pad_batch_for_cp — padding shapes, values, and position_ids continuity
-  3. _NoCPGroup — dummy process group behaviour
+  2. _NoCPGroup — dummy process group behaviour
+  3. _thd_cp_partition_index — TE-based per-sample THD CP partitioning
   4. Cross-validation against megatron.core.utils.get_batch_on_this_cp_rank
 
 Run with:  pytest examples/multimodal_dev/tests/test_cp_support.py -v
@@ -14,12 +14,7 @@ Run with:  pytest examples/multimodal_dev/tests/test_cp_support.py -v
 import pytest
 import torch
 
-from examples.multimodal_dev.models.base import _cp_split_tensor
-
-# ---------------------------------------------------------------------------
-# Test _cp_split_tensor
-# ---------------------------------------------------------------------------
-
+from examples.multimodal_dev.models.base import _cp_split_tensor, _NoCPGroup
 
 
 class TestCpSplitTensor:
@@ -174,186 +169,6 @@ class TestCpSplitTensor:
             assert c.shape[0] == B
 
 
-# ---------------------------------------------------------------------------
-# Test _pad_batch_for_cp (requires mocking parallel_state)
-# ---------------------------------------------------------------------------
-
-class TestPadBatchForCp:
-    """Tests for CP padding logic.
-
-    These tests mock the parallel_state functions to avoid needing
-    a real distributed environment.
-    """
-
-    def _make_batch(self, B=2, S=10):
-        """Create a minimal batch dict."""
-        return {
-            "input_ids": torch.randint(0, 1000, (B, S)),
-            "labels": torch.randint(0, 1000, (B, S)),
-            "loss_mask": torch.ones(B, S),
-            "position_ids": torch.arange(S).unsqueeze(0).unsqueeze(0).expand(3, B, S).clone(),
-            "attention_mask": torch.ones(B, S, dtype=torch.bool),
-        }
-
-    def test_padding_shape(self, monkeypatch):
-        """Padded shapes should be divisible by cp_size * 2."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        batch = self._make_batch(B=2, S=10)
-        padded = fs._pad_batch_for_cp(batch)
-
-        # S=10 should be padded to 12 (next multiple of 2*2=4)
-        assert padded["input_ids"].shape[1] == 12
-        assert padded["labels"].shape[1] == 12
-        assert padded["loss_mask"].shape[1] == 12
-        assert padded["position_ids"].shape[2] == 12
-        assert padded["attention_mask"].shape[1] == 12
-
-    def test_padding_values(self, monkeypatch):
-        """Check pad values: input_ids=0, labels=-100, loss_mask=0."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        batch = self._make_batch(B=1, S=6)
-        padded = fs._pad_batch_for_cp(batch)
-
-        # S=6 -> padded to 8 (2 padding tokens)
-        assert padded["input_ids"][0, -1].item() == 0
-        assert padded["labels"][0, -1].item() == -100
-        assert padded["loss_mask"][0, -1].item() == 0
-        assert padded["attention_mask"][0, -1].item() == 0
-
-    def test_position_ids_padding_continuity(self, monkeypatch):
-        """MRoPE position_ids padding should continue incrementing."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        B, S = 1, 6
-        pos = torch.arange(S).unsqueeze(0).unsqueeze(0).expand(3, B, -1).clone()
-        # pos[:, 0, :] = [0, 1, 2, 3, 4, 5] for each of the 3 components
-        batch = self._make_batch(B=B, S=S)
-        batch["position_ids"] = pos
-
-        padded = fs._pad_batch_for_cp(batch)
-        # Should pad to 8: last original value is 5, padded values should be 6, 7
-        for d in range(3):
-            assert padded["position_ids"][d, 0, 6].item() == 6
-            assert padded["position_ids"][d, 0, 7].item() == 7
-
-    def test_no_padding_when_divisible(self, monkeypatch):
-        """No padding when seq_len already divisible."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        batch = self._make_batch(B=2, S=8)  # 8 % 4 == 0
-        padded = fs._pad_batch_for_cp(batch)
-        assert padded["input_ids"].shape[1] == 8
-
-    def test_cp1_noop(self, monkeypatch):
-        """CP=1 should return batch unchanged."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 1)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        batch = self._make_batch(B=2, S=10)
-        original_shape = batch["input_ids"].shape
-        padded = fs._pad_batch_for_cp(batch)
-        assert padded["input_ids"].shape == original_shape
-
-    def test_padding_with_tp_sp(self, monkeypatch):
-        """When SP is enabled, alignment includes tp_size."""
-        import examples.multimodal_dev.forward_step as fs
-        import megatron.training as mt
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 4)
-        monkeypatch.setattr(
-            mt,
-            "get_args",
-            lambda: type("Args", (), {"sequence_parallel": True})(),
-        )
-
-        # divisible_by = tp_size * cp_size * 2 = 4 * 2 * 2 = 16
-        batch = self._make_batch(B=1, S=10)
-        padded = fs._pad_batch_for_cp(batch)
-        assert padded["input_ids"].shape[1] == 16  # next multiple of 16
-
-    def test_padding_with_cp4(self, monkeypatch):
-        """CP=4 should pad to multiple of 8."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 4)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        # divisible_by = 4 * 2 = 8
-        batch = self._make_batch(B=1, S=5)
-        padded = fs._pad_batch_for_cp(batch)
-        assert padded["input_ids"].shape[1] == 8
-
-    def test_padding_with_cp8(self, monkeypatch):
-        """CP=8 should pad to multiple of 16."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 8)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        # divisible_by = 8 * 2 = 16
-        batch = self._make_batch(B=1, S=10)
-        padded = fs._pad_batch_for_cp(batch)
-        assert padded["input_ids"].shape[1] == 16
-
-    def test_standard_position_ids_padding(self, monkeypatch):
-        """Standard [B, S] position_ids (non-MRoPE) should also be padded."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        B, S = 1, 6
-        batch = self._make_batch(B=B, S=S)
-        batch["position_ids"] = torch.arange(S).unsqueeze(0)  # [1, 6] standard
-
-        padded = fs._pad_batch_for_cp(batch)
-        # S=6 -> padded to 8
-        assert padded["position_ids"].shape == (1, 8)
-        assert padded["position_ids"][0, 6].item() == 6
-        assert padded["position_ids"][0, 7].item() == 7
-
-    def test_loss_mask_padding_zeroes_out(self, monkeypatch):
-        """Padded loss_mask positions should be 0 so they don't contribute to loss."""
-        import examples.multimodal_dev.forward_step as fs
-
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 2)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        B, S = 2, 6
-        batch = self._make_batch(B=B, S=S)
-        batch["loss_mask"] = torch.ones(B, S)  # all 1s
-
-        padded = fs._pad_batch_for_cp(batch)
-        # Original 6 positions should still be 1
-        assert padded["loss_mask"][:, :6].sum().item() == B * S
-        # Padded 2 positions should be 0
-        assert padded["loss_mask"][:, 6:].sum().item() == 0
-
-
-# ---------------------------------------------------------------------------
-# Test _NoCPGroup
-# ---------------------------------------------------------------------------
-
-from examples.multimodal_dev.models.base import _NoCPGroup
-
-
 class TestNoCPGroup:
     """Tests for the dummy CP group used by the vision encoder."""
 
@@ -365,88 +180,6 @@ class TestNoCPGroup:
         g = _NoCPGroup()
         assert g.rank() == 0
 
-
-# ---------------------------------------------------------------------------
-# Test pad + split round-trip
-# ---------------------------------------------------------------------------
-
-class TestPadAndSplitRoundTrip:
-    """Verify that padding + splitting gives consistent results across ranks."""
-
-    def test_padded_batch_splits_cleanly(self, monkeypatch):
-        """After padding, the batch should split evenly across all CP ranks."""
-        import examples.multimodal_dev.forward_step as fs
-
-        for cp_size in [2, 4, 8]:
-            monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda cs=cp_size: cs)
-            monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-            B, S = 2, 17  # deliberately not aligned
-            batch = {
-                "input_ids": torch.arange(B * S).reshape(B, S),
-                "labels": torch.arange(B * S).reshape(B, S) + 1000,
-                "loss_mask": torch.ones(B, S),
-            }
-
-            padded = fs._pad_batch_for_cp(batch)
-            padded_S = padded["input_ids"].shape[1]
-
-            # Should be divisible by 2 * cp_size
-            assert padded_S % (2 * cp_size) == 0, (
-                f"CP={cp_size}: padded S={padded_S} not divisible by {2 * cp_size}"
-            )
-
-            # Split should work without assertion errors
-            all_ids = []
-            for rank in range(cp_size):
-                chunk = _cp_split_tensor(
-                    padded["input_ids"], seq_dim=1, cp_size=cp_size, cp_rank=rank,
-                )
-                assert chunk.shape == (B, padded_S // cp_size)
-                all_ids.append(chunk)
-
-            # All tokens appear exactly once across ranks
-            combined = torch.cat(all_ids, dim=1)
-            for b in range(B):
-                assert torch.equal(
-                    combined[b].sort().values,
-                    padded["input_ids"][b].sort().values,
-                ), f"Token mismatch at batch {b} for CP={cp_size}"
-
-    def test_loss_mask_zero_for_padded_on_all_ranks(self, monkeypatch):
-        """After pad + split, padded positions have loss_mask=0 on whichever rank they land."""
-        import examples.multimodal_dev.forward_step as fs
-
-        cp_size = 4
-        monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: cp_size)
-        monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 1)
-
-        B, S = 1, 10  # 10 -> padded to 16 for CP=4
-        batch = {
-            "input_ids": torch.randint(1, 1000, (B, S)),  # non-zero tokens
-            "loss_mask": torch.ones(B, S),
-        }
-
-        padded = fs._pad_batch_for_cp(batch)
-        padded_S = padded["input_ids"].shape[1]
-        num_padded = padded_S - S  # 6 padded positions
-
-        # Count total loss_mask=0 across all ranks
-        total_zero = 0
-        for rank in range(cp_size):
-            lm_chunk = _cp_split_tensor(
-                padded["loss_mask"], seq_dim=1, cp_size=cp_size, cp_rank=rank,
-            )
-            total_zero += (lm_chunk == 0).sum().item()
-
-        assert total_zero == B * num_padded, (
-            f"Expected {B * num_padded} zero loss_mask positions, got {total_zero}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test _thd_cp_partition_index (THD + CP per-sample partitioning)
-# ---------------------------------------------------------------------------
 
 try:
     from transformer_engine.pytorch import cpp_extensions as _tex  # noqa: F401

@@ -12,7 +12,6 @@ position encoding (e.g. MRoPE for Qwen3.5-VL).
 """
 
 import contextlib
-import os
 from typing import Optional
 
 import torch
@@ -55,17 +54,10 @@ def _cp_split_tensor(tensor, seq_dim, cp_size, cp_rank):
 
 
 class _NoCPGroup:
-    """Dummy process group reporting ``size()=1, rank()=0``.
-
-    Used to override ``packed_seq_params.cp_group`` so that
-    ``MultimodalRotaryEmbedding.forward`` skips its BSHD-style zigzag
-    split of MRoPE freqs.  Without this, MRoPE always splits freqs by
-    ``2 * cp_size`` even in THD mode (a known gap in Megatron-Core
-    where ``MultimodalRotaryEmbedding`` lacks the ``not packed_seq``
-    check that ``RotaryEmbedding`` has — see
-    ``megatron/core/models/common/embeddings/rotary_pos_embedding.py``
-    line 201 vs 402).  Attention reads its own cp_group from
-    ``self.pg_collection.cp`` and is unaffected.
+    """Dummy size-1 process group used to bypass MRoPE's BSHD-style
+    zigzag of pre-computed THD freqs (Megatron-Core gap:
+    ``MultimodalRotaryEmbedding.forward`` lacks the ``not packed_seq``
+    skip that plain ``RotaryEmbedding`` has).
     """
 
     def size(self):
@@ -77,89 +69,16 @@ class _NoCPGroup:
 
 _NO_CP_GROUP = _NoCPGroup()
 
-
-def _patch_mtp_roll_tensor_for_padded_thd():
-    """Patch ``multi_token_prediction.roll_tensor`` so the THD+CP path
-    slices each sample's per-rank chunk using ``cu_seqlens_q_padded``
-    instead of ``cu_seqlens_q``.
-
-    Megatron-Core's ``_roll_tensor_packed_seq`` (CP>1 branch) computes
-    per-sample local indices as ``cu_seqlens // cp_size`` (see
-    ``megatron/core/transformer/multi_token_prediction.py`` line 268-269).
-    That assumes each sample's *valid* length is divisible by ``cp_size``
-    — true only if cu_seqlens already references padded boundaries. In
-    typical THD packing, valid lengths are arbitrary while only the
-    *padded* lengths are multiples of ``2 * cp_size``.
-
-    With our TE-based per-sample CP partition (which lays each rank's
-    tokens out on ``cu_seqlens_q_padded // cp_size`` boundaries), MTP's
-    rolling uses the wrong slice indices unless we swap cu_seqlens to
-    cu_seqlens_padded for the duration of the call. The swap is harmless
-    because rolled positions in the padding region carry loss_mask=0.
-    """
-    import megatron.core.transformer.multi_token_prediction as _mtp
-
-    if getattr(_mtp.roll_tensor, "_thd_padded_patch_applied", False):
-        return
-
-    _orig = _mtp.roll_tensor
-
-    def _patched(
-        tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None,
-    ):
-        if (
-            packed_seq_params is not None
-            and getattr(packed_seq_params, "cu_seqlens_q_padded", None)
-            is not None
-            and packed_seq_params.cu_seqlens_q
-            is not packed_seq_params.cu_seqlens_q_padded
-        ):
-            saved = packed_seq_params.cu_seqlens_q
-            packed_seq_params.cu_seqlens_q = (
-                packed_seq_params.cu_seqlens_q_padded
-            )
-            try:
-                return _orig(
-                    tensor, shifts=shifts, dims=dims, cp_group=cp_group,
-                    packed_seq_params=packed_seq_params,
-                )
-            finally:
-                packed_seq_params.cu_seqlens_q = saved
-        return _orig(
-            tensor, shifts=shifts, dims=dims, cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-
-    _patched._thd_padded_patch_applied = True
-    _mtp.roll_tensor = _patched
-
-
-_patch_mtp_roll_tensor_for_padded_thd()
-
-
-# Note: under THD+CP the reported ``mtp_1 loss`` deviates ~1.3% from the
-# CP=1 baseline at step 1 because Megatron-Core's logging averages
-# per-rank pre-divided ratios with op=AVG, and per-rank num_tokens are
-# unequal after MTP rolling (chunk-3 boundary on rank 0 zeroes a token,
-# chunk-2 on the last rank receives one). A correct sum-then-divide
-# reduction needs coordinated changes in ``process_mtp_loss``,
-# ``MTPLossLoggingHelper``, and ``track_mtp_metrics`` (the last
-# multiplies by ``1/get_num_microbatches()`` assuming the per-mb-ratio
-# accumulation), which is upstream-Megatron territory. The gradient
-# path is correct; only the *logged* value drifts.
+# Note: reported ``mtp_1 loss`` drifts ~1.3% from the CP=1 baseline under
+# THD+CP. Megatron-Core's logging averages per-rank pre-divided ratios
+# with op=AVG, and per-rank num_tokens are unequal after MTP rolling.
+# Gradients are correct; only the *logged* value drifts.
 
 
 def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
-    """Per-rank token index for THD + CP, mirroring Megatron's THD partitioner.
-
-    Delegates to TransformerEngine's ``thd_get_partitioned_indices``, which
-    splits each packed sub-sample (boundaries given by *cu_seqlens_padded*)
-    into ``2 * cp_size`` chunks per sample and returns the indices owned
-    by *cp_rank*. This matches what
-    ``megatron.core.utils.get_thd_batch_on_this_cp_rank`` does.
-
-    Returned tensor is cast to ``int64`` so it can be used with
-    ``index_select`` regardless of the TE version's return dtype.
+    """Per-rank token index for THD + CP via TE's
+    ``thd_get_partitioned_indices``.  Cast to int64 so the result can be
+    used directly with ``index_select`` regardless of TE's return dtype.
     """
     from transformer_engine.pytorch import cpp_extensions as tex
 
@@ -167,50 +86,6 @@ def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
         cu_seqlens_padded, total_tokens, cp_size, cp_rank,
     )
     return idx.long()
-
-
-def _cp_debug_enabled():
-    return os.environ.get("MMDEV_CP_DEBUG", "0") == "1"
-
-
-def _cp_debug_dump(tag, **tensors):
-    """Print per-rank diagnostic info when ``MMDEV_CP_DEBUG=1``.
-
-    *tensors* may include actual tensors (shapes/hashes printed) and
-    primitive values (printed as-is).
-    """
-    if not _cp_debug_enabled():
-        return
-    rank = (
-        torch.distributed.get_rank()
-        if torch.distributed.is_initialized()
-        else 0
-    )
-    try:
-        cp_rank = parallel_state.get_context_parallel_rank()
-        cp_size = parallel_state.get_context_parallel_world_size()
-        dp_rank = parallel_state.get_data_parallel_rank()
-    except Exception:
-        cp_rank = cp_size = dp_rank = -1
-
-    parts = [f"[CP_DBG {tag}] rank={rank} dp={dp_rank} cp={cp_rank}/{cp_size}"]
-    for name, val in tensors.items():
-        if isinstance(val, torch.Tensor):
-            shape = tuple(val.shape)
-            try:
-                if val.dtype in (torch.int32, torch.int64, torch.bool):
-                    summary = val.flatten()[:8].tolist()
-                else:
-                    summary = (
-                        f"sum={val.float().sum().item():.4e} "
-                        f"mean={val.float().mean().item():.4e}"
-                    )
-                parts.append(f"{name}={shape} {summary}")
-            except Exception:
-                parts.append(f"{name}={shape}")
-        else:
-            parts.append(f"{name}={val}")
-    print(" | ".join(parts), flush=True)
 
 
 class MultimodalModel(MegatronModule):
@@ -333,17 +208,12 @@ class MultimodalModel(MegatronModule):
         self,
         input_ids: Tensor,
         image_grid_thw: Optional[Tensor] = None,
+        packed_seq_params=None,
     ) -> Tensor:
         """Compute position IDs.  Override for MRoPE etc.
 
-        Default: simple sequential positions.
-
-        Args:
-            input_ids: ``[B, S]`` token IDs.
-            image_grid_thw: ``[num_images, 3]`` grid dimensions.
-
-        Returns:
-            Position IDs tensor.
+        Default: simple sequential positions.  ``packed_seq_params`` is
+        accepted for subclass compatibility (e.g. MRoPE in THD mode).
         """
         B, S = input_ids.shape
         return (
@@ -410,18 +280,6 @@ class MultimodalModel(MegatronModule):
             loss_mask = _split(loss_mask, 1)
             attention_mask = _split(attention_mask, 1)
 
-        _cp_debug_dump(
-            f"{type(self).__name__}.forward post-CP",
-            decoder_input=decoder_input,
-            input_ids=input_ids,
-            labels=labels,
-            loss_mask=loss_mask,
-            position_ids=position_ids,
-            cu_seqlens_q_padded=(
-                packed_seq_params.cu_seqlens_q_padded
-                if packed_seq_params is not None else None
-            ),
-        )
         return (
             decoder_input, input_ids, labels, loss_mask,
             attention_mask, position_ids,
@@ -429,18 +287,12 @@ class MultimodalModel(MegatronModule):
 
     @contextlib.contextmanager
     def _thd_mrope_no_cp_override(self, packed_seq_params):
-        """Temporarily override ``rotary_pos_emb.cp_group`` to size 1.
-
-        ``MultimodalRotaryEmbedding`` always zigzag-splits MRoPE freqs
-        when its ``cp_group.size() > 1``, even for packed sequences
-        (Megatron-Core gap: ``rotary_pos_embedding.py`` line 402 lacks
-        the ``not packed_seq`` guard that line 201 has for plain RoPE).
-        Forcing the local cp_group to size 1 keeps the freqs full-length;
-        attention then applies per-sample CP zigzag itself via
-        ``_apply_rotary_pos_emb_thd``.  Done as a per-call mutation
-        (rather than via ``packed_seq_params.cp_group``) so that MTP's
-        CP-aware roll, which reads ``packed_seq_params.cp_group``,
-        still sees the real CP group.
+        """Force ``rotary_pos_emb.cp_group`` to size 1 for the wrapped
+        forward call so MRoPE returns full-length freqs in THD mode.
+        Attention then applies per-sample CP zigzag itself via
+        ``_apply_rotary_pos_emb_thd``.  Done by direct mutation rather
+        than via ``packed_seq_params.cp_group`` so MTP's CP-aware roll
+        (which reads that field) still sees the real CP group.
         """
         mrope = (
             getattr(self.language_model, "rotary_pos_emb", None)
@@ -487,6 +339,13 @@ class MultimodalModel(MegatronModule):
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
+        if position_ids is None:
+            position_ids = self.compute_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                packed_seq_params=packed_seq_params,
+            )
+
         vision_embeddings = None
         if (
             self.vision_model is not None
