@@ -39,12 +39,21 @@ from megatron.core.inference.moe.permute import compute_expert_offsets, compute_
 BLOCK_SIZE_M = 64
 
 _AUTOTUNE_CONFIGS = [
-    # BLOCK_SIZE_M is fixed — must match indirection table padding.
+    # GROUP_SIZE_M=1: better when each expert has few tokens (decode, sparse activation).
+    # With few tokens per expert, adjacent M-blocks belong to different experts, so
+    # grouping them for L2 weight-tile reuse is counterproductive.
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=3),
+    # GROUP_SIZE_M=8: better for large batches where experts see many tokens and
+    # adjacent M-blocks can share weight tiles in L2 cache.
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=4),
 ]
@@ -369,6 +378,77 @@ def _invoke_fused_moe_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Fused topk reduction (replaces torch.sum + copy)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _moe_sum_kernel(
+    input_ptr,
+    output_ptr,
+    valid_tokens_ptr,
+    K,
+    topk: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_K_BLOCKS: tl.constexpr,
+):
+    """Reduce topk dimension with valid_tokens gating.
+
+    input:  [max_tokens * topk, K] bf16
+    output: [max_tokens, K] bf16
+
+    For token t < valid_tokens: output[t] = sum(input[t*topk : (t+1)*topk]).
+    For token t >= valid_tokens: output[t] = 0.
+    Accumulation in fp32 for numerical accuracy.
+    """
+    token_id = tl.program_id(0).to(tl.int64)
+    valid_tokens = tl.load(valid_tokens_ptr)
+    is_valid = token_id < valid_tokens
+
+    for k_idx in range(NUM_K_BLOCKS):
+        offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < K
+
+        acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+        if is_valid:
+            base = token_id * topk * K
+            for t in range(topk):
+                v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
+                acc += v.to(tl.float32)
+
+        tl.store(output_ptr + token_id * K + offs_k, acc.to(tl.bfloat16), mask=k_mask)
+
+
+def _moe_sum(
+    input: torch.Tensor,
+    max_tokens: int,
+    topk: int,
+    K: int,
+    valid_tokens: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused topk reduction: [max_tokens*topk, K] → [max_tokens, K].
+
+    Writes directly to `out` if provided (e.g. the RSV symmetric memory tensor),
+    avoiding a separate allocation + copy. Rows beyond valid_tokens are zeroed.
+    """
+    if out is None:
+        out = torch.empty(max_tokens, K, dtype=input.dtype, device=input.device)
+    BLOCK_K = min(triton.next_power_of_2(K), 1024)
+    NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
+    _moe_sum_kernel[(max_tokens,)](
+        input,
+        out,
+        valid_tokens,
+        K,
+        topk=topk,
+        BLOCK_K=BLOCK_K,
+        NUM_K_BLOCKS=NUM_K_BLOCKS,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -463,11 +543,7 @@ def vllm_fused_moe(
         top_k=1,
     )
 
-    # Reduce over topk: [max_tokens, topk, K] → [max_tokens, K]
-    # bf16 sum is sufficient — each value is already bf16 from the kernel,
-    # and summing topk (typically 6-8) values loses <1 bit of precision.
-    result = intermediate3.view(max_tokens, topk, K).sum(dim=1)
-    if out is not None:
-        out.copy_(result)
-        return out
-    return result
+    # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
+    # Fused kernel accumulates in fp32, writes directly to out (if provided),
+    # and zeros rows beyond valid_tokens.
+    return _moe_sum(intermediate3, max_tokens, topk, K, valid_tokens, out=out)
