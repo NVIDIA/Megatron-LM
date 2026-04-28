@@ -1987,16 +1987,41 @@ class DynamicInferenceEngine(AbstractEngine):
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
 
+        Routes to the speculative path when async scheduling is active and the
+        current step satisfies the speculation predicate; otherwise runs the
+        serial path (today's behavior).
+
         Returns:
             A tuple comprised of:
                 1. Requests that ran in the last step and are still active.
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
+        if self._async_scheduling_active():
+            return await self._async_step_speculative()
+        return await self._async_step_serial()
+
+    async def _async_step_serial(
+        self,
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+        """Serial step path: forward + sample, then CPU bookkeeping. Today's behavior."""
         last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data)
-        # Keep for compatibility with current test suite.
-        return ret
+        return await self.async_bookkeep(*last_step_data)
+
+    async def _async_step_speculative(
+        self,
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+        """Speculative step path: launch the next forward immediately after sampling
+        so the GPU runs forward -> sample -> forward without waiting on CPU
+        bookkeeping. CPU bookkeeping runs in parallel and verifies retroactively.
+
+        Stub for C3.5: currently identical to the serial path. The launch-ahead
+        and reconciliation logic is added in C4 alongside the rejection-event
+        handling. Splitting the structural routing into its own commit keeps the
+        engine-loop refactor reviewable.
+        """
+        last_step_data = await self.async_forward()
+        return await self.async_bookkeep(*last_step_data)
 
     def _run_coroutine_sync(self, coro):
         """Run a coroutine synchronously, handling the case when already in an event loop.
