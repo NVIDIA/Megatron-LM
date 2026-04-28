@@ -2513,14 +2513,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
     def get_index_of_chunked_prefill_request(self, safe: bool = True) -> int:
-        """
-        Get the index of the chunked prefill request in the context.
+        """Get the slot index of the chunked prefill request.
 
-        If `safe` is True, then clamp the search space to the current total request count.
-        Otherwise, expand the search beyond the current total request count.
+        If ``safe`` is True, only ``request_ids[:total_request_count]`` is
+        searched; a hidden chunked request (past the boundary) returns -1.
+        Otherwise the search covers the full ``[0, max_requests)`` range.
 
-        Return:
-            (int) Index of the chunked prefill request, or -1 if none exists.
+        Uses a single ``.item()`` CPU sync via the any+argmax shape-stable
+        pattern (no variable-length intermediates).
+
+        Returns:
+            (int) Slot index of the chunked prefill request, or -1 if none
+            exists in the searched range.
         """
         if self.chunked_prefill_request_id == -1:
             return -1
@@ -2529,10 +2533,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         if safe:
             request_ids = request_ids[: self.total_request_count]
 
-        matches = torch.where(request_ids == self.chunked_prefill_request_id)[0]
-        if len(matches) > 0:
-            return matches[0].item()
-        return -1
+        mask = request_ids == self.chunked_prefill_request_id
+        any_match = mask.any()
+        # argmax on a bool/int tensor returns the index of the first True
+        # (or 0 if all False); disambiguate via where against a -1 sentinel.
+        first_match = mask.to(torch.int32).argmax()
+        idx_gpu = torch.where(any_match, first_match, torch.full_like(first_match, -1))
+        return int(idx_gpu.item())
 
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
