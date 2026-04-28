@@ -4,10 +4,20 @@ import functools
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+try:
+    from flashinfer import top_k as _flashinfer_top_k
+
+    def _topk(values: Tensor, k: int) -> Tuple[Tensor, Tensor]:
+        return _flashinfer_top_k(values, k=k, sorted=False)
+
+except ImportError:
+
+    def _topk(values: Tensor, k: int) -> Tuple[Tensor, Tensor]:
+        return torch.topk(values, k=k, dim=-1, sorted=False)
 
 
 class LogProbsDecode:
@@ -53,7 +63,7 @@ class LogProbsDecode:
     def softmax_kernel(
         logits: Tensor, new_tokens: Tensor, request_indices: Tensor, padded_arange: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        """Gather logits and compute decode log probs.
+        """Gather logits, compute decode log probs and per-row lse.
 
         Args:
             logits: shape [1, total_active_requests, vocab_size]
@@ -62,22 +72,23 @@ class LogProbsDecode:
             padded_arange: shape [padded_active_requests]
 
         Returns:
-            (selected_log_probs, selected_logits)
+            (selected_log_probs, lse)
         """
         selected_tokens = new_tokens[request_indices]
         selected_logits = logits.squeeze(0)[request_indices].float()
-        log_softmax_result = F.log_softmax(selected_logits, dim=-1)
-        selected_log_probs = log_softmax_result[padded_arange, selected_tokens]
-        return selected_log_probs, selected_logits
+        lse = torch.logsumexp(selected_logits, dim=-1)
+        selected_log_probs = selected_logits[padded_arange, selected_tokens] - lse
+        return selected_log_probs, lse
 
     @staticmethod
     def extract(
         context,
         request_indices: Tensor,
         selected_log_probs: Tensor,
+        lse: Tensor,
         log_prob_request_count: int,
         active_request_count: int,
-        selected_logits: Optional[Tensor] = None,
+        logits: Optional[Tensor] = None,
         top_n_max: int = 0,
     ) -> Tuple[List[Optional[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
         """Extract decode log-prob kernel outputs into a per-request list.
@@ -86,9 +97,10 @@ class LogProbsDecode:
             context: The active DynamicInferenceContext.
             request_indices (Tensor): Padded indices from indexing_kernel.
             selected_log_probs (Tensor): Log probs from softmax_kernel.
+            lse (Tensor): Per-row log-sum-exp from softmax_kernel.
             log_prob_request_count (int): Number of real (non-padding) requests wanting log probs.
             active_request_count (int): Total number of active requests.
-            selected_logits (Optional[Tensor]): Raw logits for top-n computation.
+            logits (Optional[Tensor]): Raw logits from the forward pass (for top-n re-gather).
             top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
 
         Returns:
@@ -101,11 +113,10 @@ class LogProbsDecode:
             result[req_idx] = [lp_list[i]]
 
         top_n_dict = None
-        if top_n_max > 0 and selected_logits is not None:
-            raw = selected_logits[:log_prob_request_count]
-            lse = torch.logsumexp(raw, dim=-1, keepdim=True)
-            top_n_v, top_n_i = torch.topk(raw, k=top_n_max, dim=-1)
-            top_n_v = top_n_v - lse
+        if top_n_max > 0 and logits is not None:
+            raw = logits.squeeze(0)[request_indices[:log_prob_request_count]].float()
+            top_n_v, top_n_i = _topk(raw, k=top_n_max)
+            top_n_v = top_n_v - lse[:log_prob_request_count].unsqueeze(-1)
             top_n_dict = LogProbsDecode._build_top_n_dict(context, req_idx_list, top_n_v, top_n_i)
         return result, top_n_dict
 
@@ -168,7 +179,7 @@ class LogProbsDecode:
         """
         ri, padded_arange = self._ri, self._padded_arange
         key = ("decode_sm", context.padded_batch_dimensions)
-        slp, sl = self.softmax_kernel(
+        slp, lse = self.softmax_kernel(
             logits, new_tokens, ri, padded_arange, eager=eager, cache_key=key,
         )
         active_request_count = context.total_request_count - context.paused_request_count
@@ -177,8 +188,9 @@ class LogProbsDecode:
             context,
             ri,
             slp,
+            lse,
             log_prob_request_count,
             active_request_count,
-            selected_logits=sl,
+            logits=logits,
             top_n_max=top_n_max,
         )

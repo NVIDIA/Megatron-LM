@@ -4,10 +4,20 @@ import functools
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+try:
+    from flashinfer import top_k as _flashinfer_top_k
+
+    def _topk(values: Tensor, k: int) -> Tuple[Tensor, Tensor]:
+        return _flashinfer_top_k(values, k=k, sorted=False)
+
+except ImportError:
+
+    def _topk(values: Tensor, k: int) -> Tuple[Tensor, Tensor]:
+        return torch.topk(values, k=k, dim=-1, sorted=False)
 
 
 class LogProbsPrefill:
@@ -80,8 +90,8 @@ class LogProbsPrefill:
         logit_indices: Tensor,
         logit_indices_range: Tensor,
         masked_tokens: Tensor,
-    ) -> Tensor:
-        """Insert sampled tokens and compute prefill log probs.
+    ) -> Tuple[Tensor, Tensor]:
+        """Insert sampled tokens, compute prefill log probs and per-row lse.
 
         Args:
             logits (Tensor): Raw model output logits [1, total_active_tokens, vocab_size].
@@ -93,14 +103,14 @@ class LogProbsPrefill:
             masked_tokens (Tensor): Token IDs to gather log probs for from indexing_kernel.
 
         Returns:
-            selected_log_probs tensor.
+            (selected_log_probs, lse)
         """
         # Insert the newly-generated tokens at request boundaries.
         masked_tokens[cu_masked_lengths - 1] = new_tokens[request_indices]
         selected_logits = logits.squeeze(0)[logit_indices].float()
-        log_softmax_result = F.log_softmax(selected_logits, dim=-1)
-        selected_log_probs = log_softmax_result[logit_indices_range, masked_tokens]
-        return selected_log_probs
+        lse = torch.logsumexp(selected_logits, dim=-1)
+        selected_log_probs = selected_logits[logit_indices_range, masked_tokens] - lse
+        return selected_log_probs, lse
 
     @staticmethod
     def extract(
@@ -108,6 +118,7 @@ class LogProbsPrefill:
         request_indices: Tensor,
         cu_masked_lengths: Tensor,
         token_log_probs: Tensor,
+        lse: Tensor,
         log_prob_request_count: int,
         active_request_count: int,
         top_n_max: int = 0,
@@ -121,11 +132,12 @@ class LogProbsPrefill:
             request_indices (Tensor): Padded indices from indexing_kernel.
             cu_masked_lengths (Tensor): Cumulative masked lengths from indexing_kernel.
             token_log_probs (Tensor): Per-token log probs from softmax_kernel.
+            lse (Tensor): Per-token log-sum-exp from softmax_kernel.
             log_prob_request_count (int): Number of real (non-padding) requests wanting log probs.
             active_request_count (int): Total number of active requests.
             top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
-            logits (Optional[Tensor]): Raw logits for top-n computation.
-            logit_indices (Optional[Tensor]): Logit indices for top-n computation.
+            logits (Optional[Tensor]): Raw logits for top-n re-gather.
+            logit_indices (Optional[Tensor]): Logit indices for top-n re-gather.
 
         Returns:
             (per_request_log_probs, top_n_dict) tuple.
@@ -145,9 +157,8 @@ class LogProbsPrefill:
         top_n_dict = None
         if top_n_max > 0 and logits is not None and logit_indices is not None:
             raw = logits.squeeze(0)[logit_indices[:selected_token_count]].float()
-            lse = torch.logsumexp(raw, dim=-1, keepdim=True)
-            top_n_v, top_n_i = torch.topk(raw, k=top_n_max, dim=-1)
-            top_n_v = top_n_v - lse
+            top_n_v, top_n_i = _topk(raw, k=top_n_max)
+            top_n_v = top_n_v - lse[:selected_token_count].unsqueeze(-1)
             top_n_dict = LogProbsPrefill._build_top_n_dict(
                 context, req_idx_list, masked_lengths_cpu, top_n_v, top_n_i
             )
@@ -231,7 +242,7 @@ class LogProbsPrefill:
             self._ri, self._cu_ml, self._li, self._li_range, self._mt,
         )
         key = ("prefill_sm", context.padded_batch_dimensions)
-        slp = self.softmax_kernel(
+        slp, lse = self.softmax_kernel(
             logits, new_tokens, ri, cu_ml, li, li_range, mt,
             eager=eager, cache_key=key,
         )
@@ -242,6 +253,7 @@ class LogProbsPrefill:
             ri,
             cu_ml,
             slp,
+            lse,
             log_prob_request_count,
             active_request_count,
             top_n_max=top_n_max,

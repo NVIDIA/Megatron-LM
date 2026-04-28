@@ -3,18 +3,28 @@
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.logprobs.prefill import LogProbsPrefill
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
+try:
+    from flashinfer import top_k as _flashinfer_top_k
+
+    def _topk(values: Tensor, k: int) -> Tuple[Tensor, Tensor]:
+        return _flashinfer_top_k(values, k=k, sorted=False)
+
+except ImportError:
+
+    def _topk(values: Tensor, k: int) -> Tuple[Tensor, Tensor]:
+        return torch.topk(values, k=k, dim=-1, sorted=False)
+
 
 class LogProbsSpeculative:
     """Log probability computation for speculative decoding.
 
-    Handles the post-forward softmax, post-verification gather, and CPU extraction.
-    When full prefill logits are available it delegates to `LogProbsPrefill`.
+    Handles the post-forward softmax (lse only), post-verification gather, and CPU extraction.
+    When prefill logits are available it delegates to `LogProbsPrefill` for the prefill portion.
     """
 
     def __init__(self, config=None):
@@ -47,15 +57,14 @@ class LogProbsSpeculative:
 
     @staticmethod
     def softmax_kernel(context, logits: Tensor) -> Tuple[Tensor, Tensor]:
-        """Post-forward: log-softmax over all speculative logit rows.
+        """Post-forward: per-row log-sum-exp over all speculative logit rows.
 
         Args:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
 
         Returns:
-            (decode_log_probs [padded_decode, spec+1, vocab],
-             prefill_log_probs [padded_prefill, vocab])
+            (decode_lse [padded_decode, spec+1], prefill_lse [padded_prefill])
         """
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
         padded_prefill_count = context.padded_batch_dimensions.prefill_req_count
@@ -63,18 +72,17 @@ class LogProbsSpeculative:
         decode_len = padded_decode_count * spec_plus_one
         total_len = decode_len + padded_prefill_count
 
-        all_log_probs = F.log_softmax(logits.squeeze(0)[:total_len].float(), dim=-1)
-        decode_log_probs = all_log_probs[:decode_len].reshape(
-            padded_decode_count, spec_plus_one, -1
-        )
-        prefill_log_probs = all_log_probs[decode_len:]
-        return decode_log_probs, prefill_log_probs
+        all_lse = torch.logsumexp(logits.squeeze(0)[:total_len].float(), dim=-1)
+        decode_lse = all_lse[:decode_len].reshape(padded_decode_count, spec_plus_one)
+        prefill_lse = all_lse[decode_len:]
+        return decode_lse, prefill_lse
 
     @staticmethod
     def gather_kernel(
         context,
-        decode_log_probs: Tensor,
-        prefill_log_probs: Tensor,
+        logits: Tensor,
+        decode_lse: Tensor,
+        prefill_lse: Tensor,
         new_tokens: Tensor,
         accepted_tokens: Tensor,
         accepted_token_counts: Tensor,
@@ -83,8 +91,9 @@ class LogProbsSpeculative:
 
         Args:
             context: The active DynamicInferenceContext.
-            decode_log_probs (Tensor): Decode log probs [padded_decode, spec+1, vocab].
-            prefill_log_probs (Tensor): Prefill log probs [padded_prefill, vocab].
+            logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
+            decode_lse (Tensor): Decode lse [padded_decode, spec+1].
+            prefill_lse (Tensor): Prefill lse [padded_prefill].
             new_tokens (Tensor): Newly sampled tokens [padded_active_requests].
             accepted_tokens (Tensor): Speculative-verified token IDs.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
@@ -95,7 +104,8 @@ class LogProbsSpeculative:
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
         padded_prefill_count = context.padded_batch_dimensions.prefill_req_count
         spec_plus_one = context.num_speculative_tokens + 1
-        device = decode_log_probs.device
+        decode_len = padded_decode_count * spec_plus_one
+        device = decode_lse.device
 
         gather_tokens = torch.zeros(
             padded_decode_count, spec_plus_one, device=device, dtype=torch.long
@@ -107,13 +117,22 @@ class LogProbsSpeculative:
         gather_tokens[decode_row_range, accepted_token_counts[:padded_decode_count]] = new_tokens[
             :padded_decode_count
         ]
-        decode_gathered = decode_log_probs.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
+
+        decode_logits = logits.squeeze(0)[:decode_len].float().reshape(
+            padded_decode_count, spec_plus_one, -1
+        )
+        decode_gathered_raw = decode_logits.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
+        decode_gathered = decode_gathered_raw - decode_lse
 
         prefill_new_tokens = new_tokens[
             padded_decode_count : padded_decode_count + padded_prefill_count
         ]
         prefill_row_range = torch.arange(padded_prefill_count, device=device)
-        prefill_gathered = prefill_log_probs[prefill_row_range, prefill_new_tokens]
+        prefill_logits = logits.squeeze(0)[
+            decode_len : decode_len + padded_prefill_count
+        ].float()
+        prefill_gathered_raw = prefill_logits[prefill_row_range, prefill_new_tokens]
+        prefill_gathered = prefill_gathered_raw - prefill_lse
 
         return decode_gathered, prefill_gathered
 
@@ -157,6 +176,8 @@ class LogProbsSpeculative:
         accepted_token_counts: Tensor,
         result: List[Optional[List[float]]],
         logits: Optional[Tensor] = None,
+        decode_lse: Optional[Tensor] = None,
+        prefill_lse: Optional[Tensor] = None,
         top_n_max: int = 0,
     ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
         """CPU extraction for speculative log probs. Populates `result` in-place.
@@ -167,7 +188,9 @@ class LogProbsSpeculative:
             prefill_gathered (Tensor): Gathered prefill log probs from gather_kernel.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
             result (List): Mutable list to populate with per-request log probs.
-            logits (Optional[Tensor]): Raw logits for top-n computation.
+            logits (Optional[Tensor]): Raw logits for top-n re-gather.
+            decode_lse (Optional[Tensor]): Decode lse from softmax_kernel.
+            prefill_lse (Optional[Tensor]): Prefill lse from softmax_kernel.
             top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
 
         Returns:
@@ -189,13 +212,14 @@ class LogProbsSpeculative:
         top_n_dict: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
 
         # Decode top-n.
-        if top_n_max > 0 and logits is not None and num_decode > 0:
+        if top_n_max > 0 and logits is not None and decode_lse is not None and num_decode > 0:
             spec_plus_one = context.num_speculative_tokens + 1
-            raw_decode = logits.squeeze(0)[: num_decode * spec_plus_one].float()
-            raw_reshaped = raw_decode.reshape(num_decode, spec_plus_one, -1)
-            lse = torch.logsumexp(raw_reshaped, dim=-1, keepdim=True)
-            top_n_v, top_n_i = torch.topk(raw_reshaped, k=top_n_max, dim=-1)
-            top_n_v = top_n_v - lse
+            decode_len = num_decode * spec_plus_one
+            raw_decode = logits.squeeze(0)[:decode_len].float()
+            top_n_v, top_n_i = _topk(raw_decode, k=top_n_max)
+            top_n_v = top_n_v - decode_lse[:num_decode].reshape(decode_len).unsqueeze(-1)
+            top_n_v = top_n_v.reshape(num_decode, spec_plus_one, -1)
+            top_n_i = top_n_i.reshape(num_decode, spec_plus_one, -1)
             top_n_v_cpu = top_n_v.cpu()
             top_n_i_cpu = top_n_i.cpu()
             top_n_per_req_cpu: List[int] = context.active_request_metadata[
@@ -223,13 +247,12 @@ class LogProbsSpeculative:
                 result[num_decode + i] = [prefill_gathered_cpu[i].item()]
 
         # Materialized prefill top-n.
-        if top_n_max > 0 and logits is not None and num_prefill > 0:
+        if top_n_max > 0 and logits is not None and prefill_lse is not None and num_prefill > 0:
             spec_plus_one = context.num_speculative_tokens + 1
             raw_decode_len = num_decode * spec_plus_one
             raw_prefill = logits.squeeze(0)[raw_decode_len : raw_decode_len + num_prefill].float()
-            lse = torch.logsumexp(raw_prefill, dim=-1, keepdim=True)
-            top_n_v, top_n_i = torch.topk(raw_prefill, k=top_n_max, dim=-1)
-            top_n_v = top_n_v - lse
+            top_n_v, top_n_i = _topk(raw_prefill, k=top_n_max)
+            top_n_v = top_n_v - prefill_lse[:num_prefill].unsqueeze(-1)
             top_n_v_cpu = top_n_v.cpu()
             top_n_i_cpu = top_n_i.cpu()
             top_n_per_req_cpu2: List[int] = context.active_request_metadata[
@@ -257,7 +280,7 @@ class LogProbsSpeculative:
     def softmax(self, context, logits: Tensor, *, eager: bool = False) -> None:
         """Run post-forward softmax with optional CUDA graph capture/replay."""
         key = ("spec_sm", context.padded_batch_dimensions)
-        self._decode_log_probs, self._prefill_log_probs = self.softmax_kernel(
+        self._decode_lse, self._prefill_lse = self.softmax_kernel(
             context, logits, eager=eager, cache_key=key,
         )
 
@@ -293,14 +316,15 @@ class LogProbsSpeculative:
         only_last = context.config.materialize_only_last_token_logits
 
         # Speculative gather: runs post-verification.
-        decode_log_probs = self._decode_log_probs
-        prefill_log_probs = self._prefill_log_probs
+        decode_lse = self._decode_lse
+        prefill_lse = self._prefill_lse
 
         key = ("spec_ga", context.padded_batch_dimensions)
         decode_gathered, prefill_gathered = self.gather_kernel(
             context,
-            decode_log_probs,
-            prefill_log_probs,
+            logits,
+            decode_lse,
+            prefill_lse,
             new_tokens,
             accepted_tokens,
             accepted_token_counts,
@@ -310,6 +334,7 @@ class LogProbsSpeculative:
 
         # Full prefill softmax (if needed); runs post-verification, before extract.
         fp_slp = None
+        fp_lse = None
         fp_ri = fp_cu_ml = fp_li = fp_count_gpu = None
         if not only_last and num_prefill > 0:
             fp_ri = self._fp_ri
@@ -320,7 +345,7 @@ class LogProbsSpeculative:
             fp_count_gpu = self._fp_count_gpu
 
             fp_key = ("spec_fp_sm", context.padded_batch_dimensions)
-            fp_slp = self._prefill_softmax(
+            fp_slp, fp_lse = self._prefill_softmax(
                 logits, new_tokens, fp_ri, fp_cu_ml, fp_li, li_range, mt,
                 eager=eager, cache_key=fp_key,
             )
@@ -334,6 +359,8 @@ class LogProbsSpeculative:
                 accepted_token_counts,
                 result,
                 logits=logits,
+                decode_lse=decode_lse,
+                prefill_lse=prefill_lse,
                 top_n_max=top_n_max,
             )
 
@@ -343,6 +370,7 @@ class LogProbsSpeculative:
                     fp_ri,
                     fp_cu_ml,
                     fp_slp,
+                    fp_lse,
                     fp_count_gpu.item(),
                     active_request_count,
                     top_n_max=top_n_max,

@@ -55,24 +55,26 @@ def calculate_log_probs(
 
     if only_last_token_logits or context.is_decode_only():
         ri, padded_arange = LogProbsDecode.indexing_kernel(context)
-        slp, sl = LogProbsDecode.softmax_kernel(logits, new_tokens, ri, padded_arange)
+        slp, lse = LogProbsDecode.softmax_kernel(logits, new_tokens, ri, padded_arange)
         return LogProbsDecode.extract(
             context,
             ri,
             slp,
+            lse,
             log_prob_request_count,
             active_request_count,
-            selected_logits=sl,
+            logits=logits,
             top_n_max=top_n_max,
         )
     else:
         ri, cu_ml, li, li_range, mt = LogProbsPrefill.indexing_kernel(context)
-        slp = LogProbsPrefill.softmax_kernel(logits, new_tokens, ri, cu_ml, li, li_range, mt)
+        slp, lse = LogProbsPrefill.softmax_kernel(logits, new_tokens, ri, cu_ml, li, li_range, mt)
         return LogProbsPrefill.extract(
             context,
             ri,
             cu_ml,
             slp,
+            lse,
             log_prob_request_count,
             active_request_count,
             top_n_max=top_n_max,
@@ -96,11 +98,12 @@ def _calculate_log_probs_speculative(
     num_prefill = active_request_count - num_decode
     result = [None] * active_request_count
 
-    decode_log_probs, prefill_log_probs = LogProbsSpeculative.softmax_kernel(context, logits)
+    decode_lse, prefill_lse = LogProbsSpeculative.softmax_kernel(context, logits)
     decode_gathered, prefill_gathered = LogProbsSpeculative.gather_kernel(
         context,
-        decode_log_probs,
-        prefill_log_probs,
+        logits,
+        decode_lse,
+        prefill_lse,
         new_tokens,
         accepted_tokens,
         accepted_token_counts,
@@ -112,6 +115,8 @@ def _calculate_log_probs_speculative(
         accepted_token_counts,
         result,
         logits=logits,
+        decode_lse=decode_lse,
+        prefill_lse=prefill_lse,
         top_n_max=top_n_max,
     )
 
@@ -120,12 +125,15 @@ def _calculate_log_probs_speculative(
         ri, cu_ml, li, li_range, mt, count_gpu = LogProbsSpeculative.prefill_indexing_kernel(
             context
         )
-        slp = LogProbsPrefill.softmax_kernel(logits, new_tokens, ri, cu_ml, li, li_range, mt)
+        slp, fp_lse = LogProbsPrefill.softmax_kernel(
+            logits, new_tokens, ri, cu_ml, li, li_range, mt
+        )
         prefill_result, prefill_top_n = LogProbsPrefill.extract(
             context,
             ri,
             cu_ml,
             slp,
+            fp_lse,
             count_gpu.item(),
             active_request_count,
             top_n_max=top_n_max,
