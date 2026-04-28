@@ -366,6 +366,7 @@ class LanguageModule(MegatronModule):
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
         """
+        # CudaGraphManager consumes these args, if it exists 
         del eager, cache_key
         layer_idx = 0 if depth is None else depth
         mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
