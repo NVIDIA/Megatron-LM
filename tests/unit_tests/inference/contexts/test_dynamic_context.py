@@ -1821,6 +1821,143 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_chunked_prefill_continuation_while_paused(self):
+        """
+        Adding the next chunk of a chunked-prefill request while another
+        request is paused must not corrupt the [active | paused | dead]
+        layout. The new chunk has to land at the active boundary, with
+        paused entries shifting one slot to the right and the hidden
+        chunked-prefill record (sitting at total_request_count) rolling
+        into the new active slot so its KV blocks survive.
+
+        The scheduler reaches this path via the is_continuing_chunked_prefill
+        bypass in schedule_chunked_prefill, which lets add_request fire even
+        when paused_request_count > 0.
+        """
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.05,
+            block_size_tokens=128,
+            max_tokens=None,
+            enable_chunked_prefill=True,
+            max_requests=16,
+        )
+        bs = dynamic_context.block_size_tokens
+
+        # Two decode requests; index 0 will be parked at the block boundary
+        # so update_requests is forced to pause it.
+        req10 = DynamicInferenceRequest(
+            request_id=10,
+            prompt_tokens=torch.arange(0, 4, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        req11 = DynamicInferenceRequest(
+            request_id=11,
+            prompt_tokens=torch.arange(0, 4, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(req10)
+        dynamic_context.add_request(req11)
+
+        # Pretend prefill already happened: both requests are now in decode
+        # mode. Index 0 sits at the block boundary (offset == bs - 1) so the
+        # next forward step will demand a new block for it.
+        dynamic_context.request_in_prefill_status_tensor[0:2] = 0
+        dynamic_context.request_query_lengths[0:2] = 1
+        dynamic_context.request_kv_length_offsets[0] = bs - 1
+        dynamic_context.request_kv_length_offsets[1] = 5
+        dynamic_context.request_last_kv_block_offset[0] = bs - 1
+        dynamic_context.request_last_kv_block_offset[1] = 5
+        # Clear active_token_count populated by the two prefill add_requests
+        # so the chunked prefill below installs its own active tokens cleanly.
+        dynamic_context.active_token_count = 0
+
+        # Add chunk 1 of a chunked prefill request.
+        req999 = DynamicInferenceRequest(
+            request_id=999,
+            prompt_tokens=torch.arange(0, 200, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.chunked_prefill_request_id = 999
+        dynamic_context.add_request(req999, prefill_chunk_length=8)
+
+        # Snapshot the chunked prefill's KV block before update_requests so
+        # we can later assert it follows the request to its post-rotation slot.
+        chunked_kv_block_before = dynamic_context.request_to_kv_block_ids[2, 0].item()
+        assert chunked_kv_block_before != -1
+
+        # Drain the active block pool so request 10 cannot resume after
+        # being paused; keep the paused-pool capacity high so request 10
+        # isn't immediately evicted out of the system either.
+        dynamic_context.kv_block_allocator.total_avail = 0
+        dynamic_context.kv_block_allocator.paused_count = 100
+
+        # update_requests pauses request 10, keeps request 11 active, and
+        # hides chunked 999 just past total_request_count.
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask, new_tokens=new_tokens
+        )
+
+        # Verify the engineered post-step layout:
+        #   index 0: active decode 11
+        #   index 1: paused decode 10
+        #   index 2: hidden chunked 999 (just past total_request_count)
+        assert dynamic_context.paused_request_count == 1
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[0].item() == 11
+        assert dynamic_context.request_ids[1].item() == 10
+        assert dynamic_context.request_ids[2].item() == 999
+
+        # Now simulate the scheduler dispatching the next chunk for 999
+        # while paused_request_count > 0 — the bug path.
+        req999.finished_chunk_token_count = 8
+        dynamic_context.add_request(req999, prefill_chunk_length=8)
+
+        # The new chunk must land at the active boundary (index 1), the
+        # paused decode must shift to index 2, and the chunked's KV block
+        # must follow the request to its new slot.
+        assert dynamic_context.total_request_count == 3
+        assert dynamic_context.paused_request_count == 1
+        new_active_count = (
+            dynamic_context.total_request_count - dynamic_context.paused_request_count
+        )
+        assert new_active_count == 2
+
+        assert dynamic_context.request_ids[0].item() == 11, (
+            f"Active decode 11 should stay at index 0, got "
+            f"{dynamic_context.request_ids[0].item()}"
+        )
+        assert dynamic_context.request_ids[1].item() == 999, (
+            f"New chunked chunk should land at the active boundary "
+            f"(index 1); without the fix it would land at total (index 2) "
+            f"in the paused region. Got request "
+            f"{dynamic_context.request_ids[1].item()}"
+        )
+        assert dynamic_context.request_ids[2].item() == 10, (
+            f"Paused decode 10 should be shifted to index 2, got request "
+            f"{dynamic_context.request_ids[2].item()}"
+        )
+
+        # KV block of the chunked's first chunk must follow the request, or
+        # the next forward step would see a clobbered block table.
+        assert (
+            dynamic_context.request_to_kv_block_ids[1, 0].item()
+            == chunked_kv_block_before
+        ), (
+            f"Chunked prefill's KV block must follow the request to its "
+            f"new position; expected {chunked_kv_block_before} at index 1, "
+            f"got {dynamic_context.request_to_kv_block_ids[1, 0].item()}"
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_update_requests_speculative(self):
         """Test update_requests correctly interleaves sampled and speculative tokens."""
 
