@@ -3363,7 +3363,7 @@ def train(
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
                     if getattr(buf, 'nccl_mem_pool', None) is not None:
-                        nccl_allocator.deregister_nccl_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+                        nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
