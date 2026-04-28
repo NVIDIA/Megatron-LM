@@ -2,8 +2,9 @@
 
 import logging
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -18,6 +19,189 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class DeferredReleaseRegistry:
+    """Singleton registry for deferred tensor memory release during CUDA graph capture.
+
+    **WARNING**: due to the lack of "pytorch allocation stream" detection,
+    we only assume a 2-stream (comm vs. comp) setup
+    
+    TODO: currently DeepEP's internal record_stream (on its own streams) might still get leaked
+    Need further testing and consider adding this protection inside DeepEP too. 
+    Hybrid EP currently should work fine
+
+    During CUDA graph capture, record_stream() causes deferred frees in PyTorch's caching
+    allocator that never resolve (because cudaEventQuery never returns True during capture),
+    inflating the private pool memory. This registry replaces record_stream() + resize_(0)
+    with a manual buffering scheme:
+
+    1. Instead of record_stream + resize_(0), tensors are registered here with their
+       associated event and the stream on which they were last consumed
+       (producing_stream).
+    2. When a ScheduleNode enters stream_acquire_context on a DIFFERENT stream and
+       waits on the same event, it is guaranteed that producing_stream's work is
+       complete. At that point, the registry drains matching tensors by calling
+       resize_(0).
+    3. This avoids record_stream entirely during capture while preserving the same
+       memory reclamation timing as eager mode.
+
+    The registry is keyed by (event_id, producing_stream_id). When a node on
+    stream S waits on event E, it drains all entries keyed with event E whose
+    producing_stream != S (i.e., tensors that were used on the OTHER stream and
+    are now safe to free).
+
+    Only active during CUDA graph capture; in eager mode, the original
+    record_stream + resize_(0) path is used unchanged.
+
+    Note: We do not track the true allocation stream of each tensor (PyTorch's
+    caching allocator stores ``block->stream`` internally but does not expose it
+    via any public Python API). Instead we record the *producing* node's stream
+    — the stream that last wrote to the tensor. The drain logic relies on the
+    combined_1f1b schedule using exactly two streams (comp and comm) that
+    alternate via a shared event. A runtime check enforces this two-stream
+    invariant: if more than two distinct streams are observed, an exception is
+    raised immediately to prevent silent correctness issues.
+    """
+
+    _MAX_STREAMS = 2
+
+    _instance = None
+
+    def __init__(self):
+        # Key: (id(event), cuda_stream_ptr) -> List[torch.Tensor]
+        # cuda_stream_ptr is stream.cuda_stream (the raw cudaStream_t integer),
+        # NOT id(stream), because multiple Python Stream objects can wrap the
+        # same underlying CUDA stream.
+        self._registry: Dict[Tuple[int, int], List[torch.Tensor]] = defaultdict(list)
+        # Track all distinct cuda_stream_ptr values seen between drain_all() calls.
+        self._seen_streams: Dict[int, torch.cuda.Stream] = {}
+
+    @classmethod
+    def get_instance(cls) -> "DeferredReleaseRegistry":
+        """Get the singleton instance, creating it if necessary.
+
+        Note: reset() is intentionally not called on exception paths.
+        This registry is only active during CUDA graph capture, and an
+        exception mid-capture leaves the graph itself in an unrecoverable
+        state — the stale registry is dominated by that larger failure.
+        drain_all() clears the registry at the end of every successful
+        capture pass.
+        """
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @staticmethod
+    def _stream_key(stream: torch.cuda.Stream) -> int:
+        """Return the raw cudaStream_t pointer as the identity key for a stream.
+
+        Using stream.cuda_stream instead of id(stream) because multiple Python
+        Stream objects can wrap the same underlying CUDA stream (e.g. when
+        streams are lazily constructed via a Callable per microbatch).
+        """
+        return stream.cuda_stream
+
+    def _check_stream(self, stream: torch.cuda.Stream) -> None:
+        """Record a stream and assert the two-stream invariant."""
+        stream_id = self._stream_key(stream)
+        if stream_id not in self._seen_streams:
+            self._seen_streams[stream_id] = stream
+            if len(self._seen_streams) > self._MAX_STREAMS:
+                stream_reprs = [f"cuda_stream={sid}" for sid in self._seen_streams]
+                raise RuntimeError(
+                    f"DeferredReleaseRegistry: expected at most {self._MAX_STREAMS} "
+                    f"distinct streams, but observed {len(self._seen_streams)}. "
+                    f"Streams: [{', '.join(stream_reprs)}]. "
+                    f"The deferred-release scheme assumes a two-stream "
+                    f"(comp/comm) alternating schedule. If more streams are "
+                    f"needed, the drain logic must be generalized."
+                )
+
+    def defer_release(
+        self,
+        tensors: List[torch.Tensor],
+        event: torch.cuda.Event,
+        producing_stream: torch.cuda.Stream,
+    ):
+        """Register tensors for deferred release.
+
+        Args:
+            tensors: List of tensors whose storage should be freed later.
+            event: The CUDA event that will be recorded on producing_stream
+                after the tensors' last use. A subsequent event.wait on another
+                stream guarantees safety.
+            producing_stream: The stream of the node that last used (consumed)
+                these tensors. The tensors become safe to free once another
+                stream waits on the event.
+        """
+        self._check_stream(producing_stream)
+        key = (id(event), self._stream_key(producing_stream))
+        self._registry[key].extend(tensors)
+
+    def drain(self, event: torch.cuda.Event, waiting_stream: torch.cuda.Stream):
+        """Free all deferred tensors that are now safe, given that waiting_stream
+        has just waited on the given event.
+
+        This should be called INSIDE stream_acquire_context, after event.wait(stream),
+        while the stream context is active. It frees tensors whose producing_stream is
+        different from waiting_stream (meaning the wait guarantees their work is done).
+
+        Args:
+            event: The event that was just waited on.
+            waiting_stream: The stream that performed the wait (self.stream of the node).
+        """
+        self._check_stream(waiting_stream)
+        event_id = id(event)
+        waiting_key = self._stream_key(waiting_stream)
+        # Collect keys to drain: same event, but producing_stream != waiting_stream
+        keys_to_drain = [
+            key for key in self._registry if key[0] == event_id and key[1] != waiting_key
+        ]
+        # NOTE: resize_(0) returns storage to the CUDA caching allocator.
+        # The allocator tracks the *allocator-stream* (the stream that last
+        # used the tensor), NOT the PyTorch stream context, so wrapping in
+        # `with torch.cuda.stream(waiting_stream)` does not change when the
+        # memory becomes reusable.  We keep the stream context purely for
+        # semantic clarity: these deallocations logically belong to the
+        # waiting stream, which has already synchronized with the producer
+        # via event.wait().
+        with torch.cuda.stream(waiting_stream):
+            for key in keys_to_drain:
+                tensors = self._registry.pop(key)
+                for t in tensors:
+                    t.untyped_storage().resize_(0)
+
+    def drain_all(self):
+        """Free ALL deferred tensors unconditionally.
+
+        Called at synchronization points where all streams have been joined
+        (e.g., at the end of TransformerModelChunkSchedulePlan.run() after
+        wait_current_stream on both schedule plans). At that point, all GPU
+        work is guaranteed complete and all deferred tensors are safe to free.
+
+        Also resets the seen-streams record so the two-stream invariant is
+        checked afresh for the next iteration / capture.
+        """
+        stream = torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            for key in list(self._registry.keys()):
+                tensors = self._registry.pop(key)
+                for t in tensors:
+                    t.untyped_storage().resize_(0)
+        self._seen_streams.clear()
+
+    def clear(self):
+        """Clear all deferred tensors without freeing. Used for cleanup/reset."""
+        self._registry.clear()
+        self._seen_streams.clear()
+
+    @classmethod
+    def reset(cls):
+        """Reset the singleton instance."""
+        if cls._instance is not None:
+            cls._instance.clear()
+            cls._instance = None
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -227,10 +411,20 @@ class ScheduleNode:
         # Immediately frees input tensors after they are used for nodes
         # where inputs are no longer needed after computation.
         if self.free_input:
-            for input in inputs:
-                if input is not None:
-                    input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
+            if torch.cuda.is_current_stream_capturing():
+                # During CUDA graph capture, record_stream causes deferred frees that
+                # never resolve, inflating the private pool. Instead, defer the release
+                # to the next node on the OTHER stream that waits on our event.
+                deferred = [inp for inp in inputs if inp is not None]
+                if deferred:
+                    DeferredReleaseRegistry.get_instance().defer_release(
+                        deferred, self.event, self.stream
+                    )
+            else:
+                for input in inputs:
+                    if input is not None:
+                        input.record_stream(self.stream)
+                        input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -260,15 +454,26 @@ class ScheduleNode:
 
         # output_grad maybe from another stream
         if output_grad:
-            for g in output_grad:
-                if g is not None:
-                    g.record_stream(self.stream)
-                    # Manually trigger the memory release of dgrad tensor
-                    # to avoid delayed garbage collection. If
-                    # delay_grads_release is True, dgrad is last used in
-                    # wgrad compute and skip the release here.
-                    if self.manual_release_grads and not self.delay_grads_release:
-                        g.untyped_storage().resize_(0)
+            if torch.cuda.is_current_stream_capturing():
+                # Note: unlike the eager path, we do NOT check manual_release_grads here.  
+                # That flag suppresses resize_(0) for per-scope CG (e.g. CudaGraphScope.attn),  
+                # but during full-iteration capture we must reclaim memory in the private pool. 
+                if not self.delay_grads_release:
+                    deferred = [g for g in output_grad if g is not None]
+                    if deferred:
+                        DeferredReleaseRegistry.get_instance().defer_release(
+                            deferred, self.event, self.stream
+                        )
+            else:
+                for g in output_grad:
+                    if g is not None:
+                        g.record_stream(self.stream)
+                        # Manually trigger the memory release of dgrad tensor
+                        # to avoid delayed garbage collection. If
+                        # delay_grads_release is True, dgrad is last used in
+                        # wgrad compute and skip the release here.
+                        if self.manual_release_grads and not self.delay_grads_release:
+                            g.untyped_storage().resize_(0)
 
         grads = self.get_grad()
         self._release_state()
@@ -290,13 +495,20 @@ class ScheduleNode:
 
         This context manager consolidates:
         1. Event wait/record for synchronization between streams
-        2. NVTX range for profiling (if name is provided)
-        3. torch.cuda.stream context for execution on the specified stream
+        2. Deferred tensor release (during CUDA graph capture)
+        3. NVTX range for profiling (if name is provided)
+        4. torch.cuda.stream context for execution on the specified stream
 
         Args:
             name: Optional name for NVTX range profiling
         """
         self.event.wait(self.stream)
+        # During CUDA graph capture, drain any deferred tensors that are now safe
+        # to free. After event.wait(self.stream), all work on the OTHER stream
+        # that recorded this event is guaranteed complete, so tensors produced
+        # on that other stream can be safely freed.
+        if torch.cuda.is_current_stream_capturing():
+            DeferredReleaseRegistry.get_instance().drain(self.event, self.stream)
         if name:
             nvtx_range_push(name)
         try:

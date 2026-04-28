@@ -176,8 +176,8 @@ class TransformerLayerSchedulePlan:
 
         # mlp and combine may receive dgrad from attn, which is managed by cuda graph.
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
-            self.mlp.manual_grads_release = False
-            self.moe_combine.manual_grads_release = False
+            self.mlp.manual_release_grads = False
+            self.moe_combine.manual_release_grads = False
 
     def get_fp8_context(self):
         """
@@ -549,5 +549,14 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.wait_current_stream()
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
+
+        # During CUDA graph capture, drain any remaining deferred tensors that were
+        # not picked up by stream_acquire_context (e.g., tensors deferred by the last
+        # backward node with no subsequent node on the other stream to drain them).
+        # At this point both streams have been synchronized via wait_current_stream.
+        if torch.cuda.is_current_stream_capturing():
+            from megatron.core.pipeline_parallel.utils import DeferredReleaseRegistry
+
+            DeferredReleaseRegistry.get_instance().drain_all()
 
         return f_input
