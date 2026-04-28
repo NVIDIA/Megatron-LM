@@ -666,8 +666,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         process_group = mpu.get_data_parallel_group(with_context_parallel=True)
                     elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
                         process_group = mpu.get_expert_data_parallel_group()
-                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
-                                                                     args.ckpt_assume_constant_structure)
+                    save_strategy = FullyParallelSaveStrategyWrapper(
+                        save_strategy,
+                        process_group,
+                        args.ckpt_assume_constant_structure,
+                        replicate_local_replicas=getattr(
+                            args, 'ckpt_fully_parallel_save_replicate_local', False
+                        ),
+                    )
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy

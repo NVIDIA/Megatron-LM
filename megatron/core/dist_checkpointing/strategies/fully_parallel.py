@@ -23,6 +23,9 @@ from megatron.core.dist_checkpointing.exchange_utils import (
     exchange_loaded_objects_gather_object,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
+from megatron.core.dist_checkpointing.strategies.local_replica import (
+    rewrite_replicas_to_shadow,
+)
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
@@ -75,6 +78,7 @@ class FullyParallelSaveStrategyWrapper:
         do_cache_distribution: bool = False,
         backend: str = "torch_dist",
         version: int = 1,
+        replicate_local_replicas: bool = False,
     ):
         """ """
         self.base_strategy = strategy
@@ -84,6 +88,13 @@ class FullyParallelSaveStrategyWrapper:
         self.do_cache_distribution = do_cache_distribution
         self.backend = backend
         self.version = version
+        # When True, after the standard parallelization step has elected a
+        # main saver per shard, every other rank in the parallelization group
+        # that holds a replica also writes its copy under a per-rank shadow
+        # FQN (see strategies/local_replica.py). Trades extra disk for the
+        # ability of every rank to read its tensors from its own
+        # __<rank>_*.distcp file at load time, eliminating cross-rank reads.
+        self.replicate_local_replicas = replicate_local_replicas
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
@@ -135,6 +146,19 @@ class FullyParallelSaveStrategyWrapper:
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
+
+        # Local-replica mode: every non-main local replica is renamed to a
+        # per-rank shadow FQN and promoted to a saver. This must run *after*
+        # validate_sharding_integrity (which expects the original key
+        # topology) and *after* the cached_distribution snapshot above (so
+        # subsequent saves replay the same rename deterministically).
+        if self.replicate_local_replicas:
+            global_rank = torch.distributed.get_rank()
+            n_renamed = rewrite_replicas_to_shadow(sharded_state_dict, global_rank)
+            logger.debug(
+                f"replicate_local_replicas: renamed {n_renamed} ShardedTensors "
+                f"to shadow keys on rank {global_rank}"
+            )
         end = time()
         logger.debug(f"parallel save sharding, time: {end - start}")
 

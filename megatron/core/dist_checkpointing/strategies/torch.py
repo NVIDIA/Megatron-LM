@@ -475,6 +475,68 @@ class MCoreSavePlanner(DefaultSavePlanner):
         assert not local_plan.planner_data, 'Planner data should be empty with decentralized plan'
         return local_plan
 
+    def _create_global_plan(self, all_plans):
+        """Override the parent's volume validation to skip shadow keys.
+
+        The default ``_validate_global_plan`` in PyT DCP enforces that the
+        union of every chunk's volume equals the global tensor's volume —
+        i.e., the saved chunks fully cover the tensor. That rule does not
+        apply to *shadow* entries produced by the local-replica save mode:
+        each shadow FQN is unique to one rank and only carries that rank's
+        local chunk(s), even though its global shape is the original
+        (full-tensor) shape. So we run the validator over a metadata view
+        with shadow keys filtered out, and only fall back to raising on the
+        non-shadow errors.
+
+        For non-local-replica checkpoints (no shadow keys present) this
+        override is a no-op: the filtered metadata equals the original.
+
+        We implement the override here (rather than monkey-patching
+        ``_validate_global_plan``) to keep the change local to MCore code
+        and to support both the older PyT signature (``-> bool``) and the
+        newer one (``-> list[str]``).
+        """
+        import dataclasses
+
+        from torch.distributed.checkpoint.default_planner import (
+            create_default_global_save_plan,
+            _validate_global_plan,
+        )
+
+        from .local_replica import filter_non_shadow_keys
+
+        deduped_plans = self._dedup_save_plans(all_plans)
+        global_plan, metadata = create_default_global_save_plan(deduped_plans)
+
+        if self.flatten_state_dict:
+            from collections import ChainMap
+            planner_data_dict = [p.planner_data for p in global_plan]
+            merged_mappings = dict(ChainMap(*planner_data_dict))
+            metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
+
+        # Strip shadow entries before the volume check (see docstring).
+        metadata_for_validation = dataclasses.replace(
+            metadata,
+            state_dict_metadata=filter_non_shadow_keys(metadata.state_dict_metadata),
+        )
+        result = _validate_global_plan(global_plan, metadata_for_validation)
+        # PyT versions disagree on the return type: older builds return a
+        # bool (``True`` == valid), newer source returns a list of error
+        # strings (empty == valid). Handle both.
+        if isinstance(result, bool):
+            if not result:
+                raise ValueError("Failed to validate global plan")
+        else:
+            if result:
+                error_summary = "; ".join(result)
+                if len(error_summary) > 500:
+                    error_summary = error_summary[:500] + "... (truncated)"
+                raise ValueError(
+                    f"Failed to validate global plan: {error_summary}"
+                )
+
+        return global_plan, metadata
+
     def transform_object(self, write_item: WriteItem, object: Any):
         """Make no transformations - bytes objects are already serialized."""
         return object
@@ -878,6 +940,23 @@ class TorchDistLoadShardedStrategy:
         fsr = _get_filesystem_reader(
             checkpoint_dir, cache_metadata=self.cache_metadata, async_strategy=async_strategy
         )
+        # Local-replica redirection: if this checkpoint was saved with the
+        # local-replica mode, every replica that *this* rank holds was
+        # written under a `__shadow_<rank>__<fqn>` FQN pointing at the
+        # rank's own __<rank>_*.distcp file. Reroute every load request
+        # whose shadow key is in the metadata so that PyT DCP opens our
+        # local file rather than the dedup-winning peer's file.
+        from .local_replica import (
+            redirect_pyt_state_dict_to_shadows,
+            restore_pyt_state_dict_from_shadows,
+        )
+
+        shadow_renames: Dict[str, str] = {}
+        if torch.distributed.is_initialized():
+            metadata = fsr.read_metadata()  # cached when cache_metadata=True
+            shadow_renames = redirect_pyt_state_dict_to_shadows(
+                pyt_state_dict, metadata, torch.distributed.get_rank()
+            )
         checkpoint.load(
             pyt_state_dict,
             fsr,
@@ -889,6 +968,10 @@ class TorchDistLoadShardedStrategy:
             ),
             no_dist=True,
         )
+        # Reverse the shadow rename so downstream code (unwrap, key-restore)
+        # sees the original FQNs the user-facing state dict expects.
+        if shadow_renames:
+            restore_pyt_state_dict_from_shadows(pyt_state_dict, shadow_renames)
 
         if self.cache_metadata:
             self.cached_global_metadata = (
