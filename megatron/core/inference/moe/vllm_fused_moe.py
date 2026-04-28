@@ -104,7 +104,6 @@ def _fused_moe_kernel(
     # Dimensions
     N,
     K,
-    EM,
     num_valid_tokens,
     # Strides
     stride_am,
@@ -133,8 +132,17 @@ def _fused_moe_kernel(
     output in-register before writing, avoiding a separate activation pass.
     """
     pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+
+    # Derive the M-block count from the device-side exact padded count (not the
+    # host-side upper-bound EM used only for grid sizing).  This lets excess
+    # CTAs exit before computing the group mapping AND gives the GROUP_SIZE_M
+    # grouping the correct layout for B-matrix L2 reuse.
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    if pid >= num_pid_m * num_pid_n:
+        return
+
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -142,22 +150,12 @@ def _fused_moe_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
-
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token_id = pid_m * BLOCK_SIZE_M + offs
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if off_experts == -1:
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.bfloat16), mask=c_mask)
-        return
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
@@ -400,7 +398,6 @@ def _invoke_fused_moe_kernel(
         num_tokens_post_padded,
         B.size(1),
         B.size(2),
-        EM,
         num_tokens,
         A.stride(0),
         A.stride(1),
