@@ -50,9 +50,7 @@ class TorchSampling(Sampling):
         """
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
-        assert not (
-            top_k > 0 and top_p > 0.0
-        ), "Cannot have top-p and top-k both greater than zero"
+        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
         assert top_p <= 1.0, "top-p should be in (0,1]"
 
         def modify_logits_for_top_k_filtering(logits, top_k):
@@ -117,8 +115,7 @@ class TorchSampling(Sampling):
 
         self._buckets = [(indices, *params) for params, indices in bucket_map.items()]
         self._bucket_index_tensors = [
-            torch.tensor(indices, device=device, dtype=torch.long)
-            for indices, *_ in self._buckets
+            torch.tensor(indices, device=device, dtype=torch.long) for indices, *_ in self._buckets
         ]
 
     def sample_kernel(
@@ -154,9 +151,7 @@ class TorchSampling(Sampling):
         output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
         indices_list = []
-        for idx_tensor, (_, temp, top_k, top_p) in zip(
-            self._bucket_index_tensors, self._buckets
-        ):
+        for idx_tensor, (_, temp, top_k, top_p) in zip(self._bucket_index_tensors, self._buckets):
             if token_to_request_index is None:
                 row_indices = idx_tensor
             else:
