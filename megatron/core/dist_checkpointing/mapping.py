@@ -321,6 +321,7 @@ class ShardedTensor(ShardedBase):
         ]
 
     def to_dtensor(self):
+        """Converts tensor to DTensor."""
         from torch.distributed.tensor import DTensor
 
         assert self.dtensor_ckpt_device_mesh is not None

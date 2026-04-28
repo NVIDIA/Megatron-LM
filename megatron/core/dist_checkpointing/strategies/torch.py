@@ -406,9 +406,11 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
 
 
 def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -> StateDict:
+    """Converts ShardedTensor-based state dict to DTensor-based state dict."""
     num_dtensors = 0
 
     def sh_ten_to_dtensor(x: Union[ShardedTensor, Any]) -> Union[Any, DTensor]:
+        """Converts ShardedTensor to DTensor."""
         nonlocal num_dtensors
 
         if isinstance(x, ShardedTensor):
@@ -430,6 +432,7 @@ def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -
 
 
 def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
+    """ """
     def dtensor_to_ten(x: Union[DTensor, Any]) -> Union[Any, torch.Tensor]:
         if isinstance(x, DTensor):
             x = x.to_local()
@@ -445,6 +448,7 @@ def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
 
 @dataclass
 class PlaceholderValue:
+    """ """
     key: str
 
 
