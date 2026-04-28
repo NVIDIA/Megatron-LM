@@ -122,6 +122,30 @@ class KVBlockAllocator:
                     device=torch.cuda.current_device(),
                 )
 
+            # ── Graphed-path scaffolding ──
+            # Dereg queue: the graphed release path writes (block_id, old_hash)
+            # pairs for blocks whose ref count drops to zero. Sized to hold
+            # events from both graph bodies back-to-back without an intermediate
+            # drain: `2 * max_release_per_step + 2 * max_requests + 1` sink slot.
+            dereg_capacity = 2 * self.max_release_per_step + 2 * max_requests + 1
+            self._pc_dereg_sink_idx = dereg_capacity - 1
+            self._pc_pending_dereg_ids = torch.full(
+                (dereg_capacity,), -1, dtype=torch.int32, device=device
+            )
+            self._pc_pending_dereg_hashes = torch.full(
+                (dereg_capacity,), -1, dtype=torch.int64, device=device
+            )
+            self._pc_pending_dereg_count = torch.zeros((), dtype=torch.int64, device=device)
+            self._pc_dereg_may_have_events: bool = False
+
+            # Per-block workspace for deduplicating released block IDs.
+            self._pc_released_bitmap = torch.zeros(
+                (self.total_count,), dtype=torch.bool, device=device
+            )
+            self._pc_block_arange = torch.arange(
+                self.total_count, dtype=torch.int32, device=device
+            )
+
         # Per-block MoE routing storage (populated when routing replay is enabled)
         self.block_routing: Dict[int, np.ndarray] = {}
 
@@ -308,8 +332,63 @@ class KVBlockAllocator:
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
 
+            # Reset graphed-path scaffolding state.
+            self._pc_pending_dereg_ids.fill_(-1)
+            self._pc_pending_dereg_hashes.fill_(-1)
+            self._pc_pending_dereg_count.zero_()
+            self._pc_dereg_may_have_events = False
+
         # Clear per-block routing storage
         self.block_routing.clear()
+
+    def drain_pending_dereg(self) -> None:
+        """Apply queued dereg events to the host-side dict and callback.
+
+        The graphed release path mutates all GPU-resident prefix caching
+        state directly, but ``kv_hash_to_block_id`` is a Python dict and
+        ``on_blocks_deregistered`` is a host callback — both inherently
+        host-only. Instead of syncing per release, the graphed body queues
+        (block_id, old_hash) pairs in ``_pc_pending_dereg_ids`` and
+        ``_pc_pending_dereg_hashes``; this method drains the queue in one
+        host pass.
+
+        Call from ``update_requests`` after the final graph body finishes
+        and before returning, so ``add_request`` (the only reader of the
+        dict) sees a consistent view between steps.
+
+        Idempotent. Skips the GPU sync entirely when no prefix-aware
+        release has run since the last drain (via the host-side
+        ``_pc_dereg_may_have_events`` flag).
+        """
+        if not self.enable_prefix_caching:
+            return
+        if not self._pc_dereg_may_have_events:
+            return
+
+        self._pc_dereg_may_have_events = False
+        count = int(self._pc_pending_dereg_count.item())
+        if count == 0:
+            return
+
+        # Pack ids (int32) and hashes (int64) into one int64 buffer and
+        # do a single .cpu() to avoid two separate D2H syncs (was 3 in
+        # the slow path: count.item() + ids.tolist() + hashes.tolist()).
+        device = self._pc_pending_dereg_count.device
+        combined = torch.empty(2 * count, dtype=torch.int64, device=device)
+        combined[:count] = self._pc_pending_dereg_ids[:count].to(torch.int64)
+        combined[count:] = self._pc_pending_dereg_hashes[:count]
+        flat = combined.cpu().tolist()
+        ids = flat[:count]
+        hashes = flat[count:]
+
+        keys_to_delete = set(hashes) - {-1}
+        for h in keys_to_delete:
+            self.kv_hash_to_block_id.pop(h, None)
+
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(ids, keys_to_delete)
+
+        self._pc_pending_dereg_count.zero_()
 
     # =========================================================================
     # Prefix caching methods
