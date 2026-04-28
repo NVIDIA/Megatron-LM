@@ -292,7 +292,9 @@ class TestExtractShardedBaseOrDTensor:
     def test_dtensors_go_to_sharded_part(self):
         """DTensors land in the sharded part alongside ShardedBase objects."""
         placements, device_mesh = _get_dtensor_metadata_dp_only()
-        dtensor = DTensor.from_local(torch.ones(4, device='cuda'), device_mesh, placements, run_check=False)
+        dtensor = DTensor.from_local(
+            torch.ones(4, device='cuda'), device_mesh, placements, run_check=False
+        )
         state_dict = {'dt': dtensor, 'scalar': 42}
 
         sharded, common = extract_sharded_base_or_dtensor(state_dict)
@@ -306,7 +308,9 @@ class TestExtractShardedBaseOrDTensor:
         """Mixed state dict is split correctly between sharded and common parts."""
         sh_ten = ShardedTensor.from_rank_offsets('k', torch.ones(2), replica_id=0)
         placements, device_mesh = _get_dtensor_metadata_dp_only()
-        dtensor = DTensor.from_local(torch.ones(3, device='cuda'), device_mesh, placements, run_check=False)
+        dtensor = DTensor.from_local(
+            torch.ones(3, device='cuda'), device_mesh, placements, run_check=False
+        )
 
         state_dict = {'sh_ten': sh_ten, 'dtensor': dtensor, 'int_val': 99, 'tensor': torch.zeros(5)}
 
@@ -484,7 +488,7 @@ class TestDTensorSaveLoad:
             load_spec = {
                 'bf_key': self._make_sh_ten(
                     'bf_key', torch.zeros(6, 4, dtype=torch.bfloat16, device='cuda'), device_mesh
-                ),
+                )
             }
             loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
 
@@ -526,9 +530,7 @@ class TestDTensorSaveLoad:
         assert torch.allclose(loaded['model']['bias'], t2)
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(
-        torch.cuda.device_count() < 2, reason="TP=2 requires at least 2 GPUs"
-    )
+    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="TP=2 requires at least 2 GPUs")
     def test_save_load_tp2_sharded_tensors(self, tmp_path_dist_ckpt):
         """DTensor format round-trip with TP=2: each rank holds its TP shard."""
         Utils.initialize_model_parallel(2, 1)
@@ -577,9 +579,7 @@ class TestDTensorSaveLoad:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_tp2') as ckpt_dir:
             save(save_sd, ckpt_dir, async_sharded_save=False, use_dtensor_format=True)
 
-            load_spec = {
-                'weight': make_tp_sh_ten('weight', torch.zeros(8, 1, device='cuda'))
-            }
+            load_spec = {'weight': make_tp_sh_ten('weight', torch.zeros(8, 1, device='cuda'))}
             loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
 
         assert torch.allclose(loaded['weight'], local_tensor)

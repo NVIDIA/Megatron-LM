@@ -419,7 +419,9 @@ def apply_swiglu_sharded_factory(
         kwargs = {}
         if use_dtensor_format:
             placements, device_mesh = get_dtensor_metadata(tp=True, tp_axis=swiglu_shard_axis)
-            kwargs.update(dict(dtensor_ckpt_device_mesh=device_mesh, dtensor_ckpt_placements=placements))
+            kwargs.update(
+                dict(dtensor_ckpt_device_mesh=device_mesh, dtensor_ckpt_placements=placements)
+            )
 
         return [
             ShardedTensor.from_rank_offsets(

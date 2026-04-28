@@ -319,12 +319,14 @@ class ShardedTensor(ShardedBase):
                 global_offset=global_offset,
             )
         ]
-    
+
     def to_dtensor(self):
         from torch.distributed.tensor import DTensor
 
         assert self.dtensor_ckpt_device_mesh is not None
-        return DTensor.from_local(self.data, self.dtensor_ckpt_device_mesh, self.dtensor_ckpt_placements, run_check=False)
+        return DTensor.from_local(
+            self.data, self.dtensor_ckpt_device_mesh, self.dtensor_ckpt_placements, run_check=False
+        )
 
 
 def is_main_replica(replica_id: ReplicaId):

@@ -150,7 +150,9 @@ def load(
     )
 
     async_strategy = getattr(common_state_dict.get("args"), "async_strategy", "nvrx")
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format)
+    loaded_state_dict = sharded_strategy.load(
+        sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format
+    )
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -400,9 +402,7 @@ def save(
             tensor_format = "DTensor" if use_dtensor_format else "ShardedTensor"
             save_config(
                 CheckpointingConfig(
-                    sharded_strategy.backend,
-                    sharded_strategy.version,
-                    tensor_format=tensor_format,
+                    sharded_strategy.backend, sharded_strategy.version, tensor_format=tensor_format
                 ),
                 checkpoint_dir,
             )

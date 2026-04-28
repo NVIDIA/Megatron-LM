@@ -13,7 +13,11 @@ from .mapping import (
     StateDict,
     apply_factories,
 )
-from .utils import _clean_metadata_for_serialization, extract_nonpersistent, extract_sharded_base_or_dtensor
+from .utils import (
+    _clean_metadata_for_serialization,
+    extract_nonpersistent,
+    extract_sharded_base_or_dtensor,
+)
 from .validation import determine_global_metadata, validate_sharding_integrity
 
 

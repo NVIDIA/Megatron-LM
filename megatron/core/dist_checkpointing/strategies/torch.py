@@ -407,6 +407,7 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
 
 def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -> StateDict:
     num_dtensors = 0
+
     def sh_ten_to_dtensor(x: Union[ShardedTensor, Any]) -> Union[Any, DTensor]:
         nonlocal num_dtensors
 
@@ -475,10 +476,12 @@ def inject_placeholders(sharded_state_dict: ShardedStateDict) -> Dict[str, Any]:
 
 
 def fill_placeholders(sharded_state_dict: ShardedStateDict, loaded_values: Dict[str, Any]) -> None:
-    """Inverse of `inject_placeholders`. """
+    """Inverse of `inject_placeholders`."""
+
     def _fill_placeholder(x: PlaceholderValue):
         assert isinstance(x, PlaceholderValue)
         return loaded_values[x.key]
+
     dict_list_map_inplace(_fill_placeholder, sharded_state_dict)
 
 
@@ -744,6 +747,7 @@ class TorchDistSaveShardedStrategy:
             # Wrapping each stage's dict under a "ppN" key gives every stage a unique
             # DCP path, preventing shape-mismatch collisions on save and load.
             from megatron.core import parallel_state as mpu
+
             pp_size = mpu.get_pipeline_model_parallel_world_size()
             if pp_size > 1:
                 pp_rank = mpu.get_pipeline_model_parallel_rank()
@@ -753,7 +757,9 @@ class TorchDistSaveShardedStrategy:
             return torch.distributed.checkpoint.save(dcp_state_dict, checkpoint_id=checkpoint_dir)
         else:
             strategy = "nvrx" if HAVE_NVRX else "mcore"
-            async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
+            async_request = self.async_save(
+                sharded_state_dict, checkpoint_dir, async_strategy=strategy
+            )
             async_request.execute_sync()
             del async_request
 
@@ -964,13 +970,16 @@ class TorchDistLoadShardedStrategy:
             fill_placeholders(sharded_state_dict, values_to_load)
 
             from megatron.core import parallel_state as mpu
+
             pp_size = mpu.get_pipeline_model_parallel_world_size()
             if pp_size > 1:
                 pp_rank = mpu.get_pipeline_model_parallel_rank()
                 dcp_state_dict = {f"pp{pp_rank}": sharded_state_dict}
             else:
                 dcp_state_dict = sharded_state_dict
-            torch.distributed.checkpoint.load(state_dict=dcp_state_dict, checkpoint_id=checkpoint_dir)
+            torch.distributed.checkpoint.load(
+                state_dict=dcp_state_dict, checkpoint_id=checkpoint_dir
+            )
             unwrap_dtensors_and_sh_ten(sharded_state_dict)
 
             return sharded_state_dict

@@ -230,7 +230,9 @@ class FullyParallelLoadStrategyWrapper:
         loaded_state_dict = {}
 
         if get_pg_size(self.parallelization_group) <= 1:
-            return self.base_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format)
+            return self.base_strategy.load(
+                sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format
+            )
 
         # Step 1 and 2: exchange load metadata and distribute the load
         with debug_time("self.apply_loading_parallelization", logger):
@@ -263,7 +265,9 @@ class FullyParallelLoadStrategyWrapper:
 
         with debug_time("base_load_ShardedTensors", logger):
             # Load sharded tensors separately
-            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy, use_dtensor_format)
+            loaded_tensors = self.base_strategy.load(
+                to_load_shards, checkpoint_dir, async_strategy, use_dtensor_format
+            )
 
         with debug_time("self.exchange_loaded_tensors", logger):
 
