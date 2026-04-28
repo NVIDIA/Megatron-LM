@@ -57,6 +57,11 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     # so that experts.py can always call _valid_tokens() on this base class.
     _valid_tokens_tensor: Optional[torch.Tensor] = None
 
+    # Host-side mirror of the total valid token count. Set each step in
+    # update_metadata so that kernel tile-size heuristics can read it without
+    # a device-to-host sync (which would break CUDA graph capture).
+    _host_valid_tokens: Optional[int] = None
+
     # Per-subclass instance counter (shadows via MRO on first mutation, so NCCL
     # and NVLS each start from 0). The first instance created owns update_metadata.
     _dispatcher_count: int = 0
@@ -70,6 +75,10 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
         return cls._valid_tokens_tensor
+
+    @classmethod
+    def _get_host_valid_tokens(cls) -> Optional[int]:
+        return cls._host_valid_tokens
 
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata refresh fired from the first instance's token_dispatch.
@@ -147,8 +156,10 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(
                 local_tokens_per_rank.sum()
             )
+            InferenceAllGatherDispatcherBase._host_valid_tokens = sum(cls._local_tokens_per_rank)
         else:
             InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(ep_size * local_tokens)
+            InferenceAllGatherDispatcherBase._host_valid_tokens = ep_size * local_tokens
 
     def token_dispatch(self, hidden_states, probs):
         """Gather hidden_states, probs, and routing_map from all EP ranks.
@@ -395,6 +406,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             symm_mem_hdl=cls._symm_metadata["handle"],
             step_metadata=cls._step_metadata,
         )
+        InferenceAllGatherDispatcherBase._host_valid_tokens = local_tokens * self.ep_size
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
 

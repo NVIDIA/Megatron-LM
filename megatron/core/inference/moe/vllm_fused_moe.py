@@ -30,7 +30,10 @@ if not HAVE_TRITON:
     tl = MagicMock()
 
 from megatron.core.inference.moe.fused_moe import ActivationType
-from megatron.core.inference.moe.permute import compute_expert_offsets, compute_local_tokens_per_expert
+from megatron.core.inference.moe.permute import (
+    compute_expert_offsets,
+    compute_local_tokens_per_expert,
+)
 
 # ---------------------------------------------------------------------------
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
@@ -59,18 +62,31 @@ def _select_block_size_m(max_tokens: int) -> int:
 _AUTOTUNE_CONFIGS = [
     # GROUP_SIZE_M=1: better when each expert has few tokens (decode, sparse activation).
     triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=5),
     # GROUP_SIZE_M=8: better for large batches where experts see many tokens.
     triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=5),
+    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=6),
     triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=5),
 ]
 
 
@@ -143,11 +159,16 @@ def _fused_moe_kernel(
         tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.bfloat16), mask=c_mask)
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + off_experts * stride_be + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    b_block_ptr = tl.make_block_ptr(
+        base=b_ptr + off_experts * stride_be,
+        shape=(K, N),
+        strides=(stride_bk, stride_bn),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -156,10 +177,10 @@ def _fused_moe_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
     if FUSE_SQUARED_RELU:
         accumulator = tl.maximum(accumulator, 0.0)
@@ -256,6 +277,27 @@ def _fill_expert_block_ids_kernel(
             tl.store(expert_ids_ptr + b, e)
 
 
+@triton.jit
+def _sort_expert_block_kernel(
+    sorted_token_ids_ptr,
+    tokens_per_expert_ptr,
+    exclusive_offsets_ptr,
+    SENTINEL: tl.constexpr,
+    MAX_BLOCK_SIZE: tl.constexpr,
+):
+    """Sort token indices within each expert's block for coalesced A loads."""
+    eid = tl.program_id(0)
+    count = tl.load(tokens_per_expert_ptr + eid)
+    if count <= 1 or count > MAX_BLOCK_SIZE:
+        return
+    start = tl.load(exclusive_offsets_ptr + eid)
+    offs = tl.arange(0, MAX_BLOCK_SIZE)
+    mask = offs < count
+    vals = tl.load(sorted_token_ids_ptr + start + offs, mask=mask, other=SENTINEL)
+    sorted_vals = tl.sort(vals)
+    tl.store(sorted_token_ids_ptr + start + offs, sorted_vals, mask=mask)
+
+
 def _moe_align_block_size_cuda_graphable(
     routing_map: torch.Tensor,
     block_size: int,
@@ -335,11 +377,226 @@ def _moe_align_block_size_cuda_graphable(
         NUM_BLOCKS=NUM_BLOCKS,
     )
 
+    MAX_TPE = triton.next_power_of_2(min(max_tokens * topk, 512))
+    _sort_expert_block_kernel[(num_local_experts,)](
+        sorted_token_ids,
+        tokens_per_expert,
+        exclusive_offsets,
+        SENTINEL=sentinel,
+        MAX_BLOCK_SIZE=MAX_TPE,
+    )
+
     num_tokens_post_padded_local = inclusive_offsets[-1:]
     num_tokens_post_padded_all = torch.full(
         (1,), max_sorted, dtype=torch.int32, device=device
     )
     return sorted_token_ids, expert_ids, num_tokens_post_padded_local, num_tokens_post_padded_all
+
+
+# ---------------------------------------------------------------------------
+# Split-K GEMM variant for small-M (decode)
+# ---------------------------------------------------------------------------
+
+_SPLITK_CONFIGS = [
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
+    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=5),
+]
+
+_SPLITK_NUM_SPLITS = 4
+
+
+@triton.autotune(configs=_SPLITK_CONFIGS, key=['N', 'K'])
+@triton.jit
+def _fused_moe_kernel_splitk(
+    # Pointers
+    a_ptr,
+    b_ptr,
+    workspace_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    num_k_splits,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_wm,
+    stride_wn,
+    # Flags / constexprs
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Split-K fused MoE GEMM: partitions K across CTAs, accumulates via atomics."""
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_mn = num_pid_m * num_pid_n
+    pid_k = pid % num_k_splits
+    pid_mn = pid // num_k_splits
+
+    if pid_mn >= num_pid_mn:
+        return
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid_mn // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid_mn % num_pid_in_group) % group_size_m)
+    pid_n = (pid_mn % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token_id = pid_m * BLOCK_SIZE_M + offs
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        return
+
+    k_per_split = tl.cdiv(K, num_k_splits)
+    k_start = pid_k * k_per_split
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + (k_start + offs_k[None, :]) * stride_ak)
+    b_block_ptr = tl.make_block_ptr(
+        base=b_ptr + off_experts * stride_be,
+        shape=(K, N),
+        strides=(stride_bk, stride_bn),
+        offsets=(k_start, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(k_per_split, BLOCK_SIZE_K)):
+        k_abs = k_start + k * BLOCK_SIZE_K
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & ((k_abs + offs_k[None, :]) < K),
+            other=0.0,
+        )
+        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        accumulator += tl.dot(a, b)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator *= moe_weight[:, None]
+
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    w_ptrs = workspace_ptr + stride_wm * offs_token[:, None] + stride_wn * offs_cn[None, :]
+    w_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.atomic_add(w_ptrs, accumulator, mask=w_mask)
+
+
+@triton.jit
+def _splitk_finalize_kernel(
+    workspace_ptr,
+    output_ptr,
+    N,
+    total_rows,
+    APPLY_SQUARED_RELU: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Convert fp32 split-K workspace to bf16 output, optionally applying squared ReLU."""
+    row = tl.program_id(0)
+    if row >= total_rows:
+        return
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        mask = offs_n < N
+        val = tl.load(workspace_ptr + row * N + offs_n, mask=mask, other=0.0)
+        if APPLY_SQUARED_RELU:
+            val = tl.maximum(val, 0.0)
+            val *= val
+        tl.store(output_ptr + row * N + offs_n, val.to(tl.bfloat16), mask=mask)
+
+
+def _invoke_splitk(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    block_size_m: int,
+    fuse_squared_relu: bool = False,
+):
+    """Launch split-K variant: GEMM with K-partitioning + finalize pass."""
+    M = A.size(0)
+    num_tokens = M * top_k
+    EM = sorted_token_ids.size(0)
+    N = B.size(1)
+    K = B.size(2)
+
+    workspace = torch.zeros(C.size(0), C.size(1), dtype=torch.float32, device=C.device)
+
+    grid = lambda META: (  # noqa: E731
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(N, META["BLOCK_SIZE_N"])
+        * _SPLITK_NUM_SPLITS,
+    )
+
+    _fused_moe_kernel_splitk[grid](
+        A,
+        B,
+        workspace,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        EM,
+        num_tokens,
+        _SPLITK_NUM_SPLITS,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        workspace.stride(0),
+        workspace.stride(1),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        BLOCK_SIZE_M=block_size_m,
+    )
+
+    BLOCK_N = min(triton.next_power_of_2(C.size(1)), 1024)
+    _splitk_finalize_kernel[(C.size(0),)](
+        workspace,
+        C,
+        C.size(1),
+        C.size(0),
+        APPLY_SQUARED_RELU=fuse_squared_relu,
+        BLOCK_N=BLOCK_N,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -358,9 +615,23 @@ def _invoke_fused_moe_kernel(
     top_k: int,
     block_size_m: int,
     fuse_squared_relu: bool = False,
+    num_tokens_hint: Optional[int] = None,
 ):
-    """Launch the Triton fused-MoE kernel for one GEMM pass."""
-    M = A.size(0)
+    """Launch the Triton fused-MoE kernel for one GEMM pass.
+
+    Automatically selects the split-K variant for small-M (decode) workloads
+    to increase SM occupancy. Uses num_tokens_hint (actual batch size) rather
+    than A.size(0) (worst-case buffer size) when available.
+    """
+    effective_m = num_tokens_hint if num_tokens_hint is not None else A.size(0)
+    if effective_m <= 32:
+        _invoke_splitk(
+            A, B, C, topk_weights, sorted_token_ids, expert_ids,
+            num_tokens_post_padded, mul_routed_weight, top_k,
+            block_size_m, fuse_squared_relu,
+        )
+        return
+
     num_tokens = M * top_k
     EM = sorted_token_ids.size(0)
 
@@ -481,6 +752,7 @@ def vllm_fused_moe(
     valid_tokens: torch.Tensor,
     routing_map: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    num_tokens_hint: Optional[int] = None,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -500,6 +772,9 @@ def vllm_fused_moe(
         routing_map: [max_tokens, topk] int expert assignments.
         out: optional [max_tokens, hidden_size] bf16 output buffer (e.g. RSV
             symmetric memory tensor). If None, a local buffer is allocated.
+        num_tokens_hint: optional host-side int with the expected number of
+            valid tokens (e.g. batch_size * ep_size). Used to select a better
+            BLOCK_SIZE_M instead of using the worst-case buffer size.
 
     Returns:
         [max_tokens, hidden_size] BF16 output.
@@ -510,7 +785,7 @@ def vllm_fused_moe(
 
     max_tokens = hidden_states.size(0)
     topk = routing_map.shape[1]
-    block_size_m = _select_block_size_m(max_tokens)
+    block_size_m = _select_block_size_m(num_tokens_hint if num_tokens_hint is not None else max_tokens)
 
     sorted_token_ids, expert_ids, num_post_local, num_post_all = (
         _moe_align_block_size_cuda_graphable(
@@ -529,6 +804,7 @@ def vllm_fused_moe(
     intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
+    effective_tokens = num_tokens_hint if num_tokens_hint is not None else max_tokens
     _invoke_fused_moe_kernel(
         hidden_states,
         fc1_weight,
@@ -541,6 +817,7 @@ def vllm_fused_moe(
         top_k=topk,
         block_size_m=block_size_m,
         fuse_squared_relu=True,
+        num_tokens_hint=effective_tokens,
     )
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights
@@ -561,6 +838,7 @@ def vllm_fused_moe(
         mul_routed_weight=True,
         top_k=1,
         block_size_m=block_size_m,
+        num_tokens_hint=effective_tokens * topk if num_tokens_hint is not None else None,
     )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
