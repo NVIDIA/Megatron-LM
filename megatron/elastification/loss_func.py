@@ -25,7 +25,7 @@ def _mask_loss(output_tensor, loss_mask):
         param_loss = None
 
     num_tokens = loss_mask.sum().float()
-    
+
     # Sharath: param loss for flextron copied from Ali
     if param_loss is not None:
         if param_loss > 0:
@@ -61,9 +61,12 @@ def _mask_loss(output_tensor, loss_mask):
         return loss
 
 
-
-
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTModel, selected_budget: float = None):
+def loss_func(
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: GPTModel,
+    selected_budget: float = None,
+):
     """Loss function (with KD Loss support).
 
     Args:
@@ -114,24 +117,22 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
             report['lm loss (budget)'] = report['lm loss']
             report['lm loss (full)'] = (zero_num, zero_den)
 
-
     if model.training and args.export_kd_teacher_load:
         # [ModelOpt]: Handle knowledge distillation.
         # The installed balancer with skip_lm_loss=True drops student_loss (param_loss) from
         # the total. Add loss_lm back manually to restore the router gradient signal.
         losses = model.compute_kd_loss(
-            student_loss=loss_lm,
-            loss_reduction_fn=lambda x: _mask_loss(x, loss_mask),
+            student_loss=loss_lm, loss_reduction_fn=lambda x: _mask_loss(x, loss_mask)
         )
         loss = losses["kd_loss"] + param_loss_item
         # All-gather logits_loss across DP ranks so we can mask by selected_budget below.
         logits_loss = losses["logits_loss"].detach()
-        dp_world_size = torch.distributed.get_world_size(group=parallel_state.get_data_parallel_group())
+        dp_world_size = torch.distributed.get_world_size(
+            group=parallel_state.get_data_parallel_group()
+        )
         logits_loss_gathered = [torch.zeros_like(logits_loss) for _ in range(dp_world_size)]
         torch.distributed.all_gather(
-            logits_loss_gathered,
-            logits_loss,
-            group=parallel_state.get_data_parallel_group()
+            logits_loss_gathered, logits_loss, group=parallel_state.get_data_parallel_group()
         )
         logits_loss_gathered = torch.stack(logits_loss_gathered)
 
@@ -152,46 +153,56 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
             report["kd loss (budget)"] = (total_loss_report, num_tokens)
             report["kd loss (full)"] = (zero_num_kd, zero_den_kd)
         report["logits distillation loss"] = (losses["logits_loss"].detach(), num_tokens)
-        report["intermediate distillation loss"] = (losses["intermediate_loss"].detach(), num_tokens)
+        report["intermediate distillation loss"] = (
+            losses["intermediate_loss"].detach(),
+            num_tokens,
+        )
 
         local_budget = torch.tensor(
-            [selected_budget],
-            dtype=torch.float32,
-            device=logits_loss.device
+            [selected_budget], dtype=torch.float32, device=logits_loss.device
         )
         budgets_gathered = [torch.zeros_like(local_budget) for _ in range(dp_world_size)]
         torch.distributed.all_gather(
-            budgets_gathered,
-            local_budget,
-            group=parallel_state.get_data_parallel_group()
+            budgets_gathered, local_budget, group=parallel_state.get_data_parallel_group()
         )
         budgets_gathered = torch.cat(budgets_gathered)
 
         # Create a binary mask where gathered budgets are equal to selected_budget (with 1e-6 tolerance)
         budget_mask = (budgets_gathered - selected_budget).abs() < 1e-6
-        logits_loss_gathered_selected = logits_loss_gathered[budget_mask].sum()/budget_mask.sum()
-        budget_num_tokens = num_tokens.float() * budget_mask.sum()/budget_mask.shape[0]/budget_mask.sum()
+        logits_loss_gathered_selected = logits_loss_gathered[budget_mask].sum() / budget_mask.sum()
+        budget_num_tokens = (
+            num_tokens.float() * budget_mask.sum() / budget_mask.shape[0] / budget_mask.sum()
+        )
 
         corrected_budget_list = list(set(args.budget_list))
 
         for temp_budget in corrected_budget_list:
             report[f"logits distillation loss {temp_budget:.3f}"] = (
                 torch.tensor(0.0, device=logits_loss.device, dtype=torch.float32),
-                torch.tensor(0.0, device=logits_loss.device, dtype=torch.float32)
+                torch.tensor(0.0, device=logits_loss.device, dtype=torch.float32),
             )
         index_of_selected_budget = corrected_budget_list.index(selected_budget)
-        all_budget_logit = torch.zeros(len(corrected_budget_list), device=logits_loss.device, dtype=logits_loss.dtype)
-        all_budget_tokens = torch.zeros(len(corrected_budget_list), device=logits_loss.device, dtype=logits_loss.dtype)
+        all_budget_logit = torch.zeros(
+            len(corrected_budget_list), device=logits_loss.device, dtype=logits_loss.dtype
+        )
+        all_budget_tokens = torch.zeros(
+            len(corrected_budget_list), device=logits_loss.device, dtype=logits_loss.dtype
+        )
 
         all_budget_logit[index_of_selected_budget] = logits_loss_gathered_selected
         all_budget_tokens[index_of_selected_budget] = budget_num_tokens
 
         for i in range(len(corrected_budget_list)):
-            report[f"logits distillation loss {corrected_budget_list[i]:.3f}"] = (all_budget_logit[i], all_budget_tokens[i])
+            report[f"logits distillation loss {corrected_budget_list[i]:.3f}"] = (
+                all_budget_logit[i],
+                all_budget_tokens[i],
+            )
 
     # Convert all items in report dict to a single (value, num_tokens) tensor.
     for key, val in report.items():
         assert isinstance(val, tuple), "Value is not a tuple"
-        report[key] = torch.tensor([val[0], val[1].view(1)], device=loss_lm.device, dtype=loss_lm.dtype)
+        report[key] = torch.tensor(
+            [val[0], val[1].view(1)], device=loss_lm.device, dtype=loss_lm.dtype
+        )
 
     return loss, num_tokens, report

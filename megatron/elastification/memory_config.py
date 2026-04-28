@@ -43,11 +43,12 @@ class MemoryConfig:
         Whether the param-budget loss supervises on ``'active'`` (top-k experts only)
         or ``'total'`` (all parameters including non-active experts) parameter count.
     """
-    bpe_params:          float = 2.0
-    bpe_kv_cache:        float = 2.0
-    bpe_ssm_cache:       float = 2.0
-    bpe_max_buffer:      float = 2.0
-    param_budget_target: str   = "active"   # "active" | "total"
+
+    bpe_params: float = 2.0
+    bpe_kv_cache: float = 2.0
+    bpe_ssm_cache: float = 2.0
+    bpe_max_buffer: float = 2.0
+    param_budget_target: str = "active"  # "active" | "total"
 
     def __post_init__(self):
         valid_targets = {"active", "total"}
@@ -87,9 +88,7 @@ def load_memory_config(args) -> MemoryConfig:
     print(f"[memory_config] profile='{profile_name}'  path={profile_path}")
 
     if not os.path.isfile(profile_path):
-        raise FileNotFoundError(
-            f"Memory profiles file not found: {profile_path}"
-        )
+        raise FileNotFoundError(f"Memory profiles file not found: {profile_path}")
 
     with open(profile_path) as f:
         profiles = yaml.safe_load(f)
@@ -103,14 +102,16 @@ def load_memory_config(args) -> MemoryConfig:
         )
 
     preset = presets[profile_name]
-    cfg.bpe_params          = float(preset.get("params",           cfg.bpe_params))
-    cfg.bpe_kv_cache        = float(preset.get("kv_cache",         cfg.bpe_kv_cache))
-    cfg.bpe_ssm_cache       = float(preset.get("ssm_cache",        cfg.bpe_ssm_cache))
-    cfg.bpe_max_buffer      = float(preset.get("max_buffer",       cfg.bpe_max_buffer))
-    cfg.param_budget_target =       preset.get("param_budget_target", cfg.param_budget_target)
-    print(f"[memory_config] after preset : bpe_params={cfg.bpe_params} bpe_kv_cache={cfg.bpe_kv_cache} "
-          f"bpe_ssm_cache={cfg.bpe_ssm_cache} bpe_max_buffer={cfg.bpe_max_buffer} "
-          f"param_budget_target={cfg.param_budget_target}")
+    cfg.bpe_params = float(preset.get("params", cfg.bpe_params))
+    cfg.bpe_kv_cache = float(preset.get("kv_cache", cfg.bpe_kv_cache))
+    cfg.bpe_ssm_cache = float(preset.get("ssm_cache", cfg.bpe_ssm_cache))
+    cfg.bpe_max_buffer = float(preset.get("max_buffer", cfg.bpe_max_buffer))
+    cfg.param_budget_target = preset.get("param_budget_target", cfg.param_budget_target)
+    print(
+        f"[memory_config] after preset : bpe_params={cfg.bpe_params} bpe_kv_cache={cfg.bpe_kv_cache} "
+        f"bpe_ssm_cache={cfg.bpe_ssm_cache} bpe_max_buffer={cfg.bpe_max_buffer} "
+        f"param_budget_target={cfg.param_budget_target}"
+    )
 
     # ── Apply individual CLI overrides (take priority over preset) ─────────
     if getattr(args, "bpe_params", None) is not None:
@@ -120,13 +121,19 @@ def load_memory_config(args) -> MemoryConfig:
         print(f"[memory_config] override bpe_kv_cache: {cfg.bpe_kv_cache} -> {args.bpe_kv_cache}")
         cfg.bpe_kv_cache = float(args.bpe_kv_cache)
     if getattr(args, "bpe_ssm_cache", None) is not None:
-        print(f"[memory_config] override bpe_ssm_cache: {cfg.bpe_ssm_cache} -> {args.bpe_ssm_cache}")
+        print(
+            f"[memory_config] override bpe_ssm_cache: {cfg.bpe_ssm_cache} -> {args.bpe_ssm_cache}"
+        )
         cfg.bpe_ssm_cache = float(args.bpe_ssm_cache)
     if getattr(args, "bpe_max_buffer", None) is not None:
-        print(f"[memory_config] override bpe_max_buffer: {cfg.bpe_max_buffer} -> {args.bpe_max_buffer}")
+        print(
+            f"[memory_config] override bpe_max_buffer: {cfg.bpe_max_buffer} -> {args.bpe_max_buffer}"
+        )
         cfg.bpe_max_buffer = float(args.bpe_max_buffer)
     if getattr(args, "param_budget_target", None) is not None:
-        print(f"[memory_config] override param_budget_target: {cfg.param_budget_target} -> {args.param_budget_target}")
+        print(
+            f"[memory_config] override param_budget_target: {cfg.param_budget_target} -> {args.param_budget_target}"
+        )
         cfg.param_budget_target = args.param_budget_target
 
     print(f"[memory_config] final       : {cfg}")
