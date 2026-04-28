@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from typing import Any, Callable, Dict, Generator, List, Optional, OrderedDict, Tuple, Union
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
 import torch
@@ -160,11 +160,6 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = None
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
-
-        # Side stream for pre-forward bookkeeping. Work issued here runs concurrently
-        # with the forward pass; post-forward consumers synchronize on the event.
-        self._pre_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
-        self._pre_forward_bookkeeping_event = torch.cuda.Event()
 
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
@@ -1594,18 +1589,6 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
-    def graph_capture_variants(self) -> Generator[Callable, None, None]:
-        """Yield context-setup callables for each graph-capture variant.
-
-        During graph warmup, the engine runs the full step pipeline once per yielded callable.
-        Each callable exercises a different kernel path.
-        """
-        if not self._enable_cuda_graph:
-            yield lambda context: None
-            return
-
-        yield lambda context: None
-
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
         on ranks that do not have any real requests. It may run in eager mode."""
@@ -1855,11 +1838,6 @@ class TextGenerationController:
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Launch bookkeeping on a side stream so it overlaps with forward.
-            self._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
-                self._pre_forward_bookkeeping_event.record()
-
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             self._dynamic_step_forward_logits(input_ids, position_ids)
@@ -1885,9 +1863,9 @@ class TextGenerationController:
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
-        self._pre_forward_bookkeeping_event.synchronize()
         with torch.inference_mode():
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+
             self._dynamic_step_sample_bookkeeping()
 
             if self.num_speculative_tokens > 0:
