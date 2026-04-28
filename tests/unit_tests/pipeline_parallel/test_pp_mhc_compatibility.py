@@ -194,6 +194,27 @@ class TestGetTensorShapesWithMHC:
         shapes = self._shapes(cfg, pp_rank=1, pp_size=2, is_recv=False)
         assert shapes == [(self.SEQ, self.MBS, self.H)]
 
+    def test_mhc_pp_requires_pp_group(self):
+        """mHC PP shape calculation requires the current PP group."""
+        cfg = _make_config(
+            hidden_size=self.H,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=self.N_STREAMS,
+        )
+        tp, cp = _make_tp_cp_groups()
+        with pytest.raises(ValueError, match="pp_group must be provided"):
+            get_tensor_shapes(
+                seq_length=self.SEQ,
+                micro_batch_size=self.MBS,
+                decoder_seq_length=None,
+                config=cfg,
+                tp_group=tp,
+                cp_group=cp,
+                pp_group=None,
+                is_recv=True,
+            )
+
     # --- With mHC, PP=4 (intermediate ranks) ---
 
     def test_mhc_pp4_intermediate_ranks(self):

@@ -2056,6 +2056,13 @@ def get_tensor_shapes(
             "Use the interleaved schedule tensor_shape path for VPP+mHC."
         )
 
+    if (
+        getattr(config, 'enable_hyper_connections', False)
+        and getattr(config, 'pipeline_model_parallel_size', 1) > 1
+        and pp_group is None
+    ):
+        raise ValueError("pp_group must be provided when enable_hyper_connections=True")
+
     # Determine hidden dimension based on hyper connections and pipeline stage
     hidden_size = config.hidden_size
     # TODO: make this more robust, including flexible VPP layout

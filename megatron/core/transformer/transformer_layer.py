@@ -1297,15 +1297,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return True
         return False
 
-    def backward_dw_cudagraph(self, microbatch_idx):
-        """
-        CUDA Graph backward weight gradient computation for this layer.
-        """
-        cg_index = microbatch_idx % len(self.cuda_graphs)
-        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
-            return
-        self.cuda_graphs[cg_index].backward_dw()
-
     def __call__(self, *args, **kwargs):
         # Extract mhc_recompute_manager before CUDA graph manager processes kwargs,
         # since CheckpointManager is not a CUDA-graph-supported type.
@@ -1548,9 +1539,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 attention_output_with_bias[0]
             )
 
-        nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
+        nvtx_range_push(suffix="self_attention_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
+            hidden_states = self.self_attention_hyper_connection.h_res_h_post_bda(
                 self_attn_h_res,
                 residual,
                 self_attn_hc_h_post,
@@ -1560,7 +1551,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 self.config.bias_dropout_fusion,
                 mhc_recompute_manager,
             )
-        nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
+        nvtx_range_pop(suffix="self_attention_h_res_h_post_bda")
 
         if self.offload_attn_norm:
             hidden_states = off_interface.group_commit(
@@ -1709,9 +1700,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 mlp_output_with_bias[0]
             )
 
-        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+        nvtx_range_push(suffix="mlp_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
+            hidden_states = self.mlp_hyper_connection.h_res_h_post_bda(
                 mlp_h_res,
                 residual,
                 mlp_hc_h_post,
@@ -1721,7 +1712,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 self.config.bias_dropout_fusion,
                 mhc_mlp_bda_recompute_manager,
             )
-        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+        nvtx_range_pop(suffix="mlp_h_res_h_post_bda")
 
         if self.offload_mlp_norm:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (

@@ -441,9 +441,10 @@ if _CUTILE_AVAILABLE:
         s, b, n, C = original_residual.shape
         sb = s * b
         TILE_C = math.gcd(C, 1024)
-        TILE_SIZE = math.gcd(sb, 1)
+        # These kernels reshape each program's sequence/batch tile as a single row.
+        TILE_SIZE = 1
         out = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
-        grid = (math.ceil(sb / TILE_SIZE),)
+        grid = (sb,)
         if bias is not None:
             ct.launch(
                 torch.cuda.current_stream(),
@@ -490,7 +491,8 @@ if _CUTILE_AVAILABLE:
         s, b, n, C = original_residual.shape
         sb = s * b
         TILE_C = math.gcd(C, 1024)
-        TILE_SIZE = math.gcd(sb, 1)
+        # These kernels reshape each program's sequence/batch tile as a single row.
+        TILE_SIZE = 1
         g_hr = torch.empty(sb, n, n, dtype=h_res.dtype, device=h_res.device)
         g_res = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
         g_hp = torch.empty(sb, n, dtype=h_res.dtype, device=h_res.device)
@@ -549,10 +551,9 @@ if _CUTILE_AVAILABLE:
     # -- Proj RMS kernels ----------------------------------------------------
 
     @ct.function
-    def _ct_rms_dnorm(a_tile, norm_tile, dr_tile, K):
+    def _ct_rms_dnorm(a_tile, norm_tile, dr_tile, K, eps):
         inv_norm = ct.where(norm_tile > 0, 1.0 / norm_tile, 0.0)
         inv_sqrt_k = 1.0 / ct.sqrt(K)
-        eps = 1e-8
         u = norm_tile * inv_sqrt_k + eps
         coeff = -(1.0 / (u * u)) * inv_sqrt_k
         return dr_tile * coeff * a_tile * inv_norm
@@ -605,6 +606,7 @@ if _CUTILE_AVAILABLE:
         M: int,
         N: int,
         K: int,
+        eps: float,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         TILE_SIZE_K: ConstInt,
@@ -628,7 +630,7 @@ if _CUTILE_AVAILABLE:
                 DR, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=zero_pad
             )
             accumulator_da = accumulator_da + _ct_rms_dnorm(
-                a_tile.astype(ct.float32), norm_tile, dr_tile, K
+                a_tile.astype(ct.float32), norm_tile, dr_tile, K, eps
             )
             b_tile = ct.load(
                 B, index=(0, tile_k_id), shape=(TILE_SIZE_N, TILE_SIZE_K), padding_mode=zero_pad
@@ -646,7 +648,7 @@ if _CUTILE_AVAILABLE:
 
     @ct.kernel
     def _ct_proj_rms_bwd_small_k_kernel(
-        A, B, NORM, DD, DR, DA, DB, M: int, N: int, K: int, TILE_N_SIZE: ConstInt
+        A, B, NORM, DD, DR, DA, DB, M: int, N: int, K: int, eps: float, TILE_N_SIZE: ConstInt
     ):
         zero_pad = ct.PaddingMode.ZERO
         TILE_DB_SIZE_M = 128
@@ -702,7 +704,7 @@ if _CUTILE_AVAILABLE:
                     DR, index=(dd_tile_idx, 0), shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad
                 )
                 accumulator_da = accumulator_da + _ct_rms_dnorm(
-                    a_tile.astype(ct.float32), norm_tile, dr_tile, K
+                    a_tile.astype(ct.float32), norm_tile, dr_tile, K, eps
                 )
                 b_tile = ct.load(
                     B,
@@ -785,6 +787,7 @@ if _CUTILE_AVAILABLE:
                     M,
                     N,
                     K,
+                    eps,
                     TILE_SIZE_M,
                     TILE_SIZE_N,
                     TILE_SIZE_K,
@@ -796,7 +799,7 @@ if _CUTILE_AVAILABLE:
                 torch.cuda.current_stream(),
                 grid,
                 _ct_proj_rms_bwd_small_k_kernel,
-                (x, weight, norm, grad_proj, grad_r, da, db, M, N, K, TILE_SIZE_N),
+                (x, weight, norm, grad_proj, grad_r, da, db, M, N, K, eps, TILE_SIZE_N),
             )
         return da, db
 
@@ -964,4 +967,12 @@ else:
             proj: [M, N] = x @ weight^T
             r: [M, 1] = 1 / (||x|| / sqrt(K) + eps)
         """
+        if _next_power_of_2(weight.shape[0]) > 256:
+            input_dtype = x.dtype
+            x_float = x.float()
+            weight_float = weight.float()
+            proj = torch.matmul(x_float, weight_float.t()).to(dtype=input_dtype)
+            norm = x_float.norm(dim=-1, keepdim=True)
+            rms = norm / math.sqrt(x.shape[-1]) + eps
+            return proj, (1.0 / rms).to(dtype=input_dtype)
         return FusedProjRms.apply(x, weight, eps)

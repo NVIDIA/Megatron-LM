@@ -882,7 +882,12 @@ class TransformerConfig(ModelParallelConfig):
     """Enable mHC residual connections."""
 
     num_residual_streams: int = 4
-    """Number of residual streams (n in paper)."""
+    """Number of residual streams (n in paper).
+
+    Within each hyper-connection transformer block, hidden states are expanded
+    from [s, b, C] to [s, b, n*C], so activation memory in the block scales
+    roughly linearly with this value.
+    """
 
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
@@ -1489,6 +1494,11 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
+        if self.enable_hyper_connections and self.num_residual_streams < 2:
+            raise ValueError(
+                "num_residual_streams must be >= 2 when hyper connections are enabled."
+            )
+
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
             if not self.enable_hyper_connections:
@@ -1517,9 +1527,17 @@ class TransformerConfig(ModelParallelConfig):
                     "tensor_pop on a None chunk. Disable one of them."
                 )
 
-        if self.enable_hyper_connections and not (
-            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        if (
+            self.enable_hyper_connections
+            and self.recompute_granularity is not None
+            and not (self.recompute_granularity == "selective" and "mhc" in self.recompute_modules)
         ):
+            if self.recompute_granularity == "full":
+                raise ValueError(
+                    "enable_hyper_connections is not yet compatible with full activation "
+                    "recompute. Use selective recompute with 'mhc' in recompute_modules "
+                    "or disable activation recompute."
+                )
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "
@@ -1547,6 +1565,13 @@ class TransformerConfig(ModelParallelConfig):
                     UserWarning,
                 )
                 self.use_fused_mhc = False
+            fused_proj_dim = self.num_residual_streams**2 + 2 * self.num_residual_streams
+            if self.use_fused_mhc and fused_proj_dim > 256:
+                raise ValueError(
+                    "use_fused_mhc supports num_residual_streams values whose "
+                    "n^2 + 2n projection dimension is <= 256. Disable use_fused_mhc "
+                    "or choose fewer residual streams."
+                )
 
         # Validation for hyper_connections with MTP
         if self.enable_hyper_connections and self.mtp_num_layers is not None:

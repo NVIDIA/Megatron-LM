@@ -919,10 +919,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
                     # Extract intermediate embeddings using global layer index
                     if (l_no + layer_offset) in extract_layer_indices:
-                        intermediate_hidden_states.append(hidden_states)
+                        intermediate_hidden_state = hidden_states
+                        if self.config.enable_hyper_connections:
+                            intermediate_hidden_state = HyperConnectionModule.output_contract(
+                                intermediate_hidden_state, self.num_residual_streams
+                            )
+                        intermediate_hidden_states.append(intermediate_hidden_state)
 
-        # Only contract if the final layer norm is in this stage
-        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+        # Contract at the model boundary. Final layernorm may be disabled, but
+        # downstream output layers and feature consumers still expect [s, b, C].
+        if self.config.enable_hyper_connections and self.post_process:
             hidden_states = HyperConnectionModule.output_contract(
                 hidden_states, self.num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]
