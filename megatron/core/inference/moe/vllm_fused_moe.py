@@ -63,6 +63,9 @@ _AUTOTUNE_CONFIGS = [
     # GROUP_SIZE_M=1: better when each expert has few tokens (decode, sparse activation).
     triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
     triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
     triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
@@ -104,6 +107,7 @@ def _fused_moe_kernel(
     # Dimensions
     N,
     K,
+    EM,
     num_valid_tokens,
     # Strides
     stride_am,
@@ -133,22 +137,22 @@ def _fused_moe_kernel(
     """
     pid = tl.program_id(0)
 
-    # Derive the M-block count from the device-side exact padded count (not the
-    # host-side upper-bound EM used only for grid sizing).  This lets excess
-    # CTAs exit before computing the group mapping AND gives the GROUP_SIZE_M
-    # grouping the correct layout for B-matrix L2 reuse.
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    # Compute group mapping from EM (host-side upper bound passed as a kernel
+    # arg) so the compiler can resolve pid_m/pid_n without waiting on a global
+    # memory load.  The device-side num_tokens_post_padded is loaded afterwards
+    # only for the per-block early-exit check.
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    if pid >= num_pid_m * num_pid_n:
-        return
-
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
 
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token_id = pid_m * BLOCK_SIZE_M + offs
@@ -157,15 +161,13 @@ def _fused_moe_kernel(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
 
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
-    b_block_ptr = tl.make_block_ptr(
-        base=b_ptr + off_experts * stride_be,
-        shape=(K, N),
-        strides=(stride_bk, stride_bn),
-        offsets=(0, pid_n * BLOCK_SIZE_N),
-        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
-        order=(0, 1),
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     )
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -175,10 +177,10 @@ def _fused_moe_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        b = tl.load(b_ptrs)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+        b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if FUSE_SQUARED_RELU:
         accumulator = tl.maximum(accumulator, 0.0)
@@ -283,6 +285,7 @@ def _moe_align_block_size_cuda_graphable(
     num_local_experts: int,
     local_expert_start: int,
     valid_tokens: torch.Tensor,
+    num_tokens_hint: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build indirection tables for the vLLM kernel, fully on-device.
 
@@ -296,6 +299,9 @@ def _moe_align_block_size_cuda_graphable(
         num_local_experts: experts on this rank.
         local_expert_start: first global expert index on this rank.
         valid_tokens: scalar int32 CUDA tensor.
+        num_tokens_hint: optional host-side valid token count. When
+            provided, tightens the scatter kernel grid to avoid launching
+            CTAs that would immediately exit.
 
     Returns:
         sorted_token_ids: [max_sorted] int32 indirection table.
@@ -338,9 +344,10 @@ def _moe_align_block_size_cuda_graphable(
         BLOCK=128,
     )
 
+    effective_pairs = (num_tokens_hint * topk) if num_tokens_hint is not None else (max_tokens * topk)
     max_pairs = max_tokens * topk
     SCATTER_BLOCK = 256
-    scatter_grid = _ceil_div(max_pairs, SCATTER_BLOCK)
+    scatter_grid = _ceil_div(effective_pairs, SCATTER_BLOCK)
     _scatter_token_indices_kernel[(scatter_grid,)](
         routing_map,
         sorted_token_ids,
@@ -398,6 +405,7 @@ def _invoke_fused_moe_kernel(
         num_tokens_post_padded,
         B.size(1),
         B.size(2),
+        EM,
         num_tokens,
         A.stride(0),
         A.stride(1),
@@ -474,6 +482,7 @@ def _moe_sum(
     local_expert_start: int,
     num_local_experts: int,
     out: Optional[torch.Tensor] = None,
+    grid_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] → [max_tokens, K].
 
@@ -481,12 +490,17 @@ def _moe_sum(
     avoiding a separate allocation + copy. Rows beyond valid_tokens are zeroed.
     Only accumulates contributions from local experts; non-local topk slots are
     skipped (their values in `input` are undefined).
+
+    grid_tokens: if provided, launches only this many CTAs instead of max_tokens.
+    Rows beyond grid_tokens are left untouched (stale or uninitialized). Safe when
+    downstream consumers gate reads with valid_tokens (which is ≤ grid_tokens).
     """
     if out is None:
         out = torch.empty(max_tokens, K, dtype=input.dtype, device=input.device)
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
-    _moe_sum_kernel[(max_tokens,)](
+    grid_size = grid_tokens if grid_tokens is not None else max_tokens
+    _moe_sum_kernel[(grid_size,)](
         input,
         out,
         valid_tokens,
@@ -550,11 +564,13 @@ def vllm_fused_moe(
 
     max_tokens = hidden_states.size(0)
     topk = routing_map.shape[1]
-    block_size_m = _select_block_size_m(num_tokens_hint if num_tokens_hint is not None else max_tokens)
+    effective_tokens = num_tokens_hint if num_tokens_hint is not None else max_tokens
+    block_size_m = _select_block_size_m(effective_tokens)
 
     sorted_token_ids, expert_ids, num_post_padded = (
         _moe_align_block_size_cuda_graphable(
-            routing_map, block_size_m, num_local_experts, local_expert_start, valid_tokens
+            routing_map, block_size_m, num_local_experts, local_expert_start, valid_tokens,
+            num_tokens_hint=num_tokens_hint,
         )
     )
     num_valid = max_tokens * topk
@@ -569,14 +585,9 @@ def vllm_fused_moe(
     intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
-    effective_tokens = num_tokens_hint if num_tokens_hint is not None else max_tokens
     # Tight grid bound: only enough CTAs for actual tokens + per-expert alignment padding.
     # Without this, the grid covers the entire worst-case buffer (max_tokens * topk + padding).
-    grid_em = (
-        (effective_tokens * topk + block_size_m * (num_local_experts + 1))
-        if num_tokens_hint is not None
-        else None
-    )
+    grid_em = effective_tokens * topk + block_size_m * (num_local_experts + 1)
     _invoke_fused_moe_kernel(
         hidden_states,
         fc1_weight,
@@ -618,4 +629,5 @@ def vllm_fused_moe(
     return _moe_sum(
         intermediate3, max_tokens, topk, K, valid_tokens,
         routing_map, local_expert_start, num_local_experts, out=out,
+        grid_tokens=effective_tokens,
     )
