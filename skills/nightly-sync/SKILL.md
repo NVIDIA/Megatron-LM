@@ -281,12 +281,16 @@ the branch.
      in a collapsed `<details>` block. If git is too old for `--remerge-diff`,
      note the git version and describe the merge strategy used instead.
 - Save the PR number for later phases
-- **Add the `Run functional tests` label** to the PR immediately after
-  creation. This ensures `/ok to test` triggers the full CI suite (unit tests
-  + functional/integration tests with 100-step training and golden value
-  comparison). Without this label, only a lightweight subset runs.
+- **Add the `Run functional tests` and `Run MBridge tests` labels** to the
+  PR immediately after creation. The `Run functional tests` label ensures
+  `/ok to test` triggers the full CI suite (unit tests + functional/
+  integration tests with 100-step training and golden value comparison).
+  The `Run MBridge tests` label triggers the MBridge test suite. Without
+  these labels, only a lightweight subset runs.
   ```bash
-  gh pr edit <PR_NUMBER> --repo $REPO --add-label "Run functional tests"
+  gh pr edit <PR_NUMBER> --repo $REPO \
+    --add-label "Run functional tests" \
+    --add-label "Run MBridge tests"
   ```
 
 ---
@@ -449,8 +453,10 @@ CI progresses. No separate registration poll needed.
   `/ok to test`. Pushing to them directly breaks the CI trigger
   mechanism. Always push to your own sync branch (e.g.
   `main2dev/<DATE>`) instead.
-- **Do NOT forget the `Run functional tests` label.** Without it,
-  the internal GitLab functional tests do not run.
+- **Do NOT forget the `Run functional tests` and `Run MBridge tests`
+  labels.** Without `Run functional tests`, the internal GitLab
+  functional tests do not run; without `Run MBridge tests`, the
+  MBridge test suite does not run.
 
 ### Failure Investigation
 
