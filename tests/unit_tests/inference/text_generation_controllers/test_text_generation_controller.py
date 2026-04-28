@@ -67,6 +67,7 @@ class TextGenerationControllerTestBase:
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
         hybrid_layer_pattern: str = None,
+        sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
     ):
         if use_training_random_init:
@@ -164,6 +165,7 @@ class TextGenerationControllerTestBase:
                     enable_prefix_caching=enable_prefix_caching,
                     max_requests=max_requests,
                     mamba_inference_state_config=mamba_inference_state_config,
+                    sampling_backend=sampling_backend,
                 ),
             )
 
@@ -280,17 +282,20 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
-    @pytest.mark.parametrize("backend", ["torch"])
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_sample_from_dynamic_logits(
         self, backend: str, materialize_only_last_token_logits: bool
     ):
+        if backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         batch_size = 12
         self.setup_model(
             torch.float32,
             batch_size=batch_size,
             static=False,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+            sampling_backend=backend,
         )
         self.mock_tokenizer.eod = self.vocab_size
 
@@ -320,7 +325,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
         context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
         context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
-        self.text_generation_controller._sampling_backend = backend
 
         context.padded_active_token_count = batch_size
         context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32, device='cuda')
