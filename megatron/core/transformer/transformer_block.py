@@ -294,6 +294,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # required for pipeline parallel schedules
         self.input_tensor = None
 
+        # Lazily populated mHC recompute layout cache (deterministic from config
+        # and num_layers); see `_build_mhc_recompute_layer_plan`.
+        self._mhc_block_end_plan: Optional[List[bool]] = None
+
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
@@ -676,7 +680,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if not use_mhc_recompute or num_layers == 0:
             return [None] * num_layers, [False] * num_layers
 
-        if not hasattr(self, "_mhc_block_end_plan"):
+        if self._mhc_block_end_plan is None:
             self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
         is_recompute_block_end = self._mhc_block_end_plan
 

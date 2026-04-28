@@ -441,7 +441,12 @@ if _CUTILE_AVAILABLE:
         s, b, n, C = original_residual.shape
         sb = s * b
         TILE_C = math.gcd(C, 1024)
-        # These kernels reshape each program's sequence/batch tile as a single row.
+        # `_ct_hpb_fwd_kernel` / `_ct_hpb_fwd_bias_kernel` reshape `hp_tile` from
+        # (TILE_SIZE, N) to (N, 1) and `hr_tile` from (TILE_SIZE, N, N) to (N, N).
+        # Those reshapes are only correct when TILE_SIZE==1; values >1 would
+        # silently mix data across batch elements. The parameterization is kept
+        # for kernel signature symmetry with the other tiled kernels but must
+        # not be changed without a kernel rewrite.
         TILE_SIZE = 1
         out = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
         grid = (sb,)
@@ -491,7 +496,9 @@ if _CUTILE_AVAILABLE:
         s, b, n, C = original_residual.shape
         sb = s * b
         TILE_C = math.gcd(C, 1024)
-        # These kernels reshape each program's sequence/batch tile as a single row.
+        # As in `_cutile_h_post_bda_fwd`: the bwd kernels collapse the batch
+        # tile dimension to 1 inside their reshapes, so TILE_SIZE must remain 1
+        # for correctness.
         TILE_SIZE = 1
         g_hr = torch.empty(sb, n, n, dtype=h_res.dtype, device=h_res.device)
         g_res = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)

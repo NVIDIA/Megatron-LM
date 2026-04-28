@@ -1600,6 +1600,40 @@ class TransformerConfig(ModelParallelConfig):
                 "single-stream residual tensors."
             )
 
+        if (
+            self.enable_hyper_connections
+            and self.virtual_pipeline_model_parallel_size is not None
+        ):
+            # The interleaved schedule allocates a single tensor_shape for all P2P
+            # exchanges per physical rank, but VPP straddles pre/post-process
+            # boundaries on each physical rank — intermediate virtual chunks need
+            # n*C while embedding/loss chunks use C. Block until per-virtual-chunk
+            # shapes are wired through. (A second, layout-derived path is caught
+            # at schedule-execution time in `forward_backward_pipelining_with_interleaving`.)
+            raise ValueError(
+                "enable_hyper_connections is not yet supported with "
+                "virtual_pipeline_model_parallel_size set. Disable VPP or wait for "
+                "per-virtual-chunk shape support."
+            )
+
+        if self.enable_hyper_connections and (self.num_moe_experts or 0) > 0:
+            raise ValueError(
+                "enable_hyper_connections is not yet supported with MoE layers. "
+                "Disable MoE (set num_moe_experts=None or 0) or disable mHC."
+            )
+
+        if self.enable_hyper_connections:
+            if self.mhc_sinkhorn_iterations < 1:
+                raise ValueError(
+                    f"mhc_sinkhorn_iterations must be >= 1; got "
+                    f"{self.mhc_sinkhorn_iterations}."
+                )
+            if self.mhc_init_gating_factor < 0:
+                raise ValueError(
+                    f"mhc_init_gating_factor must be non-negative; got "
+                    f"{self.mhc_init_gating_factor}."
+                )
+
         if self.fine_grained_activation_offloading:
             assert (
                 not self.cpu_offloading

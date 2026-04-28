@@ -1496,6 +1496,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         residual = hidden_states
         if self.config.fp32_residual_connection:
+            # Upcast the n-stream residual to fp32 to match the base
+            # TransformerLayer behavior. `h_res`/`h_post` from the hyper
+            # connection stay in compute dtype; downstream `native_h_post_bda`
+            # / `apply_h_res` align dtypes before `torch.bmm` rather than
+            # relying on Inductor auto-promotion.
             residual = residual.float()
 
         nvtx_range_push(suffix="self_attention_hyper_connection")

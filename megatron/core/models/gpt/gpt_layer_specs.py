@@ -264,6 +264,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
             )
             return TransformerLayerSubmodules(
                 input_layernorm=input_layernorm,
+                self_attention_hyper_connection=hc_module,
                 self_attention=ModuleSpec(
                     module=FusedMLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
@@ -280,6 +281,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 ),
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                mlp_hyper_connection=hc_module,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map=(

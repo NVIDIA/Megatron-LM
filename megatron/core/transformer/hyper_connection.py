@@ -75,6 +75,12 @@ def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     """Native H_res @ residual + H_post * (x [+ bias])."""
+    # `fp32_residual_connection=True` upcasts `original_residual` to fp32 while
+    # `h_res` stays in compute dtype. `torch.bmm` requires matching input dtypes
+    # (Inductor auto-promotes today, but eager / aot_eager backends would error),
+    # so align explicitly to the residual dtype.
+    if h_res.dtype != original_residual.dtype:
+        h_res = h_res.to(original_residual.dtype)
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, C)
@@ -128,6 +134,10 @@ class HyperConnectionModule(MegatronModule):
     def __init__(self, config: TransformerConfig, layer_number: int):
         super().__init__(config)
         self.config = config
+        # `layer_number` is currently unused inside HyperConnectionModule, but we
+        # accept and store it so callers can identify the module at debug time
+        # and so layer-dependent alpha schedules / per-layer epsilon tuning can
+        # be added later without changing the constructor signature.
         self.layer_number = layer_number
         self.n = config.num_residual_streams
         self.hidden_size = config.hidden_size
@@ -393,6 +403,12 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = residual.shape
         n = self.n
         C = self.hidden_size
+
+        # `torch.bmm` requires both operands to share dtype. `fp32_residual_connection`
+        # upcasts `residual` to fp32 while `h_res` stays in compute dtype; align
+        # `h_res` to the residual dtype rather than relying on Inductor auto-promotion.
+        if h_res.dtype != residual.dtype:
+            h_res = h_res.to(residual.dtype)
 
         # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
         h_res_batched = h_res.view(s * b, n, n)

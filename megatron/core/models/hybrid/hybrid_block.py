@@ -98,7 +98,9 @@ class HyperConnectionHybridLayer(MegatronModule):
                 _called_from_hybrid_mhc_wrapper=True,
             )
         else:
-            # Non-transformer layers (e.g. Mamba, GDN) do not accept
+            # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
+            # accept `sequence_len_offset` is currently always wrapped inside a
+            # TransformerLayer spec, so it takes the branch above) do not accept
             # rotary_pos_emb / sequence_len_offset / padding_mask — pass only
             # the common arguments. New layer types that consume any of these
             # must add explicit handling here.

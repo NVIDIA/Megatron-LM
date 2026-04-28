@@ -2080,21 +2080,28 @@ def get_tensor_shapes(
     ):
         raise ValueError("pp_group must be provided when enable_hyper_connections=True")
 
-    # Determine hidden dimension based on hyper connections and pipeline stage
+    # Determine hidden dimension based on hyper connections and pipeline stage.
+    #
+    # mHC keeps the n-stream tensor `[s, b, n*C]` only at *intermediate* layer
+    # boundaries. The first PP stage receives a single-stream `[s, b, C]` from
+    # the embedding layer and expands to n*C for its first transformer layer;
+    # the last PP stage contracts back to C before the output. So the boundary
+    # shapes are asymmetric:
+    #   - rank 0:           recv = C,    send = n*C
+    #   - middle ranks:     recv = n*C,  send = n*C
+    #   - rank pp_size-1:   recv = n*C,  send = C
+    # `is_recv` selects the correct dimension at each boundary.
+    # TODO: make this more robust, including flexible VPP layout.
     hidden_size = config.hidden_size
-    # TODO: make this more robust, including flexible VPP layout
     if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
         pp_rank = pp_group.rank()
         pp_size = pp_group.size()
-        # For hyper connections:
-        # - recv: stages with rank > 0 receive n-stream (n*C) from previous stage
-        # - send: stages with rank < pp_size-1 send n-stream (n*C) to next stage
         use_nstream = False
         if is_recv and pp_rank > 0:
-            # Receiving from previous stage (which sends n*C)
+            # Receiving from previous stage (which sends n*C).
             use_nstream = True
         elif not is_recv and pp_rank < pp_size - 1:
-            # Sending to next stage (send n*C)
+            # Sending to next stage (send n*C).
             use_nstream = True
 
         if use_nstream:
