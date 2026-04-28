@@ -235,6 +235,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # Tracks how many requests have finished but not yet been removed from
         # the active batch via a sync. Used by the periodic-sync backstop.
         self._finished_pending_count = 0
+        # Holds the launch_state dict produced by a prior iteration's
+        # speculative pre-launch of step N+1. The next iteration consumes it
+        # instead of launching fresh. None when no speculative launch is in
+        # flight (warmup, after rejection, or async scheduling disabled).
+        self._pending_launch_state: Optional[Dict] = None
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.

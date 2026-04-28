@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -966,6 +966,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # request staging slots start with a deterministic value.
         self._cpu_bookkeeping_buf.fill_(0)
 
+        # Snapshot used by speculatively_advance_for_next_decode_step /
+        # restore_after_speculative_advance. None when no speculative advance
+        # is currently outstanding.
+        self._spec_advance_state: Optional[Dict[str, Tensor]] = None
+
         _off = 0
         # Per-token state (source-of-truth lives in the coalesced buffer since
         # the CPU-side bookkeeping and the GPU forward pass use the same
@@ -1326,17 +1331,99 @@ class DynamicInferenceContext(BaseInferenceContext):
     def can_speculate_decode_step(self, advance: int = 1) -> bool:
         """Predicate: can we run the next ``advance`` decode steps speculatively?
 
-        Returns True when the speculation chain is safe to continue: pure decode
-        only, and either no new blocks are needed or all needed blocks are
-        available without eviction. Used by the engine in C3 to gate the
-        async-scheduling fast path.
+        Returns True only when the next step's metadata can be derived from the
+        current state by a position bump alone — no allocator activity, no
+        speculative-decoding interaction. Tighter than the original block-budget
+        check because the speculative advance path implemented in
+        :meth:`speculatively_advance_for_next_decode_step` does not yet handle
+        block-boundary crossings or speculative decoding (num_speculative_tokens
+        > 0); the engine falls back to serial whenever this returns False.
         """
         if not self.is_decode_only():
             return False
-        blocks_needed = self.predict_decode_blocks_needed(advance=advance)
-        if blocks_needed == 0:
-            return True
-        return self.kv_block_allocator.is_memory_available(blocks_needed)
+        if self.num_speculative_tokens > 0:
+            return False
+        # Boundary-crossing requires allocator work that the speculative advance
+        # cannot replay safely; defer to serial when any active request would
+        # need a fresh block at the next step.
+        return self.predict_decode_blocks_needed(advance=advance) == 0
+
+    def speculatively_advance_for_next_decode_step(self) -> None:
+        """Advance state to what update_requests would produce after the next
+        pure-decode step, assuming no termination/pause/eviction events.
+
+        Called by the engine async-scheduling path to populate the pinned
+        bookkeeping buffer for step N+1 before step N's update_requests has
+        run. Reversible via :meth:`restore_after_speculative_advance`, which
+        the engine invokes after queueing step N+1's H2D + forward + sample
+        on the stream so that step N's update_requests sees pre-speculation
+        canonical state.
+
+        Preconditions (caller-enforced via :meth:`can_speculate_decode_step`):
+            - ``is_decode_only()``
+            - ``num_speculative_tokens == 0``
+            - No active request crosses a block boundary at the next step.
+        """
+        assert self.is_decode_only(), "speculative advance requires pure decode"
+        assert self.num_speculative_tokens == 0, (
+            "speculative advance not yet supported alongside speculative decoding"
+        )
+        assert self._spec_advance_state is None, (
+            "previous speculative advance has not been restored"
+        )
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        n_active = self.total_request_count - self.paused_request_count
+
+        # Snapshot persistent tensors that the advance mutates. Pinned-buffer
+        # token-level fields (token_to_pos_ids, etc.) are intentionally not
+        # snapshotted: they are overwritten by the upcoming update_requests
+        # call on the canonical post-step-N state, which will produce the same
+        # values we wrote here in the no-event case.
+        self._spec_advance_state = {
+            'request_kv_length_offsets': self.request_kv_length_offsets[active_slice].clone(),
+            'request_last_kv_block_offset': self.request_last_kv_block_offset[
+                active_slice
+            ].clone(),
+        }
+
+        # Advance per-request offsets: kv_offsets += query_lengths (==1 in pure
+        # decode), and last_kv_block_offset rolls forward by one mod block size.
+        query_lens = self.request_query_lengths[active_slice]
+        self.request_kv_length_offsets[active_slice] += query_lens
+        self.request_last_kv_block_offset[active_slice] = (
+            self.request_last_kv_block_offset[active_slice] + 1
+        ) % self.block_size_tokens
+
+        # Advance pinned token-level fields (aliased into _cpu_bookkeeping_buf
+        # so writes here flow into the next H2D source). For pure decode with
+        # num_speculative_tokens == 0 there is exactly one token per active
+        # request; per-token pos_ids equal the per-request kv_offset.
+        new_kv_offsets = self.request_kv_length_offsets[active_slice]
+        self.token_to_pos_ids[:n_active] = new_kv_offsets
+        self.token_to_position_in_request[:n_active] = new_kv_offsets
+        self.token_to_local_position_within_kv_block[:n_active] = (
+            new_kv_offsets % self.block_size_tokens
+        )
+
+    def restore_after_speculative_advance(self) -> None:
+        """Reverse a prior :meth:`speculatively_advance_for_next_decode_step`.
+
+        Restores only the persistent tensors. The pinned-buffer token-level
+        fields are intentionally left at their speculatively-advanced values;
+        update_requests for the just-completed step will overwrite them with
+        the canonical post-step-N values during normal bookkeeping.
+        """
+        assert self._spec_advance_state is not None, (
+            "no speculative advance to restore"
+        )
+        state = self._spec_advance_state
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        self.request_kv_length_offsets[active_slice] = state['request_kv_length_offsets']
+        self.request_last_kv_block_offset[active_slice] = state[
+            'request_last_kv_block_offset'
+        ]
+        self._spec_advance_state = None
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.

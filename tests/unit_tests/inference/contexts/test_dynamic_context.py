@@ -512,6 +512,123 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_speculatively_advance_and_restore_roundtrip(self):
+        """Speculative advance bumps positions; restore reverses persistent state."""
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=False,
+        )
+        # Drive a single request through prefill and update_requests so the
+        # context lands in pure-decode steady state (is_decode_only() == True).
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, 16, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=dynamic_context.max_tokens - 16
+                ),
+            )
+        )
+        dynamic_context.update_requests(
+            active_requests_mask=torch.tensor([1], dtype=torch.int32),
+            new_tokens=torch.tensor([42]),
+        )
+        assert dynamic_context.is_decode_only()
+
+        active_slice = slice(
+            dynamic_context.paused_request_count, dynamic_context.total_request_count
+        )
+        kv_offsets_before = dynamic_context.request_kv_length_offsets[active_slice].clone()
+        last_block_offset_before = dynamic_context.request_last_kv_block_offset[
+            active_slice
+        ].clone()
+
+        dynamic_context.speculatively_advance_for_next_decode_step()
+
+        # kv_offsets advanced by query_lengths (1 in pure decode).
+        kv_offsets_after = dynamic_context.request_kv_length_offsets[active_slice]
+        assert torch.equal(kv_offsets_after, kv_offsets_before + 1)
+        # last_kv_block_offset rolled forward mod block_size.
+        assert torch.equal(
+            dynamic_context.request_last_kv_block_offset[active_slice],
+            (last_block_offset_before + 1) % dynamic_context.block_size_tokens,
+        )
+        # Pinned token-level pos_ids reflect the advanced kv_offsets.
+        n_active = dynamic_context.total_request_count - dynamic_context.paused_request_count
+        assert torch.equal(
+            dynamic_context.token_to_pos_ids[:n_active], kv_offsets_after
+        )
+
+        dynamic_context.restore_after_speculative_advance()
+        assert torch.equal(
+            dynamic_context.request_kv_length_offsets[active_slice], kv_offsets_before
+        )
+        assert torch.equal(
+            dynamic_context.request_last_kv_block_offset[active_slice],
+            last_block_offset_before,
+        )
+        # A second restore must fail loudly to surface unbalanced advance/restore.
+        with pytest.raises(AssertionError):
+            dynamic_context.restore_after_speculative_advance()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_can_speculate_decode_step_rejects_boundary_crossing(self):
+        """can_speculate_decode_step returns False whenever a request would cross
+        a block boundary at the next step, regardless of allocator availability.
+        """
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=False,
+        )
+        # Drive a 16-token request into pure decode, then nudge its kv_offset
+        # to exactly fill block 0 so the next decode step would cross into
+        # block 1.
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, 16, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=dynamic_context.max_tokens - 16
+                ),
+            )
+        )
+        dynamic_context.update_requests(
+            active_requests_mask=torch.tensor([1], dtype=torch.int32),
+            new_tokens=torch.tensor([42]),
+        )
+        assert dynamic_context.is_decode_only()
+        # Force kv_offset to (block_size - query_length) so the next step lands
+        # exactly at the block boundary and demands a fresh allocation.
+        active_slice = slice(
+            dynamic_context.paused_request_count, dynamic_context.total_request_count
+        )
+        dynamic_context.request_kv_length_offsets[active_slice] = (
+            dynamic_context.block_size_tokens
+            - dynamic_context.request_query_lengths[active_slice]
+        )
+        assert dynamic_context.predict_decode_blocks_needed(advance=1) >= 1
+        # Even though the allocator has free blocks, speculation must defer to
+        # the serial path because the speculative advance cannot replay block
+        # allocation safely.
+        assert dynamic_context.can_speculate_decode_step(advance=1) is False
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_add_dummy_requests_parallel_populates_state(self):
 
         dynamic_context = self._get_dynamic_context(
