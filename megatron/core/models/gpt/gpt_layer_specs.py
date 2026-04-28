@@ -774,7 +774,13 @@ def get_gpt_mtp_block_spec_for_backend(
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = copy.copy(spec.layer_specs[-1])
-    elif isinstance(spec, ModuleSpec) and issubclass(spec.module, TransformerLayer):
+    elif isinstance(spec, ModuleSpec) and spec.module in (
+        TransformerLayer,
+        HyperConnectionTransformerLayer,
+    ):
+        # Restrict to the explicit set rather than `issubclass(..., TransformerLayer)`
+        # so MoETransformerLayer (which also subclasses TransformerLayer) keeps falling
+        # through to the ValueError below — MTP+MoE is not a supported configuration.
         transformer_layer_spec = copy.copy(spec)
     else:
         raise ValueError(f"Invalid spec: {spec}")

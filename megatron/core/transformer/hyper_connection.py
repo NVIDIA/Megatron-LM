@@ -129,11 +129,14 @@ class HyperConnectionModule(MegatronModule):
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
 
-        # Projection weights for dynamic mappings
-        # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
-        # - H_pre: n values
-        # - H_post: n values
-        # - H_res: n^2 values (before Sinkhorn projection)
+        # Stream-mapping projection that produces the per-token H_pre, H_post, and
+        # H_res logits used by the hyper connection. Note the strong asymmetry: the
+        # input is wide (n * hidden_size, e.g. 16384 for n=4 / C=4096) but the
+        # output is tiny (n^2 + 2n, e.g. 24 for n=4). The output slices are:
+        #   - first  n        : H_pre  logits (aggregation weights)
+        #   - next   n        : H_post logits (expansion weights)
+        #   - last   n*n      : H_res  logits (residual mixing, fed into Sinkhorn)
+        # Kept named `mapping_proj` to preserve checkpoint state_dict keys.
         self.mapping_proj = nn.Linear(
             self.n * self.hidden_size, self.n * self.n + 2 * self.n, bias=False
         )
@@ -212,6 +215,11 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             h_res: [s, b, n^2] - residual mixing logits
         """
+        # `alpha_` is rebuilt each call from three learnable scalars rather than
+        # cached as a derived buffer because @torch.compile fuses the expand+cat
+        # into the surrounding fused multiply, leaving no measurable overhead in
+        # the compiled graph. The scalar `alpha_*` parameters remain the source of
+        # truth for optimizer/state_dict.
         alpha_ = torch.cat(
             [
                 self.alpha_pre.expand(self.n),

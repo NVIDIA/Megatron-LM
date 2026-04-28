@@ -135,9 +135,13 @@ class HyperConnectionHybridLayer(MegatronModule):
             packed_seq_params,
             padding_mask,
         )
+        # The inner hybrid layer already applied its own local residual/dropout, so
+        # it returns `aggregated + f(aggregated)`. We feed only the function
+        # delta `f(aggregated)` into the n-stream BDA so it does not double-count
+        # the residual that mHC owns. The temporary [s, b, C] tensor here is the
+        # simplest correct form; a future optimization could fuse the subtraction
+        # into `h_res_h_post_bda` to avoid the allocation.
         layer_delta = layer_output - aggregated
-        # The inner hybrid layer already applied its own local residual/dropout.
-        # mHC only mixes the deterministic layer delta back into the n-stream state.
         hidden_states = self.hyper_connection.h_res_h_post_bda(
             h_res,
             residual,

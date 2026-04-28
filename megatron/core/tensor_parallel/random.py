@@ -598,8 +598,14 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
+        # Deferred import: cuda_graphs imports from this module, so a top-level
+        # import would be circular.
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
+        # `_is_checkpoint_valid()` returns False during cuda graph capture because
+        # PyTorch invokes backward via .grad() rather than .backward() while
+        # tracing the backward graph. Suppress the guard only in that path; the
+        # check still fires for genuine .grad() callers outside graph capture.
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
@@ -764,6 +770,16 @@ class CheckpointManager:
         ckpt_function.checkpoint(run_function, *args)
         # other checkpointed operations
         ckpt_manager.discard_all_outputs_and_register_unified_recompute(final_output)
+
+    Lifetime / memory tradeoff:
+        A manager is single-use: it accumulates references to every
+        ``CheckpointWithoutOutput`` (and transitively each one's saved tensors,
+        ``ctx`` and ``run_function``) until the unified backward hook fires and
+        runs the recompute. Larger recompute blocks therefore hold more checkpoint
+        contexts simultaneously — this offsets some of the memory savings from
+        discarding outputs. ``_build_mhc_recompute_layer_plan`` allocates a fresh
+        manager per recompute block; managers should not be reused across blocks
+        or across training steps.
     """
 
     def __init__(self):
@@ -822,6 +838,12 @@ class CheckpointWithoutOutput(object):
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
         """
+        # Coerce to bool so the default `fp8=False` does not enter the fp8 recompute
+        # context. The previous expression `fp8 is not None` was True for `fp8=False`,
+        # which silently activated `fp8_autocast` for every default-constructed
+        # checkpoint. Existing call sites pass `quantization` (truthy str when
+        # active, None/False otherwise), so `bool()` preserves their intended
+        # behavior while fixing the default-False path.
         self.fp8 = bool(fp8)
         self.ckpt_manager = ckpt_manager
         self.run_function = None

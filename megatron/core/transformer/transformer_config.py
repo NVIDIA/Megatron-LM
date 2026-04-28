@@ -907,15 +907,22 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_recompute_layer_num: Optional[int] = None
     """Number of layers per MHC recompute block.
-    
+
     When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
     in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
     layer in the transformer block) will:
     - NOT checkpoint its final MLP BDA
     - Register the unified recompute hook on its MLP BDA output
     - A new CheckpointManager is created for subsequent layers
-    
+
     If None, all layers in the transformer block share a single recompute block.
+
+    Memory/compute tradeoff: a single ``CheckpointManager`` retains references to every
+    per-sublayer ``CheckpointWithoutOutput`` until its unified backward hook fires.
+    Smaller blocks (e.g. 4) recompute more frequently but hold fewer checkpoint contexts
+    simultaneously; larger blocks (or ``None``) save recompute overhead at the cost of
+    holding more contexts at peak. As a starting point, try
+    ``mhc_recompute_layer_num=4`` for deep stacks and tune based on observed peak memory.
 
     Must be a positive integer when set."""
 

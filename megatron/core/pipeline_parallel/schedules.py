@@ -1065,12 +1065,25 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    # Determine hidden dimension for P2P communication
-    # For hyper connections with multiple PP stages, use n-stream dimension
+    # Determine hidden dimension for P2P communication.
+    # For hyper connections with multiple PP stages, use n-stream dimension.
+    if (
+        getattr(config, 'enable_hyper_connections', False)
+        and pipeline_parallel_size > 1
+        and getattr(config, 'virtual_pipeline_model_parallel_size', None) is not None
+    ):
+        # The interleaved schedule allocates a single tensor_shape for all P2P
+        # exchanges, but VPP straddles pre/post-process boundaries on each physical
+        # rank — intermediate virtual chunks need n*C while embedding/loss chunks
+        # use C. Block until per-virtual-chunk shapes are wired through; see the
+        # parallel guard in `get_tensor_shapes`.
+        raise ValueError(
+            "enable_hyper_connections is not yet supported with "
+            "virtual_pipeline_model_parallel_size set in the interleaved pipeline "
+            "schedule. Disable VPP or wait for per-virtual-chunk shape support."
+        )
     hidden_dim = config.hidden_size
     if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
-        # For interleaved PP with hyper connections, all intermediate communications use n-stream
-        # Note: This is a simplified approach - proper VPP support may need more complex logic
         hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]

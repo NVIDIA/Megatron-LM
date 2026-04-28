@@ -714,9 +714,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Injected by __call__ for cuda graph keying; not a real forward arg.
         kwargs.pop("dynamic_inference_decode_only", None)
         called_from_hybrid_mhc_wrapper = kwargs.pop("_called_from_hybrid_mhc_wrapper", False)
-        assert (
-            not self.config.enable_hyper_connections or called_from_hybrid_mhc_wrapper
-        ), "Please use HyperConnectionTransformerLayer instead"
+        if self.config.enable_hyper_connections and not called_from_hybrid_mhc_wrapper:
+            raise RuntimeError(
+                "TransformerLayer.forward() must not be called directly when "
+                "enable_hyper_connections=True. Use HyperConnectionTransformerLayer for "
+                "transformer-only stacks; HyperConnectionHybridLayer drives the wrapped "
+                "TransformerLayer through this path automatically for hybrid stacks."
+            )
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
