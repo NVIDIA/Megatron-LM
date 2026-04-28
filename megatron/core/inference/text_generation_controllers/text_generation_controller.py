@@ -165,7 +165,13 @@ class TextGenerationController:
             )
         else:
             self._all_logits_cuda = None
-        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        # Speculative path:
+        #     - `self._sampled_tokens_cuda` is pre-allocated by `_init_mtp_sampling_tensors`.
+        #     - The tensor cannot be reused between the Triton kernel and the sampling graph.
+        # Non-speculative path:
+        #     - `self._sampled_tokens_cuda` is rebound to the output of `sample()`,
+        #     which uses CudaGraphManager syntactic sugar to keep it as a static tensor.
+        self._sampled_tokens_cuda = None
 
         # Sampling backend: dispatches per-step bookkeeping and the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -200,6 +206,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
         device = torch.cuda.current_device()
+        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
         self._sampled_mtp_tokens_cuda = torch.empty(
             [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
         )
@@ -1056,7 +1063,7 @@ class TextGenerationController:
             if context.config.materialize_only_last_token_logits
             else context.active_request_last_token_idxs
         )
-        sampled = self._sampling.sample(
+        self._sampled_tokens_cuda = self._sampling.sample(
             self._all_logits_cuda.squeeze(0),
             n,
             context,
@@ -1064,10 +1071,6 @@ class TextGenerationController:
             cache_key=("sample", n) if use_graph else None,
             gather_indices=gather_indices,
         )
-        # Copy out of the captured static buffer (under CG) into our persistent
-        # buffer so subsequent steps see the new sampled values, and the static
-        # buffer is free to be reused.
-        self._sampled_tokens_cuda[:n].copy_(sampled)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
