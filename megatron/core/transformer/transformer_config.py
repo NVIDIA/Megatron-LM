@@ -1978,6 +1978,10 @@ class TransformerConfig(ModelParallelConfig):
                 "local",
             ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
+            assert (
+                self.cuda_graph_warmup_steps >= 1
+            ), "cuda_graph_warmup_steps must be >= 1 when CUDA graphs are enabled."
+
             if self.cpu_offloading and self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
