@@ -103,7 +103,6 @@ def _fused_moe_kernel(
     # Dimensions
     N,
     K,
-    EM,
     num_valid_tokens,
     # Strides
     stride_am,
@@ -133,22 +132,21 @@ def _fused_moe_kernel(
     """
     pid = tl.program_id(0)
 
-    # Compute group mapping from EM (host-side upper bound passed as a kernel
-    # arg) so the compiler can resolve pid_m/pid_n without waiting on a global
-    # memory load.  The device-side num_tokens_post_padded is loaded afterwards
-    # only for the per-block early-exit check.
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    # Use the device-side num_tokens_post_padded for group mapping so the
+    # tiling adapts to actual token counts each step. The grid is launched at
+    # max buffer size for CUDA-graph safety; excess CTAs exit here.
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    if pid >= num_pid_m * num_pid_n:
+        return
+
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
-
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
 
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token_id = pid_m * BLOCK_SIZE_M + offs
@@ -371,16 +369,16 @@ def _invoke_fused_moe_kernel(
     top_k: int,
     block_size_m: int,
     fuse_squared_relu: bool = False,
-    grid_em: Optional[int] = None,
 ):
     """Launch the Triton fused-MoE kernel for one GEMM pass.
 
-    grid_em: if provided, replaces sorted_token_ids.size(0) as the EM
-    dimension for the grid, avoiding launching CTAs for unused buffer rows.
+    The grid covers the full sorted_token_ids buffer for CUDA-graph safety.
+    The kernel uses the device-side num_tokens_post_padded for group mapping
+    and early exit, so excess CTAs are inexpensive.
     """
     M = A.size(0)
     num_tokens = M * top_k
-    EM = grid_em if grid_em is not None else sorted_token_ids.size(0)
+    EM = sorted_token_ids.size(0)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
@@ -396,7 +394,6 @@ def _invoke_fused_moe_kernel(
         num_tokens_post_padded,
         B.size(1),
         B.size(2),
-        EM,
         num_tokens,
         A.stride(0),
         A.stride(1),
