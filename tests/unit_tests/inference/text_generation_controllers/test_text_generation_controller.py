@@ -324,14 +324,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         context.padded_active_token_count = batch_size
         context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32)
-        context.active_request_query_lengths[:batch_size].fill_(1)
-        context.active_request_last_token_idxs[:batch_size].copy_(
-            torch.arange(
-                batch_size,
-                dtype=context.active_request_last_token_idxs.dtype,
-                device=context.active_request_last_token_idxs.device,
-            )
-        )
         context.paused_request_count = 0
         context.total_request_count = batch_size
 
@@ -918,9 +910,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             context.num_prefill_requests = batch_size
             context.request_query_lengths = torch.tensor(
                 [0] * context.paused_request_count + query_lengths, dtype=torch.int32, device='cuda'
-            )
-            context.active_request_query_lengths[:batch_size].copy_(
-                torch.tensor(query_lengths, dtype=context.active_request_query_lengths.dtype)
             )
 
             # Create logits for all tokens
