@@ -1068,6 +1068,7 @@ class TextGenerationController:
         # These indices are always needed for input_ids slicing and tracking
         # accepted sequence positions, even when logits are pre-sliced.
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
+        # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
         required_logit_indices = context.speculative_required_logit_indices(logits.device)
 
@@ -1307,6 +1308,7 @@ class TextGenerationController:
         num_decode_requests = active_request_count - num_prefill_requests
 
         only_last = context.config.materialize_only_last_token_logits
+        # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
         logits_squeezed = logits.squeeze(0).float()
         if only_last:
