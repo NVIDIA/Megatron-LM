@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Sample Generate GPT."""
+"""Script for quantizing a HuggingFace or Megatron-LM checkpoint using ModelOpt."""
 
 import copy
 import functools
@@ -19,6 +19,7 @@ from tqdm import tqdm
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 import modelopt.torch.quantization as mtq
+from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 
@@ -130,21 +131,16 @@ def add_text_generate_ptq_args(parser):
     )
     group.add_argument("--weight-only", action="store_true", help="Disable input quantization.")
     group.add_argument(
-        "--force-all-expert-routing",
-        action="store_true",
-        help="Forcing all experts to be routed during the calibration.",
-    )
-    group.add_argument(
-        "--num-first-layers-to-skip-quant",
-        type=int,
+        "--recipe",
+        type=str,
         default=None,
-        help="Number of first layers to skip quantization.",
-    )
-    group.add_argument(
-        "--num-last-layers-to-skip-quant",
-        type=int,
-        default=None,
-        help="Number of last layers to skip quantization.",
+        help=(
+            "PTQ recipe YAML file or name without suffix (e.g. "
+            "'general/ptq/nvfp4_default-fp8_kv', "
+            "'models/Nemotron-3-Super-120B-A12B/super-nvfp4'). "
+            "When set, --export-quant-cfg / --export-kv-cache-quant are ignored; "
+            "the recipe is authoritative for quant_cfg, algorithm, and KV cache config."
+        ),
     )
     add_modelopt_args(parser)
     return parser
@@ -162,59 +158,22 @@ def check_arguments():
         args.moe_grouped_gemm = False
 
 
-def _is_first_layers(name: str, num_layers: int = 1, num_layers_to_disable: int = 1) -> bool:
-    if "layers." not in name:
-        return False
-    try:
-        layer_idx = int(name.split("layers.")[-1].split(".")[0])
-    except ValueError:
-        return False
-    return layer_idx < num_layers_to_disable
-
-
-def _is_last_layers(name: str, num_layers: int = 1, num_layers_to_disable: int = 1) -> bool:
-    if "layers." not in name:
-        return False
-    try:
-        layer_idx = int(name.split("layers.")[-1].split(".")[0])
-    except ValueError:
-        return False
-    return layer_idx >= num_layers - num_layers_to_disable
-
-
-def get_first_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
-    """Get a config for `mtq.quantize` with first & last `num_layers_to_disable` layers disabled.
-
-    The layers to disable are the first & last `num_layers_to_disable` layers.
-    """
-    config = copy.deepcopy(config)
-    quant_cfg = config.get("quant_cfg", {})
-    predicate = functools.partial(
-        _is_first_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
-    )
-    quant_cfg.append({"quantizer_name": predicate, "enable": False})
-    config["quant_cfg"] = quant_cfg
-    return config
-
-
-def get_last_layers_disabled_config(config, num_layers: int = 1, num_layers_to_disable: int = 1):
-    """Get a config for `mtq.quantize` with last `num_layers_to_disable` layers disabled.
-
-    The layers to disable are the last `num_layers_to_disable` layers.
-    """
-    config = copy.deepcopy(config)
-    quant_cfg = config.get("quant_cfg", {})
-    predicate = functools.partial(
-        _is_last_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
-    )
-    quant_cfg.append({"quantizer_name": predicate, "enable": False})
-    config["quant_cfg"] = quant_cfg
-    return config
-
-
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
+
+    if args.recipe is not None:
+        # YAML recipe is authoritative: skip predefined-config customizations and KV
+        # cache override; the recipe encodes quant_cfg + algorithm + KV cache directly.
+        print_rank_0(f"Use recipe {args.recipe} for quantization")
+        recipe = load_recipe(args.recipe)
+        assert isinstance(recipe, ModelOptPTQRecipe), (
+            f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}"
+        )
+        if args.export_kv_cache_quant != "none":
+            print_rank_0(f"Ignoring --export-kv-cache-quant={args.export_kv_cache_quant} since you passed in a YAML recipe.")
+        return recipe.quantize.model_dump()
+
     if args.export_quant_cfg not in QUANT_CFG_CHOICES:
         raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
@@ -414,12 +373,7 @@ if __name__ == "__main__":
 
     unwrapped_model = unwrap_model(model)[0]
 
-    if args.force_all_expert_routing:
-        warnings.warn(
-            "--force-all-expert-routing will be deprecated in the next release and is no longer needed."
-        )
-
-    if args.export_quant_cfg is not None:
+    if args.export_quant_cfg is not None or args.recipe is not None:
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
