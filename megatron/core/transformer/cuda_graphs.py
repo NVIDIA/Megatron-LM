@@ -805,6 +805,7 @@ class _CudaGraphRunner(torch.nn.Module):
         # graph capture's forward passes do not corrupt its value. Inference is not affected
         # (no known buffer mutators) and would add new buffers (lazy MoE _fc1_weight/
         # _fc2_weight) that misalign the positional restore.
+
         if self.training and torch.is_grad_enabled():
             buffer_backup = []
             for buf in self.base_module.buffers():

@@ -1100,6 +1100,26 @@ class _SimpleModule(MegatronModule):
         return self.linear(x)
 
 
+class _SimpleNonModule:
+    """non-nn.Module base_module for testing the function_name= form of `CudaGraphManager`."""
+
+    def __init__(self, config):
+        self.weight = torch.randn(
+            config.hidden_size, config.hidden_size, device="cuda"
+        )
+
+    def my_op(self, x):
+        return x @ self.weight
+
+
+def _make_simple_module(config):
+    return _SimpleModule(config).cuda().eval()
+
+
+def _make_simple_non_module(config):
+    return _SimpleNonModule(config)
+
+
 class TestInlineCaptureManager:
     """Tests for CudaGraphManager with inline_capture, function_name, eager, and cache_key."""
 
@@ -1126,11 +1146,18 @@ class TestInlineCaptureManager:
         CudaGraphManager.global_mempool = None
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize(
+        "make_module",
+        [
+            pytest.param(_make_simple_module, id="nn_module"),
+            pytest.param(_make_simple_non_module, id="plain_class"),
+        ],
+    )
     @torch.inference_mode()
-    def test_inline_capture_matches_eager(self):
+    def test_inline_capture_matches_eager(self, make_module):
         """Inline-captured graph output must match eager execution."""
         config = self._make_config()
-        module = _SimpleModule(config).cuda().eval()
+        module = make_module(config)
 
         # Get eager reference before wrapping
         x = torch.randn(4, config.hidden_size, device="cuda")
