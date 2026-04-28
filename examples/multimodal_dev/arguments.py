@@ -88,5 +88,13 @@ def add_multimodal_args(parser):
             "padding waste."
         ),
     )
+    group.add_argument(
+        "--use-vanilla-collate-fn",
+        action="store_true",
+        default=False,
+        help=(
+            "Use vanilla collate function to collate the data."
+        ),
+    )
 
     return parser

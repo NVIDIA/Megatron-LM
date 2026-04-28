@@ -108,7 +108,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
     # Torch dataloader.
-    if args.dynamic_context_parallel or args.use_packed_sequence:
+    if args.dynamic_context_parallel or getattr(args, "use_vanilla_collate_fn", False):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
