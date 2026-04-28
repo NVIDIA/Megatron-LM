@@ -64,7 +64,7 @@ MODEL_ARGS:
   --recompute-granularity: selective
   --recompute-modules: "[moe_act]"
   --cuda-graph-impl: transformer_engine
-  --cuda-graph-scope: "[attn mlp moe_router moe_preprocess]"
+  --cuda-graph-modules: "[attn mlp moe_router moe_preprocess]"
   --log-memory-to-tensorboard: true
   --log-params-norm: true
   --log-num-zeros-in-grad: true

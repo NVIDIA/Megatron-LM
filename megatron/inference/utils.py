@@ -335,7 +335,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs
-            if args.cuda_graph_impl == "local"
+            if args.cuda_graph_impl in ("local", "full_iteration")
             else None
         ),
         max_requests=args.inference_dynamic_batching_max_requests,

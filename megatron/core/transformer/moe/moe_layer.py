@@ -644,7 +644,7 @@ class MoELayer(BaseMoELayer):
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
-                # like cuda_graph_scope=["moe_router", "moe_preprocess"].
+                # like cuda_graph_modules=["moe_router", "moe_preprocess"].
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 

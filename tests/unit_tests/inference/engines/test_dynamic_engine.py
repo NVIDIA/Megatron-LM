@@ -51,7 +51,7 @@ from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -128,9 +128,9 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
-    cuda_graph_scope: List[CudaGraphScope] = field(
-        default_factory=lambda: [CudaGraphScope.full_iteration_inference]
-    )
+    cuda_graph_modules: List[CudaGraphModule] = field(default_factory=list)
+    inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
+    cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     # If False, do not build cuda graphs in the tests, even if
@@ -179,6 +179,23 @@ class DynamicEngineTestEnv:
 
 
 class TestDynamicInferenceEngine:
+
+    @staticmethod
+    def _assert_full_iteration_inference_compat_state(env) -> None:
+        model = env.engine.controller.inference_wrapped_model.model
+        assert env.engine.cuda_graph_impl == "full_iteration"
+        assert env.engine.context.cuda_graph_token_counts is not None
+        assert env.engine.context.cuda_graph_batch_dimensions_list
+        assert not hasattr(model.decoder, 'cudagraph_manager')
+        for layer in model.decoder.layers:
+            assert not hasattr(layer, 'cudagraph_manager')
+
+    @staticmethod
+    def _cuda_graph_batch_dimension_signature(env) -> List[Tuple[int, int, int]]:
+        return [
+            (dim.token_count, dim.prefill_req_count, dim.decode_req_count)
+            for dim in env.engine.context.cuda_graph_batch_dimensions_list
+        ]
 
     @classmethod
     def _build_requests(cls, test_config: DynamicEngineTestConfig) -> List[DynamicInferenceRequest]:
@@ -300,6 +317,13 @@ class TestDynamicInferenceEngine:
 
         # Requests.
         requests = cls._build_requests(test_config)
+        effective_cuda_graph_impl = test_config.cuda_graph_impl
+        if effective_cuda_graph_impl is None:
+            effective_cuda_graph_impl = (
+                "local"
+                if test_config.num_cuda_graphs is not None and test_config.force_build_cuda_graphs
+                else "none"
+            )
 
         if test_config.model_provider == "gpt":
             # Transformer config.
@@ -310,12 +334,7 @@ class TestDynamicInferenceEngine:
                 hidden_size=128 if test_config.fp8 else 32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
-                cuda_graph_impl=(
-                    "local"
-                    if test_config.num_cuda_graphs is not None
-                    and test_config.force_build_cuda_graphs
-                    else "none"
-                ),
+                cuda_graph_impl=effective_cuda_graph_impl,
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
@@ -332,7 +351,13 @@ class TestDynamicInferenceEngine:
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
-                cuda_graph_scope=test_config.cuda_graph_scope,
+                cuda_graph_modules=test_config.cuda_graph_modules,
+                inference_cuda_graph_scope=(
+                    test_config.inference_cuda_graph_scope
+                    if test_config.num_cuda_graphs is not None
+                    and test_config.force_build_cuda_graphs
+                    else InferenceCudaGraphScope.none
+                ),
                 transformer_impl=test_config.transformer_impl,
                 normalization=(
                     "RMSNorm"
@@ -381,12 +406,7 @@ class TestDynamicInferenceEngine:
                 mamba_num_heads=16,
                 num_attention_heads=16,
                 use_cpu_initialization=True,
-                cuda_graph_impl=(
-                    "local"
-                    if test_config.num_cuda_graphs is not None
-                    and test_config.force_build_cuda_graphs
-                    else "none"
-                ),
+                cuda_graph_impl=effective_cuda_graph_impl,
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=pp_size,
@@ -402,7 +422,13 @@ class TestDynamicInferenceEngine:
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
-                cuda_graph_scope=test_config.cuda_graph_scope,
+                cuda_graph_modules=test_config.cuda_graph_modules,
+                inference_cuda_graph_scope=(
+                    test_config.inference_cuda_graph_scope
+                    if test_config.num_cuda_graphs is not None
+                    and test_config.force_build_cuda_graphs
+                    else InferenceCudaGraphScope.none
+                ),
                 transformer_impl=test_config.transformer_impl,
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
@@ -576,8 +602,10 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4, -1])
-    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
-    def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
+    @pytest.mark.parametrize(
+        "inference_cuda_graph_scope", [InferenceCudaGraphScope.layer, InferenceCudaGraphScope.block]
+    )
+    def test_simple(self, model_provider, num_cuda_graphs, inference_cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         num_tokens_to_generate = 16
@@ -587,7 +615,7 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=num_tokens_to_generate,
             model_provider=model_provider,
             num_cuda_graphs=num_cuda_graphs,
-            cuda_graph_scope=cuda_graph_scope,
+            inference_cuda_graph_scope=inference_cuda_graph_scope,
             force_build_cuda_graphs=True,
             context_max_requests=128,
         )
@@ -599,7 +627,7 @@ class TestDynamicInferenceEngine:
             assert env.engine.context.cuda_graph_token_counts is not None
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
-            if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
+            if inference_cuda_graph_scope == InferenceCudaGraphScope.block:
                 # check if cudagraph runners are created at the decoder level
                 assert model.decoder.cudagraph_manager.cudagraph_runners
             else:
@@ -649,6 +677,71 @@ class TestDynamicInferenceEngine:
                 f"result ({request.generated_tokens}) != "
                 f"expected ({expected_generated_tokens})."
             )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_full_iteration_impl_preserves_legacy_inference_setup_behavior(self) -> None:
+        """impl=full_iteration must preserve the legacy inference warmup/no-graph path."""
+        with pytest.warns(
+            UserWarning,
+            match="--cuda-graph-impl=full_iteration.*will not create inference CUDA graphs",
+        ):
+            env = self._build_test_env(
+                DynamicEngineTestConfig(
+                    model_provider="gpt",
+                    num_tokens_to_generate=4,
+                    num_cuda_graphs=1,
+                    force_build_cuda_graphs=True,
+                    context_max_requests=128,
+                    cuda_graph_impl="full_iteration",
+                    inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+                )
+            )
+
+        self._assert_full_iteration_inference_compat_state(env)
+
+        with mock.patch.object(
+            env.engine.controller,
+            "_dynamic_step_forward_logits",
+            wraps=env.engine.controller._dynamic_step_forward_logits,
+        ) as forward_logits:
+            with torch.inference_mode():
+                with pytest.warns(
+                    UserWarning,
+                    match="--cuda-graph-impl=full_iteration.*will not create inference CUDA graphs",
+                ):
+                    env.engine.create_cuda_graphs()
+
+        assert forward_logits.call_count == len(env.engine.context.cuda_graph_batch_dimensions_list)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_deprecated_full_iteration_inference_scope_matches_new_flag_runtime_behavior(
+        self,
+    ) -> None:
+        """Deprecated scope='full_iteration_inference' must still build block-level graphs."""
+        with pytest.warns(
+            DeprecationWarning, match="cuda_graph_modules 'full_iteration_inference' is deprecated"
+        ):
+            env = self._run_test(
+                num_tokens_to_generate=4,
+                model_provider="gpt",
+                num_cuda_graphs=1,
+                cuda_graph_modules='full_iteration_inference',
+                force_build_cuda_graphs=True,
+                context_max_requests=128,
+            )
+
+        model = env.engine.controller.inference_wrapped_model.model
+        assert model.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert model.config.cuda_graph_modules == []
+        assert model.decoder.cudagraph_manager.cudagraph_runners
+        for layer in model.decoder.layers:
+            assert not hasattr(layer, 'cudagraph_manager')
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

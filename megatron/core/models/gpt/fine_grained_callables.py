@@ -14,7 +14,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
@@ -93,7 +93,7 @@ def should_free_input(name, is_moe, config, num_local_experts):
         # If moe_preprocess is in cuda graph scope, tokens and probs are fixed size tensors,
         # so they cannot be freed.
         "moe_dispatch": not (enable_deepep or enable_hybridep)
-        and (CudaGraphScope.moe_preprocess not in config.cuda_graph_scope),
+        and (CudaGraphModule.moe_preprocess not in config.cuda_graph_modules),
     }
 
     return free_input_nodes.get(name, False)
@@ -386,16 +386,16 @@ class _BackwardDWWrapper:
             )
         else:
             self.shared_expert_dw_callable = None
-        self.cuda_graph_scope = layer.config.cuda_graph_scope
+        self.cuda_graph_modules = layer.config.cuda_graph_modules
 
     def backward_dw(self):
         """Execute weight gradients, skipping CUDA graphed components during replay."""
         is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
         if self.shared_expert_dw_callable is not None and (
-            not is_replay or CudaGraphScope.moe_router not in self.cuda_graph_scope
+            not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
         ):
             self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphScope.attn not in self.cuda_graph_scope:
+        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
             self.attn_dw_callable()
         if is_replay and self.graphed_backward_dw_callable is not None:
             self.graphed_backward_dw_callable()
