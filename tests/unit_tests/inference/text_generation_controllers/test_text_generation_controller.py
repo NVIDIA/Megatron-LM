@@ -999,11 +999,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 return torch.zeros((12,), dtype=torch.long, device='cuda')
 
         # Override sampling to return our predictable mock outputs
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
-        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
+        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 1, 0.0)]
+        self.text_generation_controller._sampling._bucket_index_tensors = [
             torch.tensor([0, 1], device='cuda', dtype=torch.long)
         ]
-        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+        self.text_generation_controller._sampling._sampling_func = mock.MagicMock(
             side_effect=mock_sampling_func
         )
 
@@ -1239,9 +1239,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
 
         # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
-        # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
-        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
+        # _buckets format: (indices, temp, top_k, top_p)
+        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 0, 0.9)]
+        self.text_generation_controller._sampling._bucket_index_tensors = [
             torch.tensor([0, 1], device='cuda', dtype=torch.long)
         ]
 
@@ -1491,8 +1491,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
-        ctrl._torch_sampling_bucket_index_tensors = [
+        ctrl._sampling._buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+        ctrl._sampling._bucket_index_tensors = [
             torch.arange(active_request_count, device='cuda', dtype=torch.long)
         ]
 
