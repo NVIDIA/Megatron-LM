@@ -418,8 +418,8 @@ class TestMTPCudaGraphInference:
             ctrl._mtp_resolved_padded_count = padded_count
             context._using_cuda_graph_this_step = True
 
-            ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
-            ctrl._torch_sampling_bucket_index_tensors = [
+            ctrl._sampling._buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+            ctrl._sampling._bucket_index_tensors = [
                 torch.arange(active_request_count, device='cuda', dtype=torch.long)
             ]
 
@@ -519,8 +519,8 @@ class TestMTPCudaGraphInference:
                 unwrapped._decoder_hidden_states_cache = local_hidden
 
                 ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
-                ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
-                ctrl._torch_sampling_bucket_index_tensors = [
+                ctrl._sampling._buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+                ctrl._sampling._bucket_index_tensors = [
                     torch.arange(active_request_count, device='cuda', dtype=torch.long)
                 ]
 
