@@ -1212,16 +1212,21 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def is_decode_only(self) -> bool:
         """
-        Return if this iteration we run decode only implementation.
+        Return whether this iteration uses the decode-only implementation.
 
-        When CUDA graphs are active, uses padded_batch_dimensions because it
-        reflects the post-expert-parallel sync state.  Otherwise falls back to
-        num_prefill_requests which is always up-to-date regardless of where we
-        are in the step lifecycle.
+        Reads ``padded_batch_dimensions`` — the dim was frozen by
+        ``prepare_attn_init`` and tells the model which forward branch to
+        take.  Reading ``num_prefill_requests`` instead is unsafe mid-step
+        because ``_prepare_update_requests_metadata`` zeros it on the
+        side stream before the forward, which would flip this from False
+        to True after the dim has already been computed for mixed mode.
+
+        Callers that run *inside* ``prepare_attn_init`` (i.e. before the
+        new dim is set) must inline ``self.num_prefill_requests == 0``
+        directly — the previous step's ``padded_batch_dimensions`` is
+        stale at that point.
         """
-        if self._using_cuda_graph_this_step:
-            return self.padded_batch_dimensions.prefill_req_count == 0
-        return self.num_prefill_requests == 0
+        return self.padded_batch_dimensions.prefill_req_count == 0
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
@@ -2021,7 +2026,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:
-            if self.is_decode_only():
+            # Inline ``num_prefill_requests == 0`` rather than ``is_decode_only()``:
+            # at this point the new ``padded_batch_dimensions`` hasn't been set
+            # yet, and ``is_decode_only`` reads from it.
+            if self.num_prefill_requests == 0:
                 if self.num_speculative_tokens > 0:
                     padded_decode_req_count = min(
                         self.max_requests, self.round_up_requests(self.num_decode_requests)

@@ -434,6 +434,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 context.reset()
 
+        # Only need to capture the context bookkeeping graph once.
+        prep_result = controller._dynamic_step_post_sample_bookkeeping()
+        controller._run_update_requests(prep_result)
+
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)

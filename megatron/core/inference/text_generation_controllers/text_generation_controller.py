@@ -162,6 +162,11 @@ class TextGenerationController:
             self._all_logits_cuda = None
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
+        # Side stream for pre-forward bookkeeping. Work issued here runs concurrently
+        # with the forward pass; post-forward consumers synchronize on the event.
+        self._pre_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
+        self._pre_forward_bookkeeping_event = torch.cuda.Event()
+
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
             self._torch_sampling_buckets: List[Tuple] = []
@@ -181,6 +186,21 @@ class TextGenerationController:
                 inline_capture=True,
                 num_warmup_steps=1,
             )
+            # Wrap the two update_requests graph bodies. First non-eager call
+            # captures, subsequent calls replay. Engine warmup invokes
+            # `_run_update_requests` once after forward graph capture.
+            for body_name in (
+                "_classify_and_resume_body",
+                "_evict_resume_chunked_tokens_body",
+            ):
+                CudaGraphManager(
+                    self.model_config,
+                    context,
+                    function_name=body_name,
+                    need_backward=False,
+                    inline_capture=True,
+                    num_warmup_steps=1,
+                )
         context._init_body_hooks.append(self._apply_bucket_toggles)
 
         if self.model_config.transformer_impl == "inference_optimized":
@@ -1715,13 +1735,10 @@ class TextGenerationController:
                 )
             nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
-        """Update the dynamic inference context after sampling.
+    def _dynamic_step_post_sample_bookkeeping(self) -> Dict:
+        """Build the active-request mask and prepare update_requests inputs.
 
-        Return:
-            Dict [str, Tensor]: A dictionary containing:
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
+        Returns active/finished IDs and whether the batch has a chunked prefill request.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1737,14 +1754,13 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
-        # Note: termination_id tensor has per-request termination IDs from mixed sampling
         active_request_mask = (
             self._sampled_tokens_cuda[:active_request_count]
             != context.request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
         # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests)
+        # (detected in previous step's post_process_requests).
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = context.active_request_ids[:active_request_count].tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
@@ -1753,8 +1769,18 @@ class TextGenerationController:
                     if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
 
+        # Clone before returning: ``context.active_request_ids`` is a static
+        # buffer overwritten by the next step's ``_prepare_update_requests_metadata``
+        # and ``build_active_slices``. Returning a view leaves the engine's
+        # eventual ``.tolist()`` reading whatever's in that buffer at the
+        # moment it syncs — which can include stale dummy IDs from warmup
+        # or partially-overwritten state if the next step has already started.
+        # ``finished_request_ids`` uses fancy indexing which already copies,
+        # but cloning is explicit and matches the pattern used for
+        # ``sample``/``accepted_tokens`` in the main return dict.
+        active_request_ids = context.active_request_ids[:active_request_count].clone()
         finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
-        finished_request_ids = context.active_request_ids[finished_idxs]
+        finished_request_ids = context.active_request_ids[finished_idxs].clone()
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
@@ -1767,23 +1793,40 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
-        # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
-        # which would corrupt the reused _sampled_tokens_cuda buffer.
-        new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
-
-        # Update requests.
-        # _sampled_mtp_tokens_cuda has shape [num_speculative_tokens, max_requests]
+        # Prepare sampled tokens for the side stream.
         if self.num_speculative_tokens > 0:
             sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         else:
             sampled_mtp_tokens_cuda = None
-        update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cuda
+
+        has_chunked = context._prepare_update_requests_new_tokens(
+            active_request_mask,
+            self._sampled_tokens_cuda[:active_request_count],
+            sampled_mtp_tokens_cuda,
         )
 
         return {
+            "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
             "finished_routing_block_ids": finished_routing_block_ids,
+            "has_chunked": has_chunked,
+        }
+
+    def _run_update_requests(self, prep_result: Dict) -> Dict[str, Tensor]:
+        """Run update_requests."""
+        context = self.inference_wrapped_model.inference_context
+
+        # Each body is wrapped by its own CudaGraphManager (installed in __init__).
+        # First call captures, subsequent calls replay; cache_key keeps both bodies
+        # routed to a single runner each.
+        context._classify_and_resume_body(cache_key="update_requests")
+        context._evict_resume_chunked_tokens_body(cache_key="update_requests")
+        update_result = context._finalize_update_requests(prep_result["has_chunked"])
+
+        return {
+            "active_request_ids": prep_result["active_request_ids"],
+            "finished_request_ids": prep_result["finished_request_ids"],
+            "finished_routing_block_ids": prep_result["finished_routing_block_ids"],
             **(update_result or {}),
         }
 
@@ -1825,6 +1868,13 @@ class TextGenerationController:
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
+            # Launch bookkeeping on a side stream so it overlaps with forward.
+            self._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
+                context._prepare_update_requests_metadata()
+                self._pre_forward_bookkeeping_event.record()
+
+
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             self._dynamic_step_forward_logits(input_ids, position_ids)
@@ -1850,6 +1900,7 @@ class TextGenerationController:
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
+        self._pre_forward_bookkeeping_event.synchronize()
         with torch.inference_mode():
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
@@ -1882,6 +1933,9 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
+            if not skip_bookkeeping:
+                prep_result = self._dynamic_step_post_sample_bookkeeping()
+
             log_probs = None
             top_n_logprobs = None
             if return_log_probs or return_top_n_logprobs:
@@ -1903,10 +1957,13 @@ class TextGenerationController:
             if skip_bookkeeping:
                 request_bookkeeping = {}
             else:
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                request_bookkeeping = self._run_update_requests(prep_result)
 
             ret = {
-                "active_request_ids": context.active_request_ids[:active_request_count],
+                # Clone needed: context.active_request_ids is overwritten by
+                # the next step's _prepare_update_requests_metadata and the
+                # forward graph's build_active_slices.
+                "active_request_ids": context.active_request_ids[:active_request_count].clone(),
                 # Clone needed: _sampled_tokens_cuda is a reused buffer overwritten each step.
                 "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
                 "accepted_tokens": (
