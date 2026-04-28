@@ -1212,16 +1212,12 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        if active_request_count > 0:
-            log_prob_count = (
-                context.active_request_metadata["return_log_probs"][:active_request_count] > 0
-            ).sum()
-            top_n_max_gpu = context.active_request_metadata["top_n_logprobs"][
-                :active_request_count
-            ].max()
-        else:
-            log_prob_count = torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
-            top_n_max_gpu = torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
+        log_prob_count = (
+            context.active_request_metadata["return_log_probs"][:active_request_count].sum()
+        )
+        top_n_max_gpu = (
+            context.active_request_metadata["top_n_logprobs"][:active_request_count].max().long()
+        )
 
         self._log_prob_count_pinned.copy_(log_prob_count, non_blocking=True)
         self._top_n_max_pinned.copy_(top_n_max_gpu, non_blocking=True)
@@ -1327,10 +1323,7 @@ class TextGenerationController:
 
     def _dynamic_step_calculate_log_probs(self):
         """Calculate log probs from logits."""
-        # No extra GPU sync needed; the `_pre_forward_bookkeeping_event` guaranteed correct data.
-        log_prob_request_count = self._log_prob_count_pinned.item()
-        top_n_max = self._top_n_max_pinned.item()
-        if log_prob_request_count == 0 and top_n_max == 0:
+        if self._log_prob_count_pinned.item() == 0 and self._top_n_max_pinned.item() == 0:
             return None
 
         context = self.inference_wrapped_model.inference_context
