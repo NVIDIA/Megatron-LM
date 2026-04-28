@@ -102,6 +102,12 @@ class HybridStack(MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
+        self.checkpoint_core_attention = (
+            self.config.recompute_granularity == 'selective'
+            and self.config.recompute_modules is not None
+            and "core_attn" in self.config.recompute_modules
+        )
+
         assert layer_type_list is not None, (
             "layer_type_list must be provided. It should be pre-computed from "
             "--hybrid-layer-pattern by HybridModel."
@@ -535,3 +541,4 @@ class HybridStack(MegatronModule):
 # Backward-compatible aliases
 MambaStackSubmodules = HybridStackSubmodules
 MambaStack = HybridStack
+                                                                                                                                                                                                                                                
