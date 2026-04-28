@@ -185,6 +185,19 @@ class HyperConnectionHybridLayer(MegatronModule):
             fused=False,
             manager=mhc_recompute_manager,
         )
+        # In `HyperConnectionTransformerLayer` the n-stream output stays in compute
+        # dtype because the post-attention `x` is in compute dtype. In the hybrid
+        # wrapper, `layer_delta` may be fp32 (when `fp32_residual_connection=True`
+        # or an inner layer upcasts), so `h_post_bda`'s `output.to(x.dtype)` would
+        # leave the result in fp32 and silently propagate fp32 n-stream hidden
+        # states to every subsequent layer (~2x activation memory). Restore the
+        # compute-dtype contract here.
+        if (
+            self.config.fp32_residual_connection
+            and self.config.params_dtype is not None
+            and hidden_states.dtype != self.config.params_dtype
+        ):
+            hidden_states = hidden_states.to(self.config.params_dtype)
         return hidden_states, context
 
 

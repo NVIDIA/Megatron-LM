@@ -796,6 +796,14 @@ def get_gpt_mtp_block_spec_for_backend(
     transformer_layer_spec.submodules.mlp_hyper_connection = IdentityOp
     if transformer_layer_spec.module is HyperConnectionTransformerLayer:
         transformer_layer_spec.module = TransformerLayer
+    # Defensive postcondition: a future spec extension that adds another HC
+    # field would silently slip past the explicit assignments above. Verify
+    # the final submodules object contains no remaining HC references so MTP
+    # never accidentally builds an HC-enabled layer.
+    assert transformer_layer_spec.submodules.self_attention_hyper_connection is IdentityOp
+    assert transformer_layer_spec.submodules.cross_attention_hyper_connection is IdentityOp
+    assert transformer_layer_spec.submodules.mlp_hyper_connection is IdentityOp
+    assert transformer_layer_spec.module is not HyperConnectionTransformerLayer
 
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
         mtp_model_layer_spec=transformer_layer_spec, backend=backend

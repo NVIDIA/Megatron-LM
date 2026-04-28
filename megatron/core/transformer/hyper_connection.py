@@ -529,7 +529,10 @@ class HyperConnectionModule(MegatronModule):
         """
         Contract n-stream to 1-stream at TransformerBlock exit.
 
-        Simple averaging strategy: average all streams.
+        Strategy: uniform mean over the n streams. This is intentional and not
+        configurable; if a learned or weighted contraction is added later it
+        should be a separate method (or a strategy parameter), so callers of
+        ``output_contract`` continue to get the simple-average semantics.
 
         Args:
             x: [s, b, n*C] - n-stream hidden states
