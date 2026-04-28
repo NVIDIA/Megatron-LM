@@ -226,15 +226,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.async_scheduling = inference_config.async_scheduling
-        self.finished_sync_period = inference_config.finished_sync_period
-        # Set when CPU bookkeeping detects an event (add/pause/evict) that
-        # would invalidate the speculative chain. Read by _async_scheduling_active
+        # Set when CPU bookkeeping detects a pause/evict event that would
+        # invalidate the speculative chain. Read by _async_scheduling_active
         # to drop out of speculation; cleared after the engine drains the
-        # in-flight forwards and applies the corrected state.
+        # in-flight pre-launch and applies the corrected state. Finishes
+        # are caught earlier (via _would_any_finish) and never reach the
+        # bookkeep with a stale pre-launch in flight, so they don't signal
+        # rejection.
         self._rejection_pending = False
-        # Tracks how many requests have finished but not yet been removed from
-        # the active batch via a sync. Used by the periodic-sync backstop.
-        self._finished_pending_count = 0
         # Holds the launch_state dict produced by a prior iteration's
         # speculative pre-launch of step N+1. The next iteration consumes it
         # instead of launching fresh. None when no speculative launch is in
@@ -1995,57 +1994,82 @@ class DynamicInferenceEngine(AbstractEngine):
     def _async_scheduling_active(self) -> bool:
         """Engine-level gate for the async-scheduling speculative chain.
 
-        Returns True when the current step is eligible to launch the next
-        forward speculatively without waiting for CPU bookkeeping. Used by the
-        engine loop in the launch-ahead refactor to decide whether to chain
-        the next forward on the stream or to fall back to serial behavior.
-
-        False when any of the following is true:
+        Returns True when the speculative path is allowed for this step.
+        False when:
         - async_scheduling is disabled by configuration.
-        - A rejection event (add/pause/evict) is pending and must be applied.
-        - The current step is not pure decode (prefill present).
-        - The next step would require new KV blocks that aren't available.
-        - The periodic finished-pending sync is due (every K steps when
-          finished requests are accumulated).
+        - A pause/evict event in the prior bookkeep marked a rejection that
+          still needs applying.
+        - The context predicate (`can_speculate_decode_step`) is not satisfied
+          (prefill present, boundary crossing, speculative decoding active).
+
+        Note: speculation also requires checks the engine performs *inside*
+        the iteration: a batch-composition change after `schedule_waiting_
+        requests` aborts the consume-pending path, and a `_would_any_finish`
+        check on the just-sampled tokens skips the speculative pre-launch.
+        Together those make the gate's job simpler — finishes never reach
+        bookkeep with a stale pending pre-launch in flight, and adds are
+        caught the moment they happen.
         """
         if not self.async_scheduling:
             return False
         if self._rejection_pending:
             return False
-        if self._finished_sync_due():
-            return False
-        # Requests waiting in the queue would change batch composition at
-        # the next iteration. Drop to the serial path so the schedule call
-        # can integrate them and re-launch from canonical state.
-        if len(self.waiting_request_ids) > 0:
-            return False
         return self.context.can_speculate_decode_step()
-
-    def _finished_sync_due(self) -> bool:
-        """Check whether the periodic finished-pending sync is due this step.
-
-        Fires when finished_sync_period > 0, finished requests are pending, and
-        step_count is at a sync-period boundary. Used as a backstop so finished
-        slots can't accumulate indefinitely in the speculative chain.
-        """
-        if self.finished_sync_period <= 0:
-            return False
-        if self._finished_pending_count <= 0:
-            return False
-        return self.context.step_count % self.finished_sync_period == 0
 
     def _signal_rejection(self) -> None:
         """Mark a rejection event so the next step drops out of speculation.
 
-        Called by CPU bookkeeping when an add/pause/evict event makes the
+        Called by CPU bookkeeping when a pause/evict event makes the
         speculative metadata invalid. Cleared after the engine drains in-flight
         forwards and applies the corrected state via transfer_bookkeeping_to_gpu.
+
+        Finishes are *not* signalled here — the engine catches finishes via
+        :meth:`_would_any_finish` before pre-launching, skipping the
+        speculative forward when any request would terminate this step.
+        That avoids the wasted forward that a post-bookkeep rejection
+        would have caused.
         """
         self._rejection_pending = True
 
     def _clear_rejection(self) -> None:
         """Clear the rejection-pending flag after the engine has resynced."""
         self._rejection_pending = False
+
+    def _would_any_finish(self, sample_cpu: torch.Tensor, active_count: int) -> bool:
+        """Predict whether any active request will be marked finished by
+        :meth:`_dynamic_step_context_bookkeeping` for the just-sampled tokens.
+
+        Mirrors the active-request-mask computation done inside the
+        controller's bookkeep so the engine can decide whether to issue the
+        speculative pre-launch *before* committing GPU work. If any request
+        would finish, the bookkeep will compact the batch — invalidating any
+        pre-launch that used the old batch composition. Skipping the pre-
+        launch in that case avoids wasted GPU work.
+
+        A finish is detected when sample == termination_id, or when the
+        request's sequence length after this step would equal/exceed its
+        ``max_sequence_length``, or (if a stop-word callback is registered)
+        the callback flags the request id.
+        """
+        active_slice = slice(
+            self.context.paused_request_count,
+            self.context.paused_request_count + active_count,
+        )
+        term_ids = self.controller._request_metadata["termination_id"][active_slice]
+        if (sample_cpu[:active_count] == term_ids).any().item():
+            return True
+        active_seq_lens = self.context.get_active_sequence_lengths() + 1
+        max_seq_lens = self.context.get_max_sequence_lengths()
+        if (active_seq_lens >= max_seq_lens).any().item():
+            return True
+        if self.controller._get_stop_word_finished_ids_callback is not None:
+            request_ids = self.context.request_ids[active_slice].tolist()
+            stop_finished = self.controller._get_stop_word_finished_ids_callback(request_ids)
+            if stop_finished:
+                for rid in request_ids:
+                    if rid in stop_finished:
+                        return True
+        return False
 
     async def async_step(
         self,
@@ -2157,7 +2181,20 @@ class DynamicInferenceEngine(AbstractEngine):
             raise EngineSuspendedError(self.context.step_count)
 
         # async_forward equivalents needed before any launch.
+        # Track total_request_count across schedule so we can detect new
+        # arrivals — those would change the batch composition and invalidate
+        # any pending pre-launch issued for the prior batch.
+        pre_schedule_total = self.context.total_request_count
         self.schedule_waiting_requests()
+        if (
+            self._pending_launch_state is not None
+            and self.context.total_request_count != pre_schedule_total
+        ):
+            # New request was scheduled this iter; the pending pre-launch
+            # was computed for the smaller batch. Drain the stale pre-launch
+            # and continue this iter as if there was no pending state.
+            self._drain_pending_launch()
+            self._clear_rejection()
 
         will_log_this_step = (
             self.logging_step_interval > 0
@@ -2217,10 +2254,22 @@ class DynamicInferenceEngine(AbstractEngine):
         active_count = launch_state_N["_active_request_count"]
         sample_N_cpu = self.controller._sampled_tokens_cuda[:active_count].cpu()
 
-        # 3. Pre-launch step N+1 if eligible. Snapshot the RNG and mamba
-        # state first so we can roll back if the pre-launch is later
-        # discarded.
-        if self.context.can_speculate_decode_step():
+        # 3. Pre-launch step N+1 if eligible. Two checks:
+        #    a) The context predicate (`can_speculate_decode_step`) — pure
+        #       decode, no boundary crossing, no speculative-decoding interaction.
+        #    b) `_would_any_finish` — if any request would terminate this step,
+        #       the bookkeep will compact the batch and any pre-launch we issue
+        #       here would be operating on a stale batch. Skipping the
+        #       pre-launch costs one cycle of GPU idle time but saves a wasted
+        #       forward + sample plus a serial drain on the next iter.
+        #
+        # Snapshot RNG + mamba state before the pre-launch so a *future*
+        # pause/evict rejection can roll them back; finishes never reach this
+        # path because we gate them at (b).
+        if (
+            self.context.can_speculate_decode_step()
+            and not self._would_any_finish(sample_N_cpu, active_count)
+        ):
             self._pre_launch_rng_state = self.controller.sampling_rng.get_state()
             self.context.save_mamba_state_for_speculation()
 
@@ -2262,13 +2311,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.prefix_cache_lru_clock += 1
         nvtx_range_pop("Decode")
 
-        # 7. Detect events that invalidate the speculative chain. Any of
-        # finish / pause / evict triggers a rejection so the next iteration's
-        # serial path drains and re-launches from canonical state.
-        finished_request_ids = bookkeep_state.get("finished_request_ids")
-        if finished_request_ids is not None and len(finished_request_ids) > 0:
-            self._finished_pending_count += int(len(finished_request_ids))
-            self._signal_rejection()
+        # 7. Detect events that invalidate any pre-launch we just queued.
+        # Finishes never reach this point with a pre-launch in flight — the
+        # `_would_any_finish` gate above skipped the pre-launch on this iter.
+        # Pause/evict can still happen inside update_requests when memory
+        # pressure forces a request out; signal rejection so the next iter's
+        # serial path drains the stale pre-launch.
         if bookkeep_state.get("newly_paused_request_ids") is not None:
             self._signal_rejection()
         if bookkeep_state.get("evict_request_ids") is not None:
