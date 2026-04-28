@@ -223,6 +223,8 @@ class GPTModel(LanguageModule):
                 pg_collection=self.pg_collection,
             )
 
+            self._setup_mtp_cuda_graphs()
+
         # Output
         if self.post_process:
 

@@ -1,0 +1,196 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Nightly Sync Main to Dev
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 21:00 UTC = 2 PM PDT (1 PM PST during winter — GitHub Actions cron
+    # is UTC-only and does not follow DST).
+    - cron: '0 21 * * *'
+
+concurrency:
+  group: nightly-sync-main-to-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  sync-main-to-dev:
+    runs-on: ubuntu-latest
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ secrets.PAT }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "svcnvidia-nemo-ci"
+          git config user.email "svcnvidia-nemo-ci@nvidia.com"
+
+      - name: Compute branch name
+        id: vars
+        run: |
+          DATE=$(date -u +%d_%m_%Y)
+          BRANCH="main2dev/${DATE}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+
+      - name: Close previous unmerged sync PRs
+        run: |
+          OPEN_PRS=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --base dev \
+            --state open \
+            --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("main2dev/")) | .number')
+
+          for PR_NUM in $OPEN_PRS; do
+            echo "Closing stale sync PR #${PR_NUM}"
+            gh pr close "$PR_NUM" \
+              --repo "${{ github.repository }}" \
+              --comment "Superseded by today's nightly sync."
+          done
+
+      - name: Check if sync is needed
+        id: check-sync
+        run: |
+          git fetch origin main dev
+          AHEAD_COUNT=$(git rev-list --count origin/dev..origin/main)
+          echo "main is $AHEAD_COUNT commit(s) ahead of dev"
+          if [ "$AHEAD_COUNT" -eq 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No changes to sync."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Claude Code to merge, fix, and iterate
+        if: steps.check-sync.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.PAT }}
+          prompt: |
+            You are an automated sync bot. Merge `main` into `dev`, create a
+            PR, ensure CI passes (fixing failures), and mark the PR ready.
+            There are 4 phases. You are NOT done until Phase 4 completes.
+
+            REPO: ${{ github.repository }}
+            BRANCH: ${{ steps.vars.outputs.branch }}
+            DATE: ${{ steps.vars.outputs.date }}
+
+            Read `.claude/skills/nightly-sync/SKILL.md` for the detailed
+            merge strategy, CI architecture, failure investigation procedures,
+            and known issues. Also read `.claude/skills/build-and-test/SKILL.md`
+            and `CLAUDE.md` for general CI and contribution guidelines.
+
+            ## Hard Constraints
+
+            **Exit condition:** You MUST run `gh pr ready <PR_NUMBER>` before
+            exiting. That command is Phase 4. Do NOT exit after Phase 1, 2,
+            or 3 — not even if CI is "still running" or "stuck in queue."
+            Keep polling until it resolves, then act.
+
+            **NO background tasks. Ever.**
+            You are running inside a single GitHub Actions step. The step
+            process owns your shell. When you stop issuing tool calls, the
+            step ends and the runner container is DESTROYED — every
+            background process dies with it and cannot resume. There is no
+            "future session" to wake up into.
+
+            The following are strictly forbidden:
+            - `Bash` with `run_in_background: true`
+            - `Agent` with `run_in_background: true`
+            - `ScheduleWakeup` (nothing will ever wake up)
+            - Any shell command ending in `&`, or using `nohup`, `disown`,
+              or `setsid` to detach a process
+            - `tail -f` on a log produced by a backgrounded task
+
+            Required shape for every long wait: ONE foreground Bash tool
+            call containing an inline `while true; do ... sleep <N>; done`
+            or `until ...; do sleep <N>; done` loop that BLOCKS inside
+            that single tool call and only returns when the wait is
+            resolved (success, failure, or a clearly-classified terminal
+            state). Do NOT break a long wait into many short polls with
+            conversation in between — that wastes `--max-turns` and
+            creates windows where the agent could forget the loop.
+
+            **Source of truth for CI status:**
+            `gh pr view <PR_NUMBER> --repo $REPO --json statusCheckRollup`
+            This lists every required check — GitHub Actions jobs AND
+            external contexts (GitLab CI, `copy-pr-bot`, etc.). The
+            `gh api .../actions/runs/<RUN_ID>/jobs` endpoint alone is
+            NOT sufficient — it misses external contexts.
+
+            **Pre-existing failures:** MUST verify against recent dev CI
+            before classifying any failure as pre-existing. Run
+            `gh pr checks` on a recently merged dev PR. If the test passes
+            on dev, the failure is sync-caused and you must fix it. A
+            check that has never completed on your PR cannot be
+            pre-existing — wait for it to finish first.
+
+            **Phase 4 gate — strict "all terminal, all green":**
+            Do NOT run `gh pr ready` until every non-exempt required check
+            in `statusCheckRollup` satisfies BOTH:
+              - `status == "COMPLETED"` (NOT `QUEUED`, `IN_PROGRESS`,
+                `PENDING`, `WAITING`, or `REQUESTED`), AND
+              - `conclusion` ∈ {`SUCCESS`, `SKIPPED`, `NEUTRAL`}.
+            A check stuck in a runner queue is NOT complete. Never
+            classify queued/in-progress jobs as "infrastructure-blocked"
+            and ship anyway — wait for them to reach a terminal
+            conclusion, then act on that result. When a check fails,
+            loop: diagnose → fix → commit → push → `/ok to test <sha>` →
+            poll. Only exit the loop when the gate is satisfied on the
+            LATEST CI run against the current HEAD SHA.
+
+            **Exempt checks (may be ignored for the Phase 4 gate):**
+            These categories are pre-merge policy signals, not
+            correctness signals, so their failure must not block the
+            sync bot from marking the PR ready for human review.
+
+            - Approval / code-review: `codeowners-approval`,
+              `check-approval`, `multi-approval-bot-summary`,
+              `is-not-external-contributor`, any check whose name
+              contains `review` or `approval`.
+            - Code coverage: `Coverage (unit-test)`, `Coverage_Fake`,
+              any check whose name contains `codecov` or `coverage`
+              (case-insensitive).
+            - Docs: `build-docs / Build docs`, `build-docs-summary`,
+              any check whose name contains `build-docs`, `doc-build`,
+              `readthedocs`, or `sphinx`.
+
+            Everything else — unit tests (`tests/unit_tests/...`),
+            integration tests (`gpt/...`, `moe/...`, etc.), `linting`,
+            `cicd-container-build`, `cicd-mbridge-testing`,
+            `Nemo_CICD_Test`, `copyright-check`, `pre-flight`, wheel
+            builds, etc. — is NOT exempt and must reach a terminal
+            green conclusion.
+          show_full_output: true
+          claude_args: |
+            --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
+            --model "opus[1m]"
+            --effort max
+            --max-turns 1500
