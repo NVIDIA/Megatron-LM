@@ -8,6 +8,7 @@ Includes:
 - Unpermute expert outputs back to original token order
 """
 
+from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
@@ -28,6 +29,16 @@ if not HAVE_TRITON:
     tl = MagicMock()
 
 
+_NUM_SMS: Optional[int] = None
+
+
+def _get_num_sms(device: torch.device) -> int:
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
+    return _NUM_SMS
+
+
 def _ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -40,26 +51,37 @@ def _count_local_tokens_kernel(
     topk,  # number of expert choices per token
     local_expert_start,  # first global expert index owned by this rank
     num_local_experts: tl.constexpr,  # number of experts on this rank
-    BLOCK_SIZE: tl.constexpr,  # number of pairs processed per program
+    num_sms,  # number of SMs (grid size for persistent kernel)
+    BLOCK_SIZE: tl.constexpr,  # number of pairs processed per iteration
 ):
-    """Count tokens routed to experts on this rank, ignoring tokens routed elsewhere.
+    """Count tokens routed to local experts using a persistent grid.
 
-    Each program processes BLOCK_SIZE (token, topk) pairs. Tokens assigned to
-    experts outside [local_expert_start, local_expert_start + num_local_experts)
-    or beyond valid_tokens are silently skipped.  CTAs beyond valid_pairs exit
-    immediately (important for allgather-V where valid_tokens << max_tokens).
+    Launches num_sms CTAs. Each CTA loops over its share of BLOCK_SIZE-sized
+    chunks, with total work determined device-side from valid_tokens.
+    Per-block counts are aggregated with tl.sum before a single atomic_add
+    per expert, reducing atomic traffic from O(valid_pairs) to
+    O(num_blocks * num_local_experts).
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
     valid_pairs = valid_tokens * topk
-    if pid * BLOCK_SIZE >= valid_pairs:
-        return
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < valid_pairs
-    expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
-    local_ids = expert_ids - local_expert_start
-    is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
-    tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
+
+    total_blocks = tl.cdiv(valid_pairs, BLOCK_SIZE)
+    blocks_per_cta = tl.cdiv(total_blocks, num_sms)
+    block_start = pid * blocks_per_cta
+    block_end = tl.minimum(block_start + blocks_per_cta, total_blocks)
+
+    for block_id in tl.range(block_start, block_end):
+        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < valid_pairs
+        expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
+        local_ids = expert_ids - local_expert_start
+        is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
+
+        for e in range(num_local_experts):
+            count = tl.sum(((local_ids == e) & is_local).to(tl.int32))
+            if count > 0:
+                tl.atomic_add(tokens_per_expert_ptr + e, count)
 
 
 def compute_local_tokens_per_expert(
@@ -78,17 +100,18 @@ def compute_local_tokens_per_expert(
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens
             this iteration. Fixed address; value updated each step before graph replay.
     """
-    max_pairs = routing_map.numel()
     topk = routing_map.shape[1]
     tokens_per_expert = torch.zeros(num_local_experts, dtype=torch.int32, device=routing_map.device)
     BLOCK = 1024
-    _count_local_tokens_kernel[(_ceil_div(max_pairs, BLOCK),)](
+    num_sms = _get_num_sms(routing_map.device)
+    _count_local_tokens_kernel[(num_sms,)](
         routing_map,
         tokens_per_expert,
         valid_tokens,
         topk,
         local_expert_start,
         num_local_experts,
+        num_sms,
         BLOCK_SIZE=BLOCK,
     )
     return tokens_per_expert

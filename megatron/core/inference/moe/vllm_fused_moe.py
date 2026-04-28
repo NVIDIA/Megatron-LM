@@ -31,18 +31,10 @@ if not HAVE_TRITON:
 
 from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference.moe.permute import (
+    _get_num_sms,
     compute_expert_offsets,
     compute_local_tokens_per_expert,
 )
-
-_NUM_SMS: Optional[int] = None
-
-
-def _get_num_sms(device: torch.device) -> int:
-    global _NUM_SMS
-    if _NUM_SMS is None:
-        _NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
-    return _NUM_SMS
 
 # ---------------------------------------------------------------------------
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
