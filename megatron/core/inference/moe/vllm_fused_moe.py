@@ -227,7 +227,6 @@ def _scatter_token_indices_kernel(
     routing_map_ptr,
     sorted_token_ids_ptr,
     counters_ptr,
-    nonlocal_counter_ptr,
     valid_tokens_ptr,
     topk: tl.constexpr,
     local_expert_start,
@@ -235,12 +234,10 @@ def _scatter_token_indices_kernel(
     max_pairs,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Scatter flat token indices into the padded indirection table.
+    """Scatter local-expert pair indices into the padded indirection table.
 
-    Each CTA processes a contiguous block of BLOCK_SIZE pairs with a coalesced
-    vector load and masked per-element atomics.  CTAs whose block falls
-    entirely beyond valid_pairs exit immediately (important for allgather-V
-    where valid_tokens << max_tokens).
+    Only local expert pairs are written; non-local pairs are skipped (the
+    _moe_sum kernel handles them by checking the routing map directly).
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -256,10 +253,6 @@ def _scatter_token_indices_kernel(
 
     local_pos = tl.atomic_add(counters_ptr + lids, 1, mask=is_local)
     tl.store(sorted_token_ids_ptr + local_pos, offs, mask=is_local)
-
-    is_nonlocal = (~is_local) & mask
-    nonlocal_pos = tl.atomic_add(nonlocal_counter_ptr + tl.zeros_like(offs), 1, mask=is_nonlocal)
-    tl.store(sorted_token_ids_ptr + nonlocal_pos, offs, mask=is_nonlocal)
 
 
 @triton.jit
@@ -292,7 +285,7 @@ def _moe_align_block_size_cuda_graphable(
     num_local_experts: int,
     local_expert_start: int,
     valid_tokens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build indirection tables for the vLLM kernel, fully on-device.
 
     Replaces the original _moe_align_block_size which used .item() calls
@@ -309,8 +302,7 @@ def _moe_align_block_size_cuda_graphable(
     Returns:
         sorted_token_ids: [max_sorted] int32 indirection table.
         expert_ids: [max_blocks] int32 expert per block.
-        num_tokens_post_padded_local: [1] int32 (local expert padded count).
-        num_tokens_post_padded_all: [1] int32 (including non-local expert slots).
+        num_tokens_post_padded: [1] int32 (local expert padded count).
     """
     max_tokens, topk = routing_map.shape
     device = routing_map.device
@@ -348,11 +340,6 @@ def _moe_align_block_size_cuda_graphable(
         BLOCK=128,
     )
 
-    # Snapshot the local-expert padded count before reusing inclusive_offsets[-1:]
-    # as the nonlocal atomic counter (avoids a D2D clone).
-    num_tokens_post_padded_local = inclusive_offsets[-1:].clone()
-    # exclusive_offsets is not read after this point — reuse directly as atomic
-    # counters for the scatter kernel (avoids a D2D clone).
     max_pairs = max_tokens * topk
     SCATTER_BLOCK = 256
     scatter_grid = _ceil_div(max_pairs, SCATTER_BLOCK)
@@ -360,7 +347,6 @@ def _moe_align_block_size_cuda_graphable(
         routing_map,
         sorted_token_ids,
         exclusive_offsets,
-        inclusive_offsets[-1:],
         valid_tokens,
         topk,
         local_expert_start,
@@ -369,10 +355,8 @@ def _moe_align_block_size_cuda_graphable(
         BLOCK_SIZE=SCATTER_BLOCK,
     )
 
-    # inclusive_offsets[-1] was atomically incremented by scatter and now holds
-    # the position past the last non-local expert pair.
-    num_tokens_post_padded_all = inclusive_offsets[-1:]
-    return sorted_token_ids, expert_ids, num_tokens_post_padded_local, num_tokens_post_padded_all
+    num_tokens_post_padded = inclusive_offsets[-1:]
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +426,9 @@ def _moe_sum_kernel(
     input_ptr,
     output_ptr,
     valid_tokens_ptr,
+    routing_map_ptr,
+    local_expert_start,
+    num_local_experts: tl.constexpr,
     K,
     topk: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -452,7 +439,10 @@ def _moe_sum_kernel(
     input:  [max_tokens * topk, K] bf16
     output: [max_tokens, K] bf16
 
-    For token t < valid_tokens: output[t] = sum(input[t*topk : (t+1)*topk]).
+    For token t < valid_tokens: output[t] = sum of input[t*topk+k] over
+    topk slots k where the expert is local.  Non-local slots are skipped
+    (their values in `input` are undefined because FC2 only processes
+    local-expert blocks).
     For token t >= valid_tokens: output[t] = 0.
     Accumulation in fp32 for numerical accuracy.
     """
@@ -468,8 +458,11 @@ def _moe_sum_kernel(
         if is_valid:
             base = token_id * topk * K
             for t in range(topk):
-                v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
-                acc += v.to(tl.float32)
+                eid = tl.load(routing_map_ptr + token_id * topk + t)
+                lid = eid - local_expert_start
+                if lid >= 0 and lid < num_local_experts:
+                    v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
+                    acc += v.to(tl.float32)
 
         tl.store(output_ptr + token_id * K + offs_k, acc.to(tl.bfloat16), mask=k_mask)
 
@@ -480,12 +473,17 @@ def _moe_sum(
     topk: int,
     K: int,
     valid_tokens: torch.Tensor,
+    routing_map: torch.Tensor,
+    local_expert_start: int,
+    num_local_experts: int,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] → [max_tokens, K].
 
     Writes directly to `out` if provided (e.g. the RSV symmetric memory tensor),
     avoiding a separate allocation + copy. Rows beyond valid_tokens are zeroed.
+    Only accumulates contributions from local experts; non-local topk slots are
+    skipped (their values in `input` are undefined).
     """
     if out is None:
         out = torch.empty(max_tokens, K, dtype=input.dtype, device=input.device)
@@ -495,6 +493,9 @@ def _moe_sum(
         input,
         out,
         valid_tokens,
+        routing_map,
+        local_expert_start,
+        num_local_experts,
         K,
         topk=topk,
         BLOCK_K=BLOCK_K,
@@ -554,7 +555,7 @@ def vllm_fused_moe(
     topk = routing_map.shape[1]
     block_size_m = _select_block_size_m(num_tokens_hint if num_tokens_hint is not None else max_tokens)
 
-    sorted_token_ids, expert_ids, num_post_local, num_post_all = (
+    sorted_token_ids, expert_ids, num_post_padded = (
         _moe_align_block_size_cuda_graphable(
             routing_map, block_size_m, num_local_experts, local_expert_start, valid_tokens
         )
@@ -586,7 +587,7 @@ def vllm_fused_moe(
         topk_weights_flat,
         sorted_token_ids,
         expert_ids,
-        num_post_local,
+        num_post_padded,
         mul_routed_weight=False,
         top_k=topk,
         block_size_m=block_size_m,
@@ -594,10 +595,9 @@ def vllm_fused_moe(
         grid_em=grid_em,
     )
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights
-    # num_post_all covers the full indirection table including non-local expert
-    # pairs (expert_ids=-1), so the kernel writes zeros to those output positions.
-    # This eliminates the need for torch.zeros on intermediate3.
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights.
+    # Only local-expert blocks are processed; non-local positions are left
+    # undefined and skipped by _moe_sum (which checks the routing map).
     intermediate3 = torch.empty(
         num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
     )
@@ -608,7 +608,7 @@ def vllm_fused_moe(
         topk_weights_flat,
         sorted_token_ids,
         expert_ids,
-        num_post_all,
+        num_post_padded,
         mul_routed_weight=True,
         top_k=1,
         block_size_m=block_size_m,
@@ -617,5 +617,8 @@ def vllm_fused_moe(
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
     # Fused kernel accumulates in fp32, writes directly to out (if provided),
-    # and zeros rows beyond valid_tokens.
-    return _moe_sum(intermediate3, max_tokens, topk, K, valid_tokens, out=out)
+    # zeros rows beyond valid_tokens, and skips non-local expert slots.
+    return _moe_sum(
+        intermediate3, max_tokens, topk, K, valid_tokens,
+        routing_map, local_expert_start, num_local_experts, out=out,
+    )
