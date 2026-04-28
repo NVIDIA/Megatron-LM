@@ -47,14 +47,13 @@ class FlashInferSampling(Sampling):
         self,
         logits: Tensor,
         n: int,
-        output: Tensor,
         context,
         *,
         eager: bool = False,
         cache_key: Any = None,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
-    ) -> None:
+    ) -> Tensor:
         """FlashInfer fused top-k / top-p sampling kernel.
 
         Reads sampling parameters per-row from `context.active_request_metadata`,
@@ -64,6 +63,9 @@ class FlashInferSampling(Sampling):
         When wrapped by `CudaGraphManager`, `eager` and `cache_key` are consumed by
         the wrapper before this body runs. When unwrapped (no CUDA graphs), they are
         accepted and ignored so callers can pass them unconditionally.
+
+        Returns:
+            Sampled token ids of shape `[n]`. Under CUDA graph replay, this is a static buffer.
         """
         del eager, cache_key
         md = context.active_request_metadata
@@ -89,8 +91,10 @@ class FlashInferSampling(Sampling):
         # tokens, top_p=1.0 keeps the full probability mass.
         top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
         top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
-        output[:n].copy_(
+        output = torch.empty(n, device=logits.device, dtype=torch.int64)
+        output.copy_(
             flashinfer.sampling.top_k_top_p_sampling_from_probs(
                 probs, top_k_safe, top_p_safe, generator=self._rng
             )
         )
+        return output

@@ -125,31 +125,33 @@ class TorchSampling(Sampling):
         self,
         logits: Tensor,
         n: int,
-        output: Tensor,
         context,
         *,
         eager: bool = False,
         cache_key: Any = None,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
-    ) -> None:
+    ) -> Tensor:
         """Sample by iterating over pre-computed sampling buckets.
 
         Args:
             logits: Logits tensor of shape `[>=n, vocab_size]`.
             n: Number of rows to sample.
-            output: Destination buffer; the kernel writes to the rows selected per bucket.
             context: The active DynamicInferenceContext (unused; kept for ABC parity).
             eager: Accepted for API symmetry with FlashInfer; ignored (no wrapper here).
             cache_key: Accepted for API symmetry; ignored.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
+
+        Returns:
+            Sampled token ids of shape `[n]`.
         """
         del eager, cache_key
         if gather_indices is not None:
             logits = logits[gather_indices[:n], :]
 
+        output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
         indices_list = []
         for idx_tensor, (_, temp, top_k, top_p) in zip(
@@ -165,6 +167,7 @@ class TorchSampling(Sampling):
         sampled_tokens = torch.cat(token_list, dim=0)
         sampled_indices = torch.cat(indices_list, dim=0)
         output[sampled_indices] = sampled_tokens
+        return output
 
     def _sampling_func(
         self, last_token_logits: Tensor, temperature: float, top_k: int, top_p: float

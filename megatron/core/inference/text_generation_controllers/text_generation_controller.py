@@ -722,12 +722,12 @@ class TextGenerationController:
         Returns:
             Tensor: Sampled tokens of shape [num_requests].
         """
-        n = logits_2d.shape[0]
-        output = torch.empty(n, device=logits_2d.device, dtype=torch.int64)
-        self._sampling.sample(
-            logits_2d, n, output, self.inference_wrapped_model.inference_context, eager=True
+        return self._sampling.sample(
+            logits_2d,
+            logits_2d.shape[0],
+            self.inference_wrapped_model.inference_context,
+            eager=True,
         )
-        return output
 
     def _compute_serial_mtp_and_sample(self):
         """Compute MTP logits serially after verification and sample speculative tokens.
@@ -1033,15 +1033,18 @@ class TextGenerationController:
             if context.config.materialize_only_last_token_logits
             else context.active_request_last_token_idxs
         )
-        self._sampling.sample(
+        sampled = self._sampling.sample(
             self._all_logits_cuda.squeeze(0),
             n,
-            self._sampled_tokens_cuda,
             context,
             eager=not use_graph,
             cache_key=("sample", n) if use_graph else None,
             gather_indices=gather_indices,
         )
+        # Copy out of the captured static buffer (under CG) into our persistent
+        # buffer so subsequent steps see the new sampled values, and the static
+        # buffer is free to be reused.
+        self._sampled_tokens_cuda[:n].copy_(sampled)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
