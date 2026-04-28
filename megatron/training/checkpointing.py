@@ -679,7 +679,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                          preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                                                          content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
                                                          async_strategy=args.async_strategy,
-                                                         use_dtensor_format=args.dist_ckpt_use_dtensor_format)
+                                                         use_dtensor_format=args.dist_ckpt_use_dtensor_format,
                                                          verify_integrity=args.verify_integrity)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:

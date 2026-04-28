@@ -35,8 +35,10 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
+    from torch.distributed import DeviceMesh, get_process_group_ranks
+    from torch.distributed.distributed_c10d import _get_group_tag
     from torch.distributed._tensor import DTensor
-    from torch.distributed.tensor.placement_types import Shard
+    from torch.distributed.tensor.placement_types import Shard, Replicate
 
     HAVE_DTENSOR = True
 except ImportError:
@@ -967,32 +969,11 @@ def make_tp_sharded_tensor_for_checkpoint(
         replica_id = (0, 0, dp_replica_id)
 
     if use_dtensor_format:
-        from torch.distributed import DeviceMesh, get_process_group_ranks
-        from torch.distributed.distributed_c10d import _get_group_tag
-        from torch.distributed.tensor.placement_types import Shard, Replicate
         if prepend_axis_num > 0:
             for _, _, offset_dim_size in prepend_offsets:
                 assert offset_dim_size == 1, f'Non-trivial prepended-style sharding not supported with DTensors: {prepend_offsets}'
         
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-        tp_group_for_mesh = parallel_state.get_tensor_model_parallel_group()
-        dp_group_for_mesh = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        process_group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
-        with torch.device("cpu"):
-            group_ranks = get_process_group_ranks(process_group)
-            # Megatron ranks within tp+dp group are ordered: dp_rank * tp_size + tp_rank.
-            # Reshape as (dp_size, tp_size) then transpose to get (tp_size, dp_size) mesh
-            # where row=tp_rank and col=dp_rank, matching mesh_dim_names=('tp', 'dp').
-            mesh = torch.tensor(group_ranks, dtype=torch.int).view(dp_size, tp_size).T.contiguous()
-        device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('tp', 'dp',), _init_backend=False)
-        tp_ranks = get_process_group_ranks(tp_group_for_mesh)
-        dp_ranks = get_process_group_ranks(dp_group_for_mesh)
-        device_mesh._dim_group_infos = [
-            (_get_group_tag(tp_group_for_mesh), tp_ranks, tp_group_for_mesh.group_name),
-            (_get_group_tag(dp_group_for_mesh), dp_ranks, dp_group_for_mesh.group_name),
-        ]
-        placements = [Shard(tp_axis), Replicate()]
+        placements, device_mesh = get_dtensor_metadata(tp=True, tp_axis=tp_axis)
 
         kwargs.update(dict(
                 dtensor_ckpt_device_mesh=device_mesh,
@@ -1053,21 +1034,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
     if use_dtensor_format:
-        from torch.distributed import DeviceMesh, get_process_group_ranks
-        from torch.distributed.distributed_c10d import _get_group_tag
-        from torch.distributed.tensor.placement_types import Shard, Replicate
-        process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        mesh_shape = (parallel_state.get_data_parallel_world_size(with_context_parallel=True),)
-        with torch.device("cpu"):
-            group_ranks = get_process_group_ranks(process_group)
-            mesh = torch.tensor(group_ranks, dtype=torch.int).view(mesh_shape)
-
-        device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('dp',), _init_backend=False)
-        device_mesh._dim_group_infos = [
-            (_get_group_tag(process_group), group_ranks,
-                process_group.group_name)
-        ]
-        placements = [Replicate()]
+        placements, device_mesh = get_dtensor_metadata()
 
         kwargs.update(dict(
                 dtensor_ckpt_device_mesh=device_mesh,
@@ -2609,3 +2576,38 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+def get_dtensor_metadata(tp: bool = False, tp_axis: int = None):
+    """Generates placements and device mesh for DTensor."""
+    process_group = parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
+    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+    group_ranks = get_process_group_ranks(process_group)
+    if tp:
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_group_for_mesh = parallel_state.get_tensor_model_parallel_group()
+        dp_group_for_mesh = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        with torch.device("cpu"):
+            # Megatron ranks within tp+dp group are ordered: dp_rank * tp_size + tp_rank.
+            # Reshape as (dp_size, tp_size) then transpose to get (tp_size, dp_size) mesh
+            # where row=tp_rank and col=dp_rank, matching mesh_dim_names=('tp', 'dp').
+            mesh = torch.tensor(group_ranks, dtype=torch.int).view(dp_size, tp_size).T.contiguous()
+        device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('tp', 'dp',), _init_backend=False)
+        tp_ranks = get_process_group_ranks(tp_group_for_mesh)
+        dp_ranks = get_process_group_ranks(dp_group_for_mesh)
+        device_mesh._dim_group_infos = [
+            (_get_group_tag(tp_group_for_mesh), tp_ranks, tp_group_for_mesh.group_name),
+            (_get_group_tag(dp_group_for_mesh), dp_ranks, dp_group_for_mesh.group_name),
+        ]
+        placements = [Shard(tp_axis), Replicate()]
+    else:
+        with torch.device("cpu"):
+            mesh = torch.tensor(group_ranks, dtype=torch.int).view(dp_size,)
+        device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('dp',), _init_backend=False)
+        device_mesh._dim_group_infos = [
+            (_get_group_tag(process_group), group_ranks,
+                process_group.group_name)
+        ]
+        placements = [Replicate()]
+
+    return placements, device_mesh
