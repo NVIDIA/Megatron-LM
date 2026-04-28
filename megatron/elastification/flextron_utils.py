@@ -399,7 +399,7 @@ def inject_flextron_forward_logic(model):
             assert (
                 self.config.is_flex_eval
             ), "Override selected budget should only be set in flex eval mode"
-            if self.config.override_selected_budget == 1.0:
+            if self.config.override_selected_budget[0] == 1.0:
                 flextron_kwargs = {}
             else:
                 flextron_kwargs = {'budget': self.config.override_selected_budget[0]}
