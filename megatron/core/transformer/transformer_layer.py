@@ -215,16 +215,21 @@ class TransformerLayerSubmodules:
 
     Args:
         input_layernorm: Specification for the input layer normalization.
+        self_attention_hyper_connection: Specification for the hyper-connection module
+            before/after self-attention.
         self_attention (Union[ModuleSpec, type]): Specification for the self-attention mechanism.
         self_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after self-attention.
         pre_cross_attn_layernorm: Specification for the layer
             normalization before cross-attention.
+        cross_attention_hyper_connection: Reserved for future cross-attention
+            hyper-connection support and must remain IdentityOp for now.
         cross_attention (Union[ModuleSpec, type]): Specification for the cross-attention mechanism.
         cross_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after cross-attention.
         pre_mlp_layernorm: Specification for the layer normalization
             before the MLP.
+        mlp_hyper_connection: Specification for the hyper-connection module before/after the MLP.
         mlp (Union[ModuleSpec, type]): Specification for the MLP in Dense layer.
         mlp_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after the MLP.
@@ -238,7 +243,7 @@ class TransformerLayerSubmodules:
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
-    # Reserved for future cross-attention hyper-connection support.
+    # TODO: wire this when cross-attention hyper-connection support is added.
     cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
@@ -1291,15 +1296,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return True
         return False
 
-    def backward_dw_cudagraph(self, microbatch_idx):
-        """
-        CUDA Graph backward weight gradient computation for this layer.
-        """
-        cg_index = microbatch_idx % len(self.cuda_graphs)
-        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
-            return
-        self.cuda_graphs[cg_index].backward_dw()
-
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
             # Inference mode.
@@ -1548,9 +1544,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 attention_output_with_bias[0]
             )
 
-        nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
+        nvtx_range_push(suffix="self_attention_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
+            hidden_states = self.self_attention_hyper_connection.h_res_h_post_bda(
                 self_attn_h_res,
                 residual,
                 self_attn_hc_h_post,
@@ -1560,7 +1556,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 self.config.bias_dropout_fusion,
                 mhc_recompute_manager,
             )
-        nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
+        nvtx_range_pop(suffix="self_attention_h_res_h_post_bda")
 
         if self.offload_attn_norm:
             hidden_states = off_interface.group_commit(hidden_states, name="attn_norm")
@@ -1727,9 +1723,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 mlp_output_with_bias[0]
             )
 
-        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+        nvtx_range_push(suffix="mlp_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
+            hidden_states = self.mlp_hyper_connection.h_res_h_post_bda(
                 mlp_h_res,
                 residual,
                 mlp_hc_h_post,
@@ -1739,7 +1735,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 self.config.bias_dropout_fusion,
                 mhc_mlp_bda_recompute_manager,
             )
-        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+        nvtx_range_pop(suffix="mlp_h_res_h_post_bda")
 
         if self.offload_mlp_norm:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (

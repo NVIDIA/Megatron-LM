@@ -495,6 +495,23 @@ class TestTransformerConfigRecomputeMhc:
                 recompute_granularity="selective",
             )
 
+    def test_config_rejects_full_recompute_hyper_connections(self):
+        """Full activation recompute is not wired for hyper-connection blocks yet."""
+        with pytest.raises(
+            ValueError,
+            match="enable_hyper_connections is not yet compatible with full activation recompute",
+        ):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_hyper_connections=True,
+                num_residual_streams=4,
+                recompute_granularity="full",
+                recompute_method="block",
+                recompute_num_layers=1,
+            )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

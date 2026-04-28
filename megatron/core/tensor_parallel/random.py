@@ -804,10 +804,6 @@ class MHCRecomputeManager:
             ckpt._recompute(None)
 
 
-# Backward-compatible alias for earlier internal users of the generic name.
-CheckpointManager = MHCRecomputeManager
-
-
 class CheckpointWithoutOutput(object):
     """
     Checkpoint a model or part of the model and release the output.

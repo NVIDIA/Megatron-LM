@@ -183,11 +183,11 @@ class HyperConnectionModule(MegatronModule):
         # This is required because HyperConnectionModule uses non-TP-aware layers
         # (nn.Linear, nn.RMSNorm) whose gradients need to be all-reduced.
         if self.config.sequence_parallel:
-            setattr(self.mapping_proj.weight, 'sequence_parallel', True)
-            setattr(self.alpha_pre, 'sequence_parallel', True)
-            setattr(self.alpha_post, 'sequence_parallel', True)
-            setattr(self.alpha_res, 'sequence_parallel', True)
-            setattr(self.bias, 'sequence_parallel', True)
+            self.mapping_proj.weight.sequence_parallel = True
+            self.alpha_pre.sequence_parallel = True
+            self.alpha_post.sequence_parallel = True
+            self.alpha_res.sequence_parallel = True
+            self.bias.sequence_parallel = True
 
     def _projection_and_get_norm(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -259,16 +259,14 @@ class HyperConnectionModule(MegatronModule):
         return h_pre, h_post, h_res
 
     @torch.compile
-    def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
+    def _apply_h_post_hidden(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
-        Core implementation of H_post application to a single tensor.
+        Apply H_post to hidden states.
 
         Computes: H_post^T @ x
 
         Args:
-            x: Input tensor, can be either:
-               - [s, b, C] - standard hidden states
-               - [C] - bias tensor (will be broadcast)
+            x: [s, b, C] - standard hidden states
             h_post: [s, b, n] - expansion weights
 
         Returns:
@@ -276,19 +274,32 @@ class HyperConnectionModule(MegatronModule):
         """
         n = self.n
         s, b, _ = h_post.shape
-
-        if x.dim() == 1:
-            # x is bias with shape [C], need to broadcast to [s, b, 1, C]
-            C = x.shape[0]
-            x_expanded = x.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(s, b, 1, C)
-        else:
-            # x is [s, b, C]
-            C = x.shape[-1]
-            x_expanded = x.unsqueeze(2)  # [s, b, 1, C]
+        C = x.shape[-1]
+        x_expanded = x.unsqueeze(2)  # [s, b, 1, C]
 
         # h_post^T @ x : [s, b, n, 1] * [s, b, 1, C] -> [s, b, n, C]
-        # Using broadcast multiply instead of einsum
         result = h_post.unsqueeze(-1) * x_expanded
+        return result.view(s, b, n * C)
+
+    @torch.compile
+    def _apply_h_post_bias(self, bias: Tensor, h_post: Tensor) -> Tensor:
+        """
+        Apply H_post to a bias vector.
+
+        Args:
+            bias: [C] - bias tensor broadcast across sequence and batch
+            h_post: [s, b, n] - expansion weights
+
+        Returns:
+            output: [s, b, n*C] - expanded bias
+        """
+        n = self.n
+        s, b, _ = h_post.shape
+        C = bias.shape[0]
+        bias_expanded = bias.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(s, b, 1, C)
+
+        # h_post^T @ x : [s, b, n, 1] * [s, b, 1, C] -> [s, b, n, C]
+        result = h_post.unsqueeze(-1) * bias_expanded
         return result.view(s, b, n * C)
 
     @nvtx_decorator(message="HyperConnection::apply_h_post")
@@ -322,22 +333,22 @@ class HyperConnectionModule(MegatronModule):
         if manager is not None:
             from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
-            # Checkpoint _apply_h_post to discard the output
+            # Checkpoint H_post application to discard the output
             x_out = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-                self._apply_h_post, x, h_post
+                self._apply_h_post_hidden, x, h_post
             )
 
-            # Checkpoint _apply_h_post for bias if not None
+            # Checkpoint H_post bias expansion if not None
             if bias is not None:
                 bias_out = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-                    self._apply_h_post, bias, h_post
+                    self._apply_h_post_bias, bias, h_post
                 )
             else:
                 bias_out = None
         else:
             # Normal execution without checkpoint
-            x_out = self._apply_h_post(x, h_post)
-            bias_out = self._apply_h_post(bias, h_post) if bias is not None else None
+            x_out = self._apply_h_post_hidden(x, h_post)
+            bias_out = self._apply_h_post_bias(bias, h_post) if bias is not None else None
 
         return x_out, bias_out
 
@@ -433,7 +444,7 @@ class HyperConnectionModule(MegatronModule):
         compute_mappings is called directly (not checkpointed) since its outputs
         (h_pre, h_post, h_res) are needed downstream. Only aggregate is wrapped with
         CheckpointWithoutOutput and auto-registered to the manager.
-        apply_h_res is deferred to fused_h_res_h_post_bda for kernel fusion.
+        apply_h_res is deferred to h_res_h_post_bda for kernel fusion.
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
@@ -498,10 +509,10 @@ class HyperConnectionModule(MegatronModule):
         contracted = x_streams.mean(dim=2)
         return contracted
 
-    # ==================== Fused kernel placeholder ====================
+    # ==================== Combined H_res + H_post + BDA path ====================
 
-    @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda")
-    def fused_h_res_h_post_bda(
+    @nvtx_decorator(message="HyperConnection::h_res_h_post_bda")
+    def h_res_h_post_bda(
         self,
         h_res: Tensor,
         original_residual: Tensor,
@@ -513,10 +524,11 @@ class HyperConnectionModule(MegatronModule):
         manager: Optional['MHCRecomputeManager'] = None,
     ) -> Tensor:
         """
-        Fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
+        Combine apply_h_res, apply_h_post and bias-dropout-add.
 
-        This is a placeholder for future kernel fusion optimization.
-        Currently implements the operations sequentially using native PyTorch.
+        This is a reference implementation that uses native PyTorch for the
+        dropout path. Actual fused kernels are selected through _h_post_bda_op
+        when dropout is disabled or training is off.
 
         The computation flow is:
             1. mixed = H_res @ original_residual (apply_h_res)
@@ -540,7 +552,7 @@ class HyperConnectionModule(MegatronModule):
             output: [s, b, n*C] - final output after all operations
         """
         if manager is not None:
-            return self._fused_h_res_h_post_bda_with_checkpoint(
+            return self._h_res_h_post_bda_with_checkpoint(
                 h_res,
                 original_residual,
                 h_post,
@@ -551,7 +563,7 @@ class HyperConnectionModule(MegatronModule):
                 manager,
             )
         else:
-            return self._fused_h_res_h_post_bda_native(
+            return self._h_res_h_post_bda_native(
                 h_res,
                 original_residual,
                 h_post,
@@ -561,7 +573,7 @@ class HyperConnectionModule(MegatronModule):
                 fused,
             )
 
-    def _fused_h_res_h_post_bda_native(
+    def _h_res_h_post_bda_native(
         self,
         h_res: Tensor,
         original_residual: Tensor,
@@ -604,15 +616,15 @@ class HyperConnectionModule(MegatronModule):
         with torch.cuda.nvtx.range("HyperConnection::apply_h_res"):
             mixed = self.apply_h_res(h_res, original_residual)
         with torch.cuda.nvtx.range("HyperConnection::apply_h_post"):
-            x_expanded = self._apply_h_post(x, h_post)
-            bias_expanded = self._apply_h_post(bias, h_post) if bias is not None else None
+            x_expanded = self._apply_h_post_hidden(x, h_post)
+            bias_expanded = self._apply_h_post_bias(bias, h_post) if bias is not None else None
         bda_func = get_bias_dropout_add(training, fused)
         with torch.cuda.nvtx.range("HyperConnection::bda"):
             output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
         return output
 
-    @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
-    def _fused_h_res_h_post_bda_with_checkpoint(
+    @nvtx_decorator(message="HyperConnection::h_res_h_post_bda_with_checkpoint")
+    def _h_res_h_post_bda_with_checkpoint(
         self,
         h_res: Tensor,
         original_residual: Tensor,
@@ -624,7 +636,7 @@ class HyperConnectionModule(MegatronModule):
         manager: 'MHCRecomputeManager',
     ) -> Tensor:
         """
-        Checkpointed variant of _fused_h_res_h_post_bda_native.
+        Checkpointed variant of _h_res_h_post_bda_native.
 
         Wraps compute in CheckpointWithoutOutput for activation memory savings.
         Cannot reuse _native directly because checkpoint requires all args to be
@@ -677,9 +689,9 @@ class HyperConnectionModule(MegatronModule):
                 with torch.cuda.nvtx.range("HyperConnection::apply_h_res"):
                     mixed = self.apply_h_res(h_res, original_residual)
                 with torch.cuda.nvtx.range("HyperConnection::apply_h_post"):
-                    x_expanded = self._apply_h_post(x, h_post)
+                    x_expanded = self._apply_h_post_hidden(x, h_post)
                     if has_bias:
-                        bias_expanded = self._apply_h_post(optional_bias[0], h_post)
+                        bias_expanded = self._apply_h_post_bias(optional_bias[0], h_post)
                     else:
                         bias_expanded = None
                 with torch.cuda.nvtx.range("HyperConnection::bda"):
