@@ -979,6 +979,7 @@ class TestMTPCudaGraphExpertParallel:
             next_token_ids=dummy_tokens,
             position_ids=dummy_positions,
             depth=0,
+            eager=True,
         )
 
         assert h_out.shape == (tp_size, 1, self.HIDDEN_SIZE)

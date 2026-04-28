@@ -69,13 +69,14 @@ class LanguageModule(MegatronModule):
 
         Must be called by subclasses after `self.mtp` is created.
         """
-        self._mtp_cudagraph_manager = CudaGraphManager(
-            self.config,
-            base_module=self,
-            function_name="compute_mtp_single_step",
-            need_backward=False,
-            inline_capture=True,
-        )
+        if self.config.cuda_graph_impl == "local":
+            self._mtp_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_single_step",
+                need_backward=False,
+                inline_capture=True,
+            )
 
     def _is_in_embd_group(self):
         if self.embd_group is None:
@@ -344,6 +345,8 @@ class LanguageModule(MegatronModule):
         next_token_ids: Tensor,
         position_ids: Tensor,
         depth: Optional[int] = None,
+        eager: bool = False,
+        cache_key=None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 
@@ -354,14 +357,16 @@ class LanguageModule(MegatronModule):
             hidden_states (Tensor): Hidden states at last accepted positions.
             next_token_ids (Tensor): Correct next token IDs [1, N].
             position_ids (Tensor): Position IDs for the next tokens [1, N].
-            depth (int, optional): MTP depth index. Only needed when
-                ``mtp_use_repeated_layer`` is False (each depth uses a
-                distinct layer). Omit for repeated-layer models so that a
+            depth (int, optional): MTP depth index. Only needed when `mtp_use_repeated_layer` is
+                False (each depth uses a distinct layer). Omit for repeated-layer models so that a
                 single CUDA graph can serve all depths.
+            eager: Added as an optional argument here to simplify upstream code.
+            cache_key: Added as an optional argument here to simplify upstream code.
 
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
         """
+        del eager, cache_key
         layer_idx = 0 if depth is None else depth
         mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
             hidden_states=hidden_states,
