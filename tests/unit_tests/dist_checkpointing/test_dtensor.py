@@ -411,8 +411,25 @@ class TestShardedObjectEmptyFromKey:
         assert ShardedObject.empty_from_key('k/shard_0_5').data is None
 
 
+def _make_dcp_device_mesh():
+    """Create a properly-initialized DeviceMesh for the DP group.
+
+    Unlike get_dtensor_metadata() which uses _init_backend=False, this calls
+    DeviceMesh.from_group() so that DCP's internal NCCL collectives work correctly.
+    """
+    from megatron.core import parallel_state
+
+    dp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    return DeviceMesh.from_group(dp_group, "cuda")
+
+
 class TestDTensorSaveLoad:
-    """End-to-end save/load tests with use_dtensor_format=True."""
+    """End-to-end save/load tests with use_dtensor_format=True.
+
+    These tests use DeviceMesh.from_group() (not get_dtensor_metadata) so that
+    torch.distributed.checkpoint.save/load can use properly-initialized NCCL
+    communicators.  get_dtensor_metadata() is tested separately in TestGetDTensorMetadata.
+    """
 
     def setup_method(self, method):
         pass
@@ -420,157 +437,145 @@ class TestDTensorSaveLoad:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    def _make_sh_ten(self, key, tensor, device_mesh, replica_id=None):
+        if replica_id is None:
+            replica_id = Utils.rank
+        return ShardedTensor.from_rank_offsets(
+            key,
+            tensor,
+            replica_id=replica_id,
+            dtensor_ckpt_device_mesh=device_mesh,
+            dtensor_ckpt_placements=[Replicate()],
+        )
+
     def test_save_load_replicated_tensors_preserves_values(self, tmp_path_dist_ckpt):
         """Round-trip save→load with DTensor format recovers original tensor values."""
         Utils.initialize_model_parallel(1, 1)
+        device_mesh = _make_dcp_device_mesh()
 
         tensor_a = torch.full((4, 8), 2.0, dtype=torch.float32, device='cuda')
         tensor_b = torch.full((3, 5), 3.5, dtype=torch.float32, device='cuda')
 
         save_sd = {
-            'key_a': _make_replicated_sh_ten('key_a', tensor_a),
-            'key_b': _make_replicated_sh_ten('key_b', tensor_b),
+            'key_a': self._make_sh_ten('key_a', tensor_a, device_mesh),
+            'key_b': self._make_sh_ten('key_b', tensor_b, device_mesh),
         }
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_replicated') as ckpt_dir:
-            save(save_sd, ckpt_dir, async_strategy=None, use_dtensor_format=True)
-            torch.distributed.barrier()
+            save(save_sd, ckpt_dir, async_sharded_save=False, use_dtensor_format=True)
 
-            placements, device_mesh = _get_dtensor_metadata_dp_only()
             load_spec = {
-                'key_a': ShardedTensor.from_rank_offsets(
-                    'key_a',
-                    torch.zeros(4, 8, dtype=torch.float32, device='cuda'),
-                    replica_id=Utils.rank,
-                    dtensor_ckpt_device_mesh=device_mesh,
-                    dtensor_ckpt_placements=placements,
-                ),
-                'key_b': ShardedTensor.from_rank_offsets(
-                    'key_b',
-                    torch.zeros(3, 5, dtype=torch.float32, device='cuda'),
-                    replica_id=Utils.rank,
-                    dtensor_ckpt_device_mesh=device_mesh,
-                    dtensor_ckpt_placements=placements,
-                ),
+                'key_a': self._make_sh_ten('key_a', torch.zeros(4, 8, device='cuda'), device_mesh),
+                'key_b': self._make_sh_ten('key_b', torch.zeros(3, 5, device='cuda'), device_mesh),
             }
-
             loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
 
         assert set(loaded.keys()) == {'key_a', 'key_b'}
         assert torch.allclose(loaded['key_a'], tensor_a)
         assert torch.allclose(loaded['key_b'], tensor_b)
+        Utils.destroy_model_parallel()
 
     def test_save_load_bfloat16(self, tmp_path_dist_ckpt):
         """DTensor format round-trip works with bfloat16 tensors."""
         Utils.initialize_model_parallel(1, 1)
+        device_mesh = _make_dcp_device_mesh()
 
         tensor = torch.full((6, 4), 1.5, dtype=torch.bfloat16, device='cuda')
-        save_sd = {'bf_key': _make_replicated_sh_ten('bf_key', tensor)}
+        save_sd = {'bf_key': self._make_sh_ten('bf_key', tensor, device_mesh)}
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_bf16') as ckpt_dir:
-            save(save_sd, ckpt_dir, async_strategy=None, use_dtensor_format=True)
-            torch.distributed.barrier()
+            save(save_sd, ckpt_dir, async_sharded_save=False, use_dtensor_format=True)
 
-            placements, device_mesh = _get_dtensor_metadata_dp_only()
             load_spec = {
-                'bf_key': ShardedTensor.from_rank_offsets(
-                    'bf_key',
-                    torch.zeros(6, 4, dtype=torch.bfloat16, device='cuda'),
-                    replica_id=Utils.rank,
-                    dtensor_ckpt_device_mesh=device_mesh,
-                    dtensor_ckpt_placements=placements,
+                'bf_key': self._make_sh_ten(
+                    'bf_key', torch.zeros(6, 4, dtype=torch.bfloat16, device='cuda'), device_mesh
                 ),
             }
             loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
 
         assert loaded['bf_key'].dtype == torch.bfloat16
         assert torch.allclose(loaded['bf_key'].float(), tensor.float())
+        Utils.destroy_model_parallel()
 
     def test_save_load_nested_state_dict(self, tmp_path_dist_ckpt):
         """DTensor format round-trip preserves nested state dict structure."""
         Utils.initialize_model_parallel(1, 1)
+        device_mesh = _make_dcp_device_mesh()
 
-        placements, device_mesh = _get_dtensor_metadata_dp_only()
         t1 = torch.full((2, 4), 11.0, device='cuda')
         t2 = torch.full((3,), 22.0, device='cuda')
 
-        def make_sh_ten(key, tensor):
-            return ShardedTensor.from_rank_offsets(
-                key,
-                tensor,
-                replica_id=Utils.rank,
-                dtensor_ckpt_device_mesh=device_mesh,
-                dtensor_ckpt_placements=placements,
-            )
-
         save_sd = {
             'model': {
-                'weight': make_sh_ten('model.weight', t1),
-                'bias': make_sh_ten('model.bias', t2),
+                'weight': self._make_sh_ten('model.weight', t1, device_mesh),
+                'bias': self._make_sh_ten('model.bias', t2, device_mesh),
             }
         }
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_nested') as ckpt_dir:
-            save(save_sd, ckpt_dir, async_strategy=None, use_dtensor_format=True)
-            torch.distributed.barrier()
+            save(save_sd, ckpt_dir, async_sharded_save=False, use_dtensor_format=True)
 
             load_spec = {
                 'model': {
-                    'weight': make_sh_ten('model.weight', torch.zeros(2, 4, device='cuda')),
-                    'bias': make_sh_ten('model.bias', torch.zeros(3, device='cuda')),
+                    'weight': self._make_sh_ten(
+                        'model.weight', torch.zeros(2, 4, device='cuda'), device_mesh
+                    ),
+                    'bias': self._make_sh_ten(
+                        'model.bias', torch.zeros(3, device='cuda'), device_mesh
+                    ),
                 }
             }
             loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
 
         assert torch.allclose(loaded['model']['weight'], t1)
         assert torch.allclose(loaded['model']['bias'], t2)
+        Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(
         torch.cuda.device_count() < 2, reason="TP=2 requires at least 2 GPUs"
     )
     def test_save_load_tp2_sharded_tensors(self, tmp_path_dist_ckpt):
-        """DTensor format round-trip with TP=2: each rank holds a shard."""
+        """DTensor format round-trip with TP=2: each rank holds its TP shard."""
         Utils.initialize_model_parallel(2, 1)
-
-        from megatron.core.utils import get_dtensor_metadata
-
-        tp_axis = 0
-        placements, device_mesh = get_dtensor_metadata(tp=True, tp_axis=tp_axis)
 
         from megatron.core import parallel_state
 
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         tp_size = 2
-        # Global tensor [0..15] split along axis 0: rank 0 gets rows 0-7, rank 1 gets rows 8-15
+        # dp_rank disambiguates replicas across DP groups (replica_id=0 is the main replica)
+        dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+        # Use a properly-initialized 2-d mesh for TP+DP
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        dp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        device_mesh = DeviceMesh.from_group([tp_group, dp_group], "cuda",
+                                            mesh_dim_names=("tp", "dp"))
+        placements = [Shard(0), Replicate()]
+
+        # Global tensor rows [0,8) on tp_rank=0, rows [8,16) on tp_rank=1
         local_tensor = torch.arange(
             tp_rank * 8, (tp_rank + 1) * 8, dtype=torch.float32, device='cuda'
         ).reshape(8, 1)
 
-        save_sd = {
-            'weight': ShardedTensor.from_rank_offsets(
-                'weight',
-                local_tensor,
-                (tp_axis, tp_rank, tp_size),
-                replica_id=0,
+        def make_tp_sh_ten(key, tensor):
+            return ShardedTensor.from_rank_offsets(
+                key,
+                tensor,
+                (0, tp_rank, tp_size),
+                replica_id=dp_rank,
                 dtensor_ckpt_device_mesh=device_mesh,
                 dtensor_ckpt_placements=placements,
             )
-        }
+
+        save_sd = {'weight': make_tp_sh_ten('weight', local_tensor)}
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_tp2') as ckpt_dir:
-            save(save_sd, ckpt_dir, async_strategy=None, use_dtensor_format=True)
-            torch.distributed.barrier()
+            save(save_sd, ckpt_dir, async_sharded_save=False, use_dtensor_format=True)
 
             load_spec = {
-                'weight': ShardedTensor.from_rank_offsets(
-                    'weight',
-                    torch.zeros(8, 1, dtype=torch.float32, device='cuda'),
-                    (tp_axis, tp_rank, tp_size),
-                    replica_id=0,
-                    dtensor_ckpt_device_mesh=device_mesh,
-                    dtensor_ckpt_placements=placements,
-                )
+                'weight': make_tp_sh_ten('weight', torch.zeros(8, 1, device='cuda'))
             }
             loaded = load(load_spec, ckpt_dir, use_dtensor_format=True)
 
         assert torch.allclose(loaded['weight'], local_tensor)
+        Utils.destroy_model_parallel()
