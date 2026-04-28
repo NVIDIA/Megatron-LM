@@ -2210,27 +2210,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.active_token_count + effective_prefill_chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
-        # Given the [active | paused | dead] layout,
-        # new requests must land at the right edge of the active region (active_count).
-        # When no requests are paused, that position equals total_request_count.
-        # Any hidden chunked-prefill data already sitting at total is naturally extended in-place.
-        # write at total — and any hidden chunked-prefill data already sitting
-        # there is naturally extended in place.
-        # When paused requests exist
-        # (reachable via the chunked-prefill continuation bypass of check_availability's paused==0)
-        # inserting at total would land past the paused region.
-        # Instead, we right-rotate [active_count..total] by one slot.
-        # That moves the hidden chunked-prefill record from total down into active_count.
+        # In the [active | paused | dead] layout, new requests must land at the
+        # right edge of the active region (active_count). When no requests are
+        # paused that coincides with total_request_count, so writing at
+        # active_count naturally extends any hidden chunked-prefill record
+        # sitting at total in place. When paused requests exist (reachable via
+        # the chunked-prefill continuation bypass of check_availability's
+        # paused==0 gate), inserting at total would land past the paused
+        # region; instead we right-rotate [active_count..total] by one slot,
+        # moving the hidden chunked-prefill record from total down into
+        # active_count and shifting each paused entry one slot to the right.
         active_count = self.total_request_count - self.paused_request_count
         if self.paused_request_count > 0:
             device = self.request_ids.device
             rotate_dst = torch.arange(active_count, self.total_request_count + 1, device=device)
-            rotate_src = torch.cat(
-                (
-                    torch.tensor([self.total_request_count], device=device),
-                    torch.arange(active_count, self.total_request_count, device=device),
-                )
-            )
+            rotate_src = torch.roll(rotate_dst, shifts=1, dims=0)
             self._move_book_keeping_tensors(src_idxs=rotate_src, dst_idxs=rotate_dst)
 
         current_id = active_count
