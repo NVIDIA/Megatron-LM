@@ -29,11 +29,6 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.skipif(not HAVE_DTENSOR, reason="DTensor not available")
 
 
-@pytest.fixture(scope="class")
-def tmp_path_dist_ckpt(tmp_path_factory):
-    return tmp_path_factory.mktemp("dtensor_ckpt")
-
-
 def _get_dtensor_metadata_dp_only():
     """Helper: returns (placements, device_mesh) for DP-only (Replicate) DTensor."""
     from megatron.core.utils import get_dtensor_metadata
