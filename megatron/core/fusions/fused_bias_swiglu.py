@@ -298,7 +298,7 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, clamp
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:
-        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
+        output = WeightedSwiGLUFunction.apply(input, weights, fp8_input_store, clamp_value)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 

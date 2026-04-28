@@ -1778,7 +1778,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            mlp_output_with_bias = self.mlp(
+                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
+            )
 
         nvtx_range_pop(suffix="mlp")
 

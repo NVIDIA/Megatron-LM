@@ -2171,6 +2171,9 @@ class TransformerConfig(ModelParallelConfig):
                     f"{n_decoders_with_embedding} decoder layers, but "
                     f"moe_n_hash_layers={self.moe_n_hash_layers}."
                 )
+            assert not self.overlap_moe_expert_parallel_comm, (
+                "overlap_moe_expert_parallel_comm does not support moe_n_hash_layers > 0 for now."
+            )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
