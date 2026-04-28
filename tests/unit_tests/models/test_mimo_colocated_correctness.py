@@ -51,6 +51,7 @@ Run with::
 """
 
 import os
+import re
 from functools import partial
 
 import pytest
@@ -61,8 +62,10 @@ from packaging import version
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.models.mimo.colocated_schedule import colocated_forward_backward_with_pp
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.transformer.enums import ModelType
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.models.test_mimo_1f1b_schedule import (
@@ -164,7 +167,7 @@ def _set_deterministic_env():
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
 
-def _wire_training_hooks(mimo_model, language_pg, vision_pg):
+def _wire_training_hooks(mimo_model, language_pg, vision_pg, llm_grid=None):
     """Attach no_sync / finalize_grads / grad_scale hooks to a MimoModel.
 
     The finalize hook implements the heterogeneous-DP grad-scaling story
@@ -185,6 +188,12 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
       3. Calls ``scale_gradients(1/N_global)`` on each side — lands the
          true global per-token mean uniformly on encoder and LLM grads.
 
+    ``llm_grid`` is required for LLM PP>1 callers: with PP>1 the inner
+    schedule only populates ``num_tokens`` on the last LLM PP stage; this
+    hook broadcasts it from the last PP rank to earlier stages before the
+    DP all-reduce so every rank arrives at the same ``N_global``.
+    Pass ``None`` (default) for PP=1, where the broadcast is a no-op.
+
     Note: encoder has no loss_func (so nothing emits a per-encoder-DP
     ``num_tokens`` to feed ``finalize_model_grads``' internal all-reduce).
     Doing the all-reduce once ourselves and calling ``scale_gradients``
@@ -193,6 +202,7 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
     """
 
     no_sync_func = build_no_sync_func(mimo_model)
+    pp_group = llm_grid.get_pg("pp") if llm_grid is not None else None
 
     def finalize_grads_func(model_list, num_tokens, force_all_reduce=False, **kwargs):
         # Schedule passes the per-rank sum-across-microbatches of what the
@@ -202,6 +212,13 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg):
             "finalize_grads_func expects calculate_per_token_loss=True on the "
             "TransformerConfig so the schedule forwards total_num_tokens; got None."
         )
+
+        # PP>1: only the last LLM PP stage emits a non-zero num_tokens
+        # from the loss_func. Broadcast to earlier stages so every rank
+        # holds the same value before the DP all-reduce below.
+        if pp_group is not None and pp_group.size() > 1:
+            last_rank = dist.get_global_rank(pp_group, pp_group.size() - 1)
+            dist.broadcast(num_tokens, src=last_rank, group=pp_group)
 
         # Phase 1: lift the all-reduce. After this, every rank (including
         # encoder-only replicas) has N_global = total non-padded tokens in
@@ -828,6 +845,173 @@ def _assert_encoder_weights_match(ref_module, dist_module, rtol=1e-3, atol=1e-3)
         )
 
 
+_LLM_LAYER_RX = re.compile(r'^(.*decoder\.layers\.)(\d+)(\..*)$')
+
+
+def _llm_pp_remap_name(name, pp_rank, layers_per_stage):
+    """Remap a dist LLM param name (local layer idx) to its ref PP=1 name (global idx).
+
+    Dist's ``decoder.layers.{local_idx}`` on PP stage ``s`` corresponds to
+    ref's global layer ``s * layers_per_stage + local_idx``. Non-layer
+    params (embedding, final_layernorm, output_layer) are present only on
+    stages that own them and their names match exactly between ref and dist.
+    """
+    m = _LLM_LAYER_RX.match(name)
+    if not m:
+        return name
+    prefix, local_idx_s, suffix = m.groups()
+    return f"{prefix}{pp_rank * layers_per_stage + int(local_idx_s)}{suffix}"
+
+
+def _copy_llm_params_pp_aware(ref_module, dist_module, pp_rank, pp_size, num_layers):
+    """Copy LLM params ref (PP=1) → dist (PP>=1) with layer-index remapping.
+
+    Assumes ``dist_llm_tp == ref_llm_tp`` so shards line up 1:1; callers
+    must verify (the consolidated correctness test only enables LLM PP-aware
+    copy/oracle when this holds).
+    """
+    assert num_layers % pp_size == 0, (
+        f"num_layers={num_layers} not divisible by pp_size={pp_size}; "
+        f"oracle requires even PP split."
+    )
+    layers_per_stage = num_layers // pp_size
+    ref_params = dict(ref_module.named_parameters())
+
+    with torch.no_grad():
+        for name, dist_param in dist_module.named_parameters():
+            ref_name = _llm_pp_remap_name(name, pp_rank, layers_per_stage)
+            assert ref_name in ref_params, (
+                f"LLM param '{name}' on PP stage {pp_rank} maps to ref name "
+                f"'{ref_name}' which does not exist in ref (ref has llm_pp=1)."
+            )
+            ref_param = ref_params[ref_name]
+            assert ref_param.shape == dist_param.shape, (
+                f"LLM param '{name}': ref.shape={tuple(ref_param.shape)} != "
+                f"dist.shape={tuple(dist_param.shape)} — oracle requires "
+                f"dist_llm_tp == ref_llm_tp."
+            )
+            dist_param.data.copy_(ref_param.data.to(dist_param.dtype))
+
+
+def _copy_ref_llm_with_tp_and_pp_remap(
+    ref_module, dist_module, ref_tp_group, dist_tp_group, pp_rank, pp_size, num_layers
+):
+    """Copy ref LLM (PP=1, ``ref_llm_tp``) → dist LLM (PP>=1, ``dist_llm_tp``).
+
+    Combines the PP-aware layer-index remap (from
+    :func:`_llm_pp_remap_name`) with the TP reshard
+    (all-gather-across-ref-TP + slice-by-dist-TP). Needed when fan-out
+    PP>1 forces ``dist_llm_tp != enc_tp`` on a fixed rank count (e.g.
+    fan-out PP=2 on 8 GPUs).
+
+    Two-phase to avoid cross-PP-stage collectives:
+
+    * Phase 1 — gather full ref params across ``ref_tp_group``. Iterates
+      ``ref_module.named_parameters()``, which is identical on every
+      rank in the same ``ref_tp_group``, so the all-gather collective is
+      lockstep regardless of how dist's PP layout splits those ranks.
+    * Phase 2 — copy from ``full_ref`` into this rank's local dist params
+      (PP-staged) using the layer-index remap. No collectives.
+
+    The naive "iterate dist_module and all-gather inside the loop"
+    approach hangs whenever dist's PP split spreads across a ref TP
+    group: ranks on different dist PP stages iterate different params
+    and never reach the same all-gather call together.
+    """
+    assert num_layers % pp_size == 0, f"num_layers={num_layers} not divisible by pp_size={pp_size}."
+    layers_per_stage = num_layers // pp_size
+    ref_tp_size = dist.get_world_size(ref_tp_group)
+    dist_tp_rank = dist.get_rank(dist_tp_group)
+    dist_tp_size = dist.get_world_size(dist_tp_group)
+
+    # Phase 1: gather full ref params across ref_tp_group. Safe because
+    # every rank in ref_tp_group iterates ref_module.named_parameters()
+    # in the same order.
+    full_ref = {}
+    with torch.no_grad():
+        for name, ref_param in ref_module.named_parameters():
+            partition_dim = getattr(ref_param, 'partition_dim', -1)
+            if ref_tp_size <= 1 or partition_dim < 0:
+                full_ref[name] = ref_param.data.detach().clone()
+                continue
+            shards = [torch.empty_like(ref_param.data) for _ in range(ref_tp_size)]
+            dist.all_gather(shards, ref_param.data.contiguous(), group=ref_tp_group)
+            full_ref[name] = torch.cat(shards, dim=partition_dim)
+
+    # Phase 2: per-rank local copy into dist's PP-staged params, with
+    # PP-aware layer-index remap and dist-TP slicing. No collectives.
+    with torch.no_grad():
+        for name, dist_param in dist_module.named_parameters():
+            ref_name = _llm_pp_remap_name(name, pp_rank, layers_per_stage)
+            assert ref_name in full_ref, (
+                f"LLM param '{name}' on PP stage {pp_rank} maps to ref name "
+                f"'{ref_name}' which does not exist in ref (ref has llm_pp=1)."
+            )
+            full_weight = full_ref[ref_name]
+            partition_dim = getattr(dist_param, 'partition_dim', -1)
+
+            if dist_tp_size <= 1 or partition_dim < 0:
+                # Replicated on dist (or no TP): full ref weight should
+                # match dist's local shape.
+                assert full_weight.shape == dist_param.shape, (
+                    f"Param '{name}' (ref '{ref_name}'): full_ref.shape="
+                    f"{tuple(full_weight.shape)} != dist.shape="
+                    f"{tuple(dist_param.shape)} (dist_tp={dist_tp_size}, "
+                    f"partition_dim={partition_dim})"
+                )
+                dist_param.data.copy_(full_weight.to(dist_param.dtype))
+                continue
+
+            dist_slice = torch.tensor_split(full_weight, dist_tp_size, dim=partition_dim)[
+                dist_tp_rank
+            ]
+            assert dist_slice.shape == dist_param.shape, (
+                f"Param '{name}' (ref '{ref_name}'): sliced.shape="
+                f"{tuple(dist_slice.shape)} != dist.shape="
+                f"{tuple(dist_param.shape)} (ref_tp={ref_tp_size}, "
+                f"dist_tp={dist_tp_size}, partition_dim={partition_dim})"
+            )
+            dist_param.data.copy_(dist_slice.to(dist_param.dtype))
+
+
+def _assert_llm_weights_match_pp_aware(
+    ref_module, dist_module, pp_rank, pp_size, num_layers, rtol=1e-2, atol=1e-2
+):
+    """Assert dist LLM shards match ref (PP=1) via the PP-aware layer-index remap.
+
+    Counterpart to :func:`_copy_llm_params_pp_aware`. Non-layer params
+    (embedding, final_layernorm, output_layer) only exist on stages that
+    own them and their names are unchanged between ref and dist.
+    """
+    layers_per_stage = num_layers // pp_size
+    ref_params = dict(ref_module.named_parameters())
+
+    mismatches = []
+    for name, dist_param in dist_module.named_parameters():
+        ref_name = _llm_pp_remap_name(name, pp_rank, layers_per_stage)
+        assert ref_name in ref_params, (
+            f"LLM param '{name}' maps to ref '{ref_name}' which does not exist "
+            f"(ref has llm_pp=1)."
+        )
+        ref_param = ref_params[ref_name]
+        assert ref_param.shape == dist_param.shape, (
+            f"LLM param '{name}': ref.shape={tuple(ref_param.shape)} != "
+            f"dist.shape={tuple(dist_param.shape)}."
+        )
+        try:
+            torch.testing.assert_close(dist_param.data, ref_param.data, rtol=rtol, atol=atol)
+        except AssertionError as e:
+            mismatches.append((name, ref_name, str(e)))
+
+    if mismatches:
+        rank = dist.get_rank()
+        details = "\n".join(f"  {n} -> {rn}: {msg}" for n, rn, msg in mismatches)
+        raise AssertionError(
+            f"Rank {rank}: {len(mismatches)} LLM param(s) diverged between "
+            f"PP>1 dist model and PP=1 reference:\n{details}"
+        )
+
+
 class _BatchIterator:
     """Minimal iterator over a pre-generated list of batches."""
 
@@ -857,17 +1041,39 @@ def _run_forward_backward(
     seq_length,
     num_microbatches,
 ):
-    """One forward/backward pass through the mimo schedule."""
-    return schedule.forward_backward_no_pipelining(
-        forward_step_func=partial(
-            forward_step, encoder_grid=enc_grid, llm_grid=llm_grid, encoder_name=encoder_name
-        ),
+    """Dispatch to no-pipelining (LLM PP=1) or three-phase (LLM PP>1) schedule.
+
+    PP=1 path uses :func:`forward_step` so per-rank slicing for fan-in/
+    fan-out happens at forward-time inside the no-pipelining schedule.
+    PP>1 path uses :func:`colocated_forward_backward_with_pp`, which
+    applies the same fan-in/fan-out narrowing internally (encoder side
+    in ``_slice_for_encoder_dp``, LLM side in ``_build_lm_microbatches``).
+    """
+    pp_size = llm_grid.get_pg("pp").size() if 'pp' in llm_grid.dim_names else 1
+    if pp_size <= 1:
+        return schedule.forward_backward_no_pipelining(
+            forward_step_func=partial(
+                forward_step, encoder_grid=enc_grid, llm_grid=llm_grid, encoder_name=encoder_name
+            ),
+            data_iterator=_BatchIterator(batches),
+            model=[mimo_model],
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            forward_only=False,
+            pg_collection=language_pg,
+        )
+
+    return colocated_forward_backward_with_pp(
+        mimo_model=mimo_model,
         data_iterator=_BatchIterator(batches),
-        model=[mimo_model],
         num_microbatches=num_microbatches,
+        encoder_grid=enc_grid,
+        llm_grid=llm_grid,
+        encoder_name=encoder_name,
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
-        forward_only=False,
+        p2p_communicator=P2PCommunicator(pp_group=llm_grid.get_pg("pp"), config=mimo_model.config),
         pg_collection=language_pg,
     )
 
@@ -919,43 +1125,93 @@ class TestColocatedGradientScalingCorrectness:
         version.parse(torch.__version__) < version.parse("2.3.0"), reason="Requires PyTorch 2.3+"
     )
     @pytest.mark.parametrize(
-        "enc_tp,enc_dp,llm_tp,llm_dp", [(2, 4, 4, 2), (4, 2, 2, 4)], ids=["fan_in", "fan_out"]
+        "enc_tp,enc_dp,llm_tp,llm_pp,llm_dp",
+        [
+            (2, 4, 4, 1, 2),  # fan-in,  PP=1
+            (4, 2, 2, 1, 4),  # fan-out, PP=1
+            (2, 4, 2, 2, 2),  # fan-in,  PP=2 (dist_llm_tp == enc_tp → LLM weight oracle on)
+            (4, 2, 1, 2, 4),  # fan-out, PP=2 (dist_llm_tp != enc_tp → LLM weight oracle off)
+        ],
+        ids=["fan_in_pp1", "fan_out_pp1", "fan_in_pp2", "fan_out_pp2"],
     )
     @pytest.mark.parametrize(
         "mask_pattern", ["uniform", "asymmetric"], ids=["uniform", "asymmetric"]
     )
     @pytest.mark.parametrize("num_microbatches", [1, 4], ids=["mbs1", "mbs4"])
     def test_dist_matches_dp1_reference_post_step_weights(
-        self, enc_tp, enc_dp, llm_tp, llm_dp, mask_pattern, num_microbatches
+        self, enc_tp, enc_dp, llm_tp, llm_pp, llm_dp, mask_pattern, num_microbatches
     ):
-        """Heterogeneous-DP dist post-step encoder weights match equal-DP reference.
+        """Heterogeneous-(TP/DP/PP) dist post-step weights match equal-DP PP=1 reference.
 
         Builds two MimoModels on every rank:
 
-        * Dist: the heterogeneous TP/DP config under test, with
+        * Dist: the heterogeneous TP/DP/PP config under test, with
           ``calculate_per_token_loss=True`` + custom finalize hook that
           pure-SUMs DDP and externally divides by ``N_global``.
         * Ref: equal-DP uniform with ``enc_tp=dist_enc_tp``,
-          ``enc_dp=dist_enc_dp``, ``llm_tp=dist_enc_tp``,
-          ``llm_dp=dist_enc_dp`` — bridge is
-          ``BridgeDirection.EQUAL`` (identity passthrough), and the
-          encoder TP sharding matches dist's exactly so shards line up
-          1:1 for comparison.
+          ``enc_dp=dist_enc_dp``, ``llm_tp=dist_enc_tp``, ``llm_pp=1``,
+          ``llm_dp=dist_enc_dp`` — bridge is ``BridgeDirection.EQUAL``
+          (identity passthrough), and the encoder TP sharding matches
+          dist's exactly so shards line up 1:1 for comparison.
 
-        Both models run the same finalize wiring; both DDPs pure-SUM
-        across their own DP group, then divide uniformly by ``N_global``.
-        LLM TP differs between the two models, which introduces fp32 TP
-        accumulation-order drift in the gradient flowing back to the
-        encoder but does not change the per-token-mean invariant that the
-        post-step encoder oracle checks.
+        For ``llm_pp == 1`` the dist side runs the no-pipelining schedule
+        with the existing ``forward_step`` (which narrows for fan-in/
+        fan-out at forward time). For ``llm_pp > 1`` the dist side runs
+        :func:`colocated_forward_backward_with_pp` (three-phase: encoder
+        forward → LLM 1F1B → encoder backward), which applies the same
+        narrowing internally. Ref always runs no-pipelining (``llm_pp=1``).
 
         Reference weights are copied into the distributed model so both
         start from identical state. One Adam step later, the dist shards
-        should match the ref shards within fp32 precision.
+        should match the ref shards within fp32 precision. Oracles:
+
+        * Always: encoder weights, first-layer encoder grads.
+        * ``llm_pp == 1``: LLM input + LLM logits (TP+DP-gathered, robust
+          to different LLM TP layouts).
+        * ``llm_pp > 1`` AND ``dist_llm_tp == enc_tp``: LLM weights via
+          PP-aware layer-index remap (shards align 1:1 only if dist and
+          ref share the same LLM TP).
+
+        Fan-out PP>1 with ``dist_llm_tp == enc_tp`` is impossible on 8
+        GPUs (``enc_tp * 2 * llm_dp = 8`` and ``llm_dp > enc_dp = 8/enc_tp``
+        contradict), so the LLM weight oracle is skipped there — encoder
+        weight match alone is the gold-standard end-to-end signal because
+        the encoder's grads pass through the LLM forward + backward.
         """
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        if num_microbatches < llm_pp:
+            pytest.skip(
+                f"PP={llm_pp} requires num_microbatches >= {llm_pp}; " f"got {num_microbatches}"
+            )
 
+        # Wrap the entire test body so we can catch and PRINT any
+        # exception before pytest's distributed traceback formatter gets
+        # jumbled across 8 ranks. Without this, NCCL teardown across
+        # ranks that fail asymmetrically (some raise, some don't) tends
+        # to SIGABRT before pytest emits per-rank tracebacks.
+        rank = dist.get_rank()
+        try:
+            self._run_test_body(
+                rank, enc_tp, enc_dp, llm_tp, llm_pp, llm_dp, mask_pattern, num_microbatches
+            )
+        except Exception:
+            import traceback as _tb
+
+            print(
+                f"\n=== rank {rank} TEST EXCEPTION ===\n"
+                f"config: enc_tp={enc_tp} enc_dp={enc_dp} llm_tp={llm_tp} "
+                f"llm_pp={llm_pp} llm_dp={llm_dp} mbs={num_microbatches} "
+                f"mask={mask_pattern}\n"
+                f"{_tb.format_exc()}\n"
+                f"=== end rank {rank} exception ===\n",
+                flush=True,
+            )
+            raise
+
+    def _run_test_body(
+        self, rank, enc_tp, enc_dp, llm_tp, llm_pp, llm_dp, mask_pattern, num_microbatches
+    ):
         _set_deterministic_env()
         torch.use_deterministic_algorithms(True)
         torch.backends.cudnn.deterministic = True
@@ -963,17 +1219,21 @@ class TestColocatedGradientScalingCorrectness:
 
         encoder_name = "images"
         hidden_size, seq_length, vocab_size = 256, 64, 1000
+        num_layers = 2
+        # PP-aware param copy/oracle requires layers divisible by pp_size.
+        assert num_layers % llm_pp == 0
         micro_batch_size = 2
 
         # Global batch spans the larger DP side; dist pre-slices per rank
-        # before forward_step (which further slices encoder/LLM side).
+        # via _slice_global_batch_for_dist (LLM-DP-sized for fan-in,
+        # encoder-DP-sized for fan-out).
         global_batch_size = micro_batch_size * max(enc_dp, llm_dp)
 
         # Grids: dist is heterogeneous; ref is equal-DP uniform matching
         # dist's encoder so the bridge is identity and encoder shards
         # align 1:1 for direct comparison.
         dist_enc_grid = create_hypercomm_grid(offset=0, tp=enc_tp, cp=1, pp=1, dp=enc_dp)
-        dist_llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, cp=1, pp=1, dp=llm_dp)
+        dist_llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, cp=1, pp=llm_pp, dp=llm_dp)
         ref_enc_grid = create_hypercomm_grid(offset=0, tp=enc_tp, cp=1, pp=1, dp=enc_dp)
         ref_llm_grid = create_hypercomm_grid(offset=0, tp=enc_tp, cp=1, pp=1, dp=enc_dp)
         create_all_embedding_groups([dist_enc_grid, dist_llm_grid, ref_enc_grid, ref_llm_grid])
@@ -988,14 +1248,14 @@ class TestColocatedGradientScalingCorrectness:
             overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
         )
 
-        # Build dist first (heterogeneous TP/DP).
+        # Build dist first (heterogeneous TP/DP/PP).
         torch.manual_seed(12345)
         dist_mimo, _, _, dist_language_pg, dist_vision_pg = get_mimo_model(
             encoder_name=encoder_name,
             encoder_grid=dist_enc_grid,
             llm_grid=dist_llm_grid,
             hidden_size=hidden_size,
-            num_layers=2,
+            num_layers=num_layers,
             vocab_size=vocab_size,
             seq_len=seq_length,
             ddp_config=ddp_config,
@@ -1007,14 +1267,14 @@ class TestColocatedGradientScalingCorrectness:
         dist_mimo.model_type = ModelType.encoder_or_decoder
         self._mimo_models.append(dist_mimo)
 
-        # Reference with equal-DP uniform (enc_tp == llm_tp, enc_dp == llm_dp).
+        # Reference with equal-DP uniform (enc_tp == llm_tp, enc_dp == llm_dp, PP=1).
         torch.manual_seed(12345)
         ref_mimo, _, _, ref_language_pg, ref_vision_pg = get_mimo_model(
             encoder_name=encoder_name,
             encoder_grid=ref_enc_grid,
             llm_grid=ref_llm_grid,
             hidden_size=hidden_size,
-            num_layers=2,
+            num_layers=num_layers,
             vocab_size=vocab_size,
             seq_len=seq_length,
             ddp_config=ddp_config,
@@ -1026,25 +1286,57 @@ class TestColocatedGradientScalingCorrectness:
         ref_mimo.model_type = ModelType.encoder_or_decoder
         self._mimo_models.append(ref_mimo)
 
-        # Force identical initial state: encoder shards already match
-        # (same TP layout), so the helper copies shard-to-shard. LLM
-        # shards don't match (ref_llm_tp=enc_tp, dist_llm_tp=llm_tp), so
-        # the helper all-gathers ref's shards across ref's TP group and
-        # re-slices for dist's TP group.
+        # Force identical initial state. Encoder shards already match
+        # (same TP layout), so the helper copies shard-to-shard.
         _copy_ref_params_to_dist(
             ref_mimo.modality_submodules[encoder_name].module,
             dist_mimo.modality_submodules[encoder_name].module,
             ref_enc_grid.get_pg("tp"),
             dist_enc_grid.get_pg("tp"),
         )
-        _copy_ref_params_to_dist(
-            ref_mimo.language_model.module,
-            dist_mimo.language_model.module,
-            ref_llm_grid.get_pg("tp"),
-            dist_llm_grid.get_pg("tp"),
-        )
+        if llm_pp == 1:
+            # LLM shards may not match (ref_llm_tp=enc_tp, dist_llm_tp=llm_tp);
+            # the helper all-gathers ref's shards across ref's TP group and
+            # re-slices for dist's TP group.
+            _copy_ref_params_to_dist(
+                ref_mimo.language_model.module,
+                dist_mimo.language_model.module,
+                ref_llm_grid.get_pg("tp"),
+                dist_llm_grid.get_pg("tp"),
+            )
+        elif llm_tp == enc_tp:
+            # PP>1 with matching TP: dist's local layers map to a slice of
+            # ref's global layers and shards align 1:1 post-remap.
+            _copy_llm_params_pp_aware(
+                ref_mimo.language_model.module,
+                dist_mimo.language_model.module,
+                pp_rank=dist_llm_grid.get_pg("pp").rank(),
+                pp_size=llm_pp,
+                num_layers=num_layers,
+            )
+        else:
+            # PP>1 with mismatched TP (e.g. fan-out PP=2 on 8 GPUs):
+            # combine TP-reshard (all-gather ref's TP shards, slice for
+            # dist's TP) with PP-aware layer-index remap.
+            _copy_ref_llm_with_tp_and_pp_remap(
+                ref_mimo.language_model.module,
+                dist_mimo.language_model.module,
+                ref_llm_grid.get_pg("tp"),
+                dist_llm_grid.get_pg("tp"),
+                pp_rank=dist_llm_grid.get_pg("pp").rank(),
+                pp_size=llm_pp,
+                num_layers=num_layers,
+            )
 
-        _wire_training_hooks(dist_mimo, dist_language_pg, dist_vision_pg)
+        # PP>1 dist needs the broadcast-from-last-PP-stage variant of the
+        # finalize hook so num_tokens lands consistently on every rank.
+        # Ref is always PP=1 (no broadcast needed).
+        _wire_training_hooks(
+            dist_mimo,
+            dist_language_pg,
+            dist_vision_pg,
+            llm_grid=dist_llm_grid if llm_pp > 1 else None,
+        )
         _wire_training_hooks(ref_mimo, ref_language_pg, ref_vision_pg)
 
         # Distributed optimizers snapshot current param.data into fp32 master
@@ -1061,7 +1353,7 @@ class TestColocatedGradientScalingCorrectness:
         dist_optimizer = get_mimo_optimizer(dist_mimo, opt_config)
         ref_optimizer = get_mimo_optimizer(ref_mimo, opt_config)
 
-        # Data: one deterministic global batch, identical on every rank.
+        # Data: deterministic global batches, identical on every rank.
         torch.manual_seed(99999)
         global_batches = _generate_and_broadcast_global_batches(
             global_mbs=global_batch_size,
@@ -1083,16 +1375,23 @@ class TestColocatedGradientScalingCorrectness:
         ]
         ref_per_rank_batch_size = global_batch_size // enc_dp
 
-        # Logits capture: hook fires on every microbatch forward.
-        # Registered before forward/backward, removed right after so the
-        # hook doesn't leak across the second model's run.
-        dist_logits, dist_logits_hook = _register_logits_capture(dist_mimo)
-        ref_logits, ref_logits_hook = _register_logits_capture(ref_mimo)
-        dist_llm_input, dist_input_hook = _register_llm_input_capture(dist_mimo)
-        ref_llm_input, ref_input_hook = _register_llm_input_capture(ref_mimo)
+        # Capture hooks: only meaningful for PP=1 (output_layer / decoder
+        # captures fire on every microbatch; for PP>1 they fire only on
+        # specific PP stages of dist, breaking the per-microbatch
+        # alignment with ref's PP=1 captures). Skip registration for PP>1.
+        capture_hooks = []
+        if llm_pp == 1:
+            dist_logits, dist_logits_hook = _register_logits_capture(dist_mimo)
+            ref_logits, ref_logits_hook = _register_logits_capture(ref_mimo)
+            dist_llm_input, dist_input_hook = _register_llm_input_capture(dist_mimo)
+            ref_llm_input, ref_input_hook = _register_llm_input_capture(ref_mimo)
+            capture_hooks = [dist_logits_hook, ref_logits_hook, dist_input_hook, ref_input_hook]
+        else:
+            dist_logits = ref_logits = dist_llm_input = ref_llm_input = None
 
         try:
-            # One optimizer step on dist (heterogeneous forward_step slicing).
+            # One optimizer step on dist (PP=1: no-pipelining + forward_step;
+            # PP>1: three-phase schedule with internal narrowing).
             dist_optimizer.zero_grad()
             _run_forward_backward(
                 mimo_model=dist_mimo,
@@ -1115,7 +1414,7 @@ class TestColocatedGradientScalingCorrectness:
                 "silently zeroed by wrong scaling"
             )
 
-            # One optimizer step on ref (enc_dp == llm_dp → forward_step skips slicing).
+            # One optimizer step on ref (always PP=1, equal-DP).
             ref_optimizer.zero_grad()
             _run_forward_backward(
                 mimo_model=ref_mimo,
@@ -1133,18 +1432,14 @@ class TestColocatedGradientScalingCorrectness:
             assert ref_success, "Ref optimizer step failed"
             assert ref_grad_norm is not None and ref_grad_norm > 0, f"Ref grad_norm={ref_grad_norm}"
         finally:
-            dist_logits_hook.remove()
-            ref_logits_hook.remove()
-            dist_input_hook.remove()
-            ref_input_hook.remove()
+            for h in capture_hooks:
+                h.remove()
 
-        # Run all three oracles regardless of individual failures so the
-        # diff-stats print covers every layer. Order: encoder weights /
-        # first-layer grads first (tightest — same encoder TP/DP layout
-        # → shards align 1:1), then LLM logits last (loosest — different
-        # LLM TP layout drives fp32 accumulation drift). Each oracle
-        # printed its own min/mean/p95/p99/max before its assertion ran,
-        # so the user sees the full drift distribution for every test.
+        # Run all oracles regardless of individual failures so the diff-
+        # stats print covers every layer. Order: encoder weights / first-
+        # layer grads first (tightest — same encoder TP/DP layout → shards
+        # align 1:1), then LLM oracles (looser — different LLM TP layout
+        # drives fp32 accumulation drift).
         failures = []
 
         try:
@@ -1164,20 +1459,60 @@ class TestColocatedGradientScalingCorrectness:
         except AssertionError as e:
             failures.append(('first_layer_grads', str(e)))
 
-        try:
-            _assert_llm_input_match(
-                ref_llm_input, dist_llm_input, ref_llm_grid, dist_llm_grid, rtol=1e-3, atol=1e-3
-            )
-        except AssertionError as e:
-            failures.append(('llm_input', str(e)))
+        if llm_pp == 1:
+            # LLM input + logits oracles use TP+DP all-gather, so they
+            # work for any LLM TP layout. They expect one capture per
+            # microbatch, which only PP=1 satisfies.
+            try:
+                _assert_llm_input_match(
+                    ref_llm_input, dist_llm_input, ref_llm_grid, dist_llm_grid, rtol=1e-3, atol=1e-3
+                )
+            except AssertionError as e:
+                failures.append(('llm_input', str(e)))
 
-        try:
-            _assert_llm_logits_match(
-                ref_logits, dist_logits, ref_llm_grid, dist_llm_grid, rtol=1e-2, atol=1e-2
-            )
-        except AssertionError as e:
-            failures.append(('llm_logits', str(e)))
+            try:
+                _assert_llm_logits_match(
+                    ref_logits, dist_logits, ref_llm_grid, dist_llm_grid, rtol=1e-2, atol=1e-2
+                )
+            except AssertionError as e:
+                failures.append(('llm_logits', str(e)))
+        elif llm_tp == enc_tp:
+            # PP>1 with matching TP: assert LLM weights match ref via
+            # PP-aware layer-index remap. (LLM forward differs between
+            # 1F1B and no-pipelining, plus TP shards may accumulate in
+            # different order; tolerances absorb that drift even in fp32.)
+            try:
+                _assert_llm_weights_match_pp_aware(
+                    ref_mimo.language_model.module,
+                    dist_mimo.language_model.module,
+                    pp_rank=dist_llm_grid.get_pg("pp").rank(),
+                    pp_size=llm_pp,
+                    num_layers=num_layers,
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+            except AssertionError as e:
+                failures.append(('llm_weights_pp_aware', str(e)))
+        # else: PP>1 with mismatched TP (fan-out on 8 GPUs). The init copy
+        # via _copy_ref_llm_with_tp_and_pp_remap aligns starting state, but
+        # post-step shape comparison would require the same TP-reshard of
+        # ref's PP=1 weights. Skipped here — encoder weight oracle alone
+        # is sufficient end-to-end (it requires a working LLM forward +
+        # backward + bridge for the encoder grads to land correctly).
 
         if failures:
             summary = "\n\n".join(f"== {oracle} ==\n{msg}" for oracle, msg in failures)
+            # Print before raising so the message lands in stdout even when
+            # post-test cleanup blows up (NCCL teardown across asymmetric
+            # pass/fail ranks can SIGABRT before pytest formats the
+            # traceback).
+            rank = dist.get_rank()
+            print(
+                f"\n=== rank {rank} test_dist_matches failures ===\n"
+                f"config: enc_tp={enc_tp} enc_dp={enc_dp} llm_tp={llm_tp} "
+                f"llm_pp={llm_pp} llm_dp={llm_dp} mbs={num_microbatches} mask={mask_pattern}\n"
+                f"{summary}\n"
+                f"=== end rank {rank} failures ===\n",
+                flush=True,
+            )
             raise AssertionError(f"{len(failures)} oracle(s) failed:\n{summary}")
