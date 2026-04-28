@@ -26,15 +26,14 @@ class Sampling(ABC):
         self,
         logits: Tensor,
         n: int,
-        output: Tensor,
         context,
         *,
         eager: bool = False,
         cache_key: Any = None,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
-    ) -> None:
-        """Sample n tokens from logits into `output[:n]`.
+    ) -> Tensor:
+        """Sample `n` tokens from `logits` and return them.
 
         `eager` and `cache_key` are consumed by the `CudaGraphManager` wrapper when one
         is installed; unwrapped subclasses accept and ignore them.
@@ -42,13 +41,15 @@ class Sampling(ABC):
         Args:
             logits: Logits tensor of shape `[>=n, vocab_size]`.
             n: Number of rows to sample.
-            output: Destination buffer for sampled token ids.
             context: The active DynamicInferenceContext.
             eager: If True, skip CUDA graph capture/replay (consumed by the wrapper).
             cache_key: Hashable key for runner lookup (consumed by the wrapper).
             gather_indices: If provided, only sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: Per-token request mapping; when set, sampling
                 parameters are gathered per-token instead of per-request.
+
+        Returns:
+            Sampled token ids of shape `[n]`. Under CUDA graph replay, this is a static buffer.
         """
         ...
 
@@ -56,19 +57,17 @@ class Sampling(ABC):
         self,
         logits: Tensor,
         n: int,
-        output: Tensor,
         context,
         *,
         eager: bool = False,
         cache_key: Any = None,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
-    ) -> None:
+    ) -> Tensor:
         """Sample `n` tokens, optionally with CUDA graph capture/replay."""
-        self.sample_kernel(
+        return self.sample_kernel(
             logits,
             n,
-            output,
             context,
             eager=eager,
             cache_key=cache_key,
@@ -107,14 +106,11 @@ class Sampling(ABC):
                 torch.arange(num_decode, num_decode + num_prefill, device=device),
             ]
         )
-        output_tokens = torch.empty(num_tokens, device=device, dtype=torch.int64)
-        self.sample_kernel(
+        return self.sample_kernel(
             required_logits,
             num_tokens,
-            output_tokens,
             context,
             eager=eager,
             cache_key=cache_key,
             token_to_request_index=token_to_request_index,
         )
-        return output_tokens
