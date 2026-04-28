@@ -30,6 +30,8 @@ class KVBlockAllocator:
         context: "DynamicInferenceContext",
         total_count: int,
         paused_count: int,
+        max_kv_block_count: Optional[int] = None,
+        max_requests: Optional[int] = None,
         enable_prefix_caching: bool = False,
         prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
             PrefixCachingEvictionPolicy.REF_ZERO
@@ -54,10 +56,26 @@ class KVBlockAllocator:
         # so this index is always valid.
         self.dummy_block_idx = self.total_count
 
-        # Initialize block pool as a "stack" data structure
-        self.block_bag = torch.arange(
-            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+        # Fall back to context when not explicitly passed (backwards compat).
+        if max_requests is None:
+            max_requests = context.max_requests
+        if max_kv_block_count is None:
+            max_kv_block_count = context.max_kv_block_count
+
+        self.max_requests = max_requests
+        self.max_release_per_step = max_requests * max_kv_block_count
+
+        device = torch.cuda.current_device()
+
+        # Initialize block pool as a stack data structure.
+        # Pre-sized to hold the graphed release path's write footprint.
+        self.block_bag = torch.empty(
+            total_count + self.max_release_per_step, dtype=torch.int32, device=device
         )
+        self.block_bag[:total_count] = torch.arange(
+            total_count, dtype=torch.int32, device=device
+        )
+        self.block_bag[total_count:] = self.dummy_block_idx
 
         if self.enable_prefix_caching:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash.
@@ -253,9 +271,12 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(
-            self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
+        # Fill in place to preserve the tensor's memory address (required for
+        # static-address CUDA graph capture against the pre-sized block_bag).
+        self.block_bag[: self.total_count].copy_(
+            torch.arange(self.total_count, dtype=torch.int32, device=torch.cuda.current_device())
         )
+        self.block_bag[self.total_count :].fill_(self.dummy_block_idx)
 
         self.total_avail = self.total_count
 
