@@ -18,7 +18,6 @@ def _mask_loss(output_tensor, loss_mask):
         tp_reduce, is_sequence_parallel = False, False
     elif isinstance(output_tensor, tuple):
         # Special distillation flags indicating whether to perform additional tensor-parallel adjustments.
-        #(tensor([[0, 0, 0,  ..., 0, 0, 0]], device='cuda:0'), (tensor([0.2500], device='cuda:0', grad_fn=<ToCopyBackward0>), {}))
         output_tensor, tp_reduce, is_sequence_parallel = output_tensor
         param_loss = None
     else:
@@ -30,10 +29,8 @@ def _mask_loss(output_tensor, loss_mask):
     # Sharath: param loss for flextron copied from Ali
     if param_loss is not None:
         if param_loss > 0:
-            #param_loss_report = param_loss.detach().clone()
             pass
         else:
-            #param_loss_report = param_loss.detach().clone()
             param_loss = -args.router_beta * param_loss
 
     if is_sequence_parallel:
@@ -96,9 +93,10 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
     num_tokens = torch.clamp(num_tokens, min=1)
     # Report (value, num_tokens) as local-rank values; the training loop performs the
     # DP+CP all-reduce on report-dict tuples (training.py: token-weighted reduction).
-    reporting_loss_lm = torch.cat([loss_lm.clone().detach().view(1), num_tokens.view(1)])
-    report = {'lm loss': ((reporting_loss_lm[0].clone().detach().view(1)-param_loss_item.clone().detach().view(1)).detach().clone(), reporting_loss_lm[1]),
-              'param loss item': (param_loss_item.clone().detach().view(1), reporting_loss_lm[1])}
+    report = {
+        'lm loss': ((loss_lm.detach() - param_loss_item.detach()).view(1), num_tokens),
+        'param loss item': (param_loss_item.detach().view(1), num_tokens),
+    }
 
     # Add per-model LM loss breakdown for logging only when KD is NOT active
     kd_active = model.training and args.export_kd_teacher_load
@@ -107,8 +105,8 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
             is_full_model = (param_loss_item is None) or (param_loss_item.detach().abs() == 0)
         except Exception:
             is_full_model = False
-        zero_num = report['lm loss'][0].clone().detach() * 0.0
-        zero_den = report['lm loss'][1].clone().detach() * 0.0
+        zero_num = torch.zeros_like(report['lm loss'][0])
+        zero_den = torch.zeros_like(num_tokens)
         if is_full_model:
             report['lm loss (full)'] = report['lm loss']
             report['lm loss (budget)'] = (zero_num, zero_den)
@@ -126,8 +124,6 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
             loss_reduction_fn=lambda x: _mask_loss(x, loss_mask),
         )
         loss = losses["kd_loss"] + param_loss_item
-        # Local per-rank values; report-dict tuples are DP-reduced by the training loop.
-        reporting_losses = torch.stack([losses["kd_loss"].detach(), losses["logits_loss"].detach(), losses["intermediate_loss"].detach()]).to(device=reporting_loss_lm.device)
         # All-gather logits_loss across DP ranks so we can mask by selected_budget below.
         logits_loss = losses["logits_loss"].detach()
         dp_world_size = torch.distributed.get_world_size(group=parallel_state.get_data_parallel_group())
@@ -139,24 +135,24 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
         )
         logits_loss_gathered = torch.stack(logits_loss_gathered)
 
-        total_loss_report = reporting_losses[0] + param_loss_item.detach()
-        report["total loss"] = (total_loss_report, reporting_loss_lm[1])
+        total_loss_report = losses["kd_loss"].detach() + param_loss_item.detach()
+        report["total loss"] = (total_loss_report, num_tokens)
 
         # Log KD loss split into full vs budget similar to LM loss breakdown.
         try:
             is_full_model_kd = (param_loss_item is None) or (param_loss_item.detach().abs() == 0)
         except Exception:
             is_full_model_kd = False
-        zero_num_kd = total_loss_report.clone().detach() * 0.0
-        zero_den_kd = reporting_loss_lm[1].clone().detach() * 0.0
+        zero_num_kd = torch.zeros_like(total_loss_report)
+        zero_den_kd = torch.zeros_like(num_tokens)
         if is_full_model_kd:
-            report["kd loss (full)"] = (total_loss_report, reporting_loss_lm[1])
+            report["kd loss (full)"] = (total_loss_report, num_tokens)
             report["kd loss (budget)"] = (zero_num_kd, zero_den_kd)
         else:
-            report["kd loss (budget)"] = (total_loss_report, reporting_loss_lm[1])
+            report["kd loss (budget)"] = (total_loss_report, num_tokens)
             report["kd loss (full)"] = (zero_num_kd, zero_den_kd)
-        report["logits distillation loss"] = (reporting_losses[1], reporting_loss_lm[1])
-        report["intermediate distillation loss"] = (reporting_losses[2], reporting_loss_lm[1])
+        report["logits distillation loss"] = (losses["logits_loss"].detach(), num_tokens)
+        report["intermediate distillation loss"] = (losses["intermediate_loss"].detach(), num_tokens)
 
         local_budget = torch.tensor(
             [selected_budget],
@@ -174,7 +170,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
         # Create a binary mask where gathered budgets are equal to selected_budget (with 1e-6 tolerance)
         budget_mask = (budgets_gathered - selected_budget).abs() < 1e-6
         logits_loss_gathered_selected = logits_loss_gathered[budget_mask].sum()/budget_mask.sum()
-        budget_num_tokens = reporting_loss_lm[1] * budget_mask.sum()/budget_mask.shape[0]/budget_mask.sum()
+        budget_num_tokens = num_tokens.float() * budget_mask.sum()/budget_mask.shape[0]/budget_mask.sum()
 
         corrected_budget_list = list(set(args.budget_list))
 
@@ -193,10 +189,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
         for i in range(len(corrected_budget_list)):
             report[f"logits distillation loss {corrected_budget_list[i]:.3f}"] = (all_budget_logit[i], all_budget_tokens[i])
 
-    # Convert all items in report dict to torch.tensor
+    # Convert all items in report dict to a single (value, num_tokens) tensor.
     for key, val in report.items():
-        # If value is a tuple, convert both items to tensors (if not already)
         assert isinstance(val, tuple), "Value is not a tuple"
-        report[key] = torch.tensor(val, device=reporting_loss_lm[0].device, dtype=reporting_loss_lm[0].dtype)
+        report[key] = torch.tensor([val[0], val[1].view(1)], device=loss_lm.device, dtype=loss_lm.dtype)
 
     return loss, num_tokens, report
