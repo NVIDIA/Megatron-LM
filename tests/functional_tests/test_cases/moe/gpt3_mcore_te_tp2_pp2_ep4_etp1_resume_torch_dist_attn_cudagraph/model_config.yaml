@@ -121,7 +121,7 @@ MODEL_ARGS:
   # CUDA Graph args
   --cuda-graph-impl: transformer_engine
   --cuda-graph-scope: attn
-  --cuda-graph-warmup-steps: 0
+  --cuda-graph-warmup-steps: 1
   --te-rng-tracker: true
   # Add mixed precision args
   --bf16: true
