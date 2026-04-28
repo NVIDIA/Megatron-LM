@@ -154,7 +154,9 @@ class KVBlockAllocator:
 
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 # GPU-resident monotonic LRU clock.
-                self.lru_clock_gpu = torch.zeros((), dtype=torch.int64, device=device)
+                self.lru_clock_gpu = torch.zeros(
+                    (), dtype=torch.int64, device=device
+                )
 
                 # Append-only sorted list of cached block IDs, sized to
                 # 2 * total_count (+ 1 sink) to absorb one full generation
@@ -167,19 +169,15 @@ class KVBlockAllocator:
                 )
                 self._lru_cached_list_len = torch.zeros((), dtype=torch.int64, device=device)
 
-                # Position arange shared by ``_lru_evict_if_deficit`` and the
-                # compaction pass. Sized to the list capacity (excluding
-                # the +1 sink slot).
-                self._lru_compact_pos_arange = torch.arange(
-                    2 * self.total_count, dtype=torch.int64, device=device
-                )
-
                 # Pre-allocated snapshot buffers for allocation-free compaction.
                 self._lru_compact_scratch = torch.full(
                     (2 * self.total_count,), -1, dtype=torch.int32, device=device
                 )
                 self._lru_compact_scratch_ts = torch.zeros(
                     (2 * self.total_count,), dtype=torch.int64, device=device
+                )
+                self._lru_compact_pos_arange = torch.arange(
+                    2 * self.total_count, dtype=torch.int64, device=device
                 )
 
                 # Compaction interval: budget is total_count stale slots,
@@ -371,14 +369,7 @@ class KVBlockAllocator:
 
         # Reset block bag to so we start consuming from the beginning of the pool
         # for UVM performance.
-        # *Note*: Resetting the block bag is essential because if engine has been
-        # suspended, then the block bag contains non-unique IDs since the
-        # right-most IDs have been 'popped' off and are owned by the context.
-        # Without resetting the block bag, context request memory will clash and
-        # requests will point to each other's memory blocks, resulting in faulty
-        # generations.
-        # Fill in place to preserve the tensor's memory address (required for
-        # static-address CUDA graph capture against the pre-sized block_bag).
+        # Fill in place to preserve the tensor's memory address.
         self.block_bag[: self.total_count].copy_(
             torch.arange(self.total_count, dtype=torch.int32, device=torch.cuda.current_device())
         )
@@ -463,72 +454,6 @@ class KVBlockAllocator:
 
         self._pc_pending_dereg_count.zero_()
 
-    # =========================================================================
-    # Prefix caching methods
-    # =========================================================================
-
-    def register_kv_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
-        """Register blocks in the hash-to-block mapping for discovery (batch).
-
-        Args:
-            block_ids: List of block IDs.
-            block_hashes: List of computed hash values (same length as block_ids).
-        """
-        if not block_ids:
-            return
-        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
-        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
-        self.block_hashes[id_tensor] = hash_tensor
-        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
-
-    def _deregister_blocks(self, block_ids: Tensor) -> None:
-        """Remove blocks from prefix caching state and return to free pool.
-
-        Shared cleanup logic for both LRU eviction and RZ proactive eviction.
-
-        Args:
-            block_ids: Tensor of block IDs to deregister.
-        """
-        num_blocks = block_ids.numel()
-        if num_blocks == 0:
-            return
-
-        # Gather hashes via batched tensor indexing
-        block_ids_i64 = block_ids.to(torch.int64)
-        hashes = self.block_hashes[block_ids_i64].tolist()
-
-        # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
-        keys_to_delete = set(hashes) - {-1}
-        deque(
-            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
-            maxlen=0,
-        )
-
-        # Notify Mamba slot allocator (if wired) to clean up its state
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
-
-        # Reset block state (batched tensor ops)
-        self.block_hashes[block_ids] = -1
-        self.block_ref_counts[block_ids] = 0
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-            self.block_timestamps[block_ids] = 0
-
-        # Return blocks to free pool
-        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
-        self.total_avail += num_blocks
-        self.total_avail_gpu.fill_(self.total_avail)
-
-    def sync_to_cpu(self) -> None:
-        """Mirror ``total_avail_gpu`` back into the Python int.
-
-        The graphed allocate/release paths mutate ``total_avail_gpu``
-        in-place; eager callers (``add_request``, etc.) read the Python
-        ``total_avail``. Call this once per step (after the graphed
-        bodies finish) so the host-visible counter stays consistent.
-        """
-        self.total_avail = int(self.total_avail_gpu.item())
-
     def allocate_memory_blocks_gpu(self, count_gpu: Tensor) -> Tensor:
         """Shape-stable allocate with GPU-resident state.
 
@@ -591,7 +516,8 @@ class KVBlockAllocator:
         ``block_bag`` was sized ``total_count + max_release_per_step`` by
         ``__init__``, so the sink at index
         ``total_count + max_release_per_step - 1`` never collides with
-        a real push target.
+        a real push target (max real target is
+        ``total_avail_gpu + num_pushed - 1 <= total_count + max_release_per_step - 2``).
         """
         push_i64 = push_mask.to(torch.int64)
         push_prefix = torch.cumsum(push_i64, dim=0) - push_i64
@@ -629,31 +555,15 @@ class KVBlockAllocator:
         self._lru_cached_list_ts[targets] = self.block_timestamps
         self._lru_cached_list_len.add_(cached_i64.sum())
 
-    def bump_lru_clock(self) -> None:
-        """Advance the GPU-resident monotonic LRU clock by 1.
-
-        Called once per inference step from the engine, replacing the
-        previous ``context.prefix_cache_lru_clock += 1`` Python-int
-        bump. The clock is used by ``update_timestamps`` and
-        ``_lru_append_newly_cached`` to stamp blocks for staleness
-        detection.
-
-        Cheap no-op when prefix caching isn't LRU; the engine still
-        calls it unconditionally so the call site is a single line.
-        """
-        if (
-            self.enable_prefix_caching
-            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
-        ):
-            self.lru_clock_gpu.add_(1)
-
     def _enqueue_dereg_and_clear_hashes(self, dereg_mask: Tensor) -> None:
         """Shape-stable: enqueue dereg events and clear hashes.
 
         Snapshots ``(block_id, old_hash)`` pairs for each block where
         ``dereg_mask`` is True into the pending-dereg queue (for the
         host-side ``drain_pending_dereg`` pass) and clears those blocks'
-        hashes in-place.
+        hashes in-place. Used by both the prefix-aware release path
+        (REF_ZERO) and — in a later chunk — the graphed LRU eviction
+        path during allocation.
 
         Args:
             dereg_mask: ``(total_count,)`` bool. True at each block whose
@@ -685,7 +595,7 @@ class KVBlockAllocator:
         Differs from :meth:`release_memory_blocks_gpu` in that it handles
         per-block reference counting, deduplication of shared blocks, and
         the policy-specific decision of whether a zero-ref block should
-        be deregistered and pushed back to the free pool.
+        be deregistered, pushed back to the free pool, or left cached.
 
         Semantics by policy:
 
@@ -696,7 +606,7 @@ class KVBlockAllocator:
         - **LRU**: Zero-ref blocks with ``hash != -1`` stay cached (added
           to the LRU list for later eviction). Zero-ref blocks with
           ``hash == -1`` (unregistered partial blocks) go directly to
-          the free pool.
+          the free pool. *(LRU support is added in a later chunk.)*
 
         Handles duplicate block IDs correctly: prefix caching can share a
         block across multiple requests, so the same ID may appear several
@@ -718,6 +628,8 @@ class KVBlockAllocator:
         assert self.enable_prefix_caching
         assert packed_blocks.numel() == self.max_release_per_step
 
+        max_release = self.max_release_per_step
+
         # ── Decrement ref counts ──
         # Build a per-position change vector: -1 for each valid slot, 0 for
         # sentinels. Using ``scatter_add_`` lets duplicate block IDs (from
@@ -729,7 +641,7 @@ class KVBlockAllocator:
         self.block_ref_counts.scatter_add_(0, packed_blocks.long(), change)
 
         # ── Deduplicated "was released this call" per-block mask ──
-        # Scatter True into a bitmap keyed by block ID; dedup is automatic.
+        # scatter True into a bitmap keyed by block ID; dedup is automatic.
         # Sentinels land at ``dummy_block_idx``; we clear that slot after.
         safe_indices = torch.where(
             valid_mask,
@@ -906,9 +818,9 @@ class KVBlockAllocator:
         Increments ``_lru_calls_since_compact``; when the counter
         reaches ``_lru_compaction_interval``, runs an unconditional
         compaction and resets the counter. No GPU sync is needed — the
-        interval was sized in ``__init__`` so the list cannot overflow
-        between compactions under the worst-case append rate
-        (``2 * max_release_per_step`` entries per call).
+        interval was sized in ``__init__`` so the list
+        cannot overflow between compactions under the worst-case
+        append rate (``2 * max_release_per_step`` entries per call).
 
         Call once per ``update_requests`` invocation from the host
         side, before any release/append op that might push the list
@@ -966,8 +878,94 @@ class KVBlockAllocator:
         self._lru_cached_list_ts[targets] = self._lru_compact_scratch_ts
         self._lru_cached_list_len.copy_(valid_i64.sum())
 
+    def sync_to_cpu(self) -> None:
+        """Mirror ``total_avail_gpu`` back into the Python ``total_avail``.
+
+        The graphed release path only updates the GPU mirror, so callers that
+        need the CPU int (``add_request``, logging, external readers) must
+        call this before reading it.  In the graphed middle, ``update_requests``
+        calls this once at the end of the step.
+        """
+        self.total_avail = int(self.total_avail_gpu.item())
+
+    # =========================================================================
+    # Prefix caching methods
+    # =========================================================================
+
+    def register_kv_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+        """Register blocks in the hash-to-block mapping for discovery (batch).
+
+        Args:
+            block_ids: List of block IDs.
+            block_hashes: List of computed hash values (same length as block_ids).
+        """
+        if not block_ids:
+            return
+        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
+        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
+        self.block_hashes[id_tensor] = hash_tensor
+        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+
+    def _deregister_blocks(self, block_ids: Tensor) -> None:
+        """Remove blocks from prefix caching state and return to free pool.
+
+        Shared cleanup logic for both LRU eviction and RZ proactive eviction.
+
+        Args:
+            block_ids: Tensor of block IDs to deregister.
+        """
+        num_blocks = block_ids.numel()
+        if num_blocks == 0:
+            return
+
+        # Gather hashes via batched tensor indexing
+        block_ids_i64 = block_ids.to(torch.int64)
+        hashes = self.block_hashes[block_ids_i64].tolist()
+
+        # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
+        keys_to_delete = set(hashes) - {-1}
+        deque(
+            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
+            maxlen=0,
+        )
+
+        # Notify Mamba slot allocator (if wired) to clean up its state
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
+
+        # Reset block state (batched tensor ops)
+        self.block_hashes[block_ids] = -1
+        self.block_ref_counts[block_ids] = 0
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            self.block_timestamps[block_ids] = 0
+
+        # Return blocks to free pool
+        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
+        self.total_avail += num_blocks
+
+    def bump_lru_clock(self) -> None:
+        """Advance the LRU clock by one tick.  Call once per engine step.
+
+        The engine calls this once per step so that all blocks accessed
+        within the same step receive the same timestamp.  The graphed
+        allocate path (``allocate_memory_blocks_prefix_aware_gpu``) also
+        bumps the clock independently to give freshly-allocated blocks a
+        distinct timestamp for staleness detection in the LRU list.
+        """
+        if (
+            not self.enable_prefix_caching
+            or self.prefix_caching_eviction_policy != PrefixCachingEvictionPolicy.LRU
+        ):
+            return
+        self.lru_clock_gpu.add_(1)
+
     def update_timestamps(self, block_ids: Tensor) -> None:
-        """Update LRU timestamps for accessed blocks. No-op in RZ mode.
+        """Stamp ``block_timestamps`` with the current LRU clock.  No-op in RZ mode.
+
+        Does NOT bump the clock — the engine's per-step
+        ``bump_lru_clock`` call is the authoritative source of
+        step-level ticks, ensuring all blocks accessed within the same
+        step share the same timestamp.
 
         Args:
             block_ids: Tensor of block IDs that were accessed.
