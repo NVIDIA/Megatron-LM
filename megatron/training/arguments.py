@@ -732,9 +732,8 @@ def validate_args(args, defaults={}):
             args.rank,
         )
 
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-        Symbols,
-        get_hybrid_total_layer_count,
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
+        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
         parse_hybrid_pattern,
     )
@@ -2043,8 +2042,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
-
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
 
@@ -2495,156 +2493,79 @@ def _add_network_size_args(parser):
 
     group = parser.add_argument_group(title='network size')
 
-    group.add_argument(
-        '--encoder-num-layers', type=int, default=None, help='Number of encoder transformer layers.'
-    )
-    group.add_argument(
-        '--decoder-num-layers', type=int, default=None, help='Number of decoder transformer layers.'
-    )
-    group.add_argument(
-        '--group-query-attention', action='store_true', help='Use group-query attention.'
-    )
-    group.add_argument(
-        '--window-size',
-        type=tuple_type,
-        default=None,
-        help='Window size for window attention. If not provided, '
-        'window attention will be disabled.',
-    )
-    group.add_argument(
-        '--window-attn-skip-freq',
-        type=moe_freq_type,
-        default=None,
-        help='Frequency of layers to skip window attention. Accepts either: '
-        '- An integer N: Represents a (N-1):1 ratio, meaning one full attention layer '
-        'after (N-1) SWA layers. '
-        '- A string containing a Python list expression that defines a custom pattern, '
-        'e.g.: "[1,1,1,0]*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
-        'where 1 indicates SWA and 0 indicates full attention. ',
-    )
-    group.add_argument(
-        '--max-position-embeddings',
-        type=int,
-        default=None,
-        help='Maximum number of position embeddings to use. '
-        'This is the size of position embedding.',
-    )
-    group.add_argument(
-        '--position-embedding-type',
-        type=str,
-        default='learned_absolute',
-        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
-        help='Position embedding type.',
-    )
-    group.add_argument(
-        '--relative-attention-num-buckets',
-        type=int,
-        default=32,
-        help='Number of buckets for relative position embeddings.',
-    )
-    group.add_argument(
-        '--relative-attention-max-distance',
-        type=int,
-        default=128,
-        help='Maximum distance for relative position embeddings calculation.',
-    )
-    group.add_argument(
-        '--use-rotary-position-embeddings',
-        action='store_true',
-        help='Use rotary positional embeddings or not. '
-        'Deprecated: use --position-embedding-type',
-    )
-    group.add_argument(
-        '--rotary-base',
-        type=int,
-        default=10000,
-        help='Base to use for rotary positional embeddings, default 10000',
-    )
-    group.add_argument(
-        '--rotary-percent',
-        type=float,
-        default=1.0,
-        help='Percent of rotary dimension to use, default 100%%',
-    )
-    group.add_argument(
-        '--rotary-seq-len-interpolation-factor',
-        type=int,
-        default=None,
-        help='Sequence length interpolation factor for rotary embeddings.',
-    )
-    group.add_argument(
-        '--use-rope-scaling', action='store_true', help='Apply rope scaling as used in llama3.x'
-    )
-    group.add_argument(
-        '--rope-scaling-factor',
-        type=float,
-        default=8.0,
-        help='Rope scaling factor in llama3.x models',
-    )
-    group.add_argument(
-        '--no-rope-freq',
-        type=no_rope_freq_type,
-        default=None,
-        help='Controls which layers to skip performing Rotary Position Embedding. Accepts either: '
-        '- An integer N: Represents a 1:N ratio, meaning RoPE is skipped every N-1 layers. '
-        '- A string containing a Python list expression that defines a custom pattern, e.g.: '
-        '"([0]*3+[1]*1)*3" evaluates to [0,0,0,1,0,0,0,1,0,0,0,1] '
-        'where 1 indicates no-rope layer. This patten is equivalent to --no-rope-freq=4.'
-        'By default this is disabled and set to None, indicating RoPE will be performed'
-        'on every layer.',
-    )
-    group.add_argument(
-        '--no-position-embedding',
-        action='store_false',
-        help='Disable position embedding. Deprecated: use --position-embedding-type',
-        dest='add_position_embedding',
-    )
-    group.add_argument(
-        '--make-vocab-size-divisible-by',
-        type=int,
-        default=128,
-        help='Pad the vocab size to be divisible by this value.'
-        'This is added for computational efficieny reasons.',
-    )
-    group.add_argument(
-        '--openai-gelu',
-        action='store_true',
-        help='Use OpenAIs GeLU implementation. This option'
-        'should not be used unless for backward compatibility'
-        'reasons.',
-    )
-    group.add_argument(
-        '--squared-relu',
-        action='store_true',
-        help='Use squared relu activation instead of default gelu',
-    )
-    group.add_argument(
-        '--swiglu',
-        action='store_true',
-        help='Use gated linear units and SiLU activation instead of default gelu',
-    )
-    group.add_argument(
-        '--quick-geglu',
-        action='store_true',
-        help='Use quick geglu activation instead of default gelu',
-    )
-    group.add_argument(
-        '--onnx-safe',
-        type=bool,
-        required=False,
-        help='Use workarounds for known problems with ' 'Torch ONNX exporter',
-    )
-    group.add_argument(
-        '--bert-no-binary-head',
-        action='store_false',
-        help='Disable BERT binary head.',
-        dest='bert_binary_head',
-    )
-    group.add_argument(
-        '--untie-embeddings-and-output-weights',
-        action='store_true',
-        help='Untie embeddings and output weights.',
-    )
+    group.add_argument('--encoder-num-layers', type=int, default=None,
+                       help='Number of encoder transformer layers.')
+    group.add_argument('--decoder-num-layers', type=int, default=None,
+                       help='Number of decoder transformer layers.')
+    group.add_argument('--group-query-attention', action='store_true',
+                          help='Use group-query attention.')
+    group.add_argument('--window-size', type=tuple_type, default=None,
+                       help='Window size for window attention. If not provided, '
+                            'window attention will be disabled.')
+    group.add_argument('--window-attn-skip-freq', type=moe_freq_type, default=None,
+                       help='Frequency of layers to skip window attention. Accepts either: '
+                            '- An integer N: Represents a (N-1):1 ratio, meaning one full attention layer '
+                            'after (N-1) SWA layers. '
+                            '- A string containing a Python list expression that defines a custom pattern, '
+                            'e.g.: "[1,1,1,0]*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0] '
+                            'where 1 indicates SWA and 0 indicates full attention. ')
+    group.add_argument('--max-position-embeddings', type=int, default=None,
+                       help='Maximum number of position embeddings to use. '
+                       'This is the size of position embedding.')
+    group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
+                        choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
+                        help='Position embedding type.')
+    group.add_argument('--relative-attention-num-buckets', type=int, default=32,
+                        help='Number of buckets for relative position embeddings.')
+    group.add_argument('--relative-attention-max-distance', type=int, default=128,
+                        help='Maximum distance for relative position embeddings calculation.')
+    group.add_argument('--use-rotary-position-embeddings', action='store_true',
+                       help='Use rotary positional embeddings or not. '
+                       'Deprecated: use --position-embedding-type')
+    group.add_argument('--rotary-base', type=int, default=10000,
+                       help='Base to use for rotary positional embeddings, default 10000')
+    group.add_argument('--rotary-percent', type=float, default=1.0,
+                       help='Percent of rotary dimension to use, default 100%%')
+    group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
+                       help='Sequence length interpolation factor for rotary embeddings.')
+    group.add_argument('--use-rope-scaling', action='store_true',
+                       help='Apply rope scaling as used in llama3.x')
+    group.add_argument('--rope-scaling-factor', type=float, default=8.0,
+                       help='Rope scaling factor in llama3.x models')
+    group.add_argument('--no-rope-freq', type=no_rope_freq_type, default=None,
+                       help='Controls which layers to skip performing Rotary Position Embedding. Accepts either: '
+                            '- An integer N: Represents a 1:N ratio, meaning RoPE is skipped every N-1 layers. '
+                            '- A string containing a Python list expression that defines a custom pattern, e.g.: '
+                            '"([0]*3+[1]*1)*3" evaluates to [0,0,0,1,0,0,0,1,0,0,0,1] '
+                            'where 1 indicates no-rope layer. This patten is equivalent to --no-rope-freq=4.'
+                            'By default this is disabled and set to None, indicating RoPE will be performed'
+                            'on every layer.'
+                       )
+    group.add_argument('--no-position-embedding',
+                       action='store_false',
+                       help='Disable position embedding. Deprecated: use --position-embedding-type',
+                       dest='add_position_embedding')
+    group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
+                       help='Pad the vocab size to be divisible by this value.'
+                       'This is added for computational efficieny reasons.')
+    group.add_argument('--openai-gelu', action='store_true',
+                       help='Use OpenAIs GeLU implementation. This option'
+                       'should not be used unless for backward compatibility'
+                       'reasons.')
+    group.add_argument('--squared-relu', action='store_true',
+                       help='Use squared relu activation instead of default gelu')
+    group.add_argument('--swiglu', action='store_true',
+                       help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument('--quick-geglu', action='store_true',
+                       help='Use quick geglu activation instead of default gelu')
+    group.add_argument('--onnx-safe', type=bool, required=False,
+                       help='Use workarounds for known problems with '
+                       'Torch ONNX exporter')
+    group.add_argument('--bert-no-binary-head', action='store_false',
+                       help='Disable BERT binary head.',
+                       dest='bert_binary_head')
+    group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
+                       help='Untie embeddings and output weights.')
     return parser
 
 
@@ -3913,119 +3834,65 @@ def _add_validation_args(parser):
 
 def _add_tokenizer_args(parser):
     group = parser.add_argument_group(title='tokenizer')
-    group.add_argument(
-        '--vocab-size', type=int, default=None, help='Size of vocab before EOD or padding.'
-    )
-    group.add_argument(
-        '--padded-vocab-size',
-        type=int,
-        default=None,
-        help='Vocabulary size of the model (padded to be divisible by '
-        'tensor model parallel size). If not provided, it will be '
-        'automatically calculated from vocab-size.',
-    )
-    group.add_argument('--vocab-file', type=str, default=None, help='Path to the vocab file.')
-    group.add_argument('--merge-file', type=str, default=None, help='Path to the BPE merge file.')
-    group.add_argument(
-        '--vocab-extra-ids',
-        type=int,
-        default=0,
-        help='Number of additional vocabulary tokens. '
-        'They are used for span masking in the T5 model',
-    )
-    group.add_argument(
-        '--tokenizer-type',
-        type=str,
-        default=None,
-        choices=[
-            'BertWordPieceLowerCase',
-            'BertWordPieceCase',
-            'GPT2BPETokenizer',
-            'SentencePieceTokenizer',
-            'GPTSentencePieceTokenizer',
-            'HuggingFaceTokenizer',
-            'Llama2Tokenizer',
-            'TikTokenizer',
-            'MultimodalTokenizer',
-            'NullTokenizer',
-            'NullMultimodalTokenizer',
-            'SFTTokenizer',
-        ],
-        help='What type of tokenizer to use.',
-    )
-    group.add_argument(
-        '--tokenizer-model', type=str, default=None, help='Sentencepiece tokenizer model.'
-    )
-    group.add_argument(
-        '--tokenizer-metadata',
-        type=str,
-        default=None,
-        help='Path to tokenizer metadata in json format.',
-    )
-    group.add_argument(
-        '--tokenizer-special-tokens',
-        type=str,
-        nargs='+',
-        default=None,
-        help='List of special tokens. For TikTokenizer needs to have '
-        '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]',
-    )
-    group.add_argument(
-        '--tiktoken-pattern',
-        type=str,
-        default=None,
-        help='Which tiktoken pattern to use. Options: [v1, v2]',
-    )
-    group.add_argument(
-        '--tiktoken-num-special-tokens',
-        type=int,
-        default=1000,
-        help='Number of special tokens in tiktoken tokenizer',
-    )
-    group.add_argument(
-        '--tiktoken-special-tokens',
-        type=str,
-        nargs='+',
-        default=None,
-        help='List of tiktoken special tokens, needs to have '
-        '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]',
-    )
-    group.add_argument(
-        '--tokenizer-sentencepiece-legacy',
-        action='store_true',
-        default=False,
-        help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-use-fast',
-        action='store_true',
-        default=True,
-        help='Whether to use fast HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-include-special-tokens',
-        action='store_true',
-        default=True,
-        help='Converting text to ids will include special for HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-no-use-fast',
-        action='store_true',
-        default=False,
-        help='Whether to use fast HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        '--tokenizer-hf-no-include-special-tokens',
-        action='store_true',
-        default=False,
-        help='Converting text to ids will not include special for HuggingFace tokenizer.',
-    )
-    group.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        default=False,
-        help='Whether or not to allow PreTrainedTokenizer to execute remote code',
-    )
+    group.add_argument('--vocab-size', type=int, default=None,
+                       help='Size of vocab before EOD or padding.')
+    group.add_argument('--padded-vocab-size', type=int, default=None,
+                       help='Vocabulary size of the model (padded to be divisible by '
+                       'tensor model parallel size). If not provided, it will be '
+                       'automatically calculated from vocab-size.')
+    group.add_argument('--vocab-file', type=str, default=None,
+                       help='Path to the vocab file.')
+    group.add_argument('--merge-file', type=str, default=None,
+                       help='Path to the BPE merge file.')
+    group.add_argument('--vocab-extra-ids', type=int, default=0,
+                       help='Number of additional vocabulary tokens. '
+                            'They are used for span masking in the T5 model')
+    group.add_argument('--tokenizer-type', type=str,
+                       default=None,
+                       choices=['BertWordPieceLowerCase',
+                                'BertWordPieceCase',
+                                'GPT2BPETokenizer',
+                                'SentencePieceTokenizer',
+                                'GPTSentencePieceTokenizer',
+                                'HuggingFaceTokenizer',
+                                'Llama2Tokenizer',
+                                'TikTokenizer',
+                                'MultimodalTokenizer',
+                                'NullTokenizer',
+                                'NullMultimodalTokenizer',
+                                'SFTTokenizer'],
+                       help='What type of tokenizer to use.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='Sentencepiece tokenizer model.')
+    group.add_argument('--tokenizer-metadata', type=str, default=None,
+                       help='Path to tokenizer metadata in json format.')
+    group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
+                       help='List of special tokens. For TikTokenizer needs to have '
+                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+    group.add_argument('--tiktoken-pattern', type=str, default=None,
+                       help='Which tiktoken pattern to use. Options: [v1, v2]')
+    group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
+                       help='Number of special tokens in tiktoken tokenizer')
+    group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
+                       help='List of tiktoken special tokens, needs to have '
+                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+    group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
+                       help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
+    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=True,
+                       help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=True,
+                       help='Converting text to ids will include special for HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
+                       help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
+    group.add_argument("--trust-remote-code", action="store_true", default=False,
+                       help='Whether or not to allow PreTrainedTokenizer to execute remote code')
+    group.add_argument('--null-tokenizer-eod-id', type=int, default=None,
+                       help='EOD token id for NullTokenizer. Defaults to `vocab_size - 1`.')
+    group.add_argument('--null-tokenizer-pad-id', type=int, default=-1,
+                       help='Pad token id for NullTokenizer. Defaults to -1 (no pad token). '
+                            'Set to a value outside the dataset to avoid masking real tokens.')
     return parser
 
 

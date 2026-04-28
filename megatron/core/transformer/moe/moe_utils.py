@@ -775,7 +775,8 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            return torch.topk(scores, k=topk, dim=1)
+            # Sorting top-k turned off during inference
+            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active

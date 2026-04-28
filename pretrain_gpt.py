@@ -48,6 +48,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.utils import (
@@ -97,7 +98,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
           - MTP ranks (``mtp_on_this_rank``) also receive the full batch,
             regardless of pipeline stage.
 
-        Difference from ``pretrain_mamba.py``:
+        Difference from ``pretrain_hybrid.py``:
           - Return format: GPT returns a 6-tuple
             ``(tokens, labels, loss_mask, attention_mask, position_ids,
             packed_seq_params)`` where ``packed_seq_params`` is a
@@ -450,7 +451,8 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    pretrain(
+    full_config = pretrain_cfg_container_from_args(args)
+    pretrain(full_config,
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,

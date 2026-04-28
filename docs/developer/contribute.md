@@ -13,7 +13,7 @@ This document outlines the processes and policies for issues and pull requests b
 
 Everyone is welcome to contribute to the project! We recently migrated from using an internal repo to doing all development directly from the GitHub repository.
 
-When contributing it is important to ensure that changes are in line with the project direction. Small changes to fix bugs are welcomed and appreciated. If proposing large architectural changes or changes for stylistic reasons open an issue first so we can discuss it.
+When contributing it is important to ensure that changes are in line with the project direction. Small changes to fix bugs are welcomed and appreciated. **If proposing large architectural changes or changes for stylistic reasons open an issue first so we can discuss it.**
 
 ## Issue policy
 
