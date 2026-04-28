@@ -12,10 +12,11 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.extensions.transformer_engine import TENorm, te_checkpoint
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -206,6 +207,127 @@ class HybridStack(MegatronModule):
                 return layer.mamba_state_shapes_per_request()
         return None
 
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        rotary_pos_emb: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        use_inner_quantization_context: bool,
+    ) -> Tensor:
+        """Forward over self.layers with `recompute_granularity = 'full'`.
+
+        Mirrors `TransformerBlock._checkpointed_forward` but adapted to
+        HybridStack's heterogeneous layer dispatch (TransformerLayer vs
+        MambaLayer / others) and reduced argument set.
+        """
+
+        def custom(start: int, end: int):
+            def custom_forward(
+                hidden_states, attention_mask, rotary_pos_emb, padding_mask
+            ):
+                for index in range(start, end):
+                    layer = self.layers[index]
+
+                    if use_inner_quantization_context:
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        else:
+                            inner_quantization_context = nullcontext()
+                    else:
+                        inner_quantization_context = nullcontext()
+
+                    with inner_quantization_context:
+                        if isinstance(layer, TransformerLayer):
+                            hidden_states, _ = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=None,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=None,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                            )
+                        else:  # MambaLayer, MLP, MoE, GDN
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=None,
+                                packed_seq_params=packed_seq_params,
+                            )
+
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
+                return hidden_states
+
+            return custom_forward
+
+        def checkpoint_handler(forward_func):
+            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
+            if self.config.fp8 or self.config.fp4:
+                return te_checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    attention_mask,
+                    rotary_pos_emb,
+                    padding_mask,
+                )
+            else:
+                return tensor_parallel.checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    attention_mask,
+                    rotary_pos_emb,
+                    padding_mask,
+                )
+
+        if self.config.recompute_method == 'uniform':
+            # Uniformly divide the total number of layers and checkpoint
+            # the input activation of each divided chunk.
+            layer_idx = 0
+            while layer_idx < self.num_layers_per_pipeline_rank:
+                chunk_end = min(
+                    layer_idx + self.config.recompute_num_layers,
+                    self.num_layers_per_pipeline_rank,
+                )
+                hidden_states = checkpoint_handler(custom(layer_idx, chunk_end))
+                layer_idx += self.config.recompute_num_layers
+
+        elif self.config.recompute_method == 'block':
+            # Checkpoint the input activation of only a set number of individual
+            # layers and skip the rest.
+            recompute_skip_num_layers = 0
+            for layer_idx in range(self.num_layers_per_pipeline_rank):
+                # Skip recomputation when input grad computation is not needed.
+                # Need to have at least one input tensor with gradient computation
+                # for re-entrant autograd engine.
+                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
+                    recompute_skip_num_layers += 1
+                if (
+                    layer_idx >= recompute_skip_num_layers
+                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                ):
+                    hidden_states = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+                else:
+                    hidden_states = custom(layer_idx, layer_idx + 1)(
+                        hidden_states, attention_mask, rotary_pos_emb, padding_mask
+                    )
+        else:
+            raise ValueError("Invalid activation recompute method.")
+
+        return hidden_states
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -299,33 +421,45 @@ class HybridStack(MegatronModule):
                 return nullcontext()
 
         with outer_fp8_context:
-            for layer in self.layers:
-                # Layers have 1-indexed layer numbers attribute.
-                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
-                with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
-                        hidden_states, _ = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            rotary_pos_emb=rotary_pos_emb,
-                            sequence_len_offset=sequence_len_offset,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                        )
-                    else:  # MambaLayer, Expert, or MLP
-                        hidden_states = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
-                        )
+            if self.config.recompute_granularity == 'full' and self.training:
+                hidden_states = self._checkpointed_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                )
+            else:
+                for layer in self.layers:
+                    # Layers have 1-indexed layer numbers attribute.
+                    inner_quant_context = get_inner_quant_context(
+                        self.config, layer.layer_number - 1
+                    )
+                    with inner_quant_context:
+                        if isinstance(layer, TransformerLayer):
+                            hidden_states, _ = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=sequence_len_offset,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                            )
+                        else:  # MambaLayer, Expert, or MLP
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                            )
 
-                # The attention layer (currently a simplified transformer layer)
-                # outputs a tuple of (hidden_states, context). Context is intended
-                # for cross-attention, and is not needed in our model.
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[0]
+                    # The attention layer (currently a simplified transformer layer)
+                    # outputs a tuple of (hidden_states, context). Context is intended
+                    # for cross-attention, and is not needed in our model.
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

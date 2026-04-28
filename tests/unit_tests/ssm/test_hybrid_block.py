@@ -30,7 +30,7 @@ class TestHybridBlock:
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-    def get_mamba_block(self, layer_pattern):
+    def get_mamba_block(self, layer_pattern, **config_kwargs):
         layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
@@ -39,6 +39,7 @@ class TestHybridBlock:
             num_layers=len(layer_type_list),
             num_attention_heads=4,
             use_cpu_initialization=True,
+            **config_kwargs,
         )
         modules = hybrid_stack_spec.submodules
         return HybridStack(
@@ -102,6 +103,63 @@ class TestHybridBlock:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == block.config.hidden_size
         assert output.dtype == torch.float32
+
+    def _run_forward(self, block, sequence_length=32, micro_batch_size=2):
+        block.cuda()
+        block.train()
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, block.config.hidden_size)
+        ).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+        return block(hidden_states, attention_mask=attention_mask)
+
+    def test_gpu_forward_full_checkpoint_block(self):
+        """recompute_granularity='full' with method='block' across mixed layer types.
+
+        With num_layers=3 and recompute_num_layers=2, layers 0-1 take the
+        checkpointed path and layer 2 takes the un-checkpointed path.
+        """
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(
+            layer_pattern,
+            recompute_granularity='full',
+            recompute_method='block',
+            recompute_num_layers=2,
+        )
+        output = self._run_forward(block)
+        assert output.shape == (32, 2, block.config.hidden_size)
+
+    def test_gpu_forward_full_checkpoint_uniform(self):
+        """recompute_granularity='full' with method='uniform' across mixed layer types."""
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(
+            layer_pattern,
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=3,  # single chunk covering all layers
+        )
+        output = self._run_forward(block)
+        assert output.shape == (32, 2, block.config.hidden_size)
+
+    def test_gpu_forward_uniform_checkpoint_non_divisible_layers(self):
+        """uniform with chunk size that doesn't divide num_layers (5 layers, chunk=3)."""
+        layer_pattern = (
+            Symbols.MAMBA
+            + Symbols.ATTENTION
+            + Symbols.MLP
+            + Symbols.MAMBA
+            + Symbols.ATTENTION
+        )
+        block = self.get_mamba_block(
+            layer_pattern,
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=3,  # chunks: [0,1,2] + [3,4]
+        )
+        output = self._run_forward(block)
+        assert output.shape == (32, 2, block.config.hidden_size)
 
     def test_layer_types(self):
         """

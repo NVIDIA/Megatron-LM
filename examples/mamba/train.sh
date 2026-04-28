@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Use: ./train.sh <data-path> <tokenizer-path>
+# Use: ./train.sh   (mock data + NullTokenizer; no positional args needed)
 
 MODEL_SCALE="800M" # or "8B"
 
@@ -25,24 +25,23 @@ case "${MODEL_SCALE}" in
         ;;
 esac
 
-DATA_PATH=$1
-TOKENIZER_PATH=$2
-
 export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_TIMEOUT=19
 export NCCL_IB_QPS_PER_CONNECTION=4
 
-CHECKPOINT_DIR="./checkpoints"
-DATACACHE_DIR="./data-cache"
-TENSORBOARD_DIR="./tensorboard"
+WORKSPACE_DIR="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/users/xuantengh/tmp/pipe_clean/Mamba-800M"
+
+CHECKPOINT_DIR="${WORKSPACE_DIR}/checkpoints"
+DATACACHE_DIR="${WORKSPACE_DIR}/data-cache"
+TENSORBOARD_DIR="${WORKSPACE_DIR}/tensorboard"
 
 mkdir -p ${CHECKPOINT_DIR}
 mkdir -p ${DATACACHE_DIR}
 mkdir -p ${TENSORBOARD_DIR}
 
-export TRITON_CACHE_DIR="./triton-cache/"
-export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
+export TRITON_CACHE_DIR="${WORKSPACE_DIR}/triton-cache/"
+# export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
 
 SEQ_LEN=4096
 TRAIN_SAMPLES=73242188  # 300B tokens / 4096
@@ -71,11 +70,9 @@ options=" \
        --lr-decay-samples ${LR_DECAY_SAMPLES} \
        --save ${CHECKPOINT_DIR} \
        --load ${CHECKPOINT_DIR} \
-       --data-path ${DATA_PATH} \
-       --data-cache-path ${DATACACHE_DIR} \
-       --split 99,1,0 \
-       --tokenizer-type GPTSentencePieceTokenizer \
-       --tokenizer-model ${TOKENIZER_PATH} \
+       --mock-data \
+       --tokenizer-type NullTokenizer \
+       --vocab-size 131072 \
        --distributed-backend nccl \
        --micro-batch-size 4 \
        --global-batch-size ${GLOBAL_BATCH_SIZE} \
