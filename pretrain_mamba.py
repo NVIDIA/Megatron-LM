@@ -3,6 +3,7 @@
 
 # Capture the true program start time BEFORE any heavy imports.
 import time
+
 _PROGRAM_START_TIME = time.time()
 
 import json
@@ -10,6 +11,7 @@ import json
 # Suppress warnings on all ranks but rank 0.
 import os
 import warnings
+
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
@@ -25,15 +27,12 @@ from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import (
-    get_context_parallel_rank,
-    get_context_parallel_world_size,
-)
 from megatron.core.models.mamba import MambaModel
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import get_context_parallel_rank, get_context_parallel_world_size
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
+from megatron.core.utils import StragglerDetector, get_attr_wrapped_model, is_te_min_version
 from megatron.training import (
     get_args,
     get_timers,
@@ -42,6 +41,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -54,6 +54,7 @@ from model_provider import model_provider
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
@@ -90,7 +91,7 @@ def get_batch(data_iterator, vp_stage=None):
         return empty_batch.values()
 
     batch = get_batch_on_this_tp_rank(data_iterator)
-    
+
     cu_seqlens = batch['cu_seqlens']
     # Unused at the moment
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
@@ -129,12 +130,7 @@ def get_batch(data_iterator, vp_stage=None):
                 "Context Parallel with THD format data"
             )
             cp_rank = get_context_parallel_rank()
-            index = tex.thd_get_partitioned_indices(
-                cu_seqlens,
-                total_tokens,
-                cp_size,
-                cp_rank,
-            )
+            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             for key, data in batch.items():
                 if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
                     continue
@@ -149,7 +145,10 @@ def get_batch(data_iterator, vp_stage=None):
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[MambaModel] = None):
+
+def loss_func(
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[MambaModel] = None
+):
     """Loss function.
 
     Args:
@@ -180,14 +179,14 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
             result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are deterministic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=True,
         )
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are deterministic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=True,
         )
     # Check for spiky loss
@@ -200,7 +199,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,        # forward pass calculations are deterministic
+            tolerance=0.0,  # forward pass calculations are deterministic
             fatal=False,
         )
 
@@ -223,15 +222,9 @@ def forward_step(data_iterator, model: MambaModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        (
-            tokens,
-            labels,
-            loss_mask,
-            attention_mask,
-            position_ids,
-            cu_seqlens,
-            max_seqlen,
-        ) = get_batch(data_iterator, vp_stage)
+        (tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen) = (
+            get_batch(data_iterator, vp_stage)
+        )
 
     if cu_seqlens is None:
         packed_seq_params = None
@@ -257,7 +250,7 @@ def forward_step(data_iterator, model: MambaModel):
             attention_mask,
             labels=labels,
             packed_seq_params=packed_seq_params,
-            loss_mask=loss_mask
+            loss_mask=loss_mask,
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -335,7 +328,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         dataset_type,
         train_val_test_num_samples,
         partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
-        config
+        config,
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")
@@ -356,11 +349,14 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
-    pretrain(train_valid_test_datasets_provider,
-             partial(model_provider, mamba_builder),
-             ModelType.encoder_or_decoder,
-             forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-             store=store,
-             extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
-             )
+    args = parse_and_validate_args(
+        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
+    pretrain(
+        train_valid_test_datasets_provider,
+        partial(model_provider, mamba_builder),
+        ModelType.encoder_or_decoder,
+        forward_step,
+        store=store,
+    )
