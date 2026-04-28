@@ -233,32 +233,39 @@ def _scatter_token_indices_kernel(
     local_expert_start,
     num_local_experts: tl.constexpr,
     max_pairs,
-    NUM_BLOCKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """Scatter flat token indices into the padded indirection table.
 
-    For each valid (token, topk) pair, atomically claim a position and write
-    the flat index. Local expert pairs go to their expert's padded block;
-    non-local expert pairs go to a trailing section (expert_ids stays -1,
-    so the GEMM kernel writes zeros for those output positions).
+    Vectorized: each CTA processes BLOCK_SIZE pairs at once with a single
+    vector load, then one atomic per expert per CTA (instead of per pair).
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
     valid_pairs = valid_tokens * topk
-    if pid >= valid_pairs:
+    if pid * BLOCK_SIZE >= valid_pairs:
         return
-    for pair in tl.range(pid, max_pairs, NUM_BLOCKS):
-        tok = pair // topk
-        if tok < valid_tokens:
-            k = pair % topk
-            eid = tl.load(routing_map_ptr + tok * topk + k)
-            lid = eid - local_expert_start
-            if lid >= 0 and lid < num_local_experts:
-                pos = tl.atomic_add(counters_ptr + lid, 1)
-                tl.store(sorted_token_ids_ptr + pos, pair)
-            else:
-                pos = tl.atomic_add(nonlocal_counter_ptr, 1)
-                tl.store(sorted_token_ids_ptr + pos, pair)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < valid_pairs
+
+    eids = tl.load(routing_map_ptr + offs, mask=mask, other=-1)
+    lids = eids - local_expert_start
+    is_local = (lids >= 0) & (lids < num_local_experts) & mask
+
+    for e in range(num_local_experts):
+        e_mask = (lids == e) & is_local
+        count = tl.sum(e_mask.to(tl.int32))
+        if count > 0:
+            base = tl.atomic_add(counters_ptr + e, count)
+            positions = tl.cumsum(e_mask.to(tl.int32), axis=0) - 1
+            tl.store(sorted_token_ids_ptr + base + positions, offs, mask=e_mask)
+
+    is_nonlocal = (~is_local) & mask
+    nonlocal_count = tl.sum(is_nonlocal.to(tl.int32))
+    if nonlocal_count > 0:
+        base = tl.atomic_add(nonlocal_counter_ptr, nonlocal_count)
+        positions = tl.cumsum(is_nonlocal.to(tl.int32), axis=0) - 1
+        tl.store(sorted_token_ids_ptr + base + positions, offs, mask=is_nonlocal)
 
 
 @triton.jit
@@ -266,15 +273,21 @@ def _fill_expert_block_ids_kernel(
     expert_ids_ptr,
     exclusive_offsets_ptr,
     inclusive_offsets_ptr,
-    NUM_LOCAL_EXPERTS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    """Fill expert_ids with expert index for each BLOCK_SIZE_M block."""
-    for e in range(NUM_LOCAL_EXPERTS):
-        start_block = tl.load(exclusive_offsets_ptr + e) // BLOCK_SIZE_M
-        end_block = tl.load(inclusive_offsets_ptr + e) // BLOCK_SIZE_M
-        for b in tl.range(start_block, end_block):
-            tl.store(expert_ids_ptr + b, e)
+    """Fill expert_ids with expert index for each BLOCK_SIZE_M block.
+
+    Grid: one CTA per expert (parallelised across experts).
+    Inner loop uses vectorised stores of BLOCK elements at a time.
+    """
+    e = tl.program_id(0)
+    start_block = tl.load(exclusive_offsets_ptr + e) // BLOCK_SIZE_M
+    end_block = tl.load(inclusive_offsets_ptr + e) // BLOCK_SIZE_M
+    num_blocks = end_block - start_block
+    for off in tl.range(0, num_blocks, BLOCK):
+        idxs = start_block + off + tl.arange(0, BLOCK)
+        tl.store(expert_ids_ptr + idxs, e, mask=idxs < end_block)
 
 
 
@@ -333,12 +346,12 @@ def _moe_align_block_size_cuda_graphable(
         tokens_per_expert, alignment=block_size
     )
 
-    _fill_expert_block_ids_kernel[(1,)](
+    _fill_expert_block_ids_kernel[(num_local_experts,)](
         expert_ids,
         exclusive_offsets,
         inclusive_offsets,
-        NUM_LOCAL_EXPERTS=num_local_experts,
         BLOCK_SIZE_M=block_size,
+        BLOCK=128,
     )
 
     # Snapshot the local-expert padded count before reusing inclusive_offsets[-1:]
@@ -347,8 +360,9 @@ def _moe_align_block_size_cuda_graphable(
     # exclusive_offsets is not read after this point — reuse directly as atomic
     # counters for the scatter kernel (avoids a D2D clone).
     max_pairs = max_tokens * topk
-    NUM_BLOCKS = min(max_pairs, 512)
-    _scatter_token_indices_kernel[(NUM_BLOCKS,)](
+    SCATTER_BLOCK = 256
+    scatter_grid = _ceil_div(max_pairs, SCATTER_BLOCK)
+    _scatter_token_indices_kernel[(scatter_grid,)](
         routing_map,
         sorted_token_ids,
         exclusive_offsets,
@@ -358,7 +372,7 @@ def _moe_align_block_size_cuda_graphable(
         local_expert_start,
         num_local_experts,
         max_pairs,
-        NUM_BLOCKS=NUM_BLOCKS,
+        BLOCK_SIZE=SCATTER_BLOCK,
     )
 
     # inclusive_offsets[-1] was atomically incremented by scatter and now holds
