@@ -16,7 +16,7 @@ from torch import Tensor, nn
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -27,6 +27,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -205,10 +206,6 @@ class HybridStack(MegatronModule):
             submodules = copy.deepcopy(submodules)
             mla_spec = submodules.mla_layer
             # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
-
-            from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
-            from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
-
             mla_spec.submodules.input_layernorm = IdentityOp
             mla_spec.submodules.self_attention.module = FusedMLASelfAttention
             mla_spec.submodules.self_attention.submodules.linear_qkv_down_proj = (
