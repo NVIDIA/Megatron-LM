@@ -227,6 +227,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.async_scheduling = inference_config.async_scheduling
         self.finished_sync_period = inference_config.finished_sync_period
+        # Set when CPU bookkeeping detects an event (add/pause/evict) that
+        # would invalidate the speculative chain. Read by _async_scheduling_active
+        # to drop out of speculation; cleared after the engine drains the
+        # in-flight forwards and applies the corrected state.
+        self._rejection_pending = False
+        # Tracks how many requests have finished but not yet been removed from
+        # the active batch via a sync. Used by the periodic-sync backstop.
+        self._finished_pending_count = 0
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -1967,17 +1975,47 @@ class DynamicInferenceEngine(AbstractEngine):
         engine loop in the launch-ahead refactor to decide whether to chain
         the next forward on the stream or to fall back to serial behavior.
 
-        False when:
+        False when any of the following is true:
         - async_scheduling is disabled by configuration.
+        - A rejection event (add/pause/evict) is pending and must be applied.
         - The current step is not pure decode (prefill present).
         - The next step would require new KV blocks that aren't available.
-
-        Refined in C4 to also detect rejection events (add/pause/evict) and
-        the periodic finished-pending sync.
+        - The periodic finished-pending sync is due (every K steps when
+          finished requests are accumulated).
         """
         if not self.async_scheduling:
             return False
+        if self._rejection_pending:
+            return False
+        if self._finished_sync_due():
+            return False
         return self.context.can_speculate_decode_step()
+
+    def _finished_sync_due(self) -> bool:
+        """Check whether the periodic finished-pending sync is due this step.
+
+        Fires when finished_sync_period > 0, finished requests are pending, and
+        step_count is at a sync-period boundary. Used as a backstop so finished
+        slots can't accumulate indefinitely in the speculative chain.
+        """
+        if self.finished_sync_period <= 0:
+            return False
+        if self._finished_pending_count <= 0:
+            return False
+        return self.context.step_count % self.finished_sync_period == 0
+
+    def _signal_rejection(self) -> None:
+        """Mark a rejection event so the next step drops out of speculation.
+
+        Called by CPU bookkeeping when an add/pause/evict event makes the
+        speculative metadata invalid. Cleared after the engine drains in-flight
+        forwards and applies the corrected state via transfer_bookkeeping_to_gpu.
+        """
+        self._rejection_pending = True
+
+    def _clear_rejection(self) -> None:
+        """Clear the rejection-pending flag after the engine has resynced."""
+        self._rejection_pending = False
 
     async def async_step(
         self,
