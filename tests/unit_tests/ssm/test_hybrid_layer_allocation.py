@@ -815,7 +815,7 @@ class TestBracketValidation:
             parse_hybrid_pattern("[*|M]")
 
     def test_brackets_crossing_mtp(self):
-        with pytest.raises(ValueError, match="MTP '/'.*inside"):
+        with pytest.raises(ValueError, match="MTP separator '/'.*inside"):
             parse_hybrid_pattern("[*/M]")
 
     def test_layer_count_with_brackets(self):
