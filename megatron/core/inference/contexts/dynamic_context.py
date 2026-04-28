@@ -1712,7 +1712,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_expert_parallel_dummy_cuda_graph_step,
         ):
-            self.run_attn_init_graph_body(eager=True)
+            use_graph = self.using_cuda_graph_this_step()
+            self.run_attn_init_graph_body(
+                eager=not use_graph,
+                cache_key=self.padded_batch_dimensions if use_graph else None,
+            )
             self.finalize_attn_init()
 
     def prepare_attn_init(

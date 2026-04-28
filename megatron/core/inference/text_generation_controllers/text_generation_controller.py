@@ -620,16 +620,10 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        if context.prepare_attn_init(
+        context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
-        ):
-            use_graph = context.using_cuda_graph_this_step()
-            context.run_attn_init_graph_body(
-                eager=not use_graph,
-                cache_key=context.padded_batch_dimensions if use_graph else None,
-            )
-            context.finalize_attn_init()
+        )
 
         # Derive the MTP padded batch size from the existing padded graph dimensions.
         # For MoE models this is post EP sync. In eager mode MTP uses locally SP-aligned
