@@ -10,6 +10,8 @@ dimensions for fast unit test execution:
 - shared experts
 """
 
+import gc
+
 import pytest
 import torch
 
@@ -315,6 +317,10 @@ class TestNVLSAllGatherVDispatcher:
 
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _make_dispatcher(self):
         from megatron.core.parallel_state import get_expert_model_parallel_group
