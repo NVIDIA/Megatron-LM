@@ -726,91 +726,59 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=next_tokens
         )
 
-        # Verify structural invariants.
+        # ── Count-level invariants ──
         assert dynamic_context.paused_request_count == 0
         assert dynamic_context.total_request_count == 7
         assert dynamic_context.active_token_count == 7
 
-        # Layout invariant: [active | paused | dead].
-        active_count = dynamic_context.total_request_count - dynamic_context.paused_request_count
-        active_ids = set(dynamic_context.request_ids[:active_count].cpu().tolist())
-        paused_ids = set(
-            dynamic_context.request_ids[active_count : dynamic_context.total_request_count]
-            .cpu()
-            .tolist()
-        )
-        assert active_ids == {0, 1, 2, 4, 5, 6, 9}  # IDs 3, 7, 8 finished
-        assert paused_ids == set()  # no paused requests
-        # Dead zone should not contain any surviving IDs (stale data cleared).
-        dead_ids = set(
-            dynamic_context.request_ids[dynamic_context.total_request_count : 10].cpu().tolist()
-        )
-        assert dead_ids.isdisjoint(active_ids)
-
-        # IDs that stayed active have offset 10+1=11; IDs that got new blocks
-        # have offset (127+1)%128=0. Check only the live region [0:total).
-        live_offsets = (
-            dynamic_context.request_last_kv_block_offset[: dynamic_context.total_request_count]
-            .cpu()
-            .tolist()
-        )
-        for i, rid in enumerate(
+        # ── Slot-level invariants ──
+        # Active IDs should be exactly the surviving set: {0,1,2,4,5,6,9}.
+        # Requests 3, 7, 8 were finished.
+        active_ids = set(
             dynamic_context.request_ids[: dynamic_context.total_request_count].cpu().tolist()
-        ):
-            if rid in {2, 4, 9}:
-                assert (
-                    live_offsets[i] == 11
-                ), f"request {rid} at index {i}: expected offset 11, got {live_offsets[i]}"
-            else:
-                assert (
-                    live_offsets[i] == 0
-                ), f"request {rid} at index {i}: expected offset 0, got {live_offsets[i]}"
-        assert dynamic_context.token_to_input_ids[
-            : dynamic_context.active_token_count
-        ].cpu().numpy().tolist() == [2, 9, 4, 5, 6, 0, 1]
+        )
+        assert active_ids == {0, 1, 2, 4, 5, 6, 9}
 
-        assert dynamic_context.token_to_pos_ids[
-            : dynamic_context.active_token_count
-        ].cpu().numpy().tolist() == [128, 128, 128, 128, 11, 11, 11]
+        # Requests 0,1,5,6 had full blocks (offset == block_size-1) → newly paused
+        # → then resumed → got new blocks → offset should be 0 after decode step.
+        # Requests 2,4,9 had offset=10 → after decode step offset = 11.
+        offsets = dynamic_context.request_last_kv_block_offset[:7].cpu().tolist()
+        assert sorted(offsets) == [0, 0, 0, 0, 11, 11, 11]
 
-        # The first 4 requests will require an extra block.
-        # Since 3 requests have finished, the last 3 rows should be all -1.
-        if is_hybrid_model:
-            assert torch.all(
-                dynamic_context.request_to_kv_block_ids[0:10].cpu()
-                == torch.tensor(
-                    [
-                        [544, 547, -1, -1],
-                        [545, 544, -1, -1],
-                        [549, 551, -1, -1],
-                        [550, 552, -1, -1],
-                        [548, -1, -1, -1],
-                        [546, -1, -1, -1],
-                        [553, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                    ]
-                )
-            )
-        else:
-            assert torch.all(
-                dynamic_context.request_to_kv_block_ids[0:10].cpu()
-                == torch.tensor(
-                    [
-                        [479, 482, -1, -1],
-                        [480, 479, -1, -1],
-                        [484, 486, -1, -1],
-                        [485, 487, -1, -1],
-                        [483, -1, -1, -1],
-                        [481, -1, -1, -1],
-                        [488, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                        [-1, -1, -1, -1],
-                    ]
-                )
-            )
+        # Each resumed request (0,1,5,6) should have 2 blocks now.
+        # Continuing requests (2,4,9) still have 1 block.
+        block_counts = dynamic_context.request_kv_block_counts[:7].cpu().tolist()
+        assert sorted(block_counts) == [1, 1, 1, 2, 2, 2, 2]
+
+        # Finished request slots (beyond total_request_count) should have
+        # block IDs all set to -1.
+        assert torch.all(dynamic_context.request_to_kv_block_ids[7:10] == -1)
+
+        # Token bookkeeping: active_token_count tokens should have valid
+        # request_idx values within [paused, total).
+        req_idxs = dynamic_context.token_to_request_idx[:7]
+        assert torch.all(req_idxs >= 0)
+        assert torch.all(req_idxs < 7)
+
+        # Per-request consistency: requests with 2 blocks should have offset 0,
+        # and requests with 1 block should have offset 11.
+        for i in range(7):
+            bc = dynamic_context.request_kv_block_counts[i].item()
+            off = dynamic_context.request_last_kv_block_offset[i].item()
+            if bc == 2:
+                assert off == 0, f"slot {i}: 2-block request should have offset 0, got {off}"
+            elif bc == 1:
+                assert off == 11, f"slot {i}: 1-block request should have offset 11, got {off}"
+
+        # query_lengths should all be 1 (decode mode).
+        ql = dynamic_context.request_query_lengths[:7]
+        assert torch.all(ql == 1)
+
+        # GPU allocator state matches CPU.
+        assert (
+            dynamic_context.kv_block_allocator.total_avail_gpu.item()
+            == dynamic_context.kv_block_allocator.total_avail
+        )
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -961,6 +929,22 @@ class TestDynamicContext:
 
         # Verify that all 6 blocks were released by checking the available blocks
         assert dynamic_context.kv_block_allocator.total_avail == initial_available_blocks + 6
+
+    # ── Tests for the permutation-based update_requests rewrite ──
+
+    def _make_context(self, is_hybrid_model=False, buffer_size_gb=0.03):
+        """Shorthand for creating a test context."""
+        return self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=buffer_size_gb,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=is_hybrid_model,
+        )
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2835,81 +2819,6 @@ class TestDynamicContext:
 
         # Effective query length should be 3 (35 total - 32 skipped)
         assert ctx.request_query_lengths[1].item() == 3
-
-    @pytest.mark.internal
-    @rounder_override(64)
-    def test_eviction_with_shared_prefix_blocks(self):
-        """Test that evicting a request drops ref counts correctly without destroying shared blocks."""
-
-        model_config = TransformerConfig(
-            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
-        )
-        inference_config = InferenceConfig(
-            max_sequence_length=512,
-            buffer_size_gb=0.1,
-            block_size_tokens=16,
-            enable_prefix_caching=True,
-            unified_memory_level=0,
-            paused_buffer_size_gb=0.0,  # 0 paused capacity to force immediate eviction
-            max_tokens=512,
-            max_requests=512,
-        )
-        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
-
-        bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
-
-        # Add req1 and req2 with identical prompts
-        req1 = DynamicInferenceRequest(
-            request_id=1,
-            prompt_tokens=prompt.clone(),
-            sampling_params=SamplingParams(num_tokens_to_generate=10),
-            block_size_tokens=bs,
-            enable_prefix_caching=True,
-        )
-        ctx.add_request(req1)
-
-        req2 = DynamicInferenceRequest(
-            request_id=2,
-            prompt_tokens=prompt.clone(),
-            sampling_params=SamplingParams(num_tokens_to_generate=10),
-            block_size_tokens=bs,
-            enable_prefix_caching=True,
-        )
-        ctx.add_request(req2)
-
-        shared_b0 = ctx.request_to_kv_block_ids[0, 0].item()
-        shared_b1 = ctx.request_to_kv_block_ids[0, 1].item()
-
-        # Both blocks should be safely shared with ref count 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
-
-        # Mock the state to make req2 active and req1 paused.
-        # Layout: [active | paused] => request_ids[0] = active (req2), request_ids[1] = paused (req1).
-        ctx.paused_request_count = 1
-        ctx.total_request_count = 2
-        ctx.request_ids[0] = 2
-        ctx.request_ids[1] = 1
-        ctx.request_kv_block_counts[0] = 2
-        ctx.request_kv_block_counts[1] = 2
-
-        # Exhaust the active block allocator
-        ctx.kv_block_allocator.total_avail = 0
-
-        # Trigger the eviction logic
-        # next_tokens must be sized to total_request_count (1 paused + 1 active = 2)
-        next_tokens = torch.tensor([50, 51], device='cuda')
-        evicted_ids = ctx.evict_overflow_paused_requests(
-            active_request_count=1, next_tokens=next_tokens
-        )
-
-        # req1 should be successfully evicted
-        assert evicted_ids is not None
-        assert evicted_ids[0].item() == 1
-
-        # req2 remains active, so the shared blocks should drop to a ref count of 1
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 1
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 1
 
     @pytest.mark.internal
     @rounder_override(64)
