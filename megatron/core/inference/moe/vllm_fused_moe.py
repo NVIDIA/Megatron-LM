@@ -387,9 +387,11 @@ def _moe_align_block_size_cuda_graphable(
     )
 
     num_tokens_post_padded_local = inclusive_offsets[-1:]
-    num_tokens_post_padded_all = torch.full(
-        (1,), max_sorted, dtype=torch.int32, device=device
-    )
+    # nonlocal_counter was atomically incremented by the scatter kernel and now
+    # holds the position past the last non-local expert pair — a tight upper
+    # bound that covers both local expert blocks and actual non-local pairs,
+    # without including the sentinel-filled tail of sorted_token_ids.
+    num_tokens_post_padded_all = nonlocal_counter
     return sorted_token_ids, expert_ids, num_tokens_post_padded_local, num_tokens_post_padded_all
 
 
