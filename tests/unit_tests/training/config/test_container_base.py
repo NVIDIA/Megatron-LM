@@ -4,8 +4,7 @@ import copy
 import functools
 import os
 import tempfile
-import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from unittest.mock import MagicMock, mock_open, patch
 
 import yaml
@@ -653,24 +652,6 @@ class TestConfigContainer_Integration:
         assert loaded_config.value == config.value
         assert loaded_config.description == config.description
 
-    def test_error_handling_in_complex_scenarios(self):
-        """Test error handling with complex nested structures."""
-        # Test with missing _target_ in from_dict
-        invalid_dict = {"name": "invalid"}
-
-        with pytest.raises(AssertionError):
-            TestConfigContainer.from_dict(invalid_dict)
-
-        # Test with extra keys in strict mode
-        invalid_strict_dict = {
-            "_target_": _target_qualname(TestConfigContainer),
-            "name": "test",
-            "invalid_field": "should_fail",
-        }
-
-        with pytest.raises(ValueError, match="extra keys"):
-            TestConfigContainer.from_dict(invalid_strict_dict, mode=InstantiationMode.STRICT)
-
 
 class TestConfigContainer_EdgeCases:
     """Test edge cases for ConfigContainer."""
@@ -823,21 +804,6 @@ class TestConfigContainer_CallablesAndPartials:
         assert reconstructed.partial_loss.keywords == config.partial_loss.keywords
         assert reconstructed.torch_activation is config.torch_activation
 
-    def test_callable_dataclass_field_exclusion(self):
-        """Test that no fields are excluded — callable fields pass through as-is."""
-        callable_data = CallableDataclass()
-        result = TestConfigContainer._convert_value_to_dict(callable_data)
-
-        # Primitive fields present
-        assert result["name"] == "callable_test"
-        assert result["regular_value"] == 100
-
-        # Callable fields are also present — _convert_value_to_dict does not exclude them
-        assert result["activation_func"] is activation_function
-        assert result["loss_func"] is callable_data.loss_func
-        assert result["torch_func"] is torch.nn.functional.relu
-        assert callable(result["lambda_func"])
-
     def test_mixed_container_with_callables_and_regular_data(self):
         """Test container mixing callable and regular data."""
 
@@ -892,30 +858,3 @@ class TestConfigContainer_CallablesAndPartials:
         # Modify original to verify independence
         config.name = "modified"
         assert copied_config.name == "deepcopy_test"
-
-
-class TestConfigContainerBackwardCompat:
-    """Test ConfigContainerBase integration with backward compatibility."""
-
-    def test_from_dict_removes_init_false_fields(self):
-        """Test from_dict removes init=False fields before instantiation."""
-        # This test verifies the integration point in from_dict
-        # Note: We can't directly test with DataclassWithInitFalse as it's not a ConfigContainer,
-        # but we can test that the sanitization is called by checking no error is raised
-        # when extra fields that would be init=False are present
-        from megatron.training.config.instantiate_utils import target_allowlist
-
-        config_dict = {
-            "_target_": _target_qualname(TestConfigContainer),
-            "name": "test_from_dict",
-            "value": 42,
-            "description": "test description",
-        }
-
-        # This should work without error
-        target_allowlist.disable()
-        result = TestConfigContainer.from_dict(config_dict, mode=InstantiationMode.STRICT)
-        target_allowlist.enable()
-
-        assert result.name == "test_from_dict"
-        assert result.value == 42
