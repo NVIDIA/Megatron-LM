@@ -1146,29 +1146,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             out=self.cu_active_sequence_lengths[1 : n + 1],
         )
 
-    def build_active_kv_slices(self):
-        """Build active slices of tensors mutated by `_rewind_kv_cache`.
-
-        Must be re-run after KV-cache rewind so that `active_sequence_lengths`
-        reflects post-rewind offsets rather than the pre-forward snapshot.
-        """
-        n = self.padded_active_request_count
-        torch.add(
-            self.active_request_query_lengths[:n],
-            self.request_kv_length_offsets[:n],
-            out=self.active_sequence_lengths[:n],
-        )
-        # request_kv_length_offsets may have stale values at padding positions.
-        req_pad_mask = self._arange_requests[:n] >= self._real_request_count_gpu
-        self.active_sequence_lengths[:n] = torch.where(
-            req_pad_mask, 0, self.active_sequence_lengths[:n]
-        )
-        torch.cumsum(
-            self.active_sequence_lengths[:n],
-            dim=0,
-            out=self.cu_active_sequence_lengths[1 : n + 1],
-        )
-
     def run_attn_init_graph_body(self, eager=False, cache_key=None):
         """Graphable portion of `initialize_attention_state`."""
         self._context_op_metadata_gpu.copy_(self._context_op_metadata_cpu, non_blocking=True)
