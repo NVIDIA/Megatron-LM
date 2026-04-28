@@ -16,6 +16,11 @@
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
+# example script: 
+# WANDB_PROJECT=qwen35-cp-test  WANDB_MODE=online CP=2 GPUS_PER_NODE=8 CKPT_LOAD=/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/models/Qwen/Qwen3.5-0.8B-fsdp-0420/ USE_FSDP=1 EP=1  GBS=16 MODEL_VARIANT=0.8b   SAVE_INTERVAL=10000 CKPT_RESUME=0 DRY_RUN=0  USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
+
+# WANDB_PROJECT=qwen35-cp-test  WANDB_MODE=online CP=1 GPUS_PER_NODE=4 CKPT_LOAD=/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/models/Qwen/Qwen3.5-0.8B-fsdp-0420/ USE_FSDP=1 EP=1  GBS=16 MODEL_VARIANT=0.8b   SAVE_INTERVAL=10000 CKPT_RESUME=0 DRY_RUN=0  USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
+
 set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -298,6 +303,7 @@ MULTIMODAL_ARGS=(
     --model-variant "$MODEL_VARIANT"
     --dataset-provider cord_v2
     --hf-processor-path Qwen/Qwen3.5-397B-A17B
+    --use-vanilla-collate-fn
     --image-token-id 248056
     --image-size 224
     --total-seq-length "$SEQ_LEN"
