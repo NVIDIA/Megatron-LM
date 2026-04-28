@@ -243,6 +243,10 @@ class TransformerLayerSubmodules:
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
+    # Reserved for future cross-attention mHC support. Currently
+    # `HyperConnectionTransformerLayer.__init__` rejects any value other than
+    # `IdentityOp`; the field exists so the spec dataclass shape stays stable
+    # once cross-attention support lands.
     cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
@@ -711,9 +715,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        # Injected by __call__ for cuda graph keying; not a real forward arg.
-        kwargs.pop("dynamic_inference_decode_only", None)
         called_from_hybrid_mhc_wrapper = kwargs.pop("_called_from_hybrid_mhc_wrapper", False)
+        # `mhc_recompute_manager` is unconditionally passed by `TransformerBlock` so a
+        # single forward signature covers HC and non-HC layers; non-HC layers ignore it.
+        kwargs.pop("mhc_recompute_manager", None)
         if self.config.enable_hyper_connections and not called_from_hybrid_mhc_wrapper:
             raise RuntimeError(
                 "TransformerLayer.forward() must not be called directly when "
@@ -1301,26 +1306,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return True
         return False
 
-    def __call__(self, *args, **kwargs):
-        # Extract mhc_recompute_manager before CUDA graph manager processes kwargs,
-        # since CheckpointManager is not a CUDA-graph-supported type.
-        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            # Inference mode.
-            if kwargs.get('inference_context') is not None:
-                # dynamic_inference_decode_only is not a real argument to forward, it is only used
-                # to differentiate the cuda graph used for decode from the one used for non-decode
-                # inference.
-                kwargs["dynamic_inference_decode_only"] = kwargs[
-                    'inference_context'
-                ].is_decode_only()
-
-        try:
-            return super().__call__(*args, **kwargs)
-        finally:
-            self._mhc_recompute_manager = None
-
     def get_layer_norm_weights(self):
         """
         Get the weights of all layernorms (attention and MLP) in the transformer layer.
@@ -1448,9 +1433,19 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             submodules.append(self.mlp_hyper_connection)
         return submodules
 
+    def __call__(self, *args, **kwargs):
+        # Extract mhc_recompute_manager before the CUDA-graph manager processes
+        # kwargs, since CheckpointManager is not a CUDA-graph-supported type.
+        # Stash it on `self` so `forward()` can recover it under cuda graph
+        # capture/replay (which strips non-tensor kwargs).
+        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        try:
+            return super().__call__(*args, **kwargs)
+        finally:
+            self._mhc_recompute_manager = None
+
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
-        kwargs.pop("dynamic_inference_decode_only", None)
         kwargs.pop("_called_from_hybrid_mhc_wrapper", None)
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)

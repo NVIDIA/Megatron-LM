@@ -1084,6 +1084,10 @@ def forward_backward_pipelining_with_interleaving(
         )
     hidden_dim = config.hidden_size
     if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
+        # NOTE: this branch is only reachable when VPP is disabled (the explicit
+        # ValueError above blocks VPP+mHC). Kept for the non-VPP interleaved-style
+        # entry path. Per-virtual-chunk shape selection is needed before this can
+        # safely cover VPP+mHC; do not remove the guard above without wiring that.
         hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]

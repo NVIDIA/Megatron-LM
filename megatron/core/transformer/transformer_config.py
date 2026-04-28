@@ -890,7 +890,13 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     mhc_sinkhorn_iterations: int = 20
-    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection.
+
+    20 is a conservative default that converges robustly across all tested
+    configurations. For typical small ``num_residual_streams`` (n=4, giving 4×4
+    matrices), 8–10 iterations are usually sufficient and reduce per-layer
+    Sinkhorn cost. Tune downward only after verifying convergence quality on
+    the target model."""
 
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""

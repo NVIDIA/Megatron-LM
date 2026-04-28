@@ -98,6 +98,10 @@ class HyperConnectionHybridLayer(MegatronModule):
                 _called_from_hybrid_mhc_wrapper=True,
             )
         else:
+            # Non-transformer layers (e.g. Mamba, GDN) do not accept
+            # rotary_pos_emb / sequence_len_offset / padding_mask — pass only
+            # the common arguments. New layer types that consume any of these
+            # must add explicit handling here.
             output = self.inner_layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -141,6 +145,14 @@ class HyperConnectionHybridLayer(MegatronModule):
         # the residual that mHC owns. The temporary [s, b, C] tensor here is the
         # simplest correct form; a future optimization could fuse the subtraction
         # into `h_res_h_post_bda` to avoid the allocation.
+        # Sanity check: this contract requires the inner layer to preserve shape;
+        # any mismatch indicates a future layer type is breaking the residual
+        # assumption and would silently corrupt the n-stream state.
+        assert layer_output.shape == aggregated.shape, (
+            "HyperConnectionHybridLayer requires inner layers to preserve "
+            f"hidden-state shape. Got {tuple(layer_output.shape)} from inner layer "
+            f"vs {tuple(aggregated.shape)} input — layer must add its own residual."
+        )
         layer_delta = layer_output - aggregated
         hidden_states = self.hyper_connection.h_res_h_post_bda(
             h_res,

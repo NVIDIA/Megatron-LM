@@ -17,13 +17,17 @@ if TYPE_CHECKING:
 
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
+    # Stabilization strategy aligned with the cuTile fused kernel
+    # (`_ct_sinkhorn_fwd_kernel` uses `row_sum + eps`). Both paths therefore
+    # produce bit-similar results for well-conditioned inputs, and any future
+    # divergence at near-zero sums is bounded by the same `eps` regularization.
     output_dtype = input_logits.dtype
     input_logits_fp32 = input_logits.float()
     row_max = input_logits_fp32.max(dim=-1, keepdim=True).values
     M = torch.exp(input_logits_fp32 - row_max)
     for _ in range(num_iterations):
-        M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
-        M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
+        M = M / (M.sum(dim=-1, keepdim=True) + eps)
+        M = M / (M.sum(dim=-2, keepdim=True) + eps)
     return M.to(output_dtype)
 
 
