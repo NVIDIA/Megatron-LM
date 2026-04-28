@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import functools
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,7 +28,10 @@ class LogProbsPrefill:
     Instance methods wrap the kernels in CUDA-graph capture/replay.
     """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, topn_stream=None, topn_event=None):
+        # See LogProbsDecode for stream/event semantics.
+        self._topn_stream = topn_stream
+        self._topn_event = topn_event
         if config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
                 config, self,
@@ -118,12 +122,10 @@ class LogProbsPrefill:
         request_indices: Tensor,
         cu_masked_lengths: Tensor,
         token_log_probs: Tensor,
-        lse: Tensor,
         log_prob_request_count: int,
         active_request_count: int,
-        top_n_max: int = 0,
-        logits: Optional[Tensor] = None,
-        logit_indices: Optional[Tensor] = None,
+        top_n_values: Optional[Tensor] = None,
+        top_n_indices: Optional[Tensor] = None,
     ) -> Tuple[List[Optional[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
         """Extract prefill log-prob kernel outputs into a per-request list.
 
@@ -132,12 +134,10 @@ class LogProbsPrefill:
             request_indices (Tensor): Padded indices from indexing_kernel.
             cu_masked_lengths (Tensor): Cumulative masked lengths from indexing_kernel.
             token_log_probs (Tensor): Per-token log probs from softmax_kernel.
-            lse (Tensor): Per-token log-sum-exp from softmax_kernel.
             log_prob_request_count (int): Number of real (non-padding) requests wanting log probs.
             active_request_count (int): Total number of active requests.
-            top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
-            logits (Optional[Tensor]): Raw logits for top-n re-gather.
-            logit_indices (Optional[Tensor]): Logit indices for top-n re-gather.
+            top_n_values (Optional[Tensor]): Pre-computed per-token top-n log-prob values.
+            top_n_indices (Optional[Tensor]): Pre-computed per-token top-n token indices.
 
         Returns:
             (per_request_log_probs, top_n_dict) tuple.
@@ -155,12 +155,11 @@ class LogProbsPrefill:
             result[req_idx] = per_request[i].tolist()
 
         top_n_dict = None
-        if top_n_max > 0 and logits is not None and logit_indices is not None:
-            raw = logits.squeeze(0)[logit_indices[:selected_token_count]].float()
-            top_n_v, top_n_i = _topk(raw, k=top_n_max)
-            top_n_v = top_n_v - lse[:selected_token_count].unsqueeze(-1)
+        if top_n_values is not None and top_n_indices is not None:
+            top_n_v_cpu = top_n_values[:selected_token_count].cpu()
+            top_n_i_cpu = top_n_indices[:selected_token_count].cpu()
             top_n_dict = LogProbsPrefill._build_top_n_dict(
-                context, req_idx_list, masked_lengths_cpu, top_n_v, top_n_i
+                context, req_idx_list, masked_lengths_cpu, top_n_v_cpu, top_n_i_cpu
             )
         return result, top_n_dict
 
@@ -172,15 +171,7 @@ class LogProbsPrefill:
         top_n_values: Tensor,
         top_n_indices: Tensor,
     ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
-        """Build per-request top-n dict for prefill mode.
-
-        Args:
-            context: The active DynamicInferenceContext.
-            req_idx_list (List[int]): Request indices that wanted log probs.
-            masked_lengths_cpu (List[int]): Per-request token counts.
-            top_n_values (Tensor): Top-n log-prob values on GPU.
-            top_n_indices (Tensor): Top-n token indices on GPU.
-        """
+        """Build per-request top-n dict for prefill mode."""
         active_request_count = context.total_request_count - context.paused_request_count
         top_n_per_req: List[int] = context.active_request_metadata["top_n_logprobs"][
             :active_request_count
@@ -188,8 +179,6 @@ class LogProbsPrefill:
         skip_prompt_per_req: List[bool] = context.active_request_metadata["skip_prompt_log_probs"][
             :active_request_count
         ].tolist()
-        top_n_v_cpu = top_n_values.cpu()
-        top_n_i_cpu = top_n_indices.cpu()
         result: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
         token_offset = 0
         for i, req_idx in enumerate(req_idx_list):
@@ -198,10 +187,10 @@ class LogProbsPrefill:
             if n > 0:
                 if skip_prompt_per_req[req_idx] and req_len > 1:
                     last = token_offset + req_len - 1
-                    result[req_idx] = [(top_n_v_cpu[last, :n], top_n_i_cpu[last, :n])]
+                    result[req_idx] = [(top_n_values[last, :n], top_n_indices[last, :n])]
                 else:
                     result[req_idx] = [
-                        (top_n_v_cpu[token_offset + j, :n], top_n_i_cpu[token_offset + j, :n])
+                        (top_n_values[token_offset + j, :n], top_n_indices[token_offset + j, :n])
                         for j in range(req_len)
                     ]
             token_offset += req_len
@@ -225,14 +214,14 @@ class LogProbsPrefill:
         eager: bool = False,
         top_n_max: int = 0,
     ):
-        """Run softmax kernel and return a deferred extract callable.
+        """Run softmax kernel + top-n (on side stream) and return a deferred extract callable.
 
         Args:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, padded_active_tokens, vocab_size].
             new_tokens (Tensor): Newly sampled tokens.
             log_prob_request_count (int): Number of requests wanting log probs.
-            eager (bool): If True, skip CUDA graph capture/replay.
+            eager (bool): If True, skip CUDA graph capture/replay for the kernels.
             top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
 
         Returns:
@@ -246,6 +235,23 @@ class LogProbsPrefill:
             logits, new_tokens, ri, cu_ml, li, li_range, mt,
             eager=eager, cache_key=key,
         )
+
+        top_n_v = top_n_i = None
+        if top_n_max > 0:
+            if self._topn_stream is not None:
+                self._topn_stream.wait_stream(torch.cuda.current_stream())
+                stream_ctx = torch.cuda.stream(self._topn_stream)
+            else:
+                stream_ctx = nullcontext()
+            with stream_ctx:
+                # Topk on all padded rows; extract slices to selected_token_count.
+                # The sentinel-fill rows produce throwaway top-n that extract drops.
+                raw = logits.squeeze(0)[li].float()
+                top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
+                top_n_v = top_n_v_raw - lse.unsqueeze(-1)
+            if self._topn_event is not None:
+                self._topn_event.record(self._topn_stream)
+
         active_request_count = context.total_request_count - context.paused_request_count
         return functools.partial(
             self.extract,
@@ -253,10 +259,8 @@ class LogProbsPrefill:
             ri,
             cu_ml,
             slp,
-            lse,
             log_prob_request_count,
             active_request_count,
-            top_n_max=top_n_max,
-            logits=logits,
-            logit_indices=li,
+            top_n_values=top_n_v,
+            top_n_indices=top_n_i,
         )

@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,7 +28,10 @@ class LogProbsSpeculative:
     When prefill logits are available it delegates to `LogProbsPrefill` for the prefill portion.
     """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, topn_stream=None, topn_event=None):
+        # See LogProbsDecode for stream/event semantics.
+        self._topn_stream = topn_stream
+        self._topn_event = topn_event
         if config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
                 config, self,
@@ -175,10 +179,10 @@ class LogProbsSpeculative:
         prefill_gathered: Tensor,
         accepted_token_counts: Tensor,
         result: List[Optional[List[float]]],
-        logits: Optional[Tensor] = None,
-        decode_lse: Optional[Tensor] = None,
-        prefill_lse: Optional[Tensor] = None,
-        top_n_max: int = 0,
+        decode_top_n_values: Optional[Tensor] = None,
+        decode_top_n_indices: Optional[Tensor] = None,
+        prefill_top_n_values: Optional[Tensor] = None,
+        prefill_top_n_indices: Optional[Tensor] = None,
     ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
         """CPU extraction for speculative log probs. Populates `result` in-place.
 
@@ -188,13 +192,13 @@ class LogProbsSpeculative:
             prefill_gathered (Tensor): Gathered prefill log probs from gather_kernel.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
             result (List): Mutable list to populate with per-request log probs.
-            logits (Optional[Tensor]): Raw logits for top-n re-gather.
-            decode_lse (Optional[Tensor]): Decode lse from softmax_kernel.
-            prefill_lse (Optional[Tensor]): Prefill lse from softmax_kernel.
-            top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
+            decode_top_n_values / decode_top_n_indices (Optional[Tensor]):
+                Pre-computed decode top-n shape [num_decode, spec+1, top_n_max].
+            prefill_top_n_values / prefill_top_n_indices (Optional[Tensor]):
+                Pre-computed last-token prefill top-n shape [num_prefill, top_n_max].
 
         Returns:
-            top_n_dict if top_n_max > 0, else None.
+            top_n_dict if any top-n entries were produced, else None.
         """
         num_decode = context.num_decode_requests
         num_prefill = context.total_request_count - context.paused_request_count - num_decode
@@ -212,16 +216,9 @@ class LogProbsSpeculative:
         top_n_dict: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
 
         # Decode top-n.
-        if top_n_max > 0 and logits is not None and decode_lse is not None and num_decode > 0:
-            spec_plus_one = context.num_speculative_tokens + 1
-            decode_len = num_decode * spec_plus_one
-            raw_decode = logits.squeeze(0)[:decode_len].float()
-            top_n_v, top_n_i = _topk(raw_decode, k=top_n_max)
-            top_n_v = top_n_v - decode_lse[:num_decode].reshape(decode_len).unsqueeze(-1)
-            top_n_v = top_n_v.reshape(num_decode, spec_plus_one, -1)
-            top_n_i = top_n_i.reshape(num_decode, spec_plus_one, -1)
-            top_n_v_cpu = top_n_v.cpu()
-            top_n_i_cpu = top_n_i.cpu()
+        if decode_top_n_values is not None and decode_top_n_indices is not None and num_decode > 0:
+            top_n_v_cpu = decode_top_n_values.cpu()
+            top_n_i_cpu = decode_top_n_indices.cpu()
             top_n_per_req_cpu: List[int] = context.active_request_metadata[
                 "top_n_logprobs"
             ].tolist()
@@ -246,15 +243,14 @@ class LogProbsSpeculative:
             if prefill_mask_cpu[i]:
                 result[num_decode + i] = [prefill_gathered_cpu[i].item()]
 
-        # Materialized prefill top-n.
-        if top_n_max > 0 and logits is not None and prefill_lse is not None and num_prefill > 0:
-            spec_plus_one = context.num_speculative_tokens + 1
-            raw_decode_len = num_decode * spec_plus_one
-            raw_prefill = logits.squeeze(0)[raw_decode_len : raw_decode_len + num_prefill].float()
-            top_n_v, top_n_i = _topk(raw_prefill, k=top_n_max)
-            top_n_v = top_n_v - prefill_lse[:num_prefill].unsqueeze(-1)
-            top_n_v_cpu = top_n_v.cpu()
-            top_n_i_cpu = top_n_i.cpu()
+        # Materialized prefill top-n (last token only).
+        if (
+            prefill_top_n_values is not None
+            and prefill_top_n_indices is not None
+            and num_prefill > 0
+        ):
+            top_n_v_cpu = prefill_top_n_values.cpu()
+            top_n_i_cpu = prefill_top_n_indices.cpu()
             top_n_per_req_cpu2: List[int] = context.active_request_metadata[
                 "top_n_logprobs"
             ].tolist()
@@ -296,7 +292,7 @@ class LogProbsSpeculative:
         eager: bool = False,
         top_n_max: int = 0,
     ):
-        """Run gather kernel and return a deferred extract callable.
+        """Run gather kernel + top-n (on side stream) and return a deferred extract callable.
 
         Args:
             context: The active DynamicInferenceContext.
@@ -305,17 +301,19 @@ class LogProbsSpeculative:
             log_prob_request_count (int): Number of requests wanting log probs.
             accepted_tokens (Tensor): Speculative-verified token IDs.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
-            eager (bool): If True, skip CUDA graph capture/replay.
+            eager (bool): If True, skip CUDA graph capture/replay for the kernels.
             top_n_max (int): Maximum top-n logprobs to compute (0 to skip).
 
         Returns:
             A callable that returns (per_request_log_probs, top_n_dict).
         """
         active_request_count = context.total_request_count - context.paused_request_count
-        num_prefill = active_request_count - context.num_decode_requests
+        num_decode = context.num_decode_requests
+        num_prefill = active_request_count - num_decode
         only_last = context.config.materialize_only_last_token_logits
+        spec_plus_one = context.num_speculative_tokens + 1
 
-        # Speculative gather: runs post-verification.
+        # Speculative gather: runs post-verification on main stream.
         decode_lse = self._decode_lse
         prefill_lse = self._prefill_lse
 
@@ -332,9 +330,8 @@ class LogProbsSpeculative:
             cache_key=key,
         )
 
-        # Full prefill softmax (if needed); runs post-verification, before extract.
-        fp_slp = None
-        fp_lse = None
+        # Full prefill softmax (if needed); runs post-verification on main stream.
+        fp_slp = fp_lse = None
         fp_ri = fp_cu_ml = fp_li = fp_count_gpu = None
         if not only_last and num_prefill > 0:
             fp_ri = self._fp_ri
@@ -350,6 +347,49 @@ class LogProbsSpeculative:
                 eager=eager, cache_key=fp_key,
             )
 
+        # Top-n on the side stream after all main-stream work above.
+        decode_top_n_v = decode_top_n_i = None
+        prefill_top_n_v = prefill_top_n_i = None
+        fp_top_n_v = fp_top_n_i = None
+
+        if top_n_max > 0:
+            if self._topn_stream is not None:
+                self._topn_stream.wait_stream(torch.cuda.current_stream())
+                stream_ctx = torch.cuda.stream(self._topn_stream)
+            else:
+                stream_ctx = nullcontext()
+            with stream_ctx:
+                # Decode region: topk on [num_decode * spec_plus_one] real rows.
+                if num_decode > 0:
+                    decode_len = num_decode * spec_plus_one
+                    raw_decode = logits.squeeze(0)[:decode_len].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_decode, k=top_n_max)
+                    top_n_v_flat = top_n_v_raw - decode_lse[:num_decode].reshape(
+                        decode_len
+                    ).unsqueeze(-1)
+                    decode_top_n_v = top_n_v_flat.reshape(num_decode, spec_plus_one, -1)
+                    decode_top_n_i = top_n_i_raw.reshape(num_decode, spec_plus_one, -1)
+
+                # Last-token prefill region (also valid for not-only-last; if full
+                # prefill top-n is computed below, it overwrites these per-request).
+                if num_prefill > 0:
+                    decode_len = num_decode * spec_plus_one
+                    raw_prefill = logits.squeeze(0)[
+                        decode_len : decode_len + num_prefill
+                    ].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_prefill, k=top_n_max)
+                    prefill_top_n_v = top_n_v_raw - prefill_lse[:num_prefill].unsqueeze(-1)
+                    prefill_top_n_i = top_n_i_raw
+
+                # Full prefill region (when not only_last).
+                if fp_slp is not None:
+                    raw_full_prefill = logits.squeeze(0)[fp_li].float()
+                    top_n_v_raw, top_n_i_raw = _topk(raw_full_prefill, k=top_n_max)
+                    fp_top_n_v = top_n_v_raw - fp_lse.unsqueeze(-1)
+                    fp_top_n_i = top_n_i_raw
+            if self._topn_event is not None:
+                self._topn_event.record(self._topn_stream)
+
         def extract_fn():
             result: List[Optional[List[float]]] = [None] * active_request_count
             top_n_dict = LogProbsSpeculative.extract(
@@ -358,10 +398,10 @@ class LogProbsSpeculative:
                 prefill_gathered,
                 accepted_token_counts,
                 result,
-                logits=logits,
-                decode_lse=decode_lse,
-                prefill_lse=prefill_lse,
-                top_n_max=top_n_max,
+                decode_top_n_values=decode_top_n_v,
+                decode_top_n_indices=decode_top_n_i,
+                prefill_top_n_values=prefill_top_n_v,
+                prefill_top_n_indices=prefill_top_n_i,
             )
 
             if fp_slp is not None:
@@ -370,12 +410,10 @@ class LogProbsSpeculative:
                     fp_ri,
                     fp_cu_ml,
                     fp_slp,
-                    fp_lse,
                     fp_count_gpu.item(),
                     active_request_count,
-                    top_n_max=top_n_max,
-                    logits=logits,
-                    logit_indices=fp_li,
+                    top_n_values=fp_top_n_v,
+                    top_n_indices=fp_top_n_i,
                 )
                 for i, lp in enumerate(prefill_result):
                     if lp is not None:

@@ -171,10 +171,14 @@ class TextGenerationController:
         # Side stream for post-forward bookkeeping (e.g. speculative softmax).
         # Runs concurrently with verification/sampling on the main stream.
         self._post_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
+        # Side stream for the eager top-n compute hoisted out of `extract`.
+        # Runs concurrently with context bookkeeping and initialization.
+        self._log_probs_topn_stream = torch.cuda.Stream(device=device)
 
         # GPU-ordering events.
         self._pre_forward_bookkeeping_event = torch.cuda.Event()
         self._post_forward_bookkeeping_event = torch.cuda.Event()
+        self._log_probs_topn_event = torch.cuda.Event()
 
         # CPU-blocking events.
         self._pre_init_bookkeeping_event = torch.cuda.Event()
@@ -185,9 +189,23 @@ class TextGenerationController:
         self._top_n_max_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
 
         # Log-prob computation backends (graph caching is per-backend).
-        self._log_probs_decode = LogProbsDecode(self.model_config)
-        self._log_probs_prefill = LogProbsPrefill(self.model_config)
-        self._log_probs_speculative = LogProbsSpeculative(self.model_config)
+        # All three share the same top-n side stream + event so the next
+        # forward only needs to wait on a single point.
+        self._log_probs_decode = LogProbsDecode(
+            self.model_config,
+            topn_stream=self._log_probs_topn_stream,
+            topn_event=self._log_probs_topn_event,
+        )
+        self._log_probs_prefill = LogProbsPrefill(
+            self.model_config,
+            topn_stream=self._log_probs_topn_stream,
+            topn_event=self._log_probs_topn_event,
+        )
+        self._log_probs_speculative = LogProbsSpeculative(
+            self.model_config,
+            topn_stream=self._log_probs_topn_stream,
+            topn_event=self._log_probs_topn_event,
+        )
 
 
         # Used for inefficient torch sampling.
@@ -1323,7 +1341,9 @@ class TextGenerationController:
 
     def _dynamic_step_calculate_log_probs(self):
         """Calculate log probs from logits."""
-        if self._log_prob_count_pinned.item() == 0 and self._top_n_max_pinned.item() == 0:
+        log_prob_request_count = self._log_prob_count_pinned.item()
+        top_n_max = self._top_n_max_pinned.item()
+        if log_prob_request_count == 0 and top_n_max == 0:
             return None
 
         context = self.inference_wrapped_model.inference_context
@@ -1348,7 +1368,6 @@ class TextGenerationController:
                 eager=eager,
                 top_n_max=top_n_max,
             )
-
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
             return self._log_probs_decode.calculate(
                 context,
@@ -1358,15 +1377,14 @@ class TextGenerationController:
                 eager=eager,
                 top_n_max=top_n_max,
             )
-        else:
-            return self._log_probs_prefill.calculate(
-                context,
-                logits,
-                new_tokens,
-                log_prob_request_count,
-                eager=eager,
-                top_n_max=top_n_max,
-            )
+        return self._log_probs_prefill.calculate(
+            context,
+            logits,
+            new_tokens,
+            log_prob_request_count,
+            eager=eager,
+            top_n_max=top_n_max,
+        )
 
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
@@ -1612,6 +1630,9 @@ class TextGenerationController:
             return None
 
         with torch.inference_mode():
+            # Wait for the previous step's top-n side-stream read of `_all_logits_cuda`.
+            torch.cuda.current_stream().wait_event(self._log_probs_topn_event)
+
             # Launch log-prob reduction + D2H copy early so the pinned counts
             # are ready by the time indexing needs them (after context init).
             self._pre_init_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
