@@ -139,11 +139,17 @@ class KVBlockAllocator:
             self._pc_dereg_may_have_events: bool = False
 
             # Per-block workspace for deduplicating released block IDs.
+            # Sized total_count + 1 so the dummy sentinel slot at index
+            # ``dummy_block_idx`` is a valid no-op write target.
             self._pc_released_bitmap = torch.zeros(
-                (self.total_count,), dtype=torch.bool, device=device
+                (self.total_count + 1,), dtype=torch.bool, device=device
             )
+            # ``arange`` length matches the per-block scratch tensors so
+            # scatter writes that include the sentinel position resolve
+            # cleanly; the sentinel value ``total_count`` lands at the
+            # sink targets the surrounding masks route invalid lanes to.
             self._pc_block_arange = torch.arange(
-                self.total_count, dtype=torch.int32, device=device
+                self.total_count + 1, dtype=torch.int32, device=device
             )
 
         # Per-block MoE routing storage (populated when routing replay is enabled)
@@ -504,6 +510,133 @@ class KVBlockAllocator:
         bag_indices = self.total_avail_gpu + self._release_arange_i32
         self.block_bag[bag_indices.long()] = packed_blocks
         self.total_avail_gpu.add_(num_valid_gpu.to(torch.int32).view(1))
+
+    def _push_masked_to_pool(self, push_mask: Tensor) -> None:
+        """Shape-stable push of selected blocks onto the free pool stack.
+
+        Iterates over the full block pool via ``push_mask`` (shape
+        ``(total_count,)``, bool). Valid positions are packed onto the
+        stack above the current ``total_avail_gpu`` pointer; masked-out
+        positions route to a sink at the tail of the extended
+        ``block_bag``. The stack pointer advances by the number of
+        valid positions.
+
+        ``block_bag`` was sized ``total_count + max_release_per_step`` by
+        ``__init__``, so the sink at index
+        ``total_count + max_release_per_step - 1`` never collides with
+        a real push target.
+        """
+        push_i64 = push_mask.to(torch.int64)
+        push_prefix = torch.cumsum(push_i64, dim=0) - push_i64
+        bag_sink = self.total_count + self.max_release_per_step - 1
+        bag_targets = torch.where(
+            push_mask,
+            self.total_avail_gpu.to(torch.int64) + push_prefix,
+            torch.full_like(push_prefix, bag_sink),
+        )
+        self.block_bag[bag_targets] = self._pc_block_arange
+        self.total_avail_gpu.add_(push_i64.sum().to(torch.int32).view(1))
+
+    def _enqueue_dereg_and_clear_hashes(self, dereg_mask: Tensor) -> None:
+        """Shape-stable: enqueue dereg events and clear hashes.
+
+        Snapshots ``(block_id, old_hash)`` pairs for each block where
+        ``dereg_mask`` is True into the pending-dereg queue (for the
+        host-side ``drain_pending_dereg`` pass) and clears those blocks'
+        hashes in-place.
+
+        Args:
+            dereg_mask: ``(total_count,)`` bool. True at each block whose
+                hash must be dropped from ``kv_hash_to_block_id`` and
+                cleared in ``block_hashes``.
+        """
+        # Scatter-pack over the full block pool into the dereg queue.
+        # Real entries land at ``_pc_pending_dereg_count + prefix``;
+        # masked-out entries land at the sink slot (last queue position).
+        dereg_i64 = dereg_mask.to(torch.int64)
+        dereg_prefix = torch.cumsum(dereg_i64, dim=0) - dereg_i64
+        dereg_targets = torch.where(
+            dereg_mask,
+            self._pc_pending_dereg_count + dereg_prefix,
+            torch.full_like(dereg_prefix, self._pc_dereg_sink_idx),
+        )
+        self._pc_pending_dereg_ids[dereg_targets] = self._pc_block_arange
+        self._pc_pending_dereg_hashes[dereg_targets] = self.block_hashes
+        self._pc_pending_dereg_count.add_(dereg_i64.sum())
+
+        # Clear the GPU-side hashes for the dereg'd blocks.
+        self.block_hashes.masked_fill_(dereg_mask, -1)
+
+    def release_memory_blocks_prefix_aware_gpu(
+        self, packed_blocks: Tensor, num_valid_gpu: Tensor
+    ) -> None:
+        """Shape-stable, prefix-caching-aware graphed release.
+
+        Differs from :meth:`release_memory_blocks_gpu` in that it handles
+        per-block reference counting, deduplication of shared blocks, and
+        the policy-specific decision of whether a zero-ref block should
+        be deregistered and pushed back to the free pool.
+
+        REF_ZERO semantics: every block whose ref count hits zero is
+        deregistered (hash cleared, pushed to pool, queued for host-side
+        dict/callback cleanup in ``_pc_pending_dereg_*``).
+
+        LRU semantics land in the next commit.
+
+        Handles duplicate block IDs correctly: prefix caching can share a
+        block across multiple requests, so the same ID may appear several
+        times in ``packed_blocks``. ``scatter_add_`` accumulates the
+        decrements, and the post-decrement scan over the full block pool
+        (via ``_pc_released_bitmap``) deduplicates the zero-detection.
+
+        Args:
+            packed_blocks: Fixed-size ``(max_release_per_step,)`` tensor
+                with valid block IDs packed at ``[0, num_valid_gpu)`` and
+                sentinels (``dummy_block_idx``) elsewhere.
+            num_valid_gpu: 0-d or 1-element int tensor holding the valid
+                count.
+
+        The caller must drain ``_pc_pending_dereg_*`` (via
+        :meth:`drain_pending_dereg`) before the next release, so the
+        queue never holds more than one release's worth of entries.
+        """
+        assert self.enable_prefix_caching
+        assert (
+            self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
+        ), "LRU policy not yet supported by graphed prefix-aware release."
+        assert packed_blocks.numel() == self.max_release_per_step
+
+        # ── Decrement ref counts ──
+        # Build a per-position change vector: -1 for each valid slot, 0 for
+        # sentinels. Using ``scatter_add_`` lets duplicate block IDs (from
+        # shared prefix cache entries) accumulate their decrements
+        # correctly. Sentinels land at ``dummy_block_idx`` with change 0,
+        # which is a safe no-op scatter.
+        valid_mask = self._release_arange_i64 < num_valid_gpu.view(1)
+        change = -valid_mask.to(torch.int32)
+        self.block_ref_counts.scatter_add_(0, packed_blocks.long(), change)
+
+        # ── Deduplicated "was released this call" per-block mask ──
+        # Scatter True into a bitmap keyed by block ID; dedup is automatic.
+        # Sentinels land at ``dummy_block_idx``; we clear that slot after.
+        safe_indices = torch.where(
+            valid_mask,
+            packed_blocks.long(),
+            torch.full_like(packed_blocks.long(), self.dummy_block_idx),
+        )
+        self._pc_released_bitmap.zero_()
+        self._pc_released_bitmap[safe_indices] = True
+        # Clear the sentinel drain in case ``dummy_block_idx`` isn't
+        # legitimately released (it should never be — it's reserved).
+        self._pc_released_bitmap[self.dummy_block_idx] = False
+
+        # ── Per-block "now zero" mask (deduplicated) ──
+        now_zero_mask = self._pc_released_bitmap & (self.block_ref_counts == 0)
+
+        # REF_ZERO: every zero-ref block is deregistered (hash cleared,
+        # queued for host-side dict cleanup) AND pushed to the free pool.
+        self._enqueue_dereg_and_clear_hashes(now_zero_mask)
+        self._push_masked_to_pool(now_zero_mask)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.

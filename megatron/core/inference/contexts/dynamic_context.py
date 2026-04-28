@@ -2809,6 +2809,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         released_mask = torch.zeros(self.max_requests, dtype=torch.bool, device=device)
         released_mask[request_indexes] = True
         self._release_blocks_from_mask_gpu(released_mask)
+        # Eager release: we just enqueued possible dereg events GPU-side, so
+        # arm the host flag that drain_pending_dereg uses to gate its sync,
+        # then drain in the same call to keep the host dict consistent for
+        # subsequent add_request calls.
+        self.kv_block_allocator._pc_dereg_may_have_events = True
+        self.kv_block_allocator.drain_pending_dereg()
 
     def _release_blocks_from_mask_gpu(self, released_mask: Tensor) -> None:
         """Shape-stable release driven by a full-size bool mask.
@@ -2842,9 +2848,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             fill_value=self.kv_block_allocator.dummy_block_idx,
             sink_idx_value=max_release,
         )
-        self.kv_block_allocator.release_memory_blocks_gpu(
-            self._ur.release_pack_buf[:max_release], num_valid_gpu
-        )
+        if (
+            self.enable_prefix_caching
+            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
+        ):
+            # Prefix-aware release: per-block ref count decrement,
+            # deregistration, hash clearing, and free-pool push. Host-side
+            # dict cleanup is deferred to ``drain_pending_dereg`` called
+            # after this graph body syncs.
+            self.kv_block_allocator.release_memory_blocks_prefix_aware_gpu(
+                self._ur.release_pack_buf[:max_release], num_valid_gpu
+            )
+        else:
+            self.kv_block_allocator.release_memory_blocks_gpu(
+                self._ur.release_pack_buf[:max_release], num_valid_gpu
+            )
         # Invalidate released rows in the block ID matrix.
         self.request_to_kv_block_ids.masked_fill_(row_mask, -1)
 
@@ -3752,6 +3770,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # wrote into _ur.combined_sync.
         sv = UpdateRequestsSyncedCounters.from_buffer(self._ur.combined_sync.cpu().tolist())
 
+        # Pre-step total, captured before the writes below overwrite it.
+        # The graphed bodies only release blocks for finished requests
+        # (bucket4 = total_pre - sum(bucket0..3)) and evicted ones. Used
+        # below to gate the prefix-caching dereg drain so it only fires
+        # when the queue could plausibly hold events.
+        total_pre = self.total_request_count
+
         self.reset_attention_state()
 
         if sv.total_final == 0 and not has_chunked:
@@ -3761,6 +3786,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count = 0
             self.reset_mamba_state()
             self.kv_block_allocator.total_avail = sv.total_avail
+            # Body 1 just released every active request's blocks. If
+            # prefix caching is on, that release enqueued dereg events
+            # we need to drain so the host-side hash dict stays in sync.
+            if self.enable_prefix_caching and total_pre > 0:
+                self.kv_block_allocator._pc_dereg_may_have_events = True
+            self.kv_block_allocator.drain_pending_dereg()
             return {"newly_paused_request_ids": None, "evict_request_ids": None}
 
         # [active | paused]: paused_count = total - active.
@@ -3815,6 +3846,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.paused_speculative_tokens = self._ur.paused_spec_tokens_buf[
                     :, :new_paused_final
                 ]
+
+        # bucket4 (finished count) = pre-step total minus the four kept
+        # buckets; together with eviction it covers every release this
+        # step. Skip the drain — and its .item() sync — when nothing was
+        # released, even with prefix caching enabled.
+        bucket4 = total_pre - sv.bucket0 - sv.bucket1 - sv.bucket2 - sv.bucket3
+        if self.enable_prefix_caching and (bucket4 + sv.evict_count) > 0:
+            self.kv_block_allocator._pc_dereg_may_have_events = True
+        self.kv_block_allocator.drain_pending_dereg()
 
         if __debug__:
             assert active_request_count > 0 or self.chunked_prefill_request_id != -1, (
