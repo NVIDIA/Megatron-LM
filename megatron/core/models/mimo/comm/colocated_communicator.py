@@ -95,12 +95,7 @@ class ColocatedBridgeCommunicator:
         elif self.dest_dp_size > self.src_dp_size:
             self.direction = BridgeDirection.FAN_OUT
             self.scale = self.dest_dp_size // self.src_dp_size
-            self.gather_group_ranks = self._build_gather_groups(
-                iter_size=self.src_dp_size,
-                sibling_tp_size=self.dest_tp_size,
-                scale=self.scale,
-                rank_to_pos=self.rank_to_dest_pos,
-            )
+            self.gather_group_ranks = self._build_fan_out_gather_groups()
             self.gather_pg, _ = dist.new_subgroups_by_enumeration(
                 self.gather_group_ranks, backend='nccl'
             )
@@ -128,8 +123,9 @@ class ColocatedBridgeCommunicator:
                 f"src={self.src_grid.rank_offset}, dest={self.dest_grid.rank_offset}"
             )
 
-        # Per-grid dim checks: tp/dp required; pp and cp (if present) must be 1.
-        # CP>1 also corrupts dp_idx when iterating get_rank_enum(['tp']) groups.
+        # Per-grid dim checks: tp/dp required; cp (if present) must be 1.
+        # Src PP must be 1; dest PP>1 is allowed. CP>1 corrupts dp_idx when
+        # iterating get_rank_enum(['tp']) groups.
         for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
             for required in ('tp', 'dp'):
                 if required not in grid.dim_names:
@@ -137,14 +133,16 @@ class ColocatedBridgeCommunicator:
                         f"{name} grid must have '{required}' dimension, "
                         f"got dim_names={grid.dim_names}"
                     )
-            for singleton in ('pp', 'cp'):
-                if singleton in grid.dim_names:
-                    size = grid.shape[grid.dim_names.index(singleton)]
-                    if size != 1:
-                        raise ValueError(
-                            f"{name} {singleton.upper()} must be 1 for "
-                            f"ColocatedBridgeCommunicator, got {size}"
-                        )
+            if 'cp' in grid.dim_names:
+                cp_size = grid.shape[grid.dim_names.index('cp')]
+                if cp_size != 1:
+                    raise ValueError(
+                        f"{name} CP must be 1 for ColocatedBridgeCommunicator, got {cp_size}"
+                    )
+        if 'pp' in self.src_grid.dim_names:
+            src_pp = self.src_grid.shape[self.src_grid.dim_names.index('pp')]
+            if src_pp != 1:
+                raise ValueError(f"src PP must be 1 for ColocatedBridgeCommunicator, got {src_pp}")
 
         src_dp = self.src_grid.shape[self.src_grid.dim_names.index('dp')]
         dest_dp = self.dest_grid.shape[self.dest_grid.dim_names.index('dp')]
@@ -158,20 +156,35 @@ class ColocatedBridgeCommunicator:
         self.src_dp_size = self.src_grid.shape[self.src_grid.dim_names.index('dp')]
         self.dest_tp_size = self.dest_grid.shape[self.dest_grid.dim_names.index('tp')]
         self.dest_dp_size = self.dest_grid.shape[self.dest_grid.dim_names.index('dp')]
+        self.dest_pp_size = (
+            self.dest_grid.shape[self.dest_grid.dim_names.index('pp')]
+            if 'pp' in self.dest_grid.dim_names
+            else 1
+        )
 
     def _build_rank_mappings(self):
         self.rank_to_src_pos: Dict[int, Tuple[int, int]] = {}
         self.rank_to_dest_pos: Dict[int, Tuple[int, int]] = {}
+        self.rank_to_dest_pp_pos: Dict[int, Tuple[int, int, int]] = {}
+        self.dest_pp_pos_to_rank: Dict[Tuple[int, int, int], int] = {}
 
         src_tp_groups = self.src_grid.get_rank_enum(['tp'])
         for dp_idx, tp_group in enumerate(src_tp_groups):
             for tp_idx, rank in enumerate(tp_group):
                 self.rank_to_src_pos[rank] = (dp_idx, tp_idx)
 
-        dest_tp_groups = self.dest_grid.get_rank_enum(['tp'])
-        for dp_idx, tp_group in enumerate(dest_tp_groups):
-            for tp_idx, rank in enumerate(tp_group):
+        # Include destination PP when enumerating destination ranks so DP
+        # indices stay true DP coordinates instead of flattened (dp, pp)
+        # positions. Fan-out gather groups then stay within one PP stage.
+        dest_group_dims = ['tp', 'pp'] if 'pp' in self.dest_grid.dim_names else ['tp']
+        dest_tp_pp_groups = self.dest_grid.get_rank_enum(dest_group_dims)
+        for dp_idx, tp_pp_group in enumerate(dest_tp_pp_groups):
+            for local_idx, rank in enumerate(tp_pp_group):
+                pp_idx = local_idx // self.dest_tp_size if self.dest_pp_size > 1 else 0
+                tp_idx = local_idx % self.dest_tp_size
                 self.rank_to_dest_pos[rank] = (dp_idx, tp_idx)
+                self.rank_to_dest_pp_pos[rank] = (dp_idx, pp_idx, tp_idx)
+                self.dest_pp_pos_to_rank[(dp_idx, pp_idx, tp_idx)] = rank
 
     @staticmethod
     def _build_gather_groups(
@@ -196,6 +209,21 @@ class ColocatedBridgeCommunicator:
                             group_ranks.append(rank)
                             break
                 groups.append(group_ranks)
+        return groups
+
+    def _build_fan_out_gather_groups(self) -> List[List[int]]:
+        """Build dest-side fan-out gather groups, preserving destination PP stage."""
+        groups: List[List[int]] = []
+        for src_dp_idx in range(self.src_dp_size):
+            sibling_dp_indices = range(src_dp_idx * self.scale, (src_dp_idx + 1) * self.scale)
+            for dest_pp_idx in range(self.dest_pp_size):
+                for dest_tp_idx in range(self.dest_tp_size):
+                    group_ranks = []
+                    for dest_dp_idx in sibling_dp_indices:
+                        group_ranks.append(
+                            self.dest_pp_pos_to_rank[(dest_dp_idx, dest_pp_idx, dest_tp_idx)]
+                        )
+                    groups.append(group_ranks)
         return groups
 
     def is_fan_in(self) -> bool:
