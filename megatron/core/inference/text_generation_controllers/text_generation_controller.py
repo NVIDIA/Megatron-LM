@@ -144,8 +144,11 @@ class TextGenerationController:
         else:
             max_logits = context.max_tokens
 
-        # Callback to get request IDs that should be marked as finished due to stop words
+        # Callback to get request IDs that should be marked as finished due to stop words.
+        # The mask is pre-computed on _pre_forward_bookkeeping_stream so the D2H
+        # sync overlaps with the forward pass.
         self._get_stop_word_finished_ids_callback = None
+        self._stop_word_mask = torch.zeros(max_requests, dtype=torch.bool, device='cuda')
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.config.params_dtype
@@ -166,6 +169,11 @@ class TextGenerationController:
         # with the forward pass; post-forward consumers synchronize on the event.
         self._pre_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
         self._pre_forward_bookkeeping_event = torch.cuda.Event()
+
+        # Side stream for post-sampling bookkeeping. Copies the mask and sampled
+        # tokens into static buffers while the main stream builds return values.
+        self._post_sampling_bookkeeping_stream = torch.cuda.Stream(device=device)
+        self._post_sampling_bookkeeping_event = torch.cuda.Event()
 
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
@@ -1735,6 +1743,20 @@ class TextGenerationController:
                 )
             nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")
 
+    def _precompute_stop_word_mask(self) -> None:
+        """Build the stop-word mask."""
+        if self._get_stop_word_finished_ids_callback is None:
+            return
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_ids = context.active_request_ids[:active_request_count]
+        request_ids_list = active_request_ids.tolist()
+        stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+        self._stop_word_mask[:active_request_count] = torch.tensor(
+            [rid in stop_word_finished_ids for rid in request_ids_list],
+            dtype=torch.bool,
+        ) if stop_word_finished_ids else False
+
     def _dynamic_step_post_sample_bookkeeping(self) -> Dict:
         """Build the active-request mask and prepare update_requests inputs.
 
@@ -1759,15 +1781,9 @@ class TextGenerationController:
             != context.request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
-        # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests).
+        # Apply pre-computed stop-word mask.
         if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = context.active_request_ids[:active_request_count].tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
+            active_request_mask.masked_fill_(self._stop_word_mask[:active_request_count], 0)
 
         # Clone before returning: ``context.active_request_ids`` is a static
         # buffer overwritten by the next step's ``_prepare_update_requests_metadata``
@@ -1871,6 +1887,7 @@ class TextGenerationController:
             # Launch bookkeeping on a side stream so it overlaps with forward.
             self._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
+                self._precompute_stop_word_mask()
                 context._prepare_update_requests_metadata()
                 self._pre_forward_bookkeeping_event.record()
 
@@ -1933,8 +1950,13 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
+            # Build termination mask and copy tokens into static buffers
+            # on a side stream so it overlaps with log-probs computation.
             if not skip_bookkeeping:
-                prep_result = self._dynamic_step_post_sample_bookkeeping()
+                self._post_sampling_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._post_sampling_bookkeeping_stream):
+                    prep_result = self._dynamic_step_post_sample_bookkeeping()
+                    self._post_sampling_bookkeeping_event.record()
 
             log_probs = None
             top_n_logprobs = None
@@ -1957,6 +1979,7 @@ class TextGenerationController:
             if skip_bookkeeping:
                 request_bookkeeping = {}
             else:
+                torch.cuda.current_stream().wait_event(self._post_sampling_bookkeeping_event)
                 request_bookkeeping = self._run_update_requests(prep_result)
 
             ret = {
