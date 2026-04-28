@@ -402,6 +402,18 @@ class MambaMetadata:
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1
 
+    def free_slots_gpu(self, packed_slots: torch.Tensor, num_valid: torch.Tensor) -> None:
+        """Shape-stable mamba free that writes a pre-packed buffer onto the stack.
+
+        Args:
+            packed_slots: (`max_requests`,) tensor with mamba slot IDs packed at `[0, num_valid)`.
+            num_valid: 0-d or 1-element int tensor holding the valid count.
+        """
+        assert packed_slots.numel() == self.max_requests
+        free_indices = self._free_slot_count_gpu + self._free_arange
+        self.mamba_state_free_slots[free_indices.long()] = packed_slots
+        self._free_slot_count_gpu.add_(num_valid.to(torch.int32).view(1))
+
     def sync_to_cpu(self) -> None:
         """Mirror `_free_slot_count_gpu` back into the Python int."""
         self.mamba_state_free_slot_count = int(self._free_slot_count_gpu.item())
