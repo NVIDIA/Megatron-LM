@@ -526,6 +526,9 @@ class CheckpointConfig:
     "ep_dp": Expert data parallel process group.
     """
 
+    exit_after_loading_ckpt: bool = False
+    """If set, exit the program after loading from a checkpoint. Useful for testing checkpoint loading."""
+
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 

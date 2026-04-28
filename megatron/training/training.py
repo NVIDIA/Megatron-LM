@@ -1768,6 +1768,10 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+        if args.exit_after_loading_ckpt:
+            print_rank_0('Checkpoint successfully loaded. Exiting due to --exit-after-loading-ckpt.')
+            torch.distributed.barrier()
+            exit()
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
