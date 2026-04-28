@@ -12,7 +12,6 @@ This article documents an agent-driven exploration of heterogeneous TP/DP/PP for
 - [Failure Modes and Human Verification](#failure-modes-and-human-verification)
 - [The Operating Model](#the-operating-model)
 - [Adapting This for Other Workloads](#adapting-this-for-other-workloads)
-- [Resources](#resources)
 
 ## The Problem
 
@@ -80,7 +79,7 @@ All measurements are H100 (BF16). World sizes range from 16 to 64 GPUs (2 to 8 n
 
 ### Standard sequence length (8K)
 
-Across five encoder–LLM pairs at 8K, heterogeneous parallelism gives +8.1% to +14.0% TFLOPs/GPU over the strongest homogeneous baseline. The gain holds across encoder size (1B, 3B) and LLM size (7B through 70B).
+Across four encoder–LLM pairs at 8K (all at 64 GPUs), heterogeneous parallelism gives +12.7% to +14.0% TFLOPs/GPU over the strongest homogeneous baseline. The gain holds across encoder size (1B, 3B) and LLM size (14B through 70B).
 
 <img src="./images/throughput_8k.png" alt="Heterogeneous vs homogeneous throughput at 8K sequence length, 1B and 3B encoders" width="700">
 
@@ -88,13 +87,12 @@ Figure 1. TFLOPs/GPU at 8K sequence length on H100 (BF16). Each heterogeneous ru
 
 | Encoder | LLM   | World | GBS | Homo TP/DP/PP | Hetero Enc TP/DP/PP | Hetero LLM TP/DP/PP | Homo TFLOPs/GPU | Hetero TFLOPs/GPU |    Δ    | Mem Homo (GB) | Mem Hetero (GB) | Iter Homo (ms) | Iter Hetero (ms) |
 | ------- | ----- | ----: | --: | ------------- | ------------------- | ------------------- | --------------: | ----------------: | ------: | ------------: | --------------: | -------------: | ---------------: |
-| 1B      | 7B    |    16 |  64 | 4/4/1         | 1/16/1              | 4/4/1               |           333.8 |             360.8 |  +8.1%  |          66.3 |            62.2 |              — |                — |
 | 1B      | 14B   |    64 | 256 | 4/16/1        | 1/64/1              | 2/16/2              |           415.1 |             473.3 | +14.0%  |          57.6 |            58.2 |           7746 |             6785 |
 | 3B      | 14B   |    64 | 256 | 4/16/1        | 1/64/1              | 2/16/2              |           441.4 |             498.3 | +12.9%  |          60.1 |            58.3 |           8083 |             7169 |
 | 3B      | 32B   |    64 | 128 | 4/16/1        | 1/64/1              | 4/8/2               |           432.0 |             486.9 | +12.7%  |          69.4 |            55.9 |          14385 |            12787 |
 | 3B      | 70B   |    64 | 128 | 8/4/1         | 1/64/1              | 8/4/2               |           408.0 |             467.4 | +13.0%  |          56.3 |            62.9 |          16573 |            14074 |
 
-Table 1. 8K results. Heterogeneous configurations all run encoder TP=1; rows with LLM PP=2 also use encoder parameter offload during the LLM pipeline phase. Vision token fractions per row: 90% / 90% / 88% / 75% / 75%. Iter time is per-microbatch forward+backward in milliseconds; the 1B+7B 8K iter time was not captured in the source data.
+Table 1. 8K results. Heterogeneous configurations all run encoder TP=1 with encoder parameter offload during the LLM pipeline phase (all four rows have LLM PP=2). Vision token fractions per row: 90% / 88% / 75% / 75%. Iter time is per-microbatch forward+backward in milliseconds.
 
 ### Long context with context parallelism
 
@@ -146,10 +144,3 @@ The reusable patterns:
 - **The team lead is a skeptic.** Validate same-GBS, same-precision, same-optimization-stack equivalence before any result is logged as a finding. Without this role, the team produces propagating bias.
 - **Stop course-correcting; restart.** When an agent goes down a wrong path — flawed assumptions, compounding errors, biased baselines — terminate the session and start fresh. Mid-conversation course correction rarely recovers.
 - **Confirmed, disproven, hypothesis.** The `learnings.md` schema with three sections (confirmed / disproven / hypothesis) makes the knowledge base auditable. A "confirmed" rule that produces a counterexample gets demoted to "depends on configuration" rather than silently failing.
-
-Sanitized agent role definitions for adaptation to other workloads will be added in a follow-up change.
-
-## Resources
-
-1. [Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
-2. [Claude Code](https://www.anthropic.com/claude-code)
