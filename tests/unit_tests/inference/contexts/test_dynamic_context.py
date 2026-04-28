@@ -1409,9 +1409,9 @@ class TestDynamicContext:
     @pytest.mark.parametrize(
         "log_prob_indices",
         [
-            [0, 2],     # partial mask: requests 0 and 2 want log probs
+            [0, 2],  # partial mask: requests 0 and 2 want log probs
             [0, 1, 2],  # full mask: K == num_active (still K < padded_count)
-            [1],        # single masked request
+            [1],  # single masked request
         ],
     )
     @rounder_override(64)
@@ -1461,10 +1461,7 @@ class TestDynamicContext:
         _set_mask()
 
         log_probs, _ = calculate_log_probs(
-            dynamic_context,
-            logits,
-            new_tokens,
-            log_prob_request_count=log_prob_request_count,
+            dynamic_context, logits, new_tokens, log_prob_request_count=log_prob_request_count
         )
 
         for i, req_len in enumerate(request_lengths):
@@ -1482,9 +1479,7 @@ class TestDynamicContext:
                 tok_view = dynamic_context.token_to_input_ids[token_offset : token_offset + req_len]
                 shifted = tok_view[1:].tolist() + [new_tokens[i].item()]
                 for j, tok in enumerate(shifted):
-                    assert (
-                        abs(log_probs[i][j] - expected[token_offset + j, tok].item()) < 1e-5
-                    )
+                    assert abs(log_probs[i][j] - expected[token_offset + j, tok].item()) < 1e-5
             token_offset += req_len
 
         # ── Decode step ──

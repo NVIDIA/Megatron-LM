@@ -126,13 +126,7 @@ def _calculate_log_probs_speculative(
 
     decode_lse, prefill_lse = LogProbsSpeculative.softmax_kernel(context, logits)
     decode_gathered, prefill_gathered = LogProbsSpeculative.gather_kernel(
-        context,
-        logits,
-        decode_lse,
-        prefill_lse,
-        new_tokens,
-        accepted_tokens,
-        accepted_token_counts,
+        context, logits, decode_lse, prefill_lse, new_tokens, accepted_tokens, accepted_token_counts
     )
 
     decode_top_n_v = decode_top_n_i = None

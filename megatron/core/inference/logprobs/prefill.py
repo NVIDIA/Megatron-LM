@@ -34,13 +34,15 @@ class LogProbsPrefill:
         self._topn_event = topn_event
         if config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
-                config, self,
+                config,
+                self,
                 function_name="indexing_kernel",
                 need_backward=False,
                 inline_capture=True,
             )
             CudaGraphManager(
-                config, self,
+                config,
+                self,
                 function_name="softmax_kernel",
                 need_backward=False,
                 inline_capture=True,
@@ -154,47 +156,33 @@ class LogProbsPrefill:
         for i, req_idx in enumerate(req_idx_list):
             result[req_idx] = per_request[i].tolist()
 
-        top_n_dict = None
+        top_n_dict: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]] = None
         if top_n_values is not None and top_n_indices is not None:
             top_n_v_cpu = top_n_values[:selected_token_count].cpu()
             top_n_i_cpu = top_n_indices[:selected_token_count].cpu()
-            top_n_dict = LogProbsPrefill._build_top_n_dict(
-                context, req_idx_list, masked_lengths_cpu, top_n_v_cpu, top_n_i_cpu
-            )
+            top_n_per_req: List[int] = context.active_request_metadata["top_n_logprobs"][
+                :active_request_count
+            ].tolist()
+            skip_prompt_per_req: List[bool] = context.active_request_metadata[
+                "skip_prompt_log_probs"
+            ][:active_request_count].tolist()
+            built: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
+            token_offset = 0
+            for i, req_idx in enumerate(req_idx_list):
+                req_len = masked_lengths_cpu[i]
+                n = top_n_per_req[req_idx]
+                if n > 0:
+                    if skip_prompt_per_req[req_idx] and req_len > 1:
+                        last = token_offset + req_len - 1
+                        built[req_idx] = [(top_n_v_cpu[last, :n], top_n_i_cpu[last, :n])]
+                    else:
+                        built[req_idx] = [
+                            (top_n_v_cpu[token_offset + j, :n], top_n_i_cpu[token_offset + j, :n])
+                            for j in range(req_len)
+                        ]
+                token_offset += req_len
+            top_n_dict = built or None
         return result, top_n_dict
-
-    @staticmethod
-    def _build_top_n_dict(
-        context,
-        req_idx_list: List[int],
-        masked_lengths_cpu: List[int],
-        top_n_values: Tensor,
-        top_n_indices: Tensor,
-    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
-        """Build per-request top-n dict for prefill mode."""
-        active_request_count = context.total_request_count - context.paused_request_count
-        top_n_per_req: List[int] = context.active_request_metadata["top_n_logprobs"][
-            :active_request_count
-        ].tolist()
-        skip_prompt_per_req: List[bool] = context.active_request_metadata["skip_prompt_log_probs"][
-            :active_request_count
-        ].tolist()
-        result: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
-        token_offset = 0
-        for i, req_idx in enumerate(req_idx_list):
-            req_len = masked_lengths_cpu[i]
-            n = top_n_per_req[req_idx]
-            if n > 0:
-                if skip_prompt_per_req[req_idx] and req_len > 1:
-                    last = token_offset + req_len - 1
-                    result[req_idx] = [(top_n_values[last, :n], top_n_indices[last, :n])]
-                else:
-                    result[req_idx] = [
-                        (top_n_values[token_offset + j, :n], top_n_indices[token_offset + j, :n])
-                        for j in range(req_len)
-                    ]
-            token_offset += req_len
-        return result if result else None
 
     # -- public API --
 
@@ -227,13 +215,10 @@ class LogProbsPrefill:
         Returns:
             A callable that returns (per_request_log_probs, top_n_dict).
         """
-        ri, cu_ml, li, li_range, mt = (
-            self._ri, self._cu_ml, self._li, self._li_range, self._mt,
-        )
+        ri, cu_ml, li, li_range, mt = (self._ri, self._cu_ml, self._li, self._li_range, self._mt)
         key = ("prefill_sm", context.padded_batch_dimensions)
         slp, lse = self.softmax_kernel(
-            logits, new_tokens, ri, cu_ml, li, li_range, mt,
-            eager=eager, cache_key=key,
+            logits, new_tokens, ri, cu_ml, li, li_range, mt, eager=eager, cache_key=key
         )
 
         top_n_v = top_n_i = None

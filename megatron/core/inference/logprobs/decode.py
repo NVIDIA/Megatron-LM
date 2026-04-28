@@ -39,13 +39,15 @@ class LogProbsDecode:
         self._topn_event = topn_event
         if config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
-                config, self,
+                config,
+                self,
                 function_name="indexing_kernel",
                 need_backward=False,
                 inline_capture=True,
             )
             CudaGraphManager(
-                config, self,
+                config,
+                self,
                 function_name="softmax_kernel",
                 need_backward=False,
                 inline_capture=True,
@@ -119,39 +121,27 @@ class LogProbsDecode:
         for i, req_idx in enumerate(req_idx_list):
             result[req_idx] = [lp_list[i]]
 
-        top_n_dict = None
+        top_n_dict: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]] = None
         if top_n_values is not None and top_n_indices is not None:
             top_n_v_cpu = top_n_values[:log_prob_request_count].cpu()
             top_n_i_cpu = top_n_indices[:log_prob_request_count].cpu()
-            top_n_dict = LogProbsDecode._build_top_n_dict(
-                context, req_idx_list, top_n_v_cpu, top_n_i_cpu
-            )
+            top_n_per_req: List[int] = context.active_request_metadata["top_n_logprobs"][
+                :active_request_count
+            ].tolist()
+            built: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
+            for i, req_idx in enumerate(req_idx_list):
+                n = top_n_per_req[req_idx]
+                if n > 0:
+                    built[req_idx] = [(top_n_v_cpu[i, :n], top_n_i_cpu[i, :n])]
+            top_n_dict = built or None
         return result, top_n_dict
-
-    @staticmethod
-    def _build_top_n_dict(
-        context, req_idx_list: List[int], top_n_values: Tensor, top_n_indices: Tensor
-    ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
-        """Build per-request top-n dict for decode mode."""
-        active_request_count = context.total_request_count - context.paused_request_count
-        top_n_per_req: List[int] = context.active_request_metadata["top_n_logprobs"][
-            :active_request_count
-        ].tolist()
-        result: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
-        for i, req_idx in enumerate(req_idx_list):
-            n = top_n_per_req[req_idx]
-            if n > 0:
-                result[req_idx] = [(top_n_values[i, :n], top_n_indices[i, :n])]
-        return result if result else None
 
     # -- public API --
 
     def indexing(self, context, *, eager: bool = False) -> None:
         """Run indexing kernel with optional CUDA graph capture/replay."""
         key = ("decode_idx", context.padded_batch_dimensions)
-        self._ri, self._padded_arange = self.indexing_kernel(
-            context, eager=eager, cache_key=key,
-        )
+        self._ri, self._padded_arange = self.indexing_kernel(context, eager=eager, cache_key=key)
 
     def calculate(
         self,
@@ -179,7 +169,7 @@ class LogProbsDecode:
         ri, padded_arange = self._ri, self._padded_arange
         key = ("decode_sm", context.padded_batch_dimensions)
         slp, lse = self.softmax_kernel(
-            logits, new_tokens, ri, padded_arange, eager=eager, cache_key=key,
+            logits, new_tokens, ri, padded_arange, eager=eager, cache_key=key
         )
 
         top_n_v = top_n_i = None

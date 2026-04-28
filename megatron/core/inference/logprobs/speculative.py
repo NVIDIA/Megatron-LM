@@ -34,26 +34,30 @@ class LogProbsSpeculative:
         self._topn_event = topn_event
         if config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
-                config, self,
+                config,
+                self,
                 function_name="softmax_kernel",
                 need_backward=False,
                 inline_capture=True,
             )
             CudaGraphManager(
-                config, self,
+                config,
+                self,
                 function_name="gather_kernel",
                 need_backward=False,
                 inline_capture=True,
             )
             CudaGraphManager(
-                config, self,
+                config,
+                self,
                 function_name="prefill_indexing_kernel",
                 need_backward=False,
                 inline_capture=True,
             )
             # Thin wrapper: delegates to LogProbsPrefill's static method.
             CudaGraphManager(
-                config, self,
+                config,
+                self,
                 function_name="_prefill_softmax",
                 need_backward=False,
                 inline_capture=True,
@@ -122,8 +126,8 @@ class LogProbsSpeculative:
             :padded_decode_count
         ]
 
-        decode_logits = logits.squeeze(0)[:decode_len].float().reshape(
-            padded_decode_count, spec_plus_one, -1
+        decode_logits = (
+            logits.squeeze(0)[:decode_len].float().reshape(padded_decode_count, spec_plus_one, -1)
         )
         decode_gathered_raw = decode_logits.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
         decode_gathered = decode_gathered_raw - decode_lse
@@ -132,9 +136,7 @@ class LogProbsSpeculative:
             padded_decode_count : padded_decode_count + padded_prefill_count
         ]
         prefill_row_range = torch.arange(padded_prefill_count, device=device)
-        prefill_logits = logits.squeeze(0)[
-            decode_len : decode_len + padded_prefill_count
-        ].float()
+        prefill_logits = logits.squeeze(0)[decode_len : decode_len + padded_prefill_count].float()
         prefill_gathered_raw = prefill_logits[prefill_row_range, prefill_new_tokens]
         prefill_gathered = prefill_gathered_raw - prefill_lse
 
@@ -271,13 +273,20 @@ class LogProbsSpeculative:
         """Run prefill indexing kernel with optional CUDA graph capture/replay."""
         key = ("spec_fp_idx", context.padded_batch_dimensions)
         result = self.prefill_indexing_kernel(context, eager=eager, cache_key=key)
-        self._fp_ri, self._fp_cu_ml, self._fp_li, self._fp_li_range, self._fp_mt, self._fp_count_gpu = result
+        (
+            self._fp_ri,
+            self._fp_cu_ml,
+            self._fp_li,
+            self._fp_li_range,
+            self._fp_mt,
+            self._fp_count_gpu,
+        ) = result
 
     def softmax(self, context, logits: Tensor, *, eager: bool = False) -> None:
         """Run post-forward softmax with optional CUDA graph capture/replay."""
         key = ("spec_sm", context.padded_batch_dimensions)
         self._decode_lse, self._prefill_lse = self.softmax_kernel(
-            context, logits, eager=eager, cache_key=key,
+            context, logits, eager=eager, cache_key=key
         )
 
     def calculate(
@@ -343,8 +352,15 @@ class LogProbsSpeculative:
 
             fp_key = ("spec_fp_sm", context.padded_batch_dimensions)
             fp_slp, fp_lse = self._prefill_softmax(
-                logits, new_tokens, fp_ri, fp_cu_ml, fp_li, li_range, mt,
-                eager=eager, cache_key=fp_key,
+                logits,
+                new_tokens,
+                fp_ri,
+                fp_cu_ml,
+                fp_li,
+                li_range,
+                mt,
+                eager=eager,
+                cache_key=fp_key,
             )
 
         # Top-n on the side stream after all main-stream work above.
@@ -374,9 +390,7 @@ class LogProbsSpeculative:
                 # prefill top-n is computed below, it overwrites these per-request).
                 if num_prefill > 0:
                     decode_len = num_decode * spec_plus_one
-                    raw_prefill = logits.squeeze(0)[
-                        decode_len : decode_len + num_prefill
-                    ].float()
+                    raw_prefill = logits.squeeze(0)[decode_len : decode_len + num_prefill].float()
                     top_n_v_raw, top_n_i_raw = _topk(raw_prefill, k=top_n_max)
                     prefill_top_n_v = top_n_v_raw - prefill_lse[:num_prefill].unsqueeze(-1)
                     prefill_top_n_i = top_n_i_raw

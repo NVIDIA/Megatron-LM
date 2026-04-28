@@ -207,7 +207,6 @@ class TextGenerationController:
             topn_event=self._log_probs_topn_event,
         )
 
-
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
             self._torch_sampling_buckets: List[Tuple] = []
@@ -1230,9 +1229,9 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        log_prob_count = (
-            context.active_request_metadata["return_log_probs"][:active_request_count].sum()
-        )
+        log_prob_count = context.active_request_metadata["return_log_probs"][
+            :active_request_count
+        ].sum()
         top_n_max_gpu = (
             context.active_request_metadata["top_n_logprobs"][:active_request_count].max().long()
         )
@@ -1378,12 +1377,7 @@ class TextGenerationController:
                 top_n_max=top_n_max,
             )
         return self._log_probs_prefill.calculate(
-            context,
-            logits,
-            new_tokens,
-            log_prob_request_count,
-            eager=eager,
-            top_n_max=top_n_max,
+            context, logits, new_tokens, log_prob_request_count, eager=eager, top_n_max=top_n_max
         )
 
     def dummy_forward(self):
