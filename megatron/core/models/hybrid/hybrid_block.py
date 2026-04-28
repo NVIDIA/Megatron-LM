@@ -58,6 +58,16 @@ class HyperConnectionHybridLayer(MegatronModule):
     the layer delta back through mHC expansion. The expansion path intentionally
     uses zero additional dropout because the wrapped hybrid layer has already
     applied its local dropout/residual update before the delta is computed.
+
+    Checkpoint compatibility: this is a *wrapper* (the inner layer is held as
+    `self.inner_layer`), so wrapped-layer state_dict keys are nested under
+    `inner_layer.` (e.g. `layers.0.inner_layer.input_layernorm.weight` instead
+    of `layers.0.input_layernorm.weight`). HybridStack checkpoints saved with
+    `enable_hyper_connections=False` cannot be loaded into a model with
+    `enable_hyper_connections=True` (and vice versa) without a key-mapping
+    migration. Note: this differs from `HyperConnectionTransformerLayer`,
+    which subclasses `TransformerLayer` and only adds new sibling fields,
+    keeping all base keys stable.
     """
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:

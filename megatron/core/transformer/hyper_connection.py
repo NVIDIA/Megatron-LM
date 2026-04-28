@@ -147,10 +147,12 @@ class HyperConnectionModule(MegatronModule):
         # H_res logits used by the hyper connection. Note the strong asymmetry: the
         # input is wide (n * hidden_size, e.g. 16384 for n=4 / C=4096) but the
         # output is tiny (n^2 + 2n, e.g. 24 for n=4). The output slices are:
-        #   - first  n        : H_pre  logits (aggregation weights)
-        #   - next   n        : H_post logits (expansion weights)
-        #   - last   n*n      : H_res  logits (residual mixing, fed into Sinkhorn)
+        #   - [:_h_pre_end]            : H_pre  logits (aggregation weights)
+        #   - [_h_pre_end:_h_post_end] : H_post logits (expansion weights)
+        #   - [_h_post_end:]           : H_res  logits (residual mixing, fed into Sinkhorn)
         # Kept named `mapping_proj` to preserve checkpoint state_dict keys.
+        self._h_pre_end = self.n
+        self._h_post_end = 2 * self.n
         self.mapping_proj = nn.Linear(
             self.n * self.hidden_size, self.n * self.n + 2 * self.n, bias=False
         )
@@ -244,11 +246,13 @@ class HyperConnectionModule(MegatronModule):
         )
         h = r.float() * proj.float() * alpha_.float() + self.bias.float()
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
-        h_pre = h[..., : self.n].sigmoid().to(dtype=proj.dtype)  # [s, b, n]
+        h_pre = h[..., : self._h_pre_end].sigmoid().to(dtype=proj.dtype)  # [s, b, n]
 
         # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
-        h_post = (h[..., self.n : 2 * self.n].sigmoid() * 2).to(dtype=proj.dtype)  # [s, b, n]
-        h_res = h[..., 2 * self.n :].to(dtype=proj.dtype)
+        h_post = (
+            h[..., self._h_pre_end : self._h_post_end].sigmoid() * 2
+        ).to(dtype=proj.dtype)  # [s, b, n]
+        h_res = h[..., self._h_post_end :].to(dtype=proj.dtype)
         return h_pre, h_post, h_res
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
@@ -315,7 +319,7 @@ class HyperConnectionModule(MegatronModule):
         n = self.n
         s, b, _ = h_post.shape
         C = bias.shape[0]
-        bias_expanded = bias.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(s, b, 1, C)
+        bias_expanded = bias.view(1, 1, 1, C).expand(s, b, 1, C)
 
         # h_post^T @ x : [s, b, n, 1] * [s, b, 1, C] -> [s, b, n, C]
         result = h_post.unsqueeze(-1) * bias_expanded

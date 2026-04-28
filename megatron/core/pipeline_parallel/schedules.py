@@ -2061,9 +2061,15 @@ def get_tensor_shapes(
         and getattr(config, 'virtual_pipeline_model_parallel_size', None) is not None
         and pp_group is not None
     ):
+        # Backstop in case `TransformerConfig.__post_init__`'s VPP+mHC check is
+        # skipped (e.g., when callers pass a non-TransformerConfig object). The
+        # config-level guard remains the user-facing error; this duplicate keeps
+        # the schedule path safe against silently producing wrong shapes.
         raise ValueError(
-            "get_tensor_shapes does not support mHC with virtual pipeline parallelism. "
-            "Use the interleaved schedule tensor_shape path for VPP+mHC."
+            "enable_hyper_connections is not yet supported with "
+            "virtual_pipeline_model_parallel_size set. Disable VPP or wait for "
+            "per-virtual-chunk shape support. (Same constraint enforced in "
+            "TransformerConfig.__post_init__.)"
         )
 
     if (
