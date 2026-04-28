@@ -17,16 +17,23 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_size, log_single_rank
 
 from .optimizer_config import ParamKey, ParamPredicate
 
 try:
     from torch.distributed.tensor import DTensor as _DTensor
 
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        gather_uneven_dtensor_to_full_tensor,
+        update_uneven_dtensor_chunk_metadata,
+    )
+
     _HAVE_DTENSOR = True
 except ImportError:
     _DTensor = None  # type: ignore[assignment,misc]
+    gather_uneven_dtensor_to_full_tensor = None  # type: ignore[assignment]
+    update_uneven_dtensor_chunk_metadata = None  # type: ignore[assignment]
     _HAVE_DTENSOR = False
 
 try:
@@ -348,37 +355,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 class FSDPZeROTensorParallelMuon(TensorParallelMuon):
     """`TensorParallelMuon` extended for Megatron-FSDP ZeRO-1/2/3.
 
-    Supports all three sharded strategies:
-
-    * `optim` (ZeRO-1): optimizer state sharded; grads reduce-scattered.
-    * `optim_grads` (ZeRO-2): optimizer state + grads sharded.
-    * `optim_grads_params` (ZeRO-3): optimizer state + grads + params sharded.
-
-    For all three, `finish_grad_sync()` reduce-scatters gradients so each DP
-    rank holds only a contiguous `Shard(0)` row-shard of the full TP-local 2D
-    gradient. Newton-Schulz needs the full matrix, so this class:
-
-      1. Extracts the local shard via `.to_local()` for any Shard(0) DTensor.
-      2. Allgathers the DP row-shards across the DP group to reconstruct the
-         TP-local, DP-full gradient matrix.
-      3. Trims FSDP bucket-padding rows using the declared global shape from the
-         DTensor.
-      4. Delegates to `TensorParallelMuon.orthogonalize` which handles the
-         remaining TP dimension via `newton_schulz_tp`.
-      5. Extracts the local DP row-shard of the orthogonalized result, padding
-         the last rank with zeros when FSDP bucket padding is present so the
-         per-rank shard size stays uniform.
-      6. Re-wraps the result as a DTensor matching the input's placements so
-         `OrthogonalizedOptimizer.step` can apply the in-place update without
-         placement promotion.
-
-    Memory note for ZeRO-3: each Muon step allocates a temporary `full_grad`
-    of shape `(tp_local_rows, C)` per Muon parameter for the allgather, plus
-    the NS output. Peak extra memory is roughly
-    `3 * (m * n) * sizeof(float32)` per linear layer; momentum stays sharded.
-
-    For "no_shard" or single-rank DP this falls back transparently to the
-    parent implementation.
+    Megatron-FSDP shards a flat parameter buffer across DP ranks. Most 2D
+    parameters are either fully local on one rank or empty on the others; only
+    rank-boundary parameters are split across two ranks. Muon needs the full
+    matrix for Newton-Schulz, so this class gathers only those boundary
+    parameters and runs local NS for fully-local parameters.
     """
 
     def __init__(
@@ -394,18 +375,8 @@ class FSDPZeROTensorParallelMuon(TensorParallelMuon):
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
         """Muon step for Megatron-FSDP ZeRO-1/2/3.
 
-        M-FSDP shards a flat grad buffer across DP, so the per-param local
-        shard can be empty on some ranks (`p.grad is None`) or variable in
-        size – unlike a uniform `Shard(0)` DTensor. The standard
-        `OrthogonalizedOptimizer.step` skips params with `grad is None`,
-        which desyncs the DP collective inside `orthogonalize` (different
-        ranks process different params → allgather mismatch → hang).
-
-        We fix that here by processing every param on every rank in lockstep.
-        Each param's full gradient is reconstructed via a DP-wide all-gather
-        (supports variable-size local shards), but Newton-Schulz is run on a
-        single owner rank (round-robin by param index) and broadcast back,
-        so NS compute is amortised across DP rather than duplicated 8×.
+        Ranks must enter collectives in the same order, so local boundary
+        decisions are unioned across the DP group before the parameter loop.
         """
         if closure is None:
             loss = None
@@ -413,18 +384,91 @@ class FSDPZeROTensorParallelMuon(TensorParallelMuon):
             loss = closure()
 
         for group in self.param_groups:
-            # `skip_non_grad_params=False`: we must create momentum buffers
-            # for every param, because even params with empty local grad shards
-            # on this rank need to participate in the DP-collective orthogonalize.
             self._init_group(group, skip_non_grad_params=False)
+            gather_param_indices = self._get_boundary_gather_param_indices(group)
 
-            for p in group["params"]:
-                self._muon_step_one(p, group)
+            for param_idx, p in enumerate(group["params"]):
+                self._muon_step_one(p, group, gather_full=param_idx in gather_param_indices)
 
         return loss
 
+    def _as_dtensor(self, value: Any):
+        """Return `value` or `value.data` when either is a DTensor."""
+        if not _HAVE_DTENSOR:
+            return None
+        if isinstance(value, _DTensor):
+            return value
+        data = getattr(value, "data", None)
+        if isinstance(data, _DTensor):
+            return data
+        return None
+
+    def _is_nonempty_dtensor_param(self, param: torch.Tensor) -> bool:
+        dtensor = self._as_dtensor(param)
+        return dtensor is not None and dtensor.to_local().numel() > 0
+
+    def _needs_boundary_gather(self, param: torch.Tensor) -> bool:
+        dtensor = self._as_dtensor(param)
+        if dtensor is None:
+            return False
+        local_tensor = dtensor.to_local()
+        return local_tensor.numel() > 0 and tuple(dtensor.shape) != tuple(local_tensor.shape)
+
+    def _get_boundary_gather_param_indices(self, group: Dict[str, Any]) -> set[int]:
+        """Return globally-agreed parameter indices that need a boundary all-gather."""
+        params = group["params"]
+        local_boundary_indices = [
+            idx for idx, param in enumerate(params) if self._needs_boundary_gather(param)
+        ]
+
+        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
+            return set(local_boundary_indices)
+
+        gathered_indices: list[list[int] | None] = [None] * get_pg_size(self.dp_group)
+        torch.distributed.all_gather_object(
+            gathered_indices, local_boundary_indices, group=self.dp_group
+        )
+        return {
+            idx
+            for rank_indices in gathered_indices
+            if rank_indices is not None
+            for idx in rank_indices
+        }
+
+    def _copy_dtensor_chunk_metadata(self, dst, src) -> None:
+        if hasattr(src._local_tensor, "__create_chunk_list__"):
+            dst._local_tensor.__create_chunk_list__ = src._local_tensor.__create_chunk_list__
+        if hasattr(src._local_tensor, "__create_write_items__"):
+            dst._local_tensor.__create_write_items__ = src._local_tensor.__create_write_items__
+
+    def _dtensor_from_local_like(self, value, local_tensor: torch.Tensor):
+        dtensor = _DTensor.from_local(
+            local_tensor=local_tensor,
+            device_mesh=value.device_mesh,
+            placements=value.placements,
+            shape=value.shape,
+            stride=value.stride(),
+        )
+        self._copy_dtensor_chunk_metadata(dtensor, value)
+        return dtensor
+
+    def _reshard_full_update_like(self, value, full_update: torch.Tensor):
+        if not hasattr(value._local_tensor, "__create_chunk_list__"):
+            if update_uneven_dtensor_chunk_metadata is None:
+                raise RuntimeError("DTensor support is required for Megatron-FSDP Muon.")
+            update_uneven_dtensor_chunk_metadata(value)
+        value_metadata = value._local_tensor.__create_chunk_list__()[0]
+        slices = tuple(
+            slice(offset, offset + size)
+            for offset, size in zip(value_metadata.offsets, value_metadata.sizes)
+        )
+        local_update = full_update[slices].contiguous().to(dtype=value.to_local().dtype)
+        return self._dtensor_from_local_like(value, local_update)
+
     @torch.no_grad()  # type: ignore[misc]
-    def _muon_step_one(self, p: torch.Tensor, group: Dict[str, Any]) -> None:
+    def _muon_step_one(
+        self, p: torch.Tensor, group: Dict[str, Any], gather_full: bool = False
+    ) -> None:
         """Per-param Muon update that participates in DP collectives on every rank."""
         # Fall back to the plain parent step for the single-rank / unsharded case.
         if self.dp_group is None or get_pg_size(self.dp_group) == 1:
@@ -432,139 +476,61 @@ class FSDPZeROTensorParallelMuon(TensorParallelMuon):
                 return
             return self._local_muon_update(p, p.grad, group)
 
-        # Skip params that aren't DTensors (shouldn't happen in M-FSDP).
-        if not (_HAVE_DTENSOR and isinstance(p, _DTensor)):
+        value = self._as_dtensor(p)
+        if value is None:
             if p.grad is None:
                 return
             return self._local_muon_update(p, p.grad, group)
 
-        # Every rank processes every param in lockstep (regardless of whether
-        # the local grad shard is empty) so the DP collectives below stay in
-        # sync. M-FSDP's flat-buffer sharding means local shard sizes vary
-        # per rank and per param, so we operate on DTensors and use
-        # `full_tensor()` to reconstruct the full matrix.
+        p_local = value.to_local()
+        if p_local.numel() == 0 and not gather_full:
+            return
 
-        # Use local views to mutate momentum and param. Momentum is kept
-        # per-shard (same size as p.to_local()); the initial buffer was
-        # allocated via `torch.zeros_like(p.data)` in `_init_group` which,
-        # for a DTensor p, yields a Shard(0) DTensor with the correct local
-        # shape on this rank.
         state = self.state[p]
         mom_buffer = state["momentum_buffer"]
-        mom_local = mom_buffer.to_local() if isinstance(mom_buffer, _DTensor) else mom_buffer
+        mom_dtensor = self._as_dtensor(mom_buffer)
+        mom_local = mom_dtensor.to_local() if mom_dtensor is not None else mom_buffer
 
-        # Derive this rank's local grad. If p.grad is None (empty shard on
-        # this rank), use a zero tensor of the expected local shape so the
-        # local lerp_ / weight-decay math is a no-op while still letting us
-        # participate in the full_tensor() allgather below.
         grad = p.grad
         if grad is None:
             local_grad = torch.zeros_like(mom_local)
         else:
-            local_grad = grad.to_local() if isinstance(grad, _DTensor) else grad
+            grad_dtensor = self._as_dtensor(grad)
+            local_grad = grad_dtensor.to_local() if grad_dtensor is not None else grad
 
-        p_local = p.to_local()
-
-        # Local weight decay on this rank's param/grad slice.
-        wd = group["weight_decay"]
         lr = group["lr"]
-        if wd != 0.0:
-            # Decoupled weight decay: p *= (1 - lr * wd)
-            p_local.mul_(1.0 - lr * wd)
+        self._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
 
-        # Local momentum EMA update.
         mom_local.lerp_(local_grad, 1 - group["momentum"])
-
-        # Assemble the pre-NS gradient (local).
         if self.nesterov:
-            pre_local = local_grad.lerp(mom_local, group["momentum"])
+            update_local = local_grad.lerp(mom_local, group["momentum"])
         else:
-            pre_local = mom_local
+            update_local = mom_local
 
-        # Gather per-rank local row counts so we can allocate a per-rank
-        # destination for the allgather. M-FSDP uses a flat-buffer grad
-        # sharding → local shard sizes vary per rank, which
-        # `all_gather_into_tensor` (equal-size) and DTensor `full_tensor`
-        # (assumes uniform Shard(0)) both handle poorly. We use
-        # `all_gather(tensor_list, input)`, which supports variable sizes.
-        dp_size = get_pg_size(self.dp_group)
-        dp_rank = get_pg_rank(self.dp_group)
-        row_counts = torch.zeros(dp_size, dtype=torch.long, device=p_local.device)
-        row_counts[dp_rank] = pre_local.shape[0]
-        torch.distributed.all_reduce(row_counts, group=self.dp_group)
-        row_counts_cpu = row_counts.tolist()
-
-        # Build per-rank output buffers of the right row count.
-        gathered = [
-            torch.empty(
-                (row_counts_cpu[r], *pre_local.shape[1:]),
-                device=pre_local.device,
-                dtype=pre_local.dtype,
-            )
-            for r in range(dp_size)
-        ]
-        torch.distributed.all_gather(
-            gathered, pre_local.contiguous(), group=self.dp_group
-        )
-        full_grad = torch.cat(gathered, dim=0)
-
-        # Trim any trailing FSDP bucket padding rows so NS sees only the real
-        # parameter. `p.shape[0]` is the FSDP-declared global row count
-        # (= sum of per-rank shard rows, possibly including padding at the
-        # tail); the true param row count is the global shape from the DTensor.
-        tp_group = (
-            (
-                self.pg_collection.expt_tp
-                if getattr(p, "expert_tp", False)
-                else self.pg_collection.tp
-            )
-            if self.pg_collection
-            else None
-        )
-        partition_dim = None if self.tp_mode == "blockwise" else getattr(p, "partition_dim", None)
-        if partition_dim == -1:
-            partition_dim = None
-        tp_size_dim0 = (
-            get_pg_size(tp_group) if (partition_dim == 0 and tp_group is not None) else 1
-        )
-        tp_local_rows = p.shape[0] // max(tp_size_dim0, 1)
-        if full_grad.shape[0] > tp_local_rows:
-            full_grad = full_grad[:tp_local_rows]
-
-        # Newton-Schulz on the full matrix. We run it on every rank (duplicated
-        # compute across DP) intentionally. A partition-and-broadcast scheme
-        # was tried (owner does NS; others bcast) but the per-param serial
-        # loop turns the broadcast into a per-param sync, negating the
-        # parallelism across ranks – it measured slightly slower in practice.
-        # An effective scheme would need to pipeline NS with the allgather/
-        # broadcast for the *next* param; left as future work.
         from emerging_optimizers import utils
 
         with utils.fp32_matmul_precision(self.fp32_matmul_prec):
             group_kwargs = {k: v for k, v in group.items() if k != "params"}
-            orth_full_grad = super(FSDPZeROTensorParallelMuon, self).orthogonalize(
-                p, full_grad, **group_kwargs
-            )
-
-        # Slice out this rank's contribution. Exclusive prefix sum of
-        # row_counts gives the offset; we saved it above.
-        start = sum(row_counts_cpu[:dp_rank])
-        end = start + row_counts_cpu[dp_rank]
-        # Guard against the last rank holding only padding rows: clamp end.
-        end = min(end, orth_full_grad.shape[0])
-        orth_local = orth_full_grad[start:end].to(dtype=p_local.dtype)
-        # If this rank's shard was purely padding (no real rows), orth_local
-        # may be shorter than p_local; pad with zeros so the add_ lines up.
-        if orth_local.shape[0] < p_local.shape[0]:
-            pad = torch.zeros(
-                (p_local.shape[0] - orth_local.shape[0], *p_local.shape[1:]),
-                device=p_local.device,
-                dtype=p_local.dtype,
-            )
-            orth_local = torch.cat([orth_local, pad], dim=0)
-
-        # In-place weight update on this rank's local shard.
-        p_local.add_(orth_local, alpha=-lr)
+            if gather_full:
+                if gather_uneven_dtensor_to_full_tensor is None:
+                    raise RuntimeError("DTensor support is required for Megatron-FSDP Muon.")
+                update_dtensor = self._dtensor_from_local_like(value, update_local.contiguous())
+                full_update = gather_uneven_dtensor_to_full_tensor(update_dtensor).to_local()
+                orth_full_update = super(FSDPZeROTensorParallelMuon, self).orthogonalize(
+                    p, full_update, **group_kwargs
+                )
+                sharded_update = self._reshard_full_update_like(value, orth_full_update)
+                self.pre_weight_update_fn_inplace(p, sharded_update)
+                update_target = p if isinstance(p, _DTensor) else value
+                update_target.add_(sharded_update, alpha=-lr)
+                self.post_weight_update_fn_inplace(p)
+            else:
+                orth_local_update = super(FSDPZeROTensorParallelMuon, self).orthogonalize(
+                    p, update_local, **group_kwargs
+                ).to(dtype=p_local.dtype)
+                self.pre_weight_update_fn_inplace(p_local, orth_local_update)
+                p_local.add_(orth_local_update, alpha=-lr)
+                self.post_weight_update_fn_inplace(p_local)
 
     @torch.no_grad()  # type: ignore[misc]
     def _local_muon_update(
