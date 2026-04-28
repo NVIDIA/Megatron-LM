@@ -237,8 +237,10 @@ def _scatter_token_indices_kernel(
 ):
     """Scatter flat token indices into the padded indirection table.
 
-    Vectorized: each CTA processes BLOCK_SIZE pairs at once with a single
-    vector load, then one atomic per expert per CTA (instead of per pair).
+    Each CTA processes a contiguous block of BLOCK_SIZE pairs with a coalesced
+    vector load and masked per-element atomics.  CTAs whose block falls
+    entirely beyond valid_pairs exit immediately (important for allgather-V
+    where valid_tokens << max_tokens).
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -252,20 +254,12 @@ def _scatter_token_indices_kernel(
     lids = eids - local_expert_start
     is_local = (lids >= 0) & (lids < num_local_experts) & mask
 
-    for e in range(num_local_experts):
-        e_mask = (lids == e) & is_local
-        count = tl.sum(e_mask.to(tl.int32))
-        if count > 0:
-            base = tl.atomic_add(counters_ptr + e, count)
-            positions = tl.cumsum(e_mask.to(tl.int32), axis=0) - 1
-            tl.store(sorted_token_ids_ptr + base + positions, offs, mask=e_mask)
+    local_pos = tl.atomic_add(counters_ptr + lids, 1, mask=is_local)
+    tl.store(sorted_token_ids_ptr + local_pos, offs, mask=is_local)
 
     is_nonlocal = (~is_local) & mask
-    nonlocal_count = tl.sum(is_nonlocal.to(tl.int32))
-    if nonlocal_count > 0:
-        base = tl.atomic_add(nonlocal_counter_ptr, nonlocal_count)
-        positions = tl.cumsum(is_nonlocal.to(tl.int32), axis=0) - 1
-        tl.store(sorted_token_ids_ptr + base + positions, offs, mask=is_nonlocal)
+    nonlocal_pos = tl.atomic_add(nonlocal_counter_ptr + tl.zeros_like(offs), 1, mask=is_nonlocal)
+    tl.store(sorted_token_ids_ptr + nonlocal_pos, offs, mask=is_nonlocal)
 
 
 @triton.jit
