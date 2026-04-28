@@ -8,6 +8,7 @@ import warnings
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock, mock_open, patch
 
+import yaml
 import pytest
 import torch
 from megatron.core.msc_utils import MultiStorageClientFeature
@@ -198,6 +199,8 @@ class TestConfigContainer_FromYaml:
     @patch("os.path.exists")
     def test_from_yaml_success(self, mock_exists, mock_file, mock_omegaconf, mock_msc):
         """Test successful YAML loading."""
+        from megatron.training.config.instantiate_utils import target_allowlist
+
         mock_msc.return_value = False
         mock_exists.return_value = True
         yaml_content = f"""
@@ -221,22 +224,18 @@ class TestConfigContainer_FromYaml:
             mock_omegaconf.create.return_value = mock_conf
             mock_omegaconf.to_container.return_value = config_dict
 
-            # Mock the from_dict method
-            with patch.object(TestConfigContainer, "from_dict") as mock_from_dict:
-                expected_config = TestConfigContainer(name="yaml_config", value=500)
-                mock_from_dict.return_value = expected_config
+            target_allowlist.disable()
+            result = TestConfigContainer.from_yaml("test.yaml")
+            target_allowlist.enable()
 
-                result = TestConfigContainer.from_yaml("test.yaml")
+            mock_exists.assert_called_once_with("test.yaml")
+            mock_file.assert_called_once_with("test.yaml", "r")
+            mock_yaml_load.assert_called_once()
+            mock_omegaconf.create.assert_called_once_with(config_dict)
+            mock_omegaconf.to_container.assert_called_once_with(mock_conf, resolve=True)
 
-                mock_exists.assert_called_once_with("test.yaml")
-                mock_file.assert_called_once_with("test.yaml", "r")
-                mock_yaml_load.assert_called_once()
-                mock_omegaconf.create.assert_called_once_with(config_dict)
-                mock_omegaconf.to_container.assert_called_once_with(mock_conf, resolve=True)
-                mock_from_dict.assert_called_once_with(config_dict, mode=InstantiationMode.LENIENT)
-
-                assert result.name == "yaml_config"
-                assert result.value == 500
+            assert result.name == "yaml_config"
+            assert result.value == 500
 
     @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
     @patch("os.path.exists")
@@ -457,28 +456,19 @@ class TestConfigContainer_ConvertValueToDict:
 class TestConfigContainer_ToYaml:
     """Test ConfigContainer.to_yaml method."""
 
-    @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
-    @patch("megatron.training.config.container.safe_yaml_representers")
-    @patch("yaml.safe_dump")
-    @patch("builtins.open", new_callable=mock_open)
-    def test_to_yaml_save_to_file(
-        self, mock_file, mock_yaml_dump, mock_safe_representers, mock_msc
-    ):
-        """Test to_yaml saving to file."""
-        mock_msc.return_value = False
+    def test_to_yaml_save_to_file(self):
+        """Test to_yaml writes valid YAML to disk matching to_dict()."""
         config = TestConfigContainer(name="file_test", value=888)
-        mock_safe_representers.return_value.__enter__ = MagicMock()
-        mock_safe_representers.return_value.__exit__ = MagicMock()
 
-        config.to_yaml("test_output.yaml")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "test_output.yaml")
+            config.to_yaml(tmp_path)
 
-        mock_safe_representers.assert_called_once()
-        mock_file.assert_called_once_with("test_output.yaml", "w")
-        mock_yaml_dump.assert_called_once()
+            assert os.path.exists(tmp_path)
+            with open(tmp_path, "r") as f:
+                parsed = yaml.safe_load(f)
 
-        # Verify the correct arguments were passed to yaml.safe_dump
-        call_args = mock_yaml_dump.call_args
-        assert call_args[1]["default_flow_style"] is False
+        assert parsed == config.to_dict()
 
     def test_to_yaml_with_msc_url(self):
         """Test to_yaml with MSC URL."""
@@ -504,44 +494,21 @@ class TestConfigContainer_ToYaml:
 class TestConfigContainer_PrintYaml:
     """Test ConfigContainer.print_yaml method."""
 
-    @patch("megatron.training.config.container.safe_yaml_representers")
-    @patch("yaml.safe_dump")
-    @patch("builtins.print")
-    def test_print_yaml_basic(self, mock_print, mock_yaml_dump, mock_safe_representers):
-        """Test print_yaml basic functionality."""
+    def test_print_yaml_basic(self, capsys):
+        """Test print_yaml outputs valid YAML with the correct field values."""
         config = TestConfigContainer(name="print_test", value=555, description="test print")
-        mock_yaml_dump.return_value = "printed_yaml_content"
-        mock_safe_representers.return_value.__enter__ = MagicMock()
-        mock_safe_representers.return_value.__exit__ = MagicMock()
 
         config.print_yaml()
 
-        # Verify safe_yaml_representers context manager is used
-        mock_safe_representers.assert_called_once()
+        captured = capsys.readouterr()
+        parsed = yaml.safe_load(captured.out)
 
-        # Verify yaml.safe_dump is called with correct arguments
-        mock_yaml_dump.assert_called_once()
-        call_args = mock_yaml_dump.call_args
+        assert parsed["_target_"] == _target_qualname(TestConfigContainer)
+        assert parsed["name"] == "print_test"
+        assert parsed["value"] == 555
+        assert parsed["description"] == "test print"
 
-        # Check the config dict passed to yaml.safe_dump
-        config_dict = call_args[0][0]
-        assert config_dict["_target_"] == _target_qualname(TestConfigContainer)
-        assert config_dict["name"] == "print_test"
-        assert config_dict["value"] == 555
-        assert config_dict["description"] == "test print"
-
-        # Check yaml.safe_dump options
-        assert call_args[1]["default_flow_style"] is False
-
-        # Verify print is called with the YAML content
-        mock_print.assert_called_once_with("printed_yaml_content")
-
-    @patch("megatron.training.config.container.safe_yaml_representers")
-    @patch("yaml.safe_dump")
-    @patch("builtins.print")
-    def test_print_yaml_with_complex_config(
-        self, mock_print, mock_yaml_dump, mock_safe_representers
-    ):
+    def test_print_yaml_with_complex_config(self, capsys):
         """Test print_yaml with complex nested configuration."""
         simple_config = TestConfigContainer(name="nested", value=123)
         nested_data = NestedDataclass(simple=SimpleDataclass(name="inner", value=456))
@@ -553,55 +520,27 @@ class TestConfigContainer_PrintYaml:
             metadata={"key1": 10, "key2": 20},
         )
 
-        mock_yaml_dump.return_value = "complex_yaml_content"
-        mock_safe_representers.return_value.__enter__ = MagicMock()
-        mock_safe_representers.return_value.__exit__ = MagicMock()
-
         complex_config.print_yaml()
 
-        # Verify the method was called correctly
-        mock_safe_representers.assert_called_once()
-        mock_yaml_dump.assert_called_once()
-        mock_print.assert_called_once_with("complex_yaml_content")
+        captured = capsys.readouterr()
+        parsed = yaml.safe_load(captured.out)
 
-        # Verify the complex structure in the config dict
-        call_args = mock_yaml_dump.call_args
-        config_dict = call_args[0][0]
+        assert parsed["_target_"] == _target_qualname(ComplexConfigContainer)
+        assert parsed["simple_config"]["name"] == "nested"
+        assert parsed["nested_data"]["simple"]["value"] == 456
+        assert parsed["items"] == ["a", "b", "c"]
+        assert parsed["metadata"] == {"key1": 10, "key2": 20}
 
-        assert config_dict["_target_"] == _target_qualname(ComplexConfigContainer)
-        assert config_dict["simple_config"]["name"] == "nested"
-        assert config_dict["nested_data"]["simple"]["value"] == 456
-        assert config_dict["items"] == ["a", "b", "c"]
-        assert config_dict["metadata"] == {"key1": 10, "key2": 20}
-
-    @patch("megatron.training.config.container.safe_yaml_representers")
-    @patch("yaml.safe_dump")
-    @patch("builtins.print")
-    def test_print_yaml_calls_to_dict(self, mock_print, mock_yaml_dump, mock_safe_representers):
-        """Test that print_yaml correctly calls to_dict method."""
+    def test_print_yaml_output_matches_to_dict(self, capsys):
+        """Test that the YAML output exactly round-trips through to_dict."""
         config = TestConfigContainer(name="to_dict_test", value=999)
-        mock_yaml_dump.return_value = "yaml_output"
-        mock_safe_representers.return_value.__enter__ = MagicMock()
-        mock_safe_representers.return_value.__exit__ = MagicMock()
 
-        # Mock to_dict to verify it's called
-        with patch.object(config, "to_dict") as mock_to_dict:
-            expected_dict = {
-                "_target_": _target_qualname(TestConfigContainer),
-                "name": "to_dict_test",
-                "value": 999,
-                "description": "A test configuration",
-            }
-            mock_to_dict.return_value = expected_dict
+        config.print_yaml()
 
-            config.print_yaml()
+        captured = capsys.readouterr()
+        parsed = yaml.safe_load(captured.out)
 
-            # Verify to_dict was called
-            mock_to_dict.assert_called_once()
-
-            # Verify the returned dict was passed to yaml.safe_dump
-            call_args = mock_yaml_dump.call_args
-            assert call_args[0][0] == expected_dict
+        assert parsed == config.to_dict()
 
 
 class TestConfigContainer_DeepCopy:
@@ -661,7 +600,8 @@ class TestConfigContainer_Integration:
 
     def test_roundtrip_dict_conversion(self):
         """Test that converting to dict and back preserves data."""
-        # Create a complex configuration
+        from megatron.training.config.instantiate_utils import target_allowlist
+
         simple_config = TestConfigContainer(name="roundtrip", value=999)
         nested_data = NestedDataclass(
             simple=SimpleDataclass(name="nested", value=888), description="roundtrip test"
@@ -674,32 +614,44 @@ class TestConfigContainer_Integration:
             metadata={"test": 42},
         )
 
-        # Convert to dict
         config_dict = original_config.to_dict()
 
-        # Verify dict structure
-        assert "_target_" in config_dict
-        assert config_dict["simple_config"]["name"] == "roundtrip"
-        assert config_dict["nested_data"]["simple"]["value"] == 888
+        target_allowlist.disable()
+        reconstructed_config = ComplexConfigContainer.from_dict(config_dict)
+        target_allowlist.enable()
 
-        # Convert back (would work if instantiate is properly implemented)
-        # This tests the dict structure is correct for round-trip
-        assert config_dict["simple_config"]["_target_"] == _target_qualname(TestConfigContainer)
-        assert config_dict["nested_data"]["_target_"] == _target_qualname(NestedDataclass)
+        assert reconstructed_config.simple_config.name == original_config.simple_config.name
+        assert reconstructed_config.simple_config.value == original_config.simple_config.value
+        assert (
+            reconstructed_config.nested_data.description == original_config.nested_data.description
+        )
+        assert (
+            reconstructed_config.nested_data.simple.name == original_config.nested_data.simple.name
+        )
+        assert (
+            reconstructed_config.nested_data.simple.value
+            == original_config.nested_data.simple.value
+        )
+        assert reconstructed_config.items == original_config.items
+        assert reconstructed_config.metadata == original_config.metadata
 
     def test_yaml_roundtrip_structure(self):
-        """Test YAML conversion produces expected structure."""
+        """Test that converting to YAML and back preserves data."""
+        from megatron.training.config.instantiate_utils import target_allowlist
+
         config = TestConfigContainer(name="yaml_roundtrip", value=1234)
 
-        with patch("megatron.training.config.container.safe_yaml_representers"):
-            with patch("yaml.safe_dump") as mock_dump:
-                config.print_yaml()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "test_config.yaml")
+            config.to_yaml(tmp_path)
 
-                # Verify the dictionary passed to yaml.safe_dump
-                call_args = mock_dump.call_args[0][0]
-                assert call_args["_target_"] == _target_qualname(TestConfigContainer)
-                assert call_args["name"] == "yaml_roundtrip"
-                assert call_args["value"] == 1234
+            target_allowlist.disable()
+            loaded_config = TestConfigContainer.from_yaml(tmp_path)
+            target_allowlist.enable()
+
+        assert loaded_config.name == config.name
+        assert loaded_config.value == config.value
+        assert loaded_config.description == config.description
 
     def test_error_handling_in_complex_scenarios(self):
         """Test error handling with complex nested structures."""
@@ -786,98 +738,105 @@ class TestConfigContainer_CallablesAndPartials:
         callable_data = CallableDataclass()
         result = TestConfigContainer._convert_value_to_dict(callable_data)
 
-        # Verify the structure includes _target_
-        assert "_target_" in result
-        assert _target_qualname(CallableDataclass) in result["_target_"]
-
-        # Regular fields should be preserved
+        assert result["_target_"] == _target_qualname(CallableDataclass)
         assert result["name"] == "callable_test"
         assert result["regular_value"] == 100
 
-        # Callable fields behavior depends on implementation
-        # They might be excluded or handled specially
-        # Let's check what's actually in the result
-        print(f"Callable dataclass to_dict result: {result}")
+        # Callables are not dataclasses/lists/dicts, so they pass through as-is
+        assert result["activation_func"] is activation_function
+        assert isinstance(result["loss_func"], functools.partial)
+        assert result["loss_func"].func is loss_function
+        assert result["loss_func"].keywords == {"reduction": "sum"}
+        assert result["torch_func"] is torch.nn.functional.relu
+        assert callable(result["lambda_func"])
+        assert result["lambda_func"](5) == 6
 
     def test_config_container_with_callables_to_dict(self):
         """Test ConfigContainer with callable fields converted to dict."""
         config = CallableConfigContainer()
         result = config.to_dict()
 
-        # Verify basic structure
-        assert "_target_" in result
+        assert result["_target_"] == _target_qualname(CallableConfigContainer)
         assert result["name"] == "callable_config"
 
-        # Check nested callable dataclass
-        assert "callable_data" in result
+        # Nested CallableDataclass hits the is_dataclass branch and becomes a dict
+        assert result["callable_data"]["_target_"] == _target_qualname(CallableDataclass)
         assert result["callable_data"]["name"] == "callable_test"
         assert result["callable_data"]["regular_value"] == 100
 
-        # The actual handling of callables will depend on the implementation
-        print(f"CallableConfigContainer to_dict result: {result}")
+        # Top-level callable fields pass through as-is
+        assert result["activation"] is activation_function
+        assert isinstance(result["partial_loss"], functools.partial)
+        assert result["partial_loss"].func is loss_function
+        assert result["partial_loss"].keywords == {"reduction": "none"}
+        assert result["torch_activation"] is torch.nn.functional.gelu
 
     def test_partial_function_handling(self):
-        """Test handling of functools.partial objects."""
+        """Test that partial objects pass through _convert_value_to_dict unchanged."""
         partial_func = functools.partial(loss_function, reduction="sum")
         result = TestConfigContainer._convert_value_to_dict(partial_func)
 
-        # Partial functions are callables and may be excluded or handled specially
-        # The exact behavior depends on the implementation
-        print(f"Partial function conversion result: {result}")
+        assert result is partial_func
 
     def test_various_callable_types(self):
-        """Test conversion of various callable types."""
-        callables_to_test = [
-            activation_function,  # Regular function
-            functools.partial(loss_function, reduction="mean"),  # Partial function
-            torch.nn.functional.relu,  # Torch function
-            lambda x: x * 2,  # Lambda function
-            torch.nn.ReLU(),  # Callable class instance
-        ]
+        """Test that all callable types pass through _convert_value_to_dict unchanged."""
+        # Plain function
+        assert (
+            TestConfigContainer._convert_value_to_dict(activation_function) is activation_function
+        )
 
-        for i, callable_obj in enumerate(callables_to_test):
-            result = TestConfigContainer._convert_value_to_dict(callable_obj)
-            print(f"Callable {i} ({type(callable_obj).__name__}) result: {result}")
+        # Partial — not a dataclass/list/dict so falls through as-is
+        partial_func = functools.partial(loss_function, reduction="mean")
+        assert TestConfigContainer._convert_value_to_dict(partial_func) is partial_func
+
+        # Torch built-in function
+        assert (
+            TestConfigContainer._convert_value_to_dict(torch.nn.functional.relu)
+            is torch.nn.functional.relu
+        )
+
+        # Lambda
+        fn = lambda x: x * 2
+        assert TestConfigContainer._convert_value_to_dict(fn) is fn
+
+        # Callable nn.Module instance — not a dataclass, falls through as-is
+        relu_instance = torch.nn.ReLU()
+        assert TestConfigContainer._convert_value_to_dict(relu_instance) is relu_instance
 
     def test_config_with_callables_roundtrip_behavior(self):
-        """Test the behavior of configs with callables in roundtrip scenarios."""
-        config = CallableConfigContainer(name="roundtrip_test")
+        """Test that to_dict/from_dict roundtrip preserves all fields for callable configs."""
+        from megatron.training.config.instantiate_utils import target_allowlist
 
-        # Convert to dict
+        config = CallableConfigContainer(name="roundtrip_test")
         config_dict = config.to_dict()
 
-        # Verify the structure is reasonable for potential reconstruction
-        assert "_target_" in config_dict
-        assert config_dict["name"] == "roundtrip_test"
+        target_allowlist.disable()
+        reconstructed = CallableConfigContainer.from_dict(config_dict)
+        target_allowlist.enable()
 
-        # The exact fields present will depend on how callables are handled
-        # This test documents the actual behavior
-        print(f"Roundtrip config dict keys: {list(config_dict.keys())}")
-
-        # Verify nested structure
-        if "callable_data" in config_dict:
-            assert isinstance(config_dict["callable_data"], dict)
-            assert "_target_" in config_dict["callable_data"]
+        assert reconstructed.name == config.name
+        assert reconstructed.callable_data.name == config.callable_data.name
+        assert reconstructed.callable_data.regular_value == config.callable_data.regular_value
+        # Callables pass through as-is in to_dict, so they come back with the same identity
+        assert reconstructed.activation is config.activation
+        assert reconstructed.partial_loss.func is config.partial_loss.func
+        assert reconstructed.partial_loss.keywords == config.partial_loss.keywords
+        assert reconstructed.torch_activation is config.torch_activation
 
     def test_callable_dataclass_field_exclusion(self):
-        """Test which fields are excluded when dataclass contains callables."""
+        """Test that no fields are excluded — callable fields pass through as-is."""
         callable_data = CallableDataclass()
         result = TestConfigContainer._convert_value_to_dict(callable_data)
 
-        # Document which fields are preserved vs excluded
-        expected_non_callable_fields = ["name", "regular_value"]
-        callable_fields = ["activation_func", "loss_func", "torch_func", "lambda_func"]
+        # Primitive fields present
+        assert result["name"] == "callable_test"
+        assert result["regular_value"] == 100
 
-        # Check if regular fields are preserved
-        for field in expected_non_callable_fields:
-            assert field in result, f"Regular field {field} should be preserved"
-
-        # Document callable field handling
-        for field in callable_fields:
-            if field in result:
-                print(f"Callable field {field} was preserved with value: {result[field]}")
-            else:
-                print(f"Callable field {field} was excluded from serialization")
+        # Callable fields are also present — _convert_value_to_dict does not exclude them
+        assert result["activation_func"] is activation_function
+        assert result["loss_func"] is callable_data.loss_func
+        assert result["torch_func"] is torch.nn.functional.relu
+        assert callable(result["lambda_func"])
 
     def test_mixed_container_with_callables_and_regular_data(self):
         """Test container mixing callable and regular data."""
@@ -904,11 +863,8 @@ class TestConfigContainer_CallablesAndPartials:
         assert result["nested_data"]["name"] == "nested"
         assert result["nested_data"]["value"] == 999
 
-        # Document callable handling
-        if "callable_func" in result:
-            print(f"Callable func preserved as: {result['callable_func']}")
-        else:
-            print("Callable func was excluded from serialization")
+        # Callable fields pass through as-is
+        assert result["callable_func"] is activation_function
 
     def test_deepcopy_with_callables(self):
         """Test deep copying ConfigContainer with callable fields."""
