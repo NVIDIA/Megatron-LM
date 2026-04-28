@@ -279,6 +279,11 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     if pattern is None:
         return ParsedHybridPattern(main_pattern=None, mtp_pattern=None, mtp_num_depths=0)
 
+    # Validate bracket structure before splitting on '/', otherwise a fusion
+    # group that crosses the MTP boundary looks like two unrelated unmatched
+    # bracket errors.
+    _validate_brackets(pattern, "hybrid")
+
     parts = pattern.split(Symbols.MTP_SEPARATOR)
 
     if len(parts) == 1:
