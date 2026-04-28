@@ -360,8 +360,10 @@ class LanguageModule(MegatronModule):
             depth (int, optional): MTP depth index. Only needed when `mtp_use_repeated_layer` is
                 False (each depth uses a distinct layer). Omit for repeated-layer models so that a
                 single CUDA graph can serve all depths.
-            eager: Added as an optional argument here to simplify upstream code.
-            cache_key: Added as an optional argument here to simplify upstream code.
+            eager, cache_key: The `CudaGraphManager` works by monkey-patching this argument onto the
+                function signature. Explictly including them removes the need for a monkey-patch,
+                and makes it straightforward to call the same method with and without eager mode.
+                These arguments are consumed by `CudaGraphManager`, if it exists.
 
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
