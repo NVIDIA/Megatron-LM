@@ -1227,6 +1227,17 @@ class TextGenerationController:
 
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
+        # Mirror sampled tokens into gpu_view so the next forward's CUDA
+        # graph can read them directly. Pure-decode, non-speculative only —
+        # other layouts are handled by the existing CPU+H2D path.
+        if context.is_decode_only() and not self.num_speculative_tokens:
+            active_request_count = (
+                context.total_request_count - context.paused_request_count
+            )
+            context.gpu_view.token_to_input_ids[:active_request_count].copy_(
+                self._sampled_tokens_cuda[:active_request_count]
+            )
+
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
 
