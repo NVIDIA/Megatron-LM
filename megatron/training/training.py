@@ -133,7 +133,7 @@ except ImportError:
     CallWrapper = type(None)
 
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, tensor_parallel, nccl_allocator
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
@@ -3355,6 +3355,15 @@ def train(
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
+        # Deregister NCCL user-buffer memory pools before exit.
+        # Without this, ProcessGroupNCCL's destructor calls abort() which uses
+        # ncclCommDeregister on handles created by ncclCommWindowRegister,
+        # causing "NCCL WARN Deregister: Could not find handle" and a crash.
+        for model_module in model:
+            if isinstance(model_module, DDP):
+                for buf in model_module.buffers + model_module.expert_parallel_buffers:
+                    if getattr(buf, 'nccl_mem_pool', None) is not None:
+                        nccl_allocator.deregister_nccl_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
