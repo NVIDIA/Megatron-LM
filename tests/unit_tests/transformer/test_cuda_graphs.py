@@ -1104,9 +1104,7 @@ class _SimpleNonModule:
     """non-nn.Module base_module for testing the function_name= form of `CudaGraphManager`."""
 
     def __init__(self, config):
-        self.weight = torch.randn(
-            config.hidden_size, config.hidden_size, device="cuda"
-        )
+        self.weight = torch.randn(config.hidden_size, config.hidden_size, device="cuda")
 
     def my_op(self, x):
         return x @ self.weight
