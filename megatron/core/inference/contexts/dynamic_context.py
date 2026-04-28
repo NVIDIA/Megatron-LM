@@ -1299,6 +1299,45 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
 
+    def predict_decode_blocks_needed(self, advance: int = 1) -> int:
+        """Predict total new KV blocks needed if active requests advance by ``advance``
+        decode tokens.
+
+        Used by async scheduling to decide whether the next forward can be issued
+        speculatively (no new blocks needed) or whether we must drop out of the
+        speculative chain (request would cross a block boundary and require fresh
+        allocation).
+
+        Returns the count of new blocks needed across all active requests.
+        Returns 0 if no active requests cross a block boundary.
+        """
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        seq_lens = self.request_kv_length_offsets[active_slice] + self.request_query_lengths[
+            active_slice
+        ]
+        # Current blocks used per request = ceil(seq_len / block_size_tokens).
+        current_blocks = (seq_lens + self.block_size_tokens - 1) // self.block_size_tokens
+        # Blocks used per request after advancing by `advance` decode tokens.
+        future_blocks = (
+            seq_lens + advance + self.block_size_tokens - 1
+        ) // self.block_size_tokens
+        return int((future_blocks - current_blocks).sum().item())
+
+    def can_speculate_decode_step(self, advance: int = 1) -> bool:
+        """Predicate: can we run the next ``advance`` decode steps speculatively?
+
+        Returns True when the speculation chain is safe to continue: pure decode
+        only, and either no new blocks are needed or all needed blocks are
+        available without eviction. Used by the engine in C3 to gate the
+        async-scheduling fast path.
+        """
+        if not self.is_decode_only():
+            return False
+        blocks_needed = self.predict_decode_blocks_needed(advance=advance)
+        if blocks_needed == 0:
+            return True
+        return self.kv_block_allocator.is_memory_available(blocks_needed)
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 

@@ -454,6 +454,64 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_predict_decode_blocks_needed_no_boundary(self):
+        """predict_decode_blocks_needed returns 0 when no active request would
+        cross a block boundary at the next decode step."""
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=False,
+        )
+        # 100 tokens fits within block 0 (0..127). Next step (+1 = 101) still in block 0.
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, 100, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=dynamic_context.max_tokens - 100
+                ),
+            )
+        )
+        assert dynamic_context.predict_decode_blocks_needed(advance=1) == 0
+        # Cannot speculate during prefill phase regardless of block status.
+        assert dynamic_context.can_speculate_decode_step(advance=1) is False
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_predict_decode_blocks_needed_crosses_boundary(self):
+        """predict_decode_blocks_needed returns 1 when a request at exactly a
+        block boundary needs a new block at the next decode step."""
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=False,
+        )
+        # 128 tokens fills block 0 exactly. Next step (+1 = 129) needs block 1.
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, 128, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=dynamic_context.max_tokens - 128
+                ),
+            )
+        )
+        assert dynamic_context.predict_decode_blocks_needed(advance=1) == 1
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_add_dummy_requests_parallel_populates_state(self):
 
         dynamic_context = self._get_dynamic_context(
