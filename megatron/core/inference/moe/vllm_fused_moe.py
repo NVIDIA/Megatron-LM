@@ -623,7 +623,8 @@ def _invoke_fused_moe_kernel(
     to increase SM occupancy. Uses num_tokens_hint (actual batch size) rather
     than A.size(0) (worst-case buffer size) when available.
     """
-    effective_m = num_tokens_hint if num_tokens_hint is not None else A.size(0)
+    M = A.size(0)
+    effective_m = num_tokens_hint if num_tokens_hint is not None else M
     if effective_m <= 32:
         _invoke_splitk(
             A, B, C, topk_weights, sorted_token_ids, expert_ids,
