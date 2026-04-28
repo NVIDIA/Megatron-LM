@@ -540,11 +540,21 @@ class TestDTensorSaveLoad:
         # dp_rank disambiguates replicas across DP groups (replica_id=0 is the main replica)
         dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
 
-        # Use a properly-initialized 2-d mesh for TP+DP
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        dp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        device_mesh = DeviceMesh.from_group([tp_group, dp_group], "cuda",
-                                            mesh_dim_names=("tp", "dp"))
+        dp_size = torch.distributed.get_world_size() // tp_size
+
+        # Build the 2D (tp_size × dp_size) rank tensor by gathering each rank's
+        # (global_rank, tp_rank, dp_rank) tuple, then filling mesh[tp_r][dp_r].
+        my_rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        rank_info = torch.tensor([my_rank, tp_rank, dp_rank], dtype=torch.long, device='cuda')
+        all_rank_info = [torch.zeros(3, dtype=torch.long, device='cuda') for _ in range(world_size)]
+        torch.distributed.all_gather(all_rank_info, rank_info)
+        mesh_tensor = torch.zeros(tp_size, dp_size, dtype=torch.long)
+        for info in all_rank_info:
+            g_rank, t_rank, d_rank = info.tolist()
+            mesh_tensor[int(t_rank)][int(d_rank)] = g_rank
+
+        device_mesh = DeviceMesh("cuda", mesh_tensor, mesh_dim_names=("tp", "dp"))
         placements = [Shard(0), Replicate()]
 
         # Global tensor rows [0,8) on tp_rank=0, rows [8,16) on tp_rank=1
