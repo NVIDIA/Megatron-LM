@@ -859,13 +859,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # step; used by graphable ops via torch.where so slice shapes stay fixed.
         # Packed into one contiguous tensor for a single pinned H2D copy.
         self._context_op_metadata_gpu = torch.zeros(
-            4, dtype=torch.int32, device=torch.cuda.current_device()
+            6, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        self._context_op_metadata_cpu = torch.zeros(4, dtype=torch.int32).pin_memory()
+        self._context_op_metadata_cpu = torch.zeros(6, dtype=torch.int32).pin_memory()
         self._real_request_count_gpu = self._context_op_metadata_gpu[0:1]
         self._real_token_count_gpu = self._context_op_metadata_gpu[1:2]
         self._real_decode_count_gpu = self._context_op_metadata_gpu[2:3]
         self._real_prefill_count_gpu = self._context_op_metadata_gpu[3:4]
+        self._total_request_count_gpu = self._context_op_metadata_gpu[4:5]
+        self._paused_request_count_gpu = self._context_op_metadata_gpu[5:6]
 
         # Pre-allocated index tensors for graphable ops (static addresses).
         self._arange_requests = torch.arange(
@@ -1864,6 +1866,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._context_op_metadata_cpu[1] = self.active_token_count
         self._context_op_metadata_cpu[2] = batch_dimensions.decode_req_count
         self._context_op_metadata_cpu[3] = batch_dimensions.prefill_req_count
+        self._context_op_metadata_cpu[4] = self.total_request_count
+        self._context_op_metadata_cpu[5] = self.paused_request_count
 
         return True
 
