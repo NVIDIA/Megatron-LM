@@ -1444,6 +1444,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # each layer from a single thread per process, so this is safe today;
         # if multi-threaded inference is ever introduced, switch to a
         # thread-local or pass the manager through CUDA-graph-aware kwargs.
+        # CUDA-graph replay note: replay does not invoke `__call__` (the
+        # captured graph runs directly), so `_mhc_recompute_manager` will be
+        # `None` when `forward()` is replayed. This is correct because mHC
+        # recompute is disabled under CUDA graphs (guarded by `self.training`
+        # in `_build_mhc_recompute_layer_plan` and by `is_graph_warmup()` in
+        # `CheckpointWithoutOutput.checkpoint`).
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         try:
             return super().__call__(*args, **kwargs)

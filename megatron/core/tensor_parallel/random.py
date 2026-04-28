@@ -699,6 +699,14 @@ def _load_args_from_ctx(ctx):
             reconstructed_args.append(non_tensor_map[index])
         else:
             reconstructed_args.append(next(tensor_iter))
+    # Postcondition: every saved tensor must have been consumed. A mismatch here
+    # means `_save_args_to_ctx` and `_load_args_from_ctx` disagree on argument
+    # positions, which would otherwise silently feed wrong tensors to recompute.
+    remaining = list(tensor_iter)
+    assert not remaining, (
+        f"_load_args_from_ctx left {len(remaining)} saved tensors unconsumed; "
+        "tensor/non-tensor index mismatch between save and load."
+    )
     return tuple(reconstructed_args)
 
 
@@ -808,6 +816,20 @@ class CheckpointManager:
             raise RuntimeError(
                 "CheckpointManager is single-use; "
                 "discard_all_outputs_and_register_unified_recompute() already called."
+            )
+        # Refuse to discard checkpoint outputs when no recompute hook can be
+        # registered (`hook_tensor.requires_grad=False`, e.g. inference or a
+        # `no_grad` context). Otherwise the discarded storages would never be
+        # restored and any later access would either read garbage or crash.
+        # Upstream callers (`_build_mhc_recompute_layer_plan`) already guard
+        # via `self.training`; this check turns a silent corruption into a
+        # loud failure if a future caller bypasses that guard.
+        if self.checkpoints and not hook_tensor.requires_grad:
+            raise RuntimeError(
+                "CheckpointManager.discard_all_outputs_and_register_unified_recompute "
+                "called with hook_tensor.requires_grad=False but checkpoints are "
+                "registered. Outputs would never be recomputed; this is likely a "
+                "bug (calling during inference or inside a no_grad context)."
             )
         self._finalized = True
         for ckpt in self.checkpoints:

@@ -2095,14 +2095,12 @@ def get_tensor_shapes(
     if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
         pp_rank = pp_group.rank()
         pp_size = pp_group.size()
-        use_nstream = False
-        if is_recv and pp_rank > 0:
-            # Receiving from previous stage (which sends n*C).
-            use_nstream = True
-        elif not is_recv and pp_rank < pp_size - 1:
-            # Sending to next stage (send n*C).
-            use_nstream = True
-
+        is_first_stage = pp_rank == 0
+        is_last_stage = pp_rank == pp_size - 1
+        # First stage's recv comes from the embedding (single-stream); last
+        # stage's send goes to the output (single-stream). Everything else is
+        # the n-stream tensor.
+        use_nstream = (not is_first_stage) if is_recv else (not is_last_stage)
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
 
