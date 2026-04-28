@@ -569,9 +569,6 @@ def vllm_fused_moe(
     intermediate1 = torch.empty(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
-    # Tight grid bound: only enough CTAs for actual tokens + per-expert alignment padding.
-    # Without this, the grid covers the entire worst-case buffer (max_tokens * topk + padding).
-    grid_em = effective_tokens * topk + block_size_m * (num_local_experts + 1)
     _invoke_fused_moe_kernel(
         hidden_states,
         fc1_weight,
@@ -584,7 +581,6 @@ def vllm_fused_moe(
         top_k=topk,
         block_size_m=block_size_m,
         fuse_squared_relu=True,
-        grid_em=grid_em,
     )
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights.
@@ -604,7 +600,6 @@ def vllm_fused_moe(
         mul_routed_weight=True,
         top_k=1,
         block_size_m=block_size_m,
-        grid_em=grid_em,
     )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
