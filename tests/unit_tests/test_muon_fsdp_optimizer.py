@@ -392,6 +392,89 @@ class TestFSDPTensorParallelMuon:
         final_local1 = params[1].data.to_local()
         torch.testing.assert_close(final_local1, initial_local1, atol=1e-4, rtol=1e-3)
 
+    def test_step_matches_unsharded_muon_optimizer_step_numerics(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        plans = [{0: 4}, {0: 2, 1: 3}, {0: 1, 1: 5}, {1: 4}]
+        row_counts = [sum(plan.values()) for plan in plans]
+        full_params = [
+            (
+                torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols)
+                + 1.3 * (idx + 1)
+            )
+            / (17 + idx)
+            for idx, rows in enumerate(row_counts)
+        ]
+        full_grads_by_step = [
+            [
+                (
+                    torch.arange(rows * cols, device="cuda", dtype=torch.float32).view(rows, cols)
+                    + 0.7 * (idx + 1)
+                    + step
+                )
+                / (23 + idx + step)
+                for idx, rows in enumerate(row_counts)
+            ]
+            for step in range(2)
+        ]
+        optimizer_kwargs = dict(
+            lr=0.03, momentum=0.25, nesterov=True, weight_decay=0.02, num_ns_steps=3
+        )
+
+        unsharded_params = [nn.Parameter(full_param.clone()) for full_param in full_params]
+        unsharded_optimizer = TensorParallelMuon(
+            params=unsharded_params,
+            pg_collection=None,
+            tp_mode="duplicated",
+            split_qkv=False,
+            **optimizer_kwargs,
+        )
+
+        sharded_params = []
+        for full_param, plan in zip(full_params, plans):
+            local_param = _local_slice(full_param, plan, dp_rank).contiguous()
+            sharded_params.append(
+                nn.Parameter(_make_dtensor(local_param, full_param.shape, device_mesh))
+            )
+        sharded_optimizer = _make_fsdp_muon(sharded_params, dp_group=dp_group, **optimizer_kwargs)
+
+        for step, full_grads in enumerate(full_grads_by_step, start=1):
+            for param, full_grad in zip(unsharded_params, full_grads):
+                param.grad = full_grad.clone()
+            for param, full_grad, plan in zip(sharded_params, full_grads, plans):
+                local_grad = _local_slice(full_grad, plan, dp_rank).contiguous()
+                param.grad = _make_dtensor(local_grad, full_grad.shape, device_mesh)
+
+            unsharded_optimizer.step()
+            sharded_optimizer.step()
+
+            for idx, (sharded_param, unsharded_param, plan) in enumerate(
+                zip(sharded_params, unsharded_params, plans)
+            ):
+                expected_local = _local_slice(unsharded_param.detach(), plan, dp_rank)
+                local_value = sharded_param.data.to_local()
+
+                if local_value.numel() == 0:
+                    assert local_value.shape[0] == 0
+                    continue
+
+                torch.testing.assert_close(
+                    local_value,
+                    expected_local,
+                    atol=1e-5,
+                    rtol=1e-4,
+                    msg=(
+                        "Muon+M-FSDP diverged from unsharded Muon "
+                        f"on step {step}, param {idx}, rank {dp_rank}"
+                    ),
+                )
+
 
 @_skip_if_single_rank()
 class TestFSDPFactoryIntegration:
