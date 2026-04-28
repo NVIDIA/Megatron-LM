@@ -130,7 +130,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     if args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
     else:
-        raise("You must provide a valid Mamba layer spec!")
+        raise ValueError("You must provide a valid Mamba layer spec!")
 
     model = HybridModel(
         config=config,
