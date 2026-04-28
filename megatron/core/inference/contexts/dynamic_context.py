@@ -554,10 +554,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
-        assert self.max_tokens >= self.max_requests, (
+        min_tokens = self.max_requests * (self.num_speculative_tokens + 1)
+        assert self.max_tokens >= min_tokens, (
             f"max_tokens ({self.max_tokens}) must be >= "
-            f"max_requests ({self.max_requests}), "
-            "to have consistency between cuda graph sizes and the block table size."
+            f"max_requests ({self.max_requests}) * (num_speculative_tokens + 1) "
+            f"= {min_tokens}, to have consistency between cuda graph sizes and the block "
+            "table size."
         )
 
         self.num_prefill_requests = 0
