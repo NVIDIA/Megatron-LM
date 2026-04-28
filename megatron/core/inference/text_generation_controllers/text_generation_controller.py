@@ -329,28 +329,6 @@ class TextGenerationController:
 
         return text, prompts_plus_generations_segments
 
-    def _torch_sampling_func(
-        self,
-        last_token_logits: torch.Tensor,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        vocab_size: Optional[int] = None,
-    ):
-        """Static-batching sampler shim. Forwards to `TorchSampling.sample_from_logits`.
-
-        The dynamic-batching path goes through `self._sampling`; this method is kept
-        for the static `sample_from_logits` flow and for any callers that mock it.
-        """
-        return TorchSampling.sample_from_logits(
-            last_token_logits,
-            temperature,
-            top_k,
-            top_p,
-            generator=self.sampling_rng,
-            vocab_size=vocab_size,
-        )
-
     def sample_from_logits(
         self,
         last_token_logits: torch.Tensor,
@@ -437,7 +415,14 @@ class TextGenerationController:
         top_k = sampling_params.top_k
         temperature = sampling_params.temperature
 
-        return self._torch_sampling_func(last_token_logits, temperature, top_k, top_p, vocab_size)
+        return TorchSampling.sample_from_logits(
+            last_token_logits,
+            temperature,
+            top_k,
+            top_p,
+            generator=self.sampling_rng,
+            vocab_size=vocab_size,
+        )
 
     def update_generation_status(
         self,
@@ -906,32 +891,6 @@ class TextGenerationController:
         if has_mtp:
             del unwrapped_model._decoder_hidden_states_cache
 
-    def _sample_speculative_logits(
-        self,
-        required_logits: Tensor,
-        num_decode: int,
-        num_prefill: int,
-        *,
-        eager: bool,
-        cache_key,
-    ) -> Tensor:
-        """Sample speculative-token logits via the active sampling backend.
-
-        `num_decode` and `num_prefill` are the request counts the kernel should treat
-        as decode/prefill: padded values when running a captured CUDA graph, actual
-        values otherwise. Padded slots beyond the active count contribute decode-style
-        rows (`pad_active_slices` initialises their query lengths to `1 + n_spec`).
-        """
-        return self._sampling.sample_speculative(
-            required_logits,
-            num_decode,
-            num_prefill,
-            self.num_speculative_tokens,
-            self.inference_wrapped_model.inference_context,
-            eager=eager,
-            cache_key=cache_key,
-        )
-
     def _verify_speculative_tokens(
         self,
         output_tokens: Tensor,
@@ -998,10 +957,12 @@ class TextGenerationController:
 
         # Sample tokens from logits
         nvtx_range_push("mtp-spec-decoding/verify/sample")
-        output_tokens = self._sample_speculative_logits(
+        output_tokens = self._sampling.sample_speculative(
             required_logits,
             sample_num_decode,
             sample_num_prefill,
+            self.num_speculative_tokens,
+            context,
             eager=not use_graph_for_sampling,
             cache_key=(
                 ("sample_speculative", sample_num_decode, sample_num_prefill)
