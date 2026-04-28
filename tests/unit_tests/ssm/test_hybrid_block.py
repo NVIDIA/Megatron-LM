@@ -103,6 +103,58 @@ class TestHybridBlock:
         assert output.shape[2] == block.config.hidden_size
         assert output.dtype == torch.float32
 
+    @pytest.mark.parametrize(
+        ("layer_pattern", "expected_layer_type"),
+        [
+            (
+                Symbols.FUSION_START + Symbols.ATTENTION + Symbols.MLP + Symbols.FUSION_END,
+                Symbols.ATTENTION + Symbols.MLP,
+            ),
+            (
+                Symbols.FUSION_START + Symbols.MAMBA + Symbols.MLP + Symbols.FUSION_END,
+                Symbols.MAMBA + Symbols.MLP,
+            ),
+        ],
+    )
+    def test_fused_gpu_forward_backward(self, layer_pattern, expected_layer_type):
+        """Test CUDA forward+backward through a fused hybrid-pattern block."""
+        block = self.get_mamba_block(layer_pattern)
+        assert block.layer_type_list == [expected_layer_type]
+        assert len(block.layers) == 1
+        assert isinstance(block.layers[0], TransformerLayer)
+
+        block.cuda()
+        block.train()
+        micro_batch_size = 2
+        sequence_length = 32
+        hidden_states = torch.randn(
+            (sequence_length, micro_batch_size, block.config.hidden_size),
+            device="cuda",
+            requires_grad=True,
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
+        )
+
+        output = block(hidden_states, attention_mask=attention_mask)
+        assert output.shape == hidden_states.shape
+        assert output.dtype == torch.float32
+
+        loss = output.float().square().mean()
+        loss.backward()
+
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all().item()
+
+        grads = [
+            param.grad
+            for param in block.parameters()
+            if param.requires_grad and param.grad is not None
+        ]
+        assert grads
+        assert all(torch.isfinite(grad).all().item() for grad in grads)
+        assert any(torch.count_nonzero(grad).item() > 0 for grad in grads)
+
     def test_layer_types(self):
         """
         Make sure that the layer types specified with layer_pattern
