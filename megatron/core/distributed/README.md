@@ -1,6 +1,6 @@
 # Distributed Data Parallelism
 
-This module contains 
+This module contains algorithms, data structures, and utilities used for different types of distributed data parallelism, such as DDP and FSDP.
 
 ## Distributed Data Parallelism
 
