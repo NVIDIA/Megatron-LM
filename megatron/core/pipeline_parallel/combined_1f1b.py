@@ -207,7 +207,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     f_microbatch_id = None
     input_tensor = None
     if f_virtual_microbatch_id is not None:
-        f_microbatch_id = get_microbatch_id_min_model_chunk(f_virtual_microbatch_id, forward=True)
+        f_microbatch_id = get_microbatch_id_in_model_chunk(f_virtual_microbatch_id, forward=True)
     if f_virtual_microbatch_id is not None:
         f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
         input_tensor = forward_step_helper_preprocess(
