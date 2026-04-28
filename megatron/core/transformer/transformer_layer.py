@@ -1519,11 +1519,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    self.input_layernorm, hidden_states
+                    apply_module(self.input_layernorm), hidden_states
                 )
         else:
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
-                input_layernorm_output = self.input_layernorm(hidden_states)
+                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
         input_layernorm_output = self._require_tensor_layernorm_output(
             input_layernorm_output, "input_layernorm"
         )
@@ -1627,11 +1627,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    self.pre_mlp_layernorm, hidden_states
+                    apply_module(self.pre_mlp_layernorm), hidden_states
                 )
         else:
             with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
-                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
         pre_mlp_layernorm_output = self._require_tensor_layernorm_output(
             pre_mlp_layernorm_output, "pre_mlp_layernorm"
         )

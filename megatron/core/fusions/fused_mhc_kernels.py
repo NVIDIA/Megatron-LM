@@ -448,6 +448,10 @@ if _CUTILE_AVAILABLE:
         # for kernel signature symmetry with the other tiled kernels but must
         # not be changed without a kernel rewrite.
         TILE_SIZE = 1
+        assert TILE_SIZE == 1, (
+            "_ct_hpb_*_kernel kernels' reshape pattern requires TILE_SIZE=1; "
+            "see the comment above before changing this value."
+        )
         out = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
         grid = (sb,)
         if bias is not None:
@@ -500,6 +504,9 @@ if _CUTILE_AVAILABLE:
         # tile dimension to 1 inside their reshapes, so TILE_SIZE must remain 1
         # for correctness.
         TILE_SIZE = 1
+        assert TILE_SIZE == 1, (
+            "_ct_hpb_bwd_*_kernel kernels' reshape pattern requires TILE_SIZE=1."
+        )
         g_hr = torch.empty(sb, n, n, dtype=h_res.dtype, device=h_res.device)
         g_res = torch.empty(sb, n, C, dtype=h_res.dtype, device=h_res.device)
         g_hp = torch.empty(sb, n, dtype=h_res.dtype, device=h_res.device)

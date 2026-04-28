@@ -155,6 +155,12 @@ class HyperConnectionHybridLayer(MegatronModule):
             f"hidden-state shape. Got {tuple(layer_output.shape)} from inner layer "
             f"vs {tuple(aggregated.shape)} input — layer must add its own residual."
         )
+        # `fp32_residual_connection=True` may cause some inner layers (e.g.,
+        # MambaLayer) to return `layer_output` in fp32 while `aggregated` is in
+        # compute dtype; explicitly upcast `aggregated` so the subtraction stays
+        # in fp32 instead of relying on PyTorch's implicit promotion.
+        if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
+            aggregated = aggregated.to(layer_output.dtype)
         layer_delta = layer_output - aggregated
         # `dropout_prob=0.0` already disables dropout regardless of training mode;
         # `training=self.training` is more semantically accurate than hard-coding
@@ -225,6 +231,10 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
         # Required for pipeline parallel schedules
         self.input_tensor = None
         self.pg_collection = pg_collection
+
+        # Lazily populated mHC recompute layout cache (deterministic from config
+        # and num_layers); see `_build_mhc_recompute_layer_plan`.
+        self._mhc_block_end_plan: Optional[List[bool]] = None
 
         assert layer_type_list is not None, (
             "layer_type_list must be provided. It should be pre-computed from "
@@ -366,20 +376,13 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
-    def _build_mhc_recompute_layer_plan(
-        self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
-        """Pre-build per-layer MHC recompute managers and block-end markers."""
+    def _compute_mhc_block_end_plan(self) -> List[bool]:
+        """Compute per-layer block-end markers (deterministic from config)."""
         num_layers = len(self.layers)
-        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
         is_recompute_block_end: List[bool] = [False] * num_layers
-
-        if not use_mhc_recompute or num_layers == 0:
-            return layer_managers, is_recompute_block_end
-
+        if num_layers == 0:
+            return is_recompute_block_end
         mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
-        mhc_manager = CheckpointManager()
-
         for l_no in range(num_layers):
             is_last_in_stack = l_no == num_layers - 1
             is_last_in_recompute_block = is_last_in_stack
@@ -387,13 +390,33 @@ class HybridStack(GraphableMegatronModule, MegatronModule):
                 is_last_in_recompute_block = is_last_in_stack or (
                     (l_no + 1) % mhc_recompute_layer_num == 0
                 )
-
-            layer_managers[l_no] = mhc_manager
             is_recompute_block_end[l_no] = is_last_in_recompute_block
+        return is_recompute_block_end
 
-            if is_last_in_recompute_block and not is_last_in_stack:
+    def _build_mhc_recompute_layer_plan(
+        self, use_mhc_recompute: bool
+    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+        """Pre-build per-layer MHC recompute managers and block-end markers.
+
+        The block-end plan is deterministic from config and cached on the
+        instance; only the per-block ``CheckpointManager`` instances are
+        allocated fresh per forward pass (managers are single-use). Mirrors
+        the caching scheme used by ``TransformerBlock``.
+        """
+        num_layers = len(self.layers)
+        if not use_mhc_recompute or num_layers == 0:
+            return [None] * num_layers, [False] * num_layers
+
+        if self._mhc_block_end_plan is None:
+            self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
+        is_recompute_block_end = self._mhc_block_end_plan
+
+        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
+        mhc_manager = CheckpointManager()
+        for l_no in range(num_layers):
+            layer_managers[l_no] = mhc_manager
+            if is_recompute_block_end[l_no] and l_no != num_layers - 1:
                 mhc_manager = CheckpointManager()
-
         return layer_managers, is_recompute_block_end
 
     @staticmethod

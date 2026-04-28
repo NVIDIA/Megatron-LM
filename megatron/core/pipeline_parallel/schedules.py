@@ -1066,29 +1066,22 @@ def forward_backward_pipelining_with_interleaving(
     model_type = get_model_type(model[0])
 
     # Determine hidden dimension for P2P communication.
-    # For hyper connections with multiple PP stages, use n-stream dimension.
+    # `forward_backward_pipelining_with_interleaving` is only reached when VPP is
+    # set (see `get_forward_backward_func` selection logic). VPP + mHC is rejected
+    # in `TransformerConfig.__post_init__` for explicit-VPP and re-checked here as
+    # a layout-VPP backstop; either way, mHC never reaches the n*C path inside
+    # this function.
     if (
-        getattr(config, 'enable_hyper_connections', False)
+        config.enable_hyper_connections
         and pipeline_parallel_size > 1
-        and getattr(config, 'virtual_pipeline_model_parallel_size', None) is not None
+        and config.virtual_pipeline_model_parallel_size is not None
     ):
-        # The interleaved schedule allocates a single tensor_shape for all P2P
-        # exchanges, but VPP straddles pre/post-process boundaries on each physical
-        # rank — intermediate virtual chunks need n*C while embedding/loss chunks
-        # use C. Block until per-virtual-chunk shapes are wired through; see the
-        # parallel guard in `get_tensor_shapes`.
         raise ValueError(
             "enable_hyper_connections is not yet supported with "
             "virtual_pipeline_model_parallel_size set in the interleaved pipeline "
             "schedule. Disable VPP or wait for per-virtual-chunk shape support."
         )
     hidden_dim = config.hidden_size
-    if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
-        # NOTE: this branch is only reachable when VPP is disabled (the explicit
-        # ValueError above blocks VPP+mHC). Kept for the non-VPP interleaved-style
-        # entry path. Per-virtual-chunk shape selection is needed before this can
-        # safely cover VPP+mHC; do not remove the guard above without wiring that.
-        hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
