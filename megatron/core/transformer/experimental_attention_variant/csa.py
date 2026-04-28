@@ -631,7 +631,11 @@ class CompressedSparseAttention(MegatronModule):
             self.compressor = None
 
         # Conditionally build Indexer (ratio == 4)
-        if self.compress_ratio == 4 and submodules.indexer is not None:
+        if (
+            self.compress_ratio == 4
+            and not config.csa_dense_mode
+            and submodules.indexer is not None
+        ):
             self.indexer = build_module(
                 submodules.indexer,
                 config=config,

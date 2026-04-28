@@ -1,14 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
-import math
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -777,14 +775,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
         if self.core_attention.current_max_attn_logits is None:
             raise ValueError("current_max_attn_logits is None")
-
-        # Check if we're in absorption mode
-        if self.cache_mla_latents and not hasattr(self, 'linear_kv_up_proj'):
-            raise ValueError(
-                "qk_clip is not supported when cache_mla_latents is enabled and absorption is "
-                "active. The linear_kv_up_proj layer has been deleted during absorption "
-                "preparation."
-            )
 
         assert self.core_attention.current_max_attn_logits.shape == (
             self.num_attention_heads_per_partition,
