@@ -814,6 +814,10 @@ class TestBracketValidation:
         with pytest.raises(ValueError, match="pipe '\\|'.*inside"):
             parse_hybrid_pattern("[*|M]")
 
+    def test_brackets_crossing_mtp(self):
+        with pytest.raises(ValueError, match="MTP '/'.*inside"):
+            parse_hybrid_pattern("[*/M]")
+
     def test_layer_count_with_brackets(self):
         """get_hybrid_total_layer_count counts each fusion group as 1 physical layer."""
         # "[*-]M[*-]M" -> 2 fused blocks + 2 mamba = 4 physical layers
