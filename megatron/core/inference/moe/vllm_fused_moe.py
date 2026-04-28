@@ -341,15 +341,18 @@ def _moe_align_block_size_cuda_graphable(
         BLOCK_SIZE_M=block_size,
     )
 
-    counters = exclusive_offsets.clone()
-    nonlocal_counter = inclusive_offsets[-1:].clone()
+    # Snapshot the local-expert padded count before reusing inclusive_offsets[-1:]
+    # as the nonlocal atomic counter (avoids a D2D clone).
+    num_tokens_post_padded_local = inclusive_offsets[-1:].clone()
+    # exclusive_offsets is not read after this point — reuse directly as atomic
+    # counters for the scatter kernel (avoids a D2D clone).
     max_pairs = max_tokens * topk
     NUM_BLOCKS = min(max_pairs, 512)
     _scatter_token_indices_kernel[(NUM_BLOCKS,)](
         routing_map,
         sorted_token_ids,
-        counters,
-        nonlocal_counter,
+        exclusive_offsets,
+        inclusive_offsets[-1:],
         valid_tokens,
         topk,
         local_expert_start,
@@ -358,12 +361,9 @@ def _moe_align_block_size_cuda_graphable(
         NUM_BLOCKS=NUM_BLOCKS,
     )
 
-    num_tokens_post_padded_local = inclusive_offsets[-1:]
-    # nonlocal_counter was atomically incremented by the scatter kernel and now
-    # holds the position past the last non-local expert pair — a tight upper
-    # bound that covers both local expert blocks and actual non-local pairs,
-    # without including the sentinel-filled tail of sorted_token_ids.
-    num_tokens_post_padded_all = nonlocal_counter
+    # inclusive_offsets[-1] was atomically incremented by scatter and now holds
+    # the position past the last non-local expert pair.
+    num_tokens_post_padded_all = inclusive_offsets[-1:]
     return sorted_token_ids, expert_ids, num_tokens_post_padded_local, num_tokens_post_padded_all
 
 
