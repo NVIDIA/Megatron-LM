@@ -7,11 +7,11 @@ import tempfile
 from dataclasses import dataclass
 from unittest.mock import MagicMock, mock_open, patch
 
-import yaml
 import pytest
 import torch
-from megatron.core.msc_utils import MultiStorageClientFeature
+import yaml
 
+from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.instantiate_utils import InstantiationMode
 

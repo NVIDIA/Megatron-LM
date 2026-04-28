@@ -1,8 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 from dataclasses import dataclass, field
-from megatron.training.config.container import ConfigContainerBase
+
 import pytest
+
+from megatron.training.config.container import ConfigContainerBase
 
 
 # Test dataclasses for testing
@@ -84,8 +86,8 @@ class TestBackwardCompatibility:
 
     def test_sanitize_dataclass_config_removes_init_false_fields(self):
         """Test sanitize_dataclass_config removes init=False fields."""
-        from megatron.training.config.utils import sanitize_dataclass_config
         from megatron.training.config.instantiate_utils import target_allowlist
+        from megatron.training.config.utils import sanitize_dataclass_config
 
         config = {
             "_target_": "tests.unit_tests.training.config.test_utils.DataclassWithInitFalse",
@@ -105,8 +107,8 @@ class TestBackwardCompatibility:
 
     def test_sanitize_dataclass_config_preserves_normal_fields(self):
         """Test sanitize_dataclass_config preserves fields without init=False."""
-        from megatron.training.config.utils import sanitize_dataclass_config
         from megatron.training.config.instantiate_utils import target_allowlist
+        from megatron.training.config.utils import sanitize_dataclass_config
 
         config = {
             "_target_": "tests.unit_tests.training.config.test_utils.SimpleDataclass",
@@ -124,8 +126,8 @@ class TestBackwardCompatibility:
 
     def test_sanitize_dataclass_config_handles_nested_configs(self):
         """Test sanitize_dataclass_config recursively processes nested configs."""
-        from megatron.training.config.utils import sanitize_dataclass_config
         from megatron.training.config.instantiate_utils import target_allowlist
+        from megatron.training.config.utils import sanitize_dataclass_config
 
         config = {
             "_target_": "tests.unit_tests.training.config.test_utils.NestedDataclassWithInitFalse",
@@ -153,8 +155,8 @@ class TestBackwardCompatibility:
 
     def test_sanitize_dataclass_config_handles_lists_of_configs(self):
         """Test sanitize_dataclass_config processes lists containing configs."""
-        from megatron.training.config.utils import sanitize_dataclass_config
         from megatron.training.config.instantiate_utils import target_allowlist
+        from megatron.training.config.utils import sanitize_dataclass_config
 
         config = {
             "_target_": "some.module.ListContainer",
@@ -200,8 +202,8 @@ class TestBackwardCompatibility:
 
     def test_sanitize_dataclass_config_unresolvable_target(self):
         """Test sanitize_dataclass_config handles unresolvable _target_."""
-        from megatron.training.config.utils import sanitize_dataclass_config
         from megatron.training.config.instantiate_utils import target_allowlist
+        from megatron.training.config.utils import sanitize_dataclass_config
 
         config = {"_target_": "nonexistent.module.Class", "field1": "value1", "field2": "value2"}
 
@@ -214,8 +216,8 @@ class TestBackwardCompatibility:
 
     def test_sanitize_dataclass_config_sanitizes_model(self):
         """Test sanitize_dataclass_config sanitizes model section with init=False fields."""
-        from megatron.training.config.utils import sanitize_dataclass_config
         from megatron.training.config.instantiate_utils import target_allowlist
+        from megatron.training.config.utils import sanitize_dataclass_config
 
         run_config = {
             "model": {
@@ -239,8 +241,8 @@ class TestBackwardCompatibility:
 
     def test_sanitize_dataclass_config_sanitizes_all_sections(self):
         """Test sanitize_dataclass_config sanitizes all sections, not just model."""
-        from megatron.training.config.utils import sanitize_dataclass_config
         from megatron.training.config.instantiate_utils import target_allowlist
+        from megatron.training.config.utils import sanitize_dataclass_config
 
         run_config = {
             "model": {
