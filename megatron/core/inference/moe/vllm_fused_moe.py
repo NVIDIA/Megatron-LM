@@ -549,11 +549,12 @@ def _invoke_splitk(
     top_k: int,
     block_size_m: int,
     fuse_squared_relu: bool = False,
+    grid_em: Optional[int] = None,
 ):
     """Launch split-K variant: GEMM with K-partitioning + finalize pass."""
     M = A.size(0)
     num_tokens = M * top_k
-    EM = sorted_token_ids.size(0)
+    EM = grid_em if grid_em is not None else sorted_token_ids.size(0)
     N = B.size(1)
     K = B.size(2)
 
@@ -618,12 +619,16 @@ def _invoke_fused_moe_kernel(
     block_size_m: int,
     fuse_squared_relu: bool = False,
     num_tokens_hint: Optional[int] = None,
+    grid_em: Optional[int] = None,
 ):
     """Launch the Triton fused-MoE kernel for one GEMM pass.
 
     Automatically selects the split-K variant for small-M (decode) workloads
     to increase SM occupancy. Uses num_tokens_hint (actual batch size) rather
     than A.size(0) (worst-case buffer size) when available.
+
+    grid_em: if provided, replaces sorted_token_ids.size(0) as the EM
+    dimension for the grid, avoiding launching CTAs for unused buffer rows.
     """
     M = A.size(0)
     effective_m = num_tokens_hint if num_tokens_hint is not None else M
@@ -631,12 +636,12 @@ def _invoke_fused_moe_kernel(
         _invoke_splitk(
             A, B, C, topk_weights, sorted_token_ids, expert_ids,
             num_tokens_post_padded, mul_routed_weight, top_k,
-            block_size_m, fuse_squared_relu,
+            block_size_m, fuse_squared_relu, grid_em=grid_em,
         )
         return
 
     num_tokens = M * top_k
-    EM = sorted_token_ids.size(0)
+    EM = grid_em if grid_em is not None else sorted_token_ids.size(0)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
@@ -808,6 +813,13 @@ def vllm_fused_moe(
         num_valid, N, dtype=hidden_states.dtype, device=hidden_states.device
     )
     effective_tokens = num_tokens_hint if num_tokens_hint is not None else max_tokens
+    # Tight grid bound: only enough CTAs for actual tokens + per-expert alignment padding.
+    # Without this, the grid covers the entire worst-case buffer (max_tokens * topk + padding).
+    grid_em = (
+        (effective_tokens * topk + block_size_m * (num_local_experts + 1))
+        if num_tokens_hint is not None
+        else None
+    )
     _invoke_fused_moe_kernel(
         hidden_states,
         fc1_weight,
@@ -821,6 +833,7 @@ def vllm_fused_moe(
         block_size_m=block_size_m,
         fuse_squared_relu=True,
         num_tokens_hint=effective_tokens,
+        grid_em=grid_em,
     )
 
     # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights
@@ -842,6 +855,7 @@ def vllm_fused_moe(
         top_k=1,
         block_size_m=block_size_m,
         num_tokens_hint=effective_tokens * topk if num_tokens_hint is not None else None,
+        grid_em=grid_em,
     )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
