@@ -60,7 +60,7 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.sampling import Sampling, TorchSampling
+from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
@@ -155,7 +155,7 @@ class TextGenerationController:
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.config.params_dtype
 
-        self._sampling_backend = "torch"
+        self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
 
         # Initialize bookkeeping tensors.
@@ -168,7 +168,10 @@ class TextGenerationController:
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
         # Sampling backend: dispatches per-step bookkeeping and the sampling kernel.
-        self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
+        if self._sampling_backend == "flashinfer":
+            self._sampling: Sampling = FlashInferSampling(self.vocab_size, self.sampling_rng)
+        else:
+            self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
 
         # Cache values that are constant across inference steps.
         self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
@@ -661,6 +664,9 @@ class TextGenerationController:
         # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
             self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
+        elif self._sampling_backend == "flashinfer":
+            # FlashInfer kernels require contiguous inputs.
+            self._all_logits_cuda = logits.contiguous()
         else:
             self._all_logits_cuda = logits
 
