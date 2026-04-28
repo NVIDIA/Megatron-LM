@@ -22,11 +22,7 @@ class FlashInferSampling(Sampling):
     """
 
     def __init__(
-        self,
-        vocab_size: int,
-        rng: torch.Generator,
-        config=None,
-        enable_cuda_graph: bool = False,
+        self, vocab_size: int, rng: torch.Generator, config=None, enable_cuda_graph: bool = False
     ) -> None:
         self._vocab_size = vocab_size
         self._rng = rng

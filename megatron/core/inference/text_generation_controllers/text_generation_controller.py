@@ -923,14 +923,10 @@ class TextGenerationController:
         logits = self._all_logits_cuda
         required_logit_indices = context.speculative_required_logit_indices(logits.device)
         if use_graph_for_sampling:
-            expected = (
-                sample_num_decode * (1 + self.num_speculative_tokens) + sample_num_prefill
-            )
+            expected = sample_num_decode * (1 + self.num_speculative_tokens) + sample_num_prefill
             pad_count = expected - required_logit_indices.shape[0]
             if pad_count > 0:
-                required_logit_indices = F.pad(
-                    required_logit_indices, (0, pad_count), value=0
-                )
+                required_logit_indices = F.pad(required_logit_indices, (0, pad_count), value=0)
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
