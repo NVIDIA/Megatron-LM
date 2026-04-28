@@ -395,6 +395,16 @@ class DynamicInferenceEngine(AbstractEngine):
             with torch.inference_mode():
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
 
+                # Sampling warm-up. The non-speculative path captures `sample_kernel`
+                # keyed by `("sample", padded_active_request_count)`; the speculative
+                # path additionally captures `("sample_speculative", padded_decode, 0)`
+                # for decode-only graphs. Other backends and mixed graphs run eagerly.
+                controller._dynamic_step_sample_bookkeeping()
+                if controller.num_speculative_tokens > 0:
+                    controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                else:
+                    controller._dynamic_step_sample_logits()
+
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:
                     n = cuda_graph_batch_dimension.req_count
