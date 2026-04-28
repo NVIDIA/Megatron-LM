@@ -16,6 +16,16 @@ from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.instantiate_utils import InstantiationMode
 
 
+@pytest.fixture(autouse=True)
+def _disable_allowlist():
+    """Temporarily disable allowlist to fully test container logic with local test targets."""
+    from megatron.training.config.instantiate_utils import target_allowlist
+
+    target_allowlist.disable()
+    yield
+    target_allowlist.enable()
+
+
 def _target_qualname(obj) -> str:
     return f"{obj.__module__}.{obj.__qualname__}"
 
@@ -198,8 +208,6 @@ class TestConfigContainer_FromYaml:
     @patch("os.path.exists")
     def test_from_yaml_success(self, mock_exists, mock_file, mock_omegaconf, mock_msc):
         """Test successful YAML loading."""
-        from megatron.training.config.instantiate_utils import target_allowlist
-
         mock_msc.return_value = False
         mock_exists.return_value = True
         yaml_content = f"""
@@ -223,9 +231,7 @@ class TestConfigContainer_FromYaml:
             mock_omegaconf.create.return_value = mock_conf
             mock_omegaconf.to_container.return_value = config_dict
 
-            target_allowlist.disable()
             result = TestConfigContainer.from_yaml("test.yaml")
-            target_allowlist.enable()
 
             mock_exists.assert_called_once_with("test.yaml")
             mock_file.assert_called_once_with("test.yaml", "r")
@@ -471,8 +477,6 @@ class TestConfigContainer_ToYaml:
 
     def test_to_yaml_with_msc_url(self):
         """Test to_yaml with MSC URL."""
-        from megatron.training.config.instantiate_utils import target_allowlist
-
         config = TestConfigContainer(name="msc_test", value=999)
 
         MultiStorageClientFeature.enable()
@@ -482,11 +486,9 @@ class TestConfigContainer_ToYaml:
             config.to_yaml(f"msc://default{temp_dir}/test_output.yaml")
             assert os.path.exists(f"{temp_dir}/test_output.yaml")
 
-            target_allowlist.disable()
             loaded_config = TestConfigContainer.from_yaml(
                 f"msc://default{temp_dir}/test_output.yaml"
             )
-            target_allowlist.enable()
             assert config.to_dict() == loaded_config.to_dict()
 
 
@@ -599,8 +601,6 @@ class TestConfigContainer_Integration:
 
     def test_roundtrip_dict_conversion(self):
         """Test that converting to dict and back preserves data."""
-        from megatron.training.config.instantiate_utils import target_allowlist
-
         simple_config = TestConfigContainer(name="roundtrip", value=999)
         nested_data = NestedDataclass(
             simple=SimpleDataclass(name="nested", value=888), description="roundtrip test"
@@ -615,9 +615,7 @@ class TestConfigContainer_Integration:
 
         config_dict = original_config.to_dict()
 
-        target_allowlist.disable()
         reconstructed_config = ComplexConfigContainer.from_dict(config_dict)
-        target_allowlist.enable()
 
         assert reconstructed_config.simple_config.name == original_config.simple_config.name
         assert reconstructed_config.simple_config.value == original_config.simple_config.value
@@ -636,17 +634,13 @@ class TestConfigContainer_Integration:
 
     def test_yaml_roundtrip_structure(self):
         """Test that converting to YAML and back preserves data."""
-        from megatron.training.config.instantiate_utils import target_allowlist
-
         config = TestConfigContainer(name="yaml_roundtrip", value=1234)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = os.path.join(tmp_dir, "test_config.yaml")
             config.to_yaml(tmp_path)
 
-            target_allowlist.disable()
             loaded_config = TestConfigContainer.from_yaml(tmp_path)
-            target_allowlist.enable()
 
         assert loaded_config.name == config.name
         assert loaded_config.value == config.value
@@ -786,14 +780,10 @@ class TestConfigContainer_CallablesAndPartials:
 
     def test_config_with_callables_roundtrip_behavior(self):
         """Test that to_dict/from_dict roundtrip preserves all fields for callable configs."""
-        from megatron.training.config.instantiate_utils import target_allowlist
-
         config = CallableConfigContainer(name="roundtrip_test")
         config_dict = config.to_dict()
 
-        target_allowlist.disable()
         reconstructed = CallableConfigContainer.from_dict(config_dict)
-        target_allowlist.enable()
 
         assert reconstructed.name == config.name
         assert reconstructed.callable_data.name == config.callable_data.name
