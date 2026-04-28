@@ -741,8 +741,9 @@ def _build_megatron_fsdp_emerging_optimizer(
 
       1. Builds the linear-only Muon optimizer (plain `TensorParallelMuon` for
          `no_shard`; `FSDPZeROTensorParallelMuon` for sharded strategies, which
-         allgathers DP row-shards before NS) over a frozen-grad view of the
-         model so `_get_param_groups` only emits Muon-managed params.
+         gathers only split rank-boundary DTensor parameters before NS) over a
+         frozen-grad view of the model so `_get_param_groups` only emits
+         Muon-managed params.
       2. Falls back to `get_megatron_optimizer` for the non-linear params,
          which routes through the standard Megatron-FSDP path for Adam.
       3. Wraps the chained result with `FSDPMuonChainedOptimizer`, which drives
@@ -756,9 +757,9 @@ def _build_megatron_fsdp_emerging_optimizer(
     # Choose Muon variant based on the inner-DP sharding strategy.
     # - "no_shard" (ZeRO-0): params/grads are full Replicate DTensors, so the
     #   plain TensorParallelMuon works without any DP communication.
-    # - Sharded strategies (ZeRO-1/2/3): finish_grad_sync() reduce-scatters
-    #   gradients into Shard(0) row-shards. FSDPZeROTensorParallelMuon
-    #   allgathers across the DP group before NS and re-shards the result.
+    # - Sharded strategies (ZeRO-1/2/3): FSDPZeROTensorParallelMuon gathers
+    #   only split boundary parameters across the DP group before NS and
+    #   re-shards the result.
     fsdp_strategy = getattr(
         model_chunks[0].ddp_config, "data_parallel_sharding_strategy", "no_shard"
     )
@@ -813,8 +814,8 @@ def _build_megatron_fsdp_emerging_optimizer(
     optimizers: List[Any] = []
     init_fns: List[Callable] = []
     if linear_param_groups:
-        # ZeRO-1/2/3: gradients are reduce-scattered over `dp_cp` for dense
-        # params, so the FSDPZero variant must allgather over the same group.
+        # ZeRO-1/2/3: split dense boundary params are sharded over `dp_cp`, so
+        # the FSDPZero variant must gather over the same group.
         dense_kwargs = dict(eopt_kwargs)
         if use_fsdp_zero_muon:
             dense_kwargs["dp_group"] = pg_collection.dp_cp
