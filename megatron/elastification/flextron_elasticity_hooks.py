@@ -58,7 +58,6 @@ class FlextronMambaElasticityManager:
         """Initialize Mamba-specific masks for different layers."""
         in_proj_mask_list = []
         conv1d_mask_list = []
-        out_proj_mask_list = []
 
         world_size = parallel_state.get_tensor_model_parallel_world_size()
 
@@ -149,9 +148,6 @@ class FlextronMambaElasticityManager:
             conv1d_mask[conv1d_C_shard] = True
             conv1d_mask_list.append(conv1d_mask)
 
-            out_proj_mask = torch.zeros(self.mamba_mixer.d_inner_local_tp, dtype=torch.bool)
-            out_proj_mask[out_proj_x_shard[: mamba_nhead_idx * self.mamba_mixer.headdim]] = True
-            out_proj_mask_list.append(out_proj_mask)
         self.mamba_masks_lookup = {
             mamba_int: idx for idx, mamba_int in enumerate(self.config.mamba_int_list)
         }
@@ -189,7 +185,6 @@ class FlextronMambaElasticityManager:
                 self.emb_masks = None
                 self.in_proj_mask_list = None
                 self.conv1d_mask_list = None
-                self.out_proj_mask_list = None
                 self.emb_masks_lookup = {}
                 self.mamba_masks_lookup = {}
             return output

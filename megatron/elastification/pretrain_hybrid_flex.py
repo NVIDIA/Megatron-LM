@@ -57,7 +57,7 @@ try:
     )
     has_nvidia_modelopt = True
 except ImportError:
-    raise ImportError("ModelOpt is not installed. Please install it using `pip install nvidia-modelopt`")
+    print_rank_0("ModelOpt is not installed. Please install it using `pip install nvidia-modelopt`")
     has_nvidia_modelopt = False
 print("has_nvidia_modelopt is {}".format(has_nvidia_modelopt))
 import numpy as np
