@@ -516,10 +516,6 @@ class KwTarget:
         self.kwargs = dict(kwargs)
 
 
-def _target_qualname(obj) -> str:
-    return f"{obj.__module__}.{obj.__qualname__}"
-
-
 def test_drops_unexpected_kwargs_and_warns(caplog: pytest.LogCaptureFixture) -> None:
     config = {
         "_target_": _target_qualname(DummyTarget),
