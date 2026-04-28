@@ -433,6 +433,7 @@ def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -
 
 def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
     """ """
+
     def dtensor_to_ten(x: Union[DTensor, Any]) -> Union[Any, torch.Tensor]:
         if isinstance(x, DTensor):
             x = x.to_local()
@@ -449,6 +450,7 @@ def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
 @dataclass
 class PlaceholderValue:
     """ """
+
     key: str
 
 
