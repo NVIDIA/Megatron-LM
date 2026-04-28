@@ -1386,10 +1386,18 @@ class FusedMLASelfAttention(MLASelfAttention):
         kv_key = f"{prefix}linear_kv_down_proj.weight"
 
         sharded_state_dict[q_key] = make_tp_sharded_tensor_for_checkpoint(
-            tensor=q_weight, key=q_key, tp_axis=0, prepend_offsets=sharded_offsets
+            tensor=q_weight,
+            key=q_key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
         sharded_state_dict[kv_key] = make_tp_sharded_tensor_for_checkpoint(
-            tensor=kv_weight, key=kv_key, tp_axis=0, prepend_offsets=sharded_offsets
+            tensor=kv_weight,
+            key=kv_key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
 
         return sharded_state_dict
