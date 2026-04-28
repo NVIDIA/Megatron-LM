@@ -1779,14 +1779,17 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+    def _dynamic_step_context_bookkeeping(
+        self, sample_cpu_override: Optional[Tensor] = None
+    ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
         Args:
-            new_sample (Tensor): The newly sampled tokens.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
+            sample_cpu_override (Optional[Tensor]): Pre-fetched CPU sample tensor.
+                When provided, skips the internal D2H transfer of the sample and uses
+                this tensor directly. Used by the engine async-scheduling path which
+                issues the D2H earlier (before the next step's sample clobbers
+                ``_sampled_tokens_cuda``) and synchronizes on a CUDA event.
 
         Return:
             Dict [str, Tensor]: A dictionary containing:
@@ -1798,12 +1801,19 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
-        range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count,
-        )
-        range_pop()
+        if sample_cpu_override is not None:
+            # The engine has already D2H'd sample_N to a separate pinned buffer
+            # so reading _sampled_tokens_cuda here would race against the
+            # subsequent speculative step's sample kernel.
+            sampled_tokens_cpu = sample_cpu_override
+            sampled_mtp_tokens_cpu = None
+        else:
+            # Batch GPU-to-CPU transfer of all sampled tokens.
+            range_push("transfer_samples_to_cpu")
+            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+                active_request_count,
+            )
+            range_pop()
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
@@ -1969,7 +1979,10 @@ class TextGenerationController:
         }
 
     def _bookkeep_decode_step(
-        self, launch_state: Dict, skip_bookkeeping: bool = False
+        self,
+        launch_state: Dict,
+        skip_bookkeeping: bool = False,
+        sample_cpu_override: Optional[Tensor] = None,
     ) -> Dict:
         """Run CPU bookkeeping for a previously launched decode step.
 
@@ -1977,6 +1990,14 @@ class TextGenerationController:
         to complete) and ``update_requests`` to advance canonical context
         state. Combined with ``launch_state`` from :meth:`_launch_decode_step`
         produces the same return dict shape as the legacy single-call path.
+
+        Args:
+            launch_state: Result of :meth:`_launch_decode_step`.
+            skip_bookkeeping: When True, only D2H the sample and skip
+                update_requests. Used by the dummy expert-parallel forward.
+            sample_cpu_override: Pre-fetched CPU copy of the sample tensor.
+                When provided, skips the internal D2H. Used by the async
+                scheduling path which issues the D2H earlier on the stream.
         """
         active_request_count = launch_state["_active_request_count"]
         with torch.inference_mode():
@@ -1984,13 +2005,18 @@ class TextGenerationController:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
                 # downstream consumers.
-                request_bookkeeping = {
-                    "sample": self._sampled_tokens_cuda[:active_request_count].cpu(),
-                }
+                if sample_cpu_override is not None:
+                    request_bookkeeping = {"sample": sample_cpu_override}
+                else:
+                    request_bookkeeping = {
+                        "sample": self._sampled_tokens_cuda[:active_request_count].cpu(),
+                    }
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                    sample_cpu_override=sample_cpu_override
+                )
 
             ret = {
                 "accepted_tokens": (

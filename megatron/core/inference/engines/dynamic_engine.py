@@ -303,6 +303,19 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
 
+        # Async-scheduling buffers and events. The pre-fetched sample buffer
+        # holds sample_N's CPU copy across the speculative chain so we can
+        # D2H sample_N before sample_{N+1} clobbers _sampled_tokens_cuda.
+        # Events are used to gate CPU work on stream completion: _d2h_done
+        # so we know sample_N is on CPU; _h2d_done so we know step N+1's
+        # H2D has executed before update_requests mutates the pinned buffer.
+        max_requests = self.context.max_requests
+        self._pre_fetched_sample_buf = torch.empty(
+            max_requests, dtype=torch.int64, device='cpu', pin_memory=True
+        )
+        self._d2h_done_event = torch.cuda.Event()
+        self._h2d_done_event = torch.cuda.Event()
+
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
@@ -2047,21 +2060,65 @@ class DynamicInferenceEngine(AbstractEngine):
     async def _async_step_serial(
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
-        """Serial step path: forward + sample, then CPU bookkeeping. Today's behavior."""
+        """Serial step path: forward + sample, then CPU bookkeeping. Today's behavior.
+
+        If a prior iteration left a speculative pre-launch in flight (e.g.
+        async-scheduling fired a rejection), drain it on the stream so the
+        canonical state can launch step N afresh without races.
+        """
+        if self._pending_launch_state is not None:
+            self._drain_pending_launch()
+        self._clear_rejection()
         last_step_data = await self.async_forward()
         return await self.async_bookkeep(*last_step_data)
+
+    def _drain_pending_launch(self) -> None:
+        """Synchronize the stream and discard a stale speculative pre-launch.
+
+        Called when async scheduling has fallen back to the serial path (e.g.
+        a finish/pause/evict event triggered a rejection). The pending pre-
+        launch's GPU work is allowed to complete; its results are discarded
+        because step N+1 will be re-launched from canonical state.
+        """
+        torch.cuda.current_stream().synchronize()
+        self._pending_launch_state = None
 
     async def _async_step_speculative(
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
-        """Speculative step path: launch the next forward immediately after sampling
-        so the GPU runs forward -> sample -> forward without waiting on CPU
-        bookkeeping. CPU bookkeeping runs in parallel and verifies retroactively.
+        """Speculative step path: planned to launch step N+1 ahead of step N's
+        bookkeep so the GPU runs ``forward → sample → forward → sample``
+        continuously on pure-decode chains.
 
-        Stub for C3.5: currently identical to the serial path. The launch-ahead
-        and reconciliation logic is added in C4 alongside the rejection-event
-        handling. Splitting the structural routing into its own commit keeps the
-        engine-loop refactor reviewable.
+        C5.3 status: still a stub identical to the serial path. The launch-
+        ahead loop and rejection drain-and-rewind are landed in a follow-up
+        commit. The infrastructure required by that follow-up is in place:
+
+        - ``self._pre_fetched_sample_buf`` and ``self._d2h_done_event`` /
+          ``self._h2d_done_event`` events (engine ``__init__``).
+        - ``self._pending_launch_state`` field threaded through serial path
+          via ``_drain_pending_launch``.
+        - ``self._signal_rejection`` / ``_clear_rejection`` and the
+          ``len(waiting_request_ids) > 0`` gate in
+          ``_async_scheduling_active``.
+        - ``controller._launch_decode_step`` / ``_bookkeep_decode_step``
+          split (C5.1) and ``sample_cpu_override`` parameter on the bookkeep
+          path so the engine can D2H sample_N once and pass it through
+          without racing against a subsequent speculative sample_{N+1}.
+        - ``context.speculatively_advance_for_next_decode_step`` /
+          ``restore_after_speculative_advance`` (C5.2).
+
+        A naive launch-ahead wiring (sync sample_N, mirror it into pinned
+        token_to_input_ids, speculatively advance, pre-launch step N+1, run
+        update_requests in parallel) was prototyped on this branch but
+        produced divergent tokens vs. the serial baseline starting at the
+        first decode iteration after a mid-chain rejection (e.g. when a new
+        request is added). The proximate cause appears to be state pollution
+        from the discarded pre-launch (KV writes / attention metadata /
+        rotated MHA tensors); resolving it cleanly requires either a shadow
+        bookkeeping buffer or a more thorough rollback than the persistent-
+        tensor restore that exists today. Deferred to a follow-up so the
+        infrastructure here can land separately.
         """
         last_step_data = await self.async_forward()
         return await self.async_bookkeep(*last_step_data)
