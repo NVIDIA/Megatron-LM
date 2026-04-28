@@ -864,6 +864,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_metadata = {
             label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
         }
+        # Per-request last-token row indices, used as gather indices by sampling kernels
+        # (e.g. FlashInfer) so the call site can pass a fixed-shape tensor on the padded
+        # batch dimension.
+        self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
@@ -1080,9 +1084,27 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_metadata[label][padded_slice], non_blocking=True
             )
 
+        # Cumsum of query lengths gives per-request last-token row indices.
+        # Padded slots get garbage here; pad_active_slices fills them with 0.
+        torch.cumsum(
+            self.request_query_lengths[padded_slice],
+            dim=0,
+            out=self.active_request_last_token_idxs[:batch_size],
+        )
+        self.active_request_last_token_idxs[:batch_size] -= 1
+
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
-        pass
+        active_request_count = self.total_request_count - self.paused_request_count
+        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
+        # Sampling metadata: neutral defaults so per-row sampling kernels (FlashInfer)
+        # produce harmless output for padded slots. top_k=0 / top_p=0.0 are sentinels
+        # for "no filter" in the FlashInfer wrapper.
+        self.active_request_metadata["temperature"][padding_request_slice].fill_(1.0)
+        self.active_request_metadata["top_k"][padding_request_slice].fill_(0)
+        self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
+        # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
+        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.

@@ -11,18 +11,34 @@ except ImportError:
     flashinfer = None
 
 from megatron.core.inference.sampling.base import Sampling
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 
 class FlashInferSampling(Sampling):
-    """Fused FlashInfer sampling.
+    """Fused FlashInfer sampling, with optional CUDA graph capture/replay.
 
     Unlike `TorchSampling`, FlashInfer kernels accept per-row parameter tensors
     (temperature, top_k, top_p) directly, so no bucketing is required.
     """
 
-    def __init__(self, vocab_size: int, rng: torch.Generator) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        rng: torch.Generator,
+        config=None,
+        enable_cuda_graph: bool = False,
+    ) -> None:
         self._vocab_size = vocab_size
         self._rng = rng
+        self._enable_cuda_graph = enable_cuda_graph
+        if enable_cuda_graph and config is not None and config.cuda_graph_impl == "local":
+            CudaGraphManager(
+                config,
+                self,
+                function_name="sample_kernel",
+                need_backward=False,
+                inline_capture=True,
+            )
 
     def pre_forward_bookkeeping(self, context) -> None:
         """No-op; FlashInfer needs no per-step bookkeeping."""
@@ -44,6 +60,10 @@ class FlashInferSampling(Sampling):
         Reads sampling parameters per-row from `context.active_request_metadata`,
         applies temperature scaling and top-k/top-p filtering, then samples via
         `flashinfer.sampling.top_k_top_p_sampling_from_probs`.
+
+        When wrapped by `CudaGraphManager`, `eager` and `cache_key` are consumed by
+        the wrapper before this body runs. When unwrapped (no CUDA graphs), they are
+        accepted and ignored so callers can pass them unconditionally.
         """
         del eager, cache_key
         md = context.active_request_metadata

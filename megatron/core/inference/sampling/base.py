@@ -79,34 +79,42 @@ class Sampling(ABC):
     def sample_speculative(
         self,
         required_logits: Tensor,
-        request_in_prefill_status: Tensor,
+        num_decode: int,
+        num_prefill: int,
         num_speculative_tokens: int,
         context,
+        *,
+        eager: bool = False,
+        cache_key: Any = None,
     ) -> Tensor:
         """Sample tokens for the speculative-verify path.
 
         Decode requests contribute `1 + num_speculative_tokens` rows; prefill requests
         contribute one row. Builds the per-token request mapping and dispatches to
-        `sample_kernel(eager=True)` so the call is safe inside an outer captured kernel.
+        `sample_kernel`. Callers may use `eager` and `cache_key` to control CUDA graph
+        capture/replay on backends that wrap `sample_kernel`.
         """
-        repeats = torch.where(
-            request_in_prefill_status == 0, 1 + num_speculative_tokens, 1
+        n_spec = num_speculative_tokens
+        num_decode_tokens = num_decode * (1 + n_spec)
+        num_tokens = num_decode_tokens + num_prefill
+        device = required_logits.device
+
+        token_to_request_index = torch.cat(
+            [
+                torch.arange(num_decode, device=device).repeat_interleave(
+                    1 + n_spec, output_size=num_decode_tokens
+                ),
+                torch.arange(num_decode, num_decode + num_prefill, device=device),
+            ]
         )
-        token_to_request_index = torch.repeat_interleave(
-            torch.arange(
-                len(request_in_prefill_status),
-                device=request_in_prefill_status.device,
-            ),
-            repeats,
-        )
-        n = token_to_request_index.shape[0]
-        output_tokens = torch.empty(n, device=required_logits.device, dtype=torch.int64)
+        output_tokens = torch.empty(num_tokens, device=device, dtype=torch.int64)
         self.sample_kernel(
             required_logits,
-            n,
+            num_tokens,
             output_tokens,
             context,
-            eager=True,
+            eager=eager,
+            cache_key=cache_key,
             token_to_request_index=token_to_request_index,
         )
         return output_tokens
