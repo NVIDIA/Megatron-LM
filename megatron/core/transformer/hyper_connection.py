@@ -513,6 +513,10 @@ class HyperConnectionModule(MegatronModule):
             contracted: [s, b, C] - single stream hidden states
         """
         s, b, nC = x.shape
+        assert nC % n == 0, (
+            f"output_contract: n-stream input dim {nC} is not a multiple of "
+            f"num_residual_streams={n}"
+        )
         C = nC // n
         # Average all streams
         x_streams = x.view(s, b, n, C)

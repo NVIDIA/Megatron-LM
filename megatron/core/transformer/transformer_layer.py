@@ -1438,6 +1438,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # kwargs, since CheckpointManager is not a CUDA-graph-supported type.
         # Stash it on `self` so `forward()` can recover it under cuda graph
         # capture/replay (which strips non-tensor kwargs).
+        # Single-thread assumption: this stash-on-self pattern is not
+        # thread-safe. Concurrent calls to the same layer instance would race
+        # on `_mhc_recompute_manager`. Megatron-LM training/inference invokes
+        # each layer from a single thread per process, so this is safe today;
+        # if multi-threaded inference is ever introduced, switch to a
+        # thread-local or pass the manager through CUDA-graph-aware kwargs.
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         try:
             return super().__call__(*args, **kwargs)

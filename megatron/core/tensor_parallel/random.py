@@ -787,9 +787,15 @@ class CheckpointManager:
         # Set by TransformerBlock before each layer forward.
         # When True, the layer should keep block-boundary output uncheckpointed.
         self.is_last_layer_in_recompute_block = False
+        self._finalized = False
 
     def add_checkpoint(self, ckpt):
         """Add a checkpoint to the manager."""
+        if self._finalized:
+            raise RuntimeError(
+                "CheckpointManager is single-use; cannot add checkpoints after "
+                "discard_all_outputs_and_register_unified_recompute()."
+            )
         if not isinstance(ckpt, CheckpointWithoutOutput):
             raise TypeError("Expected CheckpointWithoutOutput object")
         if ckpt.outputs is None:
@@ -798,6 +804,12 @@ class CheckpointManager:
 
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
         """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+        if self._finalized:
+            raise RuntimeError(
+                "CheckpointManager is single-use; "
+                "discard_all_outputs_and_register_unified_recompute() already called."
+            )
+        self._finalized = True
         for ckpt in self.checkpoints:
             for output in ckpt.outputs:
                 output.untyped_storage().resize_(0)

@@ -539,7 +539,10 @@ if _CUTILE_AVAILABLE:
                     TILE_SIZE,
                 ),
             )
-        g_bias = g_x.sum(dim=0) if bias is not None else None
+        # Accumulate the bias gradient in fp32 to match the rest of the mHC
+        # implementation; bf16 reduction across `s*b` rows accumulates noticeable
+        # rounding error for long sequences / large batches.
+        g_bias = g_x.float().sum(dim=0).to(g_x.dtype) if bias is not None else None
         return (
             g_hr.view(s, b, n, n),
             g_res.view(s, b, n, C),

@@ -154,13 +154,16 @@ class HyperConnectionHybridLayer(MegatronModule):
             f"vs {tuple(aggregated.shape)} input — layer must add its own residual."
         )
         layer_delta = layer_output - aggregated
+        # `dropout_prob=0.0` already disables dropout regardless of training mode;
+        # `training=self.training` is more semantically accurate than hard-coding
+        # False during a training-mode forward.
         hidden_states = self.hyper_connection.h_res_h_post_bda(
             h_res,
             residual,
             h_post,
             (layer_delta, None),
             dropout_prob=0.0,
-            training=False,
+            training=self.training,
             fused=False,
             manager=mhc_recompute_manager,
         )
