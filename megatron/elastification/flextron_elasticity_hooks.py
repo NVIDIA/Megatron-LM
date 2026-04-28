@@ -120,10 +120,10 @@ class FlextronMambaElasticityManager:
         for mamba_int in self.config.mamba_int_list:
             assert (
                 0 <= mamba_int <= self.mamba_mixer.nheads
-            ), "mamba_int_list entries must be in [0, nheads={self.mamba_mixer.nheads}], got {mamba_int}."
+            ), f"mamba_int_list entries must be in [0, nheads={self.mamba_mixer.nheads}], got {mamba_int}."
             assert (
                 mamba_int % tp_size == 0
-            ), "mamba_int_list entries must be evenly divisible by tp_size={tp_size}, got {mamba_int}."
+            ), f"mamba_int_list entries must be evenly divisible by tp_size={tp_size}, got {mamba_int}."
             mamba_nhead_idx = mamba_int // tp_size
 
             in_proj_mask = torch.zeros(
