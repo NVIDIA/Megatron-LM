@@ -2867,11 +2867,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     )[0]
                     + staying_active_count
                 )
-                src_idxs = torch.cat((active_idxs_on_right, pausing_idxs_on_left))
-                dst_idxs = torch.cat((pausing_idxs_on_left, active_idxs_on_right))
                 self._swap_book_keeping_tensors(
-                    src_idxs=src_idxs,
-                    dst_idxs=dst_idxs,
+                    src_idxs=active_idxs_on_right,
+                    dst_idxs=pausing_idxs_on_left,
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
