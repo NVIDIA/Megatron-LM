@@ -67,6 +67,11 @@ class MimoModel(MegatronModule):
             # in TP/DP within those ranks.
             self._build_colocated_communicators()
 
+        lang_info = self.role.modules.get(MIMO_LANGUAGE_MODULE_KEY)
+        self.lm_has_pp = lang_info is not None and not (
+            lang_info.is_first_stage and lang_info.is_last_stage
+        )
+
         # Use special token IDs from the config
         self.special_token_ids = (
             mimo_config.special_token_ids.copy() if mimo_config.special_token_ids else {}
@@ -318,6 +323,7 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor] = None,
         modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
         packing_kwargs: Optional[dict] = None,
+        encoder_embeddings: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass through the multimodal model.
 
@@ -362,6 +368,20 @@ class MimoModel(MegatronModule):
         input_tensors = getattr(self, 'input_tensors', None)
 
         if self.role.mode == ModuleLayout.COLOCATED:
+            if self.lm_has_pp and input_tensors is not None:
+                # PP>1 non-first stage: hidden states from P2P
+                lm_result = self._forward_language_module(
+                    input_ids,
+                    position_ids,
+                    attention_mask,
+                    labels,
+                    {MIMO_LANGUAGE_MODULE_KEY: input_tensors},
+                )
+                # Unwrap dict for P2P (schedule uses plain tensors, not dicts)
+                if isinstance(lm_result, dict):
+                    lm_result = lm_result[MIMO_LANGUAGE_MODULE_KEY]
+                return lm_result, loss_mask
+
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -370,6 +390,7 @@ class MimoModel(MegatronModule):
                 labels,
                 modality_inputs,
                 packing_kwargs,
+                encoder_embeddings=encoder_embeddings,
             )
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
@@ -519,7 +540,12 @@ class MimoModel(MegatronModule):
             )
 
     def destroy(self) -> None:
-        """Release process groups owned by this MimoModel."""
+        """Release process groups owned by this MimoModel.
+
+        NCCL caps concurrent communicators, so long-lived or
+        repeatedly-rebuilt models leak subgroups without explicit
+        destroy. Tests should call this before ``destroy_all_grids()``.
+        """
         for comm in self.colocated_comms.values():
             comm.destroy()
         self.colocated_comms.clear()
@@ -535,6 +561,22 @@ class MimoModel(MegatronModule):
                 )
         return modality_embeddings
 
+    def encode_and_communicate(self, modality_inputs):
+        """Run encoder forward + colocated TP/DP transform (collective)."""
+        modality_embeddings = {}
+        for modality_name, submodule in self.modality_submodules.items():
+            if (
+                modality_inputs
+                and modality_name in modality_inputs
+                and modality_inputs[modality_name] is not None
+            ):
+                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
+                if embeddings is not None:
+                    modality_embeddings[modality_name] = embeddings
+        if self.colocated_comms:
+            modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+        return modality_embeddings
+
     def _forward_all_modules(
         self,
         input_ids: torch.Tensor,
@@ -544,6 +586,7 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
         packing_kwargs: Optional[dict] = None,
+        encoder_embeddings: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass when all modules are on all ranks (no multi-module PP).
 
@@ -560,26 +603,12 @@ class MimoModel(MegatronModule):
             packed_seq_params.qkv_format = 'thd'
             logger.debug(f"Packed sequence parameters: {packed_seq_params}")
 
-        # 1. Process each modality to get embeddings
-        modality_embeddings = {}
-
-        for modality_name, submodule in self.modality_submodules.items():
-            if (
-                modality_inputs
-                and modality_name in modality_inputs
-                and modality_inputs[modality_name] is not None
-            ):
-                logger.debug(f"Processing {modality_name} modality")
-                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
-                if embeddings is not None:
-                    modality_embeddings[modality_name] = embeddings
-                    logger.debug(
-                        f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
-                    )
-
-        # Apply colocated communication if configured (no-op when colocated_comms is empty)
-        if self.colocated_comms:
-            modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+        if encoder_embeddings is not None:
+            # PP>1 path: encoder forward + communicate already ran in Phase 1;
+            # reuse the precomputed embeddings for every LLM microbatch.
+            modality_embeddings = encoder_embeddings
+        else:
+            modality_embeddings = self.encode_and_communicate(modality_inputs)
 
         # Get text embeddings
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
