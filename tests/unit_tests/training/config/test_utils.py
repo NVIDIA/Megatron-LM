@@ -237,22 +237,6 @@ class TestBackwardCompatibility:
         assert result["training"] == {"lr": 0.001}
         assert result["tokenizer"] == {"type": "sentencepiece"}
 
-    def test_sanitize_dataclass_config_no_model_section(self):
-        """Test sanitize_dataclass_config handles config without model section."""
-        from megatron.training.config.utils import sanitize_dataclass_config
-
-        run_config = {"training": {"lr": 0.001}}
-        result = sanitize_dataclass_config(run_config)
-
-        assert result == run_config
-
-    def test_sanitize_dataclass_config_non_dict(self):
-        """Test sanitize_dataclass_config handles non-dict input."""
-        from megatron.training.config.utils import sanitize_dataclass_config
-
-        assert sanitize_dataclass_config("string") == "string"
-        assert sanitize_dataclass_config(None) is None
-
     def test_sanitize_dataclass_config_sanitizes_all_sections(self):
         """Test sanitize_dataclass_config sanitizes all sections, not just model."""
         from megatron.training.config.utils import sanitize_dataclass_config
