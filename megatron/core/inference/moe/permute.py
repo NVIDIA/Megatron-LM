@@ -44,23 +44,23 @@ def _count_local_tokens_kernel(
 ):
     """Count tokens routed to experts on this rank, ignoring tokens routed elsewhere.
 
-    Each program processes BLOCK_SIZE (token, topk) pairs. Tokens assigned to
-    experts outside [local_expert_start, local_expert_start + num_local_experts)
-    or beyond valid_tokens are silently skipped.
-
-    Grid is launched at max size (max_tokens * topk); valid_tokens gates which
-    pairs are actually processed — required for CUDA graph compatibility.
+    Each CTA loads BLOCK_SIZE pairs, then does one bulk atomic per expert
+    instead of one atomic per pair.
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
     valid_pairs = valid_tokens * topk
+    if pid * BLOCK_SIZE >= valid_pairs:
+        return
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < valid_pairs
     expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
-    # Map global expert IDs to local indices; non-local experts become negative
     local_ids = expert_ids - local_expert_start
     is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
-    tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
+    for e in range(num_local_experts):
+        count = tl.sum(((local_ids == e) & is_local).to(tl.int32))
+        if count > 0:
+            tl.atomic_add(tokens_per_expert_ptr + e, count)
 
 
 def compute_local_tokens_per_expert(
