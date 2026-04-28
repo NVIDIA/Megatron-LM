@@ -82,6 +82,16 @@ class KVBlockAllocator:
             [self.total_avail], dtype=torch.int32, device=device
         )
 
+        # Static aranges for graphed release and allocate paths.
+        self._release_arange_i32 = torch.arange(
+            self.max_release_per_step, dtype=torch.int32, device=device
+        )
+        self._release_arange_i64 = torch.arange(
+            self.max_release_per_step, dtype=torch.int64, device=device
+        )
+        self._alloc_arange = torch.arange(max_requests, dtype=torch.int32, device=device)
+        self._alloc_arange_i64 = torch.arange(max_requests, dtype=torch.int64, device=device)
+
         if self.enable_prefix_caching:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash.
             # Sized total_count + 1 so the slot at ``dummy_block_idx`` is a no-op
@@ -366,6 +376,55 @@ class KVBlockAllocator:
         bodies finish) so the host-visible counter stays consistent.
         """
         self.total_avail = int(self.total_avail_gpu.item())
+
+    def allocate_memory_blocks_gpu(self, count_gpu: Tensor) -> Tensor:
+        """Shape-stable allocate with GPU-resident state.
+
+        Decrements ``total_avail_gpu`` by ``count_gpu`` and returns a fixed-
+        size ``(max_requests,)`` tensor of block IDs read from ``block_bag``
+        starting at the new stack pointer. Only the first ``count_gpu``
+        entries are newly allocated; the remaining ``max_requests - count_gpu``
+        entries are stale blocks above the new stack pointer and must not
+        be used by the caller.
+
+        Caller is responsible for ensuring ``count_gpu <= total_avail_gpu``;
+        callers in ``update_requests`` already clamp via ``resume_count_gpu
+        = min(fits_gpu, total_avail_gpu)`` before reaching this point.
+
+        Args:
+            count_gpu: 0-d or 1-element int tensor holding the number of
+                blocks to allocate.
+
+        Returns:
+            Tensor of shape ``(max_requests,)`` with the allocated block
+            IDs in the first ``count_gpu`` positions.
+        """
+        # Decrement the stack pointer in-place.
+        self.total_avail_gpu.sub_(count_gpu.to(torch.int32).view(1))
+        # Gather max_requests entries starting at the new pointer.
+        indices = self.total_avail_gpu + self._alloc_arange
+        return self.block_bag[indices.long()]
+
+    def release_memory_blocks_gpu(self, packed_blocks: Tensor, num_valid_gpu: Tensor) -> None:
+        """Shape-stable release that writes a pre-packed buffer onto the stack.
+
+        The caller is responsible for packing valid block ids into the first
+        ``num_valid_gpu`` entries of ``packed_blocks``; the remaining entries
+        may contain any value and will be overwritten by future releases or
+        left above the new stack pointer where they are never read.
+
+        Args:
+            packed_blocks: Fixed-size tensor of length ``max_release_per_step``,
+                with valid block IDs packed at [0, num_valid_gpu).
+            num_valid_gpu: 0-d or 1-element int tensor holding the valid count.
+        """
+        assert packed_blocks.numel() == self.max_release_per_step
+
+        # Blind copy the whole packed buffer into block_bag at the current
+        # stack pointer. Entries past the new stack top are ignored.
+        bag_indices = self.total_avail_gpu + self._release_arange_i32
+        self.block_bag[bag_indices.long()] = packed_blocks
+        self.total_avail_gpu.add_(num_valid_gpu.to(torch.int32).view(1))
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
