@@ -925,47 +925,46 @@ class TextGenerationController:
         # Sampling-side request counts: padded when running a captured graph so the
         # cache key buckets, actual otherwise. Verify uses the actual counts so the
         # downstream Triton kernels still operate on the real workload.
-        #
-        # Padding-as-decode is only safe when the captured graph is decode-only — in
-        # that case `pad_active_slices` set the padded slots' query lengths to
-        # `1 + n_spec` (decode-style). With a mixed graph, `[actual_decode,
-        # padded_decode)` may contain real prefill rows whose query lengths differ
-        # from `1 + n_spec`, so the kernel's reshape would mix prompt tokens into the
-        # decode chunks. Fall back to actual values + eager sampling in that case.
         use_graph_for_sampling = (
             self._sampling_backend == "flashinfer"
             and self._enable_cuda_graph
             and context.using_cuda_graph_this_step()
-            and context.padded_batch_dimensions.prefill_req_count == 0
         )
         if use_graph_for_sampling:
             sample_num_decode = context.padded_batch_dimensions.decode_req_count
-            sample_num_prefill = 0
+            sample_num_prefill = context.padded_batch_dimensions.prefill_req_count
         else:
             sample_num_decode = context.num_decode_requests
             sample_num_prefill = context.num_prefill_requests
 
-        # Get the logit indices for tokens that need sampling.
-        # These indices are always needed for input_ids slicing and tracking
-        # accepted sequence positions, even when logits are pre-sliced.
+        # Logit indices for tokens that need sampling.
+        # Padded under graph capture so the captured `gather_indices` input has a stable shape.
+        # Padded slots resolve to row 0; verify and prepare-next read only the actual prefix,
+        # so the padded-row samples produced by the captured kernel are discarded.
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
+        # `speculative_required_logit_indices()` already returns padded indices when
+        # running a captured graph (`num_last_token_logits` uses the padded counts and
+        # `pad_active_slices` zero-pads the trailing slots), so the call site does not
+        # need to re-pad here.
         required_logit_indices = context.speculative_required_logit_indices()
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
-            required_logits = logits.squeeze(0)
+            sample_logits = logits.squeeze(0)
+            sample_gather_indices = None
         else:
-            required_logits = logits.squeeze(0)[
-                required_logit_indices, :
-            ]  # Shape [num_required, vocab_size]
+            # Push the gather inside the captured kernel:
+            # pass the full per-token logits buffer (constant shape) plus the padded indices.
+            sample_logits = logits.squeeze(0)
+            sample_gather_indices = required_logit_indices
         nvtx_range_pop("mtp-spec-decoding/verify/logit-indices")
 
         # Sample tokens from logits
         nvtx_range_push("mtp-spec-decoding/verify/sample")
         output_tokens = self._sampling.sample_speculative(
-            required_logits,
+            sample_logits,
             sample_num_decode,
             sample_num_prefill,
             self.num_speculative_tokens,
@@ -976,6 +975,7 @@ class TextGenerationController:
                 if use_graph_for_sampling
                 else None
             ),
+            gather_indices=sample_gather_indices,
         )
         nvtx_range_pop("mtp-spec-decoding/verify/sample")
 

@@ -85,13 +85,17 @@ class Sampling(ABC):
         *,
         eager: bool = False,
         cache_key: Any = None,
+        gather_indices: Optional[Tensor] = None,
     ) -> Tensor:
         """Sample tokens for the speculative-verify path.
 
-        Decode requests contribute `1 + num_speculative_tokens` rows; prefill requests
-        contribute one row. Builds the per-token request mapping and dispatches to
-        `sample_kernel`. Callers may use `eager` and `cache_key` to control CUDA graph
-        capture/replay on backends that wrap `sample_kernel`.
+        Decode requests contribute `1 + num_speculative_tokens` rows; prefill requests contribute 1.
+        Builds the per-token request mapping and dispatches to `sample_kernel`.
+
+        When `gather_indices` is supplied, `required_logits` is the full per-token logits buffer
+        (constant shape across steps); the kernel selects rows via `logits[gather_indices[:n], :]`.
+        When `gather_indices` is None, `required_logits` is expected to be already pre-gathered to
+        the layout described above (e.g. when `materialize_only_last_token_logits=True` upstream).
         """
         n_spec = num_speculative_tokens
         num_decode_tokens = num_decode * (1 + n_spec)
@@ -112,5 +116,6 @@ class Sampling(ABC):
             context,
             eager=eager,
             cache_key=cache_key,
+            gather_indices=gather_indices,
             token_to_request_index=token_to_request_index,
         )
