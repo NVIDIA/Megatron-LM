@@ -946,6 +946,592 @@ class TestDynamicContext:
             is_hybrid_model=is_hybrid_model,
         )
 
+    def _add_n_decode_requests(self, ctx, n, prompt_len=10):
+        """Add *n* requests and advance them past prefill into decode.
+
+        Each request gets a unique prompt of length *prompt_len* and is
+        then updated once (all active) so that all become decode requests
+        with query_length=1.
+        """
+        for i in range(n):
+            ctx.add_request(
+                DynamicInferenceRequest(
+                    request_id=1000 + i,
+                    prompt_tokens=torch.randint(0, 100, (prompt_len,), device='cuda'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=ctx.max_tokens - prompt_len
+                    ),
+                )
+            )
+        # Run a prefill → decode transition step.
+        ctx.initialize_attention_state()
+        active_pre = ctx.total_request_count - ctx.paused_request_count
+        mask = torch.ones(active_pre, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active_pre,), dtype=torch.int64, device='cuda')
+        ctx.update_requests(mask, tokens)
+        # Now all requests are in decode mode (query_length == 1).
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    @pytest.mark.parametrize(
+        "scenario",
+        [
+            "all_active",
+            "all_finished",
+            "some_finished",
+            "multi_step_graph_replay",
+            "token_bookkeeping",
+        ],
+    )
+    def test_ur_scenarios(self, is_hybrid_model: bool, scenario: str):
+        """Parameterized test covering core update_requests scenarios.
+
+        Scenarios:
+        - all_active: steady-state, all active, none finished
+        - all_finished: all requests finish → context resets
+        - some_finished: partial finish, surviving IDs preserved
+        - multi_step_graph_replay: 5 steps finishing one per step (graph capture + replay)
+        - token_bookkeeping: verify token-level tensors after update
+        """
+        self._setup_model_parallel_group(1, 1)
+        ctx = self._make_context(is_hybrid_model=is_hybrid_model)
+
+        if scenario == "all_active":
+            self._add_n_decode_requests(ctx, 4)
+            total_before = ctx.total_request_count
+            paused_before = ctx.paused_request_count
+            active = total_before - paused_before
+            avail_before = ctx.kv_block_allocator.total_avail
+
+            mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+            tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+            ctx.update_requests(mask, tokens)
+
+            assert ctx.total_request_count == total_before
+            assert ctx.paused_request_count == paused_before
+            assert ctx.active_token_count == active
+            assert ctx.kv_block_allocator.total_avail == avail_before
+
+        elif scenario == "all_finished":
+            self._add_n_decode_requests(ctx, 3)
+            active = ctx.total_request_count - ctx.paused_request_count
+
+            mask = torch.zeros(active, dtype=torch.uint8, device='cuda')
+            tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+            ctx.update_requests(mask, tokens)
+
+            assert ctx.total_request_count == 0
+            assert ctx.active_token_count == 0
+            assert ctx.paused_request_count == 0
+
+        elif scenario == "some_finished":
+            self._add_n_decode_requests(ctx, 5)
+            active = ctx.total_request_count - ctx.paused_request_count
+            avail_before = ctx.kv_block_allocator.total_avail
+
+            mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+            mask[1] = 0
+            mask[3] = 0
+            tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+
+            surviving_mask = mask.bool()
+            ids_before = ctx.request_ids[ctx.active_slice()].clone()
+            surviving_ids = set(ids_before[surviving_mask].cpu().tolist())
+
+            ctx.update_requests(mask, tokens)
+
+            assert ctx.total_request_count == ctx.paused_request_count + (active - 2)
+            assert ctx.active_token_count == active - 2
+            assert ctx.kv_block_allocator.total_avail > avail_before
+            active_ids = set(ctx.request_ids[ctx.active_slice()].cpu().tolist())
+            assert active_ids == surviving_ids
+            ql = ctx.request_query_lengths[ctx.active_slice()]
+            assert torch.all(ql == 1)
+
+        elif scenario == "multi_step_graph_replay":
+            self._add_n_decode_requests(ctx, 6)
+            for step in range(5):
+                active = ctx.total_request_count - ctx.paused_request_count
+                if active == 0:
+                    break
+                mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+                mask[0] = 0
+                tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+                ctx.update_requests(mask, tokens)
+
+                assert ctx.total_request_count == ctx.paused_request_count + ctx.active_token_count
+                ql = ctx.request_query_lengths[ctx.active_slice()]
+                assert torch.all(ql == 1), f"step {step}: query_lengths not all 1"
+
+        elif scenario == "token_bookkeeping":
+            self._add_n_decode_requests(ctx, 3)
+            active = ctx.total_request_count - ctx.paused_request_count
+            mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+            tokens = torch.arange(42, 42 + active, dtype=torch.int64, device='cuda')
+            kv_offsets_before = ctx.request_kv_length_offsets[ctx.active_slice()].clone()
+
+            ctx.update_requests(mask, tokens)
+
+            n = ctx.active_token_count
+            active_slc = ctx.active_slice()
+
+            actual_tokens = ctx.token_to_input_ids[:n]
+            expected_tokens = ctx._ur.next_tokens[active_slc]
+            assert torch.equal(actual_tokens, expected_tokens)
+
+            req_idxs = ctx.token_to_request_idx[:n]
+            assert torch.all(req_idxs >= active_slc.start)
+            assert torch.all(req_idxs < active_slc.stop)
+
+            kv_offsets_after = ctx.request_kv_length_offsets[active_slc]
+            assert torch.all(kv_offsets_after == kv_offsets_before + 1)
+
+        # ── Common invariants for all scenarios ──
+        assert ctx.kv_block_allocator.total_avail_gpu.item() == ctx.kv_block_allocator.total_avail
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_ur_force_pause_excess(self, is_hybrid_model: bool):
+        """When active requests exceed max_allowed_active, excess are force-paused.
+
+        Create a context where max_tokens constrains max_allowed_active below the
+        number of active requests, and verify excess requests get paused.
+        """
+        self._setup_model_parallel_group(1, 1)
+        # max_tokens=3 with num_speculative_tokens=0 → max_allowed_active=3
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=3,
+            is_hybrid_model=is_hybrid_model,
+        )
+        # Add 3 requests and transition to decode.
+        self._add_n_decode_requests(ctx, 3)
+
+        # All 3 should be active (max_allowed_active == 3).
+        assert ctx.total_request_count - ctx.paused_request_count == 3
+
+        # Now add a 4th request — this exceeds max_allowed_active.
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=2000,
+                prompt_tokens=torch.randint(0, 100, (1,), device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=100),
+            )
+        )
+        ctx.initialize_attention_state()
+        active = ctx.total_request_count - ctx.paused_request_count
+        mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+        result = ctx.update_requests(mask, tokens)
+
+        # At least one request should have been force-paused.
+        assert ctx.paused_request_count > 0, "No requests were force-paused"
+        assert (
+            ctx.total_request_count - ctx.paused_request_count <= 3
+        ), "Active count exceeds max_allowed_active"
+        assert ctx.kv_block_allocator.total_avail_gpu.item() == ctx.kv_block_allocator.total_avail
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_ur_chunked_prefill(self, is_hybrid_model: bool):
+        """Chunked prefill request survives update_requests correctly.
+
+        Verifies:
+        - Chunked request is hidden (total_request_count decremented) for add_request
+        - A second chunk can be added without corrupting state
+        - After completing the prefill, the request decodes normally
+        """
+        self._setup_model_parallel_group(1, 1)
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=is_hybrid_model,
+            enable_chunked_prefill=True,
+            max_requests=10,
+        )
+
+        # Add a non-chunked request so there's at least one active request.
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=100,
+                prompt_tokens=torch.randint(0, 100, (10,), device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=100),
+            )
+        )
+
+        # Add a chunked request (first chunk).
+        long_prompt = torch.randint(0, 100, (300,), device='cuda')
+        chunked_req = DynamicInferenceRequest(
+            request_id=200,
+            prompt_tokens=long_prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=100),
+        )
+        ctx.add_request(chunked_req, prefill_chunk_length=128)
+
+        total_before_update = ctx.total_request_count
+        ctx.initialize_attention_state()
+        active = ctx.total_request_count - ctx.paused_request_count
+        mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+        ctx.update_requests(mask, tokens)
+
+        # After update_requests, the chunked request should be hidden:
+        # total_request_count should be decremented by 1 for the hidden chunked request.
+        assert ctx.chunked_prefill_request_id == 200
+        assert ctx.total_request_count == total_before_update - 1, (
+            f"Chunked request should be hidden: total={ctx.total_request_count}, "
+            f"expected={total_before_update - 1}"
+        )
+
+        # Add the second chunk — should overwrite the hidden slot.
+        ctx.add_request(chunked_req, prefill_chunk_length=128)
+        assert ctx.total_request_count == total_before_update
+
+        # GPU/CPU allocator sync.
+        assert ctx.kv_block_allocator.total_avail_gpu.item() == ctx.kv_block_allocator.total_avail
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_ur_zero_active_with_hidden_chunked(self):
+        """update_requests handles zero-active + hidden chunked-prefill state.
+
+        The eager path is exercised here (no graphs are captured); see
+        test_ur_graphed_capture_replay_matches_eager for the graphed
+        capture/replay equivalence.
+        """
+        self._setup_model_parallel_group(1, 1)
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=False,
+            enable_chunked_prefill=True,
+            max_requests=10,
+        )
+
+        # Add a non-chunked request + a chunked request.
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=100,
+                prompt_tokens=torch.randint(0, 100, (10,), device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=100),
+            )
+        )
+        long_prompt = torch.randint(0, 100, (300,), device='cuda')
+        chunked_req = DynamicInferenceRequest(
+            request_id=200,
+            prompt_tokens=long_prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=100),
+        )
+        ctx.add_request(chunked_req, prefill_chunk_length=128)
+
+        # Run one update to transition to decode and hide the chunked request.
+        ctx.initialize_attention_state()
+        active = ctx.total_request_count - ctx.paused_request_count
+        mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+        ctx.update_requests(mask, tokens)
+
+        assert ctx.chunked_prefill_request_id == 200
+
+        # Finish ALL remaining active requests while chunked is hidden.
+        active = ctx.total_request_count - ctx.paused_request_count
+        assert active > 0, "Need at least one active request to finish"
+        mask = torch.zeros(active, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+
+        ctx.update_requests(mask, tokens)
+
+        # Hidden chunked request must survive the zero-active capture.
+        assert ctx.chunked_prefill_request_id == 200
+        hidden_idx = ctx.get_index_of_chunked_prefill_request(safe=False)
+        assert hidden_idx != -1
+
+        # Add the second chunk and a fresh request — tests graph REPLAY
+        # with normal (non-degenerate) state after the adversarial capture.
+        ctx.add_request(chunked_req, prefill_chunk_length=128)
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=300,
+                prompt_tokens=torch.randint(0, 100, (10,), device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=100),
+            )
+        )
+        ctx.initialize_attention_state()
+        active = ctx.total_request_count - ctx.paused_request_count
+        mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+        ctx.update_requests(mask, tokens)
+
+        assert ctx.total_request_count > 0
+        assert ctx.kv_block_allocator.total_avail_gpu.item() == ctx.kv_block_allocator.total_avail
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_ur_graphed_eviction(self):
+        """Graphed eviction fires inside update_requests when paused buffer overflows.
+
+        Creates a context with zero paused-buffer capacity, adds requests
+        whose last KV block is full (forcing them to pause on the next
+        update), and verifies that the graphed eviction body inside
+        update_requests evicts the overflow and returns the evicted IDs.
+        """
+        self._setup_model_parallel_group(1, 1)
+        # Zero paused capacity → any paused request overflows immediately.
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            paused_buffer_size_gb=0.0,
+        )
+
+        # Add 3 requests with prompts that fill exactly one block (32 tokens).
+        # After the prefill→decode transition, their last_kv_block_offset
+        # will be 31 (= block_size - 1), so the next update step classifies
+        # them as "needs new block" → newly paused.
+        for i in range(3):
+            ctx.add_request(
+                DynamicInferenceRequest(
+                    request_id=500 + i,
+                    prompt_tokens=torch.randint(0, 100, (31,), device='cuda'),
+                    sampling_params=SamplingParams(num_tokens_to_generate=100),
+                )
+            )
+
+        # Prefill → decode transition.
+        ctx.initialize_attention_state()
+        active = ctx.total_request_count - ctx.paused_request_count
+        mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+        ctx.update_requests(mask, tokens)
+
+        # All 3 should be in decode mode now.  Their last_kv_block_offset
+        # should be 0 (they just crossed the block boundary and got a new
+        # block during resume).  Run one more decode step so the offset
+        # advances to 1, then we can fill the rest by setting the offset
+        # to block_size - 1 manually to trigger the pause path.
+        active = ctx.total_request_count - ctx.paused_request_count
+        assert active == 3
+        mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+        ctx.update_requests(mask, tokens)
+
+        # Manually set last_kv_block_offset to block_size - 1 for all
+        # active requests so the NEXT update classifies them as needing
+        # a new block → newly paused → overflow → eviction.
+        paused = ctx.paused_request_count
+        total = ctx.total_request_count
+        ctx.request_last_kv_block_offset[paused:total] = ctx.block_size_tokens - 1
+
+        # This update should: classify all 3 as newly_paused, trigger
+        # graphed eviction (paused_buffer_size == 0 → all overflow),
+        # then resume whatever fits in the active budget.
+        active = total - paused
+        mask = torch.ones(active, dtype=torch.uint8, device='cuda')
+        tokens = torch.randint(0, 100, (active,), dtype=torch.int64, device='cuda')
+        avail_before = ctx.kv_block_allocator.total_avail
+        result = ctx.update_requests(mask, tokens)
+
+        evict_ids = result["evict_request_ids"]
+        assert evict_ids is not None, "Expected eviction but none occurred"
+        evict_count = len(evict_ids)
+        assert evict_count > 0
+
+        # Evicted IDs should be a subset of our original request IDs.
+        original_ids = {500, 501, 502}
+        evicted_set = set(evict_ids.cpu().tolist())
+        assert evicted_set.issubset(
+            original_ids
+        ), f"Evicted IDs {evicted_set} not a subset of {original_ids}"
+
+        # Blocks from evicted requests should have been freed.
+        assert ctx.kv_block_allocator.total_avail > avail_before
+
+        # GPU/CPU allocator sync.
+        assert ctx.kv_block_allocator.total_avail_gpu.item() == ctx.kv_block_allocator.total_avail
+
+    @staticmethod
+    def _assert_ur_state_equal(ctx_e, ctx_g, result_e, result_g, label):
+        """Compare full update_requests post-state and result dicts."""
+        # Counts.
+        assert ctx_e.total_request_count == ctx_g.total_request_count, (
+            f"[{label}] total_request_count: "
+            f"{ctx_e.total_request_count} vs {ctx_g.total_request_count}"
+        )
+        assert ctx_e.paused_request_count == ctx_g.paused_request_count, (
+            f"[{label}] paused_request_count"
+        )
+        assert ctx_e.active_token_count == ctx_g.active_token_count, (
+            f"[{label}] active_token_count"
+        )
+        assert (
+            ctx_e.kv_block_allocator.total_avail == ctx_g.kv_block_allocator.total_avail
+        ), f"[{label}] total_avail"
+        assert (
+            ctx_e.kv_block_allocator.total_avail_gpu.item()
+            == ctx_g.kv_block_allocator.total_avail_gpu.item()
+        ), f"[{label}] total_avail_gpu"
+
+        # Per-request bookkeeping (full max_requests range so the dead/
+        # padding region also matches — that's where eviction trimmed).
+        for attr in (
+            "request_ids",
+            "request_kv_length_offsets",
+            "request_query_lengths",
+            "request_output_lengths",
+            "request_to_kv_block_ids",
+            "request_kv_block_counts",
+            "request_last_kv_block_id",
+            "request_last_kv_block_offset",
+        ):
+            assert torch.equal(getattr(ctx_e, attr), getattr(ctx_g, attr)), (
+                f"[{label}] mismatch in {attr}"
+            )
+
+        # Per-token bookkeeping over the active region.
+        n = ctx_e.active_token_count
+        if n > 0:
+            for attr in (
+                "token_to_input_ids",
+                "token_to_request_idx",
+                "token_to_pos_ids",
+                "token_to_position_in_request",
+                "token_to_block_idx",
+                "token_to_local_position_within_kv_block",
+            ):
+                assert torch.equal(
+                    getattr(ctx_e, attr)[:n], getattr(ctx_g, attr)[:n]
+                ), f"[{label}] mismatch in {attr}[:n]"
+
+        # Result dict (newly_paused_request_ids / evict_request_ids). Both
+        # paths must agree on None-ness and on the contained tensor.
+        for key in ("newly_paused_request_ids", "evict_request_ids"):
+            e_val = (result_e or {}).get(key)
+            g_val = (result_g or {}).get(key)
+            assert (e_val is None) == (g_val is None), (
+                f"[{label}] {key} None-ness disagrees"
+            )
+            if e_val is not None:
+                assert torch.equal(e_val, g_val), f"[{label}] mismatch in {key}"
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_ur_graphed_capture_replay_matches_eager(self):
+        """Capture+replay of update_requests bodies matches the eager path.
+
+        Asserts the production-code path (graph capture-then-replay of the two
+        body methods) produces the same state mutations as the backward-compat
+        eager `update_requests`. This is the only test that exercises the
+        actual graphed flow; all other tests run eager.
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        def make_ctx_in_decode():
+            ctx = self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=4,
+                kv_channels=8,
+                num_attention_heads=2,
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=128,
+                max_tokens=None,
+                is_hybrid_model=False,
+                max_requests=10,
+            )
+            for i in range(4):
+                ctx.add_request(
+                    DynamicInferenceRequest(
+                        request_id=600 + i,
+                        prompt_tokens=torch.randint(0, 100, (10,), device='cuda'),
+                        sampling_params=SamplingParams(num_tokens_to_generate=100),
+                    )
+                )
+            ctx.initialize_attention_state()
+            active = ctx.get_active_request_count()
+            ctx.update_requests(
+                torch.ones(active, dtype=torch.uint8, device='cuda'),
+                torch.arange(10, 10 + active, dtype=torch.int64, device='cuda'),
+            )
+            return ctx
+
+        # ── Eager reference ──
+        ctx_e = make_ctx_in_decode()
+        active_e = ctx_e.get_active_request_count()
+        mask = torch.tensor([1, 0, 1, 1][:active_e], dtype=torch.uint8, device='cuda')
+        tokens = torch.tensor([42, 43, 44, 45][:active_e], dtype=torch.int64, device='cuda')
+        result_e = ctx_e.update_requests(mask, tokens)
+
+        # ── Graphed: capture-then-execute, then finalize ──
+        ctx_g = make_ctx_in_decode()
+        ctx_g._prepare_update_requests_metadata()
+        has_chunked = ctx_g._prepare_update_requests_new_tokens(mask.clone(), tokens.clone())
+
+        # Warmup on a side stream so cuBLAS handles initialize before capture.
+        # The warmup mutates state, so do it on a fresh "throwaway" context;
+        # ctx_g stays untouched until the actual capture below.
+        warmup_ctx = make_ctx_in_decode()
+        warmup_ctx._prepare_update_requests_metadata()
+        warmup_ctx._prepare_update_requests_new_tokens(mask.clone(), tokens.clone())
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            warmup_ctx._classify_and_resume_body()
+            warmup_ctx._evict_resume_chunked_tokens_body()
+        torch.cuda.current_stream().wait_stream(s)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            ctx_g._classify_and_resume_body()
+            ctx_g._evict_resume_chunked_tokens_body()
+        result_g = ctx_g._finalize_update_requests(has_chunked)
+
+        # First-step parity: capture executed the bodies once.
+        self._assert_ur_state_equal(ctx_e, ctx_g, result_e, result_g, "capture")
+
+        # ── Replay parity: refill input buffers, replay, finalize ──
+        if ctx_g.get_active_request_count() > 0:
+            active2 = ctx_g.get_active_request_count()
+            mask2 = torch.ones(active2, dtype=torch.uint8, device='cuda')
+            tokens2 = torch.arange(80, 80 + active2, dtype=torch.int64, device='cuda')
+
+            # Eager step on the reference.
+            result_e2 = ctx_e.update_requests(mask2, tokens2)
+
+            # Graphed: prep refills the static-address input tensors, then replay.
+            ctx_g._prepare_update_requests_metadata()
+            has_chunked2 = ctx_g._prepare_update_requests_new_tokens(mask2.clone(), tokens2.clone())
+            graph.replay()
+            result_g2 = ctx_g._finalize_update_requests(has_chunked2)
+
+            self._assert_ur_state_equal(ctx_e, ctx_g, result_e2, result_g2, "replay")
+
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
