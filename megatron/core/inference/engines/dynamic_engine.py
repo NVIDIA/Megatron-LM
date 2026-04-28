@@ -370,17 +370,17 @@ class DynamicInferenceEngine(AbstractEngine):
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
         unwrapped = unwrap_model(controller.inference_wrapped_model.model)
-        if hasattr(unwrapped, 'mtp') and (controller.num_speculative_tokens or 0) > 0:
+        mtp_warmup_enabled = (
+            controller.num_mtp_heads > 0
+            and (controller.num_speculative_tokens or 0) > 0
+            and hasattr(unwrapped, 'mtp')
+        )
+        if mtp_warmup_enabled:
             tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
             sp_enabled = model_config.sequence_parallel and tp_size > 1
             mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
             mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
-        else:
-            tp_size = 1
-            sp_enabled = False
-            mtp_warmup_depths = None
-            mtp_seen_batch_sizes = None
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
@@ -408,10 +408,12 @@ class DynamicInferenceEngine(AbstractEngine):
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
             # MTP CUDA graph warmup for this batch dimension.
-            if mtp_warmup_depths is not None:
+            if mtp_warmup_enabled:
                 n = cuda_graph_batch_dimension.req_count
+                # pylint: disable-next=possibly-used-before-assignment
                 if sp_enabled:
                     n = round_up_to_nearest_multiple(n, tp_size)
+                # pylint: disable-next=possibly-used-before-assignment
                 if n > 0 and n not in mtp_seen_batch_sizes:
                     mtp_seen_batch_sizes.add(n)
                     device = torch.cuda.current_device()
@@ -436,7 +438,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-        if mtp_warmup_depths is not None and mtp_seen_batch_sizes:
+        if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
