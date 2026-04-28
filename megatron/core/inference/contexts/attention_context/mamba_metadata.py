@@ -85,10 +85,15 @@ class MambaMetadata:
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
         self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
 
-        # Allocator for Mamba state slots
-        self.mamba_state_free_slots = torch.arange(
+        # Allocator for Mamba state slots.
+        # Pre-sized to `2 * max_requests` for shape-stability; this acts as a stack.
+        self.mamba_state_free_slots = torch.empty(
+            2 * self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.mamba_state_free_slots[: self.max_requests] = torch.arange(
             self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        self.mamba_state_free_slots[self.max_requests :] = 0
         self.mamba_state_free_slot_count = self.max_requests
 
         # Scratch buffer for cumulative chunk counts.
@@ -118,8 +123,8 @@ class MambaMetadata:
         self.reset_varlen_metadata()
 
         # Re-initialize the free slot pool
-        self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        self.mamba_state_free_slots[: self.max_requests].copy_(
+            torch.arange(self.max_requests, dtype=torch.int32, device=torch.cuda.current_device())
         )
         self.mamba_state_free_slot_count = self.max_requests
 
