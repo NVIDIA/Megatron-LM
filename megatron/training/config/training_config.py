@@ -599,9 +599,9 @@ class CheckpointConfig:
 
         if self.dist_ckpt_use_dtensor_format:
             assert self.ckpt_format == "torch_dist", \
-                "`dist-ckpt-use-dtensor-format` is only supported with `torch_dist` format."
+                "`dist_ckpt_use_dtensor_format` is only supported with `torch_dist` format."
             assert not self.async_save, \
-                "`dist-ckpt-use-dtensor-format` is not supported with `--async-save.`"
+                "`dist_ckpt_use_dtensor_format` is not supported with `--async-save.`"
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
                 f"`verify_integrity` is only supported with torch_dist checkpoint format."
