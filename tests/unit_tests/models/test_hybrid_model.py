@@ -3,6 +3,7 @@
 import os
 from datetime import timedelta
 from itertools import accumulate
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -25,6 +26,24 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    from fast_hadamard_transform import hadamard_transform as _hadamard_transform
+
+    _HAVE_HADAMARD = True
+except ImportError:
+    _HAVE_HADAMARD = False
+    _hadamard_transform = None
+
+
+def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Identity-with-scale stand-in for `fast_hadamard_transform.hadamard_transform`.
+
+    Mirrors the helper in `tests/unit_tests/transformer/experimental_attention_variant/
+    test_attention_variant_dsa.py` so that DSA forward tests run in containers that
+    don't ship the upstream library.
+    """
+    return x * scale
 
 
 class TestHybridModel:
@@ -295,6 +314,12 @@ class TestHybridModel:
 
 class TestHybridQKLayernorm:
 
+    # Subclasses override these to retarget the same tests at MLA's
+    # `mla_layer.kv_layernorm` or DSA's `dsa_layer.kv_layernorm`. The base class
+    # exercises the SelfAttention path with `attention_layer.k_layernorm`.
+    _attention_layer_attr = 'attention_layer'
+    _k_norm_attr = 'k_layernorm'
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -321,11 +346,14 @@ class TestHybridQKLayernorm:
         )
 
     def _get_attention_layer(self, model):
-        """Return the SelfAttention submodule from the attention layer."""
+        """Return the self-attention submodule that owns a `q_layernorm`."""
         for layer in model.decoder.layers:
             if hasattr(layer, 'self_attention') and hasattr(layer.self_attention, 'q_layernorm'):
                 return layer.self_attention
         return None
+
+    def _get_k_norm(self, attn):
+        return getattr(attn, self._k_norm_attr)
 
     def test_trivial_qk_norm_by_default(self):
         """Without qk_layernorm, attention has trivial q/k layernorm."""
@@ -335,7 +363,8 @@ class TestHybridQKLayernorm:
         attn = self._get_attention_layer(model)
         assert attn is not None
         assert attn.q_layernorm is None or isinstance(attn.q_layernorm, IdentityOp)
-        assert attn.k_layernorm is None or isinstance(attn.q_layernorm, IdentityOp)
+        k_norm = self._get_k_norm(attn)
+        assert k_norm is None or isinstance(k_norm, IdentityOp)
 
     def test_qk_layernorm_from_config(self):
         """config.qk_layernorm=True creates q/k layernorm even with static spec."""
@@ -345,7 +374,7 @@ class TestHybridQKLayernorm:
         # TENorm is a factory (__new__ returns a TE LayerNorm/RMSNorm), so we
         # verify the norm was created rather than checking for a specific type.
         assert attn.q_layernorm is not None
-        assert attn.k_layernorm is not None
+        assert self._get_k_norm(attn) is not None
 
     def test_qk_l2_norm_from_config(self):
         """config.qk_l2_norm=True creates L2Norm q/k layernorm."""
@@ -355,40 +384,28 @@ class TestHybridQKLayernorm:
         attn = self._get_attention_layer(model)
         assert attn is not None
         assert isinstance(attn.q_layernorm, L2Norm)
-        assert isinstance(attn.k_layernorm, L2Norm)
+        assert isinstance(self._get_k_norm(attn), L2Norm)
 
     def test_spec_provided_norm_not_overwritten(self):
         """When the spec already provides q/k layernorm, config doesn't override it."""
         import copy
 
-        from megatron.core.extensions.transformer_engine import (
-            TEDotProductAttention,
-            TELayerNormColumnParallelLinear,
-            TERowParallelLinear,
-        )
-        from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-        from megatron.core.transformer.enums import AttnMaskType
         from megatron.core.transformer.identity_op import IdentityOp
-        from megatron.core.transformer.spec_utils import ModuleSpec
-        from megatron.core.transformer.transformer_layer import (
-            TransformerLayer,
-            TransformerLayerSubmodules,
-        )
 
-        # Build a spec that explicitly sets q/k layernorm to IdentityOp
+        # Build a spec that explicitly sets q/k layernorm to IdentityOp on the
+        # attention layer that this subclass exercises.
         spec = copy.deepcopy(hybrid_stack_spec)
-        spec.submodules.attention_layer.submodules.self_attention.submodules.q_layernorm = (
-            IdentityOp
-        )
-        spec.submodules.attention_layer.submodules.self_attention.submodules.k_layernorm = (
-            IdentityOp
-        )
+        attn_submodules = getattr(
+            spec.submodules, self._attention_layer_attr
+        ).submodules.self_attention.submodules
+        attn_submodules.q_layernorm = IdentityOp
+        setattr(attn_submodules, self._k_norm_attr, IdentityOp)
 
         model = self._build_model(spec=spec, qk_layernorm=True)
         attn = self._get_attention_layer(model)
         assert attn is not None
         assert isinstance(attn.q_layernorm, IdentityOp)
-        assert isinstance(attn.k_layernorm, IdentityOp)
+        assert isinstance(self._get_k_norm(attn), IdentityOp)
 
     def test_forward_with_qk_layernorm(self):
         """HybridModel forward pass works with qk_layernorm enabled."""
@@ -416,6 +433,9 @@ class TestHybridQKLayernorm:
 class TestHybridMLAQKLayernorm(TestHybridQKLayernorm):
     """Tests QK norm configuration of HybridModel with MLA."""
 
+    _attention_layer_attr = 'mla_layer'
+    _k_norm_attr = 'kv_layernorm'
+
     def _build_model(self, spec=None, **config_overrides):
         if spec is None:
             spec = hybrid_stack_spec
@@ -442,16 +462,51 @@ class TestHybridMLAQKLayernorm(TestHybridQKLayernorm):
 class TestHybridDSAQKLayernorm(TestHybridQKLayernorm):
     """Tests QK norm configuration of HybridModel with DSA."""
 
+    _attention_layer_attr = 'dsa_layer'
+    _k_norm_attr = 'kv_layernorm'
+
+    @pytest.fixture(autouse=True)
+    def _patch_hadamard_if_needed(self):
+        if not _HAVE_HADAMARD:
+            with patch(
+                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+                _mock_hadamard_transform,
+            ):
+                yield
+        else:
+            yield
+
+    def test_spec_provided_norm_not_overwritten(self):
+        # DSA cannot fuse the QK norm into the up-projection, so a trivial
+        # `IdentityOp` spec is auto-promoted to `TENorm` when `qk_layernorm=True`.
+        # Finer-grained spec-respect behavior is covered by TestDSAQKNormResolution.
+        pytest.skip("DSA auto-promotes IdentityOp to TENorm; covered by TestDSAQKNormResolution.")
+
     def _build_model(self, spec=None, **config_overrides):
         if spec is None:
             spec = hybrid_stack_spec
-        config = MLATransformerConfig(
+        config_kwargs = dict(
             num_layers=3,
             hidden_size=256,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            **config_overrides,
+            # MLASelfAttention forwards `x` and `qr` to the core attention only when
+            # `experimental_attention_variant == "dsa"`; without this the DSA core
+            # attention's forward fails on missing positional arguments.
+            experimental_attention_variant="dsa",
+            # DSA-specific settings; defaults are None and DSAIndexer requires them.
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+            # The indexer-loss path runs in training mode and multiplies by this coefficient;
+            # leaving it at the default `None` raises `TypeError: ... 'Tensor' and 'NoneType'`.
+            dsa_indexer_loss_coeff=1.0,
+            # DSA's `rotate_activation` (Hadamard rotation) only supports bf16 input.
+            bf16=True,
+            params_dtype=torch.bfloat16,
         )
+        config_kwargs.update(config_overrides)
+        config = MLATransformerConfig(**config_kwargs)
         return HybridModel(
             config=config,
             hybrid_stack_spec=spec,
@@ -503,6 +558,12 @@ class _MLAQKNormTestBase:
         )
         if self.experimental_attention_variant is not None:
             config_kwargs["experimental_attention_variant"] = self.experimental_attention_variant
+            if self.experimental_attention_variant == "dsa":
+                # DSAIndexer requires these; their config defaults are None.
+                config_kwargs.setdefault("dsa_indexer_n_heads", 8)
+                config_kwargs.setdefault("dsa_indexer_head_dim", 64)
+                config_kwargs.setdefault("dsa_indexer_topk", 32)
+
         config_kwargs.update(config_overrides)
         config = MLATransformerConfig(**config_kwargs)
         return HybridModel(
