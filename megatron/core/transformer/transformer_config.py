@@ -560,19 +560,9 @@ class TransformerConfig(ModelParallelConfig):
     in higher precision."""
 
     fp8_output_proj: bool = False
-    """If True, run the LM head (LinearCrossEntropyModule) GEMM in MXFP8. Only active
-    when fp8_recipe == 'mxfp8'. The weight Parameter stays bf16; a cached MXFP8
-    view is invalidated by weight._version. Does not change checkpoint format."""
-
-    fp8_output_proj_dgrad: bool = False
-    """When fp8_output_proj is True: if True, the LM head dgrad GEMM is run in MXFP8;
-    if False, it is run in bf16 with the saved bf16 weight. No effect when
-    fp8_output_proj is False."""
-
-    fp8_output_proj_wgrad: bool = False
-    """When fp8_output_proj is True: if True, the LM head wgrad GEMM is run in MXFP8;
-    if False, it is run in bf16 with the saved bf16 activation. No effect when
-    fp8_output_proj is False."""
+    """If True, run the LM head (LinearCrossEntropyModule) projection with a TE
+    ColumnParallelLinear under the MXFP8 autocast context. Only active when
+    fp8=True and fp8_recipe == 'mxfp8'."""
 
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
