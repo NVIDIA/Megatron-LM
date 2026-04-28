@@ -3572,10 +3572,20 @@ def evaluate_and_print_results(
     else:
         eval_iters = args.eval_iters
 
+    if args.validation_set_names:
+        assert args.multiple_validation_sets, \
+            "--validation-set-names requires --multiple-validation-sets"
+        assert len(args.validation_set_names) == len(data_iterators), \
+            f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
+            f"the number of validation datasets ({len(data_iterators)})"
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
-            suffix = f"-{index}"
+            if args.validation_set_names:
+                suffix = f"-{args.validation_set_names[index]}"
+            else:
+                suffix = f"-{index}"
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,
