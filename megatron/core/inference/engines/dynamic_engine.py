@@ -408,7 +408,9 @@ class DynamicInferenceEngine(AbstractEngine):
             with torch.inference_mode():
                 for setup_variant in controller.graph_capture_variants():
                     setup_variant(context)
-                    controller._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+                    controller._pre_forward_bookkeeping_stream.wait_stream(
+                        torch.cuda.current_stream()
+                    )
                     # Launch bookkeeping on a side stream so it overlaps with forward.
                     with torch.cuda.stream(controller._pre_forward_bookkeeping_stream):
                         controller._pre_forward_bookkeeping_event.record()
@@ -435,8 +437,12 @@ class DynamicInferenceEngine(AbstractEngine):
                                         device=device,
                                         dtype=model_config.params_dtype,
                                     ),
-                                    next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
-                                    position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                                    next_token_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.int64
+                                    ),
                                     depth=depth,
                                 )
 
