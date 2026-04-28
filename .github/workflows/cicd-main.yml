@@ -994,7 +994,7 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [pre-flight, is-not-external-contributor]
+    needs: [pre-flight, is-not-external-contributor, cicd-unit-tests-latest]
     if: |
       (
         (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
