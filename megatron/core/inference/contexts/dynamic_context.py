@@ -864,8 +864,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
         }
 
-        self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
-        self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
+        # active_request_query_lengths and active_request_last_token_idxs reserve a permanent
+        # sentinel at index `max_requests` for log-prob indexing kernels (see logprobs/prefill.py).
+        self.active_request_query_lengths = self.request_query_lengths.new_zeros(
+            self.max_requests + 1
+        )
+        self.active_request_last_token_idxs = self.request_query_lengths.new_zeros(
+            self.max_requests + 1
+        )
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:

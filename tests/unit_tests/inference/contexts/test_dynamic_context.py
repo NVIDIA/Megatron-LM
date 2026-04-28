@@ -1406,9 +1406,19 @@ class TestDynamicContext:
             torch.testing.assert_close(indices, expected.indices.cpu())
 
     @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "log_prob_indices",
+        [
+            [0, 2],     # partial mask: requests 0 and 2 want log probs
+            [0, 1, 2],  # full mask: K == num_active (still K < padded_count)
+            [1],        # single masked request
+        ],
+    )
     @rounder_override(64)
-    def test_calculate_log_probs_partial_mask(self):
-        """Verify that requests with return_log_probs=False get None in the result list."""
+    def test_calculate_log_probs_partial_mask(self, log_prob_indices):
+        """Verify per-request masking: masked-out requests get None in the result list,
+        and masked-in requests get correctly-shaped values matching reference log_softmax.
+        """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1421,7 +1431,6 @@ class TestDynamicContext:
             max_tokens=None,
         )
 
-        # Three requests; only request 0 and 2 want log probs.
         request_lengths = [6, 4, 5]
         for i, req_len in enumerate(request_lengths):
             dynamic_context.add_request(
@@ -1437,41 +1446,48 @@ class TestDynamicContext:
         num_active = dynamic_context.total_request_count - dynamic_context.paused_request_count
         total_tokens = dynamic_context.active_token_count
         vocab_size = 50000
+        log_prob_request_count = len(log_prob_indices)
 
-        # ── Prefill step with partial mask ──
+        def _set_mask():
+            dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+            for i in log_prob_indices:
+                dynamic_context.active_request_metadata["return_log_probs"][i] = True
+
+        # ── Prefill step ──
         logits = torch.randn(1, total_tokens, vocab_size, device='cuda', dtype=torch.float32)
         new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
 
         dynamic_context.initialize_attention_state()
-        # Mask: request 0 = True, request 1 = False, request 2 = True
-        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
-        dynamic_context.active_request_metadata["return_log_probs"][0] = True
-        dynamic_context.active_request_metadata["return_log_probs"][2] = True
+        _set_mask()
 
         log_probs, _ = calculate_log_probs(
-            dynamic_context, logits, new_tokens, log_prob_request_count=2
+            dynamic_context,
+            logits,
+            new_tokens,
+            log_prob_request_count=log_prob_request_count,
         )
 
-        # Request 0 should have log probs (length = request_lengths[0])
-        assert log_probs[0] is not None
-        assert len(log_probs[0]) == request_lengths[0]
+        for i, req_len in enumerate(request_lengths):
+            if i in log_prob_indices:
+                assert log_probs[i] is not None
+                assert len(log_probs[i]) == req_len
+            else:
+                assert log_probs[i] is None
 
-        # Request 1 should be None (masked out)
-        assert log_probs[1] is None
-
-        # Request 2 should have log probs (length = request_lengths[2])
-        assert log_probs[2] is not None
-        assert len(log_probs[2]) == request_lengths[2]
-
-        # Verify request 0's values against reference
+        # Verify values for each masked-in request against reference log_softmax.
         expected = torch.nn.functional.log_softmax(logits.squeeze(0), dim=-1)
-        # Request 0 occupies token positions 0..5
-        prompt_tokens_0 = dynamic_context.token_to_input_ids[: request_lengths[0]]
-        shifted_0 = prompt_tokens_0[1:].tolist() + [new_tokens[0].item()]
-        for j, tok in enumerate(shifted_0):
-            assert abs(log_probs[0][j] - expected[j, tok].item()) < 1e-5
+        token_offset = 0
+        for i, req_len in enumerate(request_lengths):
+            if i in log_prob_indices:
+                tok_view = dynamic_context.token_to_input_ids[token_offset : token_offset + req_len]
+                shifted = tok_view[1:].tolist() + [new_tokens[i].item()]
+                for j, tok in enumerate(shifted):
+                    assert (
+                        abs(log_probs[i][j] - expected[token_offset + j, tok].item()) < 1e-5
+                    )
+            token_offset += req_len
 
-        # ── Decode step with partial mask ──
+        # ── Decode step ──
         active_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
         dynamic_context.update_requests(active_requests_mask=active_mask, new_tokens=new_tokens)
 
@@ -1479,28 +1495,28 @@ class TestDynamicContext:
         decode_new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
 
         dynamic_context.initialize_attention_state()
-        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
-        dynamic_context.active_request_metadata["return_log_probs"][0] = True
-        dynamic_context.active_request_metadata["return_log_probs"][2] = True
+        _set_mask()
 
         decode_log_probs, _ = calculate_log_probs(
-            dynamic_context, decode_logits, decode_new_tokens, log_prob_request_count=2
+            dynamic_context,
+            decode_logits,
+            decode_new_tokens,
+            log_prob_request_count=log_prob_request_count,
         )
 
-        assert decode_log_probs[0] is not None and len(decode_log_probs[0]) == 1
-        assert decode_log_probs[1] is None
-        assert decode_log_probs[2] is not None and len(decode_log_probs[2]) == 1
-
-        # Verify decode values
         decode_expected = torch.nn.functional.log_softmax(decode_logits.squeeze(0), dim=-1)
-        assert (
-            abs(decode_log_probs[0][0] - decode_expected[0, decode_new_tokens[0].item()].item())
-            < 1e-5
-        )
-        assert (
-            abs(decode_log_probs[2][0] - decode_expected[2, decode_new_tokens[2].item()].item())
-            < 1e-5
-        )
+        for i in range(num_active):
+            if i in log_prob_indices:
+                assert decode_log_probs[i] is not None and len(decode_log_probs[i]) == 1
+                assert (
+                    abs(
+                        decode_log_probs[i][0]
+                        - decode_expected[i, decode_new_tokens[i].item()].item()
+                    )
+                    < 1e-5
+                )
+            else:
+                assert decode_log_probs[i] is None
 
     @pytest.mark.internal
     @rounder_override(64)

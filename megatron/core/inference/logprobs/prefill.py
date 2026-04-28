@@ -45,19 +45,22 @@ class LogProbsPrefill:
         padded_count = context.padded_active_request_count
         padded_token_count = context.padded_active_token_count
 
-        request_indices = torch.nonzero_static(
-            context.active_request_metadata["return_log_probs"][:padded_count], size=padded_count
-        ).squeeze(1)
-        last_token_idxs = context.active_request_last_token_idxs[:padded_count]
-        active_query_lengths = context.active_request_query_lengths[:padded_count]
-        masked_lengths = active_query_lengths[request_indices]
+        return_log_probs_mask = context.active_request_metadata["return_log_probs"][:padded_count]
+        active_query_lengths = context.active_request_query_lengths
+        last_token_idxs = context.active_request_last_token_idxs
 
-        # Pad the final element so the total covers padded_token_count.
+        request_indices = torch.nonzero_static(
+            return_log_probs_mask, size=padded_count + 1, fill_value=context.max_requests
+        ).squeeze(1)
+
+        masked_lengths = active_query_lengths[request_indices]
+        masked_ends = last_token_idxs[request_indices]
+
+        # Slack is non-negative because padded_token_count >= sum_real.
         slack = padded_token_count - masked_lengths.sum()
         masked_lengths[-1] = masked_lengths[-1] + slack
 
         cu_masked_lengths = masked_lengths.cumsum(0)
-        masked_ends = last_token_idxs[request_indices]
         logit_indices_offset = torch.repeat_interleave(
             masked_ends - cu_masked_lengths + 1, masked_lengths, output_size=padded_token_count
         )
