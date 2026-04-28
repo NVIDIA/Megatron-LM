@@ -96,7 +96,7 @@ MODEL_ARGS:
   --use-mcore-models: true
   --transformer-impl: transformer_engine
   --export-default-te-spec: true
-  --export-model-type: MambaModel
+  --export-model-type: HybridModel
   --distributed-backend: nccl
   --distributed-timeout-minutes: 20
   # ── Flextron (from train_flextron.sh flex_options, int-lists with ÷8) ─────
