@@ -143,6 +143,8 @@ def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, 
 
     _add_load_convert_hooks(teacher)
 
+    # NOTE: Checkpoint loading now handled in `megatron/training/checkpointing.py`.
+
     return teacher
 
 
