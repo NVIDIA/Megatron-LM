@@ -77,6 +77,11 @@ class KVBlockAllocator:
         )
         self.block_bag[total_count:] = self.dummy_block_idx
 
+        # GPU mirror of the stack pointer.
+        self.total_avail_gpu = torch.tensor(
+            [self.total_avail], dtype=torch.int32, device=device
+        )
+
         if self.enable_prefix_caching:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash.
             # Sized total_count + 1 so the slot at ``dummy_block_idx`` is a no-op
@@ -204,6 +209,7 @@ class KVBlockAllocator:
         self.total_avail -= num_blocks
         block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
         assert num_blocks == block_ids.numel()
+        self.total_avail_gpu.fill_(self.total_avail)
 
         if self.enable_prefix_caching:
             # Initialize ref counts for newly allocated blocks
@@ -255,6 +261,7 @@ class KVBlockAllocator:
             num_blocks = blocks.numel()
             self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
             self.total_avail += num_blocks
+        self.total_avail_gpu.fill_(self.total_avail)
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -279,6 +286,7 @@ class KVBlockAllocator:
         self.block_bag[self.total_count :].fill_(self.dummy_block_idx)
 
         self.total_avail = self.total_count
+        self.total_avail_gpu.fill_(self.total_avail)
 
         if self.enable_prefix_caching:
             # Reset all block hashes
@@ -347,6 +355,17 @@ class KVBlockAllocator:
         # Return blocks to free pool
         self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
         self.total_avail += num_blocks
+        self.total_avail_gpu.fill_(self.total_avail)
+
+    def sync_to_cpu(self) -> None:
+        """Mirror ``total_avail_gpu`` back into the Python int.
+
+        The graphed allocate/release paths mutate ``total_avail_gpu``
+        in-place; eager callers (``add_request``, etc.) read the Python
+        ``total_avail``. Call this once per step (after the graphed
+        bodies finish) so the host-visible counter stays consistent.
+        """
+        self.total_avail = int(self.total_avail_gpu.item())
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.

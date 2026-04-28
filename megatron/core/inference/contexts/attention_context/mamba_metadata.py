@@ -96,6 +96,14 @@ class MambaMetadata:
         self.mamba_state_free_slots[self.max_requests :] = 0
         self.mamba_state_free_slot_count = self.max_requests
 
+        # GPU mirror of the stack pointer and static arange for the graphed release path.
+        self._free_slot_count_gpu = torch.tensor(
+            [self.mamba_state_free_slot_count], dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._free_arange = torch.arange(
+            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
         # Scratch buffer for cumulative chunk counts.
         self._cum_chunks_buffer = torch.zeros(
             self.max_requests + 1, dtype=torch.int64, device=self.device
@@ -127,6 +135,7 @@ class MambaMetadata:
             torch.arange(self.max_requests, dtype=torch.int32, device=torch.cuda.current_device())
         )
         self.mamba_state_free_slot_count = self.max_requests
+        self._free_slot_count_gpu.fill_(self.max_requests)
 
     def reset_varlen_metadata(self) -> None:
         """Resets varlen metadata."""
@@ -344,6 +353,7 @@ class MambaMetadata:
         # Get a free slot
         self.mamba_state_free_slot_count -= 1
         mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
+        self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
 
         return mamba_idx
 
@@ -363,6 +373,7 @@ class MambaMetadata:
         mamba_idx = self.mamba_state_free_slots[
             self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
         ]
+        self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
 
         return mamba_idx
 
@@ -386,9 +397,14 @@ class MambaMetadata:
             end_idx = start_idx + num_to_free
             self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
             self.mamba_state_free_slot_count = end_idx
+            self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
 
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1
+
+    def sync_to_cpu(self) -> None:
+        """Mirror `_free_slot_count_gpu` back into the Python int."""
+        self.mamba_state_free_slot_count = int(self._free_slot_count_gpu.item())
 
 
 class PrefixCachedMambaMetadata(MambaMetadata):
