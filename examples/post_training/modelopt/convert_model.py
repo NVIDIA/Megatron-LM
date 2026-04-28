@@ -20,14 +20,11 @@ from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import (
-    report_current_memory_info,
-    to_empty_if_meta,
-)
+from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
-from megatron.training.arguments import parse_and_validate_args
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
@@ -103,11 +100,14 @@ def check_arguments():
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_convert_args, args_defaults={
+    parse_and_validate_args(
+        extra_args_provider=add_convert_args,
+        args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        })
+        },
+    )
     initialize_megatron()
     check_arguments()
 
@@ -141,10 +141,7 @@ if __name__ == "__main__":
         print_rank_0(
             "Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype))
         )
-        import_kwargs = {
-            "dtype": import_dtype,
-            "moe_router_dtype": args.moe_router_dtype,
-        }
+        import_kwargs = {"dtype": import_dtype, "moe_router_dtype": args.moe_router_dtype}
         if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(

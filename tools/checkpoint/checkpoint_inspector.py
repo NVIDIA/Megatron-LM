@@ -783,8 +783,8 @@ def convert_checkpoint(
     type=str,
     default=None,
     help="Path to a JSON file mapping parameter names to optimizer param group ids. "
-         "Required only if the source checkpoint has multiple optimizer param groups "
-         "(e.g. different LR/weight-decay per group). Leave unset for single-group checkpoints."
+    "Required only if the source checkpoint has multiple optimizer param groups "
+    "(e.g. different LR/weight-decay per group). Leave unset for single-group checkpoints.",
 )
 @click.option(
     "--rename-mtp-keys",

@@ -1,10 +1,21 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
-from megatron.training.config.common_config import RNGConfig, DistributedInitConfig, ProfilingConfig
-from megatron.training.config.training_config import TrainingConfig, ValidationConfig, SchedulerConfig, LoggerConfig, CheckpointConfig
-from megatron.core.optimizer import OptimizerConfig
+
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.training.config.resilience_config import RerunStateMachineConfig, StragglerDetectionConfig
+from megatron.core.optimizer import OptimizerConfig
+from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
+from megatron.training.config.resilience_config import (
+    RerunStateMachineConfig,
+    StragglerDetectionConfig,
+)
+from megatron.training.config.training_config import (
+    CheckpointConfig,
+    LoggerConfig,
+    SchedulerConfig,
+    TrainingConfig,
+    ValidationConfig,
+)
+
 
 @dataclass(kw_only=True)
 class PretrainConfigContainer:

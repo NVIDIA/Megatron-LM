@@ -79,6 +79,7 @@ LINEAR_TYPES = (
     *_TE_TYPES,
 )
 
+
 def _parse_tpe_module_name(module_name: str) -> Tuple[str, int | None, int] | None:
     """Parse a TPE-eligible module name into ``(block, mtp_idx, layer)``.
 
@@ -92,8 +93,7 @@ def _parse_tpe_module_name(module_name: str) -> Tuple[str, int | None, int] | No
     if m := re.fullmatch(r'decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc1', module_name):
         return "decoder", None, int(m.group(1))
     if m := re.fullmatch(
-        r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.mlp\.experts\.linear_fc1',
-        module_name,
+        r'mtp\.layers\.(\d+)\.mtp_model_layer\.layers\.(\d+)\.mlp\.experts\.linear_fc1', module_name
     ):
         return "mtp", int(m.group(1)), int(m.group(2))
     return None
@@ -264,15 +264,25 @@ class ActivationLogger:
 
         lines = []
         for layer, microbatches in sorted(self._decoder_tpe_records.items()):
-            lines.append(json.dumps({
-                "iter": iteration, "block": "decoder",
-                "layer": layer, "tpe": microbatches,
-            }) + "\n")
+            lines.append(
+                json.dumps(
+                    {"iter": iteration, "block": "decoder", "layer": layer, "tpe": microbatches}
+                )
+                + "\n"
+            )
         for (mtp_idx, layer), microbatches in sorted(self._mtp_tpe_records.items()):
-            lines.append(json.dumps({
-                "iter": iteration, "block": "mtp",
-                "mtp_idx": mtp_idx, "layer": layer, "tpe": microbatches,
-            }) + "\n")
+            lines.append(
+                json.dumps(
+                    {
+                        "iter": iteration,
+                        "block": "mtp",
+                        "mtp_idx": mtp_idx,
+                        "layer": layer,
+                        "tpe": microbatches,
+                    }
+                )
+                + "\n"
+            )
 
         with open(filepath, "a") as f:
             f.writelines(lines)

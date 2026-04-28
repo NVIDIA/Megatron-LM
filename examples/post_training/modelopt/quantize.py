@@ -35,18 +35,16 @@ except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
+from utils import get_hf_tokenizer
+
 from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import (
-    print_distributed_quant_summary,
-    report_current_memory_info,
-)
+from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -240,7 +238,9 @@ def get_modelopt_torch_quantization_config():
         mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp4_config})
     if "AWQ" in args.export_quant_cfg:
         try:
-            weight_quantizer = mtq.find_quant_cfg_entry_by_path(mtq_config["quant_cfg"], "*weight_quantizer")
+            weight_quantizer = mtq.find_quant_cfg_entry_by_path(
+                mtq_config["quant_cfg"], "*weight_quantizer"
+            )
             weight_quantizer["block_sizes"][-1] = 128
         except KeyError:
             weight_quantizer = None
@@ -306,7 +306,9 @@ def get_calib_dataloader(
                 elif isinstance(sample, dict) and "messages" in sample:
                     conversations = sample["messages"]
                     assert "role" in conversations[0] and "content" in conversations[0]
-                    full_text = "".join([f"{msg['role']}: {msg['content']}" for msg in conversations])
+                    full_text = "".join(
+                        [f"{msg['role']}: {msg['content']}" for msg in conversations]
+                    )
                 elif isinstance(sample, list) and isinstance(sample[0], dict):
                     assert "role" in sample[0] and "content" in sample[0]
                     full_text = "".join([f"{msg['role']}: {msg['content']}" for msg in sample])
@@ -314,23 +316,36 @@ def get_calib_dataloader(
                     raise ValueError(f"Sample {i} has unexpected format")
 
                 # Slice text
-                max_text_length = int(max_sequence_length / 0.75)  # tokenized text is roughtly ~75% length of original
+                max_text_length = int(
+                    max_sequence_length / 0.75
+                )  # tokenized text is roughtly ~75% length of original
                 start_idx = 0
                 if use_random_offset and len(full_text) > max_text_length:
                     start_idx = random.randint(0, len(full_text) - max_text_length)
                 text = full_text[start_idx : start_idx + max_text_length]
                 all_texts.append(text)
 
-        print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(all_texts)} samples")
+        print_rank_0(
+            f"Loaded calibration dataset ({dataset_path_or_name}) with {len(all_texts)} samples"
+        )
         print_rank_0(f"Actual num samples: {len(all_texts)}, max seq length: {max_sequence_length}")
-        print_rank_0(f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}")
+        print_rank_0(
+            f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}"
+        )
 
         # Tokenize all texts at once and move to device
         tokens = tokenizer(
-            all_texts, return_tensors="pt", padding="max_length", max_length=max_sequence_length, truncation=True
+            all_texts,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
         )
         all_input_ids = tokens.input_ids.cuda()
-        return [{"input_ids": all_input_ids[i:i+batch_size]} for i in range(0, len(all_input_ids), batch_size)]
+        return [
+            {"input_ids": all_input_ids[i : i + batch_size]}
+            for i in range(0, len(all_input_ids), batch_size)
+        ]
     else:
         # HuggingFace dataset
         if use_random_offset:
@@ -347,11 +362,14 @@ def get_calib_dataloader(
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_text_generate_ptq_args, args_defaults={
+    parse_and_validate_args(
+        extra_args_provider=add_text_generate_ptq_args,
+        args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
             "no_load_rng": True,
             "no_load_optim": True,
-        })
+        },
+    )
     initialize_megatron()
 
     check_arguments()
@@ -447,6 +465,7 @@ if __name__ == "__main__":
 
     # Free calibration/quantization memory before generate
     import gc
+
     gc.collect()
     torch.cuda.empty_cache()
 

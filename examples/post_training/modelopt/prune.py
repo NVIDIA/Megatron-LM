@@ -20,6 +20,7 @@ import modelopt.torch.opt as mto
 import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
+from utils import get_hf_tokenizer
 
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
@@ -29,12 +30,9 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import (
-    report_current_memory_info,
-)
+from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
@@ -150,11 +148,14 @@ def get_params(model):
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_prune_args, args_defaults={
+    parse_and_validate_args(
+        extra_args_provider=add_prune_args,
+        args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
             "no_load_rng": True,
             "no_load_optim": True,
-        })
+        },
+    )
     initialize_megatron()
 
     args = get_args()

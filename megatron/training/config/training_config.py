@@ -642,5 +642,6 @@ class CheckpointConfig:
             )
 
         if self.verify_integrity:
-            assert self.ckpt_format == "torch_dist", \
-                f"`verify_integrity` is only supported with torch_dist checkpoint format."
+            assert (
+                self.ckpt_format == "torch_dist"
+            ), f"`verify_integrity` is only supported with torch_dist checkpoint format."

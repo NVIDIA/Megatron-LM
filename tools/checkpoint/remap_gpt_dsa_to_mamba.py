@@ -153,7 +153,9 @@ def main() -> None:
         help="Path to the source GPTModel DCP checkpoint directory.",
     )
     parser.add_argument(
-        "--output", required=True, type=Path,
+        "--output",
+        required=True,
+        type=Path,
         help="Destination path for the HybridModel DCP checkpoint.",
     )
     parser.add_argument(

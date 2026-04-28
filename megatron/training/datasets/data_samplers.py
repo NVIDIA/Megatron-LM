@@ -51,7 +51,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
             data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size())
+            data_parallel_size=mpu.get_data_parallel_world_size(),
+        )
     elif args.dataloader_type == 'single':
         if args.hybrid_context_parallel:
             batch_sampler = HybridCPMegatronPretrainingSampler(
@@ -105,7 +106,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
     # Torch dataloader.
-    if args.dynamic_context_parallel:
+    if args.hybrid_context_parallel:
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
@@ -190,6 +191,69 @@ class MegatronPretrainingSampler:
             yield batch[start_idx:end_idx]
 
 
+class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
+    """
+    Data sampler for hybrid context parallel (Hybrid CP) format.
+    This data sampler pulls in the entire global batch at once across all data parallel ranks.
+    This helps provide the Hybrid CP Dataloader Wrapper to schedule and load balance sub-samples
+    of the entire global batch.
+    """
+
+    def __init__(
+        self,
+        total_samples,
+        consumed_samples,
+        micro_batch_size,
+        global_batch_size,
+        data_parallel_rank,
+        data_parallel_size,
+        drop_last=True,
+    ):
+        super().__init__(
+            total_samples,
+            consumed_samples,
+            micro_batch_size,
+            data_parallel_rank,
+            data_parallel_size,
+            drop_last,
+        )
+        self.global_batch_size = global_batch_size
+        self.data_parallel_size = data_parallel_size
+        self.num_micro_batches = self.global_batch_size // self.micro_batch_times_data_parallel_size
+
+    def __len__(self):
+        return self.total_samples
+
+    def get_start_end_idx_global_batch(self):
+        start_idx = [
+            self.data_parallel_rank * self.micro_batch_size
+            + i * self.micro_batch_size * self.data_parallel_size
+            for i in range(self.num_micro_batches)
+        ]
+        end_idx = [start_idx[i] + self.micro_batch_size for i in range(self.num_micro_batches)]
+        return start_idx, end_idx
+
+    def __iter__(self):
+        batch = []
+        # Last batch will be dropped if drop_last is not set False
+        for idx in range(self.consumed_samples, self.total_samples):
+            batch.append(idx)
+            if len(batch) == self.micro_batch_times_data_parallel_size * self.num_micro_batches:
+                start_idx, end_idx = self.get_start_end_idx_global_batch()
+                global_batch_idx = []
+                for i in range(self.num_micro_batches):
+                    global_batch_idx.extend(batch[start_idx[i] : end_idx[i]])
+                yield global_batch_idx
+                batch = []
+
+        # Check the last partial batch and see drop_last is set
+        if len(batch) > 0 and not self.drop_last:
+            start_idx, end_idx = self.get_start_end_idx_global_batch()
+            global_batch_idx = []
+            for i in range(self.num_micro_batches):
+                global_batch_idx.extend(batch[start_idx[i] : end_idx[i]])
+            yield global_batch_idx
+
 
 class MegatronFullValidationSampler:
     """Sampler for full validation that handles small datasets gracefully.
@@ -209,8 +273,9 @@ class MegatronFullValidationSampler:
         # Sanity checks
         assert self.total_samples > 0, f'no sample to consume: {self.total_samples}'
         assert data_parallel_size > 0
-        assert self.data_parallel_rank < data_parallel_size, \
-            f'data_parallel_rank should be smaller than data size: {self.data_parallel_rank}, {data_parallel_size}'
+        assert (
+            self.data_parallel_rank < data_parallel_size
+        ), f'data_parallel_rank should be smaller than data size: {self.data_parallel_rank}, {data_parallel_size}'
 
     def __len__(self):
         """Returns the number of batches this rank will yield."""

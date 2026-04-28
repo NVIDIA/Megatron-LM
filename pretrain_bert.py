@@ -7,22 +7,6 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 
-from megatron.training import get_args
-from megatron.training import print_rank_0
-from megatron.training import get_timers
-from megatron.core import tensor_parallel
-from megatron.core.enums import ModelType
-from megatron.core.models.bert.bert_model import BertModel
-from megatron.training import pretrain
-from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
-from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
 from megatron.core.datasets.bert_dataset import (
     BERTMaskedWordPieceDataset,
@@ -39,6 +23,7 @@ from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.utils import average_losses_across_data_parallel_group
 
@@ -196,6 +181,10 @@ if __name__ == "__main__":
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     full_config = pretrain_cfg_container_from_args(args)
-    pretrain(full_config, train_valid_test_datasets_provider, model_provider,
-             ModelType.encoder_or_decoder,
-             forward_step)
+    pretrain(
+        full_config,
+        train_valid_test_datasets_provider,
+        model_provider,
+        ModelType.encoder_or_decoder,
+        forward_step,
+    )

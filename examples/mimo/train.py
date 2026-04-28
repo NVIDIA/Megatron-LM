@@ -9,8 +9,6 @@ import sys
 from functools import partial
 from typing import Any, Dict, Iterator
 
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.arguments import parse_and_validate_args
 import torch
 
 from megatron.core.parallel_state import (
@@ -21,6 +19,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_src_rank,
 )
 from megatron.training import get_args, pretrain, print_rank_0
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(

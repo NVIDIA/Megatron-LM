@@ -12,6 +12,7 @@ from megatron.training import get_args, print_rank_0
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
@@ -22,7 +23,12 @@ import megatron.legacy.model  # isort: skip
 
 
 def model_provider(
-    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
+    model_builder: Callable,
+    pre_process=True,
+    post_process=True,
+    vp_stage: Optional[int] = None,
+    config=None,
+    pg_collection=None,
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel, HybridModel]:
     """Builds the model.
 
@@ -60,7 +66,9 @@ def model_provider(
         # [ModelOpt]: Use custom builder + spec when modelopt is enabled
         model_builder = modelopt_gpt_hybrid_builder
 
-    return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
+    return model_builder(
+        args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection
+    )
 
 
 def count_parameters_in_layer(model, layer_name):

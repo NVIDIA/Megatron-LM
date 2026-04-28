@@ -26,8 +26,8 @@ from megatron.core.models.T5.t5_spec import (
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from pretrain_gpt import loss_func
 
 """

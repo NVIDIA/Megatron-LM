@@ -11,6 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 import torch
 from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidation
+from utils import get_hf_tokenizer
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
@@ -18,20 +19,16 @@ from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from utils import get_hf_tokenizer
 from megatron.training.utils import print_rank_0, unwrap_model
 from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
 
-
 def add_ar_validation_args(parser):
     """Add additional arguments for ModelOpt acceptance rate validation."""
     group = parser.add_argument_group(title='ModelOpt ar validation')
-    group.add_argument(
-        "--osl", type=int, default=64, help="Output sequence length."
-    )
+    group.add_argument("--osl", type=int, default=64, help="Output sequence length.")
     parser.add_argument(
         "--prompts-path",
         type=str,
@@ -39,14 +36,9 @@ def add_ar_validation_args(parser):
         help="Path to the prompts json file. If not provided, MTBench will be used.",
     )
     parser.add_argument(
-        "--ground-truth-path",
-        type=str,
-        default=None,
-        help="Path to the ground truth pt file.",
+        "--ground-truth-path", type=str, default=None, help="Path to the ground truth pt file."
     )
-    parser.add_argument(
-        "--steps", type=int, default=1, help="Only used in EAGLE."
-    )
+    parser.add_argument("--steps", type=int, default=1, help="Only used in EAGLE.")
     parser.add_argument(
         "--save-ground-truth-path",
         type=str,
@@ -87,14 +79,15 @@ def report_current_memory_info():
     torch.distributed.barrier()
 
 
-
-
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_ar_validation_args, args_defaults={
+    parse_and_validate_args(
+        extra_args_provider=add_ar_validation_args,
+        args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        })
+        },
+    )
     initialize_megatron()
 
     check_arguments()
@@ -115,14 +108,15 @@ if __name__ == "__main__":
         ground_truth = [None for _ in range(len(prompts))]
 
     tokenizer = get_hf_tokenizer()
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
+    )
 
     report_current_memory_info()
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
-
 
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()
@@ -135,7 +129,7 @@ if __name__ == "__main__":
         gt.append(output[0])
         ar.append(output[1])
     print_rank_0("Acceptance Rate: " + str(ar))
-    print_rank_0("Average: " + str(sum(ar)/len(ar)))
+    print_rank_0("Average: " + str(sum(ar) / len(ar)))
 
     if args.save_ground_truth_path is not None:
         torch.save(gt, args.save_ground_truth_path)

@@ -13,6 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import datasets
 import torch
 import transformers
+from utils import get_hf_tokenizer
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
@@ -27,7 +28,6 @@ from megatron.training.utils import (
     get_ltor_masks_and_position_ids,
     print_rank_0,
 )
-from utils import get_hf_tokenizer
 from model_provider import model_provider
 
 REMOVE_THINK_CHAT_TEMPLATE = (
@@ -38,11 +38,15 @@ REMOVE_THINK_CHAT_TEMPLATE = (
 def add_finetune_args(parser):
     """Add additional arguments for finetune."""
     group = parser.add_argument_group(title='Finetune')
-    group.add_argument("--offline-distillation-data", type=str, help="Path to the offline dataset directory with base model features.")
-
+    group.add_argument(
+        "--offline-distillation-data",
+        type=str,
+        help="Path to the offline dataset directory with base model features.",
+    )
 
     add_modelopt_args(parser)
     return parser
+
 
 def get_eos_id():
     """Return the eos token id.
@@ -83,6 +87,7 @@ class OfflineDataset(torch.utils.data.Dataset):
         sample = torch.load(file_path)
         return sample
 
+
 class SFTDataset(torch.utils.data.Dataset):
 
     hf_dataset_to_kwargs = {
@@ -105,7 +110,7 @@ class SFTDataset(torch.utils.data.Dataset):
     }
 
     hf_dataset_to_prompt_template = {
-        "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}",
+        "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}"
     }
 
     @classmethod
@@ -161,13 +166,11 @@ class SFTDataset(torch.utils.data.Dataset):
             REMOVE_THINK_CHAT_TEMPLATE, ""
         )
 
-        hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
-            self.hf_dataset, {"split": "train"}
+        hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(self.hf_dataset, {"split": "train"})
+        self._raw_samples = datasets.load_dataset(
+            self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs
         )
-        self._raw_samples = datasets.load_dataset(self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs)
-        self._raw_samples = self._raw_samples.shard(
-            num_shards=self.num_shards, index=shard_index
-        )
+        self._raw_samples = self._raw_samples.shard(num_shards=self.num_shards, index=shard_index)
 
         print(
             "Rank {:3}/{:3} creates SFT data shard {:3}/{:3} with {:10} raw samples".format(
@@ -349,9 +352,15 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
 
     if args.export_offline_model:
-        train_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0])
-        valid_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1])
-        test_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2])
+        train_ds = OfflineDataset(
+            os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0]
+        )
+        valid_ds = OfflineDataset(
+            os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1]
+        )
+        test_ds = OfflineDataset(
+            os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2]
+        )
 
         print_rank_0("> finished creating offline SFT datasets ...")
     else:
@@ -398,13 +407,14 @@ def get_batch(data_iterator):
         datatype = torch.int64
         data_b = tensor_parallel.broadcast_data(keys, data, datatype)
         data_b["loss_mask"] = torch.ones_like(data_b["input_ids"])
-        data_b["loss_mask"][data_b["loss_mask"]==get_eos_id()] = 0
-        data_b["loss_mask"] = torch.cat([data_b["loss_mask"], torch.zeros(1,1).to(torch.cuda.current_device())], dim=-1)
+        data_b["loss_mask"][data_b["loss_mask"] == get_eos_id()] = 0
+        data_b["loss_mask"] = torch.cat(
+            [data_b["loss_mask"], torch.zeros(1, 1).to(torch.cuda.current_device())], dim=-1
+        )
 
         keys = ["aux_hidden_states", "hidden_states"]
         datatype = torch.bfloat16
         feature_b = tensor_parallel.broadcast_data(keys, data, datatype)
-
 
     # Unpack the data received.
     tokens_ = data_b["input_ids"]
@@ -414,10 +424,15 @@ def get_batch(data_iterator):
 
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens, get_eos_id(), get_eos_id(), args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss, False
+        tokens,
+        get_eos_id(),
+        get_eos_id(),
+        args.reset_position_ids,
+        args.reset_attention_mask,
+        args.eod_mask_loss,
+        False,
     )
     loss_mask = loss_mask * answer_only_loss_mask.to(dtype=loss_mask.dtype)
-
 
     labels = labels.contiguous()
     loss_mask = loss_mask.contiguous()
@@ -431,8 +446,10 @@ def get_batch(data_iterator):
     }
 
     if args.export_offline_model:
-        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[:args.seq_length]
-        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:args.seq_length]
+        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[
+            : args.seq_length
+        ]
+        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
@@ -448,7 +465,6 @@ def non_loss_data_func(model: GPTModel):
             report_draft_acceptance_length(model)
         except Exception as e:
             print(e)
-
 
 
 def forward_step(data_iterator, model: GPTModel):
@@ -476,7 +492,14 @@ def forward_step(data_iterator, model: GPTModel):
     timers("batch-generator").stop()
 
     if args.export_offline_model:
-        output_tensor = model(tokens, position_ids, attention_mask, labels=labels, aux_hidden_states=aux_hidden_states, hidden_states=hidden_states,)
+        output_tensor = model(
+            tokens,
+            position_ids,
+            attention_mask,
+            labels=labels,
+            aux_hidden_states=aux_hidden_states,
+            hidden_states=hidden_states,
+        )
     else:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 

@@ -29,29 +29,47 @@ def add_extract_args(parser):
     add_modelopt_args(parser)
     return parser
 
+
 def extract_feature(dataset, model, output_dir, idx_start, idx_end):
     os.makedirs(output_dir, exist_ok=True)
-    for i in range(idx_start + mpu.get_expert_data_parallel_rank(), idx_end, mpu.get_expert_data_parallel_world_size()):
+    for i in range(
+        idx_start + mpu.get_expert_data_parallel_rank(),
+        idx_end,
+        mpu.get_expert_data_parallel_world_size(),
+    ):
         file_name = "{:08d}.pt".format(i - idx_start)
         file_path = os.path.join(output_dir, file_name)
         if not os.path.exists(file_path):
-            input_ids = dataset[i]["input_ids"][:dataset.seq_length].unsqueeze(0).to(torch.cuda.current_device())
+            input_ids = (
+                dataset[i]["input_ids"][: dataset.seq_length]
+                .unsqueeze(0)
+                .to(torch.cuda.current_device())
+            )
             output = model(input_ids, return_eagle_inputs=True)
-            if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_expert_model_parallel_rank() == 0:
+            if (
+                mpu.get_tensor_model_parallel_rank() == 0
+                and mpu.get_expert_model_parallel_rank() == 0
+            ):
                 torch.save(output, file_path)
             torch.distributed.barrier()
 
+
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_extract_args, args_defaults={
+    parse_and_validate_args(
+        extra_args_provider=add_extract_args,
+        args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        })
+        },
+    )
     initialize_megatron()
 
     args = get_args()
     tokenizer = get_tokenizer()
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
+    )
 
     load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
     print_rank_0("Done loading checkpoint")
@@ -69,8 +87,24 @@ if __name__ == "__main__":
     }
     sft_dataset = SFTDataset(args.num_samples, None, **kwargs)
 
-    extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "train"), 0, int(args.num_samples * 0.98))
-    extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "valid"), int(args.num_samples * 0.98), int(args.num_samples * 0.99))
-    extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "test"), int(args.num_samples * 0.99), args.num_samples)
-
-
+    extract_feature(
+        sft_dataset,
+        unwrapped_model,
+        os.path.join(args.output_dir, "train"),
+        0,
+        int(args.num_samples * 0.98),
+    )
+    extract_feature(
+        sft_dataset,
+        unwrapped_model,
+        os.path.join(args.output_dir, "valid"),
+        int(args.num_samples * 0.98),
+        int(args.num_samples * 0.99),
+    )
+    extract_feature(
+        sft_dataset,
+        unwrapped_model,
+        os.path.join(args.output_dir, "test"),
+        int(args.num_samples * 0.99),
+        args.num_samples,
+    )

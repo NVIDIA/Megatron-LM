@@ -1,12 +1,12 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
-from model_provider import count_parameters_in_layer
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+from model_provider import count_parameters_in_layer
 
 
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):

@@ -1,33 +1,39 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import ast
+import builtins
 import dataclasses
-import typing
-import types
-from typing import Any, Callable, Optional
-from argparse import ArgumentParser, _ArgumentGroup, Namespace
+import enum
 import inspect
 import itertools
-import builtins
-import ast
-import enum
+import types
+import typing
+from argparse import ArgumentParser, Namespace, _ArgumentGroup
 from dataclasses import Field, fields
+from typing import Any, Callable, Optional
 
 from megatron.training.config import (
-    DistributedInitConfig, 
-    PretrainConfigContainer, 
-    SchedulerConfig, 
-    TrainingConfig, 
-    ValidationConfig, 
-    RNGConfig, 
+    CheckpointConfig,
+    DistributedInitConfig,
     LoggerConfig,
+    PretrainConfigContainer,
+    ProfilingConfig,
+    RerunStateMachineConfig,
+    RNGConfig,
+    SchedulerConfig,
     StragglerDetectionConfig,
-    RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
+    TrainingConfig,
+    ValidationConfig,
 )
+
 # TODO: support arg renames
+
 
 class TypeInferenceError(Exception):
     """Custom exception type to be conditionally handled by ArgumentGroupFactory."""
+
     pass
+
 
 class ArgumentGroupFactory:
     """Utility that adds an argument group to an ArgumentParser based on the attributes of a dataclass.
@@ -35,7 +41,7 @@ class ArgumentGroupFactory:
     This utility uses dataclass metadata including type annotations and docstrings to automatically
         infer the type, default, and other argparse keyword arguments.
 
-    You can override or supplement the automatically inferred argparse kwargs for any 
+    You can override or supplement the automatically inferred argparse kwargs for any
         dataclass field by providing an "argparse_meta" key in the field's metadata dict.
         The value should be a dict of kwargs that will be passed to ArgumentParser.add_argument().
         These metadata kwargs take precedence over the automatically inferred values.
@@ -64,13 +70,13 @@ class ArgumentGroupFactory:
         that require some customized or additional handling.
 
     Args:
-        src_cfg_class: The source dataclass type (not instance) whose fields will be 
-            converted into command-line arguments. Each field's type annotation determines 
-            the argument type, default values become argument defaults, and field-level 
+        src_cfg_class: The source dataclass type (not instance) whose fields will be
+            converted into command-line arguments. Each field's type annotation determines
+            the argument type, default values become argument defaults, and field-level
             docstrings are extracted to populate argument help text.
-        exclude: Optional list of attribute names from `src_cfg_class` to exclude from 
+        exclude: Optional list of attribute names from `src_cfg_class` to exclude from
             argument generation. Useful for omitting internal fields, computed properties,
-            or attributes that should be configured through other means. If None, all 
+            or attributes that should be configured through other means. If None, all
             dataclass fields will be converted to command-line arguments. Default: None.
     """
 
@@ -84,7 +90,7 @@ class ArgumentGroupFactory:
 
         Args:
             config_attr_name: dataclass attribute name
-            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool 
+            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool
                 settings that are default True. A hyphen is added after the prefix. Default: None
         """
         arg_name = config_attr_name
@@ -99,6 +105,7 @@ class ArgumentGroupFactory:
         With these settings, the user must provide a valid enum value, e.g.
             'flash', for `AttnBackend.flash`.
         """
+
         def enum_type_handler(cli_arg):
             return config_type[cli_arg]
 
@@ -122,7 +129,9 @@ class ArgumentGroupFactory:
 
         if origin in [types.UnionType, typing.Union]:
             # Handle Optional and Union
-            if type_tuple[1] == type(None): # Optional type. First element is value inside Optional[]
+            if type_tuple[1] == type(
+                None
+            ):  # Optional type. First element is value inside Optional[]
                 return self._extract_type(type_tuple[0])
             else:
                 raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
@@ -133,16 +142,19 @@ class ArgumentGroupFactory:
                 kwargs["nargs"] = "+"
                 return kwargs
             else:
-                raise TypeInferenceError(f"Multi-type lists not supported by argparse: {config_type}")
+                raise TypeInferenceError(
+                    f"Multi-type lists not supported by argparse: {config_type}"
+                )
 
         elif origin is typing.Literal:
             choices_types = [type(choice) for choice in type_tuple]
-            assert all([t == choices_types[0] for t in choices_types]), "Type of each choice in a Literal type should all be the same."
+            assert all(
+                [t == choices_types[0] for t in choices_types]
+            ), "Type of each choice in a Literal type should all be the same."
             kwargs = {"type": choices_types[0], "choices": type_tuple}
             return kwargs
         else:
             raise TypeInferenceError(f"Unsupported type: {config_type}")
-
 
     def _build_argparse_kwargs_from_field(self, attribute: Field) -> dict[str, Any]:
         """Assemble kwargs for add_argument().
@@ -153,7 +165,9 @@ class ArgumentGroupFactory:
         argparse_kwargs = {}
         argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
         argparse_kwargs["dest"] = attribute.name
-        argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
+        argparse_kwargs["help"] = (
+            self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
+        )
 
         # dataclasses specifies that both should not be set
         if isinstance(attribute.default, type(dataclasses.MISSING)):
@@ -167,7 +181,6 @@ class ArgumentGroupFactory:
             # save metadata here, but update at the end so the metadata has highest precedence
             attr_argparse_meta = attribute.metadata["argparse_meta"]
 
-
         # if we cannot infer the argparse type, all of this logic may fail. we try to defer
         # to the developer-specified metadata if present
         try:
@@ -175,12 +188,17 @@ class ArgumentGroupFactory:
 
             # use store_true or store_false action for enable/disable flags, which doesn't accept a 'type'
             if argparse_kwargs["type"] == bool:
-                argparse_kwargs["action"] = "store_true" if attribute.default == False else "store_false"
+                argparse_kwargs["action"] = (
+                    "store_true" if attribute.default == False else "store_false"
+                )
                 argparse_kwargs.pop("type")
 
                 # add '--no-*' and '--disable-*' prefix if this is a store_false argument
                 if argparse_kwargs["action"] == "store_false":
-                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
+                    argparse_kwargs["arg_names"] = [
+                        self._format_arg_name(attribute.name, prefix="no"),
+                        self._format_arg_name(attribute.name, prefix="disable"),
+                    ]
         except TypeInferenceError as e:
             if attr_argparse_meta is not None:
                 print(
@@ -192,7 +210,7 @@ class ArgumentGroupFactory:
             else:
                 raise e
 
-        # metadata provided by field takes precedence 
+        # metadata provided by field takes precedence
         if attr_argparse_meta is not None:
             argparse_kwargs.update(attr_argparse_meta)
 
@@ -242,8 +260,12 @@ class ArgumentGroupFactory:
 
             if a_cond and b_cond:
                 # These should be guaranteed by typechecks above, but assert just in case
-                assert isinstance(a.target.id, str), "Dataclass attribute not in the expected format. Name is not a string."
-                assert isinstance(b.value.value, str), "Dataclass attribute docstring is not a string."
+                assert isinstance(
+                    a.target.id, str
+                ), "Dataclass attribute not in the expected format. Name is not a string."
+                assert isinstance(
+                    b.value.value, str
+                ), "Dataclass attribute docstring is not a string."
 
                 # Formatting
                 docstring = inspect.cleandoc(b.value.value)
@@ -277,6 +299,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
     else:
         return kwargs
 
+
 def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
@@ -309,7 +332,6 @@ def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer
         logger=_default_config_from_args(LoggerConfig, args),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=ProfilingConfig(**prof_kwargs),
-
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
     )
