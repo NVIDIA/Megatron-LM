@@ -436,3 +436,59 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
 
         assert metadata_context.device_decode_prefill is None
+
+    # -------------------------------------------------------------------------
+    # Scenario 5: Paused requests (non-zero active slot IDs)
+    # -------------------------------------------------------------------------
+
+    @pytest.mark.internal
+    def test_update_with_paused_requests_local_seq_idx(self, metadata_context):
+        """seq_idx is 0-based local even when active mamba slots start above 0.
+
+        Regression: paused requests can hold low-numbered mamba slots, so the
+        active prefill requests sit at non-zero absolute slot IDs. The kernel
+        consumes its own input slice, so seq_idx must be local indices
+        (0, 1, ...) even though batch_indices_prefill carries the absolute IDs.
+        """
+        metadata = metadata_context
+        max_requests = metadata.max_requests
+        device = metadata.device
+
+        # Two active prefill requests of lengths 10 and 20 occupy mamba slots 2
+        # and 3; slots 0 and 1 simulate paused requests.
+        active_mamba_indices = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
+        active_mamba_indices[:2] = torch.tensor([2, 3], dtype=torch.int32, device=device)
+
+        cu_values = [0, 10, 30] + [30] * (max_requests + 1 - 3)
+        cu_seqlens = torch.tensor(cu_values, dtype=torch.int32, device=device)
+
+        real_decode_count_gpu = torch.tensor([0], dtype=torch.int32, device=device)
+        real_prefill_count_gpu = torch.tensor([2], dtype=torch.int32, device=device)
+        arange_buf = torch.arange(max_requests, dtype=torch.int32, device=device)
+
+        padded_dims = InferenceBatchDimensions(
+            token_count=30, prefill_req_count=2, decode_req_count=0
+        )
+
+        metadata.update(
+            active_mamba_indices=active_mamba_indices,
+            cu_seqlens=cu_seqlens,
+            real_decode_count_gpu=real_decode_count_gpu,
+            real_prefill_count_gpu=real_prefill_count_gpu,
+            arange_buf=arange_buf,
+            padded_batch_dimensions=padded_dims,
+        )
+
+        # Absolute slot IDs preserved in batch_indices_prefill.
+        expected_prefill = torch.tensor([2, 3], dtype=torch.int32, device=device)
+        assert torch.equal(metadata.batch_indices_prefill, expected_prefill)
+
+        # seq_idx is 0-based local (0s for the first request, 1s for the second).
+        expected_seq_idx = torch.cat(
+            [
+                torch.zeros((1, 10), dtype=torch.int32, device=device),
+                torch.ones((1, 20), dtype=torch.int32, device=device),
+            ],
+            dim=1,
+        )
+        assert torch.equal(metadata.seq_idx, expected_seq_idx)

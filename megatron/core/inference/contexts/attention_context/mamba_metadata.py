@@ -13,6 +13,11 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
 class MambaMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
+    # Default values for fields populated only by `PrefixCachedMambaMetadata`.
+    intermediate_chunk_indices: Optional[torch.Tensor] = None
+    intermediate_abs_positions: Optional[torch.Tensor] = None
+    conv_gather_offsets: Optional[torch.Tensor] = None
+
     def __init__(
         self, max_requests: int, max_tokens: int, mamba_chunk_size: int = 128, d_conv: int = 0
     ):
@@ -121,6 +126,7 @@ class MambaMetadata:
         self.batch_indices_decode = None
         self.batch_indices_prefill = None
         self.cu_seqlens = None
+        self.cum_chunks = None
         self.seq_idx = None
         self.device_decode_prefill = None
 
@@ -131,12 +137,6 @@ class MambaMetadata:
         self.conv_seq_idx = None
         self.conv_seq_start = None
 
-
-        # Intermediate state extraction (overridden by PrefixCachedMambaMetadata).
-        self.intermediate_chunk_indices = None
-        self.intermediate_abs_positions = None
-        self.conv_gather_offsets = None
-
     def update(
         self,
         active_mamba_indices: torch.Tensor,
@@ -145,7 +145,8 @@ class MambaMetadata:
         real_prefill_count_gpu: torch.Tensor,
         arange_buf: torch.Tensor,
         padded_batch_dimensions: InferenceBatchDimensions,
-        **kwargs,
+        intermediate_offsets_gpu: Optional[torch.Tensor] = None,
+        intermediate_counts_gpu: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Updates the dedicated mapping tensor with the indices of currently active requests.
@@ -169,6 +170,10 @@ class MambaMetadata:
                 least as long as the largest padded request count.
                 Paired with the GPU scalars to produce padding masks without a data-dependent shape.
             padded_batch_dimensions (InferenceBatchDimensions): Padded decode/prefill/token counts.
+            intermediate_offsets_gpu (Optional[Tensor]): Slot-allocator buffer of
+                intermediate-state offsets. Forwarded to `_update_intermediate_metadata`,
+                which is a no-op on this base class. `PrefixCachedMambaMetadata` consumes it.
+            intermediate_counts_gpu (Optional[Tensor]): Companion to `intermediate_offsets_gpu`.
         """
         padded_decode_count = padded_batch_dimensions.decode_req_count
         padded_prefill_count = padded_batch_dimensions.prefill_req_count
@@ -231,7 +236,8 @@ class MambaMetadata:
             n_chunks = torch.clamp((seq_lens + chunk_size - 1) // chunk_size, min=1)
 
             torch.cumsum(n_chunks, dim=0, out=self._cum_chunks_buffer[1 : padded_prefill_count + 1])
-            cum_chunks = self._cum_chunks_buffer[: padded_prefill_count + 1]
+            self.cum_chunks = self._cum_chunks_buffer[: padded_prefill_count + 1]
+            cum_chunks = self.cum_chunks
 
             self._last_chunk_indices_buffer[:padded_prefill_count] = cum_chunks[1:] - 1
 
@@ -287,6 +293,15 @@ class MambaMetadata:
             self.conv_seq_idx = self._conv_seq_idx_buffer[:padded_token_count]
             self.conv_seq_start = self._conv_seq_start_buffer[:padded_token_count]
 
+            self._update_intermediate_metadata(
+                intermediate_offsets_gpu=intermediate_offsets_gpu,
+                intermediate_counts_gpu=intermediate_counts_gpu,
+                real_decode_count_gpu=real_decode_count_gpu,
+                real_prefill_count_gpu=real_prefill_count_gpu,
+                arange_buf=arange_buf,
+                padded_prefill_count=padded_prefill_count,
+            )
+
         if padded_decode_count > 0 and padded_prefill_count > 0:
             self._device_decode_prefill_buffer[0] = cu_seqlens[real_decode_count_gpu]
             self._device_decode_prefill_buffer[1] = (
@@ -294,6 +309,20 @@ class MambaMetadata:
                 - cu_seqlens[real_decode_count_gpu]
             )
             self.device_decode_prefill = self._device_decode_prefill_buffer
+
+    def _update_intermediate_metadata(
+        self,
+        intermediate_offsets_gpu: Optional[torch.Tensor],
+        intermediate_counts_gpu: Optional[torch.Tensor],
+        real_decode_count_gpu: torch.Tensor,
+        real_prefill_count_gpu: torch.Tensor,
+        arange_buf: torch.Tensor,
+        padded_prefill_count: int,
+    ) -> None:
+        """Hook called from `update` after base prefill metadata is built.
+
+        No-op on the base class. `PrefixCachedMambaMetadata` overrides this.
+        """
 
     def allocate_slot(self) -> Optional[int]:
         """
@@ -397,31 +426,6 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         super().reset_varlen_metadata()
         self._reset_intermediate_state()
 
-    def update(self, *args, **kwargs) -> None:
-        intermediate_offsets_gpu = kwargs.pop("intermediate_offsets_gpu", None)
-        intermediate_counts_gpu = kwargs.pop("intermediate_counts_gpu", None)
-        super().update(*args, **kwargs)
-
-        real_decode_count_gpu = args[2] if len(args) > 2 else kwargs.get("real_decode_count_gpu")
-        real_prefill_count_gpu = (
-            args[3] if len(args) > 3 else kwargs.get("real_prefill_count_gpu")
-        )
-        arange_buf = args[4] if len(args) > 4 else kwargs.get("arange_buf")
-        padded_batch_dimensions = (
-            args[5] if len(args) > 5 else kwargs.get("padded_batch_dimensions")
-        )
-        padded_prefill_count = padded_batch_dimensions.prefill_req_count
-
-        if padded_prefill_count > 0:
-            self._update_intermediate_metadata(
-                intermediate_offsets_gpu,
-                intermediate_counts_gpu,
-                real_decode_count_gpu,
-                real_prefill_count_gpu,
-                arange_buf,
-                padded_prefill_count,
-            )
-
     def _update_intermediate_metadata(
         self,
         intermediate_offsets_gpu: Optional[torch.Tensor],
@@ -433,8 +437,9 @@ class PrefixCachedMambaMetadata(MambaMetadata):
     ) -> None:
         """Precompute intermediate extraction metadata for CUDA graph compatibility.
 
-        Uses GPU scalar offsets and fixed-shape ops.
-        When no slot allocator exists (buffers are None), fills with safe defaults unconditionally.
+        Uses GPU scalar offsets and fixed-shape ops. Reuses `self.cu_seqlens` and
+        `self.cum_chunks` produced by the base class.
+        When no slot allocator exists (buffers are None), fills with safe defaults.
 
         Args:
             intermediate_offsets_gpu: Full `[max_requests, 3]` buffer, or None.
@@ -447,7 +452,7 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         chunk_size = self.mamba_chunk_size
         max_count = self.max_intermediate_count
 
-        if intermediate_offsets_gpu is not None and padded_prefill_count > 0:
+        if intermediate_offsets_gpu is not None:
             # Gather the prefill portion from full buffers using GPU scalar offset.
             gather_idx = arange_buf[:padded_prefill_count].to(torch.int64) + real_decode_count_gpu
             offsets_2d = intermediate_offsets_gpu[gather_idx].to(torch.int64)  # [ppc, 3]
@@ -457,16 +462,10 @@ class PrefixCachedMambaMetadata(MambaMetadata):
             req_mask = arange_buf[:padded_prefill_count] < real_prefill_count_gpu
             counts_1d = torch.where(req_mask, counts_1d, 0)
 
-            cu = self._cu_seqlens_buffer[: padded_prefill_count + 1]
-            seq_lens = (cu[1:] - cu[:-1]).to(torch.int64)
-            num_chunks = torch.clamp((seq_lens + chunk_size - 1) // chunk_size, min=1)
-            cum_chunks = self._cum_chunks_buffer[: padded_prefill_count + 1]
-            cum_chunks[0] = 0
-            torch.cumsum(num_chunks, dim=0, out=cum_chunks[1:])
-
-            seq_starts = cu[:padded_prefill_count].to(torch.int64)
-
-            cum_chunks_exp = cum_chunks[:padded_prefill_count].unsqueeze(1).expand_as(offsets_2d)
+            seq_starts = self.cu_seqlens[:padded_prefill_count].to(torch.int64)
+            cum_chunks_exp = (
+                self.cum_chunks[:padded_prefill_count].unsqueeze(1).expand_as(offsets_2d)
+            )
             seq_starts_exp = seq_starts.unsqueeze(1).expand_as(offsets_2d)
 
             chunk_indices_2d = cum_chunks_exp + offsets_2d // chunk_size - 1
@@ -494,13 +493,11 @@ class PrefixCachedMambaMetadata(MambaMetadata):
             # Defer .tolist() to commit_intermediate_states (post-forward).
             # Store the gathered counts (not the full buffer).
             self._pending_intermediate_counts_gpu = counts_1d
-
-            self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
-            self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
         else:
             # No slot allocator: fill with safe defaults unconditionally.
             self._intermediate_chunk_indices_buffer.fill_(0)
             self._intermediate_abs_positions_buffer.fill_(self.d_conv)
             self._pending_intermediate_counts_gpu = None
-            self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
-            self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+
+        self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
+        self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
