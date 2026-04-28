@@ -58,9 +58,6 @@ def _count_local_tokens_kernel(
 
     Launches num_sms CTAs. Each CTA loops over its share of BLOCK_SIZE-sized
     chunks, with total work determined device-side from valid_tokens.
-    Per-block counts are aggregated with tl.sum before a single atomic_add
-    per expert, reducing atomic traffic from O(valid_pairs) to
-    O(num_blocks * num_local_experts).
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -77,11 +74,7 @@ def _count_local_tokens_kernel(
         expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
         local_ids = expert_ids - local_expert_start
         is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
-
-        for e in range(num_local_experts):
-            count = tl.sum(((local_ids == e) & is_local).to(tl.int32))
-            if count > 0:
-                tl.atomic_add(tokens_per_expert_ptr + e, count)
+        tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
 
 
 def compute_local_tokens_per_expert(
