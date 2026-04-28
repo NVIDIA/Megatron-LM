@@ -6,7 +6,7 @@ import pytest
 import torch
 
 try:
-    from torch.distributed.tensor import DTensor, DeviceMesh
+    from torch.distributed.tensor import DeviceMesh, DTensor
     from torch.distributed.tensor.placement_types import Replicate, Shard
 
     HAVE_DTENSOR = True

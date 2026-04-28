@@ -36,9 +36,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from torch.distributed import DeviceMesh, get_process_group_ranks
-    from torch.distributed.distributed_c10d import _get_group_tag
     from torch.distributed._tensor import DTensor
-    from torch.distributed.tensor.placement_types import Shard, Replicate
+    from torch.distributed.distributed_c10d import _get_group_tag
+    from torch.distributed.tensor.placement_types import Replicate, Shard
 
     HAVE_DTENSOR = True
 except ImportError:
