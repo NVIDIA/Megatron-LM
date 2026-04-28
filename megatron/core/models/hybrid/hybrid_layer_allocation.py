@@ -209,7 +209,7 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     A matching pair of "[" and "]" square brackets indicates that a fusion optimization should be
     applied. Currently, this only works for an Attention/sequence mixer variant followed by an MLP
     variant, e.g., "*-" for Attention+MLP or "ME" for Mamba+MoE. The contents in the pairs may not
-    cross pipeline boundaries.
+    cross pipeline and MTP boundaries.
 
     Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
 
@@ -370,7 +370,7 @@ def _validate_brackets(pattern: str, pattern_name: str) -> None:
         - No empty groups: '[]' with no layer symbols inside is invalid.
         - A bracket group must contain at least 2 layer symbols (fusion of one
           layer is meaningless).
-        - Bracket groups may not span across pipe ('|') boundaries.
+        - Bracket groups may not span across pipe ('|') or MTP ('/') boundaries.
 
     Args:
         pattern: The pattern string (already validated for character legality).
@@ -412,9 +412,16 @@ def _validate_brackets(pattern: str, pattern_name: str) -> None:
         elif char == Symbols.PIPE:
             if depth > 0:
                 raise ValueError(
-                    f"In {pattern_name} pattern, pipe '|' at position {i} appears inside "
-                    f"a fusion group '[...|...]'. Fusion groups may not cross pipeline "
-                    f"boundaries. Pattern: '{pattern}'"
+                    f"In {pattern_name} pattern, pipe '|' at position {i} appears "
+                    f"inside a fusion group '[...|...]'. Fusion groups may not cross "
+                    f"pipeline boundaries. Pattern: '{pattern}'"
+                )
+        elif char == Symbols.MTP_SEPARATOR:
+            if depth > 0:
+                raise ValueError(
+                    f"In {pattern_name} pattern, MTP separator '/' at position {i} appears "
+                    f"inside a fusion group '[.../...]'. Fusion groups may not cross "
+                    f"multi-token prediction boundaries. Pattern: '{pattern}'"
                 )
         else:
             # Must be a valid layer symbol.
@@ -437,7 +444,7 @@ def strip_brackets(pattern: str) -> str:
     """Remove fusion bracket markers from a pattern string.
 
     Returns the pattern with all '[' and ']' characters removed, leaving only
-    layer symbols and (if present) pipe separators.
+    layer symbols and (if present) pipe and MTP separators.
 
     Args:
         pattern: A pattern string that may contain fusion brackets.
@@ -459,11 +466,11 @@ def count_pattern_layers(pattern: str) -> int:
 
     Each fusion group `[...]` counts as a single layer (because its sub-layers
     are fused into one transformer block at runtime), regardless of how many
-    sub-layer symbols it contains. Pipe separators are ignored.
+    sub-layer symbols it contains. Pipe and MTP separators are ignored.
 
     Args:
         pattern: A pattern string that may contain fusion brackets and/or
-            pipe separators. Assumed to have already passed bracket
+            pipe/MTP separators. Assumed to have already passed bracket
             validation.
 
     Returns:
@@ -485,7 +492,7 @@ def count_pattern_layers(pattern: str) -> int:
             count += 1  # whole group counts as one block
         elif char == Symbols.FUSION_END:
             in_group = False
-        elif char == Symbols.PIPE:
+        elif char in (Symbols.PIPE, Symbols.MTP_SEPARATOR):
             continue
         elif not in_group and char in Symbols.VALID_LAYERS:
             count += 1
