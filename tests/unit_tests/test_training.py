@@ -18,6 +18,24 @@ def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
     return iter([1]), iter([2]), iter([3])
 
 
+class _LenDataloader:
+    """Fake dataloader with __len__ (required by the full_validation path)
+    and __iter__ (consumed via cyclic_iter)."""
+
+    def __init__(self, data):
+        self._data = list(data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+
+def mock_multi_valid_full_datasets_provider(train_val_test_num_samples):
+    return (iter([1]), [_LenDataloader([2, 2]), _LenDataloader([20, 20, 20])], iter([3]))
+
+
 def create_test_args():
     # Set dummy values for the args.
     args = SimpleNamespace()
@@ -54,6 +72,24 @@ class TestTraining:
         valid_data = next(valid_iter)
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
+
+    def test_build_train_valid_test_data_iterators_multi_full_validation(self):
+        """multiple_validation_sets + full_validation builds a list of iterators
+        (one per validation set) and sets args.eval_iters to the per-loader
+        lengths MAX-reduced across DP ranks."""
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        _, valid_iters, _ = build_train_valid_test_data_iterators(
+            mock_multi_valid_full_datasets_provider
+        )
+        assert isinstance(valid_iters, list)
+        assert len(valid_iters) == 2
+        assert next(valid_iters[0]) == 2
+        assert next(valid_iters[1]) == 20
+        # data_parallel_size=1, so MAX across DP ranks equals the local lengths
+        assert args.eval_iters == [2, 3]
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):

@@ -63,9 +63,10 @@ def unset_num_microbatches_calculator():
 
 def init_num_microbatches_calculator(
     rank: int,
-    global_batch_size: int,
-    micro_batch_size: int,
-    data_parallel_size: int,
+    rampup_batch_size: Optional[List[int]] = None,
+    global_batch_size: Optional[int] = None,
+    micro_batch_size: Optional[int] = None,
+    data_parallel_size: Optional[int] = None,
     decrease_batch_size_if_needed: bool = False,
     step_batch_size_schedule: Optional[str] = None,
     seq_length: Optional[int] = None,
@@ -75,11 +76,13 @@ def init_num_microbatches_calculator(
     Args:
         rank (int):
             Rank of the GPU, only rank 0 will log the information.
-        global_batch_size (int):
+        rampup_batch_size (Optional[List[int]]):
+            Deprecated. This argument is ignored. Use step_batch_size_schedule instead.
+        global_batch_size (Optional[int]):
             Global batch size for the model.
-        micro_batch_size (int):
+        micro_batch_size (Optional[int]):
             Micro batch size at initialization.
-        data_parallel_size (int):
+        data_parallel_size (Optional[int]):
             Data parallel size.
         decrease_batch_size_if_needed (bool, optional):
             If true, scale down batch size to ensure divisibility by DP size * microbatch size.
@@ -94,14 +97,19 @@ def init_num_microbatches_calculator(
             Sequence length for token-to-sample conversion when using step_batch_size_schedule.
             If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
     """
+    if rampup_batch_size is not None and rank == 0:
+        logger.warning(
+            'rampup_batch_size is deprecated and will be removed in a future release. '
+            'Use step_batch_size_schedule instead.'
+        )
     _configure_global_num_microbatches_calculator(
-        rank,
-        global_batch_size,
-        micro_batch_size,
-        data_parallel_size,
-        decrease_batch_size_if_needed,
-        step_batch_size_schedule,
-        seq_length,
+        rank=rank,
+        global_batch_size=global_batch_size,
+        micro_batch_size=micro_batch_size,
+        data_parallel_size=data_parallel_size,
+        decrease_batch_size_if_needed=decrease_batch_size_if_needed,
+        step_batch_size_schedule=step_batch_size_schedule,
+        seq_length=seq_length,
         init=True,
     )
 
@@ -114,9 +122,10 @@ def destroy_num_microbatches_calculator():
 
 def reconfigure_num_microbatches_calculator(
     rank: int,
-    global_batch_size: int,
-    micro_batch_size: int,
-    data_parallel_size: int,
+    rampup_batch_size: Optional[List[int]] = None,
+    global_batch_size: Optional[int] = None,
+    micro_batch_size: Optional[int] = None,
+    data_parallel_size: Optional[int] = None,
     decrease_batch_size_if_needed: bool = False,
     step_batch_size_schedule: Optional[str] = None,
     seq_length: Optional[int] = None,
@@ -126,11 +135,13 @@ def reconfigure_num_microbatches_calculator(
     Args:
         rank (int):
             Rank of the GPU, only rank 0 will log the information.
-        global_batch_size (int):
+        rampup_batch_size (Optional[List[int]]):
+            Deprecated. This argument is ignored. Use step_batch_size_schedule instead.
+        global_batch_size (Optional[int]):
             Global batch size for the model.
-        micro_batch_size (int):
+        micro_batch_size (Optional[int]):
             Micro batch size at initialization.
-        data_parallel_size (int):
+        data_parallel_size (Optional[int]):
             Data parallel size.
         decrease_batch_size_if_needed (bool, optional):
             If true, scale down batch size to ensure divisibility by DP size * microbatch size.
@@ -143,14 +154,19 @@ def reconfigure_num_microbatches_calculator(
             Sequence length for token-to-sample conversion when using step_batch_size_schedule.
             If provided, thresholds are interpreted as tokens. If None, thresholds are samples.
     """
+    if rampup_batch_size is not None and rank == 0:
+        logger.warning(
+            'rampup_batch_size is deprecated and will be removed in a future release. '
+            'Use step_batch_size_schedule instead.'
+        )
     _configure_global_num_microbatches_calculator(
-        rank,
-        global_batch_size,
-        micro_batch_size,
-        data_parallel_size,
-        decrease_batch_size_if_needed,
-        step_batch_size_schedule,
-        seq_length,
+        rank=rank,
+        global_batch_size=global_batch_size,
+        micro_batch_size=micro_batch_size,
+        data_parallel_size=data_parallel_size,
+        decrease_batch_size_if_needed=decrease_batch_size_if_needed,
+        step_batch_size_schedule=step_batch_size_schedule,
+        seq_length=seq_length,
         init=False,
     )
 

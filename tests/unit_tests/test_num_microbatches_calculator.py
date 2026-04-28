@@ -7,21 +7,37 @@ import megatron.core.num_microbatches_calculator as mb_calculator
 
 def test_init_num_microbatches_calculator():
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
-    mb_calculator.init_num_microbatches_calculator(0, 32, 8, 2, False)
+    mb_calculator.init_num_microbatches_calculator(
+        rank=0, global_batch_size=32, micro_batch_size=8, data_parallel_size=2
+    )
     assert mb_calculator.get_num_microbatches() == 2
     assert mb_calculator.get_current_global_batch_size() == 32
 
     with pytest.raises(AssertionError):
-        mb_calculator.init_num_microbatches_calculator(0, 32, 8, 2, False)
+        mb_calculator.init_num_microbatches_calculator(
+            rank=0, global_batch_size=32, micro_batch_size=8, data_parallel_size=2
+        )
 
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
-    mb_calculator.init_num_microbatches_calculator(0, 32, 8, 3, True)
+    mb_calculator.init_num_microbatches_calculator(
+        rank=0,
+        global_batch_size=32,
+        micro_batch_size=8,
+        data_parallel_size=3,
+        decrease_batch_size_if_needed=True,
+    )
     assert mb_calculator.get_num_microbatches() == 1
     assert mb_calculator.get_current_global_batch_size() == 32
     assert mb_calculator.get_current_running_global_batch_size() == 24
 
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
-    mb_calculator.init_num_microbatches_calculator(0, 33, 8, 2, True)
+    mb_calculator.init_num_microbatches_calculator(
+        rank=0,
+        global_batch_size=33,
+        micro_batch_size=8,
+        data_parallel_size=2,
+        decrease_batch_size_if_needed=True,
+    )
     assert mb_calculator.get_num_microbatches() == 2
     assert mb_calculator.get_current_global_batch_size() == 33
     assert mb_calculator.get_current_running_global_batch_size() == 32
@@ -29,34 +45,56 @@ def test_init_num_microbatches_calculator():
 
 def test_reconfigure_num_microbatches_calculator():
     mb_calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
-    mb_calculator.init_num_microbatches_calculator(0, 32, 8, 2, False)
+    mb_calculator.init_num_microbatches_calculator(
+        rank=0, global_batch_size=32, micro_batch_size=8, data_parallel_size=2
+    )
     assert mb_calculator.get_num_microbatches() == 2
     assert mb_calculator.get_current_global_batch_size() == 32
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, 16, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        rank=0, global_batch_size=16, micro_batch_size=8, data_parallel_size=2
+    )
     assert mb_calculator.get_num_microbatches() == 1
     assert mb_calculator.get_current_global_batch_size() == 16
 
 
 def test_get_num_microbatches():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, 16, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        rank=0, global_batch_size=16, micro_batch_size=8, data_parallel_size=2
+    )
     assert mb_calculator.get_num_microbatches() == 1
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, 16, 4, 3, True)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        rank=0,
+        global_batch_size=16,
+        micro_batch_size=4,
+        data_parallel_size=3,
+        decrease_batch_size_if_needed=True,
+    )
     assert mb_calculator.get_num_microbatches() == 1
 
 
 def test_get_current_global_batch_size():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, 16, 4, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        rank=0, global_batch_size=16, micro_batch_size=4, data_parallel_size=2
+    )
     assert mb_calculator.get_current_global_batch_size() == 16
 
-    mb_calculator.reconfigure_num_microbatches_calculator(0, 16, 4, 3, True)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        rank=0,
+        global_batch_size=16,
+        micro_batch_size=4,
+        data_parallel_size=3,
+        decrease_batch_size_if_needed=True,
+    )
     assert mb_calculator.get_current_global_batch_size() == 16
     assert mb_calculator.get_current_running_global_batch_size() == 12
 
 
 def test_get_micro_batch_size():
-    mb_calculator.reconfigure_num_microbatches_calculator(0, 16, 8, 2, False)
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        rank=0, global_batch_size=16, micro_batch_size=8, data_parallel_size=2
+    )
     assert mb_calculator.get_micro_batch_size() == 8
 
 
