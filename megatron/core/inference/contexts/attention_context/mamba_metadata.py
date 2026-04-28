@@ -13,11 +13,6 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
 class MambaMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
-    # Default values for fields populated only by `PrefixCachedMambaMetadata`.
-    intermediate_chunk_indices: Optional[torch.Tensor] = None
-    intermediate_abs_positions: Optional[torch.Tensor] = None
-    conv_gather_offsets: Optional[torch.Tensor] = None
-
     def __init__(
         self, max_requests: int, max_tokens: int, mamba_chunk_size: int = 128, d_conv: int = 0
     ):
@@ -104,6 +99,13 @@ class MambaMetadata:
         # Pre-allocated index tensor for graphable chunk ops.
         max_chunks = max_tokens // mamba_chunk_size + max_requests
         self._arange_chunks = torch.arange(max_chunks, dtype=torch.int64, device=self.device)
+
+        # Fields populated only by `PrefixCachedMambaMetadata`. Defined here so
+        # callers can read `metadata.intermediate_*` / `metadata.conv_gather_offsets`
+        # uniformly regardless of which subclass is in use.
+        self.intermediate_chunk_indices: Optional[torch.Tensor] = None
+        self.intermediate_abs_positions: Optional[torch.Tensor] = None
+        self.conv_gather_offsets: Optional[torch.Tensor] = None
 
         self.reset_varlen_metadata()
 

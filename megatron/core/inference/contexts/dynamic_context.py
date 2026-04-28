@@ -40,7 +40,6 @@ from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
 
 from .attention_context.mamba_metadata import MambaMetadata, PrefixCachedMambaMetadata
-from .attention_context.mha_metadata import MHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
@@ -563,9 +562,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.num_prefill_requests = 0
 
-        # Populated in initialize_all_tensors once the shared active_* tensors exist.
-        self.graph_attn_metadata = {}
-        self.non_graph_attn_metadata = {}
+        # Per-step max sequence lengths consumed by the attention kernels. Set
+        # by `prepare_attn_init` (graph mode, derived from padded dims) or by
+        # `finalize_attn_init` (non-graph mode, computed via torch.max + .item()).
+        self._max_seqlen_q: int = 0
+        self._max_seqlen_k: int = 0
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
         self.moe_routing_metadata = None
@@ -843,7 +844,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
 
-        # Cumulative tensors shared with MHAMetadata.
+        # Cumulative tensors consumed directly by attention kernels.
         self.cu_active_request_query_lengths = torch.zeros(
             (self.max_requests + 1,), dtype=torch.int32, device=torch.cuda.current_device()
         )
@@ -893,18 +894,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.static_kv_memory_pointers
             and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
         )
-
-        common_kwargs = dict(
-            max_requests=self.max_requests,
-            max_seqlen=self.max_sequence_length,
-            query_lengths_buf=self.active_request_query_lengths,
-            cu_query_seq_lengths_buf=self.cu_active_request_query_lengths,
-            kv_seq_lengths_buf=self.active_sequence_lengths,
-            cu_kv_seq_lengths_buf=self.cu_active_sequence_lengths,
-            block_table_buf=self.active_request_to_kv_block_ids,
-        )
-        self.graph_attn_metadata["mha_metadata"] = MHAMetadata(**common_kwargs)
-        self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(**common_kwargs)
 
         ctx_manager = nullcontext()
         if self.unified_memory_level != 0:
@@ -1068,19 +1057,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def cu_query_lengths(self) -> Tuple[Tensor, int]:
         """Cumulative query sequence lengths."""
-        assert self.active_attn_metadata is not None
-        return (
-            self.active_attn_metadata["mha_metadata"].state_data["cu_query_seq_lengths"],
-            self.active_attn_metadata["mha_metadata"].state_data["max_seqlen_q"],
-        )
+        n = self.padded_active_request_count
+        return self.cu_active_request_query_lengths[: n + 1], self._max_seqlen_q
 
     def cu_kv_lengths(self) -> Tuple[Tensor, Tensor, int]:
         """Cumulative key/value sequence lengths."""
-        assert self.active_attn_metadata is not None
+        n = self.padded_active_request_count
         return (
-            self.active_attn_metadata["mha_metadata"].state_data["cu_kv_seq_lengths"],
-            self.active_attn_metadata["mha_metadata"].state_data["kv_seq_lengths"],
-            self.active_attn_metadata["mha_metadata"].state_data["max_seqlen_k"],
+            self.cu_active_sequence_lengths[: n + 1],
+            self.active_sequence_lengths[:n],
+            self._max_seqlen_k,
         )
 
     def get_active_sequence_lengths(self) -> Tensor:
@@ -1188,12 +1174,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._context_op_metadata_gpu.copy_(self._context_op_metadata_cpu, non_blocking=True)
         self.build_active_slices()
 
-        self.active_attn_metadata["mha_metadata"].update(
-            batch_dimensions=self.batch_dimensions,
-            padded_batch_dimensions=self.padded_batch_dimensions,
-            num_speculative_tokens=self.num_speculative_tokens,
-        )
-
         if self.is_hybrid_model:
             slot_alloc = self.mamba_slot_allocator
             self.mamba_metadata.update(
@@ -1274,20 +1254,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         attention_layer_number = self.layer_map[layer_number - 1]
 
-        assert self.active_attn_metadata is not None
-
+        block_table = self.active_request_to_kv_block_ids[: self.padded_active_request_count, :]
         if self.cache_mla_latent:
-            return (
-                self.memory_buffer[attention_layer_number],
-                None,
-                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
-            )
-        else:
-            return (
-                self.memory_buffer[0, attention_layer_number],
-                self.memory_buffer[1, attention_layer_number],
-                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
-            )
+            return (self.memory_buffer[attention_layer_number], None, block_table)
+        return (
+            self.memory_buffer[0, attention_layer_number],
+            self.memory_buffer[1, attention_layer_number],
+            block_table,
+        )
 
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False
@@ -1458,8 +1432,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
-        self.active_attn_metadata = None
-
         # TODO: This `reset_varlen_metadata()` should not be necessary.
         if self.is_hybrid_model:
             self.mamba_metadata.reset_varlen_metadata()
@@ -1700,7 +1672,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_token_count = T
         self.num_prefill_requests = N_prefill
 
-        # 2. Per-request state consumed by mha_metadata.update().
+        # 2. Per-request state consumed by the attention kernels.
         #    Decode requests come first, followed by prefill requests.
         self.request_query_lengths[0:N_decode].fill_(tokens_per_decode_request)
         if N_prefill > 0:
@@ -1774,10 +1746,9 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> bool:
         """Pre-graph phase of `initialize_attention_state`.
 
-        Resolves batch/padded dimensions, selects the attention metadata dict for this step,
-        and fills the real-count GPU scalars.
-        Returns True if the body + finalize phases should still run, or False for the
-        EP-dummy fast-path where no more work is needed.
+        Resolves batch/padded dimensions, sets graph-mode max_seqlen, and stages the real-count
+        GPU scalars. Returns True if the body + finalize phases should still run, or False for
+        the EP-dummy fast-path where no more work is needed.
         """
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
@@ -1869,11 +1840,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
 
-        self.active_attn_metadata = (
-            self.graph_attn_metadata  # type: ignore[assignment]
-            if self.using_cuda_graph_this_step()
-            else self.non_graph_attn_metadata  # type: ignore[assignment]
-        )
+        # In graph mode, max_seqlen_q is a Python int derived from padded dims; baked in by capture.
+        # In non-graph mode it is recomputed in `finalize_attn_init` from the populated buffers.
+        if self.using_cuda_graph_this_step():
+            if self.padded_batch_dimensions.prefill_req_count == 0:
+                self._max_seqlen_q = self.num_speculative_tokens + 1
+            else:
+                # Force the prefill kernel to launch for prefill graphs.
+                self._max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
+            self._max_seqlen_k = self.max_sequence_length
 
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
@@ -1898,12 +1873,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-        # Resolve deferred max_seqlen .item() calls staged by `NonGraphedMHAMetadata.update()`.
-        # Graph-mode metadata already stores Python ints; nothing to resolve on that path.
+        # Non-graph mode: recompute max_seqlen from the just-populated buffers.
+        # Graph mode set these in `prepare_attn_init` from padded dims; the
+        # captured kernel calls already baked those Python ints in.
         if not self.using_cuda_graph_this_step():
-            state_data = self.active_attn_metadata["mha_metadata"].state_data
-            state_data["max_seqlen_q"] = state_data["max_seqlen_q"].item()
-            state_data["max_seqlen_k"] = state_data["max_seqlen_k"].item()
+            n = self.padded_active_request_count
+            if n > 0:
+                self._max_seqlen_q = torch.max(self.active_request_query_lengths[:n]).item()
+                self._max_seqlen_k = torch.max(self.active_sequence_lengths[:n]).item()
+            else:
+                self._max_seqlen_q = self.num_speculative_tokens + 1
+                self._max_seqlen_k = 1
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""
