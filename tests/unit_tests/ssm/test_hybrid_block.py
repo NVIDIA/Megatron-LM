@@ -116,29 +116,12 @@ class TestHybridBlock:
         return block(hidden_states, attention_mask=attention_mask)
 
     def test_gpu_forward_full_checkpoint_block(self):
-        """recompute_granularity='full' with method='block' across mixed layer types.
-
-        With num_layers=3 and recompute_num_layers=2, layers 0-1 take the
-        checkpointed path and layer 2 takes the un-checkpointed path.
-        """
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
         block = self.get_mamba_block(
             layer_pattern,
             recompute_granularity='full',
             recompute_method='block',
             recompute_num_layers=2,
-        )
-        output = self._run_forward(block)
-        assert output.shape == (32, 2, block.config.hidden_size)
-
-    def test_gpu_forward_full_checkpoint_uniform(self):
-        """recompute_granularity='full' with method='uniform' across mixed layer types."""
-        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
-        block = self.get_mamba_block(
-            layer_pattern,
-            recompute_granularity='full',
-            recompute_method='uniform',
-            recompute_num_layers=3,  # single chunk covering all layers
         )
         output = self._run_forward(block)
         assert output.shape == (32, 2, block.config.hidden_size)
@@ -160,6 +143,118 @@ class TestHybridBlock:
         )
         output = self._run_forward(block)
         assert output.shape == (32, 2, block.config.hidden_size)
+
+    def test_gpu_forward_selective_checkpoint_mlp(self):
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_mamba_block(
+            layer_pattern,
+            recompute_granularity="selective",
+            recompute_modules=["core_attn", "mlp"],
+        )
+
+        attn_layer = block.layers[1]
+        assert isinstance(attn_layer, TransformerLayer)
+        assert attn_layer.self_attention.checkpoint_core_attention is True
+        assert attn_layer.recompute_mlp is True
+
+        mlp_layer = block.layers[2]
+        assert isinstance(mlp_layer, TransformerLayer)
+        assert mlp_layer.recompute_mlp is True
+
+        output = self._run_forward(block)
+        assert output.shape == (32, 2, block.config.hidden_size)
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize(
+        "recompute_kwargs",
+        [
+            dict(
+                recompute_granularity="full",
+                recompute_method="block",
+                recompute_num_layers=2,
+            ),
+            dict(
+                recompute_granularity="full",
+                recompute_method="uniform",
+                recompute_num_layers=2,
+            ),
+            dict(
+                recompute_granularity="selective",
+                recompute_modules=["core_attn", "mlp"],
+            ),
+        ],
+        ids=["full_block", "full_uniform", "selective"],
+    )
+    def test_recompute_matches_baseline(self, recompute_kwargs):
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        seed = 123
+        sequence_length, micro_batch_size = 32, 2
+        rtol = atol = 1e-4
+
+        # When 'mlp' is in recompute_modules, the wrapped MLP's `(out, bias_param)`
+        # output triggers a reentrant-backward deadlock in CheckpointFunction.
+        # All three in-tree MoE recipes that use `recompute_modules=[..., 'mlp']`
+        # set `--disable-bias-linear: true`, so we match that usage pattern here.
+        arch_kwargs = {}
+        if (
+            recompute_kwargs.get("recompute_granularity") == "selective"
+            and "mlp" in recompute_kwargs.get("recompute_modules", [])
+        ):
+            arch_kwargs["add_bias_linear"] = False
+
+        def build_inputs():
+            torch.manual_seed(seed)
+            hs = torch.randn(
+                (sequence_length, micro_batch_size, 256),
+                device="cuda",
+                requires_grad=True,
+            )
+            am = torch.ones(
+                (micro_batch_size, 1, sequence_length, sequence_length),
+                dtype=bool,
+                device="cuda",
+            )
+            return hs, am
+
+        def run(block):
+            hs, am = build_inputs()
+            out = block(hs, attention_mask=am)
+            out.float().sum().backward()
+            grads = {
+                n: p.grad.detach().float().cpu()
+                for n, p in block.named_parameters()
+                if p.grad is not None
+            }
+            return out.detach().float().cpu(), grads
+
+        # --- Baseline (no recompute) ---
+        model_parallel_cuda_manual_seed(seed)
+        torch.manual_seed(seed)
+        base = self.get_mamba_block(layer_pattern, **arch_kwargs).cuda()
+        base.train()
+        base_logits, base_grads = run(base)
+        del base
+        torch.cuda.empty_cache()
+
+        # --- Recompute ---
+        model_parallel_cuda_manual_seed(seed)
+        torch.manual_seed(seed)
+        rec = self.get_mamba_block(
+            layer_pattern, **arch_kwargs, **recompute_kwargs
+        ).cuda()
+        rec.train()
+        rec_logits, rec_grads = run(rec)
+
+        # --- Numerical equivalence ---
+        assert torch.allclose(rec_logits, base_logits, rtol=rtol, atol=atol), (
+            f"Logits mismatch (max abs diff = {(rec_logits - base_logits).abs().max()})"
+        )
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            gb, gr = base_grads[name], rec_grads[name]
+            assert torch.allclose(gr, gb, rtol=rtol, atol=atol), (
+                f"Grad mismatch for {name} (max abs diff = {(gr - gb).abs().max()})"
+            )
 
     def test_layer_types(self):
         """
