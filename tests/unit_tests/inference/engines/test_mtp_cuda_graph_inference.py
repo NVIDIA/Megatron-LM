@@ -817,6 +817,7 @@ class TestMTPCudaGraphExpertParallel:
             next_token_ids=token_ids.clone(),
             position_ids=position_ids.clone(),
             depth=0,
+            eager=True,
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
@@ -854,7 +855,11 @@ class TestMTPCudaGraphExpertParallel:
 
         # All ranks must complete without hanging.
         h_out, logits = unwrapped.compute_mtp_single_step(
-            hidden_states=hidden, next_token_ids=token_ids, position_ids=position_ids, depth=0
+            hidden_states=hidden,
+            next_token_ids=token_ids,
+            position_ids=position_ids,
+            depth=0,
+            eager=True,
         )
 
         assert h_out.shape == (batch_size, 1, self.HIDDEN_SIZE)
