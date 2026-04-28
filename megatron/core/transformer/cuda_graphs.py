@@ -830,9 +830,10 @@ class _CudaGraphRunner(torch.nn.Module):
         # For example, megatron/core/transformer/moe/router.py's expert_bias is a persistent
         # buffer updated each forward pass by '_apply_expert_bias()'. So we need to ensure
         # graph capture's forward passes do not corrupt its value.
-        buffer_backup = []
-        for buf in self.base_module.buffers():
-            buffer_backup.append(buf.clone())
+        # Keyed by name (not position) because the warmup forward may add buffers
+        # (lazy MoE _fc1_weight/_fc2_weight) or re-register them with a new shape
+        # (yarn rotary cos_cached/sin_cached on cache miss).
+        buffer_backup = {name: buf.clone() for name, buf in self.base_module.named_buffers()}
 
         if self.training and torch.is_grad_enabled():
             grad_backup = []
@@ -1041,9 +1042,12 @@ class _CudaGraphRunner(torch.nn.Module):
                 if main_grad_copy is not None:
                     param.main_grad.copy_(main_grad_copy)
 
-        # restore cached buffers
-        for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
-            buf.copy_(buf_copy)
+        # restore cached buffers; skip ones that were added or re-registered with a new
+        # shape during capture (their post-capture value is the correct one to keep).
+        for name, buf in self.base_module.named_buffers():
+            buf_copy = buffer_backup.get(name)
+            if buf_copy is not None and buf_copy.shape == buf.shape:
+                buf.copy_(buf_copy)
 
         if is_moe:
             for name in tracker:
