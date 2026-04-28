@@ -35,6 +35,15 @@ from megatron.core.inference.moe.permute import (
     compute_local_tokens_per_expert,
 )
 
+_NUM_SMS: Optional[int] = None
+
+
+def _get_num_sms(device: torch.device) -> int:
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties(device).multi_processor_count
+    return _NUM_SMS
+
 # ---------------------------------------------------------------------------
 # Triton kernel – BF16 grouped GEMM with indirect token addressing
 # ---------------------------------------------------------------------------
@@ -104,6 +113,7 @@ def _fused_moe_kernel(
     N,
     K,
     num_valid_tokens,
+    num_sms,
     # Strides
     stride_am,
     stride_ak,
@@ -121,76 +131,77 @@ def _fused_moe_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """Fused MoE grouped GEMM with indirect token addressing.
+    """Persistent fused MoE grouped GEMM with indirect token addressing.
 
-    A: [num_tokens, K]           – input hidden states (unpermuted)
-    B: [num_local_experts, N, K] – stacked expert weights
-    C: [num_tokens * topk, N]    – output (one row per topk slot)
-
-    When FUSE_SQUARED_RELU is True, applies squared_relu to the GEMM
-    output in-register before writing, avoiding a separate activation pass.
+    Launches a fixed grid of num_sms CTAs. Each CTA loops over its share
+    of tiles, with total tile count determined device-side from
+    num_tokens_post_padded. This decouples grid size from buffer size,
+    keeping the kernel CUDA-graph safe while avoiding excess CTA overhead.
     """
     pid = tl.program_id(0)
 
-    # Use the device-side num_tokens_post_padded for group mapping so the
-    # tiling adapts to actual token counts each step. The grid is launched at
-    # max buffer size for CUDA-graph safety; excess CTAs exit here.
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    if pid >= num_pid_m * num_pid_n:
-        return
+    total_tiles = num_pid_m * num_pid_n
+
+    tiles_per_cta = tl.cdiv(total_tiles, num_sms)
+    tile_start = pid * tiles_per_cta
+    tile_end = tl.minimum(tile_start + tiles_per_cta, total_tiles)
 
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_token_id = pid_m * BLOCK_SIZE_M + offs
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
-    token_mask = offs_token < num_valid_tokens
-
-    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
-    b_block_ptr = tl.make_block_ptr(
-        base=b_ptr + off_experts * stride_be,
-        shape=(K, N),
-        strides=(stride_bk, stride_bn),
-        offsets=(0, pid_n * BLOCK_SIZE_N),
-        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
-        order=(0, 1),
-    )
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
+    for tile_id in tl.range(tile_start, tile_end):
+        # GROUP_SIZE_M swizzle: tile_id → (pid_m, pid_n)
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+        offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+        token_mask = offs_token < num_valid_tokens
+
+        off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+        a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+        b_block_ptr = tl.make_block_ptr(
+            base=b_ptr + off_experts * stride_be,
+            shape=(K, N),
+            strides=(stride_bk, stride_bn),
+            offsets=(0, pid_n * BLOCK_SIZE_N),
+            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+            order=(0, 1),
         )
-        b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        accumulator += tl.dot(a, b)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
-    if FUSE_SQUARED_RELU:
-        accumulator = tl.maximum(accumulator, 0.0)
-        accumulator *= accumulator
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            accumulator += tl.dot(a, b)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
-    if MUL_ROUTED_WEIGHT:
-        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
-        accumulator *= moe_weight[:, None]
+        if FUSE_SQUARED_RELU:
+            accumulator = tl.maximum(accumulator, 0.0)
+            accumulator *= accumulator
 
-    accumulator = accumulator.to(tl.bfloat16)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+        if MUL_ROUTED_WEIGHT:
+            moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+            accumulator *= moe_weight[:, None]
+
+        accumulator = accumulator.to(tl.bfloat16)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -372,21 +383,16 @@ def _invoke_fused_moe_kernel(
     block_size_m: int,
     fuse_squared_relu: bool = False,
 ):
-    """Launch the Triton fused-MoE kernel for one GEMM pass.
+    """Launch the persistent Triton fused-MoE kernel for one GEMM pass.
 
-    The grid covers the full sorted_token_ids buffer for CUDA-graph safety.
-    The kernel uses the device-side num_tokens_post_padded for group mapping
-    and early exit, so excess CTAs are inexpensive.
+    Uses a fixed grid of NUM_SMS CTAs for CUDA-graph safety. Each CTA
+    loops over its share of tiles, with actual work determined device-side.
     """
     M = A.size(0)
     num_tokens = M * top_k
-    EM = sorted_token_ids.size(0)
+    num_sms = _get_num_sms(A.device)
 
-    grid = lambda META: (  # noqa: E731
-        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
-    )
-
-    _fused_moe_kernel[grid](
+    _fused_moe_kernel[(num_sms,)](
         A,
         B,
         C,
@@ -397,6 +403,7 @@ def _invoke_fused_moe_kernel(
         B.size(1),
         B.size(2),
         num_tokens,
+        num_sms,
         A.stride(0),
         A.stride(1),
         B.stride(0),
