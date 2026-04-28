@@ -1858,22 +1858,20 @@ class TextGenerationController:
             **(update_result or {}),
         }
 
-    async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
-    ) -> Optional[Dict]:
-        """Forward step the model and update the inference context.
+    async def _launch_decode_step(self) -> Optional[Dict]:
+        """Queue a decode step's GPU work: H2D + forward + sample.
 
-        Args:
-            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+        Yields once between the forward and sample blocks so the event loop
+        can run other coroutines while the GPU is processing the forward pass.
+        Performs no D2H or update_requests work; the post-sample CPU work
+        lives in :meth:`_bookkeep_decode_step`. The split lets the engine
+        async-scheduling path queue the next step's launches before the
+        previous step's bookkeeping runs.
 
-        Return:
-            (Optional[Dict]): A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
-                sample (Tensor): New sample.
-                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
-                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+        Returns:
+            Optional[Dict]: launch-side state consumed by
+            :meth:`_bookkeep_decode_step`, or ``None`` if there is nothing
+            to step (no active requests and no queued tokens).
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1962,6 +1960,26 @@ class TextGenerationController:
                         )
             range_pop()
 
+        return {
+            "_active_request_count": active_request_count,
+            "log_probs": log_probs,
+            "top_n_logprobs": top_n_logprobs,
+            "routing_indices_per_request": routing_indices_per_request,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
+
+    def _bookkeep_decode_step(
+        self, launch_state: Dict, skip_bookkeeping: bool = False
+    ) -> Dict:
+        """Run CPU bookkeeping for a previously launched decode step.
+
+        Performs the D2H sample transfer (which implicitly waits for sample
+        to complete) and ``update_requests`` to advance canonical context
+        state. Combined with ``launch_state`` from :meth:`_launch_decode_step`
+        produces the same return dict shape as the legacy single-call path.
+        """
+        active_request_count = launch_state["_active_request_count"]
+        with torch.inference_mode():
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
@@ -1981,16 +1999,44 @@ class TextGenerationController:
                     if self.num_speculative_tokens > 0
                     else None
                 ),
-                "log_probs": log_probs,
-                "top_n_logprobs": top_n_logprobs,
-                "routing_indices_per_request": routing_indices_per_request,
-                "cuda_graph_request_count": cuda_graph_request_count,
+                "log_probs": launch_state["log_probs"],
+                "top_n_logprobs": launch_state["top_n_logprobs"],
+                "routing_indices_per_request": launch_state["routing_indices_per_request"],
+                "cuda_graph_request_count": launch_state["cuda_graph_request_count"],
             }
             if self.num_speculative_tokens > 0:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
             return ret
+
+    async def async_generate_output_tokens_dynamic_batch(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> Optional[Dict]:
+        """Forward step the model and update the inference context.
+
+        Thin orchestrator over :meth:`_launch_decode_step` (queues GPU work)
+        and :meth:`_bookkeep_decode_step` (post-sample CPU work). Async
+        scheduling reuses the launch and bookkeep paths separately so the
+        next step's launches can be queued before the prior step's
+        bookkeeping runs.
+
+        Args:
+            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+
+        Return:
+            (Optional[Dict]): A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+                sample (Tensor): New sample.
+                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+        """
+        launch_state = await self._launch_decode_step()
+        if launch_state is None:
+            return None
+        return self._bookkeep_decode_step(launch_state, skip_bookkeeping=skip_bookkeeping)
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
