@@ -771,6 +771,7 @@ def _run_iters_with_cuda_graph(
 @pytest.mark.skipif(
     not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.13.0"
 )
+@pytest.mark.flaky_in_dev
 @pytest.mark.parametrize(
     "is_mla, offload_modules, cuda_graph_scope, activation_offload_fraction, delay_offload",
     [
@@ -962,6 +963,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(
     not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.13.0"

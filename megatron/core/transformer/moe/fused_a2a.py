@@ -3,6 +3,8 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+from typing import Optional
+
 from megatron.core.utils import internal_api
 
 try:
@@ -280,9 +282,12 @@ def init_hybrid_ep_buffer(
     hidden_dim: int,
     seq_len: int,
     num_local_experts: int,
-    num_sms_dispatch_api: int,
-    num_sms_combine_api: int,
-    fp8_dispatch: bool,
+    num_sms_dispatch_api: Optional[int] = None,
+    num_sms_combine_api: Optional[int] = None,
+    num_blocks_permute: Optional[int] = None,
+    num_blocks_unpermute: Optional[int] = None,
+    fp8_dispatch: bool = False,
+    num_sms_preprocessing_api: Optional[int] = None,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -301,23 +306,39 @@ def init_hybrid_ep_buffer(
             Maximum sequence length of the input tensor.
         num_local_experts (int):
             Number of local experts.
-        num_sms_dispatch_api (int):
+        num_sms_dispatch_api (Optional[int]):
             Number of SMs used by the dispatch API.
-        num_sms_combine_api (int):
+        num_sms_combine_api (Optional[int]):
             Number of SMs used by the combine API.
+        num_blocks_permute (Optional[int]):
+            Number of blocks used by the permute part.
+        num_blocks_unpermute (Optional[int]):
+            Number of blocks used by the unpermute part.
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
+        num_sms_preprocessing_api (Optional[int]):
+            Number of SMs used by the preprocessing (metadata scan) kernel.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    kwargs = {}
+    if num_sms_dispatch_api is not None:
+        kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
+    if num_sms_combine_api is not None:
+        kwargs['num_sms_combine_api'] = num_sms_combine_api
+    if num_blocks_permute is not None:
+        kwargs['num_blocks_permute'] = num_blocks_permute
+    if num_blocks_unpermute is not None:
+        kwargs['num_blocks_unpermute'] = num_blocks_unpermute
+    if num_sms_preprocessing_api is not None:
+        kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
         max_num_of_tokens_per_rank=seq_len,
         num_local_experts=num_local_experts,
         use_fp8=fp8_dispatch,
-        num_sms_dispatch_api=num_sms_dispatch_api,
-        num_sms_combine_api=num_sms_combine_api,
+        **kwargs,
     )
 
 
@@ -342,14 +363,35 @@ class HybridEPDispatch(torch.autograd.Function):
         probs,
         group,
         num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
+        num_sms_dispatch_api=None,
+        num_sms_combine_api=None,
+        num_blocks_permute=None,
+        num_blocks_unpermute=None,
+        fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
+        if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
+            import inspect
+            import warnings
+
+            sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
+            if 'fuse_permute_dispatch' not in sig.parameters:
+                warnings.warn(
+                    "Current DeepEP version does not support fused permute dispatch or "
+                    "num_blocks_permute/num_blocks_unpermute. Falling back to unfused "
+                    "HybridEP dispatch.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                fused = False
+                num_blocks_permute = None
+                num_blocks_unpermute = None
+
         if _hybrid_ep_buffer is None:
             seq_len, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
@@ -360,7 +402,10 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_local_experts,
                 num_sms_dispatch_api,
                 num_sms_combine_api,
+                num_blocks_permute,
+                num_blocks_unpermute,
                 fp8_dispatch,
+                num_sms_preprocessing_api,
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
@@ -381,10 +426,12 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=pad_multiple,
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
+            **({"fuse_permute_dispatch": fused} if fused else {}),
         )
 
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
+        ctx.fused = fused
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -400,9 +447,27 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         handle = ctx.handle
         combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=grad_x, probs=grad_probs, handle=handle, pad_multiple=ctx.pad_multiple
+            hidden=grad_x,
+            probs=grad_probs,
+            handle=handle,
+            pad_multiple=ctx.pad_multiple,
+            **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
         )
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
+        return (
+            combined_hidden,
+            None,
+            combined_probs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 @internal_api
@@ -412,16 +477,20 @@ class HybridEPCombine(torch.autograd.Function):
     '''
 
     @staticmethod
-    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None):
+    def forward(ctx, x, handle, num_permuted_tokens=None, pad_multiple=None, fused=False):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
         combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
-            hidden=x, handle=handle, pad_multiple=pad_multiple
+            hidden=x,
+            handle=handle,
+            pad_multiple=pad_multiple,
+            **({"fuse_unpermute_combine": fused} if fused else {}),
         )
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.fused = fused
         return combined_hidden
 
     @staticmethod
@@ -436,6 +505,7 @@ class HybridEPCombine(torch.autograd.Function):
             handle=handle,
             pad_multiple=ctx.pad_multiple,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
         return dispatched_hidden, None, None, None, None
 
@@ -449,10 +519,14 @@ if HAVE_HYBRIDEP:
         probs,
         group,
         num_local_experts,
-        num_sms_dispatch_api=24,
-        num_sms_combine_api=24,
+        num_sms_dispatch_api=None,
+        num_sms_combine_api=None,
+        num_blocks_permute=None,
+        num_blocks_unpermute=None,
+        fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -469,10 +543,14 @@ if HAVE_HYBRIDEP:
                 Process group used for communication.
             num_local_experts (int):
                 Number of local experts.
-            num_sms_dispatch_api (int):
+            num_sms_dispatch_api (Optional[int]):
                 Number of SMs used by the dispatch API.
-            num_sms_combine_api (int):
+            num_sms_combine_api (Optional[int]):
                 Number of SMs used by the combine API.
+            num_blocks_permute (Optional[int]):
+                Number of blocks used by the permute part.
+            num_blocks_unpermute (Optional[int]):
+                Number of blocks used by the unpermute part.
             num_permuted_tokens (int):
                 Number of tokens after permute. HybridEP uses this to allocate buffers.
                 If not provided, HybridEP obtains the size from a GPU tensor,
@@ -480,6 +558,8 @@ if HAVE_HYBRIDEP:
             pad_multiple (int):
                 Alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
+            num_sms_preprocessing_api (int):
+                Number of SMs used by the preprocessing (metadata scan) kernel.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -489,12 +569,16 @@ if HAVE_HYBRIDEP:
             num_local_experts,
             num_sms_dispatch_api,
             num_sms_combine_api,
+            num_blocks_permute,
+            num_blocks_unpermute,
+            fused,
             num_permuted_tokens,
             pad_multiple,
+            num_sms_preprocessing_api,
         )
 
     @internal_api
-    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple):
+    def hybrid_ep_combine(x, handle, num_permuted_tokens, pad_multiple, fused=False):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -511,7 +595,7 @@ if HAVE_HYBRIDEP:
                 The alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
         '''
-        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple)
+        return HybridEPCombine.apply(x, handle, num_permuted_tokens, pad_multiple, fused)
 
 else:
     hybrid_ep_dispatch = None

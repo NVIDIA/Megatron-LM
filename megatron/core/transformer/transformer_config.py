@@ -613,6 +613,10 @@ class TransformerConfig(ModelParallelConfig):
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp4_recipe is custom."""
 
+    high_priority_a2a_comm_stream: bool = False
+    """If True, the communication stream created by set_streams for combined 1f1b
+    a2a overlap is created with CUDA high priority."""
+
     ####################
     # MoE related
     ####################
@@ -738,6 +742,18 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
+    dense_grouped_gemm: bool = False
+    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
+    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
+    """
+
+    log_moe_overload_factor: bool = False
+    """When True, log MoE overload metrics (avg/max vs balanced token count per step; max cum
+    overload = peak cumulative actual tokens / peak cumulative balanced count over interleaved
+    fwd/bwd) to TensorBoard/W&B and console. Records tokens_per_expert.sum() after dispatch;
+    use for debugging."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -781,6 +797,9 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
+
+    moe_permute_fusion_into_hybridep: bool = False
+    """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -826,9 +845,22 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
-    moe_hybridep_num_sms: int = 16
-    """Number of SMs to use for HybridEP. In pure NVL scenarios,
-    16 SMs can generally achieve good bandwidth."""
+    moe_hybridep_num_sms: Optional[int] = None
+    """Number of SMs to use for HybridEP. None uses the default from DeepEP.
+    In pure NVL scenarios, 16 SMs can generally achieve good bandwidth."""
+
+    moe_hybridep_num_blocks_permute: Optional[int] = None
+    """Number of cuda threads blocks to use for permute part in HybridEP. 
+    If permute_fusion_into_hybridep is True, this is the number of sms 
+    to use for the permute part."""
+
+    moe_hybridep_num_blocks_unpermute: Optional[int] = None
+    """Number of cuda threads blocks to use for unpermute part in HybridEP. 
+    If permute_fusion_into_hybridep is True, this is the number of sms to 
+    use for the unpermute part."""
+
+    moe_hybridep_num_sms_preprocessing: int = 108
+    """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
@@ -1401,10 +1433,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"but got {self.moe_shared_expert_intermediate_size}"
                 )
             if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
-                "alltoall"
+                "alltoall",
+                "flex",
             ]:
                 raise ValueError(
-                    f"moe_shared_expert_overlap only works with alltoall token dispatcher."
+                    f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
@@ -2325,9 +2358,13 @@ class TransformerConfig(ModelParallelConfig):
                         )
 
             if self.fine_grained_activation_offloading:
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                ), "fine_grained_activation_offloading must be used with TE impl of cuda_graph."
+                assert self.cuda_graph_impl == "transformer_engine" or (
+                    self.cuda_graph_impl == "local" and self.cuda_graph_scope == "full_iteration"
+                ), (
+                    "fine-grained activation offloading is only supported with "
+                    "transformer_engine CUDA graph implementation or local CUDA graph "
+                    "implementation with full_iteration scope."
+                )
                 assert (
                     CudaGraphScope.moe not in self.cuda_graph_scope
                 ), "Token-drop MoE is temporarily not supported with activation offloading."
