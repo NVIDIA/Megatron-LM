@@ -245,7 +245,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 else ddp_config.megatron_fsdp_grad_comm_dtype
             ),
         )
-        kwargs = {"mp_policy": mp_policy}
+        kwargs = {
+            "mp_policy": mp_policy,
+            "enable_unshard_prefetch": ddp_config.overlap_param_gather,
+            "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
+        }
 
         for m in module.modules():
             if isinstance(m, (TEGroupedMLP, SequentialMLP)):

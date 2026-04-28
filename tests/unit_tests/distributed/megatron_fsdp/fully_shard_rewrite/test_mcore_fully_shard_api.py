@@ -154,10 +154,11 @@ class TestMegatronFSDPE2E:
             pytest.param(
                 dict(
                     data_parallel_sharding_strategy="optim_grads_params",
-                    fsdp_double_buffer=True,
                     recompute_granularity="full",
                     recompute_method="uniform",
                     recompute_num_layers=1,
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
                     use_fully_shard_api=True,
                 ),
                 id="optim_grads_params_double_buffer",

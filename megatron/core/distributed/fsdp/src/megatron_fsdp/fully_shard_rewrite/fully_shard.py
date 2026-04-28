@@ -31,6 +31,7 @@ from torch.distributed.tensor.placement_types import Shard
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .param_group import ParameterGroup
+from .utils import ParamGroupIdx, RegisterFSDPBackwardFunction, _replace_module_parameter
 
 
 def fully_shard(
@@ -44,6 +45,9 @@ def fully_shard(
     mp_policy: Optional["MixedPrecisionPolicy"] = None,  # TODO: implement
     offload_policy: Optional["OffloadPolicy"] = None,  # TODO: implement
     ignored_params: Optional[set[nn.Parameter]] = None,
+    # --- Megatron-FSDP specific options ---
+    enable_unshard_prefetch: bool = True,
+    enable_async_reduce_grad: bool = True,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -84,7 +88,10 @@ def fully_shard(
 
     # Initialize FSDP state and parameter groups
     module._init_named_param_groups(mesh, ignored_params, mp_policy=mp_policy)
-    module._init_fsdp_state()
+    module._init_fsdp_state(
+        enable_unshard_prefetch=enable_unshard_prefetch,
+        enable_async_reduce_grad=enable_async_reduce_grad,
+    )
     module._init_param_main_grad_func()
 
     # Register hooks for unshard/reshard during forward/backward
@@ -208,23 +215,30 @@ class FSDPModule(nn.Module):
             if hasattr(m, "_reset_parameters"):
                 m._reset_parameters()
 
-    def _init_fsdp_state(self):
+    def _init_fsdp_state(self, enable_unshard_prefetch, enable_async_reduce_grad):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
         forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
         root_context = _FSDPRootContext(
-            ag_stream=torch.cuda.Stream(),
-            rs_stream=torch.cuda.Stream(),
+            ag_stream=(
+                torch.cuda.Stream() if enable_unshard_prefetch else torch.cuda.current_stream()
+            ),
+            rs_stream=(
+                torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream()
+            ),
             forward_order=forward_order,
-            reduce_grad_buckets=[[] for _ in range(len(forward_order))],
+            reduce_grad_buckets={id(module): [] for module in forward_order},
             unshard_done_events={id(module): None for module in forward_order},
-            enable_unshard_prefetch=True,
-            enable_async_reduce_grad=True,
+            enable_unshard_prefetch=enable_unshard_prefetch,
+            enable_async_reduce_grad=enable_async_reduce_grad,
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
         for child in self.modules():
             if child is not self and isinstance(child, FSDPModule):
-                child._init_fsdp_state()
+                child._init_fsdp_state(
+                    enable_unshard_prefetch=enable_unshard_prefetch,
+                    enable_async_reduce_grad=enable_async_reduce_grad,
+                )
                 child._fsdp_state._is_root = False
                 setattr(child, "_fsdp_root_context", root_context)
 
@@ -322,11 +336,12 @@ class FSDPModule(nn.Module):
         ctx = self._fsdp_root_context
         stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
-        # Handle pending reduce events before this module to ensure memory is freed in a timely manner
+        # Handle pending reduce events before this module to ensure memory is freed in a timely manner.
         if async_op:
-            for i, module in enumerate(reversed(ctx.forward_order)):
+            backward_order = list(reversed(ctx.forward_order))
+            for i, module in enumerate(backward_order):
                 if i - 2 >= 0:
-                    buckets = ctx.reduce_grad_buckets[i - 2]
+                    buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
                     while len(buckets) > 0:
                         event, param_group = buckets.pop()
                         event.wait()
@@ -345,11 +360,16 @@ class FSDPModule(nn.Module):
                     if param.grad is not None:
                         assert not torch.isnan(param.grad).any(), "NaN in parameter grad"
 
-            # Copy .grad → main grad buffer on main stream (fast memcpy)
+            # Copy .grad → main grad buffer on main stream (fast memcpy).
+            # When gradient_accumulation_fusion is active for FSDP params, the backward
+            # kernel writes directly into main_grad (weight.main_grad = get_main_grad() in
+            # layers.py) and sets grad_added_to_main_grad=True.  In that case we must NOT
+            # zero main_grad, and there is no .grad to copy.
             for name, param in zip(param_names, param_group.params):
                 main_grad = param.get_main_grad()
                 if param.grad is None:
-                    main_grad.zero_()
+                    if not getattr(param, 'grad_added_to_main_grad', False):
+                        main_grad.zero_()
                 else:
                     main_grad.copy_(param.grad.detach())
                     del param.grad
@@ -363,11 +383,7 @@ class FSDPModule(nn.Module):
                     event = torch.cuda.Event()
                     event.record()
 
-                    ctx.reduce_grad_buckets[ctx.forward_order.index(self)].append(
-                        (event, param_group)
-                    )
-                event.wait()
-                param_group.release_grad_buffer()
+                    ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -391,16 +407,15 @@ class FSDPModule(nn.Module):
                             dist_grad._local_tensor
                         ).any(), f"NaN in dist grad for parameter {name}"
 
-        setattr(self, "needs_grad_reduce", False)
-
+    @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
         """Scale gradients by a factor (e.g., for loss scaling)."""
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                if param_group.main_grad_buffer is not None:
-                    param_group.main_grad_buffer.data.mul_(scaling_factor)
+                for dist_grad in param_group.dist_grads:
+                    dist_grad._local_tensor.mul_(scaling_factor)
 
     def _zero_grad_buffer(self):
         """Zero the gradient buffer for all parameter groups."""
@@ -420,6 +435,18 @@ class FSDPModule(nn.Module):
                 if param_group.main_weight_buffer is None:
                     continue
                 param_group.model_weight_buffer.data.copy_(param_group.main_weight_buffer.data)
+
+        # Also zero main grads to avoid stale gradients after weight copy
+        self._zero_main_grads()
+
+    def _zero_main_grads(self):
+        """Zero the main gradient buffer for all parameter groups."""
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for param_group in child._fsdp_param_groups:
+                if param_group.main_grad_buffer is not None:
+                    param_group.main_grad_buffer.data.zero_()
 
     def _set_nan_check(self, enable_nan_checks: bool):
         """Enable or disable NaN checking."""
@@ -487,11 +514,12 @@ def _get_module_fsdp_param_groups(
 
     # Create ParameterGroup for each group
     fsdp_param_groups = []
-    for params in param_groups.values():
+    for i, params in enumerate(param_groups.values()):
         fsdp_param_groups.append(
             ParameterGroup(
                 params,
                 mesh=mesh,
+                param_group_id=ParamGroupIdx(id(module), i),
                 main_params_dtype=mp_policy.main_params_dtype if mp_policy is not None else None,
                 main_grads_dtype=mp_policy.main_grads_dtype if mp_policy is not None else None,
             )
@@ -556,7 +584,10 @@ def _register_backward_pre_hook(module: FSDPModule):
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
         ctx = module._fsdp_root_context
-        setattr(module, "needs_grad_reduce", True)
+        setattr(module, "post_backward_issued", False)
+        for param_group in module._fsdp_param_groups:
+            for param in param_group.params:
+                setattr(param, "grad_added_to_main_grad", False)
         if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
         module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
@@ -578,8 +609,8 @@ def _register_backward_hook(module: FSDPModule):
         """Hook called after backward pass for this module."""
         ctx = module._fsdp_root_context
         module.reshard()
-        if getattr(module, "needs_grad_reduce", False):
-            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        module.post_backward_issued = True
 
     @torch.compiler.disable
     def _register_post_backward_hook(
@@ -652,56 +683,22 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
         ctx = root_module._fsdp_root_context
         stream = ctx.rs_stream
         for module in reversed(ctx.forward_order):
+            if module.post_backward_issued:
+                continue
             module.reshard()
-            if getattr(module, "needs_grad_reduce", False):
-                with torch.cuda.stream(stream):
-                    module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
-        for buckets in ctx.reduce_grad_buckets:
+            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        for buckets in ctx.reduce_grad_buckets.values():
             while len(buckets) > 0:
                 event, param_group = buckets.pop()
                 event.wait()
                 param_group.release_grad_buffer()
+        torch.cuda.current_stream().wait_stream(stream)
         root_state._post_backward_callback_queued = False
 
     state._post_backward_callback_queued = True
     Variable._execution_engine.queue_callback(
         functools.partial(_post_backward_final_callback, state, module)
     )
-
-
-class RegisterFSDPBackwardFunction(torch.autograd.Function):
-    """
-    Autograd Function for registering post-backward hooks.
-
-    This Function simply passes inputs through in forward, but its
-    backward calls the post_backward_hook to perform reshard and
-    gradient reduction after gradients are computed.
-    """
-
-    @staticmethod
-    def forward(ctx, post_backward: Callable, *inputs: torch.Tensor):
-        ctx.post_backward = post_backward
-        return inputs
-
-    @staticmethod
-    def backward(ctx, *grads: torch.Tensor):
-        ctx.post_backward()
-        return (None,) + grads
-
-
-def _replace_module_parameter(module: nn.Module, name: str, new_param: nn.Parameter):
-    """
-    Replace a module's parameter while preserving module hierarchy.
-
-    Example:
-        If name="layers.0.linear1.weight", this finds module.layers[0].linear1
-        and replaces its weight parameter.
-    """
-    parts = name.split(".")
-    parent = module
-    for part in parts[:-1]:
-        parent = getattr(parent, part)
-    setattr(parent, parts[-1], new_param)
 
 
 @dataclass
@@ -748,11 +745,11 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     # Reduce-scatter (gradient sync) tracking
     # ------------------------------------------------------------------
-    reduce_grad_buckets: List[List[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
-        default_factory=list
+    reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
+        default_factory=dict
     )
     """
-    Per-module reduce-scatter tracking aligned with `forward_order`.
+    Maps module_id -> list of (event, parameter_group) tuples.
 
     Each entry corresponds to a module and contains a list of:
         (event, parameter_group)

@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .allocator import TemporaryBucketAllocator
+from .utils import ParamGroupIdx
 
 
 class BufferIndex:
@@ -26,9 +27,9 @@ class BufferIndex:
         dp_rank: int,
         dp_world_size: int,
         is_distributed: bool,
+        param_group_id: ParamGroupIdx,
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
-        param_group_id: int = 0,
     ):
         self.param_group_id = param_group_id
         self.is_distributed = is_distributed
@@ -221,9 +222,10 @@ class DataParallelBuffer:
         dtype: torch.dtype,
         device: torch.device,
         dp_group: torch.distributed.ProcessGroup,
+        param_group_id: ParamGroupIdx,
+        *,
         allocator: Optional[TemporaryBucketAllocator] = None,
         is_distributed: bool = False,
-        param_group_id: int = 0,
         gradient_scaling_factor: Optional[float] = None,
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
