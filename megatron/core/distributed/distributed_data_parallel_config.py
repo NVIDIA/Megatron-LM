@@ -7,6 +7,7 @@ import torch
 
 from ..utils import is_torch_min_version
 
+
 @dataclass
 class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
