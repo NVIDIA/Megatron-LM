@@ -140,9 +140,10 @@ def instantiate(
         config: The configuration object describing the target and its parameters.
         *args: Optional positional arguments that will override _args_ in the config
                if provided.
-        mode: Instantiation mode (STRICT or LENIENT). In LENIENT mode (default),
-              errors during instantiation of parameters are logged as warnings,
-              and None is used instead. In STRICT mode, errors are raised.
+        mode: Instantiation mode (STRICT or LENIENT). Controls how config keys that
+              do not match the target's signature are handled: LENIENT (default)
+              drops them with a warning, STRICT raises ``InstantiationException``.
+              Errors resolving a ``_target_`` propagate in both modes.
         **kwargs: Optional keyword arguments that will override parameters in the config.
                   Note: Dataclass instances in kwargs are treated as nested configs.
 
