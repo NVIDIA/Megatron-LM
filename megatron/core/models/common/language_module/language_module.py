@@ -69,14 +69,13 @@ class LanguageModule(MegatronModule):
 
         Must be called by subclasses after `self.mtp` is created.
         """
-        if self.config.cuda_graph_impl == "local":
-            self._mtp_cudagraph_manager = CudaGraphManager(
-                self.config,
-                base_module=self,
-                function_name="compute_mtp_single_step",
-                need_backward=False,
-                inline_capture=True,
-            )
+        self._mtp_cudagraph_manager = CudaGraphManager(
+            self.config,
+            base_module=self,
+            function_name="compute_mtp_single_step",
+            need_backward=False,
+            inline_capture=True,
+        )
 
     def _is_in_embd_group(self):
         if self.embd_group is None:

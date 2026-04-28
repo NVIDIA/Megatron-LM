@@ -1443,17 +1443,26 @@ class CudaGraphManager(torch.nn.Module):
 
         if function_name is not None:
             func = getattr(base_module, function_name)
+            if config.cuda_graph_impl == "local":
 
-            def wrapped_func(*args, eager=False, cache_key=None, **kwargs):
-                if eager:
+                def wrapped_func(*args, eager=False, cache_key=None, **kwargs):
+                    if eager:
+                        return func(*args, **kwargs)
+                    out = self(base_module, args, kwargs, cache_key=cache_key)
+                    # Unwrap single-element tuple to match the original function's return type.
+                    if isinstance(out, tuple) and len(out) == 1:
+                        return out[0]
+                    return out
+
+                setattr(base_module, function_name, wrapped_func)
+            else:
+                # Return the original function if we cannot graph it.
+                def wrapped_func(*args, eager=False, cache_key=None, **kwargs):
                     return func(*args, **kwargs)
-                out = self(base_module, args, kwargs, cache_key=cache_key)
-                # Unwrap single-element tuple to match the original function's return type.
-                if isinstance(out, tuple) and len(out) == 1:
-                    return out[0]
-                return out
 
-            setattr(base_module, function_name, wrapped_func)
+                setattr(base_module, function_name, wrapped_func)
+                self.func = func
+                return
         else:
             func = None
         self.func = func
