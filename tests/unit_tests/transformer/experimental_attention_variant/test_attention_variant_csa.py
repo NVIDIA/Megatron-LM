@@ -212,7 +212,7 @@ def _make_mla_config(
 ):
     """Helper to create MLATransformerConfig for CSA tests."""
     if csa_compress_ratios is None:
-        csa_compress_ratios = [1] * num_layers
+        csa_compress_ratios = [0] * num_layers
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -533,7 +533,7 @@ class TestCompressedSparseAttentionRatio1:
 
         cls = request.cls
         cls.config = _make_mla_config(
-            csa_compress_ratios=[1, 1, 1, 1],
+            csa_compress_ratios=[0, 0, 0, 0],
             csa_window_size=8,
         )
         cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(

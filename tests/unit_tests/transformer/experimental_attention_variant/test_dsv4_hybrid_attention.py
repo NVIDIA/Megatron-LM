@@ -68,7 +68,7 @@ def _make_config(
 ):
     """Create an MLATransformerConfig for DSv4 hybrid attention tests."""
     if csa_compress_ratios is None:
-        csa_compress_ratios = [1, 4, 128, 4]
+        csa_compress_ratios = [0, 4, 128, 4]
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=hidden_size,

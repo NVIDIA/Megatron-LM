@@ -275,8 +275,8 @@ def compress_ratios_type(x):
     """Per-layer compress ratios for compressed sparse attention.
 
     Accepts a string containing a Python list expression, e.g.:
-      "[1,1,4,128,4,128]"
-      "([1]+[4,128]*2)*3"
+      "[0,0,4,128,4,128]"
+      "([0]+[4,128]*2)*3"
     The result must be a list of integers. Each value represents the
     compression ratio for the corresponding transformer layer.
     """
@@ -4646,9 +4646,9 @@ def _add_experimental_attention_variant_args(parser):
         default=None,
         help='Per-layer compress ratios for compressed sparse attention. '
             'Accepts a string containing a Python list expression, e.g.: '
-            '"[1,1,4,128,4,128]" or "([1]+[4,128]*2)*3". '
+            '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
             'Each value is the compression ratio for the corresponding '
-            'transformer layer (valid values: 1, 4, 128). '
+            'transformer layer (valid values: 0, 4, 128). '
             'The list length must equal num_layers.'
     )
     return parser

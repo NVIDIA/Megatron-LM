@@ -293,7 +293,7 @@ class TransformerConfig(ModelParallelConfig):
     """Sliding window size for compressed sparse attention."""
 
     csa_compress_ratios: Optional[List[int]] = None
-    """Per-layer compress ratios, e.g. [1, 1, 4, 128, 4, 128, ...]."""
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
 
     csa_compress_rotary_base: float = 40000.0
     """RoPE base for compressed KV positions in compressed sparse attention."""
@@ -1286,8 +1286,8 @@ class TransformerConfig(ModelParallelConfig):
                 len(self.csa_compress_ratios) == self.num_layers
             ), "csa_compress_ratios must have the same length as num_layers"
             assert (
-                all(ratio in [1, 4, 128] for ratio in self.csa_compress_ratios)
-            ), "csa_compress_ratios must be 1, 4, or 128"
+                all(ratio in [0, 4, 128] for ratio in self.csa_compress_ratios)
+            ), "csa_compress_ratios must be 0, 4, or 128"
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling

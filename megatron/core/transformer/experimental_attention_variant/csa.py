@@ -570,7 +570,7 @@ class CompressedSparseAttention(MegatronModule):
     provides compressor and indexer submodule specs; this ``__init__`` inspects
     ``config.csa_compress_ratios[layer_idx]`` and conditionally builds them:
 
-    * ``ratio == 1``:  window-only (compressor and indexer NOT built)
+    * ``ratio == 0``:  window-only (compressor and indexer NOT built)
     * ``ratio == 4``:  window + 4x compressed + learned Indexer (both built)
     * ``ratio == 128``: window + 128x compressed, attend to all (compressor built only)
     """
