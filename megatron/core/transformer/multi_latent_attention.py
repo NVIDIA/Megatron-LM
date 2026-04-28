@@ -19,6 +19,7 @@ except ImportError:
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.models.backends import get_backend
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -29,7 +30,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.inference_layers import InferenceColumnParallelLinear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -65,7 +65,6 @@ if HAVE_TE:
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
-        TENorm,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
     )
@@ -75,11 +74,10 @@ else:
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
-        TENorm,
         Linear,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
-    ) = (None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None)
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
@@ -625,6 +623,10 @@ class MLASelfAttention(MultiLatentAttention):
         This can occur when both a primitive norm submodule and a fused
         norm+linear layer is used.
         """
+        backend = get_backend(self.config.transformer_impl)
+        # Unfused linear layer
+        linear_impl = backend.column_parallel_linear()
+
         if (
             self.config.q_lora_rank is None
             # Q layernorm is not trivial
@@ -632,11 +634,7 @@ class MLASelfAttention(MultiLatentAttention):
         ):
             help_msg = ""
             # Q projection does not include a norm
-            if submodules.linear_q_proj in (
-                TEColumnParallelLinear,
-                InferenceColumnParallelLinear,
-                ColumnParallelLinear,
-            ):
+            if submodules.linear_q_proj is linear_impl:
                 help_msg = (
                     f"Please use a fused norm+linear for "
                     f"`linear_q_proj={submodules.linear_q_proj}` if "
@@ -651,8 +649,7 @@ class MLASelfAttention(MultiLatentAttention):
             # Q layernorm is not trivial
             submodules.q_layernorm not in (None, IdentityOp)
             # Q up projection includes a norm
-            and submodules.linear_q_up_proj
-            not in (TEColumnParallelLinear, InferenceColumnParallelLinear, ColumnParallelLinear)
+            and submodules.linear_q_up_proj is not linear_impl
         ):
             raise RuntimeError(
                 f"`q_layernorm={submodules.q_layernorm}` is non-trivial "
@@ -664,8 +661,7 @@ class MLASelfAttention(MultiLatentAttention):
             # KV layernorm is not trivial
             submodules.kv_layernorm not in (None, IdentityOp)
             # KV up projection includes a norm
-            and submodules.linear_kv_up_proj
-            not in (TEColumnParallelLinear, InferenceColumnParallelLinear, ColumnParallelLinear)
+            and submodules.linear_kv_up_proj is not linear_impl
         ):
             raise RuntimeError(
                 f"`kv_layernorm={submodules.kv_layernorm}` is non-trivial "
@@ -682,9 +678,16 @@ class MLASelfAttention(MultiLatentAttention):
         # for MLA, but not DSA. (see
         # https://github.com/NVIDIA/Megatron-LM/pull/3026)
         # Config selects the default class; spec overrides if set.
-        # TODO(yuzhongw, janpabloe): Support local backend.
         is_dsa = self.config.experimental_attention_variant == "dsa"
         variant_str = "DSA" if is_dsa else "MLA"
+
+        backend = get_backend(self.config.transformer_impl)
+        qk_norm_impl = backend.layer_norm(
+            rms_norm=self.config.normalization == 'RMSNorm', for_qk=True
+        )
+        # Unfused linear layer
+        linear_impl = backend.column_parallel_linear()
+        fused_norm_linear_impl = backend.column_parallel_layer_norm_linear()
 
         def is_trivial(module_spec):
             return module_spec in (None, IdentityOp)
@@ -701,38 +704,38 @@ class MLASelfAttention(MultiLatentAttention):
             if is_dsa:
                 # Always have to use non-fused linear layers and set
                 # Q/KV layernorms individually for DSA.
-                q_norm_cls = default_if_trivial(submodules.q_layernorm, TENorm)
+                q_norm_cls = default_if_trivial(submodules.q_layernorm, qk_norm_impl)
                 if self.config.q_lora_rank is not None:
-                    linear_q_up_proj_cls = submodules.linear_q_up_proj or TEColumnParallelLinear
+                    linear_q_up_proj_cls = submodules.linear_q_up_proj or linear_impl
 
                     if linear_q_up_proj_cls is None:
                         raise RuntimeError(
                             "qk_layernorm requires TransformerEngine or "
                             "q_layernorm/kv_layernorm to be set in the spec."
                         )
-                    elif linear_q_up_proj_cls is not TEColumnParallelLinear:
+                    elif linear_q_up_proj_cls is not linear_impl:
                         raise ValueError(
                             f"`linear_q_up_proj={submodules.linear_q_up_proj}` is "
                             f"fused norm+linear, which is not supported for DSA, "
                             f"or unhandled layer type."
                         )
                 else:
-                    linear_q_proj_cls = submodules.linear_q_proj or TEColumnParallelLinear
+                    linear_q_proj_cls = submodules.linear_q_proj or linear_impl
                     if linear_q_proj_cls is None:
                         raise RuntimeError(
                             "qk_layernorm requires TransformerEngine or "
                             "q_layernorm/kv_layernorm to be set in the spec."
                         )
-                    elif linear_q_proj_cls is not TEColumnParallelLinear:
+                    elif linear_q_proj_cls is not linear_impl:
                         raise ValueError(
                             f"`linear_q_proj={submodules.linear_q_proj}` is "
                             f"fused norm+linear, which is not supported for DSA, "
                             f"or unhandled layer type."
                         )
 
-                kv_norm_cls = default_if_trivial(submodules.kv_layernorm, TENorm)
-                linear_kv_up_proj_cls = submodules.linear_kv_up_proj or TEColumnParallelLinear
-                if linear_kv_up_proj_cls is not TEColumnParallelLinear:
+                kv_norm_cls = default_if_trivial(submodules.kv_layernorm, qk_norm_impl)
+                linear_kv_up_proj_cls = submodules.linear_kv_up_proj or linear_impl
+                if linear_kv_up_proj_cls is not linear_impl:
                     raise ValueError(
                         f"`linear_kv_up_proj={submodules.linear_kv_up_proj}` is "
                         f"fused norm+linear, which is not supported for DSA, "
@@ -744,13 +747,10 @@ class MLASelfAttention(MultiLatentAttention):
                 q_norm_cls = submodules.q_layernorm or IdentityOp
                 if self.config.q_lora_rank is not None:
                     if q_norm_cls is IdentityOp:
-                        linear_q_up_proj_cls = TELayerNormColumnParallelLinear
+                        linear_q_up_proj_cls = fused_norm_linear_impl
                     else:
-                        linear_q_up_proj_cls = TEColumnParallelLinear
-                    if submodules.linear_q_up_proj not in (
-                        TEColumnParallelLinear,
-                        TELayerNormColumnParallelLinear,
-                    ):
+                        linear_q_up_proj_cls = linear_impl
+                    if submodules.linear_q_up_proj not in (linear_impl, fused_norm_linear_impl):
                         raise ValueError(
                             f"cannot apply QK norm with unhandled layer type "
                             f"`linear_q_up_proj={submodules.linear_q_up_proj}`"
@@ -762,11 +762,8 @@ class MLASelfAttention(MultiLatentAttention):
                             "q_layernorm/kv_layernorm to be set in the spec."
                         )
                 else:
-                    linear_q_proj_cls = TELayerNormColumnParallelLinear
-                    if submodules.linear_q_up_proj not in (
-                        TEColumnParallelLinear,
-                        TELayerNormColumnParallelLinear,
-                    ):
+                    linear_q_proj_cls = fused_norm_linear_impl
+                    if submodules.linear_q_up_proj not in (linear_impl, fused_norm_linear_impl):
                         raise ValueError(
                             f"cannot apply QK norm with unhandled layer type "
                             f"`linear_q_proj={submodules.linear_q_proj}`"
@@ -784,14 +781,11 @@ class MLASelfAttention(MultiLatentAttention):
 
                 kv_norm_cls = submodules.kv_layernorm or IdentityOp
                 if kv_norm_cls is IdentityOp:
-                    linear_kv_up_proj_cls = TELayerNormColumnParallelLinear
+                    linear_kv_up_proj_cls = fused_norm_linear_impl
                 else:
-                    linear_kv_up_proj_cls = TEColumnParallelLinear
+                    linear_kv_up_proj_cls = linear_impl
                 linear_kv_up_proj_cls = submodules.linear_kv_up_proj or linear_kv_up_proj_cls
-                if linear_kv_up_proj_cls not in (
-                    TEColumnParallelLinear,
-                    TELayerNormColumnParallelLinear,
-                ):
+                if linear_kv_up_proj_cls not in (linear_impl, fused_norm_linear_impl):
                     raise ValueError(
                         f"cannot apply QK norm with unhandled layer type "
                         f"`linear_kv_up_proj={submodules.linear_kv_up_proj}`"
@@ -804,24 +798,23 @@ class MLASelfAttention(MultiLatentAttention):
                 )
         else:
             if self.config.q_lora_rank is not None:
-                if (
-                    submodules.linear_q_up_proj is TELayerNormColumnParallelLinear
-                    or not is_trivial(submodules.q_layernorm)
+                if submodules.linear_q_up_proj is fused_norm_linear_impl or not is_trivial(
+                    submodules.q_layernorm
                 ):
                     raise ValueError(
                         f"spec sets linear_q_up_proj={submodules.linear_q_up_proj} and "
                         f"q_layernorm={submodules.q_layernorm}, but "
                         "qk_layernorm/qk_l2_norm are supposed to be disabled"
                     )
-                linear_q_up_proj_cls = TEColumnParallelLinear
+                linear_q_up_proj_cls = linear_impl
             else:
-                if submodules.linear_q_proj is TELayerNormColumnParallelLinear:
+                if submodules.linear_q_proj is fused_norm_linear_impl:
                     raise ValueError(
                         f"spec sets linear_q_up_proj={submodules.linear_q_proj}, but "
                         "qk_layernorm/qk_l2_norm are supposed to be disabled"
                     )
-                linear_q_proj_cls = TEColumnParallelLinear
-            if submodules.linear_kv_up_proj is TELayerNormColumnParallelLinear or not is_trivial(
+                linear_q_proj_cls = linear_impl
+            if submodules.linear_kv_up_proj is fused_norm_linear_impl or not is_trivial(
                 submodules.kv_layernorm
             ):
                 raise ValueError(
@@ -829,7 +822,7 @@ class MLASelfAttention(MultiLatentAttention):
                     f"kv_layernorm={submodules.kv_layernorm}, but "
                     "qk_layernorm/qk_l2_norm are supposed to be disabled"
                 )
-            linear_kv_up_proj_cls = TEColumnParallelLinear
+            linear_kv_up_proj_cls = linear_impl
             q_norm_cls = kv_norm_cls = IdentityOp
         return dict(
             linear_q_proj=linear_q_proj_cls,
