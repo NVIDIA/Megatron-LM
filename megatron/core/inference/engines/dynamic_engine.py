@@ -225,6 +225,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
+        self.async_scheduling = inference_config.async_scheduling
+        self.finished_sync_period = inference_config.finished_sync_period
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -1956,6 +1958,26 @@ class DynamicInferenceEngine(AbstractEngine):
             "step_time": step_time,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+
+    def _async_scheduling_active(self) -> bool:
+        """Engine-level gate for the async-scheduling speculative chain.
+
+        Returns True when the current step is eligible to launch the next
+        forward speculatively without waiting for CPU bookkeeping. Used by the
+        engine loop in the launch-ahead refactor to decide whether to chain
+        the next forward on the stream or to fall back to serial behavior.
+
+        False when:
+        - async_scheduling is disabled by configuration.
+        - The current step is not pure decode (prefill present).
+        - The next step would require new KV blocks that aren't available.
+
+        Refined in C4 to also detect rejection events (add/pause/evict) and
+        the periodic finished-pending sync.
+        """
+        if not self.async_scheduling:
+            return False
+        return self.context.can_speculate_decode_step()
 
     async def async_step(
         self,

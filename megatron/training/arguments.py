@@ -1987,6 +1987,18 @@ def _add_inference_args(parser):
                        help='Dtype for the Mamba inference SSM states tensor')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
+    group.add_argument('--inference-dynamic-batching-async-scheduling',
+                       action=argparse.BooleanOptionalAction, default=True,
+                       help='Enable async scheduling: speculatively launch the next '
+                       'forward immediately after sampling so the GPU runs '
+                       'forward -> sample -> forward -> sample without waiting on CPU '
+                       'bookkeeping. Active only on pure-decode steps; falls back to '
+                       'serial behavior on prefill or boundary events.')
+    group.add_argument('--inference-dynamic-batching-finished-sync-period',
+                       type=int, default=32,
+                       help='Force a CPU/GPU sync every N speculative decode steps '
+                       'when finished requests are pending, so finished slots stop '
+                       'consuming compute. Set to 0 to disable the periodic sync.')
     return parser
 
 

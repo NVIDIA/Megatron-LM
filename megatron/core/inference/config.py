@@ -303,6 +303,21 @@ class InferenceConfig:
     consisting of the string label, the target dtype, and whether to store the data on GPU.
     """
 
+    async_scheduling: bool = True
+    """Whether to enable async scheduling (speculative forward chain on pure-decode
+    steps). When True, the engine launches the next forward immediately after
+    sampling without waiting for CPU bookkeeping; CPU bookkeeping verifies
+    retroactively. Falls back to serial behavior on prefill or boundary events.
+    """
+
+    finished_sync_period: int = 32
+    """Periodic CPU/GPU sync interval (in speculative decode steps) used to clean
+    up finished requests that would otherwise keep consuming compute in the
+    speculative chain. The sync only fires when finished_pending > 0. Set to 0
+    to disable the periodic sync (rely solely on add/pause/evict for syncs).
+    Only applies when async_scheduling is True.
+    """
+
     use_synchronous_zmq_collectives: bool = False
     """Whether to use synchronous ZMQ collectives for inference. If True, the
     all_reduce_max operation will be performed synchronously, which can help reduce

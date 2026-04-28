@@ -362,6 +362,8 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         logging_step_interval=args.inference_logging_step_interval,
         num_speculative_tokens=args.num_speculative_tokens,
         use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
+        async_scheduling=getattr(args, 'inference_dynamic_batching_async_scheduling', True),
+        finished_sync_period=getattr(args, 'inference_dynamic_batching_finished_sync_period', 32),
     )
 
 
