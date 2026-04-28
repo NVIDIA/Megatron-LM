@@ -417,9 +417,9 @@ def inject_flextron_forward_logic(model):
             if 'budget' in flextron_kwargs:
                 budget_item = flextron_kwargs['budget']
                 original_model = False
-            # else:
-            #     budget_item = 1.0
-            #     original_model = True
+            else:
+                budget_item = 1.0
+                original_model = True
 
             # Get router output and loss function
             flextron_kwargs, loss_func = self._flextron_manager.process_router_output(budget_item)
