@@ -2096,15 +2096,21 @@ class DynamicInferenceEngine(AbstractEngine):
         launch's GPU work is allowed to complete; its results are discarded
         because step N+1 will be re-launched from canonical state.
 
-        Also rolls back the controller's sampling RNG state to the snapshot
-        taken before the discarded pre-launch's sample. Without this rollback
-        the serial re-sample would observe an RNG state advanced by the
-        discarded sample and produce a token different from the baseline.
+        Rolls back two pieces of non-idempotent state advanced by the
+        discarded forward+sample:
+          - ``controller.sampling_rng`` — sampling consumes the CUDA
+            generator state; without a rollback the serial re-sample would
+            see an advanced RNG and produce a different token.
+          - ``mamba_{conv,ssm}_states`` — Mamba's forward advances per-
+            active-request SSM/conv slices in place. The shadow copy
+            captured before the speculative forward is scattered back so
+            the serial re-launch's forward reads pre-spec state.
         """
         torch.cuda.current_stream().synchronize()
         if self._pre_launch_rng_state is not None:
             self.controller.sampling_rng.set_state(self._pre_launch_rng_state)
             self._pre_launch_rng_state = None
+        self.context.restore_mamba_state_for_speculation()
         self._pending_launch_state = None
 
     async def _async_step_speculative(
@@ -2187,12 +2193,13 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             launch_state_N = self._pending_launch_state
             self._pending_launch_state = None
-            # The RNG state snapshot is paired with the consumed pre-launch:
-            # the pre-launch's sample has already advanced the RNG. We are now
-            # consuming that sample, so the advance is "real" and we drop the
-            # snapshot — only a future rejection that discards a pre-launch
-            # would need to roll back.
+            # The RNG and mamba snapshots are paired with the consumed pre-
+            # launch: its forward + sample have already advanced both, and
+            # we are now consuming the result. The advance is real, so drop
+            # the snapshots without restoring — only a rejection that
+            # discards a pre-launch needs the rollback.
             self._pre_launch_rng_state = None
+            self.context.drop_mamba_state_speculation()
 
         if launch_state_N is None:
             # Nothing to step (no active requests).
@@ -2210,10 +2217,12 @@ class DynamicInferenceEngine(AbstractEngine):
         active_count = launch_state_N["_active_request_count"]
         sample_N_cpu = self.controller._sampled_tokens_cuda[:active_count].cpu()
 
-        # 3. Pre-launch step N+1 if eligible. Snapshot the RNG state first
-        # so we can roll back if the pre-launch is later discarded.
+        # 3. Pre-launch step N+1 if eligible. Snapshot the RNG and mamba
+        # state first so we can roll back if the pre-launch is later
+        # discarded.
         if self.context.can_speculate_decode_step():
             self._pre_launch_rng_state = self.controller.sampling_rng.get_state()
+            self.context.save_mamba_state_for_speculation()
 
             # 4. Mirror sample_N into pinned token_to_input_ids before the
             # speculative H2D so step N+1's forward reads sample_N as its
@@ -2232,6 +2241,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # No active requests after speculative advance (very rare,
                     # but handle cleanly): nothing to roll back.
                     self._pre_launch_rng_state = None
+                    self.context.drop_mamba_state_speculation()
             finally:
                 self.context.restore_after_speculative_advance()
 

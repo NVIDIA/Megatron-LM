@@ -770,6 +770,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=self.mamba_ssm_states_dtype,
                 device=torch.cuda.current_device(),
             )
+            # Shadow buffers used by save/restore_mamba_state_for_speculation:
+            # the speculative async-scheduling pre-launch's forward advances
+            # mamba_{conv,ssm}_states in place per-active-request; on rejection
+            # we copy these saved slices back so step N+1's serial re-launch
+            # reads pre-spec state. Allocated full-size for direct slot
+            # indexing (active slot indices are scattered in the pool); the
+            # active region is the only part written.
+            self._spec_mamba_conv_shadow = torch.empty_like(self.mamba_conv_states)
+            self._spec_mamba_ssm_shadow = torch.empty_like(self.mamba_ssm_states)
+            # Slot indices saved (set at save time; consumed by restore or
+            # cleared on consume). None when no speculative pre-launch is
+            # in flight.
+            self._spec_mamba_active_indices: Optional[Tensor] = None
             if self.num_speculative_tokens > 0:
                 self.mamba_intermediate_conv_states = torch.empty(
                     (
@@ -819,6 +832,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     )
         else:
             self.mamba_metadata = None
+            self._spec_mamba_conv_shadow = None
+            self._spec_mamba_ssm_shadow = None
+            self._spec_mamba_active_indices = None
 
     def initialize_all_tensors(self) -> None:
         """Allocate all GPU state during initial construction."""
@@ -1331,25 +1347,18 @@ class DynamicInferenceContext(BaseInferenceContext):
     def can_speculate_decode_step(self, advance: int = 1) -> bool:
         """Predicate: can we run the next ``advance`` decode steps speculatively?
 
-        Returns True only when the next step's metadata can be derived from the
-        current state by a position bump alone — no allocator activity, no
-        speculative-decoding interaction, no Mamba SSM advance. Tighter than
-        the original block-budget check because the speculative advance path
-        implemented in :meth:`speculatively_advance_for_next_decode_step` does
-        not yet handle block-boundary crossings, speculative decoding
-        (num_speculative_tokens > 0), or hybrid models (Mamba SSM forward
-        advances per-request conv/ssm state and would require per-step rollback
-        of large GPU buffers). The engine falls back to serial when this
-        returns False.
+        Returns True only when the next step's metadata can be derived from
+        the current state by a position bump alone — no allocator activity
+        and no speculative-decoding interaction. For hybrid (Mamba) models,
+        :meth:`save_mamba_state_for_speculation` and its restore counterpart
+        snapshot the per-active-request SSM/conv slices around the
+        speculative forward so a rejection drain can roll the in-place
+        mutations back. The engine falls back to serial when this returns
+        False.
         """
         if not self.is_decode_only():
             return False
         if self.num_speculative_tokens > 0:
-            return False
-        if self.is_hybrid_model:
-            # Mamba SSM state is mutated in-place by forward; speculative
-            # rollback would require saving/restoring per-request conv/ssm
-            # state buffers. Gate off until that is implemented.
             return False
         # Boundary-crossing requires allocator work that the speculative advance
         # cannot replay safely; defer to serial when any active request would
@@ -1432,6 +1441,72 @@ class DynamicInferenceContext(BaseInferenceContext):
             'request_last_kv_block_offset'
         ]
         self._spec_advance_state = None
+
+    def save_mamba_state_for_speculation(self) -> None:
+        """Snapshot Mamba conv/ssm states for the active requests so a
+        speculative forward's mutations can be rolled back on rejection.
+
+        Mamba's forward advances ``mamba_conv_states`` and ``mamba_ssm_states``
+        in place per-active-request slot; unlike attention's KV writes it is
+        not idempotent under re-run. The async-scheduling pre-launch issues a
+        speculative forward whose result may be discarded (rejection event),
+        and the serial re-launch must read pre-spec state. We snapshot the
+        active slices here, queued on the stream right before the speculative
+        forward so it sees pre-save state and writes post-advance state on
+        top. :meth:`restore_mamba_state_for_speculation` (called from the
+        engine's drain helper after stream sync) copies the saved slices
+        back; :meth:`drop_mamba_state_speculation` (called when the
+        pre-launch is consumed normally) drops the snapshot without
+        restoring.
+
+        No-op for non-hybrid models or when the active request count is zero.
+        """
+        if not self.is_hybrid_model:
+            return
+        n_active = self.total_request_count - self.paused_request_count
+        if n_active == 0:
+            return
+        assert self._spec_mamba_active_indices is None, (
+            "previous speculative mamba snapshot has not been resolved"
+        )
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        # request_to_mamba_state_idx is on CPU; the GPU shadow scatter wants
+        # a GPU index tensor.
+        active_indices_gpu = (
+            self.mamba_metadata.request_to_mamba_state_idx[active_slice]
+            .to(self.mamba_conv_states.device, non_blocking=True)
+            .long()
+        )
+        self._spec_mamba_conv_shadow[:, active_indices_gpu] = (
+            self.mamba_conv_states[:, active_indices_gpu]
+        )
+        self._spec_mamba_ssm_shadow[:, active_indices_gpu] = (
+            self.mamba_ssm_states[:, active_indices_gpu]
+        )
+        self._spec_mamba_active_indices = active_indices_gpu
+
+    def restore_mamba_state_for_speculation(self) -> None:
+        """Reverse :meth:`save_mamba_state_for_speculation` after a rejection.
+
+        Should be called after the engine has drained the speculative GPU
+        work via stream synchronize so the in-place mamba state mutations
+        from the discarded forward are settled. The scatter copies are
+        queued on the stream; the next forward (the serial re-launch)
+        reads the restored state.
+        """
+        if self._spec_mamba_active_indices is None:
+            return
+        idx = self._spec_mamba_active_indices
+        self.mamba_conv_states[:, idx] = self._spec_mamba_conv_shadow[:, idx]
+        self.mamba_ssm_states[:, idx] = self._spec_mamba_ssm_shadow[:, idx]
+        self._spec_mamba_active_indices = None
+
+    def drop_mamba_state_speculation(self) -> None:
+        """Drop the speculative mamba snapshot when the pre-launch is consumed
+        normally (no rejection). The advance was real, so we keep the live
+        state and discard the pre-spec snapshot.
+        """
+        self._spec_mamba_active_indices = None
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
