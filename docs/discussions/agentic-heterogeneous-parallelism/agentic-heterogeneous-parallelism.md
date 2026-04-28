@@ -1,6 +1,6 @@
 # Agentic Heterogeneous Parallelism for Megatron Multimodal Training
 
-This article documents an agent-driven exploration of heterogeneous TP/DP/PP for the vision encoder and LLM in colocated multimodal training in Megatron, on H100 (BF16) at 16–64 GPUs. The headline is the operating model: an autonomous agent team scoped narrowly, with explicit fairness rules and human verification, can do real systems research; agents that run unsupervised cannot. We document how the team was structured, the experiment loop it ran, the optimization chains it identified, the failures that required human intervention, and the reusable patterns from the setup. The throughput tables in the Results section are evidence the methodology held up, not the headline.
+We gave an agent team running on Claude Code the search space of heterogeneous TP/DP/PP configurations for colocated multimodal training in Megatron — letting the vision encoder and LLM each use their own parallelism strategy. In roughly one day on H100 (BF16) at 16–64 GPUs the team found three optimization chains — encoder TP=1, encoder activation recompute as a throughput lever, and colocated LLM pipeline parallelism with encoder parameter offload — that deliver +12.7% to +14.0% TFLOPs/GPU at 8K sequence length and up to +41.8% at 64K with context parallelism, over each configuration's strongest homogeneous baseline. A human then spent about three days verifying the strongest results and catching unfair comparisons before they propagated. The operating model — narrow agent roles, explicit fairness rules, single ownership of side effects, and human verification at the comparison boundary — is portable; the Megatron-specific knobs are not.
 
 ## Table of Contents
 
@@ -17,7 +17,8 @@ This article documents an agent-driven exploration of heterogeneous TP/DP/PP for
 
 In a colocated multimodal model the vision encoder and LLM run on the same GPUs but have different shapes. The encoder is small and dense, with high vision-token density and a relatively short per-image sequence. The LLM is large and sequence-dominated. A shared TP/DP/PP either pushes the encoder onto the LLM's high TP — wasting bandwidth on small encoder tensors and inflating TP all-reduce cost relative to encoder compute — or pushes the LLM onto a low TP and runs into memory walls.
 
-Heterogeneous parallelism, where the encoder and LLM each pick their own TP/DP/PP, removes that constraint. The cost is a configuration space — encoder/LLM size pairs, world sizes, sequence lengths, recompute and offload settings, distributed-optimizer instance counts, pipeline balancing — large enough that hand-sweeping is impractical. We treated the search as a research problem and gave it to an autonomous agent team.
+Heterogeneous parallelism, where the encoder and LLM each pick their own TP/DP/CP/PP, removes that constraint. The cost is a configuration space — encoder/LLM size pairs, world sizes, sequence lengths, recompute and offload settings, distributed-optimizer instance counts, pipeline balancing — large enough that hand-sweeping is impractical. We wanted to see what agent teams can achieve when given a definitive goal and infra for running and verifying experiments. The agents team ran hundreds of experiments across 6 model configurations at 1–128 GPUs in a single day — compressing over a week of manual experimentation.
+
 
 ## The Agent Team
 
@@ -53,7 +54,7 @@ The communication rules are strict. The user talks only to the team lead. The ru
 Each iteration of the loop is six steps:
 
 1. The campaign manager picks the next configuration to try, in consultation with the systems expert.
-2. It generates a fully materialized YAML — model + parallelism + batch + optimization stack — and validates it before submission (`enc_tp × enc_dp == llm_tp × llm_dp == world_size`, head-count divisibility, image-token math).
+2. It generates a fully materialized YAML — model + parallelism + batch + optimization stack — and validates it before submission (valid tp/dp/cp/pp, head-count divisibility, image-token math etc. ).
 3. It states the hypothesis explicitly: what it expects to change and why.
 4. The runner submits the job, polls for the result artifact (not just SLURM state — the result JSON usually appears before the job exits), and returns structured metrics (TFLOPs/GPU, peak memory, per-microbatch forward+backward time).
 5. The campaign manager logs the result immediately to `timeline.md`, updates `leaderboard.md` (grouped by global batch size), and adds a confirmed / disproven / hypothesis entry to `learnings.md`.
@@ -61,7 +62,7 @@ Each iteration of the loop is six steps:
 
 Fairness rules are baked into the loop, not bolted on afterwards. Every comparison uses the same world size and the same global batch size (`GBS = mbs × llm_dp × nmb`). The optimization stack — sequence parallel on the LLM, Transformer Engine fusions, `tp_comm_overlap`, distributed-optimizer instance count, recompute (per module), offload (per module) — must match across compared rows. Two runs are comparable only when the stack matches; per-microbatch forward+backward time is the GBS-independent metric. Heterogeneous configurations are compared against each configuration's strongest homogeneous baseline, defined as the lowest TP that fits both modules at the target world size with the same optimization stack — not the easiest baseline, the strongest one.
 
-## What the Agents Discovered
+## What the Agents Explored
 
 The team identified three optimization chains that hold across the model configurations tested. None of them was given as a prior; the team found them and the systems expert promoted them to confirmed strategies after they survived multiple campaigns.
 
@@ -141,6 +142,6 @@ The reusable patterns:
 
 - **One agent owns each side effect.** Only the runner submits cluster jobs; only the campaign manager writes campaign logs. Side effects are not shared across roles, even when it would be expedient.
 - **Narrow context per agent.** The runner sees job IDs, status, and output artifacts — not parallelism strategy. The systems expert reads source code and reasons about tradeoffs — but never submits a job. Context that does not match the role's responsibility is a source of agent confusion.
-- **The team lead is a skeptic.** Validate same-GBS, same-precision, same-optimization-stack equivalence before any result is logged as a finding. Without this role, the team produces propagating bias.
-- **Stop course-correcting; restart.** When an agent goes down a wrong path — flawed assumptions, compounding errors, biased baselines — terminate the session and start fresh. Mid-conversation course correction rarely recovers.
+- **The team lead is a skeptic.** Validate same-GBS, same-precision, same-optimization-stack equivalence before any result is logged as a finding.
+- **Stop course-correcting; restart.** When an agent goes down a wrong path — flawed assumptions, compounding errors, biased baselines — terminate the session and start fresh.
 - **Confirmed, disproven, hypothesis.** The `learnings.md` schema with three sections (confirmed / disproven / hypothesis) makes the knowledge base auditable. A "confirmed" rule that produces a counterexample gets demoted to "depends on configuration" rather than silently failing.
