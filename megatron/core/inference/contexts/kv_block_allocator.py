@@ -167,6 +167,13 @@ class KVBlockAllocator:
                 )
                 self._lru_cached_list_len = torch.zeros((), dtype=torch.int64, device=device)
 
+                # Position arange shared by ``_lru_evict_if_deficit`` and the
+                # compaction pass (commit 20). Sized to the list capacity
+                # (excluding the +1 sink slot).
+                self._lru_compact_pos_arange = torch.arange(
+                    2 * self.total_count, dtype=torch.int64, device=device
+                )
+
         # Per-block MoE routing storage (populated when routing replay is enabled)
         self.block_routing: Dict[int, np.ndarray] = {}
 
@@ -739,6 +746,140 @@ class KVBlockAllocator:
 
         # ── Push the "to pool" subset onto block_bag ──
         self._push_masked_to_pool(push_mask)
+
+    def _lru_evict_if_deficit(self, count_gpu: Tensor) -> None:
+        """Shape-stable: evict LRU cached blocks if the free pool is short.
+
+        Scans ``_lru_cached_list`` head-to-tail, finds the first
+        ``max(0, count_gpu - total_avail_gpu)`` non-stale entries, and
+        deregisters + pushes those blocks to the free pool.
+
+        A list entry is non-stale iff the block it points to is still
+        cached AND the entry's recorded timestamp matches the block's
+        current timestamp (i.e. it hasn't been reallocated since the
+        entry was appended).
+
+        No-op when ``count_gpu <= total_avail_gpu`` (the pool already
+        has enough blocks).
+        """
+        assert self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+
+        list_size = 2 * self.total_count  # excluding the sink slot
+
+        # deficit = max(0, count_gpu - total_avail_gpu)  (0-d int64)
+        avail_i64 = self.total_avail_gpu.to(torch.int64).view(())
+        deficit = torch.clamp(count_gpu.to(torch.int64).view(()) - avail_i64, min=0)
+
+        # Per-position validity: entry at position i is valid iff
+        #   i < list_len AND block at i is still cached AND its recorded
+        #   timestamp matches the block's current timestamp.
+        pos_arange = self._lru_compact_pos_arange
+        in_range = pos_arange < self._lru_cached_list_len
+        list_slice = self._lru_cached_list[:list_size]
+        safe_block_ids = torch.where(
+            in_range, list_slice.long(), torch.full_like(list_slice.long(), self.dummy_block_idx)
+        )
+        recorded_ts = self._lru_cached_list_ts[:list_size]
+        current_ts = self.block_timestamps[safe_block_ids]
+        refs = self.block_ref_counts[safe_block_ids]
+        hashes = self.block_hashes[safe_block_ids]
+        non_stale = in_range & (refs == 0) & (hashes != -1) & (recorded_ts == current_ts)
+
+        # Inclusive rank of non-stale entries; pick the first ``deficit``.
+        non_stale_i64 = non_stale.to(torch.int64)
+        rank = torch.cumsum(non_stale_i64, dim=0)
+        evict_at_pos = non_stale & (rank <= deficit)
+
+        # Convert per-position eviction mask to a per-block bitmap.
+        # For each position with evict_at_pos True, mark the block True;
+        # sentinel positions land on dummy_block_idx which we clear.
+        evict_route = torch.where(
+            evict_at_pos, safe_block_ids, torch.full_like(safe_block_ids, self.dummy_block_idx)
+        )
+        self._pc_released_bitmap.zero_()
+        self._pc_released_bitmap[evict_route] = True
+        self._pc_released_bitmap[self.dummy_block_idx] = False
+
+        # Dereg + push the evicted blocks.
+        self._enqueue_dereg_and_clear_hashes(self._pc_released_bitmap)
+        self._push_masked_to_pool(self._pc_released_bitmap)
+
+    def allocate_memory_blocks_prefix_aware_gpu(self, count_gpu: Tensor) -> Tensor:
+        """Shape-stable, prefix-caching-aware graphed allocate.
+
+        Extends :meth:`allocate_memory_blocks_gpu` with the per-block
+        state updates required by prefix caching:
+
+        1. **LRU eviction fallback**: if the free pool is short, evict
+           the oldest cached blocks via ``_lru_evict_if_deficit``.
+        2. **Ref count init**: increment ``block_ref_counts`` by 1 for
+           each allocated slot (masked write, scatter_add-based to
+           handle duplicate slot positions in the sentinel tail
+           safely).
+        3. **LRU timestamp stamp**: bump ``lru_clock_gpu`` and write
+           the new value into ``block_timestamps`` for each allocated
+           block, so the staleness check in future eviction scans can
+           tell the fresh allocation apart from any stale entry that
+           still points to the same block ID.
+
+        Caller is responsible for ensuring
+        ``count_gpu <= total_avail_gpu + num_evictable`` — i.e. the
+        allocation must actually fit after eviction. The graphed
+        resume body clamps via ``resume_count_gpu = min(fits, avail)``
+        before reaching this call.
+
+        Args:
+            count_gpu: 0-d or 1-element int tensor holding the number
+                of blocks to allocate.
+
+        Returns:
+            Tensor of shape ``(max_requests,)`` with allocated block
+            IDs in the first ``count_gpu`` positions; the tail may
+            contain stale block IDs above the new stack pointer and
+            must not be used by the caller.
+        """
+        assert self.enable_prefix_caching
+
+        # LRU: refill the pool via eviction if short.
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            self._lru_evict_if_deficit(count_gpu)
+
+        # Pop count_gpu blocks by decrementing the stack pointer and
+        # gathering the fixed-size window above it.
+        count_i32 = count_gpu.to(torch.int32).view(1)
+        self.total_avail_gpu.sub_(count_i32)
+        indices = self.total_avail_gpu + self._alloc_arange
+        allocated = self.block_bag[indices.long()]  # (max_requests,) int32
+
+        # Only positions [0, count_gpu) are freshly allocated; the tail
+        # contains stale block IDs above the new stack pointer. Build
+        # a position mask so per-slot updates only touch the fresh ones.
+        max_req = self.max_requests
+        pos_arange = self._alloc_arange_i64
+        alloc_mask = pos_arange < count_gpu.to(torch.int64).view(1)
+
+        # ── Increment ref counts for newly-allocated blocks ──
+        # Duplicate block IDs in the tail (stale reads) must not add to
+        # a live block's ref count. Gate the per-position change by
+        # ``alloc_mask`` so sentinel positions contribute 0.
+        change = alloc_mask.to(torch.int32)
+        self.block_ref_counts.scatter_add_(0, allocated.long(), change)
+
+        # ── LRU: bump the clock and stamp new timestamps ──
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            # Bump so freshly-allocated blocks get a timestamp distinct
+            # from any prior cached entry — the LRU list's staleness
+            # check compares recorded vs current timestamp to detect
+            # blocks that were re-allocated after being cached.
+            self.lru_clock_gpu.add_(1)
+            # Masked timestamp write: valid allocations get the new clock
+            # value; sentinel positions read back their current timestamp
+            # (no-op write even on aliased indices).
+            existing_ts = self.block_timestamps[allocated.long()]
+            new_ts = torch.where(alloc_mask, self.lru_clock_gpu.expand(max_req), existing_ts)
+            self.block_timestamps[allocated.long()] = new_ts
+
+        return allocated
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.

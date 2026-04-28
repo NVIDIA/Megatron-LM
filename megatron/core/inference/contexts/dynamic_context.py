@@ -2978,7 +2978,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         paused_count = total_cur.view(()) - active_cur.view(())
         fits_gpu = paused_count - i_star
 
-        total_pool = self.kv_block_allocator.total_avail_gpu.view(()).to(torch.int64)
+        # For LRU prefix caching, the effective pool also includes cached
+        # blocks (ref=0, hash set) that the graphed allocate path can
+        # LRU-evict if needed. REF_ZERO doesn't cache anything so its pool
+        # is just total_avail_gpu.
+        if (
+            self.enable_prefix_caching
+            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+        ):
+            alloc = self.kv_block_allocator
+            evictable = (
+                ((alloc.block_ref_counts == 0) & (alloc.block_hashes != -1)).to(torch.int64).sum()
+            )
+            total_pool = alloc.total_avail_gpu.view(()).to(torch.int64) + evictable
+        else:
+            total_pool = self.kv_block_allocator.total_avail_gpu.view(()).to(torch.int64)
+
         resume_by_pool = torch.minimum(fits_gpu, total_pool)
         room = torch.clamp(self._ur.max_allowed_active - active_cur.view(()), min=0)
         resume_count_gpu = torch.minimum(resume_by_pool, room)
@@ -3010,7 +3025,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         needs_new_i64_mask = needs_new_in_resumed.to(torch.int64)
         num_new_blocks_gpu = needs_new_i64_mask.sum()
 
-        allocated_full = self.kv_block_allocator.allocate_memory_blocks_gpu(num_new_blocks_gpu)
+        if self.enable_prefix_caching:
+            # Prefix-aware: may LRU-evict cached blocks to refill the pool,
+            # bumps ref counts and LRU timestamps for new allocations.
+            allocated_full = self.kv_block_allocator.allocate_memory_blocks_prefix_aware_gpu(
+                num_new_blocks_gpu
+            )
+        else:
+            allocated_full = self.kv_block_allocator.allocate_memory_blocks_gpu(num_new_blocks_gpu)
 
         prefix = torch.cumsum(needs_new_i64_mask, dim=0) - needs_new_i64_mask
         safe_prefix = prefix.clamp(max=self.max_requests - 1)
