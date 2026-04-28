@@ -971,9 +971,9 @@ def make_tp_sharded_tensor_for_checkpoint(
     if use_dtensor_format:
         if prepend_axis_num > 0:
             for _, _, offset_dim_size in prepend_offsets:
-                assert (
-                    offset_dim_size == 1
-                ), f'Non-trivial prepended-style sharding not supported with DTensors: {prepend_offsets}'
+                assert offset_dim_size == 1, (
+                    f'Non-trivial prepended-style sharding not supported with DTensors: {prepend_offsets}'
+                )
 
         placements, device_mesh = get_dtensor_metadata(tp=True, tp_axis=tp_axis)
 

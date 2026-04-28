@@ -145,8 +145,6 @@ def extract_sharded_base(
 def extract_sharded_base_or_dtensor(
     sharded_state_dict: ShardedStateDict,
 ) -> Tuple[ShardedStateDict, StateDict]:
-    from torch.distributed.tensor import DTensor
-
     """Extract a dict consisting of only ShardedBase or DTensors from a given state dict.
 
     Args:
@@ -157,6 +155,8 @@ def extract_sharded_base_or_dtensor(
             - state dict with all ShardedBase and DTensor objects (keeping the original structure)
             - state dict with all other objects (keeping the original state dict structure)
     """
+    from torch.distributed.tensor import DTensor
+
     return extract_matching_values(
         sharded_state_dict, lambda v: isinstance(v, (ShardedBase, DTensor))
     )
