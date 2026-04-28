@@ -1119,7 +1119,7 @@ class ColumnParallelLinear(torch.nn.Module):
     def extra_repr(self) -> str:
         """Extra context to add to the module's string representation."""
         tp = self.output_size // self.output_size_per_partition
-        use_bias = self.bias is not None and self.bias is True
+        use_bias = self.bias is not None
         return (
             f"in_features={self.input_size}, "
             f"out_features={self.output_size}, "
@@ -1381,7 +1381,7 @@ class RowParallelLinear(torch.nn.Module):
     def extra_repr(self) -> str:
         """Extra context to add to the module's string representation."""
         tp = self.input_size // self.input_size_per_partition
-        use_bias = self.bias is not None and self.bias is True
+        use_bias = self.bias is not None
         return (
             f"in_features={self.input_size}, "
             f"out_features={self.output_size}, "
