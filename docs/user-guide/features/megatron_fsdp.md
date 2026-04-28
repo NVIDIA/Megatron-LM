@@ -173,7 +173,7 @@ unset CUDA_DEVICE_MAX_CONNECTIONS
 --fsdp-manual-registration
 ```
 
-### Megatron-Core
+### 🤖 Megatron-Core
 
 Megatron-FSDP has a lower-level `FullyShardedDataParallel` class API that can be used with a simplified version of Megatron-LM's training loop.
 
@@ -213,7 +213,7 @@ def load_model_and_optimizer_state_dict(state_dict):
     optimizer.load_state_dict(state_dict["optimizer"])
 ```
 
-### Checkpoint Conversion
+### 🔁 Checkpoint Conversion
 
 Megatron-FSDP checkpointing supports [PyTorch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). In Megatron-LM, this is the `--ckpt-format fsdp_dtensor` checkpointing format.
 
@@ -285,12 +285,12 @@ torchrun --nproc_per_node=8 --nnodes=1 \
 
 ## Megatron-FSDP Feature Guide & API
 
-| Optimization | Description | Config |
-|--------------|-------------|--------|
-| **Megatron-FSDP** | Use Megatron-FSDP in Megatron-LM. |  `--use-megatron-fsdp` |
-| **Megatron-FSDP Checkpointing** | Save and load un-even DTensor checkpoints using [Torch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). | `--ckpt-format fsdp_dtensor` |
-| **Meta Device Initialization** | Megatron-FSDP initializes a meta-initialized model to the CUDA device in shards to avoid OOM on large models. Requires implementation of `Module.reset_parameters()` for per-Module sharded initialization. | `--init-model-with-meta-device` |
-| **Distributed Optimizer** | Megatron-FSDP uses Megatron-Core's `DistributedOptimizer`. Automatically set when using Megatron-FSDP. | `--use-distributed-optimizer` |
+| Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
+|--------------|-------------|----------------------|----------------------|
+| **Megatron-FSDP** | Use Megatron-FSDP in Megatron-LM. |  `--use-megatron-fsdp` | `fully_shard_model(module)` |
+| **Megatron-FSDP Checkpointing** | Save and load un-even DTensor checkpoints using [Torch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). | `--ckpt-format fsdp_dtensor` | `preproc_state_dict_for_dcp_ckpt=True` |
+| **Meta Device Initialization** | Megatron-FSDP initializes a meta-initialized model to the CUDA device in shards to avoid OOM on large models. Requires implementation of `Module.reset_parameters()` for per-Module sharded initialization. | `--init-model-with-meta-device` | `init_model_with_meta_device=True` |
+| **Distributed Optimizer** | Megatron-FSDP uses Megatron-Core's `DistributedOptimizer`. Automatically set when using Megatron-FSDP. | `--use-distributed-optimizer` | `fully_shard_optimizer(optimizer)` |
 
 ### FSDP Fundamentals
 
@@ -338,13 +338,13 @@ Source: Feng, Wei, Will Constable, and Yifan Mao. “Getting Started with Fully 
 
 ### FSDP Unit Modules
 
-| Optimization | Description | Config |
-|--------------|-------------|--------|
-| **FSDP Unit Modules** | A list of `str` or `class` import paths for `torch.nn.Module`(s) that are considered FSDP unit modules and sharded by Megatron-FSDP. Parameters and sub-modules that are not members of an FSDP unit are not sharded. |  Defaults to Megatron-Core's `[TransformerLayer]` in Megatron-LM. Configurable via the `fsdp_unit_modules` argument using the `MegatronFSDP` class or `fully_shard` API. |
-| **FSDP Double Buffer Allocator** | Megatron-FSDP uses the double-buffer allocator, which persistently allocates a buffer pair assigned to alternating FSDP units that temporarily stores parameters and gradients. Automatically used with NCCL user buffer registration. | `--fsdp-double-buffer` |
-| **Param All-Gather Overlap** | Whether to overlap parameter all-gather with compute. Automatically activated for the ZeRO-3 sharding strategy. | `--overlap-param-gather` |
-| **Gradient Reduce-Scatter Overlap** | Whether to overlap gradient reduce-scatter or all-reduce with compute. Automatically activated for ZeRO-2 and ZeRO-3 sharding strategies. | `--overlap-grad-reduce` |
-| **FSDP Communication Size** | Customize the size (in `numel()` elements) of AG and RS communications in Megatron-FSDP, by limiting how many elements are concurrently pre-fetched or reduced for AG and RS. Effectively suggests how many FSDP units are processed concurrently, which may launch collectives earlier and improve performance. Optionally, tune this value depending on system memory and performance requirements. | `--suggested-communication-unit-size <num-elements>` |
+| Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
+|--------------|-------------|----------------------|----------------------|
+| **FSDP Unit Modules** | A list of `str` or `class` import paths for `torch.nn.Module`(s) that are considered FSDP unit modules and sharded by Megatron-FSDP. Parameters and sub-modules that are not members of an FSDP unit are not sharded. |  Defaults to supported Megatron-Core modules (`TransformerLayer`, etc.) in Megatron-LM. | `fsdp_unit_modules=[...]` |
+| **FSDP Double Buffer Allocator** | Megatron-FSDP uses the double-buffer allocator, which persistently allocates a buffer pair assigned to alternating FSDP units that temporarily stores parameters and gradients. Automatically used with NCCL user buffer registration. | `--fsdp-double-buffer` | `fsdp_double_buffer=True` |
+| **Param All-Gather Overlap** | Whether to overlap parameter all-gather with compute. Automatically activated for the ZeRO-3 sharding strategy. | `--overlap-param-gather` | `overlap_param_gather=True` |
+| **Gradient Reduce-Scatter Overlap** | Whether to overlap gradient reduce-scatter or all-reduce with compute. Automatically activated for ZeRO-2 and ZeRO-3 sharding strategies. | `--overlap-grad-reduce` | `overlap_grad_reduce=True` |
+| **FSDP Communication Size** | Customize the size (in `numel()` elements) of AG and RS communications in Megatron-FSDP, by limiting how many elements are concurrently pre-fetched or reduced for AG and RS. Effectively suggests how many FSDP units are processed concurrently, which may launch collectives earlier and improve performance. Optionally, tune this value depending on system memory and performance requirements. | `--suggested-communication-unit-size <num-elements>` | N/A (Megatron-Core Only) |
 
 > Only a small depth-wise fraction of the model state can exist un-sharded at any point in time.
 
@@ -408,11 +408,11 @@ With double-buffering, Megatron-FSDP does not need to allocate memory after init
 
 ### Data-Parallel Sharding Strategies
 
-| Optimization | Description | Config |
-|--------------|-------------|--------|
-| **Data Parallel Sharding Strategy** | Primary data-parallel sharding strategy for FSDP, which supports DDP, ZeRO-1 (optimizer), ZeRO-2 (optimizer and gradients), and ZeRO-3 (optimizer, gradients, and parameters). Typically uses intra-node communications, i.e. "inner" or "intra" DP. |  `--data-parallel-sharding-strategy {no_shard, optim, optim_grads, optim_grads_params}` |
-| **DP-Outer Sharding Strategy** | Secondary data-parallel sharding strategy for HSDP, which supports Hybrid-Sharded Data Parallel (HSDP / `no_shard`) and Hybrid-FSDP (HFSDP / `optim`). Typically uses inter-node communications, i.e. "outer" or "inter" DP. | `--outer-dp-sharding-strategy {no_shard, optim}` |
-| **Hybrid Data Parallelism Size** | Specify the DP-Outer / Inter-DP parallel size. DP-Inner / Intra-DP sizes will be deduced from the sizes of other parallelisms and `torch.distributed.get_world_size()`. | `--num-distributed-optimizer-instances <int>` |
+| Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
+|--------------|-------------|----------------------|----------------------|
+| **Data Parallel Sharding Strategy** | Primary data-parallel sharding strategy for FSDP, which supports DDP, ZeRO-1 (optimizer), ZeRO-2 (optimizer and gradients), and ZeRO-3 (optimizer, gradients, and parameters). Typically uses intra-node communications, i.e. "inner" or "intra" DP. |  `--data-parallel-sharding-strategy {no_shard, optim, optim_grads, optim_grads_params}` | `zero_dp_strategy={no_shard, optim, optim_grads, optim_grads_params, 0, 1, 2, 3}` |
+| **DP-Outer Sharding Strategy** | Secondary data-parallel sharding strategy for HSDP, which supports Hybrid-Sharded Data Parallel (HSDP / `no_shard`) and Hybrid-FSDP (HFSDP / `optim`). Typically uses inter-node communications, i.e. "outer" or "inter" DP. | `--outer-dp-sharding-strategy {no_shard, optim}` | `outer_dp_sharding_strategy={no_shard, optim, 0, 1}` |
+| **Hybrid Data Parallelism Size** | Specify the DP-Outer / Inter-DP parallel size. DP-Inner / Intra-DP sizes will be deduced from the sizes of other parallelisms and `torch.distributed.get_world_size()`. | `--num-distributed-optimizer-instances <int>` | `dp_outer_dim=<str>` (Cumulative DP groups `hybrid_fsdp_group` / `hybrid_fsdp_expt_group` are required for HFSDP.) |
 
 Megatron-FSDP supports a variety of sharding strategies over a variety of distributed topologies:
 
@@ -437,6 +437,8 @@ Megatron-FSDP supports a variety of sharding strategies over a variety of distri
     - Outer data-parallel gradients are reduce-scattered after  during the last backward pass before the optimization step.
     - Outer data-parallel parameters are all-gathered during the first forward pass after the optimization step.
   - FSDP primary sharding (`optim_grads_params`) is required for HFSDP secondary sharding (`optim`).
+  - Requires passing cumulative data-parallel groups (`hybrid_fsdp_group` / `hybrid_fsdp_expt_group`), which include ALL data-parallel ranks, to Megatron-FSDP.
+    - To create these using `DeviceMesh`, create a data-parallel `DeviceMesh` for the cumulative DP group and use `DeviceMesh._unflatten(dp_dim, mesh_sizes=(dp_outer_size, dp_inner_size), mesh_dim_names=("dp_outer_dim", "dp_shard_dim"))` to construct a `DeviceMesh` with DP-Inner and DP-Outer mesh dimensions for Hybrid-FSDP.
 
 #### Understanding Hybrid-FSDP (HFSDP)
 
@@ -532,14 +534,14 @@ Visualization of how parameters are assigned un-evenly to the flat per-unit buff
 
 ### Mixed-Precision & Quantization
 
-| Optimization | Description | Config |
-|--------------|-------------|--------|
-| **Quantized Parameters** | Megatron-FSDP will shard and all-gather TransformerEngine-quantized parameters for computation. Quantized parameters are updated every optimization step, and both row-wise (FWD) and column-wise (BWD) data are managed for non-transposable 1-D quantization recipes like MXFP8. Otherwise, only activations are quantized. | `--fp8-param-gather` |
-| **Main Parameter (Optimization / Checkpoint) Data-Type** | Data-type for optimization and checkpointing parameters. If set to `auto`, model compute weights are utilized instead. Required for `--fp8-param-gather`. Defaults to FP32. | `--megatron-fsdp-main-params-dtype {fp32, bf16, fp16, auto}` |
-| **Main Gradient (Accumulation) Data-Type** | Data-type for gradient accumulation. If set to `auto`, main gradient precision will be derived from model parameter precision. Defaults to `auto`. | `--megatron-fsdp-main-grads-dtype {fp32, bf16, fp16, auto}` |
-| **Gradient Communication (Reduction) Data-Type** | Data-type for gradient communication and reduction. If set to `auto`, the main gradient precision will be used for communication. (When using NCCL symmetric registration, low-precision gradients are reduced in FP32 over-the-wire.) Defaults to `auto`. | `--megatron-fsdp-grad-comm-dtype {fp32, bf16, fp16, auto}` |
-| **Weight Gradient Accumulation Fusion** | When using TransformerEngine modules, Megatron-FSDP implements `get_main_grad` to allocate un-sharded gradient buffers called by TransformerEngine, to avoid `COPY`-ing the gradient to Megatron-FSDP communication buffers. Used by default and can be deactivated with `--no-gradient-accumulation-fusion`. | `--no-gradient-accumulation-fusion` |
-| **Precision-Aware Optimizer** | Use the TransformerEngine `FusedAdam` optimizer, and Megatron-FSDP will install the gradient in a temporary attribute `Parameter.decoupled_grad` which is consumed by `FusedAdam`. Megatron-FSDP manages the main parameters, but the optimizer state precision can be customized with `--exp-avg-dtype` and `--exp-avg-sq-dtype`, which both support `fp8` optimization state. | `--use-precision-aware-optimizer` |
+| Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
+|--------------|-------------|----------------------|----------------------|
+| **Quantized Parameters** | Megatron-FSDP will shard and all-gather TransformerEngine-quantized parameters for computation. Quantized parameters are updated every optimization step, and both row-wise (FWD) and column-wise (BWD) data are managed for non-transposable 1-D quantization recipes like MXFP8. Otherwise, only activations are quantized. | `--fp8-param-gather` | TransformerEngine `quantized_model_init()` |
+| **Main Parameter (Optimization / Checkpoint) Data-Type** | Data-type for optimization and checkpointing parameters. If set to `auto`, model compute weights are utilized instead. Required for `--fp8-param-gather`. Defaults to FP32. | `--megatron-fsdp-main-params-dtype {fp32, bf16, fp16, auto}` | `MixedPrecisionPolicy(main_params_dtype=...)` |
+| **Main Gradient (Accumulation) Data-Type** | Data-type for gradient accumulation. If set to `auto`, main gradient precision will be derived from model parameter precision. Defaults to `auto`. | `--megatron-fsdp-main-grads-dtype {fp32, bf16, fp16, auto}` | `MixedPrecisionPolicy(main_grads_dtype=...)` |
+| **Gradient Communication (Reduction) Data-Type** | Data-type for gradient communication and reduction. If set to `auto`, the main gradient precision will be used for communication. (When using NCCL symmetric registration, low-precision gradients are reduced in FP32 over-the-wire.) Defaults to `auto`. | `--megatron-fsdp-grad-comm-dtype {fp32, bf16, fp16, auto}` | `MixedPrecisionPolicy(grad_comm_dtype=...)` |
+| **Weight Gradient Accumulation Fusion** | When using TransformerEngine modules, Megatron-FSDP implements `get_main_grad` to allocate un-sharded gradient buffers called by TransformerEngine, to avoid `COPY`-ing the gradient to Megatron-FSDP communication buffers. Used by default and can be deactivated with `--no-gradient-accumulation-fusion`. | `--no-gradient-accumulation-fusion` | N/A (Megatron-Core Only) |
+| **Precision-Aware Optimizer** | Use the TransformerEngine `FusedAdam` optimizer, and Megatron-FSDP will install the gradient in a temporary attribute `Parameter.decoupled_grad` which is consumed by `FusedAdam`. Megatron-FSDP manages the main parameters, but the optimizer state precision can be customized with `--exp-avg-dtype` and `--exp-avg-sq-dtype`, which both support `fp8` optimization state. | `--use-precision-aware-optimizer` | `use_decoupled_grad=True` |
 
 #### Quantization
 
@@ -583,11 +585,11 @@ Megatron-FSDP sharding and communication buffers support mixed-precision, such t
 
 ### NCCL
 
-| Optimization | Description | Config |
-|--------------|-------------|--------|
-| **NCCL User Buffers** | Allocate and register Megatron-FSDP communication buffers with NCCL, which enables zero-`COPY`, high-precision reduction, copy-engine collectives, and symmetric kernels. Uses double buffering. | `--use-nccl-ub` |
-| **NCCL Manual Registration** | Instead of registering NCCL user buffers on first allocation, batch registration of all communication buffers at the end of the initial training step. Reduces registration latency. | `--fsdp-manual-registration` |
-| **Disable Symmetric Registration** | Disable symmetric registration with NCCL. Optional, as symmetric registration failure defaults to normal registration. | `--disable-symmetric-registration` |
+| Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
+|--------------|-------------|----------------------|----------------------|
+| **NCCL User Buffers** | Allocate and register Megatron-FSDP communication buffers with NCCL, which enables zero-`COPY`, high-precision reduction, copy-engine collectives, and symmetric kernels. Uses double buffering. | `--use-nccl-ub` | `nccl_ub=True` |
+| **NCCL Manual Registration** | Instead of registering NCCL user buffers on first allocation, batch registration of all communication buffers at the end of the initial training step. Reduces registration latency. | `--fsdp-manual-registration` | N/A (Megatron-Core Only) |
+| **Disable Symmetric Registration** | Disable symmetric registration with NCCL. Optional, as symmetric registration failure defaults to normal registration. | `--disable-symmetric-registration` | `disable_symmetric_registration=True` |
 
 [NVIDIA Collective Communications Library (NCCL)](https://developer.nvidia.com/nccl) implements multi-device and multi-node communication primitives optimized for CUDA devices and networking from NVIDIA. Megatron-FSDP communications are registered and deeply integrated with NCCL, which enables a variety of hardware-level networking optimizations such as copy-engine AG, high-precision RS, SHARP reduction offloading, and symmetric kernels.
 
