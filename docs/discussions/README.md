@@ -23,6 +23,10 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
 
   A practical guide to enable Megatron-FSDP training, including a quick-start example for DeepSeek-V3, required and recommended configurations, and instructions for checkpoint conversion from torch_dist to fsdp_dtensor.
 
+- **[Agentic Heterogeneous Parallelism for Megatron Multimodal Training](agentic-heterogeneous-parallelism/agentic-heterogeneous-parallelism.md)**
+
+  An agent-driven exploration of heterogeneous TP/DP/PP between the vision encoder and LLM in colocated multimodal training. Documents the agent team structure, the experiment loop, the optimization chains the team identified, the failure modes that required human verification, and the operating model. Includes throughput results across 1B/3B encoders, 7B–70B LLMs, and 8K–64K sequence lengths on H100 (BF16) as case-study evidence.
+
 ## Contributing
 
 If you'd like to contribute a guide or tutorial, please follow this structure:
