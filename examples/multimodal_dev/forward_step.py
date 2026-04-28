@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
@@ -194,8 +195,17 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD format."""
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
-    
-    divisible_by = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+
+    # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
+    try:
+        has_sp = bool(get_args().sequence_parallel)
+    except Exception:
+        has_sp = False
+
+    if cp_size > 1:
+        divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
+    else:
+        divisible_by = tp_size if has_sp else 1
     # NOTE: don't consider fp8 padding now
     
     if use_packed_sequence:
@@ -253,6 +263,10 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
         assert seq_length is not None, "seq_length must be provided when use_packed_sequence is False"
         max_seqlens = max([x["input_ids"].shape[0] for x in batch])
         target_seqlens = min(max_seqlens, seq_length)
+        # Round target seqlen up to the parallelism alignment factor so the
+        # batched tensor is divisible for CP (+SP) splitting downstream.
+        if divisible_by > 1:
+            target_seqlens = math.ceil(target_seqlens / divisible_by) * divisible_by
         padded_batch = dict()
         
         for sample in batch:
@@ -381,5 +395,32 @@ def forward_step(data_iterator, model):
         loss_mask = torch.ones_like(
             batch["input_ids"], dtype=torch.float,
         )
+
+    # CP-split loss_mask to match the model output (which is CP-split
+    # inside MultimodalModel.forward / Qwen35VLModel.forward).
+    # THD: use the same TE-based per-sample partition index as the model.
+    # BSHD: use the matching zigzag split.
+    cp_size = get_context_parallel_world_size()
+    if cp_size > 1:
+        from megatron.core.parallel_state import get_context_parallel_rank
+
+        from examples.multimodal_dev.models.base import (
+            _cp_split_tensor,
+            _thd_cp_partition_index,
+        )
+
+        cp_rank = get_context_parallel_rank()
+        psp = batch.get("packed_seq_params", None)
+        if psp is not None:
+            idx = _thd_cp_partition_index(
+                psp.cu_seqlens_q_padded,
+                loss_mask.shape[1], cp_size, cp_rank,
+            )
+            loss_mask = loss_mask.index_select(1, idx)
+        else:
+            loss_mask = _cp_split_tensor(
+                loss_mask, seq_dim=1,
+                cp_size=cp_size, cp_rank=cp_rank,
+            )
 
     return output_tensor, partial(loss_func, loss_mask)
