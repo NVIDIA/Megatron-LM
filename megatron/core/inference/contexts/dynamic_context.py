@@ -1333,15 +1333,23 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Returns True only when the next step's metadata can be derived from the
         current state by a position bump alone — no allocator activity, no
-        speculative-decoding interaction. Tighter than the original block-budget
-        check because the speculative advance path implemented in
-        :meth:`speculatively_advance_for_next_decode_step` does not yet handle
-        block-boundary crossings or speculative decoding (num_speculative_tokens
-        > 0); the engine falls back to serial whenever this returns False.
+        speculative-decoding interaction, no Mamba SSM advance. Tighter than
+        the original block-budget check because the speculative advance path
+        implemented in :meth:`speculatively_advance_for_next_decode_step` does
+        not yet handle block-boundary crossings, speculative decoding
+        (num_speculative_tokens > 0), or hybrid models (Mamba SSM forward
+        advances per-request conv/ssm state and would require per-step rollback
+        of large GPU buffers). The engine falls back to serial when this
+        returns False.
         """
         if not self.is_decode_only():
             return False
         if self.num_speculative_tokens > 0:
+            return False
+        if self.is_hybrid_model:
+            # Mamba SSM state is mutated in-place by forward; speculative
+            # rollback would require saving/restoring per-request conv/ssm
+            # state buffers. Gate off until that is implemented.
             return False
         # Boundary-crossing requires allocator work that the speculative advance
         # cannot replay safely; defer to serial when any active request would

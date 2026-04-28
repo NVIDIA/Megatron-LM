@@ -240,6 +240,13 @@ class DynamicInferenceEngine(AbstractEngine):
         # instead of launching fresh. None when no speculative launch is in
         # flight (warmup, after rejection, or async scheduling disabled).
         self._pending_launch_state: Optional[Dict] = None
+        # Snapshot of controller.sampling_rng state captured immediately
+        # before the speculative pre-launch's sample. Used to roll the RNG
+        # back when the pre-launch is discarded (rejection drain) so the
+        # serial re-sample reads from the same RNG state the baseline
+        # would have observed at that step. None when no pre-launch is in
+        # flight.
+        self._pre_launch_rng_state: Optional[torch.Tensor] = None
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -2007,6 +2014,11 @@ class DynamicInferenceEngine(AbstractEngine):
             return False
         if self._finished_sync_due():
             return False
+        # Requests waiting in the queue would change batch composition at
+        # the next iteration. Drop to the serial path so the schedule call
+        # can integrate them and re-launch from canonical state.
+        if len(self.waiting_request_ids) > 0:
+            return False
         return self.context.can_speculate_decode_step()
 
     def _finished_sync_due(self) -> bool:
@@ -2066,9 +2078,13 @@ class DynamicInferenceEngine(AbstractEngine):
         async-scheduling fired a rejection), drain it on the stream so the
         canonical state can launch step N afresh without races.
         """
+        # Drain a stale speculative pre-launch (and roll back its RNG / clear
+        # rejection state) only when one is actually pending. When there is no
+        # pre-launch in flight this branch is a no-op so the serial path is
+        # byte-identical to the pre-async-scheduling code path.
         if self._pending_launch_state is not None:
             self._drain_pending_launch()
-        self._clear_rejection()
+            self._clear_rejection()
         last_step_data = await self.async_forward()
         return await self.async_bookkeep(*last_step_data)
 
@@ -2079,49 +2095,197 @@ class DynamicInferenceEngine(AbstractEngine):
         a finish/pause/evict event triggered a rejection). The pending pre-
         launch's GPU work is allowed to complete; its results are discarded
         because step N+1 will be re-launched from canonical state.
+
+        Also rolls back the controller's sampling RNG state to the snapshot
+        taken before the discarded pre-launch's sample. Without this rollback
+        the serial re-sample would observe an RNG state advanced by the
+        discarded sample and produce a token different from the baseline.
         """
         torch.cuda.current_stream().synchronize()
+        if self._pre_launch_rng_state is not None:
+            self.controller.sampling_rng.set_state(self._pre_launch_rng_state)
+            self._pre_launch_rng_state = None
         self._pending_launch_state = None
 
     async def _async_step_speculative(
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
-        """Speculative step path: planned to launch step N+1 ahead of step N's
-        bookkeep so the GPU runs ``forward → sample → forward → sample``
-        continuously on pure-decode chains.
+        """Speculative step path: launch step N+1 ahead of step N's bookkeep
+        so the GPU runs ``forward → sample → forward → sample`` continuously
+        on pure-decode chains.
 
-        C5.3 status: still a stub identical to the serial path. The launch-
-        ahead loop and rejection drain-and-rewind are landed in a follow-up
-        commit. The infrastructure required by that follow-up is in place:
+        Stream order maintained per iteration::
 
-        - ``self._pre_fetched_sample_buf`` and ``self._d2h_done_event`` /
-          ``self._h2d_done_event`` events (engine ``__init__``).
-        - ``self._pending_launch_state`` field threaded through serial path
-          via ``_drain_pending_launch``.
-        - ``self._signal_rejection`` / ``_clear_rejection`` and the
-          ``len(waiting_request_ids) > 0`` gate in
-          ``_async_scheduling_active``.
-        - ``controller._launch_decode_step`` / ``_bookkeep_decode_step``
-          split (C5.1) and ``sample_cpu_override`` parameter on the bookkeep
-          path so the engine can D2H sample_N once and pass it through
-          without racing against a subsequent speculative sample_{N+1}.
-        - ``context.speculatively_advance_for_next_decode_step`` /
-          ``restore_after_speculative_advance`` (C5.2).
+            H2D_N → forward_N → sample_N → H2D_{N+1} → forward_{N+1} → sample_{N+1}
 
-        A naive launch-ahead wiring (sync sample_N, mirror it into pinned
-        token_to_input_ids, speculatively advance, pre-launch step N+1, run
-        update_requests in parallel) was prototyped on this branch but
-        produced divergent tokens vs. the serial baseline starting at the
-        first decode iteration after a mid-chain rejection (e.g. when a new
-        request is added). The proximate cause appears to be state pollution
-        from the discarded pre-launch (KV writes / attention metadata /
-        rotated MHA tensors); resolving it cleanly requires either a shadow
-        bookkeeping buffer or a more thorough rollback than the persistent-
-        tensor restore that exists today. Deferred to a follow-up so the
-        infrastructure here can land separately.
+        CPU sequence per iteration:
+            1. Acquire step N's launch state — consume the pending pre-launch
+               from the prior iteration, or launch fresh on warmup.
+            2. ``.cpu()`` _sampled_tokens_cuda — synchronous wait that blocks
+               CPU until sample_N completes. GPU is busy with forward_N →
+               sample_N during this wait, so no GPU idle time.
+            3. Snapshot the sampling RNG state so the next sample (the
+               speculative one) can be rolled back if the chain rejects.
+            4. Mirror sample_N into pinned ``token_to_input_ids`` so step
+               N+1's H2D copies the correct input to ``gpu_view``.
+            5. Speculatively advance state and pre-launch step N+1 (queues
+               H2D, forward, sample on the stream, advances RNG).
+            6. Run step N's full ``update_requests`` bookkeeping in parallel
+               with GPU step N+1. update_requests overwrites pinned token-
+               level fields but only ~100+ µs into its execution, by which
+               time the small (~5 µs) H2D for step N+1 has long completed.
+
+        Rejection events (finish/pause/evict) at the end of bookkeep set
+        ``_rejection_pending`` so the next iteration drops to the serial
+        path. The serial path's drain helper synchronizes the stream,
+        discards the pre-launched step's results, and restores the
+        sampling RNG so the re-sample matches the baseline byte-for-byte.
+
+        Speculation is gated off (via ``can_speculate_decode_step``) for
+        hybrid models because Mamba's SSM forward advances per-request
+        ``conv_states`` / ``ssm_states`` in place; rolling those back on
+        rejection would require saving/restoring large GPU buffers per
+        active request. Implementing that is left for a follow-up.
         """
-        last_step_data = await self.async_forward()
-        return await self.async_bookkeep(*last_step_data)
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+            raise EngineSuspendedError(self.context.step_count)
+
+        # async_forward equivalents needed before any launch.
+        self.schedule_waiting_requests()
+
+        will_log_this_step = (
+            self.logging_step_interval > 0
+            and (self.context.step_count + 1) % self.logging_step_interval == 0
+        )
+        is_decode_only = self.context.is_decode_only()
+        if will_log_this_step:
+            pre_step_context_state = {
+                "is_decode_only": is_decode_only,
+                "max_requests": self.context.max_requests,
+                "total_request_count": self.context.total_request_count,
+                "paused_request_count": self.context.paused_request_count,
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
+        else:
+            pre_step_context_state = {
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
+
+        nvtx_range_push("Decode")
+        self.is_decode_only = is_decode_only
+
+        if will_log_this_step:
+            self.step_start_event.record()
+
+        # 1. Acquire step N's launch state. Either consume the pending pre-
+        # launch from the prior iteration's speculation, or launch fresh
+        # (warmup or post-rejection).
+        if self._pending_launch_state is None:
+            launch_state_N = await self.controller._launch_decode_step()
+        else:
+            launch_state_N = self._pending_launch_state
+            self._pending_launch_state = None
+            # The RNG state snapshot is paired with the consumed pre-launch:
+            # the pre-launch's sample has already advanced the RNG. We are now
+            # consuming that sample, so the advance is "real" and we drop the
+            # snapshot — only a future rejection that discards a pre-launch
+            # would need to roll back.
+            self._pre_launch_rng_state = None
+
+        if launch_state_N is None:
+            # Nothing to step (no active requests).
+            nvtx_range_pop("Decode")
+            if will_log_this_step:
+                self.step_end_event.record()
+                self.step_end_event.synchronize()
+            return await self.async_bookkeep(
+                None, {**pre_step_context_state, "kv_stats": None}, 0.0
+            )
+
+        # 2. D2H sample_N. Synchronous: blocks CPU until sample_N completes
+        # on the stream. GPU stays busy with forward_N → sample_N during the
+        # wait so the wait does not introduce a GPU-side gap.
+        active_count = launch_state_N["_active_request_count"]
+        sample_N_cpu = self.controller._sampled_tokens_cuda[:active_count].cpu()
+
+        # 3. Pre-launch step N+1 if eligible. Snapshot the RNG state first
+        # so we can roll back if the pre-launch is later discarded.
+        if self.context.can_speculate_decode_step():
+            self._pre_launch_rng_state = self.controller.sampling_rng.get_state()
+
+            # 4. Mirror sample_N into pinned token_to_input_ids before the
+            # speculative H2D so step N+1's forward reads sample_N as its
+            # input. update_requests would do this assignment near the end
+            # of step N's bookkeep, but we must do it here because the next
+            # H2D needs the value now.
+            self.context.token_to_input_ids[:active_count] = sample_N_cpu
+
+            # 5. Speculatively advance per-request state and pre-launch.
+            self.context.speculatively_advance_for_next_decode_step()
+            try:
+                pending = await self.controller._launch_decode_step()
+                if pending is not None:
+                    self._pending_launch_state = pending
+                else:
+                    # No active requests after speculative advance (very rare,
+                    # but handle cleanly): nothing to roll back.
+                    self._pre_launch_rng_state = None
+            finally:
+                self.context.restore_after_speculative_advance()
+
+        # 6. CPU bookkeep step N using the pre-fetched sample. Runs in
+        # parallel with GPU step N+1 if speculation queued one.
+        bookkeep_state = self.controller._bookkeep_decode_step(
+            launch_state_N, sample_cpu_override=sample_N_cpu
+        )
+
+        if will_log_this_step:
+            self.step_end_event.record()
+            self.step_end_event.synchronize()
+            step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
+        else:
+            step_time = 0.0
+
+        self.context.step_count += 1
+        self.context.prefix_cache_lru_clock += 1
+        nvtx_range_pop("Decode")
+
+        # 7. Detect events that invalidate the speculative chain. Any of
+        # finish / pause / evict triggers a rejection so the next iteration's
+        # serial path drains and re-launches from canonical state.
+        finished_request_ids = bookkeep_state.get("finished_request_ids")
+        if finished_request_ids is not None and len(finished_request_ids) > 0:
+            self._finished_pending_count += int(len(finished_request_ids))
+            self._signal_rejection()
+        if bookkeep_state.get("newly_paused_request_ids") is not None:
+            self._signal_rejection()
+        if bookkeep_state.get("evict_request_ids") is not None:
+            self._signal_rejection()
+
+        # Build context_state for async_bookkeep (matches async_forward's shape).
+        if will_log_this_step:
+            kvcache_util_stats = (
+                self.context.get_kvcache_utilization_stats()
+                if self.metrics_writer is not None
+                else None
+            )
+            post_step_context_state = {
+                "waiting_request_count": len(self.waiting_request_ids),
+                "finished_request_count": self.finished_request_count,
+                "evicted_request_count": self.evicted_request_count,
+                "kv_stats": kvcache_util_stats,
+                "total_active_block_count": self.context.kv_block_allocator.active_count,
+                "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+                "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            }
+            context_state = {**pre_step_context_state, **post_step_context_state}
+        else:
+            context_state = {**pre_step_context_state, "kv_stats": None}
+
+        return await self.async_bookkeep(bookkeep_state, context_state, step_time)
 
     def _run_coroutine_sync(self, coro):
         """Run a coroutine synchronously, handling the case when already in an event loop.
