@@ -3374,6 +3374,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         to fill the graph body's input scalars.  Copies paused tokens and
         snapshots active_request_ids.
         """
+        # ``lru_maybe_compact`` is a no-op outside LRU prefix caching, but
+        # gating the call here also avoids the unconditional Python
+        # dispatch on every step in non-LRU configurations.
+        alloc = self.kv_block_allocator
+        if (
+            alloc.enable_prefix_caching
+            and alloc.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+        ):
+            alloc.lru_maybe_compact()
+
         self.num_prefill_requests = 0
         self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
 

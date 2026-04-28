@@ -168,11 +168,27 @@ class KVBlockAllocator:
                 self._lru_cached_list_len = torch.zeros((), dtype=torch.int64, device=device)
 
                 # Position arange shared by ``_lru_evict_if_deficit`` and the
-                # compaction pass (commit 20). Sized to the list capacity
-                # (excluding the +1 sink slot).
+                # compaction pass. Sized to the list capacity (excluding
+                # the +1 sink slot).
                 self._lru_compact_pos_arange = torch.arange(
                     2 * self.total_count, dtype=torch.int64, device=device
                 )
+
+                # Pre-allocated snapshot buffers for allocation-free compaction.
+                self._lru_compact_scratch = torch.full(
+                    (2 * self.total_count,), -1, dtype=torch.int32, device=device
+                )
+                self._lru_compact_scratch_ts = torch.zeros(
+                    (2 * self.total_count,), dtype=torch.int64, device=device
+                )
+
+                # Compaction interval: budget is total_count stale slots,
+                # worst-case appends per call is 2 * max_release_per_step.
+                worst_per_call = max(1, 2 * self.max_release_per_step)
+                self._lru_compaction_interval = max(
+                    1, (self.total_count * 3 // 4) // worst_per_call
+                )
+                self._lru_calls_since_compact = 0
 
         # Per-block MoE routing storage (populated when routing replay is enabled)
         self.block_routing: Dict[int, np.ndarray] = {}
@@ -390,6 +406,9 @@ class KVBlockAllocator:
                 self._lru_cached_list.fill_(-1)
                 self._lru_cached_list_ts.zero_()
                 self._lru_cached_list_len.zero_()
+                self._lru_compact_scratch.fill_(-1)
+                self._lru_compact_scratch_ts.zero_()
+                self._lru_calls_since_compact = 0
                 self.lru_clock_gpu.zero_()
 
         # Clear per-block routing storage
@@ -880,6 +899,72 @@ class KVBlockAllocator:
             self.block_timestamps[allocated.long()] = new_ts
 
         return allocated
+
+    def lru_maybe_compact(self) -> None:
+        """Host-scheduled periodic compaction of the LRU cached list.
+
+        Increments ``_lru_calls_since_compact``; when the counter
+        reaches ``_lru_compaction_interval``, runs an unconditional
+        compaction and resets the counter. No GPU sync is needed — the
+        interval was sized in ``__init__`` so the list cannot overflow
+        between compactions under the worst-case append rate
+        (``2 * max_release_per_step`` entries per call).
+
+        Call once per ``update_requests`` invocation from the host
+        side, before any release/append op that might push the list
+        past its capacity. No-op when LRU prefix caching is disabled.
+        """
+        if (
+            not self.enable_prefix_caching
+            or self.prefix_caching_eviction_policy != PrefixCachingEvictionPolicy.LRU
+        ):
+            return
+        self._lru_calls_since_compact += 1
+        if self._lru_calls_since_compact >= self._lru_compaction_interval:
+            self._compact_lru_cached_list()
+            self._lru_calls_since_compact = 0
+
+    def _compact_lru_cached_list(self) -> None:
+        """Unconditionally compact ``_lru_cached_list`` in place.
+
+        Rebuilds the list by scatter-packing non-stale entries to the
+        front, preserving their relative order (which is also their
+        sort order, since timestamps are monotonically assigned via
+        ``lru_clock_gpu``). Updates ``_lru_cached_list_len`` to the
+        new valid count.
+
+        Uses ``_lru_compact_scratch{,_ts}`` instead of ``.clone()`` so
+        compaction is allocation-free. Shape-stable throughout; runs
+        via GPU ops without any CPU sync.
+        """
+        list_size = 2 * self.total_count
+
+        # Snapshot into pre-allocated scratch (avoids inline .clone()).
+        self._lru_compact_scratch.copy_(self._lru_cached_list[:list_size])
+        self._lru_compact_scratch_ts.copy_(self._lru_cached_list_ts[:list_size])
+
+        pos_arange = self._lru_compact_pos_arange
+        in_range = pos_arange < self._lru_cached_list_len
+        safe_block_ids = torch.where(
+            in_range,
+            self._lru_compact_scratch.long(),
+            torch.full_like(self._lru_compact_scratch.long(), self.dummy_block_idx),
+        )
+        recorded_ts = self._lru_compact_scratch_ts
+        current_ts = self.block_timestamps[safe_block_ids]
+        refs = self.block_ref_counts[safe_block_ids]
+        hashes = self.block_hashes[safe_block_ids]
+        entry_valid = in_range & (refs == 0) & (hashes != -1) & (recorded_ts == current_ts)
+
+        valid_i64 = entry_valid.to(torch.int64)
+        prefix = torch.cumsum(valid_i64, dim=0) - valid_i64
+        targets = torch.where(entry_valid, prefix, torch.full_like(prefix, list_size))
+
+        self._lru_cached_list[:list_size].fill_(-1)
+        self._lru_cached_list_ts[:list_size].zero_()
+        self._lru_cached_list[targets] = self._lru_compact_scratch
+        self._lru_cached_list_ts[targets] = self._lru_compact_scratch_ts
+        self._lru_cached_list_len.copy_(valid_i64.sum())
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
