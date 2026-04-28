@@ -85,6 +85,12 @@ def native_h_post_bda(
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, C)
     mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
+    # Match the standard BDA contract: the output dtype is the post-attention
+    # `x` dtype (compute dtype), not the residual dtype. Without this downcast,
+    # `fp32_residual_connection=True` would silently propagate fp32 n-stream
+    # hidden states across every subsequent layer (≈2× activation memory).
+    if mixed.dtype != x.dtype:
+        mixed = mixed.to(x.dtype)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
@@ -533,10 +539,11 @@ class HyperConnectionModule(MegatronModule):
             contracted: [s, b, C] - single stream hidden states
         """
         s, b, nC = x.shape
-        assert nC % n == 0, (
-            f"output_contract: n-stream input dim {nC} is not a multiple of "
-            f"num_residual_streams={n}"
-        )
+        if nC % n != 0:
+            raise ValueError(
+                f"output_contract: n-stream input dim {nC} is not a multiple of "
+                f"num_residual_streams={n}"
+            )
         C = nC // n
         # Average all streams
         x_streams = x.view(s, b, n, C)
@@ -644,6 +651,12 @@ class HyperConnectionModule(MegatronModule):
             C = self.hidden_size
             orig_reshaped = original_residual.view(s, b, n, C)
             output = self._h_post_bda_op(h_res, orig_reshaped, h_post, x, bias)
+            # Match the standard BDA contract: output dtype follows post-attention
+            # `x` (compute dtype). With `fp32_residual_connection=True` the kernel
+            # may produce fp32; downcast here so n-stream hidden states do not
+            # silently propagate fp32 into every downstream layer.
+            if output.dtype != x.dtype:
+                output = output.to(x.dtype)
             return output.view(s, b, n * C)
 
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -704,7 +717,12 @@ class HyperConnectionModule(MegatronModule):
                 s, b, _ = original_residual.shape
                 orig_reshaped = original_residual.view(s, b, n, C)
                 b_arg = optional_bias[0] if optional_bias else None
-                return self._h_post_bda_op(h_res, orig_reshaped, h_post, x, b_arg).view(s, b, n * C)
+                out = self._h_post_bda_op(h_res, orig_reshaped, h_post, x, b_arg)
+                # See `_h_res_h_post_bda_native` for why this downcast is required
+                # under `fp32_residual_connection=True`.
+                if out.dtype != x.dtype:
+                    out = out.to(x.dtype)
+                return out.view(s, b, n * C)
 
             ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
             if bias is not None:
