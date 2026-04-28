@@ -1041,7 +1041,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
-          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          commit_parent: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
