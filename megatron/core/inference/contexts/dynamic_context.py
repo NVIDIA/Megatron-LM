@@ -2848,14 +2848,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             fill_value=self.kv_block_allocator.dummy_block_idx,
             sink_idx_value=max_release,
         )
-        if (
-            self.enable_prefix_caching
-            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
-        ):
+        if self.enable_prefix_caching:
             # Prefix-aware release: per-block ref count decrement,
-            # deregistration, hash clearing, and free-pool push. Host-side
-            # dict cleanup is deferred to ``drain_pending_dereg`` called
-            # after this graph body syncs.
+            # deregistration, hash clearing, and policy-dependent
+            # pool push. Host-side dict cleanup is deferred to
+            # ``drain_pending_dereg`` called after this graph body syncs.
             self.kv_block_allocator.release_memory_blocks_prefix_aware_gpu(
                 self._ur.release_pack_buf[:max_release], num_valid_gpu
             )

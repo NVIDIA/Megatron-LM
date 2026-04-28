@@ -1713,7 +1713,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
-        self.context.prefix_cache_lru_clock += 1
+        self.context.kv_block_allocator.bump_lru_clock()
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
@@ -2365,7 +2365,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            self.context.kv_block_allocator.bump_lru_clock()
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

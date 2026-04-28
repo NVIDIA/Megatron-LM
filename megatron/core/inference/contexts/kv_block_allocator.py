@@ -152,6 +152,21 @@ class KVBlockAllocator:
                 self.total_count + 1, dtype=torch.int32, device=device
             )
 
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+                # GPU-resident monotonic LRU clock.
+                self.lru_clock_gpu = torch.zeros((), dtype=torch.int64, device=device)
+
+                # Append-only sorted list of cached block IDs, sized to
+                # 2 * total_count (+ 1 sink) to absorb one full generation
+                # of stale entries before compaction.
+                self._lru_cached_list = torch.full(
+                    (2 * self.total_count + 1,), -1, dtype=torch.int32, device=device
+                )
+                self._lru_cached_list_ts = torch.zeros(
+                    (2 * self.total_count + 1,), dtype=torch.int64, device=device
+                )
+                self._lru_cached_list_len = torch.zeros((), dtype=torch.int64, device=device)
+
         # Per-block MoE routing storage (populated when routing replay is enabled)
         self.block_routing: Dict[int, np.ndarray] = {}
 
@@ -285,18 +300,39 @@ class KVBlockAllocator:
                 if zero_mask.any():
                     self._deregister_blocks(blocks[zero_mask])
             elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                # Unregistered blocks (hash == -1, ref_count == 0) have no hash
-                # entry to preserve for reuse (e.g., partial blocks at the end of
-                # a request). Return them directly to the free pool so they are not
-                # leaked.
-                unreg_mask = (self.block_ref_counts[blocks] == 0) & (
-                    self.block_hashes[blocks] == -1
-                )
-                if unreg_mask.any():
-                    unreg_blocks = blocks[unreg_mask]
+                # Split the just-zero'd blocks by whether they have a hash:
+                #   - has_hash → cacheable: append to ``_lru_cached_list`` so
+                #     the graphed prefix-aware allocate path can later evict
+                #     them. Without this append, eager and graphed releases
+                #     would maintain divergent caches.
+                #   - no hash → unregistered partial blocks: nothing to keep
+                #     cached, return them to the free pool directly.
+                zero_mask = self.block_ref_counts[blocks] == 0
+                if zero_mask.any():
+                    zero_blocks = blocks[zero_mask]
+                    has_hash_mask = self.block_hashes[zero_blocks] != -1
+
+                    cacheable_blocks = zero_blocks[has_hash_mask]
+                    if cacheable_blocks.numel() > 0:
+                        n = cacheable_blocks.numel()
+                        # Read list_len GPU-side to avoid a sync; the index
+                        # arithmetic happens on-device.
+                        indices = self._lru_cached_list_len + torch.arange(
+                            n, dtype=torch.int64, device=cacheable_blocks.device
+                        )
+                        self._lru_cached_list[indices] = cacheable_blocks.to(torch.int32)
+                        self._lru_cached_list_ts[indices] = self.block_timestamps[
+                            cacheable_blocks
+                        ]
+                        self._lru_cached_list_len.add_(n)
+
+                    unreg_blocks = zero_blocks[~has_hash_mask]
                     num_unreg = unreg_blocks.numel()
-                    self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
-                    self.total_avail += num_unreg
+                    if num_unreg > 0:
+                        self.block_bag[
+                            self.total_avail : self.total_avail + num_unreg
+                        ] = unreg_blocks
+                        self.total_avail += num_unreg
         else:
             num_blocks = blocks.numel()
             self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
@@ -343,6 +379,11 @@ class KVBlockAllocator:
             self._pc_pending_dereg_hashes.fill_(-1)
             self._pc_pending_dereg_count.zero_()
             self._pc_dereg_may_have_events = False
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+                self._lru_cached_list.fill_(-1)
+                self._lru_cached_list_ts.zero_()
+                self._lru_cached_list_len.zero_()
+                self.lru_clock_gpu.zero_()
 
         # Clear per-block routing storage
         self.block_routing.clear()
@@ -537,6 +578,49 @@ class KVBlockAllocator:
         self.block_bag[bag_targets] = self._pc_block_arange
         self.total_avail_gpu.add_(push_i64.sum().to(torch.int32).view(1))
 
+    def _lru_append_newly_cached(self, newly_cached_mask: Tensor) -> None:
+        """Shape-stable: append newly-cached blocks to the LRU list.
+
+        Each True position in ``newly_cached_mask`` names a block that
+        just transitioned to ``(ref_count == 0, hash != -1)``. The append
+        records both the block ID and its current timestamp (see
+        ``_lru_cached_list_ts``) so later staleness checks can tell it
+        apart from re-allocations of the same block.
+
+        Because ``lru_clock_gpu`` is monotone, the list remains sorted by
+        timestamp ascending (the oldest still-cached blocks are at the
+        head) without an explicit sort.
+        """
+        cached_i64 = newly_cached_mask.to(torch.int64)
+        cached_prefix = torch.cumsum(cached_i64, dim=0) - cached_i64
+        sink = 2 * self.total_count  # last slot of the sized buffer
+        targets = torch.where(
+            newly_cached_mask,
+            self._lru_cached_list_len + cached_prefix,
+            torch.full_like(cached_prefix, sink),
+        )
+        self._lru_cached_list[targets] = self._pc_block_arange
+        self._lru_cached_list_ts[targets] = self.block_timestamps
+        self._lru_cached_list_len.add_(cached_i64.sum())
+
+    def bump_lru_clock(self) -> None:
+        """Advance the GPU-resident monotonic LRU clock by 1.
+
+        Called once per inference step from the engine, replacing the
+        previous ``context.prefix_cache_lru_clock += 1`` Python-int
+        bump. The clock is used by ``update_timestamps`` and
+        ``_lru_append_newly_cached`` to stamp blocks for staleness
+        detection.
+
+        Cheap no-op when prefix caching isn't LRU; the engine still
+        calls it unconditionally so the call site is a single line.
+        """
+        if (
+            self.enable_prefix_caching
+            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+        ):
+            self.lru_clock_gpu.add_(1)
+
     def _enqueue_dereg_and_clear_hashes(self, dereg_mask: Tensor) -> None:
         """Shape-stable: enqueue dereg events and clear hashes.
 
@@ -577,11 +661,16 @@ class KVBlockAllocator:
         the policy-specific decision of whether a zero-ref block should
         be deregistered and pushed back to the free pool.
 
-        REF_ZERO semantics: every block whose ref count hits zero is
-        deregistered (hash cleared, pushed to pool, queued for host-side
-        dict/callback cleanup in ``_pc_pending_dereg_*``).
+        Semantics by policy:
 
-        LRU semantics land in the next commit.
+        - **REF_ZERO**: Every block whose ref count hits zero is
+          deregistered (hash cleared, pushed to pool, queued for
+          host-side dict/callback cleanup in ``_pc_pending_dereg_*``).
+
+        - **LRU**: Zero-ref blocks with ``hash != -1`` stay cached (added
+          to the LRU list for later eviction). Zero-ref blocks with
+          ``hash == -1`` (unregistered partial blocks) go directly to
+          the free pool.
 
         Handles duplicate block IDs correctly: prefix caching can share a
         block across multiple requests, so the same ID may appear several
@@ -601,9 +690,6 @@ class KVBlockAllocator:
         queue never holds more than one release's worth of entries.
         """
         assert self.enable_prefix_caching
-        assert (
-            self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
-        ), "LRU policy not yet supported by graphed prefix-aware release."
         assert packed_blocks.numel() == self.max_release_per_step
 
         # ── Decrement ref counts ──
@@ -633,10 +719,26 @@ class KVBlockAllocator:
         # ── Per-block "now zero" mask (deduplicated) ──
         now_zero_mask = self._pc_released_bitmap & (self.block_ref_counts == 0)
 
-        # REF_ZERO: every zero-ref block is deregistered (hash cleared,
-        # queued for host-side dict cleanup) AND pushed to the free pool.
-        self._enqueue_dereg_and_clear_hashes(now_zero_mask)
-        self._push_masked_to_pool(now_zero_mask)
+        # ── Policy-specific subsets ──
+        # The Python branch below is a config-time constant, so it bakes
+        # into any captured graph at capture time.
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
+            # Every zero-ref block is deregistered (hash cleared, queued
+            # for host-side dict cleanup) AND pushed to the free pool.
+            self._enqueue_dereg_and_clear_hashes(now_zero_mask)
+            push_mask = now_zero_mask
+        else:
+            # LRU: zero-ref blocks with a hash stay cached — append to
+            # ``_lru_cached_list`` so they can be LRU-evicted later.
+            # Unregistered partial blocks (hash == -1) have nothing to
+            # cache and go directly to the free pool.
+            has_hash = self.block_hashes != -1
+            newly_cached_mask = now_zero_mask & has_hash
+            push_mask = now_zero_mask & ~has_hash
+            self._lru_append_newly_cached(newly_cached_mask)
+
+        # ── Push the "to pool" subset onto block_bag ──
+        self._push_masked_to_pool(push_mask)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
@@ -649,7 +751,7 @@ class KVBlockAllocator:
             or block_ids.numel() == 0
         ):
             return
-        self.block_timestamps[block_ids] = self.context.prefix_cache_lru_clock
+        self.block_timestamps[block_ids] = self.lru_clock_gpu
 
     def get_evictable_block_count(self) -> Tensor:
         """Get count of cached blocks that can be evicted (ref_count == 0, hash set).
