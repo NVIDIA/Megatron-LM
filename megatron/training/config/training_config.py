@@ -536,9 +536,20 @@ class CheckpointConfig:
     key pointing at the rank's own ``__<rank>_*.distcp`` file, so at load
     time every rank can read its tensors from its own file (no cross-reads).
     Trades extra checkpoint storage (~``parallelization_group_size`` x for
-    replicated parameters) for read-side locality at scale. The load path
-    transparently honours these shadow keys when present, so leaving this
-    flag off keeps today's behaviour exactly. Default: False.
+    replicated parameters) for read-side locality at scale. Pair with
+    ``ckpt_fully_parallel_load_replicate_local`` to take advantage at load
+    time. Default: False.
+    """
+
+    ckpt_fully_parallel_load_replicate_local: bool = False
+    """If True, the load redirects every requested FQN whose
+    ``__shadow_<rank>__<fqn>`` exists in the metadata to the rank's local
+    shadow entry — eliminating cross-reads at load time. Has no effect when
+    the checkpoint was saved without
+    ``ckpt_fully_parallel_save_replicate_local`` (no shadow keys are
+    present, so there is nothing to redirect). Useful as a benchmark toggle
+    to compare the new local-read path against the legacy cross-read path
+    on the same on-disk checkpoint. Default: False.
     """
 
     ckpt_assume_constant_structure: bool = False

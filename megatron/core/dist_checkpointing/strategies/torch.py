@@ -900,9 +900,30 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False):
+    def __init__(
+        self,
+        cache_metadata: bool = False,
+        replicate_local_replicas: bool = False,
+    ):
+        """
+        Args:
+            cache_metadata (bool): keep the parsed ``.metadata`` pickle alive
+                across calls so the second and later loads avoid re-parsing
+                it. Defaults to False.
+            replicate_local_replicas (bool): when True, requests for an FQN
+                whose ``__shadow_<rank>__<fqn>`` is present in the
+                checkpoint metadata are routed to that shadow entry — i.e.
+                to the rank's own ``__<rank>_*.distcp`` file. When False
+                (default) the redirect is skipped, so the load uses the
+                metadata's deduped storage entry exactly as today, even if
+                the checkpoint *does* contain shadow keys. This is
+                deliberately a separate knob from the save side so the
+                legacy load path can be benchmarked against the local-read
+                path on the same on-disk checkpoint.
+        """
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
+        self.replicate_local_replicas = replicate_local_replicas
 
     def load(
         self,
@@ -945,14 +966,18 @@ class TorchDistLoadShardedStrategy:
         # written under a `__shadow_<rank>__<fqn>` FQN pointing at the
         # rank's own __<rank>_*.distcp file. Reroute every load request
         # whose shadow key is in the metadata so that PyT DCP opens our
-        # local file rather than the dedup-winning peer's file.
+        # local file rather than the dedup-winning peer's file. The
+        # ``replicate_local_replicas`` knob lets the user opt out of this
+        # redirect at runtime — useful for A/B benchmarking the legacy
+        # cross-read path against the new local-read path on the same
+        # on-disk checkpoint.
         from .local_replica import (
             redirect_pyt_state_dict_to_shadows,
             restore_pyt_state_dict_from_shadows,
         )
 
         shadow_renames: Dict[str, str] = {}
-        if torch.distributed.is_initialized():
+        if self.replicate_local_replicas and torch.distributed.is_initialized():
             metadata = fsr.read_metadata()  # cached when cache_metadata=True
             shadow_renames = redirect_pyt_state_dict_to_shadows(
                 pyt_state_dict, metadata, torch.distributed.get_rank()
