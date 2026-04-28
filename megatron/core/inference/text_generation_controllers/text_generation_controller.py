@@ -169,7 +169,12 @@ class TextGenerationController:
 
         # Sampling backend: dispatches per-step bookkeeping and the sampling kernel.
         if self._sampling_backend == "flashinfer":
-            self._sampling: Sampling = FlashInferSampling(self.vocab_size, self.sampling_rng)
+            self._sampling: Sampling = FlashInferSampling(
+                self.vocab_size,
+                self.sampling_rng,
+                config=self.model_config,
+                enable_cuda_graph=self._enable_cuda_graph,
+            )
         else:
             self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
 
@@ -902,14 +907,29 @@ class TextGenerationController:
             del unwrapped_model._decoder_hidden_states_cache
 
     def _sample_speculative_logits(
-        self, required_logits: Tensor, request_in_prefill_status_tensor: Tensor
+        self,
+        required_logits: Tensor,
+        num_decode: int,
+        num_prefill: int,
+        *,
+        eager: bool,
+        cache_key,
     ) -> Tensor:
-        """Sample speculative-token logits via the active sampling backend."""
+        """Sample speculative-token logits via the active sampling backend.
+
+        `num_decode` and `num_prefill` are the request counts the kernel should treat
+        as decode/prefill: padded values when running a captured CUDA graph, actual
+        values otherwise. Padded slots beyond the active count contribute decode-style
+        rows (`pad_active_slices` initialises their query lengths to `1 + n_spec`).
+        """
         return self._sampling.sample_speculative(
             required_logits,
-            request_in_prefill_status_tensor,
+            num_decode,
+            num_prefill,
             self.num_speculative_tokens,
             self.inference_wrapped_model.inference_context,
+            eager=eager,
+            cache_key=cache_key,
         )
 
     def _verify_speculative_tokens(
@@ -936,10 +956,28 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Use gpu_view for data consumed by GPU operations (sampling, verification).
-        request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
-            :active_request_count
-        ]
+        # Sampling-side request counts: padded when running a captured graph so the
+        # cache key buckets, actual otherwise. Verify uses the actual counts so the
+        # downstream Triton kernels still operate on the real workload.
+        #
+        # Padding-as-decode is only safe when the captured graph is decode-only — in
+        # that case `pad_active_slices` set the padded slots' query lengths to
+        # `1 + n_spec` (decode-style). With a mixed graph, `[actual_decode,
+        # padded_decode)` may contain real prefill rows whose query lengths differ
+        # from `1 + n_spec`, so the kernel's reshape would mix prompt tokens into the
+        # decode chunks. Fall back to actual values + eager sampling in that case.
+        use_graph_for_sampling = (
+            self._sampling_backend == "flashinfer"
+            and self._enable_cuda_graph
+            and context.using_cuda_graph_this_step()
+            and context.padded_batch_dimensions.prefill_req_count == 0
+        )
+        if use_graph_for_sampling:
+            sample_num_decode = context.padded_batch_dimensions.decode_req_count
+            sample_num_prefill = 0
+        else:
+            sample_num_decode = context.num_decode_requests
+            sample_num_prefill = context.num_prefill_requests
 
         # Get the logit indices for tokens that need sampling.
         # These indices are always needed for input_ids slicing and tracking
@@ -961,7 +999,15 @@ class TextGenerationController:
         # Sample tokens from logits
         nvtx_range_push("mtp-spec-decoding/verify/sample")
         output_tokens = self._sample_speculative_logits(
-            required_logits, request_in_prefill_status_tensor
+            required_logits,
+            sample_num_decode,
+            sample_num_prefill,
+            eager=not use_graph_for_sampling,
+            cache_key=(
+                ("sample_speculative", sample_num_decode, sample_num_prefill)
+                if use_graph_for_sampling
+                else None
+            ),
         )
         nvtx_range_pop("mtp-spec-decoding/verify/sample")
 
@@ -1034,22 +1080,29 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-
-        if context.config.materialize_only_last_token_logits:
-            # When materialize_only_last_token_logits is true, last_token_logits is
-            # already called in the forward pass of GPT.
-            required_token_logits = self._all_logits_cuda.squeeze(0)[:active_request_count, :]
-        else:
-            required_token_logits = context.last_token_logits(
-                self._all_logits_cuda[:, : context.padded_active_token_count, :]
-            )
-
+        use_graph = (
+            self._sampling_backend == "flashinfer"
+            and self._enable_cuda_graph
+            and context.using_cuda_graph_this_step()
+        )
+        # Padded count when running a captured graph (cache key buckets); actual otherwise.
+        n = context.padded_active_request_count if use_graph else active_request_count
+        # When `materialize_only_last_token_logits` is true the forward pass already
+        # selected the right rows. Otherwise we point the kernel at the per-request
+        # last-token positions via `gather_indices`; padded slots safely fan in to row 0.
+        gather_indices = (
+            None
+            if context.config.materialize_only_last_token_logits
+            else context.active_request_last_token_idxs
+        )
         self._sampling.sample(
-            required_token_logits,
-            active_request_count,
+            self._all_logits_cuda.squeeze(0),
+            n,
             self._sampled_tokens_cuda,
             context,
-            eager=True,
+            eager=not use_graph,
+            cache_key=("sample", n) if use_graph else None,
+            gather_indices=gather_indices,
         )
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
