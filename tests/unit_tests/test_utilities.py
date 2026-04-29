@@ -26,6 +26,13 @@ class TestModel(torch.nn.Module):
             self.layers[-1].weight.shared_embedding = True
 
 
+def clear_nvte_env_vars():
+    """Clear NVTE env vars set by conftest set_env fixture."""
+    os.environ.pop('NVTE_FLASH_ATTN', None)
+    os.environ.pop('NVTE_FUSED_ATTN', None)
+    os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
+
 class Utils:
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
