@@ -762,7 +762,6 @@ def forward_backward_no_pipelining(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
-
     return forward_data_store
 
 

@@ -18,6 +18,9 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import (
+    HAVE_DEEP_EP_V2,
+    deepep_v2_combine,
+    deepep_v2_dispatch,
     fused_combine,
     fused_dispatch,
     hybrid_ep_combine,
@@ -48,6 +51,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 """
 
 logger = logging.getLogger(__name__)
+
+try:
+    import deep_ep as _deep_ep
+
+    DEEPEP_TOPK_IDX_DTYPE = getattr(_deep_ep, 'topk_idx_t', None)
+except ImportError:
+    DEEPEP_TOPK_IDX_DTYPE = None
 
 
 class MoETokenDispatcher:
@@ -1179,12 +1189,22 @@ class _DeepepManager(_DispatchManager):
         # Handle used for combine operation
         self.handle = None
 
-        if fused_dispatch is None:
+        self.use_deepep_v2 = HAVE_DEEP_EP_V2
+        if not self.use_deepep_v2 and fused_dispatch is None:
             raise ImportError(
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        set_deepep_num_sms(config.moe_deepep_num_sms)
+        self.enable_expanded_layout_for_inference = (
+            self.use_deepep_v2
+            and config.bf16
+            and not config.fp8
+            and not config.fp4
+            and not config.moe_router_padding_for_quantization
+        )
+        self.use_expanded_layout = False
+        if not self.use_deepep_v2:
+            set_deepep_num_sms(config.moe_deepep_num_sms)
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
@@ -1197,6 +1217,12 @@ class _DeepepManager(_DispatchManager):
         if self.capacity_factor is not None:
             mask = self.token_probs == 0
             self.token_indices = self.token_indices.masked_fill(mask, -1)
+        if (
+            self.use_deepep_v2
+            and DEEPEP_TOPK_IDX_DTYPE is not None
+            and self.token_indices.dtype != DEEPEP_TOPK_IDX_DTYPE
+        ):
+            self.token_indices = self.token_indices.to(DEEPEP_TOPK_IDX_DTYPE)
 
     def dispatch(
         self,
@@ -1211,17 +1237,39 @@ class _DeepepManager(_DispatchManager):
                     "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
-            fused_dispatch(
-                hidden_states,
-                self.token_indices,
-                self.token_probs,
-                self.num_experts,
-                self.group,
-                async_finish=async_finish,
-                allocate_on_comm_stream=allocate_on_comm_stream,
+        if self.use_deepep_v2:
+            # Reentrant activation checkpointing may run training forwards with grad mode
+            # disabled, so also require the tensors to be outside the autograd graph.
+            self.use_expanded_layout = (
+                self.enable_expanded_layout_for_inference
+                and not torch.is_grad_enabled()
+                and not hidden_states.requires_grad
+                and not self.token_probs.requires_grad
             )
-        )
+            hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+                deepep_v2_dispatch(
+                    hidden_states,
+                    self.token_indices,
+                    self.token_probs,
+                    self.num_experts,
+                    self.group,
+                    async_finish=async_finish,
+                    allocate_on_comm_stream=allocate_on_comm_stream,
+                    use_expanded_layout=self.use_expanded_layout,
+                )
+            )
+        else:
+            hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+                fused_dispatch(
+                    hidden_states,
+                    self.token_indices,
+                    self.token_probs,
+                    self.num_experts,
+                    self.group,
+                    async_finish=async_finish,
+                    allocate_on_comm_stream=allocate_on_comm_stream,
+                )
+            )
         self.handle = handle
         self.tokens_per_expert = num_tokens_per_expert
         self.dispatched_indices = dispatched_indices
@@ -1271,13 +1319,23 @@ class _DeepepManager(_DispatchManager):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
-        hidden_states, _ = fused_combine(
-            hidden_states,
-            self.group,
-            self.handle,
-            async_finish=async_finish,
-            allocate_on_comm_stream=allocate_on_comm_stream,
-        )
+        if self.use_deepep_v2:
+            hidden_states, _ = deepep_v2_combine(
+                hidden_states,
+                self.group,
+                self.handle,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+                use_expanded_layout=self.use_expanded_layout,
+            )
+        else:
+            hidden_states, _ = fused_combine(
+                hidden_states,
+                self.group,
+                self.handle,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
         # Release the handle after combine operation
         self.handle = None
         # Manually release the metadata to avoid memory leak.
@@ -1317,6 +1375,14 @@ class _DeepepManager(_DispatchManager):
         return routing_map, tokens_per_expert
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_expanded_layout:
+            assert self.dispatched_indices is None
+            assert self.dispatched_probs.dim() == 1
+            permuted_probs = self.dispatched_probs
+            if self.router_dtype == "fp64":
+                permuted_probs = permuted_probs.to(torch.float64)
+            return hidden_states, permuted_probs
+
         if is_experimental_enabled() and self.permute_fusion:
             self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs, self.num_local_experts
@@ -1352,6 +1418,9 @@ class _DeepepManager(_DispatchManager):
         return hidden_states, permuted_probs
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_expanded_layout:
+            return hidden_states
+
         hidden_states = unpermute(
             hidden_states,
             self.reversed_mapping_for_combine,

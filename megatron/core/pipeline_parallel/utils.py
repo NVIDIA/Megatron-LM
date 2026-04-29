@@ -91,6 +91,7 @@ def make_viewless(e):
 
 
 def set_ideal_affinity_for_current_gpu():
+    return
     """Set CPU affinity for the current GPU to optimize host-device transfers."""
     import uuid
 
