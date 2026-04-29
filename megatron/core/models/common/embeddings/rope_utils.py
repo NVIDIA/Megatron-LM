@@ -147,6 +147,7 @@ def _apply_rotary_pos_emb_bshd(
 
     # Fallback to original permutation
     # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
+    # The existing MLA code is safe because the dot product is permutation-invariant.
     if mla_rotary_interleaved:
         x1, x2 = torch.chunk(t, 2, dim=-1)
         t = torch.stack((x1, x2), dim=-1).flatten(start_dim=-2)

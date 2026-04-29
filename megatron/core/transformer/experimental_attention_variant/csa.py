@@ -15,7 +15,6 @@ from megatron.core.models.common.embeddings import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -27,7 +26,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_pg_size, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 # ---------------------------------------------------------------------------
@@ -348,9 +347,6 @@ class Compressor(MegatronModule):
         """
         nvtx_range_push("compressor")
 
-        if self.config.sequence_parallel and get_pg_size(self.pg_collection.tp) > 1:
-            x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
-
         sq, b, _ = x.size()
         ratio = self.compress_ratio
 
@@ -500,11 +496,6 @@ class CSAIndexer(MegatronModule):
         """Compute Q, compressed K, and weights before top-k selection."""
         nvtx_range_push("indexer_before_topk")
 
-        # Gather for SP
-        if self.config.sequence_parallel and get_pg_size(self.pg_collection.tp) > 1:
-            x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
-            qr = gather_from_sequence_parallel_region(qr, group=self.pg_collection.tp)
-
         sq, bsz, _ = x.size()
 
         # Q path
@@ -604,8 +595,7 @@ class CompressedSparseAttention(MegatronModule):
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
-        n_local_heads = config.num_attention_heads // get_pg_size(pg_collection.tp)
-        self.n_local_heads = n_local_heads
+        self.n_local_heads = config.num_attention_heads
 
         if softmax_scale is None:
             softmax_scale = config.v_head_dim ** -0.5
@@ -614,7 +604,7 @@ class CompressedSparseAttention(MegatronModule):
         self.force_unfused_dsa = getattr(config, 'force_unfused_dsa', True)
 
         # Learnable attention sink per head
-        self.attn_sink = nn.Parameter(torch.zeros(n_local_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
 
         # Conditionally build Compressor (ratio > 1)
         if self.compress_ratio > 1 and submodules.compressor is not None:

@@ -1291,6 +1291,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 all(ratio in [0, 4, 128] for ratio in self.csa_compress_ratios)
             ), "csa_compress_ratios must be 0, 4, or 128"
+            assert self.tensor_model_parallel_size == 1, (
+                "DSv4 Hybrid Attention only supports TP size 1."
+            )
+            assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2724,10 +2728,12 @@ class MLATransformerConfig(TransformerConfig):
     """Rank of Query tensor's low rank representation."""
 
     kv_lora_rank: int = 512
-    """Rank of Key and Value tensors' low rank representation."""
+    """Rank of Key and Value tensors' low rank representation.
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_head_dim: int = 128
-    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim"""
+    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_pos_emb_head_dim: int = 64
     """Dimension of the position embedding in the QK projection."""

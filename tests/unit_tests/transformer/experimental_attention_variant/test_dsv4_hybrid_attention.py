@@ -150,13 +150,12 @@ class TestDSv4HybridAttentionConstructor:
         assert isinstance(attn, DSv4HybridSelfAttention)
         assert hasattr(attn, 'linear_q_down_proj')
         assert hasattr(attn, 'linear_q_up_proj')
-        assert hasattr(attn, 'linear_kv_up_proj')
+        assert hasattr(attn, 'linear_kv_proj')
         assert hasattr(attn, 'linear_proj')
         assert hasattr(attn, 'linear_o_group_proj')
         assert hasattr(attn, 'core_attention')
         assert hasattr(attn, 'q_layernorm')
         assert hasattr(attn, 'kv_layernorm')
-        assert attn.linear_kv_down_proj is None
 
     def test_q_head_dim_equals_v_head_dim(self):
         """q_head_dim must equal v_head_dim for DSv4 hybrid."""

@@ -188,7 +188,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
         submodules=DSv4HybridSelfAttentionSubmodules(
             linear_q_down_proj=backend.linear(),
             linear_q_up_proj=backend.column_parallel_linear(),
-            linear_kv_up_proj=backend.column_parallel_linear(),
+            linear_kv_proj=backend.column_parallel_linear(),
             core_attention=core_attention,
             linear_proj=backend.row_parallel_linear(),
             q_layernorm=qk_norm,
