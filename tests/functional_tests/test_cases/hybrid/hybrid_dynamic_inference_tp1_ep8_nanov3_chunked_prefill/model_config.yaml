@@ -1,0 +1,67 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+  TRITON_CACHE_AUTOTUNING: 0
+  MAMBA_DETERMINISTIC: 1
+TEST_TYPE: frozen-start
+MODE: inference
+MODEL_ARGS:
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --timing-log-level: 0
+  --load: ${CHECKPOINT_LOAD_PATH}/model/nemotron6/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb/
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --tokenizer-type: TikTokenizer
+  --tiktoken-pattern: v2
+  --distributed-backend: nccl
+  --log-interval: 1
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 8
+  --expert-tensor-parallel-size: 1
+  --use-mcore-models: true
+  --model-provider: mamba
+  --use-checkpoint-args: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --dist-ckpt-strictness: log_unexpected
+  --ckpt-format: torch_dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  --no-load-optim: true
+  --moe-router-score-function: sigmoid
+  --moe-router-enable-expert-bias: true
+  --moe-router-topk-scaling-factor: 2.5
+  --moe-router-dtype: fp32
+  --bf16: true
+  --attention-backend: flash
+  --no-create-attention-mask-in-dataloader: true
+  --num-workers: 8
+  --micro-batch-size: 1
+  --deterministic-mode: true
+  --temperature: 1.0
+  --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 30
+  --max-tokens-to-oom: 3600000
+  --inference-dynamic-batching-max-tokens: 16 # kept small to trigger chunked prefill.
+  --inference-dynamic-batching-max-requests: 16
+  --inference-max-seq-length: 4096
+  --enable-chunked-prefill: true
+  --cuda-graph-scope: full_iteration_inference
+  --cuda-graph-impl: local
+  --inference-dynamic-batching-num-cuda-graphs: -1
+  --output-path: ${INFERENCE_OUTPUT_PATH}
+  --prompts: 'Artificial intelligence has transformed numerous industries over the past decade. From healthcare to finance, manufacturing to education, AI systems are now capable of performing tasks that once required significant human expertise. Machine learning models can diagnose diseases from medical images, detect fraud in financial transactions, optimize supply chains, and personalize educational content for individual students. Large language models in particular have demonstrated remarkable capabilities in understanding and generating human language, enabling applications such as code generation, document summarization, question answering, and creative writing assistance. As these systems continue to improve, researchers and practitioners are working to address challenges around reliability, fairness, and interpretability. The next generation of AI systems will likely be even more capable, but also require careful consideration of their societal implications. In summary, the field of artificial intelligence is'
+  --incoming-requests-per-step: 32
+  --no-record-throughput: true
+  --mamba-inference-conv-states-dtype: fp32
+  --mamba-inference-ssm-states-dtype: fp32
+  --transformer-impl: inference_optimized
+  --inference-moe-token-dispatcher-type: nvls
+  --inference-logging-step-interval: 1
+METRICS:
