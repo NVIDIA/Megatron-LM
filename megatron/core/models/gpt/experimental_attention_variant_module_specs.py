@@ -177,8 +177,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
     core_attention = ModuleSpec(
         module=CompressedSparseAttention,
         submodules=CompressedSparseAttentionSubmodules(
-            compressor=compressor_spec,
-            indexer=indexer_spec,
+            compressor=compressor_spec, indexer=indexer_spec
         ),
     )
 

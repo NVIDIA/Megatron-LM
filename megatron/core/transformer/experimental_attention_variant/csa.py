@@ -9,10 +9,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
-from megatron.core.models.common.embeddings import (
-    RotaryEmbedding,
-    apply_rotary_pos_emb,
-)
+from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
@@ -267,9 +264,7 @@ class Compressor(MegatronModule):
         super().__init__(config=config)
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp']
-            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         self.pg_collection = pg_collection
 
         self.compress_ratio = compress_ratio
@@ -309,10 +304,7 @@ class Compressor(MegatronModule):
 
         # keep to high precision
         _ape = torch.empty(
-            compress_ratio,
-            proj_out_dim,
-            device=torch.cuda.current_device(),
-            dtype=torch.float32
+            compress_ratio, proj_out_dim, device=torch.cuda.current_device(), dtype=torch.float32
         )
         config.init_method(_ape)
         self.ape = nn.Parameter(_ape)
@@ -430,9 +422,7 @@ class CSAIndexer(MegatronModule):
         super().__init__(config=config)
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp']
-            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         self.pg_collection = pg_collection
 
         self.compress_ratio = compress_ratio
@@ -446,7 +436,7 @@ class CSAIndexer(MegatronModule):
         self.index_head_dim = config.dsa_indexer_head_dim
         self.index_topk = config.dsa_indexer_topk
 
-        self.softmax_scale: float = self.index_head_dim ** -0.5
+        self.softmax_scale: float = self.index_head_dim**-0.5
 
         self.rotary_pos_emb = rotary_pos_emb
 
@@ -488,10 +478,7 @@ class CSAIndexer(MegatronModule):
         )
 
     def forward_before_topk(
-        self,
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute Q, compressed K, and weights before top-k selection."""
         nvtx_range_push("indexer_before_topk")
@@ -517,7 +504,7 @@ class CSAIndexer(MegatronModule):
         k = self.compressor(x)  # [sq//ratio, b, index_head_dim]
 
         weights, _ = self.linear_weights_proj(x)  # [sq, b, n_heads]
-        weights = weights * (self.index_n_heads ** -0.5)
+        weights = weights * (self.index_n_heads**-0.5)
 
         nvtx_range_pop("indexer_before_topk")
         return q, k, weights
@@ -585,9 +572,7 @@ class CompressedSparseAttention(MegatronModule):
         super().__init__(config=config)
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp']
-            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         self.pg_collection = pg_collection
 
         self.layer_number = layer_number
@@ -598,7 +583,7 @@ class CompressedSparseAttention(MegatronModule):
         self.n_local_heads = config.num_attention_heads
 
         if softmax_scale is None:
-            softmax_scale = config.v_head_dim ** -0.5
+            softmax_scale = config.v_head_dim**-0.5
         self.softmax_scale = softmax_scale
 
         self.force_unfused_dsa = getattr(config, 'force_unfused_dsa', True)
@@ -662,8 +647,9 @@ class CompressedSparseAttention(MegatronModule):
             output: [sq, b, np * v_head_dim]
         """
         nvtx_range_push("compressed_sparse_attn")
-        assert packed_seq_params is None, \
-            "Packed sequence not supported for CompressedSparseAttention"
+        assert (
+            packed_seq_params is None
+        ), "Packed sequence not supported for CompressedSparseAttention"
 
         sq, b, np, hn = query.size()
 
@@ -698,15 +684,17 @@ class CompressedSparseAttention(MegatronModule):
                     x_det = x.detach()
                     qr_det = qr.detach()
 
-                    causal_mask = torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(
-                        sq, -1
+                    causal_mask = (
+                        torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(sq, -1)
                     )
                     positions = torch.arange(1, sq + 1, device=x.device).unsqueeze(1)
-                    causal_mask = torch.where(
-                        causal_mask >= positions // self.compress_ratio,
-                        float("-inf"),
-                        0.0,
-                    ).unsqueeze(0).expand(b, -1, -1)  # [b, sq, n_compressed]
+                    causal_mask = (
+                        torch.where(
+                            causal_mask >= positions // self.compress_ratio, float("-inf"), 0.0
+                        )
+                        .unsqueeze(0)
+                        .expand(b, -1, -1)
+                    )  # [b, sq, n_compressed]
 
                     if self.training and torch.is_grad_enabled():
                         q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
@@ -719,9 +707,7 @@ class CompressedSparseAttention(MegatronModule):
                         # indexer_softmax_scale; apply it here via the
                         # weights-scaling trick so the effective weights match
                         # the pre-scale-split behaviour.
-                        weights_for_unfused = (
-                            weights_indexer * self.indexer.softmax_scale
-                        )
+                        weights_for_unfused = weights_indexer * self.indexer.softmax_scale
                         topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
                             q_indexer,
                             weights_for_unfused,

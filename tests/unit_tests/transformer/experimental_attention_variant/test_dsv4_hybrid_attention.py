@@ -32,12 +32,15 @@ def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tenso
 def patch_hadamard_if_needed():
     """Patch hadamard_transform in dsa/csa modules if the library is not installed."""
     if not HAVE_HADAMARD:
-        with patch(
-            'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
-            _mock_hadamard_transform,
-        ), patch(
-            'megatron.core.transformer.experimental_attention_variant.csa.rotate_activation',
-            lambda x: x * (x.size(-1) ** -0.5),
+        with (
+            patch(
+                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+                _mock_hadamard_transform,
+            ),
+            patch(
+                'megatron.core.transformer.experimental_attention_variant.csa.rotate_activation',
+                lambda x: x * (x.size(-1) ** -0.5),
+            ),
         ):
             yield
     else:
@@ -47,6 +50,7 @@ def patch_hadamard_if_needed():
 # ---------------------------------------------------------------------------
 # Config / spec helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_config(
     num_layers=4,
@@ -214,9 +218,7 @@ class TestDSv4HybridAttentionForwardBackward:
         model_parallel_cuda_manual_seed(_SEED)
 
         cls = request.cls
-        cls.config = _make_config(
-            dsa_indexer_loss_coeff=1.0,
-        )
+        cls.config = _make_config(dsa_indexer_loss_coeff=1.0)
         cls.pg = ProcessGroupCollection.use_mpu_process_groups()
 
         yield
@@ -231,7 +233,9 @@ class TestDSv4HybridAttentionForwardBackward:
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
-        attn = _build_attention(self.config, layer_number=layer_number, pg_collection=self.pg).cuda()
+        attn = _build_attention(
+            self.config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
 
         hidden = torch.randn(
             seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
@@ -252,12 +256,16 @@ class TestDSv4HybridAttentionForwardBackward:
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
-        attn = _build_attention(self.config, layer_number=layer_number, pg_collection=self.pg).cuda()
+        attn = _build_attention(
+            self.config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
         attn.train()
 
-        hidden = torch.randn(
-            seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
-        ).cuda().requires_grad_(True)
+        hidden = (
+            torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16)
+            .cuda()
+            .requires_grad_(True)
+        )
 
         output, bias = attn(hidden_states=hidden, attention_mask=None)
         loss = output.sum()

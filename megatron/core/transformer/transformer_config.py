@@ -264,7 +264,9 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = None
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
+        None
+    )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
     ####################
@@ -1288,12 +1290,12 @@ class TransformerConfig(ModelParallelConfig):
                 f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must equal "
                 f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
             )
-            assert (
-                all(ratio in [0, 4, 128] for ratio in self.csa_compress_ratios)
+            assert all(
+                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
             ), "csa_compress_ratios must be 0, 4, or 128"
-            assert self.tensor_model_parallel_size == 1, (
-                "DSv4 Hybrid Attention only supports TP size 1."
-            )
+            assert (
+                self.tensor_model_parallel_size == 1
+            ), "DSv4 Hybrid Attention only supports TP size 1."
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
 
         if self.fp8:
@@ -2804,7 +2806,7 @@ class MLATransformerConfig(TransformerConfig):
                 logger,
                 logging.WARNING,
                 f"DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
-                f"v_head_dim and qk_pos_emb_head_dim"
+                f"v_head_dim and qk_pos_emb_head_dim",
             )
             derived = self.v_head_dim - self.qk_pos_emb_head_dim
             self.qk_head_dim = derived

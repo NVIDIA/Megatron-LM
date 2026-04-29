@@ -40,12 +40,15 @@ def mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor
 def patch_hadamard_if_needed():
     """Automatically patch hadamard_transform in both dsa and csa modules if not installed."""
     if not HAVE_HADAMARD:
-        with patch(
-            'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
-            mock_hadamard_transform,
-        ), patch(
-            'megatron.core.transformer.experimental_attention_variant.csa.rotate_activation',
-            lambda x: x * (x.size(-1) ** -0.5),
+        with (
+            patch(
+                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+                mock_hadamard_transform,
+            ),
+            patch(
+                'megatron.core.transformer.experimental_attention_variant.csa.rotate_activation',
+                lambda x: x * (x.size(-1) ** -0.5),
+            ),
         ):
             yield
     else:
@@ -150,7 +153,9 @@ class TestUnfusedCompressedSparseAttn:
         topk_indices = torch.randint(0, n_kv, (b, sq, topk), dtype=torch.int32).cuda()
         softmax_scale = hn**-0.5
 
-        output = unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, softmax_scale)
+        output = unfused_compressed_sparse_attn(
+            query, kv_full, attn_sink, topk_indices, softmax_scale
+        )
 
         assert output.shape == (sq, b, np_ * hn)
         assert output.dtype == query.dtype
@@ -170,7 +175,9 @@ class TestUnfusedCompressedSparseAttn:
         topk_indices[:, :, 0] = 0
         softmax_scale = hn**-0.5
 
-        output = unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, softmax_scale)
+        output = unfused_compressed_sparse_attn(
+            query, kv_full, attn_sink, topk_indices, softmax_scale
+        )
         assert not torch.isnan(output).any(), "Output should not contain NaN"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -187,7 +194,9 @@ class TestUnfusedCompressedSparseAttn:
         topk_indices = torch.randint(0, n_kv, (b, sq, topk), dtype=torch.int32).cuda()
         softmax_scale = hn**-0.5
 
-        output = unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, softmax_scale)
+        output = unfused_compressed_sparse_attn(
+            query, kv_full, attn_sink, topk_indices, softmax_scale
+        )
         loss = output.sum()
         loss.backward()
 
@@ -271,10 +280,7 @@ def _make_csa_indexer_submodules():
     return CSAIndexerSubmodules(
         linear_wq_b=ModuleSpec(module=TELinear),
         linear_weights_proj=ModuleSpec(module=TELinear),
-        compressor=ModuleSpec(
-            module=Compressor,
-            submodules=_make_compressor_submodules(),
-        ),
+        compressor=ModuleSpec(module=Compressor, submodules=_make_compressor_submodules()),
     )
 
 
@@ -283,14 +289,8 @@ def _make_csa_submodules():
     from megatron.core.transformer.spec_utils import ModuleSpec
 
     return CompressedSparseAttentionSubmodules(
-        compressor=ModuleSpec(
-            module=Compressor,
-            submodules=_make_compressor_submodules(),
-        ),
-        indexer=ModuleSpec(
-            module=CSAIndexer,
-            submodules=_make_csa_indexer_submodules(),
-        ),
+        compressor=ModuleSpec(module=Compressor, submodules=_make_compressor_submodules()),
+        indexer=ModuleSpec(module=CSAIndexer, submodules=_make_csa_indexer_submodules()),
     )
 
 
@@ -312,12 +312,8 @@ class TestCompressor:
         model_parallel_cuda_manual_seed(123)
 
         cls = request.cls
-        cls.config = _make_mla_config(
-            csa_compress_ratios=[4, 128, 4, 128],
-        )
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
+        cls.config = _make_mla_config(csa_compress_ratios=[4, 128, 4, 128],)
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
         from megatron.core.models.common.embeddings import RotaryEmbedding
 
@@ -373,9 +369,7 @@ class TestCompressor:
             pg_collection=self.pg_collection,
         ).cuda()
 
-        x = torch.randn(
-            short_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
-        ).cuda()
+        x = torch.randn(short_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
         output = compressor(x)
         assert output is None
 
@@ -396,9 +390,11 @@ class TestCompressor:
             pg_collection=self.pg_collection,
         ).cuda()
 
-        x = torch.randn(
-            seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16
-        ).cuda().requires_grad_(True)
+        x = (
+            torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16)
+            .cuda()
+            .requires_grad_(True)
+        )
         output = compressor(x)
         loss = output.sum()
         loss.backward()
@@ -428,13 +424,8 @@ class TestCSAIndexer:
 
         cls = request.cls
         cls.compress_ratio = 4
-        cls.config = _make_mla_config(
-            csa_compress_ratios=[4, 4, 4, 4],
-            dsa_indexer_topk=8,
-        )
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
+        cls.config = _make_mla_config(csa_compress_ratios=[4, 4, 4, 4], dsa_indexer_topk=8)
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
         from megatron.core.models.common.embeddings import RotaryEmbedding
 
@@ -493,7 +484,12 @@ class TestCSAIndexer:
 
         q, k, weights = self.indexer.forward_before_topk(x, qr)
 
-        assert q.shape == (seqlen, batch_size, self.config.dsa_indexer_n_heads, self.config.dsa_indexer_head_dim)
+        assert q.shape == (
+            seqlen,
+            batch_size,
+            self.config.dsa_indexer_n_heads,
+            self.config.dsa_indexer_head_dim
+        )
         n_compressed = seqlen // self.compress_ratio
         assert k.shape == (n_compressed, batch_size, self.config.dsa_indexer_head_dim)
         assert weights.shape == (seqlen, batch_size, self.config.dsa_indexer_n_heads)
@@ -510,11 +506,11 @@ class TestCSAIndexer:
         n_compressed = seqlen // self.compress_ratio
         causal_mask = torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(seqlen, -1)
         positions = torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1)
-        causal_mask = torch.where(
-            causal_mask >= positions // self.compress_ratio,
-            float("-inf"),
-            0.0,
-        ).unsqueeze(0).expand(batch_size, -1, -1)
+        causal_mask = (
+            torch.where(causal_mask >= positions // self.compress_ratio, float("-inf"), 0.0)
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1)
+        )
 
         index_scores, topk_indices = self.indexer(x, qr, mask=causal_mask)
 
@@ -540,13 +536,8 @@ class TestCompressedSparseAttentionRatio1:
         model_parallel_cuda_manual_seed(123)
 
         cls = request.cls
-        cls.config = _make_mla_config(
-            csa_compress_ratios=[0, 0, 0, 0],
-            csa_window_size=8,
-        )
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
+        cls.config = _make_mla_config(csa_compress_ratios=[0, 0, 0, 0], csa_window_size=8)
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
         from megatron.core.models.common.embeddings import RotaryEmbedding
 
@@ -591,9 +582,7 @@ class TestCompressedSparseAttentionRatio1:
         x = torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
         qr = torch.randn(seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
 
-        output = self.csa(
-            query=query, key=key, value=value, attention_mask=None, x=x, qr=qr,
-        )
+        output = self.csa(query=query, key=key, value=value, attention_mask=None, x=x, qr=qr)
 
         assert output.shape == (seq_len, batch_size, np_ * hn)
         assert output.dtype == torch.bfloat16
@@ -609,15 +598,19 @@ class TestCompressedSparseAttentionRatio1:
         self.csa.train()
         self.csa.cuda()
 
-        query = torch.randn(seq_len, batch_size, np_, hn, dtype=torch.float32).cuda().requires_grad_(True)
-        key = torch.randn(seq_len, batch_size, 1, hn, dtype=torch.float32).cuda().requires_grad_(True)
+        query = (
+            torch.randn(seq_len, batch_size, np_, hn, dtype=torch.float32)
+            .cuda()
+            .requires_grad_(True)
+        )
+        key = (
+            torch.randn(seq_len, batch_size, 1, hn, dtype=torch.float32).cuda().requires_grad_(True)
+        )
         value = key.clone().detach().requires_grad_(True)
         x = torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
         qr = torch.randn(seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
 
-        output = self.csa(
-            query=query, key=key, value=value, attention_mask=None, x=x, qr=qr,
-        )
+        output = self.csa(query=query, key=key, value=value, attention_mask=None, x=x, qr=qr)
         loss = output.sum()
         loss.backward()
 
@@ -644,9 +637,7 @@ class TestCompressedSparseAttentionCompressed:
             dsa_indexer_topk=8,
             dsa_indexer_loss_coeff=1.0,
         )
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
         from megatron.core.models.common.embeddings import RotaryEmbedding
 
@@ -737,8 +728,14 @@ class TestCompressedSparseAttentionCompressed:
         ).cuda()
         csa.train()
 
-        query = torch.randn(seq_len, batch_size, np_, hn, dtype=torch.float32).cuda().requires_grad_(True)
-        key = torch.randn(seq_len, batch_size, 1, hn, dtype=torch.float32).cuda().requires_grad_(True)
+        query = (
+            torch.randn(seq_len, batch_size, np_, hn, dtype=torch.float32)
+            .cuda()
+            .requires_grad_(True)
+        )
+        key = (
+            torch.randn(seq_len, batch_size, 1, hn, dtype=torch.float32).cuda().requires_grad_(True)
+        )
         value = key.clone().detach().requires_grad_(True)
         x = torch.randn(seq_len, batch_size, self.config.hidden_size, dtype=torch.bfloat16).cuda()
         qr = torch.randn(seq_len, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16).cuda()
@@ -805,13 +802,9 @@ class TestCompressedSparseAttentionDenseMode:
 
         cls = request.cls
         cls.config = _make_mla_config(
-            csa_compress_ratios=[4, 128, 4, 128],
-            csa_window_size=8,
-            csa_dense_mode=True,
+            csa_compress_ratios=[4, 128, 4, 128], csa_window_size=8, csa_dense_mode=True
         )
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp']
-        )
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
         from megatron.core.models.common.embeddings import RotaryEmbedding
 

@@ -107,8 +107,12 @@ def _mla_rope_fwd_inplace_kernel(
 
     cos_left = tl.load(COS + token_idx * stride_cos_seq + tl.arange(0, emb_dim // 2))
     sin_left = tl.load(SIN + token_idx * stride_sin_seq + tl.arange(0, emb_dim // 2))
-    cos_right = tl.load(COS + token_idx * stride_cos_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2))
-    sin_right = tl.load(SIN + token_idx * stride_sin_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+    cos_right = tl.load(
+        COS + token_idx * stride_cos_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    sin_right = tl.load(
+        SIN + token_idx * stride_sin_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
     if INVERSE:
         sin_left = -sin_left
         sin_right = -sin_right
@@ -189,8 +193,12 @@ def _mla_rope_bwd_inplace_kernel(
 
     cos_left = tl.load(COS + token_idx * stride_cos_seq + tl.arange(0, emb_dim // 2))
     sin_left = tl.load(SIN + token_idx * stride_sin_seq + tl.arange(0, emb_dim // 2))
-    cos_right = tl.load(COS + token_idx * stride_cos_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2))
-    sin_right = tl.load(SIN + token_idx * stride_sin_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+    cos_right = tl.load(
+        COS + token_idx * stride_cos_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
+    sin_right = tl.load(
+        SIN + token_idx * stride_sin_seq + emb_dim // 2 + tl.arange(0, emb_dim // 2)
+    )
     if INVERSE:
         sin_left = -sin_left
         sin_right = -sin_right

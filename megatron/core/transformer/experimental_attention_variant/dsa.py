@@ -210,7 +210,9 @@ def compute_dsa_indexer_loss(
         causal_mask = causal_mask_override.to(dtype=torch.float32)  # [b, sq, sk]
     else:
         causal_mask = torch.triu(
-            torch.full((sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device),
+            torch.full(
+                (sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device
+            ),
             diagonal=1,
         )
     # index_mask [b, sq, sk]
@@ -465,9 +467,7 @@ def bwd_fused_indexer_loss_naive(
     # Free attention_scores immediately
     del attention_scores
 
-    index_scores_softmax = torch.nn.functional.softmax(
-        index_scores, dim=-1, dtype=torch.float32
-    )
+    index_scores_softmax = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
     # Free index_scores - no longer needed after softmax
     del index_scores
 

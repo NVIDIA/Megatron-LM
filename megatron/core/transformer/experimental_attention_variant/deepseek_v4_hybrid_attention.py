@@ -24,10 +24,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import (
-    get_pg_size,
-    is_te_min_version,
-)
+from megatron.core.utils import get_pg_size, is_te_min_version
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
@@ -36,18 +33,10 @@ except Exception:
 
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import (
-        TELinear,
-        set_save_original_input,
-    )
+    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input,
     from megatron.core.post_training.modelopt.layers import Linear
 else:
-    (
-        TEColumnParallelLinear,
-        TELinear,
-        Linear,
-        set_save_original_input,
-    ) = (None, None, None, None)
+    (TEColumnParallelLinear, TELinear, Linear, set_save_original_input) = (None, None, None, None)
 
 
 @torch.compile
@@ -58,8 +47,7 @@ def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
 
 @dataclass
 class DSv4HybridSelfAttentionSubmodules:
-    """Submodules for the DSv4HybridAttention layer.
-    """
+    """Submodules for the DSv4HybridAttention layer."""
 
     q_layernorm: LayerNormBuilder
     kv_layernorm: LayerNormBuilder
@@ -72,8 +60,7 @@ class DSv4HybridSelfAttentionSubmodules:
 
 
 class DSv4HybridAttention(Attention):
-    """DeepSeek-v4 Hybrid Attention layer.
-    """
+    """DeepSeek-v4 Hybrid Attention layer."""
 
     def __init__(
         self,
@@ -177,9 +164,9 @@ class DSv4HybridAttention(Attention):
 
         # Output.
         self.o_local_groups = self.config.o_groups
-        assert self.query_projection_size % self.config.o_groups == 0, (
-            "num_attention_heads * v_head_dim must be divisible by o_groups"
-        )
+        assert (
+            self.query_projection_size % self.config.o_groups == 0
+        ), "num_attention_heads * v_head_dim must be divisible by o_groups"
         group_proj_in_size = self.query_projection_size // self.config.o_groups
         group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
 
@@ -244,16 +231,21 @@ class DSv4HybridAttention(Attention):
         inference_params=None,
     ):
         """Forward pass for DeepSeek-v4 Hybrid Attention"""
-        assert rotary_pos_emb is None, \
-            "Rotary position embeddings should not be passed into DSv4HybridAttention."
-        assert attention_bias is None, \
-            "Attention bias should not be passed into DSv4HybridAttention."
-        assert rotary_pos_cos is None and rotary_pos_sin is None, \
-            "DSv4HybridAttention does not support Flash Decoding"
-        assert not rotary_pos_cos_sin, \
-            "Flash-infer rope has not been tested with DSv4HybridAttention."
-        assert inference_context is None and inference_params is None, \
-            "Inference is not supported for DSv4HybridAttention."
+        assert (
+            rotary_pos_emb is None
+        ), "Rotary position embeddings should not be passed into DSv4HybridAttention."
+        assert (
+            attention_bias is None
+        ), "Attention bias should not be passed into DSv4HybridAttention."
+        assert (
+            rotary_pos_cos is None and rotary_pos_sin is None
+        ), "DSv4HybridAttention does not support Flash Decoding"
+        assert (
+            not rotary_pos_cos_sin
+        ), "Flash-infer rope has not been tested with DSv4HybridAttention."
+        assert (
+            inference_context is None and inference_params is None
+        ), "Inference is not supported for DSv4HybridAttention."
 
         # =====================
         # Query, Key, and Value
@@ -334,9 +326,7 @@ class DSv4HybridAttention(Attention):
                     rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq
                 )
                 rotary_pos_emb = None
-                assert (
-                    inference_context is None
-                ), "Inference with MLA RoPE fusion is not supported"
+                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
                 assert (
                     fused_mla_rope_inplace is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
@@ -507,8 +497,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             ), "dynamic_context_parallel is not supported with MLA yet and is planned for future. \
             Please disable dynamic_context_parallel."
 
-        assert inference_context is None and inference_params is None, \
-            "Inference is not supported for DSv4HybridSelfAttention."
+        assert (
+            inference_context is None and inference_params is None
+        ), "Inference is not supported for DSv4HybridSelfAttention."
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -658,9 +649,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
                 pos_dim = self.config.qk_pos_emb_head_dim
-                kv_no_pe, k_pos_emb = torch.split(
-                    kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1
-                )
+                kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
 
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
