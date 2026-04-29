@@ -286,7 +286,7 @@ def _allreduce_router_grads(model: List[torch.nn.Module], config: TransformerCon
         grads_dict: Dict[str, List[torch.Tensor]] = {}
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
-                if param.requires_grad and getattr(param, 'pipeline_parallel', False):
+                if param.requires_grad and getattr(param, 'flextron_router_pp_sync', False):
                     grad = param.main_grad
                     if name in grads_dict:
                         # Add all the virtual PP rank's gradients to

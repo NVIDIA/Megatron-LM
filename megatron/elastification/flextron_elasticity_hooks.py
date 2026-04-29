@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.utils import split_tensor_along_last_dim
-
+from megatron.core.transformer.moe.moe_utils import group_limited_topk, get_capacity
 
 class FlextronMambaElasticityManager:
     """

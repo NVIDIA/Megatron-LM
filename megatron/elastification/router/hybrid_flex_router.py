@@ -42,7 +42,7 @@ except ImportError:
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 
 
-# Router implemation for pre-gating router.
+# Router implementation for pre-gating router.
 # Use router to determine #heads, MLP sizes, and layers to skip (Router_v2)
 # Only takes the budget as input
 class FlextronRouter(MegatronModule):
@@ -112,7 +112,7 @@ class FlextronRouter(MegatronModule):
         for param in self.parameters():
             if param.requires_grad:
                 # Mark parameter for pipeline parallel synchronization
-                setattr(param, 'pipeline_parallel', True)
+                setattr(param, 'flextron_router_pp_sync', True)
 
     def _dp_gumbel_softmax(self, logits, tau=1.0, hard=False, curr_iteration=0):
         """DP-aware Gumbel softmax that uses different random seeds per DP rank and iteration"""
