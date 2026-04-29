@@ -132,6 +132,7 @@ Apply this logic based on what the PR changes:
 | CI/tooling only (`.github/`, `tools/`, `Makefile`) | _(none)_ |
 | Test files only (`tests/`) — existing tests, no new golden values | `Run tests` |
 | **New test cases added** (no golden values exist yet) | `Run functional tests` |
+| **Re-enabling a disabled test** (scope `-broken` → active) | `Run functional tests` |
 | Non-numerical library code (logging, error handling, CLI flags, refactors) | `Run tests` |
 | Could affect training numerics (model arch, attention, optimizer, distributed, MoE routing) | `Run functional tests` |
 | Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` + `container::lts` |
@@ -183,7 +184,7 @@ Apply this logic based on what the PR changes:
 
 Use `tools/trigger_internal_ci.py` to push the current branch to the internal
 GitLab remote and trigger a pipeline — without touching the GitLab UI.
-Full setup and usage details: `tools/trigger_internal_ci.md`.
+Full setup and usage details: @tools/trigger_internal_ci.md.
 
 **Prerequisites** (one-time):
 
