@@ -316,14 +316,14 @@ class TestStreamCkptDequant:
             # Plain BF16 must round-trip exactly.
             torch.testing.assert_close(loaded['w'], src)
 
-    def test_default_is_off(self):
-        """The default for stream_ckpt_dequant must be False (old behaviour preserved)."""
+    def test_default_is_on(self):
+        """The default for stream_ckpt_dequant must be True (streaming path is now default)."""
         strat = TorchDistLoadShardedStrategy()
         assert (
-            strat.stream_ckpt_dequant is False
-        ), "Default must be False so users opt-in explicitly."
+            strat.stream_ckpt_dequant is True
+        ), "Default must be True; users opt out via --no-stream-ckpt-dequant."
         planner = MCoreLoadPlanner()
-        assert planner.stream_ckpt_dequant is False
+        assert planner.stream_ckpt_dequant is True
 
     def test_planner_state_cleanup_after_load(self, tmp_path_dist_ckpt):
         """``_intermediate_read_items`` must be empty after a streaming load completes.
