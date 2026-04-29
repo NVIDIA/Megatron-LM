@@ -1,11 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import asyncio
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 
 from megatron.core.inference.engines.dynamic_step import (
     AsyncStepOutput,
+    DynamicAsyncPipeline,
     DynamicStepContextSnapshot,
     DynamicStepGpuLaunch,
     DynamicStepId,
@@ -17,6 +20,70 @@ from megatron.core.inference.engines.dynamic_step import (
     StepRetirementResult,
     assert_snapshot_gpu_view_bound,
 )
+
+
+class FakeRetirementService:
+    def __init__(self):
+        self.shutdown_drains = 0
+        self.suspend_drains = 0
+        self.reused_request_ids = []
+
+    def drain_for_shutdown(self):
+        self.shutdown_drains += 1
+
+    def drain_for_suspend(self):
+        self.suspend_drains += 1
+
+    def drain_for_request_reuse(self, request_id):
+        self.reused_request_ids.append(request_id)
+
+
+class FakePipelineEngine:
+    def __init__(self):
+        self.context = SimpleNamespace(snapshot_pool=object())
+        self.forward_calls = []
+        self.bookkeep_calls = []
+
+    async def async_forward(self):
+        step_id = len(self.forward_calls)
+        self.forward_calls.append(step_id)
+        return ({"step": step_id}, {"dynamic_step_id": step_id}, float(step_id))
+
+    async def async_bookkeep(self, step_result, context_state, step_time):
+        self.bookkeep_calls.append((step_result, context_state, step_time))
+        return {"retired_step": context_state["dynamic_step_id"]}
+
+
+def test_dynamic_async_pipeline_queue_depth_one_retires_immediately():
+    engine = FakePipelineEngine()
+    retirement_service = FakeRetirementService()
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=retirement_service, queue_depth=1
+    )
+
+    result = asyncio.run(pipeline.step())
+
+    assert result == {"retired_step": 0}
+    assert engine.forward_calls == [0]
+    assert [call[1]["dynamic_step_id"] for call in engine.bookkeep_calls] == [0]
+    assert pipeline.pending_launch_count == 0
+    assert pipeline.snapshot_pool is engine.context.snapshot_pool
+
+
+def test_dynamic_async_pipeline_drains_before_shutdown_hooks():
+    engine = FakePipelineEngine()
+    retirement_service = FakeRetirementService()
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=retirement_service, queue_depth=1
+    )
+
+    pipeline.drain_for_shutdown()
+    pipeline.drain_for_suspend()
+    pipeline.drain_for_request_reuse(7)
+
+    assert retirement_service.shutdown_drains == 1
+    assert retirement_service.suspend_drains == 1
+    assert retirement_service.reused_request_ids == [7]
 
 
 def test_dynamic_step_records_are_frozen_and_copy_mutable_inputs():

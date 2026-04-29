@@ -30,7 +30,11 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.dynamic_step import DynamicStepId, SnapshotSlotHandle
+from megatron.core.inference.engines.dynamic_step import (
+    DynamicAsyncPipeline,
+    DynamicStepId,
+    SnapshotSlotHandle,
+)
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -340,6 +344,11 @@ class DynamicInferenceEngine(AbstractEngine):
             queue_depth=getattr(self, "async_overlap_queue_depth", 1)
         )
         self.step_retirement_service = StepRetirementService(self)
+        self.async_pipeline = DynamicAsyncPipeline(
+            engine=self,
+            retirement_service=self.step_retirement_service,
+            queue_depth=self.async_overlap_queue_depth,
+        )
 
         # Coordinator state.
         self.use_coordinator = False
@@ -784,7 +793,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
-        self.step_retirement_service.drain_for_suspend()
+        self.async_pipeline.drain_for_suspend()
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -957,7 +966,7 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
-        self.step_retirement_service.drain_for_request_reuse(request_id)
+        self.async_pipeline.drain_for_request_reuse(request_id)
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
@@ -1856,17 +1865,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
-        if self.enable_async_overlap_architecture and self.async_overlap_queue_depth == 1:
-            # TODO(async-overlap commit 23): route queue-depth-one through the
-            # new DynamicAsyncPipeline once its phase contract exists. Until
-            # then this rollout flag is configuration plumbing only.
-            reasons = self.async_overlap_debug_counters.fallback_or_queue_depth_one_reasons
-            reasons["queue_depth_one_debug_mode_pending_pipeline"] = (
-                reasons.get("queue_depth_one_debug_mode_pending_pipeline", 0) + 1
-            )
         try:
-            last_step_data = await self.async_forward()
-            ret = await self.async_bookkeep(*last_step_data)
+            if self.enable_async_overlap_architecture:
+                ret = await self.async_pipeline.step()
+            else:
+                last_step_data = await self.async_forward()
+                ret = await self.async_bookkeep(*last_step_data)
         except BaseException:
             self.context.rollback_step_journal(
                 self._current_dynamic_step_id, reason="async_step_exception"
@@ -2089,7 +2093,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
-        self.step_retirement_service.drain_for_shutdown()
+        self.async_pipeline.drain_for_shutdown()
 
         # Cleanup the request futures.
         for entry in self.requests.values():

@@ -145,6 +145,8 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
+    enable_async_overlap_architecture: bool = False
+    async_overlap_queue_depth: int = 1
 
     def __post_init__(self):
 
@@ -273,6 +275,8 @@ class TestDynamicInferenceEngine:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                enable_async_overlap_architecture=test_config.enable_async_overlap_architecture,
+                async_overlap_queue_depth=test_config.async_overlap_queue_depth,
             ),
         )
 
@@ -649,6 +653,45 @@ class TestDynamicInferenceEngine:
                 f"result ({request.generated_tokens}) != "
                 f"expected ({expected_generated_tokens})."
             )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_overlap_queue_depth_one_simple(self) -> None:
+        """Queue-depth-one pipeline matches the serial GPT output path."""
+        env = self._run_test(
+            num_tokens_to_generate=16,
+            model_provider="gpt",
+            num_cuda_graphs=None,
+            cuda_graph_scope=[],
+            force_build_cuda_graphs=True,
+            context_max_requests=128,
+            enable_async_overlap_architecture=True,
+            async_overlap_queue_depth=1,
+        )
+
+        assert env.engine.async_pipeline.pending_launch_count == 0
+        assert env.engine.step_retirement_service.pending_count == 0
+        assert env.engine.async_overlap_debug_counters.queue_depth == 1
+        assert env.requests[0].generated_tokens == [
+            69,
+            85,
+            55,
+            74,
+            56,
+            89,
+            64,
+            59,
+            55,
+            67,
+            15,
+            58,
+            6,
+            37,
+            54,
+            47,
+        ]
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

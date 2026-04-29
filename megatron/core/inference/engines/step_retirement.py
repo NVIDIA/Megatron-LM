@@ -48,8 +48,9 @@ except ImportError:
 class StepRetirementService:
     """Retire dynamic steps in order.
 
-    Commit 6 runs this synchronously with queue depth one. Later commits can enqueue
-    outputs and have this service drain them independently while preserving step order.
+    Queue depth one submits and drains synchronously through DynamicAsyncPipeline.
+    Later queue-depth commits can enqueue outputs here and drain them independently
+    while preserving step order.
     """
 
     def __init__(self, engine: "DynamicInferenceEngine"):

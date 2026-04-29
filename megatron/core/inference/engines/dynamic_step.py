@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Optional, Tuple
+from typing import Any, Deque, Optional, Tuple
 
 
 def _as_tuple(value: Optional[Sequence[Any]]) -> Tuple[Any, ...]:
@@ -48,6 +49,65 @@ class DynamicStepId:
     def __post_init__(self) -> None:
         if self.value < 0:
             raise ValueError(f"DynamicStepId must be >= 0, got {self.value}")
+
+
+class DynamicAsyncPipeline:
+    """Queue-depth-limited dynamic-step launch and retirement pipeline."""
+
+    def __init__(self, *, engine: Any, retirement_service: Any, queue_depth: int):
+        if queue_depth <= 0:
+            raise ValueError(f"queue_depth must be > 0, got {queue_depth}")
+        self.engine = engine
+        self.retirement_service = retirement_service
+        self.queue_depth = int(queue_depth)
+        self.snapshot_pool = engine.context.snapshot_pool
+        self.in_flight_launches: Deque[Tuple[Any, Any, float]] = deque()
+
+    @property
+    def pending_launch_count(self) -> int:
+        """Number of launched steps awaiting ordered retirement."""
+        return len(self.in_flight_launches)
+
+    async def step(self):
+        """Run one queue-depth-limited pipeline step."""
+        if self.pending_launch_count >= self.queue_depth:
+            await self.drain_next()
+        self.in_flight_launches.append(await self.engine.async_forward())
+        return await self.drain_next()
+
+    async def drain_next(self):
+        """Retire the oldest launched step, if one is pending."""
+        if not self.in_flight_launches:
+            return None
+        step_result, context_state, step_time = self.in_flight_launches.popleft()
+        return await self.engine.async_bookkeep(step_result, context_state, step_time)
+
+    async def drain_all(self):
+        """Retire every pending launched step."""
+        result = None
+        while self.in_flight_launches:
+            result = await self.drain_next()
+        return result
+
+    def drain_for_shutdown(self) -> None:
+        """Validate no launched step is left unretired before shutdown."""
+        if self.in_flight_launches:
+            raise RuntimeError("Cannot synchronously shutdown with unretired launched steps")
+        self.retirement_service.drain_for_shutdown()
+
+    def drain_for_suspend(self) -> None:
+        """Validate no launched step is left unretired before suspend."""
+        if self.in_flight_launches:
+            raise RuntimeError("Cannot synchronously suspend with unretired launched steps")
+        self.retirement_service.drain_for_suspend()
+
+    def drain_for_request_reuse(self, request_id: int) -> None:
+        """Validate no launched step can still reference a reused request ID."""
+        if self.in_flight_launches:
+            raise RuntimeError(
+                f"Cannot reuse request {request_id} with unretired launched steps"
+            )
+        self.retirement_service.drain_for_request_reuse(request_id)
 
 
 @dataclass(frozen=True, kw_only=True)
