@@ -46,6 +46,21 @@ from megatron.core.models.hybrid.layer_configs import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+# YARN scaling parameters that HybridModel reads via getattr when
+# position_embedding_type == "yarn" (see hybrid_model.py around the
+# YarnRotaryEmbedding construction). They are not currently
+# TransformerConfig dataclass fields; compile() applies them via setattr to
+# match the existing legacy-path pattern.
+_YARN_FIELDS = (
+    "yarn_rotary_scaling_factor",
+    "yarn_original_max_position_embeddings",
+    "yarn_beta_fast",
+    "yarn_beta_slow",
+    "yarn_mscale",
+    "yarn_mscale_all_dim",
+    "yarn_correction_range_round_to_int",
+)
+
 
 @dataclass
 class CompiledRecipe:
@@ -280,6 +295,18 @@ class HybridModelConfig:
             stack_kwargs.update(loss.extra)
         stack_kwargs = {k: v for k, v in stack_kwargs.items() if v is not None}
         stack_config = TransformerConfig(**stack_kwargs)
+
+        # YARN parameters are not TransformerConfig dataclass fields today
+        # (see model_builder.py:196-201 and tests/.../test_hybrid_model.py for
+        # the existing setattr pattern). HybridModel.__init__ reads them via
+        # getattr when position_embedding_type == "yarn"; mirror that
+        # convention here so recipe-built models support YARN without forcing
+        # the recipe author to monkey-patch the config.
+        if embedding.position_embedding_type == "yarn":
+            for name in _YARN_FIELDS:
+                value = getattr(embedding, name)
+                if value is not None:
+                    setattr(stack_config, name, value)
 
         return CompiledRecipe(
             config=stack_config,
