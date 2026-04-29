@@ -39,6 +39,7 @@ from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_ledgers import DynamicRequestLedgers
+from .gpu_input_preparer import GpuInputPreparer
 from .gpu_input_state import GpuSampledTokenState
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
@@ -1155,6 +1156,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_speculative_tokens=self.num_speculative_tokens,
             device=torch.cuda.current_device(),
             stream=self.gpu_bookkeeping_stream,
+        )
+        self.gpu_input_preparer = GpuInputPreparer(
+            stream=self.gpu_bookkeeping_stream,
+            debug_enabled=self.config.async_overlap_debug_checks,
         )
 
         # Allocate large non-graphed buffers.
@@ -2597,6 +2602,72 @@ class DynamicInferenceContext(BaseInferenceContext):
             sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
             accepted_token_counts_cpu=accepted_token_counts_cpu,
         )
+
+    def build_step_input_plan(
+        self,
+        *,
+        step_id,
+        snapshot_slot_id: int,
+        source_step_id=None,
+    ):
+        """Build a GPU input-preparation plan for the current context state."""
+        from megatron.core.inference.engines.dynamic_step import StepInputPlan
+
+        active_slots = tuple(range(int(self.paused_request_count), int(self.total_request_count)))
+        active_slice = slice(int(self.paused_request_count), int(self.total_request_count))
+        request_ids = tuple(str(int(request_id)) for request_id in self.request_ids[active_slice])
+        prefill_status = self.request_in_prefill_status_tensor[active_slice].tolist()
+        decode_request_slots = tuple(
+            slot for slot, is_prefill in zip(active_slots, prefill_status) if not is_prefill
+        )
+        decode_request_ids = tuple(
+            request_id
+            for request_id, is_prefill in zip(request_ids, prefill_status)
+            if not is_prefill
+        )
+        prefill_request_ids = tuple(
+            request_id
+            for request_id, is_prefill in zip(request_ids, prefill_status)
+            if is_prefill
+        )
+
+        tokens_per_decode_request = self.num_speculative_tokens + 1
+        decode_input_destination_indices = tuple(
+            idx * tokens_per_decode_request for idx in range(len(decode_request_slots))
+        )
+
+        cursor = len(decode_request_slots) * tokens_per_decode_request
+        prefill_prompt_token_ranges = []
+        for slot, is_prefill in zip(active_slots, prefill_status):
+            if not is_prefill:
+                continue
+            query_length = int(self.request_query_lengths[slot])
+            prefill_prompt_token_ranges.append((cursor, cursor + query_length))
+            cursor += query_length
+
+        debug_expected_input_ids = None
+        if self.config.async_overlap_debug_checks:
+            debug_expected_input_ids = self.token_to_input_ids[: self.active_token_count].clone()
+
+        return StepInputPlan(
+            step_id=step_id,
+            snapshot_slot_id=snapshot_slot_id,
+            source_step_id=source_step_id,
+            request_ids=request_ids,
+            decode_request_slots=decode_request_slots,
+            decode_request_ids=decode_request_ids,
+            prefill_request_ids=prefill_request_ids,
+            decode_input_destination_indices=decode_input_destination_indices,
+            prefill_prompt_token_ranges=tuple(prefill_prompt_token_ranges),
+            speculative_width=self.num_speculative_tokens,
+            debug_expected_input_ids=debug_expected_input_ids,
+        )
+
+    def prepare_gpu_inputs(self, snapshot, input_plan, previous_sample_state=None):
+        """Prepare snapshot-bound GPU inputs from a StepInputPlan."""
+        if previous_sample_state is None:
+            previous_sample_state = self.gpu_sampled_token_state
+        return self.gpu_input_preparer.prepare(snapshot, input_plan, previous_sample_state)
 
     def dynamic_step_nvtx_label(self, name: str, step_id: Optional[int] = None) -> str:
         """Return an NVTX range name with the current dynamic step id."""

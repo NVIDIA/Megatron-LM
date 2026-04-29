@@ -56,7 +56,10 @@ def test_empty_step_contract_construction():
 
     assert request_plan.active_request_ids == ()
     assert snapshot_handle.metadata_ready_event is None
+    assert input_plan.decode_request_slots == ()
     assert input_plan.decode_input_destination_indices == ()
+    assert input_plan.prefill_prompt_token_ranges == ()
+    assert input_plan.speculative_width == 0
     assert context_snapshot.request_plan is request_plan
     assert gpu_launch.compute_done_event is None
     assert step_output.output_ready_event is None
@@ -75,6 +78,7 @@ def test_decode_only_step_contract_construction():
         step_id=step_id,
         snapshot_slot_id=0,
         request_ids=request_plan.active_request_ids,
+        decode_request_slots=(0, 1),
         decode_request_ids=request_plan.decode_request_ids,
         decode_input_destination_indices=(0, 1),
     )
@@ -95,6 +99,7 @@ def test_decode_only_step_contract_construction():
     )
 
     assert request_plan.prefill_request_ids == ()
+    assert input_plan.decode_request_slots == (0, 1)
     assert input_plan.decode_input_destination_indices == (0, 1)
     assert reservation.kv_block_ids == (7,)
     assert journal.resources_waiting_on_snapshot == (reservation,)
@@ -112,9 +117,11 @@ def test_mixed_prefill_decode_step_contract_construction():
         step_id=step_id,
         snapshot_slot_id=1,
         request_ids=request_plan.active_request_ids,
+        decode_request_slots=(0,),
         decode_request_ids=request_plan.decode_request_ids,
         prefill_request_ids=request_plan.prefill_request_ids,
         decode_input_destination_indices=(0,),
+        prefill_prompt_token_ranges=((1, 4),),
     )
     context_snapshot = DynamicStepContextSnapshot(
         step_id=step_id,
@@ -134,6 +141,7 @@ def test_mixed_prefill_decode_step_contract_construction():
 
     assert request_plan.decode_request_ids == ("decode-0",)
     assert request_plan.prefill_request_ids == ("prefill-0",)
+    assert input_plan.prefill_prompt_token_ranges == ((1, 4),)
     assert context_snapshot.snapshot_slot_id == 1
     assert gpu_launch.compute_done_event == "compute-done"
 
@@ -192,6 +200,25 @@ def test_speculative_placeholder_step_contract_construction():
     assert request_plan.placeholder_token_counts["spec-0"] == 4
     assert journal.placeholder_token_counts["spec-0"] == 4
     assert output.accepted_token_counts_cpu == (2,)
+
+
+def test_step_input_plan_rejects_mismatched_decode_destinations():
+    with pytest.raises(ValueError, match="same length"):
+        StepInputPlan(
+            step_id=DynamicStepId(5),
+            snapshot_slot_id=0,
+            decode_request_slots=(0, 1),
+            decode_input_destination_indices=(0,),
+        )
+
+
+def test_step_input_plan_rejects_invalid_prefill_ranges():
+    with pytest.raises(ValueError, match="invalid token range"):
+        StepInputPlan(
+            step_id=DynamicStepId(6),
+            snapshot_slot_id=0,
+            prefill_prompt_token_ranges=((3, 2),),
+        )
 
 
 @pytest.mark.parametrize("record_factory", [DynamicStepId])

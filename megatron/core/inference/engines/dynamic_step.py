@@ -24,6 +24,21 @@ def _freeze_mapping(value: Optional[Mapping[Any, Any]]) -> Mapping[Any, Any]:
     return MappingProxyType(dict(value))
 
 
+def _as_int_pair_tuple(value: Optional[Sequence[Sequence[int]]]) -> Tuple[Tuple[int, int], ...]:
+    """Return an immutable tuple of integer pairs."""
+    if value is None:
+        return ()
+    pairs = []
+    for pair in value:
+        if len(pair) != 2:
+            raise ValueError(f"expected a pair, got {pair}")
+        start, end = pair
+        if int(start) < 0 or int(end) < int(start):
+            raise ValueError(f"invalid token range ({start}, {end})")
+        pairs.append((int(start), int(end)))
+    return tuple(pairs)
+
+
 @dataclass(frozen=True, order=True)
 class DynamicStepId:
     """Monotonic dynamic inference step identity."""
@@ -78,16 +93,24 @@ class StepInputPlan:
 
     step_id: DynamicStepId
     snapshot_slot_id: int
+    source_step_id: Optional[DynamicStepId] = None
     request_ids: Sequence[str] = field(default_factory=tuple)
+    decode_request_slots: Sequence[int] = field(default_factory=tuple)
     decode_request_ids: Sequence[str] = field(default_factory=tuple)
     prefill_request_ids: Sequence[str] = field(default_factory=tuple)
     decode_input_destination_indices: Sequence[int] = field(default_factory=tuple)
+    prefill_prompt_token_ranges: Sequence[Sequence[int]] = field(default_factory=tuple)
+    speculative_width: int = 0
+    debug_expected_input_ids: Optional[Any] = None
     input_ready_event: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if self.snapshot_slot_id < 0:
             raise ValueError(f"snapshot_slot_id must be >= 0, got {self.snapshot_slot_id}")
+        if self.speculative_width < 0:
+            raise ValueError(f"speculative_width must be >= 0, got {self.speculative_width}")
         object.__setattr__(self, "request_ids", _as_tuple(self.request_ids))
+        object.__setattr__(self, "decode_request_slots", _as_tuple(self.decode_request_slots))
         object.__setattr__(self, "decode_request_ids", _as_tuple(self.decode_request_ids))
         object.__setattr__(self, "prefill_request_ids", _as_tuple(self.prefill_request_ids))
         object.__setattr__(
@@ -95,6 +118,16 @@ class StepInputPlan:
             "decode_input_destination_indices",
             _as_tuple(self.decode_input_destination_indices),
         )
+        object.__setattr__(
+            self,
+            "prefill_prompt_token_ranges",
+            _as_int_pair_tuple(self.prefill_prompt_token_ranges),
+        )
+        if len(self.decode_request_slots) != len(self.decode_input_destination_indices):
+            raise ValueError(
+                "decode_request_slots and decode_input_destination_indices must have "
+                "the same length"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
