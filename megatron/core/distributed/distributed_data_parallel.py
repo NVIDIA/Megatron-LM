@@ -124,8 +124,24 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel,
+        # use_layerwise_distributed_optimizer).
         buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
+
+        # Validate layerwise buffer requirements.
+        has_layerwise_buffers = any(
+            key.use_layerwise_distributed_optimizer for key in buffer_groups
+        )
+        if has_layerwise_buffers:
+            assert self.ddp_config.use_distributed_optimizer, (
+                "Buffers with use_layerwise_distributed_optimizer=True require "
+                "ddp_config.use_distributed_optimizer=True for reduce-scatter."
+            )
+            assert full_param_layout is not None, (
+                "Buffers with use_layerwise_distributed_optimizer=True require a "
+                "pre-computed full_param_layout. Use "
+                "LayerWiseDistributedOptimizer.compute_full_param_layout() to compute it."
+            )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly

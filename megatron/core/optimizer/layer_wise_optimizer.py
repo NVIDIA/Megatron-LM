@@ -458,7 +458,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
 
         # Map each param to its shard index.
-        param_id_to_shard: Dict[int, int] = {}
+        param_to_shard: Dict[torch.nn.Parameter, int] = {}
         for full_layout in full_param_layouts:
             for buffer_key, layout in full_layout.layouts.items():
                 dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
@@ -466,7 +466,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     bstart, bend = layout.bucket_indices[bucket_id]
                     shard_size = (bend - bstart) // dp_size
                     shard_idx = (start - bstart) // shard_size
-                    param_id_to_shard[id(param)] = shard_idx
+                    param_to_shard[param] = shard_idx
 
         # Collect all param groups and assign params to per-rank lists.
         param_groups = []
@@ -480,7 +480,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params_list = self.expt_dp_params_list if is_expert else self.dp_cp_params_list
 
             for p in group["params"]:
-                shard_idx = param_id_to_shard[id(p)]
+                assert p in param_to_shard, (
+                    f"Optimizer param (shape={tuple(p.shape)}, numel={p.numel()}) not found "
+                    f"in any param layout. Ensure all optimizer params are included in the "
+                    f"full_param_layout passed to DDP."
+                )
+                shard_idx = param_to_shard[p]
                 params_list[shard_idx].append(p)
                 if shard_idx == local_rank:
                     param_groups_this_rank[group_index].append(p)
