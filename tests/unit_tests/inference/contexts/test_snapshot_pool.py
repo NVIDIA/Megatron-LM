@@ -63,6 +63,23 @@ def test_snapshot_pool_releases_slots_out_of_order():
     assert sorted(pool.active_slot_ids) == [0, 1]
 
 
+def test_snapshot_pool_acquires_specific_slot_for_graph_capture():
+    pool = _pool(slot_count=2)
+    first = pool.acquire_specific(1, step_id=10)
+
+    assert first.slot_id == 1
+    assert first.state == SNAPSHOT_POPULATING
+    assert first.gpu_view.current_dynamic_step_id == 10
+
+    with pytest.raises(RuntimeError, match="not reusable"):
+        pool.acquire_specific(1, step_id=11)
+
+    pool.release(first)
+    second = pool.acquire_specific(1, step_id=12)
+    assert second.slot_id == 1
+    assert second.gpu_view.current_dynamic_step_id == 12
+
+
 def test_snapshot_pool_holds_forward_slot_while_another_slot_populates():
     pool = _pool(slot_count=2)
     held = pool.acquire(step_id=1)
@@ -110,7 +127,16 @@ def test_snapshot_pool_memory_accounting_includes_graph_captures():
     assert accounting["pinned_mirror_bytes"] == accounting["metadata_buffer_bytes"]
     assert accounting["graph_capture_count"] == 0
 
-    pool.register_graph_capture(1, byte_count=4096)
+    pool.record_graph_cache_lookup(1, hit=False)
+    pool.register_graph_capture(1, byte_count=4096, cache_key=("shape-a", 1), max_captures=1)
+    pool.record_graph_cache_lookup(1, hit=True)
+    pool.register_graph_capture(1, byte_count=8192, cache_key=("shape-a", 1), max_captures=1)
     accounting = pool.memory_accounting()
     assert accounting["graph_capture_count"] == 1
     assert accounting["graph_capture_bytes"] == 4096
+    assert accounting["graph_capture_key_count"] == 1
+    assert accounting["graph_cache_hits"] == 1
+    assert accounting["graph_cache_misses"] == 1
+
+    with pytest.raises(RuntimeError, match="exceeded CUDA graph capture budget"):
+        pool.register_graph_capture(1, byte_count=1024, cache_key=("shape-b", 1), max_captures=1)

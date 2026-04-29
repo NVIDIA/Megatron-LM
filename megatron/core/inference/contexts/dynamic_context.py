@@ -672,6 +672,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"    pinned_mirrors:        {get_mem_size_str(snapshot_accounting['pinned_mirror_bytes'])}",
             f"    graph_captures:        {snapshot_accounting['graph_capture_count']} "
             f"({get_mem_size_str(snapshot_accounting['graph_capture_bytes'])})",
+            f"    graph_cache:           {snapshot_accounting['graph_cache_hits']} hit / "
+            f"{snapshot_accounting['graph_cache_misses']} miss",
         ]
 
         if self.is_hybrid_model:
@@ -2505,6 +2507,48 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._bind_gpu_view(slot.gpu_view)
         slot.cpu_view.current_dynamic_step_id = self.current_dynamic_step_id
         return slot
+
+    @property
+    def cuda_graph_capture_slot_ids(self) -> Tuple[int, ...]:
+        """Return snapshot slot IDs that need CUDA graph captures."""
+        return tuple(slot.slot_id for slot in self.snapshot_pool.slots)
+
+    def cuda_graph_max_cache_entries(self) -> int:
+        """Maximum dynamic CUDA graph cache entries per graph-managed module."""
+        return max(1, len(self.cuda_graph_batch_dimensions_list)) * max(
+            1, self.snapshot_pool.slot_count
+        )
+
+    def cuda_graph_cache_key(
+        self,
+        padded_batch_dimensions: Optional[InferenceBatchDimensions] = None,
+        snapshot_slot_id: Optional[int] = None,
+    ):
+        """Return the dynamic CUDA graph cache key for the active snapshot binding."""
+        if padded_batch_dimensions is None:
+            padded_batch_dimensions = self.padded_batch_dimensions
+        if snapshot_slot_id is None:
+            snapshot_slot_id = getattr(self.gpu_view, "current_snapshot_slot_id", 0)
+        return (padded_batch_dimensions, int(snapshot_slot_id))
+
+    def record_cuda_graph_cache_lookup(self, cache_key, *, hit: bool) -> None:
+        """Record CUDA graph cache lookup metrics for a snapshot slot."""
+        if cache_key is None:
+            return
+        _, snapshot_slot_id = cache_key
+        self.snapshot_pool.record_graph_cache_lookup(snapshot_slot_id, hit=hit)
+
+    def record_cuda_graph_capture(self, cache_key, *, byte_count: int = 0) -> None:
+        """Record CUDA graph capture memory for a snapshot slot."""
+        if cache_key is None:
+            return
+        _, snapshot_slot_id = cache_key
+        self.snapshot_pool.register_graph_capture(
+            snapshot_slot_id,
+            byte_count=byte_count,
+            cache_key=cache_key,
+            max_captures=max(1, len(self.cuda_graph_batch_dimensions_list)),
+        )
 
     def dynamic_step_nvtx_label(self, name: str, step_id: Optional[int] = None) -> str:
         """Return an NVTX range name with the current dynamic step id."""

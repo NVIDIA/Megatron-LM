@@ -30,6 +30,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.engines.dynamic_step import DynamicStepId, SnapshotSlotHandle
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -409,32 +410,64 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-        tbar = enumerate(context.cuda_graph_batch_dimensions_list)
+        capture_items = [
+            (cuda_graph_batch_dimension, snapshot_slot_id)
+            for cuda_graph_batch_dimension in context.cuda_graph_batch_dimensions_list
+            for snapshot_slot_id in context.cuda_graph_capture_slot_ids
+        ]
+        tbar = enumerate(capture_items)
         if HAVE_TQDM:
-            tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
-        for tbar_idx, cuda_graph_batch_dimension in tbar:
-            input_ids, position_ids = self.controller._dynamic_step_context_init(
-                construct_graph_dimensions=cuda_graph_batch_dimension
+            tbar = tqdm(tbar, total=len(capture_items))
+        for tbar_idx, (cuda_graph_batch_dimension, snapshot_slot_id) in tbar:
+            capture_step_id = DynamicStepId(tbar_idx)
+            context.set_current_dynamic_step_id(capture_step_id.value)
+            snapshot_slot = context.snapshot_pool.acquire_specific(
+                snapshot_slot_id, capture_step_id.value
             )
-            # Progress.
-            tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
-            if HAVE_TQDM:
-                tbar.set_description(tbar_str)
-            else:
-                logging.info(
-                    f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
+            snapshot_handle = SnapshotSlotHandle(
+                step_id=capture_step_id, snapshot_slot_id=snapshot_slot.slot_id
+            )
+            try:
+                input_ids, position_ids = self.controller._dynamic_step_context_init(
+                    construct_graph_dimensions=cuda_graph_batch_dimension,
+                    snapshot_slot_handle=snapshot_handle,
                 )
+                cache_key = context.cuda_graph_cache_key(snapshot_slot_id=snapshot_slot.slot_id)
+                # Progress.
+                tbar_str = (
+                    f"cuda graph warmup - {cuda_graph_batch_dimension} "
+                    f"slot={snapshot_slot.slot_id}"
+                )
+                if HAVE_TQDM:
+                    tbar.set_description(tbar_str)
+                else:
+                    logging.info(f"{tbar_idx}/{len(capture_items)}. {tbar_str}")
 
-            # Enable routing recording during warmup if routing replay is enabled.
-            # This ensures the record_indices copy operation is captured in the CUDA graph.
-            model_config = controller.inference_wrapped_model.model.config
-            if model_config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                # Enable routing recording during warmup if routing replay is enabled.
+                # This ensures the record_indices copy operation is captured in the CUDA graph.
+                model_config = controller.inference_wrapped_model.model.config
+                if model_config.moe_enable_routing_replay:
+                    RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Forward pass -> logits.
-            controller._dynamic_step_forward_logits(input_ids, position_ids)
+                mem_stats_before_graph = torch.cuda.memory_stats()
 
-            context.reset()
+                # Forward pass -> logits.
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+                mem_stats_after_graph = torch.cuda.memory_stats()
+                graph_capture_bytes = max(
+                    0,
+                    mem_stats_after_graph["allocated_bytes.all.current"]
+                    - mem_stats_before_graph["allocated_bytes.all.current"],
+                    mem_stats_after_graph["reserved_bytes.all.current"]
+                    - mem_stats_before_graph["reserved_bytes.all.current"],
+                )
+                context.record_cuda_graph_capture(
+                    cache_key, byte_count=int(graph_capture_bytes)
+                )
+            finally:
+                context.snapshot_pool.release(snapshot_slot)
+                context.reset()
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:

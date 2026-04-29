@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence
 
 import torch
@@ -33,6 +33,9 @@ class GpuSnapshotSlot:
     journal_retired: bool = True
     graph_capture_count: int = 0
     graph_capture_bytes: int = 0
+    graph_capture_keys: set = field(default_factory=set)
+    graph_cache_hits: int = 0
+    graph_cache_misses: int = 0
 
     @property
     def is_free(self) -> bool:
@@ -101,14 +104,16 @@ class GpuSnapshotBufferPool:
         self.poll_retired()
         for slot in self.slots:
             if slot.is_free:
-                slot.state = SNAPSHOT_POPULATING
-                slot.owning_step_id = int(step_id)
-                slot.journal_retired = False
-                slot.last_gpu_read_event = None
-                slot.gpu_view.current_dynamic_step_id = int(step_id)
-                slot.cpu_view.current_dynamic_step_id = int(step_id)
-                return slot
+                return self._acquire_slot(slot, step_id)
         raise RuntimeError("No reusable GPU snapshot slots are available")
+
+    def acquire_specific(self, slot_or_id, step_id: int) -> GpuSnapshotSlot:
+        """Acquire a specific free snapshot slot for CUDA graph capture."""
+        self.poll_retired()
+        slot = self.get_slot(slot_or_id)
+        if not slot.is_free:
+            raise RuntimeError(f"Snapshot slot {slot.slot_id} is not reusable")
+        return self._acquire_slot(slot, step_id)
 
     def mark_ready(
         self, slot_or_id, metadata_ready_event: Optional[torch.cuda.Event] = None
@@ -161,22 +166,51 @@ class GpuSnapshotBufferPool:
             raise IndexError(f"snapshot slot id {slot_id} out of range")
         return self.slots[slot_id]
 
-    def register_graph_capture(self, slot_or_id, byte_count: int = 0) -> None:
+    def register_graph_capture(
+        self,
+        slot_or_id,
+        byte_count: int = 0,
+        *,
+        cache_key=None,
+        max_captures: Optional[int] = None,
+    ) -> None:
         """Record CUDA graph capture accounting associated with a slot."""
         slot = self.get_slot(slot_or_id)
+        if cache_key is not None:
+            if cache_key in slot.graph_capture_keys:
+                return
+            if max_captures is not None and len(slot.graph_capture_keys) >= int(max_captures):
+                raise RuntimeError(
+                    f"Snapshot slot {slot.slot_id} exceeded CUDA graph capture budget "
+                    f"({max_captures})"
+                )
+            slot.graph_capture_keys.add(cache_key)
         slot.graph_capture_count += 1
         slot.graph_capture_bytes += int(byte_count)
+
+    def record_graph_cache_lookup(self, slot_or_id, *, hit: bool) -> None:
+        """Record one CUDA graph cache lookup for a snapshot slot."""
+        slot = self.get_slot(slot_or_id)
+        if hit:
+            slot.graph_cache_hits += 1
+        else:
+            slot.graph_cache_misses += 1
 
     def memory_accounting(self) -> Dict[str, int]:
         """Return memory accounting for snapshot metadata and graph captures."""
         graph_capture_count = sum(slot.graph_capture_count for slot in self.slots)
         graph_capture_bytes = sum(slot.graph_capture_bytes for slot in self.slots)
+        graph_cache_hits = sum(slot.graph_cache_hits for slot in self.slots)
+        graph_cache_misses = sum(slot.graph_cache_misses for slot in self.slots)
         return {
             "snapshot_slot_count": self.slot_count,
             "metadata_buffer_bytes": sum(slot.gpu_view.total_bytes for slot in self.slots),
             "pinned_mirror_bytes": sum(slot.cpu_mirror.numel() for slot in self.slots),
             "graph_capture_count": graph_capture_count,
             "graph_capture_bytes": graph_capture_bytes,
+            "graph_cache_hits": graph_cache_hits,
+            "graph_cache_misses": graph_cache_misses,
+            "graph_capture_key_count": sum(len(slot.graph_capture_keys) for slot in self.slots),
         }
 
     @property
@@ -189,6 +223,15 @@ class GpuSnapshotBufferPool:
             return False
         event = slot.last_gpu_read_event
         return event is None or bool(event.query())
+
+    def _acquire_slot(self, slot: GpuSnapshotSlot, step_id: int) -> GpuSnapshotSlot:
+        slot.state = SNAPSHOT_POPULATING
+        slot.owning_step_id = int(step_id)
+        slot.journal_retired = False
+        slot.last_gpu_read_event = None
+        slot.gpu_view.current_dynamic_step_id = int(step_id)
+        slot.cpu_view.current_dynamic_step_id = int(step_id)
+        return slot
 
     def _mark_free(self, slot: GpuSnapshotSlot) -> None:
         slot.state = SNAPSHOT_FREE

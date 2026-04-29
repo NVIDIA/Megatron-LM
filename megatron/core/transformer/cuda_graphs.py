@@ -1503,14 +1503,19 @@ class CudaGraphManager(torch.nn.Module):
         if reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
             if is_inference_mode:
-                is_static_batching = kwargs['inference_context'].is_static_batching()
+                inference_context = kwargs['inference_context']
+                is_static_batching = inference_context.is_static_batching()
                 if is_static_batching:
                     batch_size = kwargs['hidden_states'].shape[0]
-                    is_decode_only = kwargs["inference_context"].is_decode_only()
-                    runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+                    is_decode_only = inference_context.is_decode_only()
+                    inference_cache_key = (batch_size, is_decode_only)
                 else:
-                    padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
-                    runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
+                    inference_cache_key = inference_context.cuda_graph_cache_key()
+                runner = self.inference_cudagraphs_lookup_table.get(inference_cache_key)
+                if not is_static_batching:
+                    inference_context.record_cuda_graph_cache_lookup(
+                        inference_cache_key, hit=runner is not None
+                    )
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 # If autograd is currently disabled, it doesnt matter if a runner was created
@@ -1536,6 +1541,16 @@ class CudaGraphManager(torch.nn.Module):
                         f"existing runners. Use `get_mismatch_errors` to debug mismatches."
                     )
                 else:
+                    if is_inference_mode and not is_static_batching:
+                        max_entries = inference_context.cuda_graph_max_cache_entries()
+                        if (
+                            inference_cache_key not in self.inference_cudagraphs_lookup_table
+                            and len(self.inference_cudagraphs_lookup_table) >= max_entries
+                        ):
+                            raise RuntimeError(
+                                "Dynamic inference CUDA graph cache exceeded its bounded "
+                                f"capacity ({max_entries}). Missing key: {inference_cache_key}"
+                            )
                     runner = _CudaGraphRunner(
                         megatron_module,
                         CudaGraphManager.global_mempool,
@@ -1546,13 +1561,9 @@ class CudaGraphManager(torch.nn.Module):
                     )
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
+                        runner.inference_cuda_graph_cache_key = inference_cache_key
                         # Cache the newly created runner in the inference lookup table.
-                        if is_static_batching:
-                            self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
-                                runner
-                            )
-                        else:
-                            self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
+                        self.inference_cudagraphs_lookup_table[inference_cache_key] = runner
         else:
             # Create cudagraphs for every microbatch
             if _CudagraphGlobalRecord.cudagraph_created:
