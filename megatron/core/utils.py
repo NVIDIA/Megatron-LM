@@ -505,6 +505,11 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
+    """Round *value* up to the nearest multiple of *multiple*."""
+    return math.ceil(value / multiple) * multiple
+
+
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.

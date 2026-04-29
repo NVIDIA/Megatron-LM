@@ -24,6 +24,7 @@ from megatron.rl.rl_utils import (
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from model_provider import model_provider
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -410,11 +411,13 @@ if __name__ == "__main__":
                 pg_collection=pg_collection,
             )
 
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_inference_args,
         args_defaults={},
     )
+    full_config = pretrain_cfg_container_from_args(args)
     pretrain(
+        full_config,
         None,  # we don't need to build any datasets for RL training
         partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,

@@ -42,6 +42,7 @@ from megatron.training import (
 )
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank as mtp_on_this_rank_func, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
@@ -373,7 +374,8 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    pretrain(
+    full_config = pretrain_cfg_container_from_args(args)
+    pretrain(full_config,
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,

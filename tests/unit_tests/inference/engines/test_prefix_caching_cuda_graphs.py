@@ -147,7 +147,7 @@ class TestPrefixCachingCudaGraphs:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
 
     def _build_engine(self, model, mamba_config, num_cuda_graphs):
         """Build an engine with prefix caching and optional CUDA graphs."""
@@ -367,7 +367,7 @@ class TestHybridChunkedPrefillIntermediateState:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
 
     def _build_engine(
         self,
