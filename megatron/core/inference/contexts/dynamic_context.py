@@ -864,6 +864,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_metadata = {
             label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
         }
+        self.active_request_query_lengths = torch.zeros_like(self.request_ids)
+        self.active_request_last_token_idxs = torch.zeros_like(self.request_ids)
+
+        # Static tensor addresses to make `last_token_logits` graphable with speculative decoding.
+        max_logit_idxs = self.max_requests * (self.num_speculative_tokens + 1)
+        self.active_logit_idxs = torch.zeros(
+            max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._decode_logit_idxs = torch.arange(
+            max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
+        )
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
@@ -1077,12 +1088,36 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Request metadata all needs to be sliced.
         for label in self.request_metadata:
             self.active_request_metadata[label][:batch_size].copy_(
-                self.request_metadata[label][padded_slice], non_blocking=True
+                self.request_metadata[label][padded_slice],
             )
+
+        self.active_request_query_lengths[:batch_size].copy_(
+            self.request_query_lengths[padded_slice],
+        )
+        torch.cumsum(
+            self.active_request_query_lengths[:batch_size],
+            dim=0,
+            out=self.active_request_last_token_idxs[:batch_size],
+        )
+        self.active_request_last_token_idxs[:batch_size].sub_(1)
 
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
-        pass
+        active_request_count = self.total_request_count - self.paused_request_count
+        active_decode_count = self.num_decode_requests
+        active_prefill_count = active_request_count - active_decode_count
+        active_decode_token_count = active_decode_count * (self.num_speculative_tokens + 1)
+
+        # Assemble a correct view of the last token indices for the current step's output logits.
+        self.active_logit_idxs[:active_decode_token_count].copy_(
+            self._decode_logit_idxs[:active_decode_token_count]
+        )
+        self.active_logit_idxs[
+            active_decode_token_count : active_decode_token_count + active_prefill_count
+        ].copy_(
+            self.active_request_last_token_idxs[active_decode_count:active_request_count]
+        )
+        self.active_logit_idxs[active_decode_token_count + active_prefill_count :].zero_()
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1911,31 +1946,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_pos_ids[:num_tokens].unsqueeze(0),
         )
 
-    def speculative_required_logit_indices(self, device: torch.device) -> Tensor:
+    def speculative_required_logit_indices(self) -> Tensor:
         """Token-level indices needed for speculative decode verification.
 
         Returns all decode token positions (base + speculative) concatenated
         with the last token position of each prefill request.
 
-        Args:
-            device (torch.device): Device on which to create the index tensor.
-
         Return:
             (Tensor) 1-D indices into the packed token sequence, length
-            ``num_decode_requests * (num_speculative_tokens + 1) + num_prefill_requests``.
+            ``num_decode_requests * (num_speculative_tokens + 1) + num_prefill_requests``
+            in eager, or the equivalent padded count under non-eager.
         """
-        paused = self.paused_request_count
-        total = self.total_request_count
-        query_lengths = self.request_query_lengths[paused:total]
-        num_decode = self.num_decode_requests
-
-        decode_token_count = num_decode * (self.num_speculative_tokens + 1)
-        decode_indices = torch.arange(decode_token_count, device=device)
-
-        cumsum = torch.cumsum(query_lengths, dim=0)
-        prefill_last_indices = cumsum[num_decode:] - 1
-
-        return torch.cat([decode_indices, prefill_last_indices])
+        return self.active_logit_idxs[: self.num_last_token_logits]
 
     @property
     def num_last_token_logits(self) -> int:
@@ -1945,11 +1967,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         `(num_speculative_tokens + 1)` rows per decode request when MTP is active.
         """
         if self.num_speculative_tokens > 0:
-            return (
-                self.num_decode_requests * (self.num_speculative_tokens + 1)
-                + self.num_prefill_requests
-            )
-        return self.total_request_count - self.paused_request_count
+            if self._using_cuda_graph_this_step:
+                return (
+                    self.padded_batch_dimensions.decode_req_count
+                    * (self.num_speculative_tokens + 1)
+                    + self.padded_batch_dimensions.prefill_req_count
+                )
+            else:
+                return (
+                    self.num_decode_requests * (self.num_speculative_tokens + 1)
+                    + self.num_prefill_requests
+                )
+        else:
+            if self._using_cuda_graph_this_step:
+                return self.padded_active_request_count
+            else:
+                return self.total_request_count - self.paused_request_count
 
     def last_token_logits(self, logits: Tensor) -> Tensor:
         """Select the logit positions needed for token generation.
@@ -1972,19 +2005,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"logits.size(1) ({tuple(logits.shape)}) != "
             f"padded_active_token_count ({self.padded_active_token_count})."
         )
-        logits_2d = logits.squeeze(0)
-
-        if self.num_speculative_tokens > 0:
-            selected = self.speculative_required_logit_indices(logits.device)
-            assert selected.numel() == self.num_last_token_logits
-            return logits_2d[selected, :]
-
-        paused = self.paused_request_count
-        total = self.total_request_count
-        query_lengths = self.request_query_lengths[paused:total]
-        last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
-        assert last_token_idxs.numel() == self.num_last_token_logits
-        return logits_2d[last_token_idxs, :]
+        return logits.squeeze(0)[self.active_logit_idxs[: self.num_last_token_logits], :]
 
     def _compute_prefix_match(
         self, req: DynamicInferenceRequest, prefill_chunk_length: int
