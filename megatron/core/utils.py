@@ -52,13 +52,6 @@ try:
 except ImportError:
     HAVE_PACKAGING = False
 
-try:
-    import nvtx
-
-    HAVE_NVTX = True
-except ImportError:
-    HAVE_NVTX = False
-
 logger = logging.getLogger(__name__)
 
 try:
@@ -511,6 +504,11 @@ def divide(numerator, denominator):
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
+
+
+def round_up_to_nearest_multiple(value: int, multiple: int) -> int:
+    """Round *value* up to the nearest multiple of *multiple*."""
+    return math.ceil(value / multiple) * multiple
 
 
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
@@ -2219,14 +2217,16 @@ def _nvtx_decorator_get_func_path(func):
     return f"{module.__name__}.{caller_func}"
 
 
-def nvtx_decorator(
-    message: Optional[str] = None, color: Optional[str] = None
-) -> Callable[[_Wrapped], _Wrapped]:
+def nvtx_decorator(message: Optional[str] = None) -> Callable[[_Wrapped], _Wrapped]:
     """Decorator to add NVTX range to a function.
+
+    The ``_nvtx_enabled`` flag is checked at **call time** inside
+    ``nvtx_range_push`` / ``nvtx_range_pop``, so the decorator works
+    correctly even when applied before ``configure_nvtx_profiling()``
+    is called (e.g. at module-import time).
 
     Args:
         message (str, optional): Custom message for the NVTX range. If None, uses function path
-        color (str, optional): Color for the NVTX range. Defaults to None
 
     Returns:
         Callable: Decorated function with NVTX profiling if enabled
@@ -2236,17 +2236,23 @@ def nvtx_decorator(
         def my_function():
             pass
 
-        @nvtx_decorator(message="Custom Range", color="blue")
+        @nvtx_decorator(message="Custom Range")
         def another_function():
             pass
     """
 
     def decorator(func: _Wrapped) -> _Wrapped:
-        if _nvtx_enabled and HAVE_NVTX:
-            return nvtx.annotate(
-                message=message or _nvtx_decorator_get_func_path(func), color=color
-            )(func)
-        return func
+        msg = message or _nvtx_decorator_get_func_path(func)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            nvtx_range_push(msg)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                nvtx_range_pop(msg)
+
+        return wrapper  # type: ignore[return-value]
 
     return decorator
 

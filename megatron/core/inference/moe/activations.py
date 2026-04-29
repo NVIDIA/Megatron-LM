@@ -46,7 +46,7 @@ def _squared_relu_kernel(input_ptr, output_ptr, src_idx_ptr, M, N, BLOCK_N: tl.c
 def padded_squared_relu(x: torch.Tensor, permutation_map: torch.Tensor) -> torch.Tensor:
     """Squared ReLU activation that skips padding rows."""
     M, N = x.shape
-    out = torch.zeros(M, N, dtype=x.dtype, device=x.device)
+    out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     _squared_relu_kernel[(M,)](x, out, permutation_map, M, N, BLOCK_N=BLOCK_N)
     return out
