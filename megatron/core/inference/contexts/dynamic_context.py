@@ -1982,9 +1982,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Graph-invariant padded version of `num_last_token_logits`."""
         if self.num_speculative_tokens > 0:
             pbd = self.padded_batch_dimensions
-            return (
-                pbd.decode_req_count * (self.num_speculative_tokens + 1) + pbd.prefill_req_count
-            )
+            return pbd.decode_req_count * (self.num_speculative_tokens + 1) + pbd.prefill_req_count
         return self.padded_active_request_count
 
     def last_token_logits(self, logits: Tensor) -> Tensor:

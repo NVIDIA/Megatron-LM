@@ -1651,7 +1651,6 @@ class TextGenerationController:
                 self._dynamic_step_log_probs_indexing()
                 self._pre_forward_bookkeeping_event.record()
 
-
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             self._dynamic_step_forward_logits(input_ids, position_ids)
