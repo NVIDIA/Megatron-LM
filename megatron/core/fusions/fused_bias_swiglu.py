@@ -50,10 +50,12 @@ def weighted_swiglu(y, weights):
 
 @jit_fuser
 def clamped_swiglu(y, clamp_value):
-    y_1, y_2 = torch.chunk(y, 2, -1)
+    dtype = y.dtype
+    y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1 = y_1.clamp(min=None, max=clamp_value)
     y_2 = y_2.clamp(min=-clamp_value, max=clamp_value)
-    return F.silu(y_1) * y_2
+    res = F.silu(y_1) * y_2
+    return res.to(dtype)
 
 
 @jit_fuser
@@ -114,10 +116,11 @@ def weighted_swiglu_back(g, y, weights):
 
 @jit_fuser
 def clamped_swiglu_back(g, y, clamp_value):
-    y_1, y_2 = torch.chunk(y, 2, -1)
+    dtype = y.dtype
+    y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1c = y_1.clamp(min=None, max=clamp_value)
     y_2c = y_2.clamp(min=-clamp_value, max=clamp_value)
-    return torch.cat(
+    res = torch.cat(
         (
             g
             * torch.sigmoid(y_1c)
@@ -128,6 +131,7 @@ def clamped_swiglu_back(g, y, clamp_value):
         ),
         -1,
     )
+    return res.to(dtype)
 
 
 @jit_fuser

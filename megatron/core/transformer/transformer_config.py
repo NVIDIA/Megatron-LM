@@ -200,7 +200,7 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu or swiglu."""
+    is quick_gelu or weighted SwiGLU (MoE only)."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -2012,6 +2012,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.activation_func_clamp_value is not None:
             # swiglu
             if self.activation_func == F.silu and self.gated_linear_unit:
+                if self.num_moe_experts is None:
+                    raise ValueError(
+                        "activation_func_clamp_value for SwiGLU is only supported with MoE."
+                    )
                 if self.use_te_activation_func:
                     raise ValueError(
                         "use_te_activation_func must be False "
@@ -2173,6 +2177,15 @@ class TransformerConfig(ModelParallelConfig):
                 )
             assert not self.overlap_moe_expert_parallel_comm, (
                 "overlap_moe_expert_parallel_comm does not support moe_n_hash_layers > 0 for now."
+            )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"Hash MoE layer initialized with placeholder round-robin tid2eid. "
+                f"For real training, you MUST either (a) load tid2eid from a "
+                f"pre-trained DSv4 checkpoint, or (b) provide a frequency-aware "
+                f"initialization (e.g., Sinkhorn-balanced over token frequency). "
+                f"Round-robin will cause severe expert imbalance.",
             )
 
         if self.num_moe_experts and self.fp8:

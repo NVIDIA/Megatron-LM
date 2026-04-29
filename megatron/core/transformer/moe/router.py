@@ -45,7 +45,6 @@ class Router(ABC, MegatronModule):
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
         """
         super().__init__(config)
-        assert layer_number is not None, "layer_number is required for the router."
         self.config = config
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
@@ -131,6 +130,10 @@ class Router(ABC, MegatronModule):
         """
         raise NotImplementedError("Forward function not implemented.")
 
+    def set_layer_number(self, layer_number: int):
+        """Set the layer number for the router."""
+        self.layer_number = layer_number
+
 
 class TopKRouter(Router):
     """Route each token to the top-k experts.
@@ -173,13 +176,16 @@ class TopKRouter(Router):
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
 
+        if self.config.moe_n_hash_layers > 0:
+            assert layer_number is not None, "layer_number is required for the hash-based router."
         self.is_hash_layer = (
             self.config.moe_n_hash_layers > 0
             and layer_number <= self.config.moe_n_hash_layers
         )
         if self.is_hash_layer:
-            # DSv4 paper does not provide the initialization method for the hash buffer.
-            # Use a round-robin approach to initialize the tid2eid buffer.
+            # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
+            # no public initialization recipe is documented. Round-robin is used here
+            # only as a placeholder so the layer is runnable from scratch.
             vocab_size = self.config.actual_vocab_size
             num_experts = self.config.num_moe_experts
             ids = torch.arange(vocab_size, device=torch.cuda.current_device())

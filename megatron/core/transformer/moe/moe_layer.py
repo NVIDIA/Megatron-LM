@@ -119,6 +119,13 @@ class RouterInterface(Protocol):
         """
         ...
 
+    def set_layer_number(self, layer_number: int) -> None:
+        """Set the layer number for the router.
+
+        Called from transformer_layer during initialization.
+        """
+        ...
+
 
 class RouterBuilder(Protocol):
     """Protocol for building a Router."""
@@ -183,6 +190,11 @@ class BaseMoELayer(MegatronModule, ABC):
     def forward(self, hidden_states):
         """Forward method for the MoE layer."""
         pass
+
+    def set_layer_number(self, layer_number: int):
+        """Set the layer number for the MoE layer."""
+        self.layer_number = layer_number
+        self.router.set_layer_number(layer_number)
 
 
 class MoELayer(BaseMoELayer):
