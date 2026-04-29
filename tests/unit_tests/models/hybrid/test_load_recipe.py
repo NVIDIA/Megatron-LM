@@ -268,7 +268,20 @@ class TestCompileErrorPropagation:
             load_recipe("tests._bad_pattern_recipe")
 
 
+def _has_apply_model_recipe_to_args() -> bool:
+    try:
+        from megatron.training.arguments import _apply_model_recipe_to_args  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 @pytest.mark.internal
+@pytest.mark.skipif(
+    not _has_apply_model_recipe_to_args(),
+    reason="--model-recipe argparse adapter lives in the CLI follow-up PR; auto-enables once it lands.",
+)
 class TestRecipeArgProjection:
     """The launcher should learn model-shape/topology args from --model-recipe.
 
