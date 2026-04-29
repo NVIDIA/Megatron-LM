@@ -136,6 +136,7 @@ def create_args():
     args.add_position_embedding = False
     args.ckpt_assume_constant_structure = False
     args.stream_ckpt_dequant = False
+    args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = "assume_ok_unexpected"
     args.fp16 = False
     args.bf16 = True
@@ -149,6 +150,7 @@ def create_args():
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
     args.async_strategy = "nvrx"
+    args.verify_integrity = False
 
     yield args
 

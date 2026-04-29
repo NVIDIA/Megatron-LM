@@ -361,8 +361,8 @@ def _unwrap_pyt_sharded_tensor(
             # BF16 copy per shard and OOMs right after a successful streaming
             # load. ``view`` is handled natively by all TE quantized tensor
             # classes without any dequantize.
-            for _ in range(mcore_sh_ten.prepend_axis_num):
-                assert ten.size(0) == 1
+            for i in range(mcore_sh_ten.prepend_axis_num):
+                assert ten.size(i) == 1
             ten = ten.view(ten.shape[mcore_sh_ten.prepend_axis_num :])
         ret_tensors.append(ten)
     return ret_tensors
