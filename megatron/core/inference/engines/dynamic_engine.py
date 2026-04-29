@@ -986,7 +986,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _async_overlap_lookahead_blocker(self) -> Optional[str]:
         """Return the conservative queue-depth-two blocker, or None if eligible."""
-        if self.context.get_active_request_count() <= 0:
+        active_request_count = self.context.get_active_request_count()
+        has_chunked_prefill_work = bool(
+            self.enable_chunked_prefill
+            and (
+                self.waiting_request_ids
+                or self.context.get_index_of_chunked_prefill_request(safe=False) != -1
+            )
+        )
+        if active_request_count <= 0 and not has_chunked_prefill_work:
             return "no_active_requests"
         if self.use_coordinator:
             return "coordinator"
@@ -998,13 +1006,25 @@ class DynamicInferenceEngine(AbstractEngine):
             return "speculative"
         if self.context.is_hybrid_model:
             return "hybrid_mamba"
-        if self.enable_chunked_prefill or self.context.get_index_of_chunked_prefill_request(
-            safe=False
-        ) != -1:
-            return "chunked_prefill"
         if self.waiting_request_ids and self.context.enable_prefix_caching:
             return "prefix_caching_waiting_prefill"
-        if not self.context.is_async_overlap_steady_state_decode_ready():
+        if has_chunked_prefill_work:
+            if self.context.paused_request_count != 0:
+                return "paused_requests"
+            if active_request_count > 0 and not self.context.is_decode_only():
+                return "not_steady_state_decode"
+            active_slice = slice(
+                self.context.paused_request_count, self.context.total_request_count
+            )
+            if torch.any(self.context.num_output_placeholders[active_slice] != 0):
+                return "output_placeholders"
+            tokens_per_decode_request = int(self.num_speculative_tokens) + 1
+            last_offsets = self.context.request_last_kv_block_offset[active_slice]
+            if last_offsets.numel() and torch.any(
+                last_offsets + tokens_per_decode_request >= self.context.block_size_tokens
+            ):
+                return "block_boundary"
+        elif not self.context.is_async_overlap_steady_state_decode_ready():
             return "not_steady_state_decode"
         active_slice = slice(self.context.paused_request_count, self.context.total_request_count)
         request_ids = list(self.context.request_ids[active_slice].tolist()) + list(
@@ -1200,6 +1220,7 @@ class DynamicInferenceEngine(AbstractEngine):
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
+        chunked_prefill_no_output_request_ids: Optional[set[int]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
@@ -1225,6 +1246,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
+        chunked_prefill_no_output_request_ids = chunked_prefill_no_output_request_ids or set()
         finished_request_records: list[DynamicInferenceRequestRecord] = []
         self.finished_request_count += len(finished_request_ids)
         if evict_request_ids is not None:
@@ -1271,7 +1293,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
-            if request_id != self.context.chunked_prefill_request_id:
+            if request_id not in chunked_prefill_no_output_request_ids:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
@@ -1369,9 +1391,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     active_request_ids.append(request_id)
             else:
-                # The chunked prefill produces useless tokens
+                # A non-final chunked prefill produces useless tokens
                 # so we are not appending them to the generated tokens.
-                # Additionally, chunked prefill request do not finish.
+                # Additionally, chunked prefill requests do not finish.
                 active_request_ids.append(request_id)
 
             # When a stop word was found mid-speculative-batch, trim log probs
@@ -1396,7 +1418,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+                is_chunked_prefill = request_id in chunked_prefill_no_output_request_ids
                 is_prefill = len(request.generated_log_probs) == 0
 
                 if request.sampling_params.skip_prompt_log_probs:

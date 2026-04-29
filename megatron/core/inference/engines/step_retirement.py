@@ -164,6 +164,10 @@ class StepRetirementService:
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             routing_indices_per_request = step_result.get("routing_indices_per_request", None)
+            chunked_prefill_no_output_request_ids = set(
+                int(request_id)
+                for request_id in step_result.get("chunked_prefill_no_output_request_ids", ())
+            )
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -184,6 +188,7 @@ class StepRetirementService:
                 log_probs,
                 top_n_logprobs,
                 routing_indices_per_request,
+                chunked_prefill_no_output_request_ids,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
             )

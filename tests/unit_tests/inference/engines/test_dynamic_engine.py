@@ -822,6 +822,171 @@ class TestDynamicInferenceEngine:
         for generated_tokens in qd2_finished.values():
             assert len(generated_tokens) == 6
 
+    def _run_async_overlap_chunked_prefill_case(
+        self,
+        *,
+        queue_depth: int,
+        staged_long_request: bool,
+        prompt_lengths: List[int],
+    ) -> Tuple[Dict[int, List[int]], DynamicEngineTestEnv]:
+        """Run a deterministic chunked-prefill case and return completed outputs."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=max([4, *prompt_lengths]),
+            num_tokens_to_generate=4,
+            model_provider="gpt",
+            num_cuda_graphs=None,
+            cuda_graph_scope=[],
+            force_build_cuda_graphs=True,
+            context_max_tokens=16,
+            context_max_requests=max(8, len(prompt_lengths) + 2),
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+            enable_async_overlap_architecture=True,
+            async_overlap_queue_depth=queue_depth,
+        )
+        env = self._build_test_env(test_config)
+        model = env.engine.controller.inference_wrapped_model.model
+
+        def deterministic_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            batch, sequence = tokens.shape
+            logits = torch.zeros(
+                batch,
+                sequence,
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            next_tokens = (tokens + 1).clamp(max=test_config.vocab_size - 1)
+            logits.scatter_(2, next_tokens.unsqueeze(-1), 100.0)
+            return logits
+
+        model.forward = deterministic_forward
+
+        def add_request(request_id: int, prompt_length: int):
+            prompt_tokens = torch.arange(prompt_length, dtype=torch.int64, device="cuda") % (
+                test_config.vocab_size - 8
+            )
+            env.engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=4,
+                        termination_id=test_config.vocab_size - 1,
+                        top_k=1,
+                    ),
+                    block_size_tokens=env.engine.context.block_size_tokens,
+                )
+            )
+
+        finished = {}
+
+        def collect_finished(result):
+            if result is None:
+                return
+            for record in result["finished_request_records"]:
+                request = record.merge()
+                assert request.status == Status.COMPLETED
+                finished[int(request.request_id)] = list(request.generated_tokens)
+
+        next_request_id = 0
+        if staged_long_request:
+            add_request(next_request_id, 4)
+            next_request_id += 1
+            collect_finished(env.engine.step_modern())
+
+        for prompt_length in prompt_lengths:
+            add_request(next_request_id, prompt_length)
+            next_request_id += 1
+
+        step_count = 0
+        while env.engine.has_unfinished_requests():
+            collect_finished(env.engine.step_modern())
+            step_count += 1
+            assert step_count < 128, "Engine did not converge"
+
+        assert env.engine.async_pipeline.pending_launch_count == 0
+        assert env.engine.step_retirement_service.pending_count == 0
+        return finished, env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_chunked_prefill_matches_queue_depth_one(
+        self,
+    ) -> None:
+        """Queue-depth-two preserves chunked-prefill outputs and no-output journals."""
+        qd1_finished, _ = self._run_async_overlap_chunked_prefill_case(
+            queue_depth=1,
+            staged_long_request=False,
+            prompt_lengths=[40],
+        )
+        qd2_finished, qd2_env = self._run_async_overlap_chunked_prefill_case(
+            queue_depth=2,
+            staged_long_request=False,
+            prompt_lengths=[40],
+        )
+
+        first_entry = qd2_env.engine.context.step_journal.get_committed_entry(0)
+        assert first_entry is not None
+        assert dict(first_entry.placeholder_token_counts) == {}
+        assert first_entry.active_request_ids == ()
+        assert qd2_finished == qd1_finished
+        assert set(qd2_finished) == {0}
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_chunked_prefill_mixed_decode_matches_queue_depth_one(
+        self,
+    ) -> None:
+        """Queue-depth-two matches qd1 when chunked prefill arrives during decode."""
+        qd1_finished, _ = self._run_async_overlap_chunked_prefill_case(
+            queue_depth=1,
+            staged_long_request=True,
+            prompt_lengths=[36],
+        )
+        qd2_finished, _ = self._run_async_overlap_chunked_prefill_case(
+            queue_depth=2,
+            staged_long_request=True,
+            prompt_lengths=[36],
+        )
+
+        assert qd2_finished == qd1_finished
+        assert set(qd2_finished) == {0, 1}
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_chunked_prefill_stress_matches_queue_depth_one(
+        self,
+    ) -> None:
+        """Queue-depth-two matches qd1 for several queued chunked prefills."""
+        prompt_lengths = [32, 34, 36, 38]
+        qd1_finished, _ = self._run_async_overlap_chunked_prefill_case(
+            queue_depth=1,
+            staged_long_request=False,
+            prompt_lengths=prompt_lengths,
+        )
+        qd2_finished, _ = self._run_async_overlap_chunked_prefill_case(
+            queue_depth=2,
+            staged_long_request=False,
+            prompt_lengths=prompt_lengths,
+        )
+
+        assert qd2_finished == qd1_finished
+        assert set(qd2_finished) == set(range(len(prompt_lengths)))
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

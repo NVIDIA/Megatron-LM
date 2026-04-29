@@ -1819,12 +1819,30 @@ class TextGenerationController:
             dtype=torch.long,
             device='cpu',
         )
+        chunked_prefill_no_output_request_ids = set()
+        if context.chunked_prefill_request_id != -1:
+            chunked_prefill_no_output_request_ids.add(int(context.chunked_prefill_request_id))
         output_placeholder_counts = torch.ones(
             active_request_count,
             dtype=context.num_output_placeholders.dtype,
             device='cpu',
         )
-        context.add_output_placeholders(active_request_slots, output_placeholder_counts)
+        if chunked_prefill_no_output_request_ids:
+            produces_output_mask = torch.tensor(
+                [
+                    int(request_id) not in chunked_prefill_no_output_request_ids
+                    for request_id in active_request_ids.tolist()
+                ],
+                dtype=torch.bool,
+                device='cpu',
+            )
+        else:
+            produces_output_mask = torch.ones(active_request_count, dtype=torch.bool, device='cpu')
+        if torch.any(produces_output_mask):
+            context.add_output_placeholders(
+                active_request_slots[produces_output_mask],
+                output_placeholder_counts[produces_output_mask],
+            )
         active_sequence_lengths = context.get_placeholder_adjusted_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
 
@@ -1841,6 +1859,8 @@ class TextGenerationController:
                 for idx, request_id in enumerate(request_ids_list):
                     if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
+        if chunked_prefill_no_output_request_ids:
+            active_request_mask[~produces_output_mask] = 1
 
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
@@ -1871,6 +1891,9 @@ class TextGenerationController:
             # Public retirement can lag one step behind the next output copy.
             # Keep an owning CPU copy so the async output pool slot can be reused.
             "sample": sampled_tokens_cpu.clone(),
+            "chunked_prefill_no_output_request_ids": tuple(
+                sorted(chunked_prefill_no_output_request_ids)
+            ),
             **(update_result or {}),
         }
 
