@@ -385,22 +385,6 @@ class Attention(MegatronModule, ABC):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
 
-        # Per-head scalar output gate (e.g., Step-3.5-Flash g_proj).
-        # Separate ColumnParallelLinear so gate weights are independent of QKV.
-        if self.config.use_head_wise_attn_gate:
-            self.g_proj = submodules.linear_qkv(
-                self.config.hidden_size,
-                self.config.num_attention_heads,
-                config=self.config,
-                init_method=not_none(self.config.init_method),
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='gate',
-                tp_group=self.pg_collection.tp,
-            )
-
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
         from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -1331,22 +1315,13 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        # Per-head scalar gate (attention_per_head_gate: separate per_head_gate module)
-        if self.config.use_head_wise_attn_gate:
-            nvtx_range_push(suffix="head_wise_attn_gate")
-            gate_states, _ = self.g_proj(hidden_states)  # [sq, b, np_per_rank]
-            gate_states = gate_states.view(*gate_states.shape[:2], -1, 1)  # [sq, b, np, 1]
-            core_attn_out = core_attn_out.view(*gate_states.shape[:3], -1)     # [sq, b, np, hn]
-            core_attn_out = (
-                core_attn_out * torch.sigmoid(gate_states.float()).to(core_attn_out.dtype)
-            )
-            core_attn_out = core_attn_out.view(*gate_states.shape[:2], -1)     # [sq, b, np*hn]
-            nvtx_range_pop(suffix="head_wise_attn_gate")
-
         # Output gate (attention_output_gate: full head_dim gate fused into QKV)
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            if self.config.use_head_wise_attn_gate:
+                core_attn_out = self._apply_output_gate_per_head(core_attn_out, gate)
+            else:
+                core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         # =================
@@ -1361,6 +1336,18 @@ class Attention(MegatronModule, ABC):
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
+
+    @jit_fuser
+    def _apply_output_gate_per_head(self, x, gate):
+        x_dtype = x.dtype
+        gate = gate.view(*gate.shape[:2], -1, 1)  # [sq, b, np, 1]
+        x = x.view(*gate.shape[:3], -1)     # [sq, b, np, hn]
+        core_attn_out = (
+            x * torch.sigmoid(gate.float()).to(x.dtype)
+        )
+        x = x.view(*gate.shape[:2], -1)     # [sq, b, np*hn]
+        x = x.to(x_dtype)
+        return x
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):
