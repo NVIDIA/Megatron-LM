@@ -22,7 +22,7 @@ The following table summarizes supported parallelism strategies.
 | **Pipeline Parallelism (PP)** | Model Depth | Very Deep Models |
 | **Context Parallelism (CP)** | Sequence Length | Long Sequences (8K+ Tokens) |
 | **Expert Parallelism (EP)** | MoE Experts | Mixture-of-Experts Models |
-| **Fully-Sharded Data Parallelism (Megatron-FSDP)** | Model State | Larger Depthwise Model State & Activation Offloading |
+| **Fully-Sharded Data Parallelism (Megatron-FSDP)** | Model State | Extremely Large Models & DP Interchangeability |
 
 ## Data Parallelism (DP)
 

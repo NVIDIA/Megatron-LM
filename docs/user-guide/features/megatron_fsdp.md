@@ -32,11 +32,11 @@
 
 ### ⏱️ Optimizations
 
-- **Advanced Bucketing**: `dtype`-customizable and precision-aware bucketing system to tune the memory overhead, numerical accuracy, and latency of collectives.
-- **Buffer Management**: Efficient use of storage and [user buffer registration with NCCL](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#user-buffer-registration) allows Megatron-FSDP to leverage **NCCL Symmetric Memory**, introduced in NCCL `v2.27`, which enables switch offloading for **Multi-Node NVLink (MNNVL)** systems such as `GB200` / `GB300`, as well as other optimizations such as high-precision reduction collectives and zero-`COPY`.
-- **Communication Overlap**: `All-Gather` (AG) and `Reduce-Scatter` (RS) collectives are optimized to be precisely overlapped with compute using various CUDA streams.
-- **[TransformerEngine](https://github.com/NVIDIA/TransformerEngine) Mixed-Precision & Fused Kernels**: Native performance- and memory-optimal compatibility with MXFP8, NVFP4, and various other quantization recipes and fused kernels provided by TransformerEngine.
-- **Optimized Communication & SM Utilization via SHARP**: Leverages [**SHARP** (Scalable Hierarchical Aggregation and Reduction Protocol)](https://docs.nvidia.com/networking/display/sharpv3130) to offload FSDP collectives to network switches (InfiniBand or NVLink-Switch) and significantly reduce utilization of GPU streaming multi-processors (SM) from 16-32 to 1-6, which lowers communication latency in large scaled-out workloads and frees up GPU-hosted processors for overlapped compute (GEMM) kernels. When FSDP sharding domains span both NVLink and InfiniBand, **hierarchical SHARP collectives** (NVL-SHARP and IB-SHARP) optimize communication paths across the entire system topology.
+- **[TransformerEngine](https://github.com/NVIDIA/TransformerEngine) Mixed-Precision & Fused Kernels**: Native performance- and memory-optimal _compatibility with MXFP8, NVFP4, and various other quantization recipes and fused kernels provided by TransformerEngine_.
+- **Advanced Bucketing**: `dtype`-customizable and precision-aware bucketing system to _tune the memory overhead, numerical accuracy, and latency of collectives_. Avoids redundant `COPY` operations before and after collectives, while remaining compatible with **[DTensor](https://docs.pytorch.org/docs/stable/distributed.tensor.html)** features such as **[Torch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)**.
+- **Buffer Management**: Efficient use of storage and [NCCL User Buffer Registration](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#user-buffer-registration) enable _direct communication into NCCL-managed memory_, achieving true zero-`COPY` data movement. Introduced in NCCL `v2.27`, **NCCL Symmetric Memory** communications employ _symmetric kernels_ that drastically reduce SM utilization and include networking optimizations such as high-precision (`FP32`) reduction over-the-wire.
+- **Optimized Communication & SM Utilization via SHARP**: Leverages [**SHARP** (Scalable Hierarchical Aggregation and Reduction Protocol)](https://docs.nvidia.com/networking/display/sharpv3130) to _offload FSDP collectives to network switches (InfiniBand or NVLink-Switch)_ and significantly reduce utilization of GPU streaming multi-processors (SM) from 16-32 to 1-6 for **Multi-Node NVLink (MNNVL)** systems (Grace-Blackwell, Vera-Rubin, etc.), which lowers communication latency in large scaled-out workloads and frees up GPU-hosted processors for overlapped compute (GEMM) kernels. When FSDP sharding domains span both NVLink and InfiniBand, **hierarchical SHARP collectives** (NVL-SHARP and IB-SHARP) _optimize communication paths across the entire system topology_.
+- [**Hybrid-FSDP (HFSDP)**](#understanding-hybrid-fsdp-hfsdp), a variation of _Hybrid-Sharded Data Parallelism (HSDP)_ that further shards the optimizer state across intra- and inter-node data-parallel ranks, _bridges the memory-communication trade-off between HSDP and FSDP_, unlocking memory efficiency at minimal cost to performance.
 
 ## 🚀 Quick Start
 
@@ -145,6 +145,7 @@ Megatron-FSDP is deeply integrated into Megatron-Core. To enable FSDP (where opt
 ```
 # Train models in Megatron-LM using Megatron-FSDP.
 --use-megatron-fsdp
+--data-parallel-sharding-strategy {no_shard, optim, optim_grads, optim_grads_params}
 --ckpt-format fsdp_dtensor
 ```
 
@@ -180,6 +181,8 @@ Megatron-FSDP has a lower-level `FullyShardedDataParallel` class API that can be
 ```python
 # Initialize model and optimizer.
 ddp_config.use_megatron_fsdp = True
+# Megatron-FSDP Base Sharding Strategies:
+# no_shard, optim, optim_grads, optim_grads_params
 ddp_config.data_parallel_sharding_strategy = "optim_grads_params"
 model = GPTModel(transformer_config)
 model = FullyShardedDataParallel(
@@ -597,9 +600,9 @@ To leverage NCCL networking optimizations, **NCCL user buffer registration (UBR)
 
 NCCL (`v2.27+`) supports symmetric allocation or registration for communicators over the NVLink domain, which allow buffers that share identical virtual addresses across devices to benefit from optimized collectives:
 
-- **Copy-Engine (CE) Collectives**: Instead of using SMs (or CTAs) for common non-computational collectives like AG in Megatron-FSDP, copy engines are instead used to perform all-gather collectives, dedicating SM resources to compute and reduction during FSDP. Requires NCCL `v2.28+`.
-- **NVSwitch SHARP Offloading** - To further minimize SM utilization for AG and RS collectives, NCCL SHARP offloads reduction and aggregation work to NVLink and IB Switch hardware that uses 1-6 SM depending on the domain: NVL, IB, or NVL + IB.
 - **Symmetric Kernels** - On the NVLink domain, symmetric kernels operating on symmetric memory reduces the SM utilization for a single communication kernel to 1.
+- **NVSwitch SHARP Offloading** - To further minimize SM utilization for AG and RS collectives, NCCL SHARP offloads reduction and aggregation work to NVLink and IB Switch hardware that uses 1-6 SM depending on the domain: NVL, IB, or NVL + IB.
+- **Copy-Engine (CE) Collectives**: Instead of using SMs (or CTAs) for common non-computational collectives like AG in Megatron-FSDP, copy engines are instead used to perform all-gather collectives, dedicating SM resources to compute and reduction during FSDP. Requires NCCL `v2.28+`.
 - **High-Precision Reduction**: When training large models, high-precision gradient reduction and accumulation is desired for accuracy and convergence, but communicating FP32 gradients is expensive. With symmetric registration, FP32 accumulators enable gradients to be reduced in FP32 but communicated in BF16, which decreases gradient RS communication latency while maintaining high accuracy during training. Megatron-FSDP supports FP32 main gradient accumulation but BF16 gradient communication, customizable through `megatron_fsdp.MixedPrecisionPolicy`.
 
 These optimizations significantly reduce SM resource contention for overlapped compute and communication kernels in FSDP. Symmetric registration, allocation, and pooling is also supported in PyTorch: [`torch.distributed._symmetric_memory`](https://docs.pytorch.org/docs/stable/symmetric_memory.html).
