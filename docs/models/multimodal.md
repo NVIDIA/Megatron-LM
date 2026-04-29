@@ -18,7 +18,7 @@ Megatron Core supports multimodal models that combine language with vision, audi
 > **Note**: MIMO is experimental and under active development. The API may change in future releases.
 
 **Key Features:**
-- Arbitrary modality combinations (vision, audio, text, etc.)
+- Arbitrary modality combinations (vision, audio, text)
 - Flexible encoder architecture for different input modalities
 - Unified embedding space across modalities
 - Support for both vision-language and audio-vision-language models
@@ -42,7 +42,8 @@ See [examples/mimo](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mim
 
 ## Diffusion Models
 
-For multimodal diffusion models (image generation, text-to-image, etc.), see [NeMo Diffusion Models](https://github.com/NVIDIA-NeMo/NeMo/tree/main/nemo/collections/diffusion). NeMo provides production-ready implementations of:
+For multimodal diffusion models (image generation, text-to-image). Refer to [Nvidia Diffusion Models](https://developer.nvidia.com/blog/understanding-diffusion-models-an-essential-guide-for-aec-professionals/). The Developer Program, NIM, and NeMo can offer production-ready implementations of:
+
 - Stable Diffusion variants
 - Text-to-image generation
 - Image-to-image translation

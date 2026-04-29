@@ -119,7 +119,7 @@ Distribute experts across GPUs in Mixture-of-Experts models.
 
 ## Parallelism Selection Guide
 
-Recommended configurations based on [NVIDIA NeMo production setups](https://github.com/NVIDIA/NeMo/tree/main/scripts/performance/recommended_model_configs):
+Recommended configurations:
 
 ### Language Models
 
