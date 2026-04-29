@@ -930,6 +930,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
             self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
             self.hc_head_scale = nn.Parameter(torch.ones(1))
+            nn.init.xavier_uniform_(self.hc_head_fn)
+            if self.config.sequence_parallel:
+                setattr(self.hc_head_fn, 'sequence_parallel', True)
+                setattr(self.hc_head_base, 'sequence_parallel', True)
+                setattr(self.hc_head_scale, 'sequence_parallel', True)
 
         self.offload_context = nullcontext()
 
@@ -998,11 +1003,21 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
             # e_proj: [s, b, h] -> [s, b, h], then broadcast to [s, b, n, h]
             e_out, _ = self.e_proj(decoder_input)
+            e_out = gather_from_tensor_model_parallel_region(
+                e_out, group=self.tp_group
+            )
             e_out = e_out.unsqueeze(2).expand(s, b, n, h)
             # h_proj: applied per-stream on the h dimension
             h_out, _ = self.h_proj(hs_streams)
+            h_out = gather_from_tensor_model_parallel_region(
+                h_out, group=self.tp_group
+            )
             # Combine and flatten back to [s, b, n*h]
             hidden_states = (e_out + h_out).reshape(s, b, n * h)
+            if self.sequence_parallel:
+                hidden_states = scatter_to_sequence_parallel_region(
+                    hidden_states, group=self.tp_group
+                )
         else:
             hidden_states = apply_module(self.hnorm)(hidden_states)
             hidden_states = make_viewless_tensor(
