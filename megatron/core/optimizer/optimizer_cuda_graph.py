@@ -6,6 +6,8 @@ import logging
 
 import torch
 
+from megatron.core.full_cuda_graph import get_shared_capture_stream, get_shared_graph_pool
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,8 +33,12 @@ class OptimizerCudaGraphWrapper:
             assert OptimizerCudaGraphWrapper.cuda_graph is None
             OptimizerCudaGraphWrapper.cuda_graph = torch.cuda.CUDAGraph()
             torch.cuda.synchronize()
-            capture_stream = torch.cuda.Stream()
-            with torch.cuda.graph(OptimizerCudaGraphWrapper.cuda_graph, stream=capture_stream):
+            capture_stream = get_shared_capture_stream()
+            with torch.cuda.graph(
+                OptimizerCudaGraphWrapper.cuda_graph,
+                stream=capture_stream,
+                pool=get_shared_graph_pool(),
+            ):
                 OptimizerCudaGraphWrapper.result = self.optimizer_step_func()
             torch.cuda.synchronize()
             torch.distributed.barrier()

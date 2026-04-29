@@ -11,6 +11,35 @@ from megatron.core.tensor_parallel.random import get_all_rng_states
 
 logger = logging.getLogger(__name__)
 
+# Process-wide handle so full-iter and optimizer graph captures share one pool and one
+# non-default stream (per-stream alloc segments can inflate memory_reserved; see
+# tools/debug_cuda_graph_pool_memory*.py).
+_shared_graph_pool = None
+_shared_capture_stream = None
+
+
+def get_shared_capture_stream():
+    """Return one `torch.cuda.Stream` for all full-iter and optimizer graph captures.
+
+    Call after the target CUDA device is selected.
+    """
+    global _shared_capture_stream
+    if _shared_capture_stream is None:
+        _shared_capture_stream = torch.cuda.Stream()
+    return _shared_capture_stream
+
+
+def get_shared_graph_pool():
+    """Return a process-wide handle so all call sites share one graph memory pool.
+
+    `torch.cuda.graph_pool_handle()` returns a new pool each time; this lazy singleton
+    ensures e.g. full-iteration and optimizer captures reuse the same pool.
+    """
+    global _shared_graph_pool
+    if _shared_graph_pool is None:
+        _shared_graph_pool = torch.cuda.graph_pool_handle()
+    return _shared_graph_pool
+
 # The below functions traverse through nested data structures (tuples, lists, dicts)
 # present in src and creates a deep copy where all PyTorch tensors are cloned,
 # detached from the computation graph, and moved to CUDA device. Non-tensor objects
@@ -171,10 +200,11 @@ class FullCudaGraphWrapper:
             for _, state in get_all_rng_states().items():
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
-            capture_stream = torch.cuda.Stream()
+            capture_stream = get_shared_capture_stream()
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],
                 stream=capture_stream,
+                pool=get_shared_graph_pool(),
                 capture_error_mode="thread_local",
             ):
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
