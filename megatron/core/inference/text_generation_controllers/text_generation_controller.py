@@ -1938,10 +1938,21 @@ class TextGenerationController:
         cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
+        snapshot_slot_id = getattr(context.gpu_view, "current_snapshot_slot_id", 0)
+        context.record_snapshot_slot(
+            step_id.value,
+            snapshot_slot_id,
+            cuda_graph_batch_dimensions=cuda_graph_request_count,
+        )
+        context.record_request_slot_transition(
+            step_id.value,
+            request_slots_after=tuple(range(int(context.total_request_count))),
+            active_request_ids=request_plan.active_request_ids,
+        )
 
         return DynamicStepContextSnapshot(
             step_id=step_id,
-            snapshot_slot_id=getattr(context.gpu_view, "current_snapshot_slot_id", 0),
+            snapshot_slot_id=snapshot_slot_id,
             request_plan=request_plan,
             active_request_count=active_request_count,
             cuda_graph_request_count=cuda_graph_request_count,

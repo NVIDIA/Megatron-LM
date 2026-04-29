@@ -1699,6 +1699,7 @@ class DynamicInferenceEngine(AbstractEngine):
             raise EngineSuspendedError(self.context.step_count)
 
         step_id = self._begin_dynamic_step()
+        self.context.begin_step_journal(step_id)
 
         # schedule requests
         scheduling_range = self._step_nvtx_label("scheduling", step_id)
@@ -1823,8 +1824,14 @@ class DynamicInferenceEngine(AbstractEngine):
             reasons["queue_depth_one_debug_mode_pending_pipeline"] = (
                 reasons.get("queue_depth_one_debug_mode_pending_pipeline", 0) + 1
             )
-        last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data)
+        try:
+            last_step_data = await self.async_forward()
+            ret = await self.async_bookkeep(*last_step_data)
+        except BaseException:
+            self.context.rollback_step_journal(
+                self._current_dynamic_step_id, reason="async_step_exception"
+            )
+            raise
         # Keep for compatibility with current test suite.
         return ret
 

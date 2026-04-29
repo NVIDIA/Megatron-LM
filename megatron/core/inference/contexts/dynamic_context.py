@@ -43,6 +43,7 @@ from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
+from .step_journal import StepJournal
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -273,6 +274,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.step_count = 0
         self.current_dynamic_step_id = -1
         self.request_ledgers = DynamicRequestLedgers()
+        self.step_journal = StepJournal()
         self.async_overlap_debug_counters = {
             "queue_depth": 1,
             "snapshot_slot_waits": 0,
@@ -2300,6 +2302,92 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Return optimistic request-ledger state."""
         return self.request_ledgers.get_optimistic_request_state(request_id)
 
+    def _journal_request_slots(self) -> Tuple[int, ...]:
+        """Return request slots currently visible to the scheduler."""
+        return tuple(range(int(self.total_request_count)))
+
+    def _journal_active_request_ids(self) -> Tuple[str, ...]:
+        """Return active request IDs currently visible to the scheduler."""
+        active_slice = slice(int(self.paused_request_count), int(self.total_request_count))
+        return tuple(str(int(request_id)) for request_id in self.request_ids[active_slice].tolist())
+
+    def begin_step_journal(self, step_id: int):
+        """Open the transaction journal entry for one dynamic step."""
+        return self.step_journal.begin_step_journal(
+            step_id,
+            snapshot_slot_id=getattr(self.gpu_view, "current_snapshot_slot_id", 0),
+            request_slots_before=self._journal_request_slots(),
+            active_request_ids=self._journal_active_request_ids(),
+        )
+
+    def record_placeholder_delta(self, step_id: int, request_id, token_count_delta: int):
+        """Record placeholder-token accounting for the step journal."""
+        if self.step_journal.get_open_entry(step_id) is None:
+            return None
+        return self.step_journal.record_placeholder_delta(
+            step_id, request_id, token_count_delta
+        )
+
+    def record_resource_reservation(self, step_id: int, reservation):
+        """Record a resource reservation in the step journal."""
+        if self.step_journal.get_open_entry(step_id) is None:
+            return None
+        return self.step_journal.record_resource_reservation(step_id, reservation)
+
+    def record_snapshot_slot(
+        self, step_id: int, snapshot_slot_id: int, cuda_graph_batch_dimensions=None
+    ):
+        """Record the snapshot slot bound to this step."""
+        if self.step_journal.get_open_entry(step_id) is None:
+            return None
+        return self.step_journal.record_snapshot_slot(
+            step_id,
+            snapshot_slot_id,
+            cuda_graph_batch_dimensions=cuda_graph_batch_dimensions,
+        )
+
+    def record_request_slot_transition(
+        self,
+        step_id: int,
+        *,
+        request_slots_before: Optional[Sequence[int]] = None,
+        request_slots_after: Optional[Sequence[int]] = None,
+        active_request_ids: Optional[Sequence[int]] = None,
+        pause_resume_evictions: Optional[Sequence[int]] = None,
+        decode_input_destination_indices: Optional[Sequence[int]] = None,
+    ):
+        """Record request-slot movement for this step."""
+        if self.step_journal.get_open_entry(step_id) is None:
+            return None
+        return self.step_journal.record_request_slot_transition(
+            step_id,
+            request_slots_before=request_slots_before,
+            request_slots_after=request_slots_after,
+            active_request_ids=active_request_ids,
+            pause_resume_evictions=pause_resume_evictions,
+            decode_input_destination_indices=decode_input_destination_indices,
+        )
+
+    def commit_step_journal(self, step_id: int):
+        """Commit the journal entry for one serial dynamic step."""
+        if self.step_journal.get_open_entry(step_id) is None:
+            return None
+        return self.step_journal.commit_step_journal(
+            step_id,
+            request_slots_after=self._journal_request_slots(),
+            active_request_ids=self._journal_active_request_ids(),
+        )
+
+    def rollback_step_journal(self, step_id: int, reason: Optional[str] = None):
+        """Roll back the journal entry for one dynamic step."""
+        if self.step_journal.get_open_entry(step_id) is None:
+            return None
+        return self.step_journal.rollback_step_journal(step_id, reason=reason)
+
+    def rollback_all_open_step_journals(self, reason: Optional[str] = None):
+        """Roll back every open dynamic-step journal entry."""
+        return self.step_journal.rollback_all_open(reason=reason)
+
     def reset(self) -> None:
         """Reset entire context.
 
@@ -2312,6 +2400,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         context's memory buffer is referenced by the cuda graph system and
         cannot be deallocated.
         """
+        self.rollback_all_open_step_journals(reason="context_reset")
         self.reset_tensors()
         self.reset_metadata()
 

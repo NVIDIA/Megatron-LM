@@ -47,14 +47,18 @@ class StepRetirementService:
     def drain_for_shutdown(self) -> None:
         """Drain in-flight retirement work before shutdown.
 
-        Queue depth one has no detached retirement work, so this is currently a no-op.
+        Queue depth one has no detached retirement work, but an interrupted step
+        can leave an open journal entry that must not survive shutdown.
         """
+        self.engine.context.rollback_all_open_step_journals(reason="shutdown_drain")
 
     def drain_for_suspend(self) -> None:
         """Drain in-flight retirement work before suspend.
 
-        Queue depth one has no detached retirement work, so this is currently a no-op.
+        Queue depth one has no detached retirement work, but an interrupted step
+        can leave an open journal entry that must not survive suspend.
         """
+        self.engine.context.rollback_all_open_step_journals(reason="suspend_drain")
 
     def drain_for_request_reuse(self, request_id: int) -> None:
         """Drain work that could still reference a request ID before reuse.
@@ -130,6 +134,7 @@ class StepRetirementService:
         engine.failed_request_ids.clear()
 
         nvtx_range_pop(output_retirement_range)
+        engine.context.commit_step_journal(step_id)
 
         # Detokenize all finished requests if not using the coordinator. Otherwise, the
         # coordinator overlaps detokenization with the engine.
