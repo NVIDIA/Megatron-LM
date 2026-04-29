@@ -30,7 +30,7 @@ class TestHybridBlock:
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-    def get_mamba_block(self, layer_pattern, **config_kwargs):
+    def get_hybrid_block(self, layer_pattern, **config_kwargs):
         layer_type_list = validate_segment_layers(layer_pattern)
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
@@ -88,7 +88,7 @@ class TestHybridBlock:
     def test_gpu_forward(self):
         """Test GPU forward pass."""
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
-        block = self.get_mamba_block(layer_pattern)
+        block = self.get_hybrid_block(layer_pattern)
         block.cuda()
         micro_batch_size = 2
         sequence_length = 32
@@ -115,55 +115,6 @@ class TestHybridBlock:
         ).cuda()
         return block(hidden_states, attention_mask=attention_mask)
 
-    def test_gpu_forward_full_checkpoint_block(self):
-        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
-        block = self.get_mamba_block(
-            layer_pattern,
-            recompute_granularity='full',
-            recompute_method='block',
-            recompute_num_layers=2,
-        )
-        output = self._run_forward(block)
-        assert output.shape == (32, 2, block.config.hidden_size)
-
-    def test_gpu_forward_uniform_checkpoint_non_divisible_layers(self):
-        """uniform with chunk size that doesn't divide num_layers (5 layers, chunk=3)."""
-        layer_pattern = (
-            Symbols.MAMBA
-            + Symbols.ATTENTION
-            + Symbols.MLP
-            + Symbols.MAMBA
-            + Symbols.ATTENTION
-        )
-        block = self.get_mamba_block(
-            layer_pattern,
-            recompute_granularity='full',
-            recompute_method='uniform',
-            recompute_num_layers=3,  # chunks: [0,1,2] + [3,4]
-        )
-        output = self._run_forward(block)
-        assert output.shape == (32, 2, block.config.hidden_size)
-
-    def test_gpu_forward_selective_checkpoint_mlp(self):
-        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
-        block = self.get_mamba_block(
-            layer_pattern,
-            recompute_granularity="selective",
-            recompute_modules=["core_attn", "mlp"],
-        )
-
-        attn_layer = block.layers[1]
-        assert isinstance(attn_layer, TransformerLayer)
-        assert attn_layer.self_attention.checkpoint_core_attention is True
-        assert attn_layer.recompute_mlp is True
-
-        mlp_layer = block.layers[2]
-        assert isinstance(mlp_layer, TransformerLayer)
-        assert mlp_layer.recompute_mlp is True
-
-        output = self._run_forward(block)
-        assert output.shape == (32, 2, block.config.hidden_size)
-
     @pytest.mark.timeout(60)
     @pytest.mark.parametrize(
         "recompute_kwargs",
@@ -185,11 +136,19 @@ class TestHybridBlock:
         ],
         ids=["full_block", "full_uniform", "selective"],
     )
-    def test_recompute_matches_baseline(self, recompute_kwargs):
-        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+    @pytest.mark.parametrize(
+        "layer_pattern",
+        [
+            Symbols.MAMBA * 5,
+            Symbols.ATTENTION * 5,
+            Symbols.MLP * 5,
+            Symbols.ATTENTION + Symbols.MLP + Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP,
+            Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP,
+        ],
+    )
+    def test_recompute(self, recompute_kwargs: dict, layer_pattern: str):
         seed = 123
         sequence_length, micro_batch_size = 32, 2
-        rtol = atol = 1e-4
 
         # When 'mlp' is in recompute_modules, the wrapped MLP's `(out, bias_param)`
         # output triggers a reentrant-backward deadlock in CheckpointFunction.
@@ -215,9 +174,9 @@ class TestHybridBlock:
                 device="cuda",
             )
             return hs, am
+        hs, am = build_inputs()
 
-        def run(block):
-            hs, am = build_inputs()
+        def run(block, hs, am):
             out = block(hs, attention_mask=am)
             out.float().sum().backward()
             grads = {
@@ -230,31 +189,27 @@ class TestHybridBlock:
         # --- Baseline (no recompute) ---
         model_parallel_cuda_manual_seed(seed)
         torch.manual_seed(seed)
-        base = self.get_mamba_block(layer_pattern, **arch_kwargs).cuda()
+        base = self.get_hybrid_block(layer_pattern, **arch_kwargs).cuda()
         base.train()
-        base_logits, base_grads = run(base)
+        base_logits, base_grads = run(base, hs, am)
         del base
         torch.cuda.empty_cache()
 
         # --- Recompute ---
         model_parallel_cuda_manual_seed(seed)
         torch.manual_seed(seed)
-        rec = self.get_mamba_block(
+        rec = self.get_hybrid_block(
             layer_pattern, **arch_kwargs, **recompute_kwargs
         ).cuda()
         rec.train()
-        rec_logits, rec_grads = run(rec)
+        rec_logits, rec_grads = run(rec, hs, am)
 
         # --- Numerical equivalence ---
-        assert torch.allclose(rec_logits, base_logits, rtol=rtol, atol=atol), (
-            f"Logits mismatch (max abs diff = {(rec_logits - base_logits).abs().max()})"
-        )
+        assert torch.equal(rec_logits, base_logits), f"Logits should be bitwise matched"
         assert set(rec_grads.keys()) == set(base_grads.keys())
         for name in base_grads:
             gb, gr = base_grads[name], rec_grads[name]
-            assert torch.allclose(gr, gb, rtol=rtol, atol=atol), (
-                f"Grad mismatch for {name} (max abs diff = {(gr - gb).abs().max()})"
-            )
+            assert torch.equal(gr, gb), f"Grad should be bitwise matched for {name}"
 
     def test_layer_types(self):
         """
@@ -262,7 +217,7 @@ class TestHybridBlock:
         were honored.
         """
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
-        block = self.get_mamba_block(layer_pattern)
+        block = self.get_hybrid_block(layer_pattern)
         layers = block.layers
         # Note that this matches the order specified by layer_pattern above
         assert isinstance(layers[0], MambaLayer)
@@ -277,7 +232,7 @@ class TestHybridBlock:
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
         # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):
-            block = self.get_mamba_block(layer_pattern)
+            block = self.get_hybrid_block(layer_pattern)
 
     def test_gdn_layer_types(self):
         """
@@ -285,7 +240,7 @@ class TestHybridBlock:
         while * creates a TransformerLayer wrapping SelfAttention.
         """
         layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
-        block = self.get_mamba_block(layer_pattern)
+        block = self.get_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], TransformerLayer)
         assert isinstance(layers[0].self_attention, GatedDeltaNet)
