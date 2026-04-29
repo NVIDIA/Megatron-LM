@@ -175,7 +175,7 @@ class TestDSv4HybridAttentionConstructor:
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
-        ratios = [1, 4, 128, 4]
+        ratios = [0, 4, 128, 4]
         config = _make_config(csa_compress_ratios=ratios)
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=layer_number, pg_collection=pg)

@@ -22,6 +22,14 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    from fast_hadamard_transform import hadamard_transform as _hadamard_transform
+
+    HAVE_HADAMARD = True
+except ImportError:
+    HAVE_HADAMARD = False
+    _hadamard_transform = None
+
 
 def mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     """Mock implementation of hadamard_transform for testing without the library installed."""

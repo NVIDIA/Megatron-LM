@@ -1282,9 +1282,12 @@ class TransformerConfig(ModelParallelConfig):
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
-            assert (
-                len(self.csa_compress_ratios) == self.num_layers
-            ), "csa_compress_ratios must have the same length as num_layers"
+            mtp_layers = self.mtp_num_layers or 0
+            expected_len = self.num_layers + mtp_layers
+            assert len(self.csa_compress_ratios) == expected_len, (
+                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must equal "
+                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
+            )
             assert (
                 all(ratio in [0, 4, 128] for ratio in self.csa_compress_ratios)
             ), "csa_compress_ratios must be 0, 4, or 128"

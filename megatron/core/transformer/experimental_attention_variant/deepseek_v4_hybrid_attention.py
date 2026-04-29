@@ -96,6 +96,7 @@ class DSv4HybridAttention(Attention):
         attention_type: str,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
 
         super().__init__(
@@ -105,6 +106,7 @@ class DSv4HybridAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
         self.config: MLATransformerConfig
 
@@ -123,8 +125,12 @@ class DSv4HybridAttention(Attention):
 
         self.softmax_scale = None
 
+        if is_mtp_layer:
+            layer_idx = self.config.num_layers + layer_number - 1
+            compress_ratio = self.config.csa_compress_ratios[layer_idx]
+        else:
+            compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
         rope_base = self.config.rotary_base
-        compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
         if compress_ratio > 1:
             rope_base = self.config.csa_compress_rotary_base
         if self.config.rope_type == "rope":
@@ -152,7 +158,10 @@ class DSv4HybridAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
-        core_attn_extra_kwargs = {"rotary_pos_emb": self.rotary_pos_emb}
+        core_attn_extra_kwargs = {
+            "rotary_pos_emb": self.rotary_pos_emb,
+            "compress_ratio": compress_ratio,
+        }
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -416,6 +425,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -428,6 +438,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
 
         q_down_proj_kwargs = {}

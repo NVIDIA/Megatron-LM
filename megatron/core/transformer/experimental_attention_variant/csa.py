@@ -589,6 +589,7 @@ class CompressedSparseAttention(MegatronModule):
         cp_comm_type: str = "p2p",
         pg_collection: Optional[ProcessGroupCollection] = None,
         rotary_pos_emb: nn.Module = None,
+        compress_ratio: int = 0,
     ):
         super().__init__(config=config)
 
@@ -599,8 +600,7 @@ class CompressedSparseAttention(MegatronModule):
         self.pg_collection = pg_collection
 
         self.layer_number = layer_number
-        layer_idx = layer_number - 1  # layer_number is 1-indexed
-        self.compress_ratio = config.csa_compress_ratios[layer_idx]
+        self.compress_ratio = compress_ratio
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
