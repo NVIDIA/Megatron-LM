@@ -1937,6 +1937,20 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return torch.cat([decode_indices, prefill_last_indices])
 
+    @property
+    def num_last_token_logits(self) -> int:
+        """Number of rows produced by `last_token_logits` for the current step.
+
+        Single source of truth for the bound: one row per request, with
+        `(num_speculative_tokens + 1)` rows per decode request when MTP is active.
+        """
+        if self.num_speculative_tokens > 0:
+            return (
+                self.num_decode_requests * (self.num_speculative_tokens + 1)
+                + self.num_prefill_requests
+            )
+        return self.total_request_count - self.paused_request_count
+
     def last_token_logits(self, logits: Tensor) -> Tensor:
         """Select the logit positions needed for token generation.
 
@@ -1950,7 +1964,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits (Tensor): Output logits of forward pass, shape [1, S, H].
 
         Return:
-            (Tensor) Selected logits, shape [N, H].
+            (Tensor) Selected logits, shape [N, H], where N == num_last_token_logits.
         """
         # todo: @lmcafee, remove these asserts?
         assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
@@ -1962,12 +1976,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.num_speculative_tokens > 0:
             selected = self.speculative_required_logit_indices(logits.device)
+            assert selected.numel() == self.num_last_token_logits
             return logits_2d[selected, :]
 
         paused = self.paused_request_count
         total = self.total_request_count
         query_lengths = self.request_query_lengths[paused:total]
         last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
+        assert last_token_idxs.numel() == self.num_last_token_logits
         return logits_2d[last_token_idxs, :]
 
     def _compute_prefix_match(

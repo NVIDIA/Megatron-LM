@@ -683,16 +683,8 @@ class TextGenerationController:
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
         if context.config.materialize_only_last_token_logits:
-            if self.num_speculative_tokens > 0:
-                # Under MTP, each decode request emits (num_speculative_tokens + 1) logit rows.
-                logits_seq_len = (
-                    context.num_decode_requests * (self.num_speculative_tokens + 1)
-                    + context.num_prefill_requests
-                )
-            else:
-                logits_seq_len = active_request_count
+            logits_seq_len = context.num_last_token_logits
         else:
             logits_seq_len = context.padded_active_token_count
 
@@ -712,13 +704,7 @@ class TextGenerationController:
 
         if self.model_is_pipeline_parallel:
             if context.config.materialize_only_last_token_logits:
-                if self.num_speculative_tokens > 0:
-                    logits_seq_len = (
-                        context.num_decode_requests * (self.num_speculative_tokens + 1)
-                        + context.num_prefill_requests
-                    )
-                else:
-                    logits_seq_len = active_request_count
+                logits_seq_len = context.num_last_token_logits
             else:
                 logits_seq_len = input_ids.shape[1]
             logits_shape = [1, logits_seq_len, self.vocab_size]
@@ -1272,6 +1258,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         # This code cannot be reached when we are using speculative decode.
+        assert self.num_speculative_tokens == 0
         logits_seq_len = (
             active_request_count
             if context.config.materialize_only_last_token_logits
