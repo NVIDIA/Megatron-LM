@@ -5,6 +5,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from ..utils import is_torch_min_version
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -213,7 +215,7 @@ class DistributedDataParallelConfig:
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
-        if self.nccl_ub:
+        if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
