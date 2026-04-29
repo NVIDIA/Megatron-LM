@@ -1063,6 +1063,11 @@ class TransformerConfig(ModelParallelConfig):
             self.ffn_hidden_size = 4 * self.hidden_size
 
         if self.kv_channels is None:
+            if self.hidden_size % self.num_attention_heads != 0:
+                raise ValueError(
+                    f"hidden_size ({self.hidden_size}) must be divisible by "
+                    f"num_attention_heads ({self.num_attention_heads})."
+                )
             self.kv_channels = self.hidden_size // self.num_attention_heads
 
         if self.num_query_groups is None:
@@ -1176,8 +1181,16 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
-            raise ValueError("num_moe_experts must be non None to use expert-parallel.")
+        if self.expert_model_parallel_size > 1:
+            if self.num_moe_experts is None:
+                raise ValueError(
+                    "num_moe_experts must be non None to use expert model parallelism."
+                )
+            if self.num_moe_experts % self.expert_model_parallel_size != 0:
+                raise ValueError(
+                    f"num_moe_experts ({self.num_moe_experts}) must be divisible by "
+                    f"expert_model_parallel_size ({self.expert_model_parallel_size})."
+                )
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
             if self.expert_tensor_parallel_size > 1:
