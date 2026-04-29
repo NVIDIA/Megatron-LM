@@ -139,7 +139,8 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
         if context.config.materialize_only_last_token_logits:
-            max_logits = max_requests
+            # Under MTP, each decode request emits (num_speculative_tokens + 1) logit rows
+            max_logits = max_requests * (self.num_speculative_tokens + 1)
         else:
             max_logits = context.max_tokens
 
@@ -683,11 +684,17 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        logits_seq_len = (
-            active_request_count
-            if context.config.materialize_only_last_token_logits
-            else context.padded_active_token_count
-        )
+        if context.config.materialize_only_last_token_logits:
+            if self.num_speculative_tokens > 0:
+                # Under MTP, each decode request emits (num_speculative_tokens + 1) logit rows.
+                logits_seq_len = (
+                    context.num_decode_requests * (self.num_speculative_tokens + 1)
+                    + context.num_prefill_requests
+                )
+            else:
+                logits_seq_len = active_request_count
+        else:
+            logits_seq_len = context.padded_active_token_count
 
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
@@ -695,11 +702,8 @@ class TextGenerationController:
             )
             # logits shape: [1, seq_len, vocab_size]
 
-        assert logits_seq_len == (
-            active_request_count
-            if context.config.materialize_only_last_token_logits
-            else input_ids.shape[1]
-        )
+        if not context.config.materialize_only_last_token_logits:
+            assert logits_seq_len == input_ids.shape[1]
 
         # Note: When speculative decoding is active (num_speculative_tokens > 0),
         # the model skips MTP computation during the forward pass. MTP logits
@@ -1265,6 +1269,7 @@ class TextGenerationController:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
+        # This code cannot be reached when we are using speculative decode.
         logits_seq_len = (
             active_request_count
             if context.config.materialize_only_last_token_logits
