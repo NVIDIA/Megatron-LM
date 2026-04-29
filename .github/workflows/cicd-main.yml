@@ -1041,7 +1041,6 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
-          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
           override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
       - name: Upload artifacts
