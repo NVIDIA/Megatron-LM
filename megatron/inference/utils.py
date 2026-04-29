@@ -51,15 +51,15 @@ def get_model_for_inference() -> MegatronModule:
     # Build model.
     model = _get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
 
-    # Load checkpoint.
-    assert args.load is not None
-    args.exit_on_missing_checkpoint = True
-    load_checkpoint(
-        ddp_model=model,
-        optimizer=None,
-        opt_param_scheduler=None,
-        strict=not args.inference_ckpt_non_strict,
-    )
+    # Load checkpoint (skipped when --load is not set; useful for perf debugging).
+    if args.load is not None:
+        args.exit_on_missing_checkpoint = True
+        load_checkpoint(
+            ddp_model=model,
+            optimizer=None,
+            opt_param_scheduler=None,
+            strict=not args.inference_ckpt_non_strict,
+        )
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"

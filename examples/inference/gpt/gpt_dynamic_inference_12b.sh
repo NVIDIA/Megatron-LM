@@ -41,8 +41,7 @@ ARGS=" \
     --no-position-embedding \
     --group-query-attention \
     --num-query-groups 8 \
-    --load ${CHECKPOINT_DIR} \
-    --use-checkpoint-args \
+    $( [ "${LOAD_CHECKPOINT:-1}" = "0" ] || echo "--load ${CHECKPOINT_DIR} --use-checkpoint-args" ) \
     --untie-embeddings-and-output-weights \
     --disable-bias-linear \
     --use-rotary-position-embeddings \
@@ -118,7 +117,7 @@ else
 fi
 
 if [[ -v NSIGHT_PREFIX ]]; then
-    CMD="nsys profile -s none -t nvtx,cuda --cudabacktrace=all --cuda-graph-trace=node --python-backtrace=cuda --wait all -o ${NSIGHT_PREFIX} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop ${CMD}"
+    CMD="nsys profile -s none -t nvtx,cuda --cuda-graph-trace=node --wait all -o ${NSIGHT_PREFIX} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop ${CMD}"
 fi
 
 echo "~~~"

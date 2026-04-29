@@ -226,13 +226,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.async_scheduling = inference_config.async_scheduling
-        # Set when CPU bookkeeping detects a pause/evict event that would
-        # invalidate the speculative chain. Read by _async_scheduling_active
-        # to drop out of speculation; cleared after the engine drains the
-        # in-flight pre-launch and applies the corrected state. Finishes
-        # are caught earlier (via _would_any_finish) and never reach the
-        # bookkeep with a stale pre-launch in flight, so they don't signal
-        # rejection.
+        # Set when CPU bookkeeping detects a finish/pause/evict event that
+        # invalidated the speculative pre-launch. Read by
+        # _async_scheduling_active to drop out of speculation on the next
+        # iter; cleared after the engine drains the in-flight pre-launch and
+        # applies the corrected state.
         self._rejection_pending = False
         # Holds the launch_state dict produced by a prior iteration's
         # speculative pre-launch of step N+1. The next iteration consumes it
@@ -2004,11 +2002,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Note: speculation also requires checks the engine performs *inside*
         the iteration: a batch-composition change after `schedule_waiting_
-        requests` aborts the consume-pending path, and a `_would_any_finish`
-        check on the just-sampled tokens skips the speculative pre-launch.
-        Together those make the gate's job simpler — finishes never reach
-        bookkeep with a stale pending pre-launch in flight, and adds are
-        caught the moment they happen.
+        requests` aborts the consume-pending path. Finishes detected by
+        bookkeep at the end of the iteration set `_rejection_pending` so the
+        next iter drains the wasted pre-launch — see :meth:`_signal_rejection`.
         """
         if not self.async_scheduling:
             return False
@@ -2019,57 +2015,24 @@ class DynamicInferenceEngine(AbstractEngine):
     def _signal_rejection(self) -> None:
         """Mark a rejection event so the next step drops out of speculation.
 
-        Called by CPU bookkeeping when a pause/evict event makes the
-        speculative metadata invalid. Cleared after the engine drains in-flight
-        forwards and applies the corrected state via transfer_bookkeeping_to_gpu.
+        Called at the end of the speculative iteration when bookkeep detects
+        any of: a request finished (EOS / max_seq_len / stop-word callback),
+        a pause/evict event, or a periodic finished-pending sync. The next
+        step's serial path drains the in-flight pre-launch via
+        :meth:`_drain_pending_launch` and applies the corrected state via
+        ``transfer_bookkeeping_to_gpu``.
 
-        Finishes are *not* signalled here — the engine catches finishes via
-        :meth:`_would_any_finish` before pre-launching, skipping the
-        speculative forward when any request would terminate this step.
-        That avoids the wasted forward that a post-bookkeep rejection
-        would have caused.
+        Cost of post-bookkeep rejection on finish: one wasted forward+sample
+        per finish event. Since pre-launch fires before bookkeep, the host
+        cannot know about the finish until the iteration ends — accepting
+        this cost is what lets pre-launch overlap with bookkeep on every
+        steady-state iteration.
         """
         self._rejection_pending = True
 
     def _clear_rejection(self) -> None:
         """Clear the rejection-pending flag after the engine has resynced."""
         self._rejection_pending = False
-
-    def _would_any_finish(self, sample_cpu: torch.Tensor, active_count: int) -> bool:
-        """Predict whether any active request will be marked finished by
-        :meth:`_dynamic_step_context_bookkeeping` for the just-sampled tokens.
-
-        Mirrors the active-request-mask computation done inside the
-        controller's bookkeep so the engine can decide whether to issue the
-        speculative pre-launch *before* committing GPU work. If any request
-        would finish, the bookkeep will compact the batch — invalidating any
-        pre-launch that used the old batch composition. Skipping the pre-
-        launch in that case avoids wasted GPU work.
-
-        A finish is detected when sample == termination_id, or when the
-        request's sequence length after this step would equal/exceed its
-        ``max_sequence_length``, or (if a stop-word callback is registered)
-        the callback flags the request id.
-        """
-        active_slice = slice(
-            self.context.paused_request_count,
-            self.context.paused_request_count + active_count,
-        )
-        term_ids = self.controller._request_metadata["termination_id"][active_slice]
-        if (sample_cpu[:active_count] == term_ids).any().item():
-            return True
-        active_seq_lens = self.context.get_active_sequence_lengths() + 1
-        max_seq_lens = self.context.get_max_sequence_lengths()
-        if (active_seq_lens >= max_seq_lens).any().item():
-            return True
-        if self.controller._get_stop_word_finished_ids_callback is not None:
-            request_ids = self.context.request_ids[active_slice].tolist()
-            stop_finished = self.controller._get_stop_word_finished_ids_callback(request_ids)
-            if stop_finished:
-                for rid in request_ids:
-                    if rid in stop_finished:
-                        return True
-        return False
 
     async def async_step(
         self,
@@ -2146,30 +2109,34 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Stream order maintained per iteration::
 
-            H2D_N → forward_N → sample_N → H2D_{N+1} → forward_{N+1} → sample_{N+1}
+            sample_N → D2H_N → H2D_{N+1} → forward_{N+1} → sample_{N+1}
 
         CPU sequence per iteration:
             1. Acquire step N's launch state — consume the pending pre-launch
                from the prior iteration, or launch fresh on warmup.
-            2. ``.cpu()`` _sampled_tokens_cuda — synchronous wait that blocks
-               CPU until sample_N completes. GPU is busy with forward_N →
-               sample_N during this wait, so no GPU idle time.
-            3. Snapshot the sampling RNG state so the next sample (the
-               speculative one) can be rolled back if the chain rejects.
-            4. Mirror sample_N into pinned ``token_to_input_ids`` so step
-               N+1's H2D copies the correct input to ``gpu_view``.
-            5. Speculatively advance state and pre-launch step N+1 (queues
-               H2D, forward, sample on the stream, advances RNG).
-            6. Run step N's full ``update_requests`` bookkeeping in parallel
-               with GPU step N+1. update_requests overwrites pinned token-
-               level fields but only ~100+ µs into its execution, by which
-               time the small (~5 µs) H2D for step N+1 has long completed.
+            2. Async D2H of sample_N into pinned ``token_to_input_ids`` and
+               record an event. The D2H is queued on the stream right after
+               sample_N, so the H2D for step N+1's pre-launch (queued next)
+               sees the correct sample_N value when it runs. Bookkeep waits
+               on the event before reading the same pinned slot.
+            3. Snapshot RNG, speculatively advance per-request state, and
+               pre-launch step N+1. Queues H2D, forward, sample on the stream
+               in order. Pre-launch fires while sample_N is still completing
+               on the GPU, so the host issuance overlaps with prior-step GPU
+               work.
+            4. Wait on the D2H event so bookkeep can read sample_N safely.
+            5. Run step N's bookkeeping (active_request_mask, update_requests).
+               Runs in parallel with GPU forward[N+1] and sample[N+1] which
+               are already queued.
 
-        Rejection events (finish/pause/evict) at the end of bookkeep set
+        Rejection events (finish / pause / evict) at the end of bookkeep set
         ``_rejection_pending`` so the next iteration drops to the serial
         path. The serial path's drain helper synchronizes the stream,
         discards the pre-launched step's results, and restores the
         sampling RNG so the re-sample matches the baseline byte-for-byte.
+        Cost of post-bookkeep rejection on finish: one wasted forward+
+        sample per finish event — accepted because pre-launch issuance no
+        longer waits for sample_N to complete on the host.
 
         Speculation is gated off (via ``can_speculate_decode_step``) for
         hybrid models because Mamba's SSM forward advances per-request
@@ -2248,39 +2215,34 @@ class DynamicInferenceEngine(AbstractEngine):
                 None, {**pre_step_context_state, "kv_stats": None}, 0.0
             )
 
-        # 2. D2H sample_N. Synchronous: blocks CPU until sample_N completes
-        # on the stream. GPU stays busy with forward_N → sample_N during the
-        # wait so the wait does not introduce a GPU-side gap.
         active_count = launch_state_N["_active_request_count"]
-        sample_N_cpu = self.controller._sampled_tokens_cuda[:active_count].cpu()
 
-        # 3. Pre-launch step N+1 if eligible. Two checks:
-        #    a) The context predicate (`can_speculate_decode_step`) — pure
-        #       decode, no boundary crossing, no speculative-decoding interaction.
-        #    b) `_would_any_finish` — if any request would terminate this step,
-        #       the bookkeep will compact the batch and any pre-launch we issue
-        #       here would be operating on a stale batch. Skipping the
-        #       pre-launch costs one cycle of GPU idle time but saves a wasted
-        #       forward + sample plus a serial drain on the next iter.
-        #
-        # Snapshot RNG + mamba state before the pre-launch so a *future*
-        # pause/evict rejection can roll them back; finishes never reach this
-        # path because we gate them at (b).
-        if (
-            self.context.can_speculate_decode_step()
-            and not self._would_any_finish(sample_N_cpu, active_count)
-        ):
+        # 2. Async D2H sample_N into the pinned token_to_input_ids buffer.
+        # Two effects:
+        #   - The pre-launch's H2D copies _cpu_bookkeeping_buf back to gpu_view.
+        #     Since this D2H is queued on the stream BEFORE that H2D, stream
+        #     order guarantees the pinned slot holds sample[N] when the H2D
+        #     reads it; gpu_view.token_to_input_ids ends up with sample[N] and
+        #     forward[N+1] reads it as input.
+        #   - bookkeep reads this same pinned slot as `sample_cpu_override`,
+        #     after waiting on the D2H event. CPU bookkeep work that doesn't
+        #     touch the sample (e.g., mask construction setup) overlaps with
+        #     the D2H + pre-launch issuance.
+        self.context.token_to_input_ids[:active_count].copy_(
+            self.controller._sampled_tokens_cuda[:active_count], non_blocking=True
+        )
+        sample_N_d2h_event = torch.cuda.Event()
+        sample_N_d2h_event.record()
+
+        # 3. Pre-launch step N+1 unconditionally on pure-decode chains.
+        # Finishes are no longer gated here; if a request finishes during
+        # bookkeep, the rejection signal at step 6 drains the wasted
+        # pre-launch on the next iter (see _drain_pending_launch). Cost:
+        # one wasted forward per finish event — far cheaper than the
+        # serial-fallback every iter that the prior gate caused.
+        if self.context.can_speculate_decode_step():
             self._pre_launch_rng_state = self.controller.sampling_rng.get_state()
             self.context.save_mamba_state_for_speculation()
-
-            # 4. Mirror sample_N into pinned token_to_input_ids before the
-            # speculative H2D so step N+1's forward reads sample_N as its
-            # input. update_requests would do this assignment near the end
-            # of step N's bookkeep, but we must do it here because the next
-            # H2D needs the value now.
-            self.context.token_to_input_ids[:active_count] = sample_N_cpu
-
-            # 5. Speculatively advance per-request state and pre-launch.
             self.context.speculatively_advance_for_next_decode_step()
             try:
                 pending = await self.controller._launch_decode_step()
@@ -2294,8 +2256,20 @@ class DynamicInferenceEngine(AbstractEngine):
             finally:
                 self.context.restore_after_speculative_advance()
 
-        # 6. CPU bookkeep step N using the pre-fetched sample. Runs in
-        # parallel with GPU step N+1 if speculation queued one.
+        # 4. Wait on the D2H event so bookkeep can read sample_N_cpu safely.
+        # By now the GPU has been doing forward[N]/sample[N] alongside the
+        # pre-launch host work, so the wait is bounded by sample[N]'s
+        # completion (~T_fwd + T_sample). Pre-launch's H2D and forward[N+1]
+        # follow on the stream and run concurrently with bookkeep CPU work.
+        # Clone out of the pinned view so subsequent iterations' D2H into the
+        # same slot don't mutate this iter's sample after the engine returns
+        # it via step_result["sample"].
+        sample_N_d2h_event.synchronize()
+        sample_N_cpu = self.context.token_to_input_ids[:active_count].clone()
+
+        # 5. CPU bookkeep step N. Runs concurrently with GPU step N+1 (which
+        # was queued in step 3 and the GPU starts executing as soon as
+        # sample[N] finishes on the stream).
         bookkeep_state = self.controller._bookkeep_decode_step(
             launch_state_N, sample_cpu_override=sample_N_cpu
         )
@@ -2311,12 +2285,17 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.prefix_cache_lru_clock += 1
         nvtx_range_pop("Decode")
 
-        # 7. Detect events that invalidate any pre-launch we just queued.
-        # Finishes never reach this point with a pre-launch in flight — the
-        # `_would_any_finish` gate above skipped the pre-launch on this iter.
-        # Pause/evict can still happen inside update_requests when memory
-        # pressure forces a request out; signal rejection so the next iter's
-        # serial path drains the stale pre-launch.
+        # 6. Detect events that invalidate the pre-launch and signal rejection
+        # so the next iter falls back to serial and drains the stale forward.
+        # Three trigger types:
+        #   - finish (EOS / max_seq_len / stop-word): the pre-launched forward
+        #     used the un-compacted batch; its sample slots now belong to
+        #     finished requests and would corrupt downstream state.
+        #   - newly_paused: memory pressure forced a request out mid-step.
+        #   - evict: paused-pool overflow forced a request out.
+        finished_ids = bookkeep_state.get("finished_request_ids")
+        if finished_ids is not None and len(finished_ids) > 0:
+            self._signal_rejection()
         if bookkeep_state.get("newly_paused_request_ids") is not None:
             self._signal_rejection()
         if bookkeep_state.get("evict_request_ids") is not None:

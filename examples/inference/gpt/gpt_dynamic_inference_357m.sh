@@ -38,13 +38,11 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 # Arguments.
 ARGS=" \
-    --exit-on-missing-checkpoint \
     --transformer-impl local \
-    --load ${CHECKPOINT_DIR} \
+    $( [ "${LOAD_CHECKPOINT:-1}" = "0" ] || echo "--exit-on-missing-checkpoint --load ${CHECKPOINT_DIR}" ) \
     --tokenizer-type GPT2BPETokenizer \
     --vocab-file ${VOCAB_FILE} \
     --merge-file ${MERGE_FILE} \
-    --exit-on-missing-checkpoint \
     --max-position-embeddings 2048 \
     --seq-length 2048 \
     --tensor-model-parallel-size 1 \
@@ -106,7 +104,7 @@ else
 fi
 
 if [[ -v NSIGHT_PREFIX ]]; then
-    CMD="nsys profile -s none -t nvtx,cuda --cudabacktrace=all --cuda-graph-trace=node --python-backtrace=cuda --wait all -o ${NSIGHT_PREFIX} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop ${CMD}"
+    CMD="nsys profile -s none -t nvtx,cuda --cuda-graph-trace=node --wait all -o ${NSIGHT_PREFIX} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop ${CMD}"
 fi
 
 echo "~~~"
