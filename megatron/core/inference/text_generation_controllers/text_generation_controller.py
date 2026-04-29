@@ -735,7 +735,7 @@ class TextGenerationController:
 
         # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
-            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits)
+            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
         else:
             self._all_logits_cuda = logits
 
@@ -1168,7 +1168,9 @@ class TextGenerationController:
             # already called in the forward pass of GPT.
             required_token_logits = self._all_logits_cuda.squeeze(0)[:active_request_count, :]
         else:
-            required_token_logits = context.last_token_logits(self._all_logits_cuda)
+            required_token_logits = context.last_token_logits(
+                self._all_logits_cuda[:, : context.padded_active_token_count, :]
+            )
 
         if self._sampling_backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
