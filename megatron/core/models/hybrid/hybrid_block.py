@@ -12,11 +12,10 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
-from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm, te_checkpoint
+from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -28,6 +27,10 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.transformer_block import (
+    checkpoint_with_recipe,
+    iterate_recompute_layers,
+)
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
@@ -275,63 +278,23 @@ class HybridStack(MegatronModule):
 
             return custom_forward
 
-        def checkpoint_handler(forward_func):
-            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            if self.config.fp8 or self.config.fp4:
-                return te_checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    hidden_states,
-                    attention_mask,
-                    rotary_pos_emb,
-                    padding_mask,
+        def chunk_runner(start: int, end: int, use_checkpoint: bool):
+            nonlocal hidden_states
+            cf = custom(start, end)
+            args = (hidden_states, attention_mask, rotary_pos_emb, padding_mask)
+            if use_checkpoint:
+                hidden_states = checkpoint_with_recipe(
+                    cf, self.config, self.pg_collection, *args
                 )
             else:
-                return tensor_parallel.checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    attention_mask,
-                    rotary_pos_emb,
-                    padding_mask,
-                )
+                hidden_states = cf(*args)
 
-        if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of layers and checkpoint
-            # the input activation of each divided chunk.
-            layer_idx = 0
-            while layer_idx < self.num_layers_per_pipeline_rank:
-                chunk_end = min(
-                    layer_idx + self.config.recompute_num_layers,
-                    self.num_layers_per_pipeline_rank,
-                )
-                hidden_states = checkpoint_handler(custom(layer_idx, chunk_end))
-                layer_idx += self.config.recompute_num_layers
-
-        elif self.config.recompute_method == 'block':
-            # Checkpoint the input activation of only a set number of individual
-            # layers and skip the rest.
-            recompute_skip_num_layers = 0
-            for layer_idx in range(self.num_layers_per_pipeline_rank):
-                # Skip recomputation when input grad computation is not needed.
-                # Need to have at least one input tensor with gradient computation
-                # for re-entrant autograd engine.
-                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
-                    recompute_skip_num_layers += 1
-                if (
-                    layer_idx >= recompute_skip_num_layers
-                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
-                ):
-                    hidden_states = checkpoint_handler(custom(layer_idx, layer_idx + 1))
-                else:
-                    hidden_states = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, rotary_pos_emb, padding_mask
-                    )
-        else:
-            raise ValueError("Invalid activation recompute method.")
-
+        iterate_recompute_layers(
+            chunk_runner=chunk_runner,
+            num_layers=self.num_layers_per_pipeline_rank,
+            config=self.config,
+            hidden_states_requires_grad=lambda: hidden_states.requires_grad,
+        )
         return hidden_states
 
     def forward(
@@ -541,4 +504,3 @@ class HybridStack(MegatronModule):
 # Backward-compatible aliases
 MambaStackSubmodules = HybridStackSubmodules
 MambaStack = HybridStack
-                                                                                                                                                                                                                                                

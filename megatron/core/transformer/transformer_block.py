@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Set, Union, cast
+from typing import Any, Callable, List, Optional, Set, Union, cast
 
 import torch
 from torch import Tensor
@@ -257,6 +257,76 @@ def _get_block_submodules(
             raise Exception(f"specialize for {spec.module.__name__}.")
     else:
         raise Exception(f"specialize for {type(spec).__name__}.")
+
+
+def checkpoint_with_recipe(
+    forward_func: Callable,
+    config: TransformerConfig,
+    pg_collection: ProcessGroupCollection,
+    *args: Tensor,
+) -> Any:
+    """Run ``forward_func(*args)`` under tensor-parallel-aware activation checkpointing.
+
+    Switches to TransformerEngine's ``te_checkpoint`` when FP8 or FP4 is enabled,
+    otherwise uses ``tensor_parallel.checkpoint``. ``args`` are the tensors saved
+    for the backward recompute pass.
+    """
+    if config.fp8 or config.fp4:
+        return te_checkpoint(
+            forward_func,
+            config.distribute_saved_activations,
+            tensor_parallel.random.get_cuda_rng_tracker,
+            pg_collection.tp,
+            *args,
+        )
+    return tensor_parallel.checkpoint(
+        forward_func, config.distribute_saved_activations, *args
+    )
+
+
+def iterate_recompute_layers(
+    *,
+    chunk_runner: Callable[[int, int, bool], None],
+    num_layers: int,
+    config: TransformerConfig,
+    hidden_states_requires_grad: Callable[[], bool],
+) -> None:
+    """Drive uniform / block activation-recompute iteration over ``num_layers`` layers.
+
+    For each chunk, calls ``chunk_runner(start, end, use_checkpoint)``. The caller is
+    responsible for running layers ``[start, end)`` (under a checkpoint when
+    ``use_checkpoint=True``) and threading whatever running state it needs (e.g.
+    ``hidden_states``, ``context``).
+
+    Inside the ``'block'`` branch, ``hidden_states_requires_grad()`` is consulted once per
+    layer to drive the FP8/FP4 grad-skip logic; the caller should typically pass
+    ``lambda: hidden_states.requires_grad`` so the closure observes updates.
+    """
+    if config.recompute_method == 'uniform':
+        # Uniformly divide the total number of layers and checkpoint
+        # the input activation of each divided chunk.
+        layer_idx = 0
+        while layer_idx < num_layers:
+            chunk_end = min(layer_idx + config.recompute_num_layers, num_layers)
+            chunk_runner(layer_idx, chunk_end, True)
+            layer_idx += config.recompute_num_layers
+    elif config.recompute_method == 'block':
+        # Checkpoint the input activation of only a set number of individual
+        # layers and skip the rest.
+        recompute_skip_num_layers = 0
+        for layer_idx in range(num_layers):
+            # Skip recomputation when input grad computation is not needed.
+            # Need to have at least one input tensor with gradient computation
+            # for re-entrant autograd engine.
+            if (config.fp8 or config.fp4) and not hidden_states_requires_grad():
+                recompute_skip_num_layers += 1
+            use_checkpoint = (
+                layer_idx >= recompute_skip_num_layers
+                and layer_idx < config.recompute_num_layers + recompute_skip_num_layers
+            )
+            chunk_runner(layer_idx, layer_idx + 1, use_checkpoint)
+    else:
+        raise ValueError("Invalid activation recompute method.")
 
 
 class TransformerBlock(GraphableMegatronModule, MegatronModule):
@@ -515,83 +585,42 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
             return custom_forward
 
-        def checkpoint_handler(forward_func):
-            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            # TODO: check if fp4 is supported in this case
-            if self.config.fp8 or self.config.fp4:
-                return te_checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    padding_mask,
+        def chunk_runner(start: int, end: int, use_checkpoint: bool):
+            nonlocal hidden_states, context
+            cf = custom(start, end)
+            args = (
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                padding_mask,
+            )
+            if use_checkpoint:
+                hidden_states, context = checkpoint_with_recipe(
+                    cf, self.config, self.pg_collection, *args
                 )
             else:
-                return tensor_parallel.checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                    padding_mask,
-                )
+                # Note: original block-branch no-checkpoint path omitted padding_mask
+                # (relied on its default=None); restored here for consistency.
+                hidden_states, context = cf(*args)
 
-        if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            layer_idx = 0
-            while layer_idx < self.num_layers_per_pipeline_rank:
-                chunk_end = min(
-                    layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
-                )
-                hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
-
-                # Feature extraction for uniform recompute: collect at end of each chunk
-                # Note: Only the last layer of each chunk can have features collected
-                for idx in range(layer_idx, chunk_end):
-                    if (idx + layer_offset) in extract_layer_indices:
-                        # For uniform recompute, we can only get features at chunk boundaries
-                        # Limitation: for fine-grained extraction, use 'block'
-                        if idx == chunk_end - 1:
-                            intermediate_hidden_states.append(hidden_states)
-
-                layer_idx += self.config.recompute_num_layers
-
-        elif self.config.recompute_method == 'block':
-            # Checkpoint the input activation of only a set number of individual
-            # Transformer layers and skip the rest.
-            # A method fully use the device memory removing redundant re-computation.
-            recompute_skip_num_layers = 0
-            for layer_idx in range(self.num_layers_per_pipeline_rank):
-                # Skip recomputation when input grad computation is not needed.
-                # Need to have at least one input tensor with gradient computation
-                # for re-enterant autograd engine.
-                # TODO: check if fp4 is supported in this case
-                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
-                    recompute_skip_num_layers += 1
-                if (
-                    layer_idx >= recompute_skip_num_layers
-                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
-                ):
-                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
-                else:
-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
-                    )
-
-                # Feature extraction: collect hidden states at specified global layer indices
-                if (layer_idx + layer_offset) in extract_layer_indices:
+            # Feature extraction.
+            if self.config.recompute_method == 'uniform':
+                # For uniform, only the last layer of each chunk can have features collected.
+                # For fine-grained extraction, use 'block'.
+                if (end - 1 + layer_offset) in extract_layer_indices:
                     intermediate_hidden_states.append(hidden_states)
-        else:
-            raise ValueError("Invalid activation recompute method.")
+            else:  # 'block' — chunk size 1, so start == end - 1
+                if (start + layer_offset) in extract_layer_indices:
+                    intermediate_hidden_states.append(hidden_states)
+
+        iterate_recompute_layers(
+            chunk_runner=chunk_runner,
+            num_layers=self.num_layers_per_pipeline_rank,
+            config=self.config,
+            hidden_states_requires_grad=lambda: hidden_states.requires_grad,
+        )
 
         # Return intermediate hidden states if feature extraction was requested
         if len(extract_layer_indices) > 0:
