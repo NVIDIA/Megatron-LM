@@ -24,6 +24,7 @@ from megatron.core.dist_checkpointing.exchange_utils import (
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
 from megatron.core.dist_checkpointing.strategies.local_replica import (
+    compute_shadow_shard_ids,
     rewrite_replicas_to_shadow,
 )
 from megatron.core.dist_checkpointing.strategies.torch import (
@@ -97,6 +98,12 @@ class FullyParallelSaveStrategyWrapper:
         self.replicate_local_replicas = replicate_local_replicas
 
         self.cached_distribution: Optional[ShardDistribution] = None
+        # Companion cache for the load-mode distribution that is needed by
+        # the algorithmic shadow filter. Only populated when
+        # ``replicate_local_replicas`` is True; mirrors ``cached_distribution``
+        # so that ``do_cache_distribution=True`` continues to skip every
+        # all_gather on subsequent saves.
+        self.cached_load_distribution: Optional[ShardDistribution] = None
 
     def async_save(
         self,
@@ -128,15 +135,32 @@ class FullyParallelSaveStrategyWrapper:
 
         Returns: None
         """
+        from megatron.core.utils import get_pg_rank
+
         start = time()
         if self.do_cache_distribution and self.cached_distribution is not None:
             logger.debug(f'Apply *cached* save parallelization')
             precomputed_distribution = self.cached_distribution
+            load_distribution = self.cached_load_distribution
         else:
             logger.debug(f'Apply save parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
                 sharded_state_dict, self.parallelization_group
             )
+            # Local-replica mode needs the load-side picker to decide which
+            # shards actually cross-read at load time. We compute it here,
+            # *before* the save distribution mutates ``replica_id`` values,
+            # so that the picker sees the same input as it will at load
+            # time (the user's ``replica_id`` convention from
+            # ``make_(tp_)sharded_tensor_for_checkpoint``). With matching
+            # inputs the deterministic picker produces the same output at
+            # save and load — which is exactly the alignment the filter
+            # relies on.
+            load_distribution: Optional[ShardDistribution] = None
+            if self.replicate_local_replicas:
+                load_distribution = determine_main_replica_uniform_distribution(
+                    sharded_state_dict, self.parallelization_group, True
+                )
 
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
@@ -146,18 +170,30 @@ class FullyParallelSaveStrategyWrapper:
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
+            self.cached_load_distribution = load_distribution
 
-        # Local-replica mode: every non-main local replica is renamed to a
-        # per-rank shadow FQN and promoted to a saver. This must run *after*
-        # validate_sharding_integrity (which expects the original key
-        # topology) and *after* the cached_distribution snapshot above (so
-        # subsequent saves replay the same rename deterministically).
+        # Local-replica mode: rename only the local replicas that the load
+        # picker would actually pull over the network. The filter
+        # (``compute_shadow_shard_ids``) returns shard ids where this rank
+        # is the load picker AND the save picker did not pick this rank in
+        # this group — exactly the shards that would otherwise cross-read.
+        # This must run *after* validate_sharding_integrity (which expects
+        # the original key topology) and *after* the cached_distribution
+        # snapshot above (so subsequent saves replay the same rename
+        # deterministically).
         if self.replicate_local_replicas:
             global_rank = torch.distributed.get_rank()
-            n_renamed = rewrite_replicas_to_shadow(sharded_state_dict, global_rank)
+            rank_in_group = get_pg_rank(group=self.parallelization_group)
+            shadow_shard_ids = compute_shadow_shard_ids(
+                precomputed_distribution, load_distribution, rank_in_group
+            )
+            n_renamed = rewrite_replicas_to_shadow(
+                sharded_state_dict, global_rank, shadow_shard_ids=shadow_shard_ids
+            )
             logger.debug(
                 f"replicate_local_replicas: renamed {n_renamed} ShardedTensors "
-                f"to shadow keys on rank {global_rank}"
+                f"to shadow keys on rank {global_rank} "
+                f"(shadow set size: {len(shadow_shard_ids)})"
             )
         end = time()
         logger.debug(f"parallel save sharding, time: {end - start}")

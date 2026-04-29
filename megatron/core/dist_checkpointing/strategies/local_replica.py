@@ -38,10 +38,14 @@ audit.
 from __future__ import annotations
 
 import re
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple, TYPE_CHECKING
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
+from megatron.core.dist_checkpointing.utils import _sharded_tensor_shard_id, _ShardId
+
+if TYPE_CHECKING:
+    from megatron.core.dist_checkpointing.exchange_utils import ShardDistribution
 
 SHADOW_PREFIX = "__shadow_"
 """Stable prefix used by every shadow FQN.
@@ -97,37 +101,122 @@ def is_shadow_key(fqn: str) -> bool:
     return _SHADOW_RE.match(fqn) is not None
 
 
-def rewrite_replicas_to_shadow(
-    sharded_state_dict: ShardedStateDict, global_rank: int
-) -> int:
-    """Promote every non-main local replica to a shadow saver in place.
+def compute_shadow_shard_ids(
+    save_distribution: Optional["ShardDistribution"],
+    load_distribution: Optional["ShardDistribution"],
+    rank_in_group: int,
+) -> Set[_ShardId]:
+    """Compute which shard ids THIS rank should write as a shadow.
 
-    Walks every :class:`ShardedTensor` in ``sharded_state_dict``. If the
-    tensor's ``replica_id`` is non-zero — meaning the wrapper's
-    parallelization step picked another rank in the group as the main saver
-    — we set ``replica_id = 0`` *and* rename ``key`` to a per-rank shadow
-    FQN. After this pass every local ShardedTensor is a "saver" from the
-    perspective of the underlying ``TorchDistSaveShardedStrategy``: main
-    keeps the original key, shadow uses ``shadow_key(global_rank, key)``.
+    The cross-read at load time happens exactly when the rank that
+    ``FullyParallelLoad`` picks as the reader for a shard is *not* the
+    rank that physically wrote that shard to disk during save. To
+    eliminate the cross-read it is sufficient — and necessary — for the
+    load-picker rank to have its own copy on disk. This function is the
+    decision rule that produces the shadow set per rank.
 
-    The state dict is mutated in place. Callers are expected to pass the
-    *save-only view* used by :meth:`FullyParallelSaveStrategyWrapper.async_save`,
-    not the live training state, so this mutation does not leak to the user.
+    A shard requires a shadow on this rank iff:
 
-    Decision: we don't deep-copy the ShardedTensor because the underlying
-    ``data`` tensor is the same object the rank already holds — a copy would
-    double the host memory footprint of the save state dict for no benefit.
+    1. ``load_distribution.main_rank_for_shard[shard]`` is this rank
+       (the rank-within-group); i.e. the load-side picker selected
+       this rank to read the shard.
+    2. AND ``save_distribution.main_rank_for_shard.get(shard) != rank``,
+       which captures **both** failure modes that produce a cross-read:
+
+       * The shard was not in save's scope at all in this group (no rank
+         in the group had the user-side ``replica_id == 0`` for that
+         shard, so save mode skipped it). ``save.get(shard)`` is missing.
+         The save-side writer lives in another parallelization group, so
+         loading from "the metadata's primary file" means crossing a
+         file-system boundary inside the same global checkpoint.
+       * The shard was in scope but save and load picked different ranks
+         within this group. The save-side writer is the other rank in
+         the same group; loading from that file is still a cross-read.
+
+    The function intentionally returns the per-rank set rather than a
+    global ``shard_id -> rank`` mapping because the renamer applies the
+    rename only on the local rank — there is no need to materialise the
+    rename plan globally. Each rank computes its own set deterministically
+    from the same gathered metadata, so no extra communication is needed.
+
+    Args:
+        save_distribution: result of
+            ``determine_main_replica_uniform_distribution(..., ignore_groups=False)``.
+        load_distribution: result of
+            ``determine_main_replica_uniform_distribution(..., ignore_groups=True)``.
+        rank_in_group: this rank's rank within the parallelization group
+            (``get_pg_rank(parallelization_group)``).
 
     Returns:
-        Number of ShardedTensors that were renamed to a shadow key. Useful
-        for assertions in tests.
+        The set of shard ids this rank should write under a shadow FQN.
+    """
+    if save_distribution is None or load_distribution is None:
+        return set()
+    out: Set[_ShardId] = set()
+    save_picks = save_distribution.main_rank_for_shard
+    load_picks = load_distribution.main_rank_for_shard
+    for shard_id, load_main in load_picks.items():
+        if load_main != rank_in_group:
+            continue
+        if save_picks.get(shard_id) == rank_in_group:
+            # I'm both save and load main → I'll read my own file at load
+            # time. No cross-read, no shadow needed.
+            continue
+        out.add(shard_id)
+    return out
+
+
+def rewrite_replicas_to_shadow(
+    sharded_state_dict: ShardedStateDict,
+    global_rank: int,
+    shadow_shard_ids: Optional[Set[_ShardId]] = None,
+) -> int:
+    """Promote selected local replicas to shadow savers in place.
+
+    Two filtering modes:
+
+    * ``shadow_shard_ids is None`` — *legacy mode*. Every non-main local
+      replica (``replica_id != 0`` after the wrapper's parallelization
+      step) is renamed. This pessimistically shadows replicas that may
+      not actually cross-read, but it is the original behaviour before
+      the algorithmic filter was added; we keep it as the fallback.
+
+    * ``shadow_shard_ids`` is a set — *filtered mode*. Only shards whose
+      id is in the set are renamed, regardless of their current
+      ``replica_id``. The set is expected to come from
+      :func:`compute_shadow_shard_ids` and contains exactly the shards
+      this rank should write to avoid a cross-read at load time.
+
+    For each renamed tensor we set ``replica_id = 0`` so the underlying
+    ``TorchDistSaveShardedStrategy``'s ``keep_only_main_replica`` filter
+    keeps the write item. We rewrite ``sh_ten.key`` to the per-rank
+    shadow FQN so PyT DCP's ``MetadataIndex``-keyed dedup does not
+    collapse two ranks' copies into a single storage entry.
+
+    The state dict is mutated in place. Callers are expected to pass the
+    *save-only view* used by :meth:`FullyParallelSaveStrategyWrapper.async_save`
+    — never the live training state — so this mutation does not leak to
+    the user.
+
+    Decision: we don't deep-copy the ShardedTensor because the underlying
+    ``data`` tensor is the same object the rank already holds — a copy
+    would double the host memory footprint of the save state dict for no
+    benefit.
+
+    Returns:
+        Number of ShardedTensors that were renamed to a shadow key. Used
+        by tests and ``logger.debug`` accounting.
     """
     n_renamed = 0
     for sh in nested_values(sharded_state_dict):
         if not isinstance(sh, ShardedTensor):
             continue
-        if sh.replica_id == 0:
-            continue
+        if shadow_shard_ids is None:
+            if sh.replica_id == 0:
+                continue
+        else:
+            if _sharded_tensor_shard_id(sh) not in shadow_shard_ids:
+                continue
         print(f"[DEBUG shadow keys | {global_rank}] {sh.key} -> {shadow_key(global_rank, sh.key)}")
         sh.key = shadow_key(global_rank, sh.key)
         sh.replica_id = 0
