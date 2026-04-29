@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple, Union, cast
 
 import torch
-import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -23,10 +22,7 @@ from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
-from megatron.core.transformer.hyper_connection import (
-    HyperConnectionModule,
-    learned_output_contract,
-)
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -385,12 +381,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
-            if self.config.enable_hyper_connections:
-                hc_mult = self.config.num_residual_streams
-                hc_dim = self.config.hidden_size * hc_mult
-                self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
-                self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
-                self.hc_head_scale = nn.Parameter(torch.ones(1))
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -937,15 +927,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Only contract if the final layer norm is in this stage
         if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
-            # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            hidden_states = HyperConnectionModule.output_contract(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.
         if self.final_layernorm is not None:
