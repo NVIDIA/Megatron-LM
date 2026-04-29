@@ -659,9 +659,22 @@ class TestPatternWhitelist:
         layer_types = parse_hybrid_layer_pattern("MMMM")
         validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
 
-    def test_rejects_moe_symbol(self):
-        layer_types = parse_hybrid_layer_pattern("M*-E")
-        with pytest.raises(ValueError, match="not GPT-compatible"):
+    def test_accepts_moe_pattern(self):
+        # MoE layers ('E') round-trip through the converter as long as every
+        # MLP-bearing position is the same kind.
+        layer_types = parse_hybrid_layer_pattern("M*EM*EM*E")
+        validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+
+    def test_accepts_pure_attn_moe_pattern(self):
+        # No SSM, alternating attn/MoE — i.e. a Mixtral-like GPT.
+        layer_types = parse_hybrid_layer_pattern("*E*E*E")
+        validate_pattern_gpt_compatible(layer_types, 'mamba-to-gpt')
+
+    def test_rejects_mixed_dense_and_moe(self):
+        # GPT layers must be uniform: '-' (dense) and 'E' (MoE) cannot both
+        # appear in the same pattern.
+        layer_types = parse_hybrid_layer_pattern("M*-M*E")
+        with pytest.raises(ValueError, match="uniform"):
             validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
 
     def test_rejects_gdn_symbol(self):
@@ -674,13 +687,18 @@ class TestPatternWhitelist:
         with pytest.raises(ValueError, match="pair every attention"):
             validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
 
+    def test_unequal_attn_moe_also_rejected(self):
+        # Same uniformity check, but with MoE — 2 attn, 1 MoE.
+        layer_types = parse_hybrid_layer_pattern("M**E")
+        with pytest.raises(ValueError, match="pair every attention"):
+            validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+
     def test_error_lists_offending_symbols(self):
-        layer_types = parse_hybrid_layer_pattern("M*-EG")
+        # 'G' is still rejected; the error message should mention it.
+        layer_types = parse_hybrid_layer_pattern("M*-G")
         with pytest.raises(ValueError) as exc:
             validate_pattern_gpt_compatible(layer_types, 'mamba-to-gpt')
-        msg = str(exc.value)
-        assert 'E' in msg
-        assert 'G' in msg
+        assert 'G' in str(exc.value)
 
 
 class TestSourceArgsWhitelist:
@@ -719,24 +737,36 @@ class TestSourceArgsWhitelist:
         minimal = argparse.Namespace(num_moe_experts=None)
         validate_source_args_gpt_compatible(minimal, 'mamba-to-gpt')
 
-    def test_rejects_moe(self):
-        with pytest.raises(ValueError, match="MoE"):
-            validate_source_args_gpt_compatible(self._ok_args(num_moe_experts=8), 'gpt-to-mamba')
+    def test_accepts_moe_args(self):
+        # MoE keys live under decoder.layers.<i>.mlp.* and round-trip as-is.
+        validate_source_args_gpt_compatible(
+            self._ok_args(num_moe_experts=8), 'gpt-to-mamba'
+        )
 
-    def test_rejects_shared_expert(self):
-        with pytest.raises(ValueError, match="shared expert"):
-            validate_source_args_gpt_compatible(
-                self._ok_args(moe_shared_expert_intermediate_size=4096), 'gpt-to-mamba'
-            )
+    def test_accepts_shared_expert_args(self):
+        # Shared experts also live under mlp.shared_experts.* and round-trip.
+        validate_source_args_gpt_compatible(
+            self._ok_args(
+                num_moe_experts=8, moe_shared_expert_intermediate_size=4096
+            ),
+            'gpt-to-mamba',
+        )
 
     def test_rejects_moe_layer_freq_list(self):
-        with pytest.raises(ValueError, match="MoE layers"):
+        # Heterogeneous interleaving (some dense, some MoE) breaks GPT uniformity.
+        with pytest.raises(ValueError, match="interleaved"):
             validate_source_args_gpt_compatible(
                 self._ok_args(moe_layer_freq=[1, 0, 1, 0]), 'gpt-to-mamba'
             )
 
     def test_accepts_moe_layer_freq_1(self):
         validate_source_args_gpt_compatible(self._ok_args(moe_layer_freq=1), 'gpt-to-mamba')
+
+    def test_accepts_moe_layer_freq_all_ones_list(self):
+        # An all-1s list is uniform (every layer is the same kind) and accepted.
+        validate_source_args_gpt_compatible(
+            self._ok_args(moe_layer_freq=[1, 1, 1, 1]), 'gpt-to-mamba'
+        )
 
     def test_rejects_experimental_attention(self):
         with pytest.raises(ValueError, match="experimental attention"):
@@ -773,11 +803,12 @@ class TestSourceArgsWhitelist:
             validate_source_args_gpt_compatible(self._ok_args(mtp_num_layers=2), 'gpt-to-mamba')
 
     def test_reports_multiple_reasons(self):
-        # Both MoE and MLA set: the error should surface both.
+        # Both heterogeneous moe_layer_freq and MLA set — both should be reported.
         with pytest.raises(ValueError) as exc:
             validate_source_args_gpt_compatible(
-                self._ok_args(num_moe_experts=8, multi_latent_attention=True), 'gpt-to-mamba'
+                self._ok_args(moe_layer_freq=[1, 0], multi_latent_attention=True),
+                'gpt-to-mamba',
             )
         msg = str(exc.value)
-        assert 'MoE' in msg
+        assert 'interleaved' in msg
         assert 'Multi-Latent' in msg

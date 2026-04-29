@@ -46,8 +46,15 @@ def make_checkpoint_args(
     seq_length=256,
     max_position_embeddings=256,
     iteration=100,
+    num_moe_experts=None,
+    moe_shared_expert_intermediate_size=None,
 ):
-    """Build a minimal checkpoint 'args' namespace mirroring Megatron's."""
+    """Build a minimal checkpoint 'args' namespace mirroring Megatron's.
+
+    Set ``num_moe_experts`` to make the source/target a MoE GPT; the converter
+    will then pass the MoE config through unchanged so the round-trip stays
+    structurally consistent.
+    """
     return SimpleNamespace(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -65,11 +72,30 @@ def make_checkpoint_args(
         params_dtype=torch.float32,
         fp16=False,
         bf16=False,
+        num_moe_experts=num_moe_experts,
+        moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+        moe_layer_freq=1,
     )
 
 
-def make_gpt_state_dict(num_layers, hidden_size, vocab_size=1024, dtype=torch.float32):
-    """Create a minimal GPT model state dict with the standard Megatron keys."""
+def make_gpt_state_dict(
+    num_layers,
+    hidden_size,
+    vocab_size=1024,
+    dtype=torch.float32,
+    num_moe_experts=None,
+    shared_expert_size=None,
+):
+    """Create a minimal GPT state dict with the standard Megatron keys.
+
+    Dense MLP layout (default): ``mlp.linear_fc1`` / ``mlp.linear_fc2``.
+    MoE layout (``num_moe_experts`` set): ``mlp.router`` plus N experts under
+    ``mlp.experts.local_experts.<j>.linear_fc{1,2}``, optionally a shared
+    expert under ``mlp.shared_experts.linear_fc{1,2}``. These are exactly the
+    keys Megatron writes for non-grouped-GEMM MoE — they all live under
+    ``decoder.layers.<i>.mlp.*`` so the converter ferries them through with no
+    MoE-specific code.
+    """
     sd = OrderedDict()
     sd['embedding.word_embeddings.weight'] = torch.randn(vocab_size, hidden_size, dtype=dtype)
 
@@ -83,8 +109,30 @@ def make_gpt_state_dict(num_layers, hidden_size, vocab_size=1024, dtype=torch.fl
             hidden_size, hidden_size, dtype=dtype
         )
         sd[p + 'pre_mlp_layernorm.weight'] = torch.randn(hidden_size, dtype=dtype)
-        sd[p + 'mlp.linear_fc1.weight'] = torch.randn(4 * hidden_size, hidden_size, dtype=dtype)
-        sd[p + 'mlp.linear_fc2.weight'] = torch.randn(hidden_size, 4 * hidden_size, dtype=dtype)
+
+        if num_moe_experts is None:
+            # Dense MLP
+            sd[p + 'mlp.linear_fc1.weight'] = torch.randn(4 * hidden_size, hidden_size, dtype=dtype)
+            sd[p + 'mlp.linear_fc2.weight'] = torch.randn(hidden_size, 4 * hidden_size, dtype=dtype)
+        else:
+            # MoE: router + N experts (+ optional shared expert)
+            sd[p + 'mlp.router.weight'] = torch.randn(num_moe_experts, hidden_size, dtype=dtype)
+            for j in range(num_moe_experts):
+                ep = p + f'mlp.experts.local_experts.{j}.'
+                sd[ep + 'linear_fc1.weight'] = torch.randn(
+                    4 * hidden_size, hidden_size, dtype=dtype
+                )
+                sd[ep + 'linear_fc2.weight'] = torch.randn(
+                    hidden_size, 4 * hidden_size, dtype=dtype
+                )
+            if shared_expert_size is not None:
+                sp = p + 'mlp.shared_experts.'
+                sd[sp + 'linear_fc1.weight'] = torch.randn(
+                    shared_expert_size, hidden_size, dtype=dtype
+                )
+                sd[sp + 'linear_fc2.weight'] = torch.randn(
+                    hidden_size, shared_expert_size, dtype=dtype
+                )
 
     sd['decoder.final_layernorm.weight'] = torch.randn(hidden_size, dtype=dtype)
     sd['output_layer.weight'] = torch.randn(vocab_size, hidden_size, dtype=dtype)
@@ -145,11 +193,15 @@ def _run_scenario(
     hidden_size=128,
     pattern="M*-M*-M*-M*-",
     source_prefix='model.',
+    num_moe_experts=None,
+    shared_expert_size=None,
 ):
     """Build a GPT source ckpt, convert GPT->Mamba->GPT, verify round-trip."""
     print(f"\n=== {label} ===")
     print(f"  source={source_format} (prefix='{source_prefix}')")
     print(f"  target={target_format}")
+    if num_moe_experts is not None:
+        print(f"  MoE: num_experts={num_moe_experts} shared={shared_expert_size}")
 
     tmpdir = tempfile.mkdtemp(prefix=f'gpt_mamba_{label.replace(" ", "_")}_')
     try:
@@ -157,8 +209,17 @@ def _run_scenario(
         mamba_dir = os.path.join(tmpdir, 'mamba_mid')
         dst_gpt_dir = os.path.join(tmpdir, 'gpt_dst')
 
-        ckpt_args = make_checkpoint_args(num_layers=num_layers, hidden_size=hidden_size)
-        gpt_sd = make_gpt_state_dict(num_layers, hidden_size)
+        ckpt_args = make_checkpoint_args(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_moe_experts=num_moe_experts,
+            moe_shared_expert_intermediate_size=shared_expert_size,
+        )
+        gpt_sd = make_gpt_state_dict(
+            num_layers, hidden_size,
+            num_moe_experts=num_moe_experts,
+            shared_expert_size=shared_expert_size,
+        )
 
         _save_dist_checkpoint(
             src_gpt_dir, gpt_sd, ckpt_args, prefix=source_prefix, backend=source_format
@@ -254,6 +315,52 @@ def test_torch_dist_dense_ssm_pattern():
     _run_scenario("torch_dist dense SSM", 'torch_dist', 'torch_dist', pattern="MM*-MM*-MM*-MM*-")
 
 
+def test_torch_dist_moe_roundtrip():
+    """MoE GPT (Mixtral-style) round-trips through an 'E'-bearing pattern.
+
+    Source has num_moe_experts=4 and writes mlp.router / mlp.experts.* keys.
+    The hybrid pattern 'M*EM*EM*E' has 3 'E' positions, one per source layer.
+    The converter should ferry the router + every per-expert tensor through
+    verbatim — no MoE-specific code path involved.
+    """
+    _run_scenario(
+        "torch_dist MoE roundtrip",
+        'torch_dist',
+        'torch_dist',
+        num_layers=3,
+        pattern="M*EM*EM*E",
+        num_moe_experts=4,
+    )
+
+
+def test_torch_dist_moe_with_shared_experts():
+    """MoE + shared experts round-trip together (mlp.shared_experts.* keys)."""
+    _run_scenario(
+        "torch_dist MoE+shared",
+        'torch_dist',
+        'torch_dist',
+        num_layers=3,
+        hidden_size=64,
+        pattern="*E*E*E",
+        num_moe_experts=4,
+        shared_expert_size=64 * 2,
+    )
+
+
+def test_fsdp_dtensor_moe_roundtrip():
+    """MoE round-trips through fsdp_dtensor (covers the 'model.module.' prefix
+    case combined with MoE keys)."""
+    _run_scenario(
+        "fsdp_dtensor MoE roundtrip",
+        'fsdp_dtensor',
+        'fsdp_dtensor',
+        num_layers=3,
+        pattern="M*EM*EM*E",
+        num_moe_experts=4,
+        source_prefix='model.module.',
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -268,6 +375,9 @@ if __name__ == '__main__':
     test_fsdp_dtensor_prefix()
     test_torch_dist_alternating_pattern()
     test_torch_dist_dense_ssm_pattern()
+    test_torch_dist_moe_roundtrip()
+    test_torch_dist_moe_with_shared_experts()
+    test_fsdp_dtensor_moe_roundtrip()
 
     print("=" * 60)
     print("ALL PARALLELISM MATRIX TESTS PASSED")

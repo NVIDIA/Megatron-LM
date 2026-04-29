@@ -14,18 +14,31 @@ Supported directions:
 
 How the hybrid layer pattern maps GPT layers (gpt-to-mamba):
     - Each GPT layer contains both attention and MLP sub-layers.
-    - The target Mamba model's hybrid_layer_pattern specifies per-layer types:
+    - The target hybrid model's hybrid_layer_pattern specifies per-layer types:
         M = Mamba SSM layer
         * = Attention-only layer
-        - = MLP-only layer
-        G = GDN layer
-        E = MoE layer
+        - = MLP-only layer (dense)
+        E = MoE MLP-only layer (router + experts; supports EP)
+        G = GDN layer (not currently mapped)
     - GPT layer i's attention params map to the i-th '*' layer in the pattern.
-    - GPT layer i's MLP params map to the i-th '-' layer in the pattern.
-    - The number of '*' and '-' layers in the pattern must both equal the number
-      of GPT layers.
+    - GPT layer i's MLP/MoE params map to the i-th MLP-bearing position
+      ('-' or 'E') in the pattern. Dense ('-') and MoE ('E') cannot be mixed:
+      GPT layers are uniform.
+    - The number of '*' positions and MLP-bearing positions must each equal
+      the number of GPT layers.
     - Mamba SSM ('M') layers have no GPT equivalent and are initialized from
       scratch using standard Mamba initialization.
+
+How MoE / Expert Parallelism (EP) works through the converter:
+    - GPTModel can run with MoE (Mixtral-style: every layer has a router and
+      N local experts). State-dict keys live under
+      `decoder.layers.<i>.mlp.{router,experts,shared_experts}.*`.
+    - Hybrid 'E' layers use the same key naming, so MoE tensors round-trip
+      verbatim — no expert collapsing, no router init, no per-expert work.
+    - EP-sharded checkpoints load through DCP transparently because each
+      tensor's `global_shape` is in the metadata, regardless of how many
+      EP / TP / PP / FSDP ranks wrote it.
+    - Use a pattern like 'M*EM*EM*E' to pair Mamba/Attn/MoE-MLP per stage.
 
 What happens to SSM parameters:
     gpt-to-mamba: SSM layers (M) are initialized from scratch:
@@ -124,13 +137,16 @@ VALID_LAYER_SYMBOLS = {'M', 'G', '*', '-', 'E'}
 
 # Layer symbols GPTModel can emit or absorb:
 #   '*' : standard self-attention layer (MHA / GQA / MQA)
-#   '-' : standard (optionally gated) MLP layer
+#   '-' : standard (optionally gated) dense MLP layer
+#   'E' : MoE MLP layer. Both sides keep the keys under
+#         decoder.layers.<i>.mlp.{router,experts,shared_experts}.* so MoE
+#         tensors round-trip verbatim (see convert_gpt_to_mamba and
+#         convert_mamba_to_gpt — `is_mlp_param` already matches `mlp.*`).
 # SSM ('M') has no GPT equivalent and is initialized from scratch /
 # discarded (see convert_gpt_to_mamba / convert_mamba_to_gpt).
-# Everything else is an architecture feature GPTModel does NOT
-# produce: GDN ('G'), DS-attention ('D'), MoE ('E'). If the hybrid
-# model contains any of those, we cannot faithfully translate.
-GPT_COMPATIBLE_PATTERN_SYMBOLS = {'M', '*', '-'}
+# 'G' (GDN) and 'D' (DS-attention) are not currently mapped — they would
+# need separate key-naming work. Reject for now.
+GPT_COMPATIBLE_PATTERN_SYMBOLS = {'M', '*', '-', 'E'}
 
 
 def parse_hybrid_layer_pattern(pattern):
@@ -156,30 +172,38 @@ def parse_hybrid_layer_pattern(pattern):
     return layer_types
 
 
+# Pattern symbols that pair to a GPT-side MLP block. Both dense ('-') and MoE
+# ('E') keep their state-dict keys under `decoder.layers.<i>.mlp.*`, so they
+# round-trip identically. The pattern uniformity check
+# (validate_pattern_gpt_compatible) ensures '-' and 'E' don't appear together,
+# which would mean GPT layers aren't uniform.
+_MLP_BEARING_SYMBOLS = ('-', 'E')
+
+
 def build_layer_index_mapping(layer_types, direction):
-    """Build mapping between GPT layer indices and Mamba layer indices.
+    """Build mapping between GPT layer indices and hybrid-model layer indices.
 
     For gpt-to-mamba:
-        Returns (attn_map, mlp_map) where:
-        - attn_map[gpt_layer_i] = mamba_layer_j  (j is the index of the i-th '*')
-        - mlp_map[gpt_layer_i]  = mamba_layer_k  (k is the index of the i-th '-')
+        Returns (attn_map, mlp_map, ssm_indices) where:
+        - attn_map[gpt_layer_i] = hybrid_layer_j  (j is the index of the i-th '*')
+        - mlp_map[gpt_layer_i]  = hybrid_layer_k  (k is the index of the i-th
+          MLP-bearing position; either '-' or 'E')
 
     For mamba-to-gpt:
-        Returns (attn_map, mlp_map) where:
-        - attn_map[mamba_attn_idx] = gpt_layer_i
-        - mlp_map[mamba_mlp_idx]   = gpt_layer_i
+        Returns (attn_map, mlp_map, ssm_indices) where:
+        - attn_map[hybrid_attn_idx] = gpt_layer_i
+        - mlp_map[hybrid_mlp_idx]   = gpt_layer_i
     """
     attn_indices = [i for i, t in enumerate(layer_types) if t == '*']
-    mlp_indices = [i for i, t in enumerate(layer_types) if t == '-']
+    mlp_indices = [i for i, t in enumerate(layer_types) if t in _MLP_BEARING_SYMBOLS]
     ssm_indices = [i for i, t in enumerate(layer_types) if t == 'M']
 
     if direction == 'gpt-to-mamba':
         if len(attn_indices) != len(mlp_indices):
             raise ValueError(
                 f"For gpt-to-mamba, the number of attention layers ({len(attn_indices)}) "
-                f"must equal the number of MLP layers ({len(mlp_indices)}) in the pattern."
+                f"must equal the number of MLP/MoE layers ({len(mlp_indices)}) in the pattern."
             )
-        # attn_map: gpt_layer_i -> mamba_layer_j
         attn_map = {i: attn_indices[i] for i in range(len(attn_indices))}
         mlp_map = {i: mlp_indices[i] for i in range(len(mlp_indices))}
         return attn_map, mlp_map, ssm_indices
@@ -188,9 +212,8 @@ def build_layer_index_mapping(layer_types, direction):
         if len(attn_indices) != len(mlp_indices):
             raise ValueError(
                 f"For mamba-to-gpt, the number of attention layers ({len(attn_indices)}) "
-                f"must equal the number of MLP layers ({len(mlp_indices)}) in the pattern."
+                f"must equal the number of MLP/MoE layers ({len(mlp_indices)}) in the pattern."
             )
-        # attn_map: mamba_layer_idx -> gpt_layer_i
         attn_map = {attn_indices[i]: i for i in range(len(attn_indices))}
         mlp_map = {mlp_indices[i]: i for i in range(len(mlp_indices))}
         return attn_map, mlp_map, ssm_indices
@@ -203,30 +226,33 @@ def build_layer_index_mapping(layer_types, direction):
 # GPT compatibility whitelist
 # ---------------------------------------------------------------------------
 #
-# GPTModel is a strict homogeneous transformer: every decoder layer is a
-# (self-attention + MLP) pair with standard linear_qkv / linear_fc1 /
-# linear_fc2 state-dict naming. The hybrid <-> GPT converter is only safe
-# when the hybrid side agrees with that shape. The helpers below act as a
-# safeguard: they reject any hybrid layout or source-args combination that
-# would silently produce a broken checkpoint.
+# GPTModel is a *uniform* transformer: every decoder layer is the same kind.
+# It can run with dense MLP or MoE MLP — both keep keys under
+# decoder.layers.<i>.mlp.* — so MoE checkpoints round-trip through the
+# converter as long as both sides share the same kind on every layer.
+# The helpers below reject any hybrid layout or source-args combination that
+# violates uniformity (and would therefore silently produce a corrupt target).
 #
 # Pattern-level rules (checked on the parsed hybrid_layer_pattern):
-#   * only 'M', '*', '-' are allowed (no 'G' GDN, no 'D' DS-attention,
-#     no 'E' MoE)
-#   * '*' count must equal '-' count (one-to-one GPT attention<->MLP pairing)
+#   * only 'M', '*', '-', 'E' are allowed (no 'G' GDN, no 'D' DS-attention)
+#   * MLP-bearing symbols must be uniform: '-' and 'E' cannot both appear
+#     (that would imply GPT has both dense and MoE layers — heterogeneous)
+#   * '*' count must equal '-'+'E' count (one-to-one GPT attn<->MLP pairing)
 #
 # Args-level rules (checked against the training args stored in the source
-# checkpoint): reject anything that would make GPTModel's layer shape
-# inapplicable to either side:
-#   * num_moe_experts                          (MoE routing, different keys)
-#   * moe_shared_expert_intermediate_size      (shared-expert branch)
-#   * moe_layer_freq                           (MoE-every-N layer insertion)
+# checkpoint): reject anything that makes GPT layers heterogeneous OR uses
+# attention variants the converter doesn't currently key-translate:
+#   * moe_layer_freq != 1                      (interleaved dense/MoE layers)
 #   * experimental_attention_variant           (gated_delta_net, dsa, ...)
-#   * linear_attention_freq                    (linear-attention layers)
-#   * heterogeneous_block_specs / heterogeneous_layers_config_path
+#   * linear_attention_freq                    (interleaved linear-attention)
+#   * heterogeneous_block_specs / heterogeneous_layers_config_*
 #                                              (Nemotron-NAS per-layer specs)
-#   * multi_latent_attention                   (MLA: different QKV layout)
+#   * multi_latent_attention                   (MLA: different QKV key layout)
 #   * mtp_num_layers                           (Multi-Token Prediction head)
+#
+# Notably NOT rejected (they round-trip via mlp.* / self_attention.* keys):
+#   * num_moe_experts                          (MoE on every layer)
+#   * moe_shared_expert_intermediate_size      (shared experts on every layer)
 #
 # All rejected configurations raise ValueError early, before any tensors
 # are touched.
@@ -236,25 +262,18 @@ def build_layer_index_mapping(layer_types, direction):
 # are treated as "absent" and pass.
 _GPT_COMPAT_REJECT_FIELDS = (
     (
-        'num_moe_experts',
-        lambda v: v is not None and v > 0,
-        'MoE routing (num_moe_experts)',
-    ),
-    (
-        'moe_shared_expert_intermediate_size',
-        lambda v: v is not None and v > 0,
-        'MoE shared experts (moe_shared_expert_intermediate_size)',
-    ),
-    (
         'moe_layer_freq',
-        # moe_layer_freq is None or 1 for non-MoE models; a list or a value
-        # > 1 means interleaved MoE layers.
+        # moe_layer_freq is None or 1 when every layer is the same kind (all
+        # dense or all MoE). A value > 1 or a list with mixed entries means
+        # GPT has interleaved dense/MoE layers — heterogeneous, can't pair
+        # one-to-one with a uniform hybrid pattern.
         lambda v: (
             v is not None
             and not (isinstance(v, int) and v == 1)
             and not (isinstance(v, str) and v.strip() in ('', '1'))
+            and not (isinstance(v, (list, tuple)) and all(x == 1 for x in v))
         ),
-        'interleaved MoE layers (moe_layer_freq)',
+        'interleaved dense/MoE layers (moe_layer_freq)',
     ),
     (
         'experimental_attention_variant',
@@ -302,29 +321,40 @@ def validate_pattern_gpt_compatible(layer_types, direction):
         direction: 'gpt-to-mamba' or 'mamba-to-gpt' (for error messages).
 
     Rules:
-        * Allowed symbols are M / * / - only. G, D, E are rejected because
-          they denote layer kinds (GDN, DS-attention, MoE) that GPTModel
-          cannot emit or absorb.
-        * The number of '*' and '-' layers must match: every GPT layer pairs
-          one attention with one MLP.
+        * Allowed symbols: 'M', '*', '-', 'E'. 'G' (GDN) and 'D' (DS-attention)
+          are not currently key-translated.
+        * MLP-bearing symbols must be uniform: '-' (dense) and 'E' (MoE) cannot
+          both appear, because that would imply GPT has both dense and MoE
+          layers — the GPT side must be uniform.
+        * The number of attention positions must equal the number of
+          MLP-bearing positions: every GPT layer pairs one attention with one
+          MLP/MoE.
     """
     bad = sorted({c for c in layer_types if c not in GPT_COMPATIBLE_PATTERN_SYMBOLS})
     if bad:
         raise ValueError(
             f"Hybrid layer pattern contains symbols {bad} that are not "
             f"GPT-compatible (allowed: {sorted(GPT_COMPATIBLE_PATTERN_SYMBOLS)}). "
-            f"GPTModel only supports standard attention ('*') and MLP ('-') "
-            f"layers; 'G' (GDN), 'D' (DS-attention), and 'E' (MoE) have no "
-            f"GPT equivalent and cannot be {direction}-converted."
+            f"'G' (GDN) and 'D' (DS-attention) are not currently key-translated "
+            f"and cannot be {direction}-converted."
+        )
+
+    mlp_kinds_present = {t for t in layer_types if t in _MLP_BEARING_SYMBOLS}
+    if len(mlp_kinds_present) > 1:
+        raise ValueError(
+            f"Hybrid layer pattern mixes '-' (dense MLP) and 'E' (MoE) "
+            f"positions. GPTModel layers must be uniform — either all GPT "
+            f"layers are dense MLP, or all are MoE. Use only one of '-' or "
+            f"'E' in the pattern."
         )
 
     n_attn = sum(1 for t in layer_types if t == '*')
-    n_mlp = sum(1 for t in layer_types if t == '-')
+    n_mlp = sum(1 for t in layer_types if t in _MLP_BEARING_SYMBOLS)
     if n_attn != n_mlp:
         raise ValueError(
             f"GPT-compatible hybrid patterns must pair every attention layer "
-            f"('*') with one MLP layer ('-'). Got {n_attn} '*' and {n_mlp} '-' "
-            f"in the pattern."
+            f"('*') with one MLP/MoE layer ('-' or 'E'). Got {n_attn} '*' "
+            f"and {n_mlp} MLP-bearing layers in the pattern."
         )
 
 
