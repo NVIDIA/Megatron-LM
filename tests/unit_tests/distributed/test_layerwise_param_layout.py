@@ -14,11 +14,7 @@ import pytest
 import torch
 
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-from megatron.core.optimizer.param_layout import (
-    BufferKey,
-    pad_param_start,
-    pad_to_divisor,
-)
+from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,12 +93,8 @@ def _assert_param_within_shard(layout, param, dp_size):
     shard_idx = (start - bstart) // shard_size
     shard_start = bstart + shard_idx * shard_size
     shard_end = shard_start + shard_size
-    assert shard_start <= start, (
-        f"param start {start} before shard start {shard_start}"
-    )
-    assert end <= shard_end, (
-        f"param end {end} past shard end {shard_end}"
-    )
+    assert shard_start <= start, f"param start {start} before shard start {shard_start}"
+    assert end <= shard_end, f"param end {end} past shard end {shard_end}"
 
 
 # ---------------------------------------------------------------------------
@@ -222,9 +214,7 @@ class TestSizeMatchingLayout:
         padded = pad_to_divisor(256, shard_div)
         small_bucket = dp_size * padded  # triggers after 1 round
 
-        layout = _LWO._compute_per_buffer_param_layout(
-            params, small_bucket, dp_size, cfg,
-        )
+        layout = _LWO._compute_per_buffer_param_layout(params, small_bucket, dp_size, cfg)
 
         assert len(layout.bucket_indices) == 4  # 8 params / (dp_size per round) = 4 rounds
 

@@ -199,7 +199,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             param_index_map[param] = (pos, pos + numel, bucket_id)
             unpadded = (pos + numel) - buf_cursor
             bucket_end = pad_bucket_end(
-                pos + numel, dp_size, ddp_config.pad_buckets_for_high_nccl_busbw,
+                pos + numel, dp_size, ddp_config.pad_buckets_for_high_nccl_busbw
             )
             bucket_indices.append((buf_cursor, bucket_end))
             per_bucket_numel_unpadded.append(unpadded)
@@ -338,11 +338,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
             if buffer_key.use_layerwise_distributed_optimizer:
                 layout = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
-                    group_params, bucket_size, dp_world_size, ddp_config, param_indices,
+                    group_params, bucket_size, dp_world_size, ddp_config, param_indices
                 )
             else:
                 layout = DistributedOptimizer._compute_per_buffer_param_layout(
-                    group_params, bucket_size, dp_world_size, ddp_config, param_indices,
+                    group_params, bucket_size, dp_world_size, ddp_config, param_indices
                 )
             layouts[buffer_key] = layout
         return FullParamLayout(layouts=layouts)
@@ -453,15 +453,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
 
         if full_param_layouts is not None:
-            self._shard_params_from_layout(
-                optimizers, full_param_layouts, dp_cp_size, expt_dp_size,
-            )
+            self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
         else:
             self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size)
 
-    def _shard_params_from_layout(
-        self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size,
-    ):
+    def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
         dp_cp_rank = get_pg_rank(self.pg_collection.dp_cp)
         expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
