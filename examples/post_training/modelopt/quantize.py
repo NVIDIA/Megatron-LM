@@ -45,6 +45,7 @@ from megatron.post_training.utils import (
     report_current_memory_info,
 )
 from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
 from utils import get_hf_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -188,13 +189,10 @@ def get_first_layers_disabled_config(config, num_layers: int = 1, num_layers_to_
     """
     config = copy.deepcopy(config)
     quant_cfg = config.get("quant_cfg", {})
-    quant_cfg.update(
-        {
-            functools.partial(
-                _is_first_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
-            ): {"enable": False}
-        }
+    predicate = functools.partial(
+        _is_first_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
     )
+    quant_cfg.append({"quantizer_name": predicate, "enable": False})
     config["quant_cfg"] = quant_cfg
     return config
 
@@ -206,13 +204,10 @@ def get_last_layers_disabled_config(config, num_layers: int = 1, num_layers_to_d
     """
     config = copy.deepcopy(config)
     quant_cfg = config.get("quant_cfg", {})
-    quant_cfg.update(
-        {
-            functools.partial(
-                _is_last_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
-            ): {"enable": False}
-        }
+    predicate = functools.partial(
+        _is_last_layers, num_layers=num_layers, num_layers_to_disable=num_layers_to_disable
     )
+    quant_cfg.append({"quantizer_name": predicate, "enable": False})
     config["quant_cfg"] = quant_cfg
     return config
 
@@ -224,28 +219,34 @@ def get_modelopt_torch_quantization_config():
         raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
 
-    fp8_config = {"enable": True, "num_bits": (4, 3), "axis": None}
+    if isinstance(mtq_config["quant_cfg"], dict):
+        # Normalize old dict format to new list format
+        mtq_config["quant_cfg"] = mtq.normalize_quant_cfg_list(mtq_config["quant_cfg"])
+
+    fp8_config = {"enable": True, "cfg": {"num_bits": (4, 3), "axis": None}}
     fp4_config = {
-        "num_bits": (2, 1),
-        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-        "axis": None,
         "enable": True,
+        "cfg": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+        },
     }
     if args.export_quant_cfg == "FP8_DEFAULT_CFG":
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"]["*medusa_heads**"] = fp8_config
+        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp8_config})
     if "FP4" in args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"]["*medusa_heads**"] = fp4_config
+        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp4_config})
     if "AWQ" in args.export_quant_cfg:
-        weight_quantizer = mtq_config["quant_cfg"]["*weight_quantizer"]  # type: ignore
-        if isinstance(weight_quantizer, list):
-            weight_quantizer = weight_quantizer[0]
-        weight_quantizer["block_sizes"][-1] = 128
-
+        try:
+            weight_quantizer = mtq.find_quant_cfg_entry_by_path(mtq_config["quant_cfg"], "*weight_quantizer")
+            weight_quantizer["block_sizes"][-1] = 128
+        except KeyError:
+            weight_quantizer = None
     # Customization
     if args.disable_qkv_quant:
-        mtq_config["quant_cfg"]["*self_attention*"] = {"enable": False}
+        mtq_config["quant_cfg"].append({"quantizer_name": "*self_attention*", "enable": False})
 
     # KV Cache Quantization
     enable_quant_kv_cache = args.export_kv_cache_quant != "none"
@@ -257,7 +258,7 @@ def get_modelopt_torch_quantization_config():
 
     # Weight Only Quantization
     if args.weight_only:
-        mtq_config["quant_cfg"]["*input_quantizer"] = {"enable": False}
+        mtq_config["quant_cfg"].append({"quantizer_name": "*input_quantizer", "enable": False})
     if args.num_first_layers_to_skip_quant is not None:
         mtq_config = get_first_layers_disabled_config(
             mtq_config,
@@ -346,14 +347,12 @@ def get_calib_dataloader(
 
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_text_generate_ptq_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_text_generate_ptq_args, args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
             "no_load_rng": True,
             "no_load_optim": True,
-        },
-    )
+        })
+    initialize_megatron()
 
     check_arguments()
 
