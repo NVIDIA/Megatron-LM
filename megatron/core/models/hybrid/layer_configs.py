@@ -488,9 +488,5 @@ class PipelineSplit:
 
 #: Anything that may legally appear at a leaf of a layer pattern.
 PatternLeaf = Union[
-    LayerConfig,
-    EmbeddingLayerConfig,
-    CrossEntropyLayerConfig,
-    MTPLayerConfig,
-    PipelineSplit,
+    LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig, MTPLayerConfig, PipelineSplit
 ]

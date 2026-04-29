@@ -64,8 +64,7 @@ def _resolve_dtype(name_or_dtype: Any) -> torch.dtype:
         return _DTYPE_BY_NAME[name_or_dtype]
     except KeyError as e:
         raise ValueError(
-            f"Unknown dtype name {name_or_dtype!r}; expected one of "
-            f"{sorted(_DTYPE_BY_NAME)}."
+            f"Unknown dtype name {name_or_dtype!r}; expected one of " f"{sorted(_DTYPE_BY_NAME)}."
         ) from e
 
 
@@ -268,8 +267,7 @@ class CommonLayerConfig:
             kwargs["fp16"] = True
         elif mp != "fp32":
             raise ValueError(
-                f"mixed_precision_dtype must be one of 'fp32' / 'fp16' / 'bf16'; "
-                f"got {mp!r}."
+                f"mixed_precision_dtype must be one of 'fp32' / 'fp16' / 'bf16'; " f"got {mp!r}."
             )
         # Escape-hatch passthrough: validate keys then merge over curated kwargs
         # for any TransformerConfig field not exposed as a first-class attribute.
