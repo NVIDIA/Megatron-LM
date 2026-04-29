@@ -63,7 +63,7 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
         num_layers=1, hidden_size=H, num_attention_heads=nh,
         num_query_groups=nkv, ffn_hidden_size=ffn,
         max_seqlen_per_dp_cp_rank=max_seqlen,
-        thd_cuda_graph_max_num_seqs=max_num_seqs,
+        thd_max_num_seqs=max_num_seqs,
         tensor_model_parallel_size=tp, sequence_parallel=sp, bf16=True)
     model_parallel_cuda_manual_seed(42)
     return TransformerLayer(
@@ -222,7 +222,7 @@ _COMMON_ARGS = [
     "--no-save-optim", "--no-save-rng",
     "--save-interval", "999999", "--eval-interval", "999999", "--eval-iters", "1",
     "--log-interval", "1", "--no-check-for-nan-in-loss-and-grad", "--deterministic-mode",
-    "--thd-cuda-graph-max-num-seqs", "32",
+    "--thd-max-num-seqs", "32",
 ]
 
 _MOONLIGHT_ARGS = _COMMON_ARGS + [
