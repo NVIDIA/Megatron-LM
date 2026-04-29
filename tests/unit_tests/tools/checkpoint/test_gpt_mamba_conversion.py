@@ -739,16 +739,12 @@ class TestSourceArgsWhitelist:
 
     def test_accepts_moe_args(self):
         # MoE keys live under decoder.layers.<i>.mlp.* and round-trip as-is.
-        validate_source_args_gpt_compatible(
-            self._ok_args(num_moe_experts=8), 'gpt-to-mamba'
-        )
+        validate_source_args_gpt_compatible(self._ok_args(num_moe_experts=8), 'gpt-to-mamba')
 
     def test_accepts_shared_expert_args(self):
         # Shared experts also live under mlp.shared_experts.* and round-trip.
         validate_source_args_gpt_compatible(
-            self._ok_args(
-                num_moe_experts=8, moe_shared_expert_intermediate_size=4096
-            ),
+            self._ok_args(num_moe_experts=8, moe_shared_expert_intermediate_size=4096),
             'gpt-to-mamba',
         )
 
@@ -806,8 +802,7 @@ class TestSourceArgsWhitelist:
         # Both heterogeneous moe_layer_freq and MLA set — both should be reported.
         with pytest.raises(ValueError) as exc:
             validate_source_args_gpt_compatible(
-                self._ok_args(moe_layer_freq=[1, 0], multi_latent_attention=True),
-                'gpt-to-mamba',
+                self._ok_args(moe_layer_freq=[1, 0], multi_latent_attention=True), 'gpt-to-mamba'
             )
         msg = str(exc.value)
         assert 'interleaved' in msg

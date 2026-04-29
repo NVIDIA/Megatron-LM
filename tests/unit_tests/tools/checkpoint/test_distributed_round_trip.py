@@ -76,16 +76,10 @@ def _build_state_dict(num_layers, hidden_size, num_moe_experts, vocab_size, dtyp
         sd[p + 'pre_mlp_layernorm.weight'] = torch.randn(hidden_size, dtype=dtype)
 
         if num_moe_experts is None:
-            sd[p + 'mlp.linear_fc1.weight'] = torch.randn(
-                4 * hidden_size, hidden_size, dtype=dtype
-            )
-            sd[p + 'mlp.linear_fc2.weight'] = torch.randn(
-                hidden_size, 4 * hidden_size, dtype=dtype
-            )
+            sd[p + 'mlp.linear_fc1.weight'] = torch.randn(4 * hidden_size, hidden_size, dtype=dtype)
+            sd[p + 'mlp.linear_fc2.weight'] = torch.randn(hidden_size, 4 * hidden_size, dtype=dtype)
         else:
-            sd[p + 'mlp.router.weight'] = torch.randn(
-                num_moe_experts, hidden_size, dtype=dtype
-            )
+            sd[p + 'mlp.router.weight'] = torch.randn(num_moe_experts, hidden_size, dtype=dtype)
             for j in range(num_moe_experts):
                 ep = p + f'mlp.experts.local_experts.{j}.'
                 sd[ep + 'linear_fc1.weight'] = torch.randn(
@@ -184,24 +178,34 @@ def main():
     parser.add_argument('--fsdp', type=int, default=1)
     parser.add_argument('--ep', type=int, default=1)
     parser.add_argument('--label', type=str, required=True)
-    parser.add_argument('--output-root', type=str, required=True,
-                        help='Shared-filesystem path where this scenario writes its '
-                             'checkpoints (must be visible from every rank).')
+    parser.add_argument(
+        '--output-root',
+        type=str,
+        required=True,
+        help='Shared-filesystem path where this scenario writes its '
+        'checkpoints (must be visible from every rank).',
+    )
     parser.add_argument('--num-layers', type=int, default=3)
     parser.add_argument('--hidden-size', type=int, default=64)
     parser.add_argument('--vocab-size', type=int, default=512)
-    parser.add_argument('--num-moe-experts', type=int, default=None,
-                        help='If set, use the MoE GPT state-dict layout '
-                             '(mlp.router + mlp.experts.local_experts.*).')
-    parser.add_argument('--pattern', type=str, default=None,
-                        help='Hybrid layer pattern. Defaults to "M*-M*-M*-" for '
-                             'dense or "M*EM*EM*E" when --num-moe-experts is set.')
+    parser.add_argument(
+        '--num-moe-experts',
+        type=int,
+        default=None,
+        help='If set, use the MoE GPT state-dict layout '
+        '(mlp.router + mlp.experts.local_experts.*).',
+    )
+    parser.add_argument(
+        '--pattern',
+        type=str,
+        default=None,
+        help='Hybrid layer pattern. Defaults to "M*-M*-M*-" for '
+        'dense or "M*EM*EM*E" when --num-moe-experts is set.',
+    )
     args = parser.parse_args()
 
     expected_world = args.tp * args.pp * args.fsdp * args.ep
-    pattern = args.pattern or (
-        'M*EM*EM*E' if args.num_moe_experts is not None else 'M*-M*-M*-'
-    )
+    pattern = args.pattern or ('M*EM*EM*E' if args.num_moe_experts is not None else 'M*-M*-M*-')
 
     # Shared init file lives on the same shared FS we use for checkpoints, so
     # all ranks on all nodes see the same path.
@@ -217,12 +221,12 @@ def main():
         sys.exit(2)
 
     # Lazy imports after sys.path is set.
-    from gpt_mamba_conversion import main as conversion_main
     from dist_checkpoint_io import (
         load_dist_checkpoint_full,
         save_dist_checkpoint_full,
         write_latest_iteration_marker,
     )
+    from gpt_mamba_conversion import main as conversion_main
 
     if rank == 0:
         _log(
@@ -236,12 +240,9 @@ def main():
     # Each rank builds the same full state dict — DCP de-duplicates writes
     # across ranks via its writer planner.
     state_dict = _build_state_dict(
-        args.num_layers, args.hidden_size, args.num_moe_experts,
-        args.vocab_size, torch.float32,
+        args.num_layers, args.hidden_size, args.num_moe_experts, args.vocab_size, torch.float32
     )
-    ckpt_args = _build_ckpt_args(
-        args.num_layers, args.hidden_size, args.num_moe_experts,
-    )
+    ckpt_args = _build_ckpt_args(args.num_layers, args.hidden_size, args.num_moe_experts)
 
     scratch = os.path.join(args.output_root, args.label)
     src_dir = os.path.join(scratch, 'gpt_src')
@@ -262,14 +263,9 @@ def main():
     # load_dist_checkpoint_full + save_dist_checkpoint_full once each.
     # If a rank exits early its gloo socket closes and rank 0's reduce_scatter
     # dies with "Connection closed by peer".
-    common_state = {
-        'args': copy.deepcopy(ckpt_args),
-        'checkpoint_version': 3.0,
-        'iteration': 100,
-    }
+    common_state = {'args': copy.deepcopy(ckpt_args), 'checkpoint_version': 3.0, 'iteration': 100}
     save_dist_checkpoint_full(
-        state_dict, common_state, iter_subdir,
-        model_prefix='model.', backend='torch_dist',
+        state_dict, common_state, iter_subdir, model_prefix='model.', backend='torch_dist'
     )
     if rank == 0:
         write_latest_iteration_marker(iter_subdir, 100)
@@ -296,17 +292,17 @@ def main():
         sys.stdout = open(os.devnull, 'w')
 
     t0 = time.time()
-    conversion_main(argparse.Namespace(
-        direction='gpt-to-mamba',
-        load_dir=src_dir, save_dir=mid_dir,
-        **common_kwargs,
-    ))
+    conversion_main(
+        argparse.Namespace(
+            direction='gpt-to-mamba', load_dir=src_dir, save_dir=mid_dir, **common_kwargs
+        )
+    )
     dist.barrier()
-    conversion_main(argparse.Namespace(
-        direction='mamba-to-gpt',
-        load_dir=mid_dir, save_dir=dst_dir,
-        **common_kwargs,
-    ))
+    conversion_main(
+        argparse.Namespace(
+            direction='mamba-to-gpt', load_dir=mid_dir, save_dir=dst_dir, **common_kwargs
+        )
+    )
     dist.barrier()
     dt = time.time() - t0
 

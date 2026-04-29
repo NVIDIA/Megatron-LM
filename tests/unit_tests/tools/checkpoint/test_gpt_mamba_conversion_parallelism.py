@@ -216,7 +216,8 @@ def _run_scenario(
             moe_shared_expert_intermediate_size=shared_expert_size,
         )
         gpt_sd = make_gpt_state_dict(
-            num_layers, hidden_size,
+            num_layers,
+            hidden_size,
             num_moe_experts=num_moe_experts,
             shared_expert_size=shared_expert_size,
         )
