@@ -529,6 +529,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
+                assert (
+                    CudaGraphScope.full_iteration_inference not in self.config.cuda_graph_scope
+                ), (
+                    "materialize_only_last_token_logits=True is incompatible with the "
+                    "full_iteration_inference CUDA graph scope: last_token_logits() uses "
+                    "Python-integer slice indices that are baked as constants at graph capture "
+                    "time and cannot reflect the live request count during replay. "
+                    "Pass --return-log-probs to disable materialize_only_last_token_logits."
+                )
                 if self.output_layer.sequence_parallel:
                     # Perform the sequence parallel gather here instead of after the output layer
                     # because we need to slice the last token logits from the full view of the
