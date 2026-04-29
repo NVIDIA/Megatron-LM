@@ -75,12 +75,9 @@ class FlashInferSampling(Sampling):
             top_p = md["top_p"][token_to_request_index]
 
         if gather_indices is None:
-            # Slice is a view; clone before in-place div_ to avoid mutating the caller.
-            scaled = logits[:n].clone()
+            scaled = logits[:n] / temperature.unsqueeze(1)
         else:
-            # Advanced indexing already returns a new tensor.
-            scaled = logits[gather_indices[:n], :]
-        scaled.div_(temperature.unsqueeze(1))
+            scaled = logits[gather_indices[:n], :] / temperature.unsqueeze(1)
         probs = torch.softmax(scaled, dim=-1)
 
         # Sentinel values disable filtering: top_k=vocab_size keeps all
