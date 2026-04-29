@@ -165,6 +165,8 @@ class AsyncOverlapDebugCounters:
     placeholder_count: int = 0
     reservation_commits: int = 0
     reservation_rollbacks: int = 0
+    retirement_backlog: int = 0
+    max_retirement_backlog: int = 1
 
 
 # pylint: disable=line-too-long
@@ -1838,7 +1840,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
-        return self.step_retirement_service.retire_step(step_result, context_state, step_time)
+        return self.step_retirement_service.submit_step(step_result, context_state, step_time)
 
     async def async_step(
         self,

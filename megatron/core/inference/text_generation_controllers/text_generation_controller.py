@@ -2159,7 +2159,7 @@ class TextGenerationController:
         top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
         skip_bookkeeping: Optional[bool] = False,
     ) -> Dict:
-        """Commit serial CPU bookkeeping and return the public dynamic-step result."""
+        """Commit context bookkeeping and return the ordered-retirement payload."""
         context = self.inference_wrapped_model.inference_context
         if isinstance(step_output, AsyncStepOutput):
             step_output = self.collect_dynamic_output(step_output)
@@ -2193,6 +2193,8 @@ class TextGenerationController:
         if self.num_speculative_tokens > 0:
             self._accepted_tokens_per_request.fill_(-1)
             self._accepted_token_counts_per_request.fill_(0)
+        # Request-object mutation is owned by StepRetirementService so public
+        # outputs are retired in strict step order.
         ret.update(request_bookkeeping)
         context.snapshot_pool.release(prepared_step.snapshot_slot_id)
         return ret

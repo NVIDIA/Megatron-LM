@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Deque, Dict, Optional
 
 import torch
 
@@ -16,6 +18,16 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 if TYPE_CHECKING:
     from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+
+
+@dataclass(frozen=True)
+class StepRetirementWorkItem:
+    """One ordered step waiting for public output retirement."""
+
+    step_result: Optional[Dict]
+    context_state: Dict
+    step_time: float
+
 
 try:
     import msgpack
@@ -43,6 +55,54 @@ class StepRetirementService:
     def __init__(self, engine: "DynamicInferenceEngine"):
         self.engine = engine
         self._last_retired_step_id = -1
+        self._pending_retirements: Deque[StepRetirementWorkItem] = deque()
+        self.max_retirement_backlog = max(1, int(getattr(engine, "async_overlap_queue_depth", 1)))
+        self._update_backlog_counters()
+
+    @property
+    def pending_count(self) -> int:
+        """Number of step outputs waiting for ordered retirement."""
+        return len(self._pending_retirements)
+
+    def enqueue_step(
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float
+    ) -> None:
+        """Queue one step for ordered retirement, enforcing the backlog limit."""
+        if self.pending_count >= self.max_retirement_backlog:
+            raise RuntimeError(
+                "Step retirement backlog is full: "
+                f"{self.pending_count}/{self.max_retirement_backlog}"
+            )
+        self._pending_retirements.append(
+            StepRetirementWorkItem(
+                step_result=step_result,
+                context_state=context_state,
+                step_time=step_time,
+            )
+        )
+        self._update_backlog_counters()
+
+    def drain_next(self) -> Optional[Dict]:
+        """Retire the next queued step, if any."""
+        if not self._pending_retirements:
+            return None
+        item = self._pending_retirements.popleft()
+        self._update_backlog_counters()
+        return self._retire_step_now(item.step_result, item.context_state, item.step_time)
+
+    def drain_pending(self) -> None:
+        """Synchronously retire every queued output in order."""
+        while self._pending_retirements:
+            self.drain_next()
+
+    def submit_step(
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float
+    ) -> Dict:
+        """Queue and immediately retire one step in queue-depth-one mode."""
+        self.enqueue_step(step_result, context_state, step_time)
+        result = self.drain_next()
+        assert result is not None
+        return result
 
     def drain_for_shutdown(self) -> None:
         """Drain in-flight retirement work before shutdown.
@@ -50,6 +110,7 @@ class StepRetirementService:
         Queue depth one has no detached retirement work, but an interrupted step
         can leave an open journal entry that must not survive shutdown.
         """
+        self.drain_pending()
         self.engine.context.rollback_all_open_step_journals(reason="shutdown_drain")
 
     def drain_for_suspend(self) -> None:
@@ -58,6 +119,7 @@ class StepRetirementService:
         Queue depth one has no detached retirement work, but an interrupted step
         can leave an open journal entry that must not survive suspend.
         """
+        self.drain_pending()
         self.engine.context.rollback_all_open_step_journals(reason="suspend_drain")
 
     def drain_for_request_reuse(self, request_id: int) -> None:
@@ -66,8 +128,15 @@ class StepRetirementService:
         Queue depth one retires each step before the next request can reuse an ID.
         """
         del request_id
+        self.drain_pending()
 
     def retire_step(
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float
+    ) -> Dict:
+        """Compatibility wrapper for queueing and retiring one dynamic step."""
+        return self.submit_step(step_result, context_state, step_time)
+
+    def _retire_step_now(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ) -> Dict:
         """Retire one dynamic step and return the engine-visible bookkeeping result."""
@@ -187,6 +256,13 @@ class StepRetirementService:
             "step_time": step_time,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+
+    def _update_backlog_counters(self) -> None:
+        counters = getattr(self.engine, "async_overlap_debug_counters", None)
+        if counters is None:
+            return
+        setattr(counters, "retirement_backlog", self.pending_count)
+        setattr(counters, "max_retirement_backlog", self.max_retirement_backlog)
 
     def _drain_prefix_cache_counters(self) -> None:
         engine = self.engine
