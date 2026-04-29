@@ -972,7 +972,10 @@ class CheckpointWithoutOutput(object):
         #   - No tensor version-counter bump (no autograd complaint)
         share_storage = _get_share_storage()
         for output, recomputation_output in zip(self.outputs, outputs):
-            if output.untyped_storage().data_ptr() != recomputation_output.untyped_storage().data_ptr():
+            if (
+                output.untyped_storage().data_ptr()
+                != recomputation_output.untyped_storage().data_ptr()
+            ):
                 share_storage(output, recomputation_output)
 
         self.ctx.outputs = outputs

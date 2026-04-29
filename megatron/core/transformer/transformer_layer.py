@@ -712,7 +712,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self._input_layernorm_checkpoint_active = self.recompute_input_layernorm
         if self._input_layernorm_checkpoint_active:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                retain_input_tensors=self._input_layernorm_returns_residual,
+                retain_input_tensors=self._input_layernorm_returns_residual
             )
             with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
@@ -819,7 +819,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                retain_input_tensors=self._pre_mlp_layernorm_returns_residual,
+                retain_input_tensors=self._pre_mlp_layernorm_returns_residual
             )
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
