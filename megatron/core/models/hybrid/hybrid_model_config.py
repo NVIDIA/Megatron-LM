@@ -30,7 +30,7 @@ implementation.
 """
 
 import dataclasses
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from megatron.core.models.hybrid.common_layer_config import CommonLayerConfig
@@ -425,10 +425,6 @@ def _compile_mtp_markers(mtp_markers: list, recipe_common: CommonLayerConfig):
             raise ValueError(
                 f"MTPLayerConfig.common_config diverges from the recipe's "
                 f"common_config. {_MTP_OVERRIDE_GUIDANCE}"
-            )
-        if marker.extra:
-            raise ValueError(
-                f"MTPLayerConfig.extra={marker.extra!r} is non-empty. " f"{_MTP_OVERRIDE_GUIDANCE}"
             )
         flat = flatten_decoder_pattern(marker.mtp_model_layer)
         if not flat:
