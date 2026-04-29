@@ -38,6 +38,7 @@ from megatron.core.utils import get_pg_size, internal_api, nvtx_range_pop, nvtx_
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
+from .dynamic_ledgers import DynamicRequestLedgers
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
@@ -271,6 +272,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
         self.current_dynamic_step_id = -1
+        self.request_ledgers = DynamicRequestLedgers()
         self.async_overlap_debug_counters = {
             "queue_depth": 1,
             "snapshot_slot_waits": 0,
@@ -1722,6 +1724,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count = end_request_idx
         if count_as_prefill:
             self.num_prefill_requests += num_new_requests
+        self.sync_optimistic_to_committed_for_queue_depth_one()
 
     def add_dummy_requests_for_cudagraph_capture(
         self, graph_dimensions: InferenceBatchDimensions
@@ -2269,6 +2272,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+        self.sync_optimistic_to_committed_for_queue_depth_one()
 
     def set_current_dynamic_step_id(self, step_id: int) -> None:
         """Set the CPU/GPU debug step identity used for trace labels."""
@@ -2281,6 +2285,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         if step_id is None:
             step_id = self.current_dynamic_step_id
         return f"{name}[step={step_id}]"
+
+    def sync_optimistic_to_committed_for_queue_depth_one(self) -> None:
+        """Synchronize committed and optimistic ledgers to the live serial context."""
+        self.request_ledgers.sync_from_context_for_queue_depth_one(self)
+        if self.config.async_overlap_debug_checks:
+            self.request_ledgers.assert_committed_matches_optimistic()
+
+    def get_committed_request_state(self, request_id: Optional[int] = None):
+        """Return committed request-ledger state."""
+        return self.request_ledgers.get_committed_request_state(request_id)
+
+    def get_optimistic_request_state(self, request_id: Optional[int] = None):
+        """Return optimistic request-ledger state."""
+        return self.request_ledgers.get_optimistic_request_state(request_id)
 
     def reset(self) -> None:
         """Reset entire context.
@@ -2746,6 +2764,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
         self.total_request_count += 1
         self.num_prefill_requests += 1
+        self.sync_optimistic_to_committed_for_queue_depth_one()
 
     def _move_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
@@ -3166,6 +3185,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
+            self.sync_optimistic_to_committed_for_queue_depth_one()
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -3513,6 +3533,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
 
+        self.sync_optimistic_to_committed_for_queue_depth_one()
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
             "evict_request_ids": evict_request_ids,
