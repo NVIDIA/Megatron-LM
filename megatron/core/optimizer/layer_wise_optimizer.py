@@ -513,6 +513,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def _shard_params_ping_pong(self, optimizers, dp_cp_size, expt_dp_size):
         """Legacy ping-pong-by-numel shard assignment (no layout available).
 
+        Legacy: this method is a fallback for when no ``full_param_layout``
+        is provided.  Once all call sites supply a layout, this can be removed
+        in favor of :meth:`_shard_params_from_layout`.
+
         List of parameters are sorted by numel and assigned to ranks in ping-pong style.
         Example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list
         will be [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]].
@@ -560,6 +564,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def set_bucket_layerwise_params_list(self, model_chunks):
         """Map sharded params to DDP buckets for async all-gather.
 
+        Legacy: only used by the variable-size all-gather path
+        (``use_buffer_param_sync=False``).  Once all call sites supply a
+        ``full_param_layout``, this can be removed — the standard distributed
+        optimizer buffer all-gather handles param sync without per-bucket
+        param lists.
+
         For each bucket in each model chunk's bucket groups, build per-rank param lists
         by cross-referencing the layer-wise sharded param lists with the bucket's params.
 
@@ -598,7 +608,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def allgather_params(self) -> None:
-        """All-gather updated params from all ranks."""
+        """All-gather updated params from all ranks.
+
+        Legacy: only used when ``use_buffer_param_sync=False``.  Once all
+        call sites supply a ``full_param_layout``, this can be removed — the
+        standard distributed optimizer buffer all-gather (via
+        ``start_param_sync``) replaces this flatten/unflatten path.
+        """
 
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
