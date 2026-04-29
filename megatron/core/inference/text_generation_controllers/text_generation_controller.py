@@ -1252,8 +1252,7 @@ class TextGenerationController:
         eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
 
         if context.num_speculative_tokens > 0:
-            if not context.config.materialize_only_last_token_logits:
-                self._log_probs_speculative.prefill_indexing(context, eager=eager)
+            self._log_probs_speculative.prefill_indexing(context, eager=eager)
             return
 
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
@@ -1271,7 +1270,7 @@ class TextGenerationController:
             return
 
         logits_seq_len = (
-            context.padded_active_request_count
+            context.padded_num_last_token_logits
             if context.config.materialize_only_last_token_logits
             else context.padded_active_token_count
         )
@@ -1348,7 +1347,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
 
         logits_seq_len = (
-            context.padded_active_request_count
+            context.padded_num_last_token_logits
             if context.config.materialize_only_last_token_logits
             else context.padded_active_token_count
         )

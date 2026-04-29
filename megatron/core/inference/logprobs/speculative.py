@@ -32,6 +32,8 @@ class LogProbsSpeculative:
         # See LogProbsDecode for stream/event semantics.
         self._topn_stream = topn_stream
         self._topn_event = topn_event
+        # Pinned CPU scalar holding `num_decode * spec_plus_one`.
+        self._prefill_offset_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
         if config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
                 config,
@@ -64,12 +66,15 @@ class LogProbsSpeculative:
             )
 
     @staticmethod
-    def softmax_kernel(context, logits: Tensor) -> Tuple[Tensor, Tensor]:
+    def softmax_kernel(
+        context, logits: Tensor, prefill_offset_gpu: Tensor
+    ) -> Tuple[Tensor, Tensor]:
         """Post-forward: per-row log-sum-exp over all speculative logit rows.
 
         Args:
             context: The active DynamicInferenceContext.
             logits (Tensor): Raw model output logits [1, seq_len, vocab_size].
+            prefill_offset_gpu (Tensor): scalar holding `num_decode * spec_plus_one`.
 
         Returns:
             (decode_lse [padded_decode, spec+1], prefill_lse [padded_prefill])
@@ -78,11 +83,18 @@ class LogProbsSpeculative:
         padded_prefill_count = context.padded_batch_dimensions.prefill_req_count
         spec_plus_one = context.num_speculative_tokens + 1
         decode_len = padded_decode_count * spec_plus_one
-        total_len = decode_len + padded_prefill_count
+        device = logits.device
 
-        all_lse = torch.logsumexp(logits.squeeze(0)[:total_len].float(), dim=-1)
-        decode_lse = all_lse[:decode_len].reshape(padded_decode_count, spec_plus_one)
-        prefill_lse = all_lse[decode_len:]
+        # Decode region: real decode rows are at [0 : num_decode * spec_plus_one].
+        decode_logits = logits.squeeze(0)[:decode_len].float()
+        decode_lse = torch.logsumexp(decode_logits, dim=-1).reshape(
+            padded_decode_count, spec_plus_one
+        )
+
+        # Prefill region: lives at the actual decode offset, not the padded one.
+        prefill_indices = prefill_offset_gpu + torch.arange(padded_prefill_count, device=device)
+        prefill_logits = logits.squeeze(0)[prefill_indices].float()
+        prefill_lse = torch.logsumexp(prefill_logits, dim=-1)
         return decode_lse, prefill_lse
 
     @staticmethod
@@ -94,6 +106,7 @@ class LogProbsSpeculative:
         new_tokens: Tensor,
         accepted_tokens: Tensor,
         accepted_token_counts: Tensor,
+        prefill_offset_gpu: Tensor,
     ) -> Tuple[Tensor, Tensor]:
         """Post-verification: gather log probs for speculative decode and materialized prefill.
 
@@ -105,6 +118,7 @@ class LogProbsSpeculative:
             new_tokens (Tensor): Newly sampled tokens [padded_active_requests].
             accepted_tokens (Tensor): Speculative-verified token IDs.
             accepted_token_counts (Tensor): Per-decode-request accepted counts.
+            prefill_offset_gpu (Tensor): scalar holding `num_decode * spec_plus_one`.
 
         Returns:
             (decode_gathered [padded_decode, spec+1], prefill_gathered [padded_prefill])
@@ -127,7 +141,9 @@ class LogProbsSpeculative:
         ]
 
         decode_logits = (
-            logits.squeeze(0)[:decode_len].float().reshape(padded_decode_count, spec_plus_one, -1)
+            logits.squeeze(0)[:decode_len]
+            .float()
+            .reshape(padded_decode_count, spec_plus_one, logits.size(-1))
         )
         decode_gathered_raw = decode_logits.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
         decode_gathered = decode_gathered_raw - decode_lse
@@ -136,23 +152,36 @@ class LogProbsSpeculative:
             padded_decode_count : padded_decode_count + padded_prefill_count
         ]
         prefill_row_range = torch.arange(padded_prefill_count, device=device)
-        prefill_logits = logits.squeeze(0)[decode_len : decode_len + padded_prefill_count].float()
+        # Prefill rows live at the actual decode offset, not the padded one.
+        prefill_indices = prefill_offset_gpu + prefill_row_range
+        prefill_logits = logits.squeeze(0)[prefill_indices].float()
         prefill_gathered_raw = prefill_logits[prefill_row_range, prefill_new_tokens]
         prefill_gathered = prefill_gathered_raw - prefill_lse
 
         return decode_gathered, prefill_gathered
 
     @staticmethod
-    def prefill_indexing_kernel(context) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Mask out decode entries, build prefill indices, restore mask.
+    def prefill_indexing_kernel(
+        context, prefill_offset_pinned: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Build prefill offset, mask out decode entries, build prefill indices, restore mask.
 
         Args:
             context: The active DynamicInferenceContext.
+            prefill_offset_pinned (Tensor): pinned CPU scalar holding `num_decode * spec_plus_one`.
 
         Returns:
-            (request_indices, cu_masked_lengths, logit_indices,
-             logit_indices_range, masked_tokens, prefill_log_prob_count_gpu)
+            (prefill_offset_gpu, request_indices, cu_masked_lengths, logit_indices,
+             logit_indices_range, masked_tokens, prefill_log_prob_count_gpu).
         """
+        device = torch.cuda.current_device()
+        prefill_offset_gpu = prefill_offset_pinned.to(device, non_blocking=True)
+
+        if context.config.materialize_only_last_token_logits:
+            # Full-prefill indexing isn't needed; return placeholder zero-shape tensors.
+            empty = torch.zeros(0, dtype=torch.int64, device=device)
+            return prefill_offset_gpu, empty, empty, empty, empty, empty, empty
+
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
 
         saved_mask = context.active_request_metadata["return_log_probs"][
@@ -168,7 +197,7 @@ class LogProbsSpeculative:
 
         context.active_request_metadata["return_log_probs"][:padded_decode_count] = saved_mask
 
-        return ri, cu_ml, li, li_range, mt, prefill_log_prob_count_gpu
+        return prefill_offset_gpu, ri, cu_ml, li, li_range, mt, prefill_log_prob_count_gpu
 
     def _prefill_softmax(self, logits, new_tokens, ri, cu_ml, li, li_range, mt):
         """Delegate to LogProbsPrefill's softmax kernel (cross-class call)."""
@@ -271,9 +300,15 @@ class LogProbsSpeculative:
 
     def prefill_indexing(self, context, *, eager: bool = False) -> None:
         """Run prefill indexing kernel with optional CUDA graph capture/replay."""
+        spec_plus_one = context.num_speculative_tokens + 1
+        # CPU-side write to pinned memory; the H2D itself is inside the graphed kernel.
+        self._prefill_offset_pinned[0] = context.num_decode_requests * spec_plus_one
         key = ("spec_fp_idx", context.padded_batch_dimensions)
-        result = self.prefill_indexing_kernel(context, eager=eager, cache_key=key)
+        result = self.prefill_indexing_kernel(
+            context, self._prefill_offset_pinned, eager=eager, cache_key=key
+        )
         (
+            self._prefill_offset_gpu,
             self._fp_ri,
             self._fp_cu_ml,
             self._fp_li,
@@ -286,7 +321,7 @@ class LogProbsSpeculative:
         """Run post-forward softmax with optional CUDA graph capture/replay."""
         key = ("spec_sm", context.padded_batch_dimensions)
         self._decode_lse, self._prefill_lse = self.softmax_kernel(
-            context, logits, eager=eager, cache_key=key
+            context, logits, self._prefill_offset_gpu, eager=eager, cache_key=key
         )
 
     def calculate(
@@ -335,6 +370,7 @@ class LogProbsSpeculative:
             new_tokens,
             accepted_tokens,
             accepted_token_counts,
+            self._prefill_offset_gpu,
             eager=eager,
             cache_key=key,
         )
