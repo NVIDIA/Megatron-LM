@@ -85,8 +85,8 @@ class CachedMetadataFileSystemReader(FileSystemReader):
                 # TODO sort by offset and cache the reading
                 for req in reqs:
                     item_md = self.storage_data[req.storage_index]
-                    if file_path_rank != rank:
-                        print(f"[DEBUG-TP-REP] [Rank {rank}] Reading item {req.storage_index} from {new_path} (type: {req.type})")
+                    #if file_path_rank != rank:
+                    print(f"[DEBUG-TP-REP] [Rank {rank}] Reading item {req.storage_index} from {file_path_rank} ({new_path}) (type: {req.type})")
                     file_slice = self._slice_file(stream, item_md)
                     transform_from = self.transforms.transform_load_stream(
                         req,

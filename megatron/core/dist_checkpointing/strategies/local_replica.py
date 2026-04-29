@@ -128,6 +128,7 @@ def rewrite_replicas_to_shadow(
             continue
         if sh.replica_id == 0:
             continue
+        print(f"[DEBUG shadow keys | {global_rank}] {sh.key} -> {shadow_key(global_rank, sh.key)}")
         sh.key = shadow_key(global_rank, sh.key)
         sh.replica_id = 0
         n_renamed += 1
