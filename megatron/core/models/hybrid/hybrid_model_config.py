@@ -30,7 +30,7 @@ implementation.
 """
 
 import dataclasses
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from megatron.core.models.hybrid.common_layer_config import CommonLayerConfig

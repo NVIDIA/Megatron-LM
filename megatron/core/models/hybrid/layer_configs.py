@@ -16,9 +16,8 @@ They participate in the layer pattern but are not "layers" the
 (vocab/sequence shape) or pipeline boundaries.
 """
 
-import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, Optional, Union
 
 from megatron.core.models.hybrid.common_layer_config import (
     CommonLayerConfig,
