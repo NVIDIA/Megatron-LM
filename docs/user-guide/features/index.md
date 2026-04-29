@@ -9,7 +9,7 @@
 
 # Advanced Features
 
-Advanced feature guides for key Megatron Core capabilities.
+Guides for Megatron Core training features.
 
 ```{toctree}
 :maxdepth: 2
