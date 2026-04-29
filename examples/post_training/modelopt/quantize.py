@@ -167,9 +167,8 @@ def get_modelopt_torch_quantization_config():
         # cache override; the recipe encodes quant_cfg + algorithm + KV cache directly.
         print_rank_0(f"Use recipe {args.recipe} for quantization")
         recipe = load_recipe(args.recipe)
-        assert isinstance(recipe, ModelOptPTQRecipe), (
-            f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}"
-        )
+        if not isinstance(recipe, ModelOptPTQRecipe), 
+            raise TypeError(f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}")
         if args.export_kv_cache_quant != "none":
             print_rank_0(f"Ignoring --export-kv-cache-quant={args.export_kv_cache_quant} since you passed in a YAML recipe.")
         return recipe.quantize.model_dump()
@@ -218,19 +217,6 @@ def get_modelopt_torch_quantization_config():
     # Weight Only Quantization
     if args.weight_only:
         mtq_config["quant_cfg"].append({"quantizer_name": "*input_quantizer", "enable": False})
-    if args.num_first_layers_to_skip_quant is not None:
-        mtq_config = get_first_layers_disabled_config(
-            mtq_config,
-            num_layers=args.num_layers,
-            num_layers_to_disable=args.num_first_layers_to_skip_quant,
-        )
-    if args.num_last_layers_to_skip_quant is not None:
-        mtq_config = get_last_layers_disabled_config(
-            mtq_config,
-            num_layers=args.num_layers,
-            num_layers_to_disable=args.num_last_layers_to_skip_quant,
-        )
-
     return mtq_config
 
 
