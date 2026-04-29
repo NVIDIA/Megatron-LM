@@ -281,6 +281,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hybrid_submodules=hybrid_submodules,
                 name="mtp",
             )
+            self._setup_mtp_cuda_graphs()
 
         # Output
         if post_process or self.mtp_process:
