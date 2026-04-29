@@ -463,6 +463,19 @@ class MTPLayerConfig:
     """Per-depth MTP body — a (possibly nested) list of decoder
     :class:`LayerConfig` instances."""
 
+    loss_scaling_factor: Optional[float] = None
+    """Scale factor applied to the auxiliary MTP loss before it is added to
+    the main cross-entropy loss. ``None`` keeps the
+    :class:`TransformerConfig` default (``mtp_loss_scaling_factor=0.1``).
+    All :class:`MTPLayerConfig` markers in a recipe must agree on this
+    value — it is a stack-level setting, not per-depth."""
+
+    use_repeated_layer: Optional[bool] = None
+    """Reuse a single MTP transformer layer across all depths instead of
+    instantiating one per depth. ``None`` keeps the
+    :class:`TransformerConfig` default (``mtp_use_repeated_layer=False``).
+    Like :attr:`loss_scaling_factor`, must agree across all markers."""
+
 
 @dataclass
 class CrossEntropyLayerConfig:
