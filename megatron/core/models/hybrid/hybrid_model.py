@@ -151,6 +151,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.disable_param_offloading = True
 
         recipe_path = layer_type_list_override is not None
+        if not recipe_path and (vocab_size is None or max_sequence_length is None):
+            raise ValueError(
+                "vocab_size and max_sequence_length are required on the legacy "
+                "(hybrid_layer_pattern) construction path; pass both explicitly. "
+                "On the recipe path, the EmbeddingLayerConfig marker supplies them."
+            )
         if recipe_path:
             if hybrid_layer_pattern is not None:
                 raise ValueError(

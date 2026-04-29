@@ -33,7 +33,6 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 from megatron.core.activations import squared_relu
-from megatron.core.utils import init_method_normal
 
 # --- string-keyed lookups for human-friendly recipe authoring -------------
 
@@ -178,7 +177,8 @@ class CommonLayerConfig:
     # ─────────────────────────────────────────────────────────────────────────
 
     transformer_impl: str = "transformer_engine"
-    """Transformer implementation: ``"transformer_engine"``, ``"local"``, or ``"inference_optimized"``."""
+    """Transformer implementation: ``"transformer_engine"``, ``"local"``, or
+    ``"inference_optimized"``."""
 
     cuda_graph_impl: Optional[str] = None
     """CUDA graph capture implementation: ``"none"``, ``"local"``, or ``"transformer_engine"``."""

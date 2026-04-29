@@ -16,9 +16,8 @@ They participate in the layer pattern but are not "layers" the
 (vocab/sequence shape) or pipeline boundaries.
 """
 
-import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, Optional, Union
 
 from megatron.core.models.hybrid.common_layer_config import (
     CommonLayerConfig,
@@ -435,12 +434,6 @@ class MTPLayerConfig:
     mtp_model_layer: list = field(default_factory=list)
     """Per-depth MTP body — a (possibly nested) list of decoder
     :class:`LayerConfig` instances."""
-
-    extra: Dict[str, Any] = field(default_factory=dict)
-    """Passthrough kwargs forwarded to the per-MTP-layer
-    :class:`TransformerConfig`. Same semantics as
-    :attr:`CommonLayerConfig.extra`. Currently unused by
-    :class:`MultiTokenPredictionBlock` — included for forward compatibility."""
 
 
 @dataclass
