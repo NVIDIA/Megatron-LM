@@ -96,8 +96,6 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
     "flash-linear-attention~=0.4.0",
     "megatron-energon[av_decode]~=6.0",
     "av",
@@ -119,8 +117,6 @@ lts = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -129,6 +125,11 @@ lts = [
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers",
+]
+
+ssm = [
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
 ]
 
 [dependency-groups]
