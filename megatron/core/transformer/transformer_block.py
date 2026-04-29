@@ -391,6 +391,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
                 self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
                 self.hc_head_scale = nn.Parameter(torch.ones(1))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -935,6 +940,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
             # When MTP is enabled, save pre-contraction multi-stream for MTP input.
             if self.config.mtp_num_layers is not None:
+                assert (
+                    len(extract_layer_indices) == 0
+                ), "Feature extraction is not supported with mHC + MTP."
                 mhc_multistream = hidden_states
             # [s, b, n*C] -> [s, b, C]
             hidden_states = learned_output_contract(
