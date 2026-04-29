@@ -43,6 +43,7 @@ from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
+from .snapshot_pool import GpuSnapshotBufferPool
 from .step_journal import StepJournal
 
 try:
@@ -663,6 +664,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"    total_blocks:          {total_blocks} ({get_mem_size_str(total_kv_bytes)})",
         ]
 
+        snapshot_accounting = self.snapshot_pool.memory_accounting()
+        log_lines += [
+            f"  GPU bookkeeping snapshots:",
+            f"    slots:                 {snapshot_accounting['snapshot_slot_count']}",
+            f"    metadata_buffers:      {get_mem_size_str(snapshot_accounting['metadata_buffer_bytes'])}",
+            f"    pinned_mirrors:        {get_mem_size_str(snapshot_accounting['pinned_mirror_bytes'])}",
+            f"    graph_captures:        {snapshot_accounting['graph_capture_count']} "
+            f"({get_mem_size_str(snapshot_accounting['graph_capture_bytes'])})",
+        ]
+
         if self.is_hybrid_model:
             mamba_conv_bytes = (
                 math.prod(self.mamba_conv_states_shape)
@@ -1115,6 +1126,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_mamba_chunks=self._max_mamba_chunks,
         )
         self.gpu_view.current_dynamic_step_id = self.current_dynamic_step_id
+        self.snapshot_pool = GpuSnapshotBufferPool(
+            slot_count=max(1, int(self.config.async_overlap_queue_depth)),
+            max_requests=self.max_requests,
+            max_tokens=self.max_tokens,
+            max_kv_blocks=self.max_kv_block_count,
+            device=torch.cuda.current_device(),
+            max_mamba_chunks=self._max_mamba_chunks,
+        )
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
         # only one is active per step, so sharing storage is safe.

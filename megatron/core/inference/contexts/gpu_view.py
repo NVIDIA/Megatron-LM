@@ -31,6 +31,8 @@ class ContextGPUView:
         max_kv_blocks: int,
         device: torch.device,
         max_mamba_chunks: int = 0,
+        backing_buffer: torch.Tensor = None,
+        zero_initialize: bool = True,
     ):
         # CPU-side debug identity for trace correlation. Later snapshot-pool
         # work will replace this singleton identity with per-slot handles.
@@ -112,8 +114,21 @@ class ContextGPUView:
             + mamba_conv_seq_start_bytes
         )
 
-        # Zero-initialized so pre-transfer reads see zeros (matches prior semantics).
-        self._buf = torch.zeros(total_bytes, dtype=torch.uint8, device=device)
+        self.total_bytes = total_bytes
+        if backing_buffer is None:
+            # Zero-initialized so pre-transfer reads see zeros (matches prior semantics).
+            self._buf = torch.zeros(total_bytes, dtype=torch.uint8, device=device)
+        else:
+            if backing_buffer.dtype != torch.uint8:
+                raise TypeError("ContextGPUView backing_buffer must have dtype torch.uint8")
+            if backing_buffer.numel() != total_bytes:
+                raise ValueError(
+                    f"ContextGPUView backing_buffer has {backing_buffer.numel()} bytes, "
+                    f"expected {total_bytes}"
+                )
+            self._buf = backing_buffer
+            if zero_initialize:
+                self._buf.zero_()
 
         # Token-level tensors (consumed by embedding, RoPE, KV append, Mamba).
         off = 0
