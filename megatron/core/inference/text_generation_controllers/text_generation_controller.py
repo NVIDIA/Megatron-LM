@@ -1808,13 +1808,19 @@ class TextGenerationController:
         range_push(context.dynamic_step_nvtx_label("active_request_mask"))
         # Everything below is 100% CPU.
         active_request_ids = context.request_ids[active_request_slice].long()
-        active_sequence_lengths = context.get_active_sequence_lengths()
-
-        # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
-        # returns kv_offsets + query_lengths which already includes all accepted
-        # speculative tokens (they were part of the query and survived the rewind).
-        # Only the newly sampled base token is not yet in the KV cache, so add 1.
-        active_sequence_lengths += 1
+        active_request_slots = torch.arange(
+            context.paused_request_count,
+            context.total_request_count,
+            dtype=torch.long,
+            device='cpu',
+        )
+        output_placeholder_counts = torch.ones(
+            active_request_count,
+            dtype=context.num_output_placeholders.dtype,
+            device='cpu',
+        )
+        context.add_output_placeholders(active_request_slots, output_placeholder_counts)
+        active_sequence_lengths = context.get_placeholder_adjusted_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.

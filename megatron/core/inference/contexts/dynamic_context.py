@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -866,6 +866,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_output_lengths = torch.empty(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
         )
+        # Output tokens scheduled but not yet retired by the committed ledger.
+        self.num_output_placeholders = torch.zeros(
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
+        )
         # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_kv_length_offsets = torch.empty(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
@@ -1307,6 +1311,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         lengths = lengths[self.paused_request_count : self.total_request_count]
         return lengths
 
+    def get_placeholder_adjusted_active_sequence_lengths(self) -> Tensor:
+        """Total active sequence lengths including scheduled output placeholders."""
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        return (
+            self.request_kv_length_offsets[active_slice]
+            + self.request_query_lengths[active_slice]
+            + self.num_output_placeholders[active_slice]
+        )
+
+    def get_placeholder_adjusted_active_token_count(self) -> int:
+        """Active token count including scheduled output placeholders."""
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        return int(
+            self.active_token_count + self.num_output_placeholders[active_slice].sum().item()
+        )
+
     def get_max_sequence_lengths(self) -> Tensor:
         """Maximum sequence length for active requests."""
         return self.request_output_lengths[self.paused_request_count : self.total_request_count]
@@ -1314,6 +1334,94 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_active_request_count(self):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
+
+    def _placeholder_request_slots_tensor(self, request_slots) -> Tensor:
+        """Return request slots as a CPU int64 tensor."""
+        if isinstance(request_slots, slice):
+            start = 0 if request_slots.start is None else request_slots.start
+            stop = self.total_request_count if request_slots.stop is None else request_slots.stop
+            step = 1 if request_slots.step is None else request_slots.step
+            return torch.arange(start, stop, step, dtype=torch.long, device='cpu')
+        if isinstance(request_slots, torch.Tensor):
+            return request_slots.to(device='cpu', dtype=torch.long)
+        return torch.as_tensor(request_slots, dtype=torch.long, device='cpu')
+
+    def _placeholder_counts_tensor(self, request_slots: Tensor, count_by_request) -> Tensor:
+        """Return placeholder counts aligned with request slots."""
+        if isinstance(count_by_request, Mapping):
+            counts = []
+            for slot in request_slots.tolist():
+                request_id = int(self.request_ids[slot].item())
+                counts.append(
+                    int(
+                        count_by_request.get(
+                            request_id, count_by_request.get(str(request_id), 0)
+                        )
+                    )
+                )
+            return torch.tensor(counts, dtype=self.num_output_placeholders.dtype, device='cpu')
+        if isinstance(count_by_request, torch.Tensor):
+            counts = count_by_request.to(device='cpu', dtype=self.num_output_placeholders.dtype)
+        else:
+            counts = torch.as_tensor(
+                count_by_request, dtype=self.num_output_placeholders.dtype, device='cpu'
+            )
+        if counts.dim() == 0:
+            counts = counts.expand(request_slots.numel()).clone()
+        return counts.reshape(-1)
+
+    def _update_placeholder_debug_count(self) -> None:
+        """Update the aggregate placeholder debug counter."""
+        if not hasattr(self, "async_overlap_debug_counters"):
+            return
+        self.async_overlap_debug_counters["placeholder_count"] = int(
+            self.num_output_placeholders[: self.total_request_count].sum().item()
+        )
+
+    def add_output_placeholders(self, request_slots, count_by_request) -> None:
+        """Add scheduled output placeholders for the provided request slots."""
+        slots = self._placeholder_request_slots_tensor(request_slots)
+        if slots.numel() == 0:
+            return
+        counts = self._placeholder_counts_tensor(slots, count_by_request)
+        self.num_output_placeholders[slots] += counts
+        for slot, count in zip(slots.tolist(), counts.tolist()):
+            if count:
+                self.record_placeholder_delta(
+                    self.current_dynamic_step_id, int(self.request_ids[slot].item()), int(count)
+                )
+        self._update_placeholder_debug_count()
+
+    def consume_output_placeholders(self, request_slots, accepted_count_by_request) -> None:
+        """Consume retired output placeholders for the provided request slots."""
+        slots = self._placeholder_request_slots_tensor(request_slots)
+        if slots.numel() == 0:
+            return
+        counts = self._placeholder_counts_tensor(slots, accepted_count_by_request)
+        updated_counts = self.num_output_placeholders[slots] - counts
+        if torch.any(updated_counts < 0):
+            raise AssertionError("Output placeholder accounting underflow")
+        self.num_output_placeholders[slots] = updated_counts
+        for slot, count in zip(slots.tolist(), counts.tolist()):
+            if count:
+                self.record_placeholder_delta(
+                    self.current_dynamic_step_id, int(self.request_ids[slot].item()), -int(count)
+                )
+        self._update_placeholder_debug_count()
+
+    def placeholder_adjusted_sequence_length(self, request_slot: int) -> int:
+        """Return request sequence length including output placeholders."""
+        return int(
+            (
+                self.request_kv_length_offsets[request_slot]
+                + self.request_query_lengths[request_slot]
+                + self.num_output_placeholders[request_slot]
+            ).item()
+        )
+
+    def placeholder_adjusted_kv_length(self, request_slot: int) -> int:
+        """Return request KV length including output placeholders."""
+        return self.placeholder_adjusted_sequence_length(request_slot)
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1630,7 +1738,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 metadata_cols[i].append(m)
 
         total_new_tokens = sum(lengths)
-        if self.active_token_count + total_new_tokens > self.max_tokens:
+        if self.get_placeholder_adjusted_active_token_count() + total_new_tokens > self.max_tokens:
             raise TokenOverflowError(requests[-1].request_id)
 
         device = self.request_ids.device
@@ -1656,6 +1764,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_query_lengths[request_slice] = lengths_tensor
         self.request_in_prefill_status_tensor[request_slice] = 1
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
+        self.num_output_placeholders[request_slice] = 0
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype, _) in enumerate(self.request_metadata_types):
@@ -2248,6 +2357,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_mamba_state()
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
+        self.num_output_placeholders.fill_(0)
 
         # Reset step counter and LRU clock
         self.step_count = 0
@@ -2593,7 +2703,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         request_tokens_can_be_added = (
-            self.active_token_count + effective_prefill_chunk_length <= self.max_tokens
+            self.get_placeholder_adjusted_active_token_count() + effective_prefill_chunk_length
+            <= self.max_tokens
         )
         kv_cache_available = self.kv_block_allocator.is_memory_available(num_blocks_from_pool)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
@@ -2715,7 +2826,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if current_id >= self.max_requests:
             raise RequestOverflowError(req.request_id)
 
-        if self.active_token_count + effective_prefill_chunk_length > self.max_tokens:
+        if (
+            self.get_placeholder_adjusted_active_token_count() + effective_prefill_chunk_length
+            > self.max_tokens
+        ):
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
@@ -2740,6 +2854,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Handle length and block assignments.
         self.request_query_lengths[current_id] = effective_prefill_chunk_length
         self.request_in_prefill_status_tensor[current_id] = 1
+        self.num_output_placeholders[current_id] = 0
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
             + prefill_chunk_length
@@ -2867,6 +2982,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
+        self.num_output_placeholders[dst_idxs] = self.num_output_placeholders[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
         next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
         if new_speculative_tokens is not None:
@@ -2894,6 +3010,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.num_output_placeholders, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
@@ -2957,6 +3074,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # fill_()/add_() creates a clone and updates it instead of the original
         # tensor.
         self.request_to_kv_block_ids[request_indexes] = -1
+        self.num_output_placeholders[request_indexes] = 0
+        self._update_placeholder_debug_count()
 
         # Free Mamba slots.
         if self.is_hybrid_model:
@@ -2998,8 +3117,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Check which paused requests will actually need a new block upon resuming
             offsets = self.request_last_kv_block_offset[: self.paused_request_count]
+            paused_placeholder_counts = self.num_output_placeholders[: self.paused_request_count]
             needs_new_block = (
-                offsets >= self.block_size_tokens - 1 - self.num_speculative_tokens
+                offsets + self.num_speculative_tokens + 1 + paused_placeholder_counts
+                >= self.block_size_tokens
             ).to(paused_block_counts.dtype)
             needs_new_block = needs_new_block.flip(dims=[0])
 
@@ -3012,8 +3133,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
             # Constrain resumptions by the maximum allowed active requests and tokens
+            active_placeholder_count = int(
+                self.num_output_placeholders[
+                    self.paused_request_count : self.total_request_count
+                ]
+                .sum()
+                .item()
+            )
+            placeholder_adjusted_max_tokens = max(0, self.max_tokens - active_placeholder_count)
             max_allowed_active = min(
-                self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+                self.max_requests,
+                placeholder_adjusted_max_tokens // (self.num_speculative_tokens + 1),
             )
             allowed_to_resume = max(0, max_allowed_active - active_request_count)
             resume_request_count = min(resume_request_count, allowed_to_resume)
@@ -3028,7 +3158,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Check which resumed requests actually need a new block
             offsets = self.request_last_kv_block_offset[resume_start:resume_end]
-            needs_new_block = offsets >= (self.block_size_tokens - 1 - self.num_speculative_tokens)
+            resumed_placeholder_counts = self.num_output_placeholders[resume_start:resume_end]
+            needs_new_block = (
+                offsets + self.num_speculative_tokens + 1 + resumed_placeholder_counts
+                >= self.block_size_tokens
+            )
             num_new_blocks = needs_new_block.sum().item()
 
             if num_new_blocks > 0:
@@ -3164,6 +3298,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count, self.total_request_count + evict_request_count
         )
         self.request_to_kv_block_ids[evict_slice] = -1
+        self.num_output_placeholders[evict_slice] = 0
+        self._update_placeholder_debug_count()
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
 
@@ -3227,6 +3363,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_tokens = new_tokens.cpu()
         if new_speculative_tokens is not None and new_speculative_tokens.is_cuda:
             new_speculative_tokens = new_speculative_tokens.cpu()
+
+        step_request_slots = torch.arange(
+            self.paused_request_count, self.total_request_count, dtype=torch.long, device='cpu'
+        )
+        step_placeholder_counts = self.num_output_placeholders[step_request_slots].clone()
+        if torch.any(step_placeholder_counts > 0):
+            self.consume_output_placeholders(step_request_slots, step_placeholder_counts)
 
         self.num_prefill_requests = 0  # all turns to decode
         # All request that were in prefill become decode requests.
@@ -3320,6 +3463,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
                 # Reset chunk ids for recently moved requests.
                 self.request_to_kv_block_ids[active_idxs_on_right] = -1
+                self.num_output_placeholders[active_idxs_on_right] = 0
+                self._update_placeholder_debug_count()
                 if self.is_hybrid_model:
                     self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
 
@@ -3332,8 +3477,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_tokens_in_last_block = self.request_last_kv_block_offset[
                 self.paused_request_count : (active_request_count + self.paused_request_count)
             ]
+            active_placeholder_counts = self.num_output_placeholders[
+                self.paused_request_count : (active_request_count + self.paused_request_count)
+            ]
+            tokens_reserved_for_next_step = (
+                self.num_speculative_tokens + 1 + active_placeholder_counts
+            )
             active_requests_requiring_new_block = (
-                num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
+                num_tokens_in_last_block + tokens_reserved_for_next_step
+                >= self.block_size_tokens
             ).byte()
 
             # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
@@ -3344,8 +3496,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                     chunked_prefill_request_idx - self.paused_request_count
                 ] = 0  # chunked prefill should not be paused
             else:
+                active_placeholder_count = int(
+                    self.num_output_placeholders[
+                        self.paused_request_count : self.total_request_count
+                    ]
+                    .sum()
+                    .item()
+                )
+                placeholder_adjusted_max_tokens = max(
+                    0, self.max_tokens - active_placeholder_count
+                )
                 max_allowed_active = min(
-                    self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+                    self.max_requests,
+                    placeholder_adjusted_max_tokens // (self.num_speculative_tokens + 1),
                 )
                 if active_request_count > max_allowed_active:
                     # Force-pause excess requests in a decode-only batch
