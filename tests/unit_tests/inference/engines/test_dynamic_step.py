@@ -15,6 +15,7 @@ from megatron.core.inference.engines.dynamic_step import (
     StepInputPlan,
     StepJournalEntry,
     StepRetirementResult,
+    assert_snapshot_gpu_view_bound,
 )
 
 
@@ -128,12 +129,30 @@ def test_mixed_prefill_decode_step_contract_construction():
         metadata_ready_event=context_snapshot.metadata_ready_event,
         input_ready_event=input_plan.input_ready_event,
         compute_done_event="compute-done",
+        gpu_view=context_snapshot.gpu_view,
     )
 
     assert request_plan.decode_request_ids == ("decode-0",)
     assert request_plan.prefill_request_ids == ("prefill-0",)
     assert context_snapshot.snapshot_slot_id == 1
     assert gpu_launch.compute_done_event == "compute-done"
+
+
+def test_snapshot_gpu_view_debug_guard_detects_mutable_context_reads():
+    step_id = DynamicStepId(8)
+    snapshot_view = object()
+    live_view = object()
+    snapshot = DynamicStepContextSnapshot(
+        step_id=step_id,
+        snapshot_slot_id=0,
+        request_plan=DynamicStepRequestPlan(step_id=step_id),
+        gpu_view=snapshot_view,
+    )
+
+    assert_snapshot_gpu_view_bound(snapshot, live_view, debug_enabled=False)
+    assert_snapshot_gpu_view_bound(snapshot, snapshot_view, debug_enabled=True)
+    with pytest.raises(RuntimeError, match="prepared snapshot"):
+        assert_snapshot_gpu_view_bound(snapshot, live_view, debug_enabled=True)
 
 
 def test_speculative_placeholder_step_contract_construction():

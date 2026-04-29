@@ -122,6 +122,21 @@ class DynamicStepContextSnapshot:
             )
 
 
+def assert_snapshot_gpu_view_bound(
+    snapshot: DynamicStepContextSnapshot, live_gpu_view: Optional[Any], *, debug_enabled: bool
+) -> None:
+    """Guard that dynamic GPU work is bound to the prepared snapshot view."""
+    if not debug_enabled:
+        return
+    if snapshot.gpu_view is None:
+        raise RuntimeError("Dynamic GPU launch requires a snapshot-bound gpu_view")
+    if snapshot.gpu_view is not live_gpu_view:
+        raise RuntimeError(
+            "Dynamic GPU launch would read mutable context.gpu_view instead of the prepared "
+            "snapshot gpu_view"
+        )
+
+
 @dataclass(frozen=True, kw_only=True)
 class DynamicStepGpuLaunch:
     """Forward/sampling launch contract for one dynamic step."""
@@ -133,6 +148,7 @@ class DynamicStepGpuLaunch:
     compute_done_event: Optional[Any] = None
     input_ids: Optional[Any] = None
     position_ids: Optional[Any] = None
+    gpu_view: Optional[Any] = None
     logits: Optional[Any] = None
     routing_indices_per_request: Optional[Any] = None
     cuda_graph_batch_dimensions: Optional[Any] = None

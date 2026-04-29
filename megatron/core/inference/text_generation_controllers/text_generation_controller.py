@@ -25,6 +25,8 @@ from megatron.core.inference.engines.dynamic_step import (
     DynamicStepGpuLaunch,
     DynamicStepId,
     DynamicStepRequestPlan,
+    SnapshotSlotHandle,
+    assert_snapshot_gpu_view_bound,
 )
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -572,6 +574,7 @@ class TextGenerationController:
         self,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_dummy_forward: bool = False,
+        snapshot_slot_handle: Optional[SnapshotSlotHandle] = None,
     ):
         """Initializes the inference context for dynamic batching.
 
@@ -596,12 +599,13 @@ class TextGenerationController:
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
+            snapshot_slot_handle=snapshot_slot_handle,
         )
         range_pop()
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
         range_push(context.dynamic_step_nvtx_label("transfer_bookkeeping_to_gpu"))
-        context.transfer_bookkeeping_to_gpu()
+        context.transfer_bookkeeping_to_gpu(snapshot_slot_handle=snapshot_slot_handle)
         range_pop()
 
         # If using symmetric kernels and we are using using nccl
@@ -1936,15 +1940,21 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
-        input_ids, position_ids = self._dynamic_step_context_init()
-        active_request_count = context.total_request_count - context.paused_request_count
         step_id = self._current_dynamic_step_record()
+        snapshot_slot = context.snapshot_pool.acquire(step_id.value)
+        snapshot_handle = SnapshotSlotHandle(
+            step_id=step_id, snapshot_slot_id=snapshot_slot.slot_id
+        )
+        input_ids, position_ids = self._dynamic_step_context_init(
+            snapshot_slot_handle=snapshot_handle
+        )
+        active_request_count = context.total_request_count - context.paused_request_count
         request_plan = self._dynamic_step_request_plan(step_id)
 
         cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
-        snapshot_slot_id = getattr(context.gpu_view, "current_snapshot_slot_id", 0)
+        snapshot_slot_id = snapshot_slot.slot_id
         context.record_snapshot_slot(
             step_id.value,
             snapshot_slot_id,
@@ -1962,9 +1972,11 @@ class TextGenerationController:
             request_plan=request_plan,
             active_request_count=active_request_count,
             cuda_graph_request_count=cuda_graph_request_count,
+            metadata_ready_event=snapshot_slot.metadata_ready_event,
             input_ids=input_ids,
             position_ids=position_ids,
-            gpu_view=context.gpu_view,
+            gpu_view=snapshot_slot.gpu_view,
+            cpu_staging_buffer=snapshot_slot.cpu_mirror,
         )
 
     def launch_dynamic_forward(
@@ -1972,6 +1984,11 @@ class TextGenerationController:
     ) -> DynamicStepGpuLaunch:
         """Launch the dynamic forward phase for a prepared serial step."""
         context = self.inference_wrapped_model.inference_context
+        assert_snapshot_gpu_view_bound(
+            prepared_step,
+            context.gpu_view,
+            debug_enabled=getattr(context.config, "async_overlap_debug_checks", False),
+        )
 
         # Enable routing recording before forward pass if routing replay is enabled
         config = self.inference_wrapped_model.model.config
@@ -1996,6 +2013,12 @@ class TextGenerationController:
         routing_indices_per_request = self._router_record_bookkeeping()
         range_pop()
 
+        gpu_read_event = torch.cuda.Event()
+        gpu_read_event.record(torch.cuda.current_stream())
+        context.snapshot_pool.mark_forward_in_flight(
+            prepared_step.snapshot_slot_id, gpu_read_event=gpu_read_event
+        )
+
         return DynamicStepGpuLaunch(
             step_id=prepared_step.step_id,
             snapshot_slot_id=prepared_step.snapshot_slot_id,
@@ -2003,6 +2026,7 @@ class TextGenerationController:
             input_ready_event=prepared_step.input_ready_event,
             input_ids=prepared_step.input_ids,
             position_ids=prepared_step.position_ids,
+            gpu_view=prepared_step.gpu_view,
             logits=logits,
             routing_indices_per_request=routing_indices_per_request,
             cuda_graph_batch_dimensions=prepared_step.cuda_graph_request_count,
@@ -2134,6 +2158,8 @@ class TextGenerationController:
             self._accepted_tokens_per_request.fill_(-1)
             self._accepted_token_counts_per_request.fill_(0)
         ret.update(request_bookkeeping)
+        context = self.inference_wrapped_model.inference_context
+        context.snapshot_pool.release(prepared_step.snapshot_slot_id)
         return ret
 
     async def async_generate_output_tokens_dynamic_batch(

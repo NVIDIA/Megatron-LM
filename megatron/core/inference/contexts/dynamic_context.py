@@ -2005,6 +2005,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
+        snapshot_slot_handle=None,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
@@ -2016,6 +2017,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
+        if snapshot_slot_handle is not None:
+            self.bind_snapshot_slot(snapshot_slot_handle)
+
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
         self._execute_pending_mamba_ops()
@@ -2253,6 +2257,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
+        if snapshot_slot_handle is not None:
+            self._populate_snapshot_cpu_mirror(snapshot_slot_handle)
+
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
 
@@ -2280,7 +2287,30 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_ssm_states[:, indices] = 0.0
                 self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def _refresh_request_staging_fields(self) -> None:
+        """Refresh request-level staging slots from persistent CPU tensors."""
+        n_active = self.total_request_count - self.paused_request_count
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+
+        # CPU-to-CPU slice assignment on pinned memory (~7.5 KB total for 3
+        # int32 fields at max_requests=624). Negligible vs. the launch overhead
+        # we save by merging 9 H2D memcpys into 1.
+        self._staging_request_in_prefill_status[:n_active] = (
+            self.request_in_prefill_status_tensor[active_slice]
+        )
+        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
+        self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
+            active_slice
+        ]
+
+    def _populate_snapshot_cpu_mirror(self, snapshot_slot_handle):
+        """Copy the populated pinned CPU bookkeeping buffer into a snapshot mirror."""
+        slot = self._snapshot_slot_from_handle(snapshot_slot_handle)
+        self._refresh_request_staging_fields()
+        slot.cpu_mirror.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        return slot
+
+    def transfer_bookkeeping_to_gpu(self, snapshot_slot_handle=None):
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2293,20 +2323,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
-        n_active = self.total_request_count - self.paused_request_count
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-
-        # Refresh request-level staging slots from the persistent CPU source.
-        # CPU-to-CPU slice assignment on pinned memory (~7.5 KB total for 3
-        # int32 fields at max_requests=624). Negligible vs. the launch overhead
-        # we save by merging 9 H2D memcpys into 1.
-        self._staging_request_in_prefill_status[:n_active] = (
-            self.request_in_prefill_status_tensor[active_slice]
-        )
-        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
-        self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
-            active_slice
-        ]
+        snapshot_slot = self._snapshot_slot_from_handle(snapshot_slot_handle)
+        if snapshot_slot is not None:
+            self._bind_gpu_view(snapshot_slot.gpu_view)
+            source_buffer = snapshot_slot.cpu_mirror
+            ready_event = snapshot_slot.metadata_ready_event
+        else:
+            self._refresh_request_staging_fields()
+            source_buffer = self._cpu_bookkeeping_buf
+            ready_event = self._gpu_bookkeeping_complete_event
 
         pending_mamba_transfer = getattr(self, '_pending_mamba_transfer', None)
 
@@ -2315,11 +2340,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
         with torch.cuda.stream(self.gpu_bookkeeping_stream):
-            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+            self.gpu_view._buf.copy_(source_buffer, non_blocking=True)
             if pending_mamba_transfer is not None:
                 self.mamba_metadata.load_from_cpu(pending_mamba_transfer)
-            self._gpu_bookkeeping_complete_event.record(self.gpu_bookkeeping_stream)
-        torch.cuda.current_stream().wait_event(self._gpu_bookkeeping_complete_event)
+            ready_event.record(self.gpu_bookkeeping_stream)
+        torch.cuda.current_stream().wait_event(ready_event)
+
+        if snapshot_slot is not None:
+            self.snapshot_pool.mark_ready(snapshot_slot, ready_event)
 
         # MHA metadata: buffers already covered by the coalesced H2D above.
         # All that's left is pointing state_data at the correct GPU slices and
@@ -2337,6 +2365,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Mamba metadata: GPU-side views were loaded on gpu_bookkeeping_stream.
         if pending_mamba_transfer is not None:
             self._pending_mamba_transfer = None
+
+        return ready_event
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
@@ -2428,6 +2458,35 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.current_dynamic_step_id = step_id
         if hasattr(self, "gpu_view"):
             self.gpu_view.current_dynamic_step_id = step_id
+
+    def _bind_gpu_view(self, gpu_view) -> None:
+        """Bind metadata helpers to the GPU view for the active step snapshot."""
+        self.gpu_view = gpu_view
+        self.gpu_view.current_dynamic_step_id = self.current_dynamic_step_id
+        self.graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+        self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+        if self.is_hybrid_model and self.mamba_metadata is not None:
+            self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
+
+    def _snapshot_slot_from_handle(self, snapshot_slot_handle):
+        """Return the snapshot slot described by a handle-like object."""
+        if snapshot_slot_handle is None:
+            return None
+        slot = self.snapshot_pool.get_slot(snapshot_slot_handle.snapshot_slot_id)
+        step_id = getattr(snapshot_slot_handle.step_id, "value", snapshot_slot_handle.step_id)
+        if slot.owning_step_id != int(step_id):
+            raise RuntimeError(
+                f"Snapshot slot {slot.slot_id} is owned by step {slot.owning_step_id}, "
+                f"not step {step_id}"
+            )
+        return slot
+
+    def bind_snapshot_slot(self, snapshot_slot_handle):
+        """Make a snapshot slot's fixed-address GPU view the active launch view."""
+        slot = self._snapshot_slot_from_handle(snapshot_slot_handle)
+        self._bind_gpu_view(slot.gpu_view)
+        slot.cpu_view.current_dynamic_step_id = self.current_dynamic_step_id
+        return slot
 
     def dynamic_step_nvtx_label(self, name: str, step_id: Optional[int] = None) -> str:
         """Return an NVTX range name with the current dynamic step id."""
