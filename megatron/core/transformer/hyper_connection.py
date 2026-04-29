@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
@@ -89,6 +90,22 @@ def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tenso
     v = norm / math.sqrt(K) + eps
     r = 1.0 / v
     return proj, r
+
+
+@torch.compile
+def learned_output_contract(
+    hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
+) -> Tensor:
+    """Learned output contraction: n-stream → 1-stream via sigmoid-gated weighted sum."""
+    dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    rsqrt = torch.rsqrt(hidden_states.square().mean(-1, keepdim=True) + eps)
+    mixes = F.linear(hidden_states, head_fn) * rsqrt
+    pre = torch.sigmoid(mixes * scale + base) + 1e-6
+    y = torch.sum(
+        pre.unsqueeze(-1) * hidden_states.view(*hidden_states.shape[:-1], n, -1), dim=-2
+    )
+    return y.to(dtype)
 
 
 # ============================================================================
