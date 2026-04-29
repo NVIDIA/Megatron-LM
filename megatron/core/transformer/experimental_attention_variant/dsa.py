@@ -26,6 +26,694 @@ try:
 except ImportError:
     hadamard_transform = None
 
+import os
+USE_FUSED_INDEXER_LOSS = int(os.getenv("USE_FUSED_INDEXER_LOSS", "0"))
+
+from functools import lru_cache
+import tilelang.language as T
+from tilelang import JITKernel
+
+def _make_stage2_kernel(
+    B: int,
+    ASq: int,
+    Sk: int,
+    AH: int,
+    AD: int,
+    BLOCK_SQ: int,
+    BLOCK_SK: int,
+    BLOCK_D: int,
+    sparse_loss: bool,
+    softmax_scale: float,
+    dtype: str,
+) -> JITKernel:
+    """Return a compiled TileLang JITKernel for stage 2.
+
+    All parameters are compile-time constants enabling full specialisation.
+
+    Tensor sizes:
+      softmax_m, softmax_d : (B, AH, ASq_total)  where ASq_total = ASq
+      m1, d1               : (B, ASq_total)
+      Index_Scores/Mask    : (B, ASq, Sk)   -- LOCAL, 0-indexed
+      Attn_Query           : (ASq, B, AH, AD) -- LOCAL
+      Loss                 : (B, ASq)         -- LOCAL output
+    """
+    num_sq_blocks = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
+    num_sk_blocks = (Sk + BLOCK_SK - 1) // BLOCK_SK
+    num_dk_blocks = (AD + BLOCK_D - 1) // BLOCK_D
+    scale_f32  = float(softmax_scale)
+    ASq_total  = ASq   # size of the m/d/m1/d1 dimension
+
+    if sparse_loss:
+        @T.prim_func
+        def _kernel_sparse(
+            Attn_Query:  T.Tensor((ASq, B, AH, AD), dtype),
+            Attn_Key:    T.Tensor((Sk,  B, AH, AD), dtype),
+            Index_Scores: T.Tensor((B, ASq, Sk), 'float32'),
+            Index_Mask:   T.Tensor((B, ASq, Sk), 'float32'),
+            softmax_m:   T.Tensor((B, AH, ASq_total), 'float32'),
+            softmax_d:   T.Tensor((B, AH, ASq_total), 'float32'),
+            m1:          T.Tensor((B, ASq_total), 'float32'),
+            d1:          T.Tensor((B, ASq_total), 'float32'),
+            Loss:        T.Tensor((B, ASq), 'float32'),
+        ):
+            with T.Kernel(B, num_sq_blocks, threads=1024) as (b, sq_blk):
+                Q_shared  = T.alloc_shared((BLOCK_SQ, BLOCK_D), dtype)
+                K_shared  = T.alloc_shared((BLOCK_SK, BLOCK_D), dtype)
+                IS_shared = T.alloc_shared((BLOCK_SQ, BLOCK_SK), 'float32')
+                IM_shared = T.alloc_shared((BLOCK_SQ, BLOCK_SK), 'float32')
+                SA_shared = T.alloc_shared((BLOCK_SQ, BLOCK_SK), 'float32')
+                m1_shared = T.alloc_shared((BLOCK_SQ,), 'float32')
+                d1_shared = T.alloc_shared((BLOCK_SQ,), 'float32')
+                loss_sh   = T.alloc_shared((BLOCK_SQ,), 'float32')
+
+                h_scores     = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), 'float32')
+                softmax_attn = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), 'float32')
+
+                aq_start = sq_blk * BLOCK_SQ
+
+                # Load m1/d1 from global (sq_off + aq_start + i) position
+                for i in T.Parallel(BLOCK_SQ):
+                    m1_shared[i] = m1[b, aq_start + i]
+                    d1_shared[i] = d1[b, aq_start + i]
+                    loss_sh[i]   = T.float32(0.0)
+
+                for sk_blk in T.serial(num_sk_blocks):
+                    sk_start = sk_blk * BLOCK_SK
+                    if sk_start >= aq_start + 1:
+                        T.loop_break()
+
+                    # Load index mask and masked index scores (local indexing)
+                    for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                        IM_shared[i, j] = Index_Mask[b, aq_start + i, sk_start + j]
+                    for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                        IS_shared[i, j] = (
+                            Index_Scores[b, aq_start + i, sk_start + j] + IM_shared[i, j]
+                        )
+
+                    T.clear(softmax_attn)
+
+                    for h in T.serial(AH):
+                        T.clear(h_scores)
+                        for d_blk in T.Pipelined(num_dk_blocks):
+                            d_off = d_blk * BLOCK_D
+                            for i, j in T.Parallel(BLOCK_SQ, BLOCK_D):
+                                Q_shared[i, j] = Attn_Query[aq_start + i, b, h, d_off + j]
+                            for i, j in T.Parallel(BLOCK_SK, BLOCK_D):
+                                K_shared[i, j] = Attn_Key[sk_start + i, b, h, d_off + j]
+                            T.gemm(Q_shared, K_shared, h_scores, transpose_B=True)
+
+                        # Accumulate softmax_attn over heads (fragment+fragment, works correctly)
+                        for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                            softmax_attn[i, j] = softmax_attn[i, j] + T.exp(
+                                h_scores[i, j] * T.float32(scale_f32)
+                                + IM_shared[i, j]     # sparse mask on attention scores
+                                + T.Select(           # causal mask (global coords)
+                                    (aq_start + i) < (sk_start + j),
+                                    T.float32(-1e30),
+                                    T.float32(0.0),
+                                )
+                                - softmax_m[b, h, aq_start + i]
+                            ) / softmax_d[b, h, aq_start + i]
+
+                    # Copy 2D fragment -> shared for 2D->1D KL reduction
+                    T.copy(softmax_attn, SA_shared)
+
+                    for i in T.Parallel(BLOCK_SQ):
+                        p0 = SA_shared[i, 0] / T.float32(AH)
+                        q0 = T.exp(IS_shared[i, 0] - m1_shared[i]) / d1_shared[i]
+                        loss_sh[i] = loss_sh[i] + p0 * (
+                            T.log(p0 + T.float32(1e-10)) - T.log(q0 + T.float32(1e-10))
+                        )
+                        for j in T.serial(1, BLOCK_SK):
+                            p = SA_shared[i, j] / T.float32(AH)
+                            q = T.exp(IS_shared[i, j] - m1_shared[i]) / d1_shared[i]
+                            loss_sh[i] = loss_sh[i] + p * (
+                                T.log(p + T.float32(1e-10)) - T.log(q + T.float32(1e-10))
+                            )
+
+                for i in T.Parallel(BLOCK_SQ):
+                    Loss[b, aq_start + i] = loss_sh[i]
+
+        return JITKernel(_kernel_sparse, out_idx=[8], target='cuda')
+
+    else:
+        @T.prim_func
+        def _kernel_dense(
+            Attn_Query:   T.Tensor((ASq, B, AH, AD), dtype),
+            Attn_Key:     T.Tensor((Sk,  B, AH, AD), dtype),
+            Index_Scores: T.Tensor((B, ASq, Sk), 'float32'),
+            softmax_m:    T.Tensor((B, AH, ASq_total), 'float32'),
+            softmax_d:    T.Tensor((B, AH, ASq_total), 'float32'),
+            m1:           T.Tensor((B, ASq_total), 'float32'),
+            d1:           T.Tensor((B, ASq_total), 'float32'),
+            Loss:         T.Tensor((B, ASq), 'float32'),
+        ):
+            with T.Kernel(B, num_sq_blocks, threads=1024) as (b, sq_blk):
+                Q_shared  = T.alloc_shared((BLOCK_SQ, BLOCK_D), dtype)
+                K_shared  = T.alloc_shared((BLOCK_SK, BLOCK_D), dtype)
+                IS_shared = T.alloc_shared((BLOCK_SQ, BLOCK_SK), 'float32')
+                SA_shared = T.alloc_shared((BLOCK_SQ, BLOCK_SK), 'float32')
+                m1_shared = T.alloc_shared((BLOCK_SQ,), 'float32')
+                d1_shared = T.alloc_shared((BLOCK_SQ,), 'float32')
+                loss_sh   = T.alloc_shared((BLOCK_SQ,), 'float32')
+
+                h_scores     = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), 'float32')
+                softmax_attn = T.alloc_fragment((BLOCK_SQ, BLOCK_SK), 'float32')
+
+                aq_start = sq_blk * BLOCK_SQ
+
+                # Load m1/d1 from global (sq_off + aq_start + i) position
+                for i in T.Parallel(BLOCK_SQ):
+                    m1_shared[i] = m1[b, aq_start + i]
+                    d1_shared[i] = d1[b, aq_start + i]
+                    loss_sh[i]   = T.float32(0.0)
+
+                for sk_blk in T.serial(num_sk_blocks):
+                    sk_start = sk_blk * BLOCK_SK
+                    if sk_start >= aq_start + 1:
+                        T.loop_break()
+
+                    # Load index scores (local indexing)
+                    for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                        IS_shared[i, j] = Index_Scores[b, aq_start + i, sk_start + j]
+
+                    T.clear(softmax_attn)
+
+                    for h in T.serial(AH):
+                        T.clear(h_scores)
+                        for d_blk in T.Pipelined(num_dk_blocks):
+                            d_off = d_blk * BLOCK_D
+                            for i, j in T.Parallel(BLOCK_SQ, BLOCK_D):
+                                Q_shared[i, j] = Attn_Query[aq_start + i, b, h, d_off + j]
+                            for i, j in T.Parallel(BLOCK_SK, BLOCK_D):
+                                K_shared[i, j] = Attn_Key[sk_start + i, b, h, d_off + j]
+                            T.gemm(Q_shared, K_shared, h_scores, transpose_B=True)
+
+                        # Accumulate softmax_attn over heads (fragment+fragment, works correctly)
+                        for i, j in T.Parallel(BLOCK_SQ, BLOCK_SK):
+                            softmax_attn[i, j] = softmax_attn[i, j] + T.exp(
+                                h_scores[i, j] * T.float32(scale_f32)
+                                + T.Select(          # causal mask (global coords)
+                                    (aq_start + i) < (sk_start + j),
+                                    T.float32(-1e30),
+                                    T.float32(0.0),
+                                )
+                                - softmax_m[b, h, aq_start + i]
+                            ) / softmax_d[b, h, aq_start + i]
+
+                    # Copy 2D fragment -> shared for 2D->1D KL reduction
+                    T.copy(softmax_attn, SA_shared)
+
+                    for i in T.Parallel(BLOCK_SQ):
+                        p0 = SA_shared[i, 0] / T.float32(AH)
+                        q0 = T.exp(IS_shared[i, 0] - m1_shared[i]) / d1_shared[i]
+                        loss_sh[i] = loss_sh[i] + p0 * (
+                            T.log(p0 + T.float32(1e-10)) - T.log(q0 + T.float32(1e-10))
+                        )
+                        for j in T.serial(1, BLOCK_SK):
+                            p = SA_shared[i, j] / T.float32(AH)
+                            q = T.exp(IS_shared[i, j] - m1_shared[i]) / d1_shared[i]
+                            loss_sh[i] = loss_sh[i] + p * (
+                                T.log(p + T.float32(1e-10)) - T.log(q + T.float32(1e-10))
+                            )
+
+                for i in T.Parallel(BLOCK_SQ):
+                    Loss[b, aq_start + i] = loss_sh[i]
+
+        return JITKernel(_kernel_dense, out_idx=[7], target='cuda')
+
+
+# Cache compiled kernels keyed by all compile-time parameters
+@lru_cache(maxsize=32)
+def _get_stage2_kernel(
+    B, ASq, Sk, AH, AD,
+    BLOCK_SQ, BLOCK_SK, BLOCK_D,
+    sparse_loss, softmax_scale, dtype,
+) -> JITKernel:
+    return _make_stage2_kernel(
+        B=B, ASq=ASq, Sk=Sk, AH=AH, AD=AD,
+        BLOCK_SQ=BLOCK_SQ, BLOCK_SK=BLOCK_SK, BLOCK_D=BLOCK_D,
+        sparse_loss=sparse_loss, softmax_scale=softmax_scale,
+        dtype=dtype,
+    )
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fwd_fused_indexer_loss_stage1_kernel(
+    Attn_Query_ptr,
+    Attn_Key_ptr,
+    Loss_ptr,
+    Index_Scores_ptr,
+    Index_Mask_ptr,
+    m_ptr,
+    d_ptr,
+    m1_ptr,
+    d1_ptr,
+    # Attn query strides: [Sq, B, H, D]
+    stride_asq,
+    stride_aqb,
+    stride_aqh,
+    stride_aqd,
+    # Attn key strides: [Sk, B, H, D]
+    stride_ask,
+    stride_akb,
+    stride_akh,
+    stride_akd,
+    # Loss strides: [B, Sq]
+    stride_lb,
+    stride_ls,
+    # Index scores strides: [B, Sq, Sk]
+    stride_ibs,
+    stride_isq,
+    stride_isk,
+    # Index mask strides: [B, Sq, Sk]
+    stride_imb,
+    stride_ims,
+    stride_imk,
+    # softmax m strides: [B, H, Sq]
+    stride_smmb,
+    stride_smmh,
+    stride_smmq,
+    # softmax d strides: [B, H, Sq]
+    stride_smdb,
+    stride_smdh,
+    stride_smdq,
+    # softmax m1 strides: [B, Sq]
+    stride_sm1b,
+    stride_sm1q,
+    # softmax dd strides: [B, Sq]
+    stride_sd1b,
+    stride_sd1q,
+    # Dimensions
+    AH: tl.constexpr,
+    AD: tl.constexpr,
+    Sk: tl.constexpr,
+    ASq: tl.constexpr,
+    BLOCK_SQ: tl.constexpr,
+    BLOCK_SK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SPARSE_LOSS: tl.constexpr,
+    Softmax_Scale: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    sq_block_id = tl.program_id(1).to(tl.int64)
+    h = tl.program_id(2)
+    
+    sq = sq_block_id * BLOCK_SQ + tl.arange(0, BLOCK_SQ)
+    sq_valid = (sq < ASq)
+    
+    aq_base = Attn_Query_ptr + b * stride_aqb
+    ak_base = Attn_Key_ptr + b * stride_akb
+
+    # 1-pass loss recursion
+    m1_i = tl.full([BLOCK_SQ], float("-inf"), dtype=tl.float32)
+    d1_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
+    loss_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
+
+    # compute the first pass for attn softmax and index softmax
+    # apply causal mask by loop trunctation
+    causal_sk = tl.minimum(tl.min(sq) + 1, Sk)
+    for sk_start in tl.range(0, causal_sk, BLOCK_SK):
+        sk_offs = sk_start + tl.arange(0, BLOCK_SK)
+        sk_valid = sk_offs < Sk
+
+        index_scores = tl.load(Index_Scores_ptr + b * stride_ibs + sq[:, None] * stride_isq + sk_offs[None, :] * stride_isk, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
+        
+        if SPARSE_LOSS:
+            index_mask_ptrs = Index_Mask_ptr + b * stride_imb + sq[:, None] * stride_ims + sk_offs[None, :] * stride_imk
+            index_mask = tl.load(index_mask_ptrs, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
+            index_scores += index_mask
+
+        if h == 0:
+            # first pass for index softmax
+            m1_i_1 = m1_i
+            m1_i = tl.maximum(m1_i, tl.max(index_scores, axis=1))
+            m1_i = tl.where(m1_i <= float("-inf"), 0.0, m1_i)
+            d1_i = d1_i * tl.exp(m1_i_1 - m1_i) + tl.exp(index_scores - m1_i[:, None]).sum(axis=1)
+
+        casual_mask = tl.full([BLOCK_SQ, BLOCK_SK], float("-inf"), dtype=tl.float32)
+        casual_mask = tl.where((sq[:, None] < sk_offs[None, :]), casual_mask, 0.0)
+
+        h_scores = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
+        for d_start in tl.range(0, AD, BLOCK_D):
+            d_offs = d_start + tl.arange(0, BLOCK_D)
+            d_valid = d_offs < AD
+
+            # Load all heads at once: [BLOCK_SQ, BLOCK_D]
+            aq_ptrs = aq_base + h * stride_aqh + sq[:, None] * stride_asq + d_offs[None, :] * stride_aqd
+            aq_vals = tl.load(aq_ptrs, mask=(sq_valid[:, None] & d_valid[None, :]), other=0.0)
+
+            # Load all heads at once: [BLOCK_D, BLOCK_SK]
+            ak_ptrs = ak_base + h * stride_akh + sk_offs[None, :] * stride_ask + d_offs[:, None] * stride_akd
+            ak_vals = tl.load(ak_ptrs, mask=(sk_valid[None, :] & d_valid[:, None]), other=0.0)
+
+            # Compute batched matrix multiplication: [BLOCK_SQ, BLOCK_D] @ [BLOCK_D, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
+            h_scores = tl.dot(aq_vals, ak_vals, acc=h_scores, allow_tf32=False)
+
+        h_scores *= Softmax_Scale
+
+        # apply causal mask
+        h_scores += casual_mask
+
+        if SPARSE_LOSS:
+            h_scores += index_mask
+
+        m_i = tl.load(m_ptr + b * stride_smmb + h * stride_smmh + sq * stride_smmq, mask=sq_valid, other=float("-inf"))
+        d_i = tl.load(d_ptr + b * stride_smdb + h * stride_smdh + sq * stride_smdq, mask=sq_valid, other=0.0)
+        m_i_1 = m_i
+        m_i = tl.maximum(m_i, tl.max(h_scores, axis=-1))
+        m_i = tl.where(m_i <= float("-inf"), 0.0, m_i)
+        d_i = d_i * tl.exp(m_i_1 - m_i) + tl.exp(h_scores - m_i[:, None]).sum(axis=-1)
+        tl.store(m_ptr + b * stride_smmb + h * stride_smmh + sq * stride_smmq, m_i, mask=sq_valid)
+        tl.store(d_ptr + b * stride_smdb + h * stride_smdh + sq * stride_smdq, d_i, mask=sq_valid)
+
+    if h == 0:
+        tl.store(m1_ptr + b * stride_sm1b + sq * stride_sm1q, m1_i, mask=sq_valid)
+        tl.store(d1_ptr + b * stride_sd1b + sq * stride_sd1q, d1_i, mask=sq_valid)
+
+@triton.jit
+def _fwd_fused_indexer_loss_stage2_kernel(
+    Attn_Query_ptr,
+    Attn_Key_ptr,
+    Loss_ptr,
+    Index_Scores_ptr,
+    Index_Mask_ptr,
+    m_ptr,
+    d_ptr,
+    m1_ptr,
+    d1_ptr,
+    # Attn query strides: [Sq, B, H, D]
+    stride_asq,
+    stride_aqb,
+    stride_aqh,
+    stride_aqd,
+    # Attn key strides: [Sk, B, H, D]
+    stride_ask,
+    stride_akb,
+    stride_akh,
+    stride_akd,
+    # Loss strides: [B, Sq]
+    stride_lb,
+    stride_ls,
+    # Index scores strides: [B, Sq, Sk]
+    stride_ibs,
+    stride_isq,
+    stride_isk,
+    # Index mask strides: [B, Sq, Sk]
+    stride_imb,
+    stride_ims,
+    stride_imk,
+    # softmax m strides: [B, H, Sq]
+    stride_smmb,
+    stride_smmh,
+    stride_smmq,
+    # softmax d strides: [B, H, Sq]
+    stride_smdb,
+    stride_smdh,
+    stride_smdq,
+    # softmax m1 strides: [B, Sq]
+    stride_sm1b,
+    stride_sm1q,
+    # softmax dd strides: [B, Sq]
+    stride_sd1b,
+    stride_sd1q,
+    # Dimensions
+    AH: tl.constexpr,
+    AD: tl.constexpr,
+    Sk: tl.constexpr,
+    ASq: tl.constexpr,
+    BLOCK_SQ: tl.constexpr,
+    BLOCK_SK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SPARSE_LOSS: tl.constexpr,
+    Softmax_Scale: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    sq_block_id = tl.program_id(1).to(tl.int64)
+    
+    sq = sq_block_id * BLOCK_SQ + tl.arange(0, BLOCK_SQ)
+    sq_valid = (sq < ASq)
+    
+    aq_base = Attn_Query_ptr + b * stride_aqb
+    ak_base = Attn_Key_ptr + b * stride_akb
+
+    # 1-pass loss recursion
+    m1_i = tl.load(m1_ptr + b * stride_sm1b + sq * stride_sm1q, mask=sq_valid, other=float("-inf"))
+    d1_i = tl.load(d1_ptr + b * stride_sd1b + sq * stride_sd1q, mask=sq_valid, other=0.0)
+    loss_i = tl.zeros([BLOCK_SQ], dtype=tl.float32)
+
+    # recompute for the second pass of attn softmax
+    causal_sk = tl.minimum(tl.min(sq) + 1, Sk)
+    for sk_start in tl.range(0, causal_sk, BLOCK_SK):
+        sk_offs = sk_start + tl.arange(0, BLOCK_SK)
+        sk_valid = sk_offs < Sk
+        
+        index_scores = tl.load(Index_Scores_ptr + b * stride_ibs + sq[:, None] * stride_isq + sk_offs[None, :] * stride_isk, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
+
+        if SPARSE_LOSS:
+            index_mask_ptrs = Index_Mask_ptr + b * stride_imb + sq[:, None] * stride_ims + sk_offs[None, :] * stride_imk
+            index_mask = tl.load(index_mask_ptrs, mask=(sq_valid[:, None] & sk_valid[None, :]), other=float("-inf"))
+            index_scores += index_mask
+
+        softmax_attn_i = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
+        casual_mask = tl.full([BLOCK_SQ, BLOCK_SK], float("-inf"), dtype=tl.float32)
+        casual_mask = tl.where((sq[:, None] < sk_offs[None, :]), casual_mask, 0.0)
+
+        for h in tl.range(0, AH):
+            h_scores = tl.zeros([BLOCK_SQ, BLOCK_SK], dtype=tl.float32)
+            for d_start in tl.range(0, AD, BLOCK_D):
+                d_offs = d_start + tl.arange(0, BLOCK_D)
+                d_valid = d_offs < AD
+
+                # Load all heads at once: [BLOCK_SQ, BLOCK_D]
+                aq_ptrs = aq_base + h * stride_aqh + sq[:, None] * stride_asq + d_offs[None, :] * stride_aqd
+                aq_vals = tl.load(aq_ptrs, mask=(sq_valid[:, None] & d_valid[None, :]), other=0.0)
+
+                # Load all heads at once: [BLOCK_D, BLOCK_SK]
+                ak_ptrs = ak_base + h * stride_akh + sk_offs[None, :] * stride_ask + d_offs[:, None] * stride_akd
+                ak_vals = tl.load(ak_ptrs, mask=(sk_valid[None, :] & d_valid[:, None]), other=0.0)
+
+                # Compute batched matrix multiplication: [BLOCK_SQ, BLOCK_D] @ [BLOCK_D, BLOCK_SK] -> [BLOCK_SQ, BLOCK_SK]
+                h_scores = tl.dot(aq_vals, ak_vals, acc=h_scores, allow_tf32=False)
+
+            h_scores *= Softmax_Scale
+
+            # apply causal mask
+            h_scores += casual_mask
+
+            if SPARSE_LOSS:
+                h_scores += index_mask
+
+            # softmax
+            m_i = tl.load(m_ptr + b * stride_smmb + h * stride_smmh + sq * stride_smmq, mask=sq_valid, other=float("-inf"))
+            d_i = tl.load(d_ptr + b * stride_smdb + h * stride_smdh + sq * stride_smdq, mask=sq_valid, other=0.0)
+            softmax_attn_i += tl.exp(h_scores - m_i[:, None]) / d_i[:, None]
+
+        softmax_attn_i /= AH
+        softmax_index_i = tl.exp(index_scores - m1_i[:, None]) / d1_i[:, None]
+
+        # loss
+        loss_sk = softmax_attn_i * (tl.log(softmax_attn_i + 1e-10) - tl.log(softmax_index_i + 1e-10))
+        loss_i += loss_sk.sum(axis=-1)
+
+    # Store loss
+    tl.store(Loss_ptr + b * stride_lb + sq * stride_ls, loss_i, mask=sq_valid)
+
+
+def fwd_fused_indexer_loss(
+    index_scores: torch.Tensor,
+    attn_query: torch.Tensor,
+    attn_key: torch.Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    sparse_loss: Optional[bool] = False,
+    topk_indices: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    ASq, AB, AH, AD = attn_query.shape
+    ASk = attn_key.shape[0]
+    assert AH <= 128, "This kernel might be broken for AH > 128."
+
+    BLOCK_SK = 128
+    BLOCK_SQ = 128
+    BLOCK_D  = 64
+    num_warps = 8
+    num_stages = 3
+
+    out_loss = torch.empty((AB, ASq), dtype=torch.float32, device=attn_query.device)
+    attn_num_sq_blocks = (ASq + BLOCK_SQ - 1) // BLOCK_SQ
+
+    if sparse_loss:
+        index_mask = torch.full(
+            (AB, ASq, ASk), float("-inf"), dtype=torch.float32, device=index_scores.device
+        ).scatter_(-1, topk_indices, 0)
+        stride_imb = index_mask.stride(0)
+        stride_ims = index_mask.stride(1)
+        stride_imk = index_mask.stride(2)
+    else:
+        index_mask = torch.empty((0,), dtype=torch.float32, device=attn_query.device)
+        stride_imb = stride_ims = stride_imk = 0
+
+    softmax_m = torch.full((AB, AH, ASq), float("-inf"), dtype=torch.float32, device=attn_query.device)
+    softmax_d = torch.full((AB, AH, ASq), 0.0, dtype=torch.float32, device=attn_query.device)
+    softmax_m1 = torch.full((AB, ASq), float("-inf"), dtype=torch.float32, device=attn_query.device)
+    softmax_d1 = torch.full((AB, ASq), 0.0, dtype=torch.float32, device=attn_query.device)
+
+    stage1_grid = (AB, attn_num_sq_blocks, AH)
+    _fwd_fused_indexer_loss_stage1_kernel[stage1_grid](
+        Attn_Query_ptr=attn_query,
+        Attn_Key_ptr=attn_key,
+        Loss_ptr=out_loss,
+        Index_Scores_ptr=index_scores,
+        Index_Mask_ptr=index_mask,
+        m_ptr=softmax_m,
+        d_ptr=softmax_d,
+        m1_ptr=softmax_m1,
+        d1_ptr=softmax_d1,
+        # Attn query strides: [Sq, B, H, D]
+        stride_asq=attn_query.stride(0),
+        stride_aqb=attn_query.stride(1),
+        stride_aqh=attn_query.stride(2),
+        stride_aqd=attn_query.stride(3),
+        # Attn key strides: [Sk, B, H, D]
+        stride_ask=attn_key.stride(0),
+        stride_akb=attn_key.stride(1),
+        stride_akh=attn_key.stride(2),
+        stride_akd=attn_key.stride(3),
+        # Loss strides: [B, Sq]
+        stride_lb=out_loss.stride(0),
+        stride_ls=out_loss.stride(1),
+        # Index scores strides: [B, Sq, Sk]
+        stride_ibs=index_scores.stride(0),
+        stride_isq=index_scores.stride(1),
+        stride_isk=index_scores.stride(2),
+        # Index mask strides: [B, Sq, Sk]
+        stride_imb=stride_imb,
+        stride_ims=stride_ims,
+        stride_imk=stride_imk,
+        # softmax m strides: [B, H, Sq]
+        stride_smmb=softmax_m.stride(0),
+        stride_smmh=softmax_m.stride(1),
+        stride_smmq=softmax_m.stride(2),
+        # softmax d strides: [B, H, Sq]
+        stride_smdb=softmax_d.stride(0),
+        stride_smdh=softmax_d.stride(1),
+        stride_smdq=softmax_d.stride(2),
+        # softmax m1 strides: [B, Sq]
+        stride_sm1b=softmax_m1.stride(0),
+        stride_sm1q=softmax_m1.stride(1),
+        # softmax dd strides: [B, Sq]
+        stride_sd1b=softmax_d1.stride(0),
+        stride_sd1q=softmax_d1.stride(1),
+        # Dimensions
+        AH=AH,
+        AD=AD,
+        Sk=ASk,
+        ASq=ASq,
+        SPARSE_LOSS=sparse_loss,
+        Softmax_Scale=softmax_scale,
+        BLOCK_SQ=BLOCK_SQ,
+        BLOCK_SK=BLOCK_SK,
+        BLOCK_D=BLOCK_D,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    if USE_FUSED_INDEXER_LOSS == 1:
+        print("###############use triton indexer loss################")
+        stage2_grid = (AB, attn_num_sq_blocks)
+        _fwd_fused_indexer_loss_stage2_kernel[stage2_grid](
+            Attn_Query_ptr=attn_query,
+            Attn_Key_ptr=attn_key,
+            Loss_ptr=out_loss,
+            Index_Scores_ptr=index_scores,
+            Index_Mask_ptr=index_mask,
+            m_ptr=softmax_m,
+            d_ptr=softmax_d,
+            m1_ptr=softmax_m1,
+            d1_ptr=softmax_d1,
+            # Attn query strides: [Sq, B, H, D]
+            stride_asq=attn_query.stride(0),
+            stride_aqb=attn_query.stride(1),
+            stride_aqh=attn_query.stride(2),
+            stride_aqd=attn_query.stride(3),
+            # Attn key strides: [Sk, B, H, D]
+            stride_ask=attn_key.stride(0),
+            stride_akb=attn_key.stride(1),
+            stride_akh=attn_key.stride(2),
+            stride_akd=attn_key.stride(3),
+            # Loss strides: [B, Sq]
+            stride_lb=out_loss.stride(0),
+            stride_ls=out_loss.stride(1),
+            # Index scores strides: [B, Sq, Sk]
+            stride_ibs=index_scores.stride(0),
+            stride_isq=index_scores.stride(1),
+            stride_isk=index_scores.stride(2),
+            # Index mask strides: [B, Sq, Sk]
+            stride_imb=stride_imb,
+            stride_ims=stride_ims,
+            stride_imk=stride_imk,
+            # softmax m strides: [B, H, Sq]
+            stride_smmb=softmax_m.stride(0),
+            stride_smmh=softmax_m.stride(1),
+            stride_smmq=softmax_m.stride(2),
+            # softmax d strides: [B, H, Sq]
+            stride_smdb=softmax_d.stride(0),
+            stride_smdh=softmax_d.stride(1),
+            stride_smdq=softmax_d.stride(2),
+            # softmax m1 strides: [B, Sq]
+            stride_sm1b=softmax_m1.stride(0),
+            stride_sm1q=softmax_m1.stride(1),
+            # softmax dd strides: [B, Sq]
+            stride_sd1b=softmax_d1.stride(0),
+            stride_sd1q=softmax_d1.stride(1),
+            # Dimensions
+            AH=AH,
+            AD=AD,
+            Sk=ASk,
+            ASq=ASq,
+            SPARSE_LOSS=sparse_loss,
+            Softmax_Scale=softmax_scale,
+            BLOCK_SQ=BLOCK_SQ,
+            BLOCK_SK=BLOCK_SK,
+            BLOCK_D=BLOCK_D,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+    else:
+        print("###############use tilelang indexer loss################")
+        # ---- Stage 2: TileLang ----
+        _dtype_map = {torch.float16: 'float16', torch.bfloat16: 'bfloat16'}
+        tl_dtype = _dtype_map.get(attn_query.dtype, 'float16')
+
+        kernel = _get_stage2_kernel(
+            B=AB, ASq=ASq, Sk=ASk, AH=AH, AD=AD,
+            BLOCK_SQ=BLOCK_SQ, BLOCK_SK=BLOCK_SK, BLOCK_D=BLOCK_D,
+            sparse_loss=bool(sparse_loss),
+            softmax_scale=softmax_scale,
+            dtype=tl_dtype,
+        )
+
+        index_scores = index_scores.contiguous()
+        if sparse_loss:
+            out_loss = kernel(
+                attn_query, attn_key,
+                index_scores, 
+                index_mask,
+                softmax_m, softmax_d,
+                softmax_m1, softmax_d1,
+            )
+        else:
+            out_loss = kernel(
+                attn_query, attn_key,
+                index_scores,
+                softmax_m, softmax_d,
+                softmax_m1, softmax_d1,
+            )
+
+    indexer_loss = out_loss.mean() * loss_coeff
+    return indexer_loss
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
@@ -199,7 +887,7 @@ def compute_dsa_indexer_loss(
     # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
     key = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
     # Compute attention scores [b * np, sq, sk]
-    attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
+    attention_scores = torch.bmm(query, key, out_dtype=torch.float32) * softmax_scale
     # Reshape to [b, np, sq, sk]
     attention_scores = attention_scores.reshape(b, np, sq, sk)
 
@@ -329,16 +1017,29 @@ def fwd_fused_indexer_loss_naive(
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, topk, mask)
 
-    indexer_loss = compute_dsa_indexer_loss(
-        index_scores,
-        topk_indices,
-        query,
-        key,
-        softmax_scale,
-        loss_coeff,
-        sparse_loss,
-        pg_collection,
-    )
+    if pg_collection.tp.size() > 1 or USE_FUSED_INDEXER_LOSS == 0:
+        print("###############use native indexer loss################")
+        indexer_loss = compute_dsa_indexer_loss(
+            index_scores,
+            topk_indices,
+            query,
+            key,
+            softmax_scale,
+            loss_coeff,
+            sparse_loss,
+            pg_collection,
+        )
+    else:
+        print("###############use fused indexer loss################")
+        indexer_loss = fwd_fused_indexer_loss(
+            index_scores,
+            query,
+            key,
+            softmax_scale,
+            loss_coeff,
+            sparse_loss,
+            topk_indices,
+        )
 
     return topk_indices, indexer_loss
 
