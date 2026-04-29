@@ -21,6 +21,22 @@ from megatron.core.transformer.transformer_layer import (
 from tests.unit_tests.test_utilities import Utils
 
 
+def _make_mhc_layer_spec(**kwargs):
+    """Build a layer spec with HyperConnectionModule submodules.
+
+    The ``enable_hyper_connection`` kwarg on ``gpt_layer_specs`` is added by
+    the GPT-wiring follow-up split, so this helper patches the mHC submodules
+    directly to keep the unit tests self-contained for this split.
+    """
+    from megatron.core.transformer.hyper_connection import HyperConnectionModule
+
+    layer_spec = get_gpt_layer_with_transformer_engine_spec(**kwargs)
+    layer_spec.module = HyperConnectionTransformerLayer
+    layer_spec.submodules.self_attention_hyper_connection = HyperConnectionModule
+    layer_spec.submodules.mlp_hyper_connection = HyperConnectionModule
+    return layer_spec
+
+
 def _make_mhc_config(hidden_size=64, num_streams=4, **extra):
     """Build a TransformerConfig with common MHC defaults.
 
@@ -360,7 +376,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             recompute_granularity='selective',
             **extra,
         )
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer_spec = _make_mhc_layer_spec()
         layer = HyperConnectionTransformerLayer(
             config, layer_spec.submodules, layer_number=layer_number
         )
@@ -544,7 +560,7 @@ class TestMHCRecomputeMemorySaving:
             recompute_modules=["core_attn", "mhc"] if use_recompute else None,
             recompute_granularity='selective' if use_recompute else None,
         )
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer_spec = _make_mhc_layer_spec()
         layers = [
             HyperConnectionTransformerLayer(
                 config, layer_spec.submodules, layer_number=i + 1
@@ -638,7 +654,7 @@ class TestMHCWithCudaGraph:
 
     def _create_mhc_layer(self, hidden_size=64, num_streams=4, **extra_config):
         config = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams, **extra_config)
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer_spec = _make_mhc_layer_spec()
         layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
         layer.cuda()
         return layer, config
@@ -980,7 +996,7 @@ class TestMHCWithOffloading:
             fine_grained_activation_offloading=True,
             offload_modules=offload_modules,
         )
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer_spec = _make_mhc_layer_spec()
         layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
         layer.cuda()
         return layer, config
@@ -1052,7 +1068,7 @@ class TestMHCWithOffloading:
 
         # Run without offloading
         config_no_offload = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams)
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer_spec = _make_mhc_layer_spec()
         layer_no_offload = HyperConnectionTransformerLayer(
             config_no_offload, layer_spec.submodules
         ).cuda()
