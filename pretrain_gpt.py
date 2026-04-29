@@ -119,25 +119,16 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
-        result = get_batch_on_this_rank_for_sequence_packing(
+        # `get_batch_on_this_rank_for_sequence_packing` applies THD + CUDA Graph
+        # padding internally when `config.max_seqlen_per_dp_cp_rank` is set, and
+        # returns a 7-tuple including `padding_mask` (None when no padding).
+        return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
+            config=config,
         )
-        # Pad THD batch for CUDA Graph compatibility when max_seqlen_per_dp_cp_rank is set.
-        padding_mask = None
-        if config.max_seqlen_per_dp_cp_rank is not None and len(result) >= 6:
-            tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = result[:6]
-            if packed_seq_params is not None:
-                tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = \
-                    pad_thd_for_cuda_graph(
-                        tokens, labels, loss_mask, position_ids, packed_seq_params,
-                        max_seqlen=config.max_seqlen_per_dp_cp_rank,
-                        max_num_seqs=config.thd_cuda_graph_max_num_seqs,
-                    )
-                return tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask
-        return (*result, padding_mask)
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = get_args().sft  # SFT always uses packed sequence
@@ -196,7 +187,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             pad_thd_for_cuda_graph(
                 tokens, labels, loss_mask, position_ids, packed_seq_params,
                 max_seqlen=config.max_seqlen_per_dp_cp_rank,
-                max_num_seqs=config.thd_cuda_graph_max_num_seqs,
+                max_num_seqs=config.thd_max_num_seqs,
             )
         if 'tokens' in batch:
             batch['tokens'] = tokens

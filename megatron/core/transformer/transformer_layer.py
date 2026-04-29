@@ -1004,7 +1004,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 or CudaGraphScope.attn in self.config.cuda_graph_scope
             ):
                 max_T = self.config.max_seqlen_per_dp_cp_rank
-                max_num_seqs = self.config.thd_cuda_graph_max_num_seqs
+                max_num_seqs = self.config.thd_max_num_seqs
                 device = torch.cuda.current_device()
 
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
@@ -1117,6 +1117,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
 
         # Record the backward event on cuda graph stream in backward pass.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the H2D transfer on reload stream.
         if self.offload_module_in_cuda_graph:
             if len(args) > 0:
                 hidden_states = args[0]
@@ -1157,6 +1159,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if context is not None:
             cuda_graph_outputs.append(context)
         # Record the forward event on cuda graph stream for cuda graph capture.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the D2H transfer on offloading stream.
         if self.offload_module_in_cuda_graph:
             self.off_interface.forward_record()
         return tuple(cuda_graph_outputs)

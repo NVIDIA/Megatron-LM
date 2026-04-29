@@ -196,8 +196,12 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
             data_iterator=data_iterator, mtp_on_this_rank=False, vp_stage=None
         )
 
-        # Unpack the result
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = result
+        # Unpack the result. The helper now always returns a 7-tuple; the 7th
+        # value is `padding_mask` (None when THD CUDA Graph padding is not in use).
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = result
+        assert padding_mask is None, (
+            "padding_mask should be None when config is not passed (legacy behavior)."
+        )
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()

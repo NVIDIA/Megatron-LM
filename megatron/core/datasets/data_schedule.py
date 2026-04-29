@@ -321,6 +321,7 @@ class BasePackingScheduler:
         cp_size: int,
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
+        max_num_seqs: Optional[int] = None,
     ):
         """
         Args:
@@ -329,11 +330,17 @@ class BasePackingScheduler:
             dp_size: The data parallel size.
             microbatch_group_size_per_vp_stage: The microbatch group size per virtual
             pipeline stage, only used when enabling VPP, otherwise None.
+            max_num_seqs: Optional cap on the number of packed sequences per
+            microbatch (config.thd_max_num_seqs). When set, the scheduler closes
+            a pack as soon as it reaches this many sequences (in addition to the
+            token-budget condition). Required for THD + CUDA Graph; harmless
+            otherwise. None disables the cap.
         """
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
+        self.max_num_seqs = max_num_seqs
 
     def get_required_sample_keys(self):
         """Return the required key of each batch."""
@@ -404,7 +411,13 @@ class DpBalancedScheduler(BasePackingScheduler):
         single_microbatch = []
 
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+            fits_token_budget = (
+                sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks
+            )
+            fits_num_seqs_budget = (
+                self.max_num_seqs is None or len(single_microbatch) < self.max_num_seqs
+            )
+            if fits_token_budget and fits_num_seqs_budget:
                 single_microbatch.append(i)
                 sum_seqlen += sample_id_seqlens[i][1]
             else:
@@ -672,6 +685,7 @@ def wrap_data_iterator(
             if config.virtual_pipeline_model_parallel_size is None
             else config.microbatch_group_size_per_vp_stage
         ),
+        max_num_seqs=getattr(config, 'thd_max_num_seqs', None),
     )
 
     (
@@ -697,15 +711,28 @@ def get_batch_on_this_rank_for_sequence_packing(
     mtp_on_this_rank: bool = False,
     vp_stage: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    config=None,
 ):
     """
     Get a batch of data for sequence packing.
+
+    When ``config.max_seqlen_per_dp_cp_rank`` is set (THD + CUDA Graph mode), the
+    returned tokens/labels/loss_mask/position_ids/packed_seq_params are padded to
+    static shapes via ``pad_thd_for_cuda_graph``, and a ``padding_mask`` is
+    generated as the 7th return value. Otherwise ``padding_mask`` is ``None`` and
+    the first six values are unchanged.
+
     Args:
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
+        config: Model parallel config (used for THD + CUDA Graph padding). When
+            ``None`` or ``config.max_seqlen_per_dp_cp_rank is None``, no padding
+            is applied (legacy behavior, ``padding_mask`` is ``None``).
     Returns:
-        tuple of (tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params)
+        tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
+        packed_seq_params, padding_mask). ``padding_mask`` is ``None`` unless
+        THD CUDA Graph padding was applied.
     """
 
     if pg_collection is None:
@@ -852,5 +879,22 @@ def get_batch_on_this_rank_for_sequence_packing(
         cp_group=None,
     )
 
+    # Pad to static shapes for THD + CUDA Graph when requested.
+    padding_mask = None
+    if (
+        config is not None
+        and getattr(config, 'max_seqlen_per_dp_cp_rank', None) is not None
+        and packed_seq_params is not None
+    ):
+        from megatron.core.packed_seq_params import pad_thd_for_cuda_graph
+
+        tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
+            pad_thd_for_cuda_graph(
+                tokens, labels, loss_mask, position_ids, packed_seq_params,
+                max_seqlen=config.max_seqlen_per_dp_cp_rank,
+                max_num_seqs=config.thd_max_num_seqs,
+            )
+        )
+
     # "attention_mask" is not valid for sequence packing, so set it to None.
-    return tokens, labels, loss_mask, None, position_ids, packed_seq_params
+    return tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask

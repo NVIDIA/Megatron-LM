@@ -247,6 +247,7 @@ class GraphableMegatronModule(MegatronModule):
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
+        # Calculate data shape related values.
         context_parallel_size = self.config.context_parallel_size
         sequence_parallel = self.config.sequence_parallel
         tensor_model_parallel_size = self.config.tensor_model_parallel_size
@@ -365,6 +366,15 @@ class GraphableMegatronModule(MegatronModule):
 
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
+        if self.config.fine_grained_activation_offloading and getattr(
+            self, 'offload_module_in_cuda_graph', False
+        ):
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
+            cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
 
     def _should_call_local_cudagraph(self, *args, **kwargs):

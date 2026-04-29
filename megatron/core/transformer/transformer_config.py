@@ -893,9 +893,17 @@ class TransformerConfig(ModelParallelConfig):
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
-    thd_cuda_graph_max_num_seqs: int = 32
-    """Maximum number of packed sequences per microbatch when using THD format with CUDA Graph.
-    cu_seqlens tensors will be padded to this size + 1."""
+    thd_max_num_seqs: int = 32
+    """Maximum number of packed sequences per microbatch in THD format. The packing
+    scheduler closes a pack as soon as it reaches this many sequences (in addition to
+    the existing token-budget condition). When CUDA Graph is enabled, cu_seqlens
+    tensors are padded to this size + 1.
+
+    Sizing guidance: choose a value that comfortably covers the worst-case packing,
+    roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
+    Setting it too small results in more microbatches with smaller packs (wasted
+    token budget); setting it too large just allocates a slightly larger cu_seqlens
+    buffer."""
 
     cuda_graph_dynamic_microbatches: bool = field(
         default=False,
