@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from functools import partial
@@ -1065,7 +1065,25 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    # Determine hidden dimension for P2P communication.
+    # `forward_backward_pipelining_with_interleaving` is only reached when VPP is
+    # set (see `get_forward_backward_func` selection logic). VPP + mHC is rejected
+    # in `TransformerConfig.__post_init__` for explicit-VPP and re-checked here as
+    # a layout-VPP backstop; either way, mHC never reaches the n*C path inside
+    # this function.
+    if (
+        config.enable_hyper_connections
+        and pipeline_parallel_size > 1
+        and config.virtual_pipeline_model_parallel_size is not None
+    ):
+        raise ValueError(
+            "enable_hyper_connections is not yet supported with "
+            "virtual_pipeline_model_parallel_size set in the interleaved pipeline "
+            "schedule. Disable VPP or wait for per-virtual-chunk shape support."
+        )
+    hidden_dim = config.hidden_size
+
+    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2008,8 +2026,18 @@ def get_tensor_shapes(
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    is_recv: bool = True,
 ):
     """Determine tensor shapes for pipeline communication.
+
+    For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
+    with dimension hidden_size * num_residual_streams.
+
+    Args:
+        is_recv: If True, compute shape for receiving; if False, for sending.
+                 This matters for hyper connections where first/last stages have different
+                 send/recv dimensions.
 
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
@@ -2028,7 +2056,55 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    if (
+        getattr(config, 'enable_hyper_connections', False)
+        and getattr(config, 'virtual_pipeline_model_parallel_size', None) is not None
+        and pp_group is not None
+    ):
+        # Backstop in case `TransformerConfig.__post_init__`'s VPP+mHC check is
+        # skipped (e.g., when callers pass a non-TransformerConfig object). The
+        # config-level guard remains the user-facing error; this duplicate keeps
+        # the schedule path safe against silently producing wrong shapes.
+        raise ValueError(
+            "enable_hyper_connections is not yet supported with "
+            "virtual_pipeline_model_parallel_size set. Disable VPP or wait for "
+            "per-virtual-chunk shape support. (Same constraint enforced in "
+            "TransformerConfig.__post_init__.)"
+        )
+
+    if (
+        getattr(config, 'enable_hyper_connections', False)
+        and getattr(config, 'pipeline_model_parallel_size', 1) > 1
+        and pp_group is None
+    ):
+        raise ValueError("pp_group must be provided when enable_hyper_connections=True")
+
+    # Determine hidden dimension based on hyper connections and pipeline stage.
+    #
+    # mHC keeps the n-stream tensor `[s, b, n*C]` only at *intermediate* layer
+    # boundaries. The first PP stage receives a single-stream `[s, b, C]` from
+    # the embedding layer and expands to n*C for its first transformer layer;
+    # the last PP stage contracts back to C before the output. So the boundary
+    # shapes are asymmetric:
+    #   - rank 0:           recv = C,    send = n*C
+    #   - middle ranks:     recv = n*C,  send = n*C
+    #   - rank pp_size-1:   recv = n*C,  send = C
+    # `is_recv` selects the correct dimension at each boundary.
+    # TODO: make this more robust, including flexible VPP layout.
+    hidden_size = config.hidden_size
+    if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
+        pp_rank = pp_group.rank()
+        pp_size = pp_group.size()
+        is_first_stage = pp_rank == 0
+        is_last_stage = pp_rank == pp_size - 1
+        # First stage's recv comes from the embedding (single-stream); last
+        # stage's send goes to the output (single-stream). Everything else is
+        # the n-stream tensor.
+        use_nstream = (not is_first_stage) if is_recv else (not is_last_stage)
+        if use_nstream:
+            hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
+
+    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
 
 
@@ -2196,6 +2272,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=getattr(p2p_communicator, 'pp_group', None),
+        is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2204,6 +2282,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=getattr(p2p_communicator, 'pp_group', None),
+        is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
