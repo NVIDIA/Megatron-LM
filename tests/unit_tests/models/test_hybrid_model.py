@@ -16,15 +16,59 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.hybrid.hybrid_block import (
+    HybridStack,
+    HybridStackSubmodules,
+    HyperConnectionHybridLayer,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+class _DummyHybridLayer(MegatronModule):
+    """Minimal same-shape layer used to test HybridModel/mHC plumbing."""
+
+    def __init__(self, config: TransformerConfig, layer_number: int, **_kwargs):
+        super().__init__(config=config)
+        self.layer_number = layer_number
+        self.proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.seen_hidden_shapes = []
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        inference_context=None,
+        packed_seq_params=None,
+        **_kwargs,
+    ):
+        self.seen_hidden_shapes.append(tuple(hidden_states.shape))
+        return hidden_states + 0.125 * self.proj(hidden_states)
+
+
+def _get_dummy_hybrid_stack_spec() -> ModuleSpec:
+    """Build a HybridStack spec whose layer symbols all resolve to dummy layers."""
+    dummy_layer_spec = ModuleSpec(module=_DummyHybridLayer)
+    return ModuleSpec(
+        module=HybridStack,
+        params={"post_layer_norm": False},
+        submodules=HybridStackSubmodules(
+            mamba_layer=dummy_layer_spec,
+            gdn_layer=dummy_layer_spec,
+            attention_layer=dummy_layer_spec,
+            dsa_layer=dummy_layer_spec,
+            mlp_layer=dummy_layer_spec,
+            moe_layer=dummy_layer_spec,
+        ),
+    )
 
 
 class TestHybridModel:
@@ -56,6 +100,109 @@ class TestHybridModel:
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
+
+    def test_constructor_with_hyper_connections(self):
+        model_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",
+        )
+
+        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in model.decoder.layers)
+        num_weights = sum([p.numel() for p in model.parameters()])
+        assert num_weights > sum([p.numel() for p in self.model.parameters()])
+
+    def test_forward_with_hyper_connections(self):
+        model_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",
+        )
+        model.cuda()
+
+        sequence_length = model.max_sequence_length
+        micro_batch_size = 2
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == model.vocab_size
+
+    def test_dummy_hybrid_model_with_hyper_connections_forward_backward(self):
+        model_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=3,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=_get_dummy_hybrid_stack_spec(),
+            vocab_size=64,
+            max_sequence_length=8,
+            hybrid_layer_pattern="M*-",
+            parallel_output=False,
+        )
+
+        assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in model.decoder.layers)
+        assert all(
+            isinstance(layer.inner_layer, _DummyHybridLayer) for layer in model.decoder.layers
+        )
+
+        model.cuda()
+        sequence_length = model.max_sequence_length
+        micro_batch_size = 2
+        data = torch.arange(sequence_length, dtype=torch.int64, device='cuda')
+        input_ids = data.repeat((micro_batch_size, 1))
+        position_ids = data.repeat((micro_batch_size, 1))
+
+        logits = model.forward(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+
+        assert logits.shape == (micro_batch_size, sequence_length, model.vocab_size)
+        assert torch.isfinite(logits).all()
+
+        logits.float().mean().backward()
+
+        for layer in model.decoder.layers:
+            assert layer.inner_layer.seen_hidden_shapes == [
+                (sequence_length, micro_batch_size, model_config.hidden_size)
+            ]
+            assert layer.inner_layer.proj.weight.grad is not None
+            assert layer.hyper_connection.mapping_proj.weight.grad is not None
+            assert torch.isfinite(layer.inner_layer.proj.weight.grad).all()
+            assert torch.isfinite(layer.hyper_connection.mapping_proj.weight.grad).all()
 
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config
