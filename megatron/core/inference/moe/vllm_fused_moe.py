@@ -419,6 +419,7 @@ def _invoke_fused_moe_kernel(
 def _moe_sum_kernel(
     input_ptr,
     output_ptr,
+    topk_weights_ptr,
     valid_tokens_ptr,
     routing_map_ptr,
     local_expert_start,
@@ -428,17 +429,17 @@ def _moe_sum_kernel(
     BLOCK_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
 ):
-    """Reduce topk dimension with valid_tokens gating.
+    """Reduce topk dimension with valid_tokens gating and routing weight application.
 
     input:  [max_tokens * topk, K] bf16
     output: [max_tokens, K] bf16
 
-    For token t < valid_tokens: output[t] = sum of input[t*topk+k] over
-    topk slots k where the expert is local.  Non-local slots are skipped
+    For token t < valid_tokens: output[t] = sum of input[t*topk+k] * prob[t*topk+k]
+    over topk slots k where the expert is local.  Non-local slots are skipped
     (their values in `input` are undefined because FC2 only processes
     local-expert blocks).
     For token t >= valid_tokens: output[t] = 0.
-    Accumulation in fp32 for numerical accuracy.
+    Routing weight multiplication and accumulation in fp32 for numerical accuracy.
     """
     token_id = tl.program_id(0).to(tl.int64)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -456,13 +457,15 @@ def _moe_sum_kernel(
                 lid = eid - local_expert_start
                 if lid >= 0 and lid < num_local_experts:
                     v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
-                    acc += v.to(tl.float32)
+                    w = tl.load(topk_weights_ptr + token_id * topk + t)
+                    acc += v.to(tl.float32) * w
 
         tl.store(output_ptr + token_id * K + offs_k, acc.to(tl.bfloat16), mask=k_mask)
 
 
 def _moe_sum(
     input: torch.Tensor,
+    topk_weights: torch.Tensor,
     max_tokens: int,
     topk: int,
     K: int,
@@ -474,6 +477,7 @@ def _moe_sum(
 ) -> torch.Tensor:
     """Fused topk reduction: [max_tokens*topk, K] → [max_tokens, K].
 
+    Applies routing weights and reduces over topk in a single kernel.
     Writes directly to `out` if provided (e.g. the RSV symmetric memory tensor),
     avoiding a separate allocation + copy. Rows beyond valid_tokens are zeroed.
     Only accumulates contributions from local experts; non-local topk slots are
@@ -486,6 +490,7 @@ def _moe_sum(
     _moe_sum_kernel[(max_tokens,)](
         input,
         out,
+        topk_weights,
         valid_tokens,
         routing_map,
         local_expert_start,
@@ -581,7 +586,9 @@ def vllm_fused_moe(
         fuse_squared_relu=True,
     )
 
-    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], with routing weights.
+    # FC2: [max_tokens*topk, N] → [max_tokens*topk, K], without routing weights.
+    # Routing weights are applied in the reduction kernel to avoid an extra
+    # bf16 truncation of prob-scaled values before the topk summation.
     # Only local-expert blocks are processed; non-local positions are left
     # undefined and skipped by _moe_sum (which checks the routing map).
     intermediate3 = torch.empty(
@@ -595,15 +602,16 @@ def vllm_fused_moe(
         sorted_token_ids,
         expert_ids,
         num_post_padded,
-        mul_routed_weight=True,
+        mul_routed_weight=False,
         top_k=1,
         block_size_m=block_size_m,
     )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
-    # Fused kernel accumulates in fp32, writes directly to out (if provided),
-    # zeros rows beyond valid_tokens, and skips non-local expert slots.
+    # Applies routing weights and accumulates in fp32, writes directly to
+    # out (if provided), zeros rows beyond valid_tokens, and skips non-local
+    # expert slots.
     return _moe_sum(
-        intermediate3, max_tokens, topk, K, valid_tokens,
-        routing_map, local_expert_start, num_local_experts, out=out,
+        intermediate3, probs, max_tokens, topk, K,
+        valid_tokens, routing_map, local_expert_start, num_local_experts, out=out,
     )
