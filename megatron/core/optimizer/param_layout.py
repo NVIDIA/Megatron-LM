@@ -49,11 +49,15 @@ class BufferKey:
         grad_dtype: Gradient reduction dtype.
         is_expert_parallel: Whether the buffer holds expert-parallel parameters,
             which use a separate data-parallel group.
+        use_layerwise_distributed_optimizer: Whether the buffer holds parameters
+            managed by the layer-wise distributed optimizer, which requires
+            shard-aligned layouts (no parameter split across shard boundaries).
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
+    use_layerwise_distributed_optimizer: bool = False
 
 
 @dataclass

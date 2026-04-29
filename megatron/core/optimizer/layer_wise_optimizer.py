@@ -50,6 +50,41 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """
 
     @staticmethod
+    def tag_params(model_chunks, eopt_name, config_overrides=None):
+        """Tag each trainable parameter with ``use_layerwise_distributed_optimizer``.
+
+        Parameters managed by the emerging optimizer (e.g. Muon for 2D weights) are
+        tagged ``True``; parameters routed to a fallback optimizer (e.g. Adam for
+        biases, norms, embeddings) are tagged ``False``.  The tag is read by
+        :func:`group_params_for_buffers` to separate them into distinct buffers.
+
+        Must be called before DDP construction so that buffer grouping reflects
+        the optimizer routing.
+
+        Args:
+            model_chunks: Model chunks whose parameters will be tagged.
+            eopt_name: Name of the emerging optimizer (e.g. ``'muon'``).
+            config_overrides: Optimizer config overrides (same dict passed to
+                :func:`_get_megatron_emerging_optimizer`).
+        """
+        from .emerging_optimizers import _EMERGING_OPTIMIZERS
+
+        all_overrides = dict(config_overrides or {})
+        if eopt_name in _EMERGING_OPTIMIZERS:
+            all_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+
+        for model_chunk in model_chunks:
+            for name, param in model_chunk.named_parameters():
+                if not param.requires_grad:
+                    continue
+                opt_name = eopt_name
+                for param_key, override in all_overrides.items():
+                    if param_key.matches(param, name) and 'optimizer' in override:
+                        opt_name = override['optimizer']
+                        break
+                param.use_layerwise_distributed_optimizer = opt_name in _EMERGING_OPTIMIZERS
+
+    @staticmethod
     def _shard_divisor(data_parallel_world_size: int, ddp_config) -> int:
         """Per-shard alignment divisor.
 
@@ -270,9 +305,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups with shard-aligned buckets.
 
-        Groups parameters by ``(param_dtype, grad_dtype, is_expert_parallel)`` via
-        :func:`group_params_for_buffers`, then delegates to
-        :meth:`_compute_per_buffer_param_layout` for size-matched shard alignment.
+        Groups parameters by :class:`BufferKey` via :func:`group_params_for_buffers`,
+        then delegates to :meth:`_compute_per_buffer_param_layout` (shard-aligned) for
+        buffers with ``use_layerwise_distributed_optimizer=True``, or to
+        :meth:`DistributedOptimizer._compute_per_buffer_param_layout` (standard) for
+        the remaining buffers.
 
         Args:
             params: All parameters to lay out.
@@ -285,6 +322,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         Returns:
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
         """
+        from .distrib_optimizer import DistributedOptimizer
+
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
@@ -297,9 +336,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             else:
                 dp_world_size = data_parallel_world_size
 
-            layout = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
-                group_params, bucket_size, dp_world_size, ddp_config, param_indices,
-            )
+            if buffer_key.use_layerwise_distributed_optimizer:
+                layout = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
+                    group_params, bucket_size, dp_world_size, ddp_config, param_indices,
+                )
+            else:
+                layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                    group_params, bucket_size, dp_world_size, ddp_config, param_indices,
+                )
             layouts[buffer_key] = layout
         return FullParamLayout(layouts=layouts)
 
@@ -319,11 +363,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             config: OptimizerConfig.
             pg_collection: ProcessGroupCollection.
             init_state_fn_list: List of init state functions.
-            model_chunks: DDP-wrapped model chunks (needed for overlap_param_gather).
+            model_chunks: DDP-wrapped model chunks.
         """
 
         self.pg_collection = pg_collection
-        self.shard_params(optimizers)
+
+        full_param_layouts = None
+        if model_chunks is not None:
+            full_param_layouts = [
+                chunk.full_param_layout
+                for chunk in model_chunks
+                if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
+            ] or None
+        self.shard_params(optimizers, full_param_layouts)
 
         # Set up overlap param gather using DDP bucket infrastructure.
         self.overlap_param_gather = config.overlap_param_gather
@@ -362,32 +414,104 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # This way each rank do some duplicated work but allgather_v is no longer needed
         # All current distopt optimization can also be potentially applied
 
-    def shard_params(self, optimizers):
-        """Shard all params into lists by rank."""
-        # list of parameter are sorted by numel and assigned to ranks in ping-pong style
-        # example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list will be
-        # [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]]
+    def shard_params(self, optimizers, full_param_layouts=None):
+        """Shard params across ranks according to the computed param layout.
 
-        # simplify when dp_cp group size is 1
-        if get_pg_size(self.pg_collection.dp_cp) == 1:
+        Each param's shard assignment is derived from the :class:`FullParamLayout`
+        stored on the DDP model chunks.  Within each bucket the buffer is divided
+        into ``dp_size`` equal shards; a param's shard index is determined by its
+        position in the buffer.
+
+        Falls back to the legacy ping-pong-by-numel strategy when no layout is
+        available (e.g. ``dp_size == 1`` or no DDP wrapper).
+
+        Args:
+            optimizers: Optimizers whose param groups will be narrowed to
+                the local rank's shard.
+            full_param_layouts: List of :class:`FullParamLayout` (one per model
+                chunk).  ``None`` triggers the legacy fallback.
+        """
+        # Simplify when dp_cp group size is 1.
+        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
+        if dp_cp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
-        dp_cp_idx, expt_dp_idx = 0, 0
-        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
         expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
-        # create ping-pong style loop so memory is more balanced
+
+        if full_param_layouts is not None:
+            self._shard_params_from_layout(
+                optimizers, full_param_layouts, dp_cp_size, expt_dp_size,
+            )
+        else:
+            self._shard_params_ping_pong(optimizers, dp_cp_size, expt_dp_size)
+
+    def _shard_params_from_layout(
+        self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size,
+    ):
+        """Derive shard assignments from the param layout."""
+        dp_cp_rank = get_pg_rank(self.pg_collection.dp_cp)
+        expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
+
+        self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
+        self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
+
+        # Map each param to its shard index.
+        param_id_to_shard: Dict[int, int] = {}
+        for full_layout in full_param_layouts:
+            for buffer_key, layout in full_layout.layouts.items():
+                dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
+                for param, (start, end, bucket_id) in layout.param_index_map.items():
+                    bstart, bend = layout.bucket_indices[bucket_id]
+                    shard_size = (bend - bstart) // dp_size
+                    shard_idx = (start - bstart) // shard_size
+                    param_id_to_shard[id(param)] = shard_idx
+
+        # Collect all param groups and assign params to per-rank lists.
+        param_groups = []
+        for optimizer in optimizers:
+            param_groups += optimizer.param_groups
+        param_groups_this_rank = [[] for _ in param_groups]
+
+        for group_index, group in enumerate(param_groups):
+            is_expert = group.get("is_expert_parallel", False)
+            local_rank = expt_dp_rank if is_expert else dp_cp_rank
+            params_list = self.expt_dp_params_list if is_expert else self.dp_cp_params_list
+
+            for p in group["params"]:
+                shard_idx = param_id_to_shard[id(p)]
+                params_list[shard_idx].append(p)
+                if shard_idx == local_rank:
+                    param_groups_this_rank[group_index].append(p)
+
+        # Now we modify the group to only handle local params.
+        for group, local_params in zip(param_groups, param_groups_this_rank):
+            group["params"] = local_params
+
+        # Simplify when expt_dp group size is 1 or expert parallel is off.
+        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+            self.expt_dp_params_list = None
+
+    def _shard_params_ping_pong(self, optimizers, dp_cp_size, expt_dp_size):
+        """Legacy ping-pong-by-numel shard assignment (no layout available).
+
+        List of parameters are sorted by numel and assigned to ranks in ping-pong style.
+        Example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list
+        will be [[p0, p7, p8], [p1, p6, p9], [p2, p5], [p3, p4]].
+        """
+        dp_cp_idx, expt_dp_idx = 0, 0
+        # Create ping-pong style loop so memory is more balanced.
         dp_cp_loop = list(range(dp_cp_size)) + list(range(dp_cp_size))[::-1]
         expt_dp_loop = list(range(expt_dp_size)) + list(range(expt_dp_size))[::-1]
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
-        # get all param groups
+        # Get all param groups.
         param_groups = []
         for optimizer in optimizers:
             param_groups += optimizer.param_groups
 
-        # sort param in all groups by param numel and assign to each rank evenly
+        # Sort param in all groups by param numel and assign to each rank evenly.
         param_list = []
         for group_index, group in enumerate(param_groups):
             for p in group["params"]:
@@ -395,7 +519,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         param_list.sort(key=lambda x: x[0].numel())
         param_groups_this_rank = [[] for g in param_groups]
 
-        # assign params to rank in ping-pong style loop
+        # Assign params to rank in ping-pong style loop.
         for p, group_index in param_list:
             if param_groups[group_index].get("is_expert_parallel", False):
                 if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.expt_dp):
@@ -408,11 +532,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 self.dp_cp_params_list[dp_cp_loop[dp_cp_idx]].append(p)
                 dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
 
-        # now we modify the group to only handle local params
+        # Now we modify the group to only handle local params.
         for groups, params in zip(param_groups, param_groups_this_rank):
             groups["params"] = params
 
-        # simplify when expt_dp group size is 1 or expert parallel is off
+        # Simplify when expt_dp group size is 1 or expert parallel is off.
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 

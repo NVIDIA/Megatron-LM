@@ -29,6 +29,7 @@ _LWO = LayerWiseDistributedOptimizer
 
 def _make_param(shape, dtype=torch.bfloat16, **attrs):
     p = torch.nn.Parameter(torch.randn(shape, dtype=dtype))
+    p.use_layerwise_distributed_optimizer = True
     for k, v in attrs.items():
         setattr(p, k, v)
     return p
@@ -320,7 +321,7 @@ class TestLayerwiseFullParamLayout:
         layout = _LWO.compute_full_param_layout(params, None, dp_size, cfg)
         assert len(layout.layouts) == 1
         key = list(layout.layouts.keys())[0]
-        assert key == BufferKey(torch.bfloat16, torch.float, False)
+        assert key == BufferKey(torch.bfloat16, torch.float, False, True)
 
     def test_expert_parallel_separate_buffer(self):
         """Expert-parallel params should be in a separate buffer group."""
