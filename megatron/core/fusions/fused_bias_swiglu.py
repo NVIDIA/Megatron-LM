@@ -254,9 +254,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         if ctx.clamp_value is not None and ctx.clamp_value > 0:
-            tmp, wgrad = clamped_weighted_swiglu_back(
-                grad_output, input, weights, ctx.clamp_value
-            )
+            tmp, wgrad = clamped_weighted_swiglu_back(grad_output, input, weights, ctx.clamp_value)
         else:
             tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
         return tmp, wgrad, None, None

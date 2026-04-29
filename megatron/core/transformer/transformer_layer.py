@@ -832,7 +832,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = self.mlp(
-                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs,
+                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
             )
 
         nvtx_range_pop(suffix="mlp")
@@ -1027,9 +1027,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and getattr(self.mlp.router, 'is_hash_layer', False)
         ):
             static_inputs["input_ids"] = torch.zeros(
-                (micro_batch_size, seq_length),
-                dtype=torch.long,
-                device=torch.cuda.current_device(),
+                (micro_batch_size, seq_length), dtype=torch.long, device=torch.cuda.current_device()
             )
 
         return static_inputs
@@ -1103,7 +1101,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         ):
             hidden_states = self._forward_mlp(
-                hidden_states, input_ids=kwargs.get("input_ids", None),
+                hidden_states, input_ids=kwargs.get("input_ids", None)
             )
         if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
             cuda_graph_outputs = [hidden_states]
@@ -1540,9 +1538,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             and getattr(self.mlp.router, 'is_hash_layer', False)
         ):
             static_inputs["input_ids"] = torch.zeros(
-                (micro_batch_size, seq_length),
-                dtype=torch.long,
-                device=torch.cuda.current_device(),
+                (micro_batch_size, seq_length), dtype=torch.long, device=torch.cuda.current_device()
             )
 
         return static_inputs

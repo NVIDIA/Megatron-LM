@@ -2157,9 +2157,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_n_hash_layers > 0:
-            assert self.actual_vocab_size is not None, (
-                "actual_vocab_size must be set when moe_n_hash_layers > 0."
-            )
+            assert (
+                self.actual_vocab_size is not None
+            ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
             if self.pipeline_model_parallel_size > 1:
                 assert self.pipeline_model_parallel_layout is not None, (
                     "pipeline_model_parallel_layout must be set when using hash MoE "
@@ -2175,9 +2175,9 @@ class TransformerConfig(ModelParallelConfig):
                     f"{n_decoders_with_embedding} decoder layers, but "
                     f"moe_n_hash_layers={self.moe_n_hash_layers}."
                 )
-            assert not self.overlap_moe_expert_parallel_comm, (
-                "overlap_moe_expert_parallel_comm does not support moe_n_hash_layers > 0 for now."
-            )
+            assert (
+                not self.overlap_moe_expert_parallel_comm
+            ), "overlap_moe_expert_parallel_comm does not support moe_n_hash_layers > 0 for now."
             log_single_rank(
                 logger,
                 logging.WARNING,

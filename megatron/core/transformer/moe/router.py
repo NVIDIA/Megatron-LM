@@ -179,8 +179,7 @@ class TopKRouter(Router):
         if self.config.moe_n_hash_layers > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
         self.is_hash_layer = (
-            self.config.moe_n_hash_layers > 0
-            and layer_number <= self.config.moe_n_hash_layers
+            self.config.moe_n_hash_layers > 0 and layer_number <= self.config.moe_n_hash_layers
         )
         if self.is_hash_layer:
             # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
@@ -189,9 +188,9 @@ class TopKRouter(Router):
             vocab_size = self.config.actual_vocab_size
             num_experts = self.config.num_moe_experts
             ids = torch.arange(vocab_size, device=torch.cuda.current_device())
-            tid2eid = torch.stack(
-                [(ids + k) % num_experts for k in range(self.topk)], dim=1,
-            ).to(torch.int32)
+            tid2eid = torch.stack([(ids + k) % num_experts for k in range(self.topk)], dim=1).to(
+                torch.int32
+            )
             self.register_buffer('tid2eid', tid2eid)
         else:
             self.tid2eid = None
@@ -612,9 +611,7 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def _hash_routing(
-        self, logits: torch.Tensor, input_ids: torch.Tensor
-    ):
+    def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
         """Hash-based routing: expert indices come from the tid2eid lookup table.
 
         Scores are still computed from the gating logits for weight computation,
