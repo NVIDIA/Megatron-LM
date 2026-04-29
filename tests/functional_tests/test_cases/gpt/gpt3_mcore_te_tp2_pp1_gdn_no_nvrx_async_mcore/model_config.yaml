@@ -45,7 +45,7 @@ MODEL_ARGS:
   --global-batch-size: 32
   --seq-length: 1024
   --max-position-embeddings: 1024
-  --train-iters: 50
+  --train-iters: 25
   --timing-log-level: 0
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
@@ -77,6 +77,8 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --async-save: true
+  --async-strategy: nvrx
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
-TEST_TYPE: ckpt-resume
+TEST_TYPE: no-nvrx

@@ -347,7 +347,17 @@ products:
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mcore_te_tp2_pp1_gdn_no_nvrx]
+  - test_case: [gpt3_mcore_te_tp2_pp1_gdn_no_nvrx_sync]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp1_gdn_no_nvrx_async]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp1_gdn_no_nvrx_async_mcore]
     products:
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
