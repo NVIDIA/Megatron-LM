@@ -68,6 +68,20 @@ user-guide/features/tokenizers
 ```
 
 ```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: Observability
+
+user-guide/observability/index
+user-guide/observability/configuration
+user-guide/observability/span-groups
+user-guide/observability/metrics
+user-guide/observability/pipeline-parallel
+user-guide/observability/observability-stack
+user-guide/observability/extending
+```
+
+```{toctree}
 :maxdepth: 1
 :hidden:
 :caption: Developer Guide
