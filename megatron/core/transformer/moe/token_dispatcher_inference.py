@@ -144,9 +144,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
             cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(
-                local_tokens_per_rank.sum()
-            )
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(local_tokens_per_rank.sum())
         else:
             InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(ep_size * local_tokens)
 

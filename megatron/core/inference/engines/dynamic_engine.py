@@ -354,7 +354,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
-       
+
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
         unwrapped = unwrap_model(controller.inference_wrapped_model.model)
@@ -423,7 +423,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             controller.has_mtp_cuda_graphs = True
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
-            
+
         # Memory usage.
         time_end = time.time()
         mem_stats_end = torch.cuda.memory_stats()
