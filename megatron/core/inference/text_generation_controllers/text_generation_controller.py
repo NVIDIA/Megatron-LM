@@ -1868,11 +1868,9 @@ class TextGenerationController:
         return {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
-            # Already a CPU tensor (independent of _sampled_tokens_cuda via the
-            # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
-            # the separate new_sample_copy). Returning the CPU copy avoids a
-            # D2H sync when the engine later calls sample.tolist().
-            "sample": sampled_tokens_cpu,
+            # Public retirement can lag one step behind the next output copy.
+            # Keep an owning CPU copy so the async output pool slot can be reused.
+            "sample": sampled_tokens_cpu.clone(),
             **(update_result or {}),
         }
 
@@ -2000,6 +1998,8 @@ class TextGenerationController:
             context.gpu_view,
             debug_enabled=getattr(context.config, "async_overlap_debug_checks", False),
         )
+        if prepared_step.metadata_ready_event is not None:
+            torch.cuda.current_stream().wait_event(prepared_step.metadata_ready_event)
         if prepared_step.input_ready_event is not None:
             torch.cuda.current_stream().wait_event(prepared_step.input_ready_event)
 

@@ -39,8 +39,10 @@ class FakeRetirementService:
 
 
 class FakePipelineEngine:
-    def __init__(self):
+    def __init__(self, *, max_launches=1, lookahead_allowed=True):
         self.context = SimpleNamespace(snapshot_pool=object())
+        self.max_launches = max_launches
+        self.lookahead_allowed = lookahead_allowed
         self.forward_calls = []
         self.bookkeep_calls = []
 
@@ -52,6 +54,12 @@ class FakePipelineEngine:
     async def async_bookkeep(self, step_result, context_state, step_time):
         self.bookkeep_calls.append((step_result, context_state, step_time))
         return {"retired_step": context_state["dynamic_step_id"]}
+
+    def has_async_overlap_launch_work(self):
+        return len(self.forward_calls) < self.max_launches
+
+    def can_launch_async_overlap_lookahead(self):
+        return self.lookahead_allowed
 
 
 def test_dynamic_async_pipeline_queue_depth_one_retires_immediately():
@@ -84,6 +92,40 @@ def test_dynamic_async_pipeline_drains_before_shutdown_hooks():
     assert retirement_service.shutdown_drains == 1
     assert retirement_service.suspend_drains == 1
     assert retirement_service.reused_request_ids == [7]
+
+
+def test_dynamic_async_pipeline_queue_depth_two_launches_before_retirement():
+    engine = FakePipelineEngine(max_launches=3)
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=FakeRetirementService(), queue_depth=2
+    )
+
+    first = asyncio.run(pipeline.step())
+    second = asyncio.run(pipeline.step())
+    final = asyncio.run(pipeline.step())
+
+    assert first == {"retired_step": 0}
+    assert second == {"retired_step": 1}
+    assert final == {"retired_step": 2}
+    assert engine.forward_calls == [0, 1, 2]
+    assert [call[1]["dynamic_step_id"] for call in engine.bookkeep_calls] == [0, 1, 2]
+    assert pipeline.pending_launch_count == 0
+
+
+def test_dynamic_async_pipeline_queue_depth_two_falls_back_when_lookahead_blocked():
+    engine = FakePipelineEngine(max_launches=2, lookahead_allowed=False)
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=FakeRetirementService(), queue_depth=2
+    )
+
+    first = asyncio.run(pipeline.step())
+    second = asyncio.run(pipeline.step())
+
+    assert first == {"retired_step": 0}
+    assert second == {"retired_step": 1}
+    assert engine.forward_calls == [0, 1]
+    assert [call[1]["dynamic_step_id"] for call in engine.bookkeep_calls] == [0, 1]
+    assert pipeline.pending_launch_count == 0
 
 
 def test_dynamic_step_records_are_frozen_and_copy_mutable_inputs():

@@ -1375,6 +1375,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
 
+    def is_async_overlap_steady_state_decode_ready(self) -> bool:
+        """Return whether the current context can safely launch one decode lookahead."""
+        if self.get_active_request_count() <= 0:
+            return False
+        if self.paused_request_count != 0:
+            return False
+        if not self.is_decode_only():
+            return False
+        if self.get_index_of_chunked_prefill_request(safe=False) != -1:
+            return False
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        if torch.any(self.num_output_placeholders[active_slice] != 0):
+            return False
+
+        tokens_per_decode_request = int(self.num_speculative_tokens) + 1
+        last_offsets = self.request_last_kv_block_offset[active_slice]
+        return bool(torch.all(last_offsets + tokens_per_decode_request < self.block_size_tokens))
+
     def _placeholder_request_slots_tensor(self, request_slots) -> Tensor:
         """Return request slots as a CPU int64 tensor."""
         if isinstance(request_slots, slice):

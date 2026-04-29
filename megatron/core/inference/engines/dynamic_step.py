@@ -70,10 +70,51 @@ class DynamicAsyncPipeline:
 
     async def step(self):
         """Run one queue-depth-limited pipeline step."""
+        if self.queue_depth == 1:
+            return await self._step_queue_depth_one()
+        return await self._step_with_lookahead()
+
+    async def _step_queue_depth_one(self):
+        """Run the serial queue-depth-one pipeline."""
         if self.pending_launch_count >= self.queue_depth:
             await self.drain_next()
         self.in_flight_launches.append(await self.engine.async_forward())
         return await self.drain_next()
+
+    async def _step_with_lookahead(self):
+        """Launch one lookahead step before retiring the oldest pending step."""
+        if self.pending_launch_count >= self.queue_depth:
+            return await self.drain_next()
+
+        launched = False
+        while self.pending_launch_count < self.queue_depth and self._has_launch_work():
+            if self.pending_launch_count > 0 and not self._can_launch_lookahead():
+                break
+            self.in_flight_launches.append(await self.engine.async_forward())
+            launched = True
+            if self.pending_launch_count > 1:
+                break
+
+        if self.pending_launch_count > 1:
+            return await self.drain_next()
+        if self.pending_launch_count == 1:
+            if not launched or not self._has_launch_work() or not self._can_launch_lookahead():
+                return await self.drain_next()
+        return None
+
+    def _has_launch_work(self) -> bool:
+        """Return whether the engine can launch another dynamic step."""
+        checker = getattr(self.engine, "has_async_overlap_launch_work", None)
+        if checker is not None:
+            return bool(checker())
+        return True
+
+    def _can_launch_lookahead(self) -> bool:
+        """Return whether a pending step can safely be left for ordered retirement."""
+        checker = getattr(self.engine, "can_launch_async_overlap_lookahead", None)
+        if checker is not None:
+            return bool(checker())
+        return True
 
     async def drain_next(self):
         """Retire the oldest launched step, if one is pending."""

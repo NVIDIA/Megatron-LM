@@ -251,10 +251,10 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         self.async_overlap_queue_depth = inference_config.async_overlap_queue_depth
         self.async_overlap_debug_checks = inference_config.async_overlap_debug_checks
-        if self.enable_async_overlap_architecture and self.async_overlap_queue_depth != 1:
+        if self.enable_async_overlap_architecture and self.async_overlap_queue_depth > 2:
             raise ValueError(
-                "async_overlap_queue_depth > 1 is not available until the "
-                "queue-depth-two async-overlap pipeline commit"
+                "async_overlap_queue_depth > 2 is not available until wider async-overlap "
+                "pipeline depths are validated"
             )
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
@@ -948,7 +948,73 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
-        return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
+        return (
+            self.context.has_unfinished_requests()
+            or len(self.waiting_request_ids) > 0
+            or self.has_async_overlap_pending_work()
+        )
+
+    def has_async_overlap_pending_work(self) -> bool:
+        """Return whether the async-overlap pipeline has work left to retire."""
+        if not hasattr(self, "async_pipeline"):
+            return False
+        return (
+            self.async_pipeline.pending_launch_count > 0
+            or self.step_retirement_service.pending_count > 0
+        )
+
+    def has_async_overlap_launch_work(self) -> bool:
+        """Return whether another real dynamic step can be launched."""
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING, EngineState.STOPPED):
+            return False
+        return self.context.get_active_request_count() > 0 or len(self.waiting_request_ids) > 0
+
+    def can_launch_async_overlap_lookahead(self) -> bool:
+        """Return whether queue-depth-two lookahead is safe for the current step."""
+        if not self.enable_async_overlap_architecture or self.async_overlap_queue_depth < 2:
+            return False
+        reason = self._async_overlap_lookahead_blocker()
+        if reason is not None:
+            self.async_overlap_debug_counters.fallback_or_queue_depth_one_reasons[reason] = (
+                self.async_overlap_debug_counters.fallback_or_queue_depth_one_reasons.get(
+                    reason, 0
+                )
+                + 1
+            )
+            return False
+        return True
+
+    def _async_overlap_lookahead_blocker(self) -> Optional[str]:
+        """Return the conservative queue-depth-two blocker, or None if eligible."""
+        if self.context.get_active_request_count() <= 0:
+            return "no_active_requests"
+        if len(self.waiting_request_ids) > 0:
+            return "waiting_requests"
+        if self.use_coordinator:
+            return "coordinator"
+        if self.controller.model_is_pipeline_parallel:
+            return "pipeline_parallel"
+        if getattr(self, "ep_world_size", 1) > 1:
+            return "expert_parallel"
+        if self.num_speculative_tokens > 0:
+            return "speculative"
+        if self.context.is_hybrid_model:
+            return "hybrid_mamba"
+        if self.enable_chunked_prefill or self.context.get_index_of_chunked_prefill_request(
+            safe=False
+        ) != -1:
+            return "chunked_prefill"
+        if not self.context.is_async_overlap_steady_state_decode_ready():
+            return "not_steady_state_decode"
+        active_slice = slice(self.context.paused_request_count, self.context.total_request_count)
+        for request_id in self.context.request_ids[active_slice].tolist():
+            request = self.get_request(int(request_id))
+            sampling_params = request.sampling_params
+            if request.stop_word_ids:
+                return "stop_words"
+            if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+                return "logprobs"
+        return None
 
     def get_request(self, request_id: int) -> DynamicInferenceRequest:
         """Get most recent request from a request record.
@@ -2136,6 +2202,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
+                                or self.has_async_overlap_pending_work()
                             )
                         )
                     )
@@ -2233,7 +2300,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
-                    )
+                    ) + int(self.has_async_overlap_pending_work())
                     global_work, all_pausing = await self._ep_establish_consensus(
                         local_pending, signal_consensus=(self.state == EngineState.PAUSING)
                     )
