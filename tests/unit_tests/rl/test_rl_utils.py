@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
-from unittest.mock import MagicMock
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -28,6 +30,7 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
     delete_cuda_graphs,
 )
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
@@ -82,6 +85,27 @@ class MockTokenizer:
 
     def detokenize(self, tokens):
         return [str(tok) for tok in tokens]
+
+
+class DummyLangModule:
+    def __init__(self, config):
+        self.config = config
+        self.rotary_pos_emb = None
+        self.eval = MagicMock()
+        self.train = MagicMock()
+
+    def modules(self):
+        return iter(())
+
+
+class DummyMoELayer:
+    def __init__(self, use_partial_cudagraphs):
+        self.use_partial_cudagraphs = use_partial_cudagraphs
+        self.transition_calls = []
+
+    def transition_cudagraph_scope(self, mode):
+        self.transition_calls.append(mode)
+        self.use_partial_cudagraphs = mode == "partial"
 
 
 @pytest.fixture
@@ -140,6 +164,68 @@ class TestRLUtils:
         args = validate_args(args)
         set_global_variables(args, False)
         return args
+
+    def _patch_rl_inference_mode_deps(self, monkeypatch, args):
+        interface = MagicMock()
+        interface.resume.return_value = object()
+        interface.suspend.return_value = object()
+        loop = SimpleNamespace(run_until_complete=MagicMock())
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(rl_utils, "get_inference_interface", lambda *_args: interface)
+        monkeypatch.setattr(
+            rl_utils,
+            "unwrap_model",
+            lambda model: model.module if hasattr(model, "module") else model,
+        )
+        monkeypatch.setattr(
+            rl_utils, "_maybe_prefetch_separate_inference_model_weights", MagicMock()
+        )
+        monkeypatch.setattr(rl_utils, "set_decode_expert_padding", MagicMock())
+        monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
+        return interface, loop
+
+    def _make_toggle_cuda_graphs_mock(self):
+        def _toggle(lang_module, set_to):
+            assert set_to in {"none", "local"}, f"Invalid CUDA graph implementation: {set_to}"
+            lang_module.config.cuda_graph_impl = set_to
+
+        return MagicMock(side_effect=_toggle)
+
+    def test_megatron_rl_inference_mode_preserves_legacy_runtime_cuda_graph_state(
+        self, monkeypatch
+    ):
+        config = SimpleNamespace(
+            cuda_graph_impl="none",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+        )
+        lang_module = DummyLangModule(config)
+        model = [SimpleNamespace(config=config, module=lang_module)]
+        args = SimpleNamespace(rl_training_cuda_graphs=False, num_experts=None, curr_iteration=11)
+        interface, _ = self._patch_rl_inference_mode_deps(monkeypatch, args)
+        toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
+        monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
+
+        with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
+            assert result is interface
+            assert config.cuda_graph_impl == "local"
+            assert config.cuda_graph_modules == []
+            assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+
+        assert toggle_cuda_graphs.call_args_list == [
+            call(lang_module, "local"),
+            call(lang_module, "none"),
+        ]
+        assert config.cuda_graph_impl == "none"
+        assert config.cuda_graph_modules == []
+        assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+        lang_module.eval.assert_called_once()
+        lang_module.train.assert_called_once()
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",

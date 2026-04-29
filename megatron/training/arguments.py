@@ -18,7 +18,14 @@ from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.cuda_graph_config import (
+    ALLOWED_INFERENCE_SCOPES,
+    get_deprecated_cuda_graph_modules_migration,
+    normalize_cuda_graph_modules,
+    normalize_inference_cuda_graph_scope,
+    validate_deprecated_cuda_graph_modules_migration_inputs,
+)
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
@@ -237,6 +244,55 @@ def _eval_pattern(pattern):
         raise ValueError(f"Invalid pattern: {pattern}")
 
     return eval(pattern)
+
+
+def _parse_cuda_graph_modules_arg(scope):
+    """Parse CUDA graph module CLI values while preserving deprecated spellings for migration."""
+    if scope in {"full", "full_iteration", "full_iteration_inference"}:
+        return scope
+    return CudaGraphModule[scope]
+
+
+def _normalize_cuda_graph_modules_args(args):
+    """Normalize cuda_graph_modules to enums and apply deprecated scope migrations."""
+    normalized_scopes, deprecated_scopes, used_full_scope = normalize_cuda_graph_modules(
+        args.cuda_graph_modules
+    )
+    validate_deprecated_cuda_graph_modules_migration_inputs(
+        deprecated_scopes,
+        args.cuda_graph_impl,
+        args.inference_cuda_graph_scope,
+    )
+    if used_full_scope:
+        warn_rank_0('full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.')
+
+    for scope, attr, value in deprecated_scopes:
+        migration = get_deprecated_cuda_graph_modules_migration(
+            scope, attr, value, args.cuda_graph_impl
+        )
+        if migration is None:
+            warn_rank_0(
+                f"--cuda-graph-modules '{scope}' is deprecated and has no effect when "
+                "--cuda-graph-impl=none. Use --cuda-graph-impl=local with "
+                "--inference-cuda-graph-scope=block to enable inference CUDA graphs."
+            )
+            continue
+        migration_attr, migration_value = migration
+        warn_rank_0(
+            f"--cuda-graph-modules '{scope}' is deprecated. "
+            f"Setting --{migration_attr.replace('_', '-')}={migration_value} instead."
+        )
+        setattr(args, migration_attr, migration_value)
+
+    args.cuda_graph_modules = normalized_scopes
+
+
+def _normalize_inference_cuda_graph_scope_arg(args):
+    """Normalize inference_cuda_graph_scope and apply the impl-derived default."""
+    args.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
+        args.inference_cuda_graph_scope, args.cuda_graph_impl
+    )
+
 
 def no_rope_freq_type(x):
     """ Controls which layers to skip performing Rotary Position Embedding.
@@ -558,6 +614,29 @@ def validate_args(args, defaults={}):
             )
             args.cuda_graph_impl = "transformer_engine"
             del args.external_cuda_graph
+
+    if getattr(args, 'cuda_graph_scope_deprecated', None) is not None:
+        assert not args.cuda_graph_modules, (
+            "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
+        )
+        warn_rank_0(
+            '--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.'
+        )
+        args.cuda_graph_modules = args.cuda_graph_scope_deprecated
+    del args.cuda_graph_scope_deprecated
+
+    # Normalize cuda_graph_modules and inference_cuda_graph_scope early so that
+    # all subsequent validation sees fully-typed enum values.
+    _normalize_cuda_graph_modules_args(args)
+    _normalize_inference_cuda_graph_scope_arg(args)
+    assert (
+        args.inference_cuda_graph_scope
+        in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl]
+    ), (
+        "Invalid inference CUDA graph scope "
+        f"{args.inference_cuda_graph_scope.name!r} for "
+        f"--cuda-graph-impl={args.cuda_graph_impl!r}."
+    )
 
     # Set input defaults.
     for key in defaults:
@@ -1078,17 +1157,17 @@ def validate_args(args, defaults={}):
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "full_iteration":
         assert not args.check_for_nan_in_loss_and_grad, \
-        "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
-    
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
+        "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-impl=full_iteration for training."
+
+    if args.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
         if args.fp8 is not None:
             assert args.transformer_impl == "inference_optimized", \
-                "fp8 with full_iteration_inference CUDA graphs is only supported with " \
+                "fp8 with --inference-cuda-graph-scope=block is only supported with " \
                 "--transformer-impl=inference_optimized"
             assert args.fp8_recipe == "mxfp8", \
-                "Only --fp8-recipe=mxfp8 is supported with full_iteration_inference CUDA graphs"
+                "Only --fp8-recipe=mxfp8 is supported with --inference-cuda-graph-scope=block"
 
     if args.cuda_graph_impl == 'local':
         assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \
@@ -1593,8 +1672,8 @@ def validate_args(args, defaults={}):
             assert is_te_min_version("2.8.0"), (
                 "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling delay_wgrad_compute"
             )
-            wgrad_in_graph_scope = CudaGraphScope.attn in args.cuda_graph_scope or (
-                CudaGraphScope.moe_router in args.cuda_graph_scope
+            wgrad_in_graph_scope = CudaGraphModule.attn in args.cuda_graph_modules or (
+                CudaGraphModule.moe_router in args.cuda_graph_modules
                 and args.moe_shared_expert_intermediate_size is not None
                 and not args.moe_shared_expert_overlap
             )
@@ -1607,7 +1686,7 @@ def validate_args(args, defaults={}):
                     'to be enabled. This is because the default gradient accumulation does not '
                     'use static memory addresses, which breaks CUDA graph requirements.'
                 )
-                if CudaGraphScope.attn in args.cuda_graph_scope:
+                if CudaGraphModule.attn in args.cuda_graph_modules:
                     assert (
                         not args.add_bias_linear and not args.add_qkv_bias
                     ), "CUDA graph with delay_wgrad_compute doesn't support attn bias for now."
@@ -1653,15 +1732,9 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
-    if args.cuda_graph_scope == "full" or (
-        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
-    ):
-        if isinstance(args.cuda_graph_scope, list):
-            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
-        args.cuda_graph_scope = []
-        warn_rank_0(
-            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
-        )
+    assert not (
+        args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
+    ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
@@ -1851,9 +1924,13 @@ def _add_inference_args(parser):
                        choices=["megatron", "huggingface"],
                        help='Select either Megatron or Huggingface as the '
                        'Bert embedder.')
-    group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope, default=[],
-                       help='Determines the CUDA graphs capturing scope. '
-                       'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
+    group.add_argument('--cuda-graph-scope', nargs='+', type=_parse_cuda_graph_modules_arg,
+                       default=None, dest='cuda_graph_scope_deprecated',
+                       help=argparse.SUPPRESS)  # hidden; use --cuda-graph-modules instead
+    group.add_argument('--cuda-graph-modules', nargs='+', type=_parse_cuda_graph_modules_arg, default=[],
+                       help='Selects capture coverage within per-layer CUDA graphs '
+                       '(local and transformer_engine implementations). '
+                       'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba": '
                        '"attn": captures operations in TransformerLayer._forward_attention(). '
                        '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
                        '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
@@ -1861,11 +1938,12 @@ def _add_inference_args(parser):
                        'including the shared experts if they are not overlapped with EP comm. '
                        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
                        '"mamba": captures the mamba layer. '
-                       '"full_iteration": captures a whole training iteration. '
-                       '"full_iteration_inference": captures a whole inference iteration. '
-                       'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
-                       'If not specified, the default scope is to capture the whole Transformer layer. '
-                       'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
+                       'An empty list means capturing the whole Transformer layer. '
+                       'This field is meaningless when --cuda-graph-impl=full_iteration and must be empty. '
+                       'Backward compatibility: "full" is deprecated but kept for backward compatibility; '
+                       'it is transformed to an empty list in validate_args. The deprecated values '
+                       '"full_iteration" and "full_iteration_inference" are also accepted and migrated '
+                       'to the new API in validate_args.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
@@ -2034,7 +2112,8 @@ def _add_network_size_args(parser):
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
-        "cuda_graph_scope",
+        "cuda_graph_modules",
+        "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",
         "params_dtype",

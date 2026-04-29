@@ -51,7 +51,6 @@ from megatron.core.inference.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs, graph_capture
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -228,7 +227,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
-        self.cuda_graph_scope = model_config.cuda_graph_scope
+        self.cuda_graph_modules = model_config.cuda_graph_modules
         # Initialize engine.
         self.reset()
 
@@ -335,16 +334,16 @@ class DynamicInferenceEngine(AbstractEngine):
             reset_context (bool): Whether to reset the context after building cuda graphs.
         """
 
-        if self.cuda_graph_impl != "local":
+        if self.cuda_graph_impl not in ("local", "full_iteration"):
             return
 
-        if (
-            CudaGraphScope.full_iteration in self.cuda_graph_scope
-            and CudaGraphScope.full_iteration_inference not in self.cuda_graph_scope
-        ):
+        if self.cuda_graph_impl == "full_iteration":
             warnings.warn(
-                "\n\n*** WARNING: 'full_iteration' CUDA graph scope used during inference! "
-                "This will not create inference CUDA graphs. Use '--cuda-graph-scope=full_iteration_inference' instead. ***\n"
+                "\n\n*** WARNING: '--cuda-graph-impl=full_iteration' used during inference! "
+                "For compatibility, this preserves the legacy '--cuda-graph-modules=full_iteration' "
+                "behavior and will not create inference CUDA graphs. Use "
+                "'--cuda-graph-impl=local --inference-cuda-graph-scope=block' "
+                "instead. ***\n"
             )
 
         context = self.context

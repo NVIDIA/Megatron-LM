@@ -31,7 +31,6 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -2020,10 +2019,7 @@ class TextGenerationController:
         )
 
         # Check whether CUDA graphs are enabled
-        enable_cuda_graph = (
-            model_config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in model_config.cuda_graph_scope
-        )
+        enable_cuda_graph = model_config.cuda_graph_impl == "local"
 
         # Pad batch tokens if necessary
         batch_size = len(active_requests)
