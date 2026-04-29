@@ -2359,7 +2359,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.fine_grained_activation_offloading:
                 assert self.cuda_graph_impl == "transformer_engine" or (
-                    self.cuda_graph_impl == "local" and self.cuda_graph_scope == "full_iteration"
+                    self.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in self.cuda_graph_scope
                 ), (
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
