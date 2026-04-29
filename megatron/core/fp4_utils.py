@@ -5,6 +5,7 @@
 from contextlib import nullcontext
 
 import torch
+
 # test comment
 
 from megatron.core.enums import Fp4Recipe
