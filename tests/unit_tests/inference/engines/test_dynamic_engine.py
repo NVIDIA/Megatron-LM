@@ -733,6 +733,95 @@ class TestDynamicInferenceEngine:
             47,
         ]
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_mixed_prefill_decode(self) -> None:
+        """Queue-depth-two matches qd1 when a prefill joins active decode requests."""
+
+        def run_mixed_prefill_decode(queue_depth: int) -> Tuple[Dict[int, List[int]], int]:
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=6,
+                model_provider="gpt",
+                num_cuda_graphs=None,
+                cuda_graph_scope=[],
+                force_build_cuda_graphs=True,
+                context_max_requests=128,
+                enable_async_overlap_architecture=True,
+                async_overlap_queue_depth=queue_depth,
+            )
+            env = self._build_test_env(test_config)
+            model = env.engine.controller.inference_wrapped_model.model
+
+            def deterministic_forward(*args, **kwargs):
+                tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+                batch, sequence = tokens.shape
+                logits = torch.zeros(
+                    batch,
+                    sequence,
+                    test_config.vocab_size,
+                    device=tokens.device,
+                    dtype=torch.bfloat16,
+                )
+                next_tokens = (tokens + 1).clamp(max=test_config.vocab_size - 1)
+                logits.scatter_(2, next_tokens.unsqueeze(-1), 100.0)
+                return logits
+
+            model.forward = deterministic_forward
+
+            def add_request(request_id: int):
+                env.engine._add_request(
+                    DynamicInferenceRequest(
+                        request_id=request_id,
+                        prompt_tokens=torch.tensor(
+                            [0, 1, 2, 3], dtype=torch.int64, device="cuda"
+                        ),
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=6,
+                            termination_id=test_config.vocab_size - 1,
+                            top_k=1,
+                        ),
+                        block_size_tokens=env.engine.context.block_size_tokens,
+                    )
+                )
+
+            add_request(0)
+            add_request(1)
+            first_result = env.engine.step_modern()
+            assert first_result["finished_request_records"] == []
+            pending_after_first_step = env.engine.async_pipeline.pending_launch_count
+
+            add_request(2)
+
+            finished = {}
+            step_count = 0
+            while env.engine.has_unfinished_requests():
+                result = env.engine.step_modern()
+                for record in result["finished_request_records"]:
+                    request = record.merge()
+                    assert request.status == Status.COMPLETED
+                    finished[int(request.request_id)] = list(request.generated_tokens)
+                step_count += 1
+                assert step_count < 32, "Engine did not converge"
+
+            assert env.engine.async_pipeline.pending_launch_count == 0
+            return finished, pending_after_first_step
+
+        qd1_finished, qd1_pending_after_first_step = run_mixed_prefill_decode(queue_depth=1)
+        qd2_finished, qd2_pending_after_first_step = run_mixed_prefill_decode(queue_depth=2)
+
+        assert qd1_pending_after_first_step == 0
+        assert qd2_pending_after_first_step == 1
+        assert qd2_finished == qd1_finished
+        assert set(qd2_finished) == {0, 1, 2}
+        for generated_tokens in qd2_finished.values():
+            assert len(generated_tokens) == 6
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

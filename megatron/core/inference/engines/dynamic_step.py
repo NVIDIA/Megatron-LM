@@ -144,11 +144,48 @@ class DynamicAsyncPipeline:
 
     def drain_for_request_reuse(self, request_id: int) -> None:
         """Validate no launched step can still reference a reused request ID."""
-        if self.in_flight_launches:
+        if self._pending_launch_references_request(request_id):
             raise RuntimeError(
                 f"Cannot reuse request {request_id} with unretired launched steps"
             )
         self.retirement_service.drain_for_request_reuse(request_id)
+
+    def _pending_launch_references_request(self, request_id: int) -> bool:
+        """Return whether pending launched work references a request ID."""
+        request_id = int(request_id)
+        for step_result, _, _ in self.in_flight_launches:
+            if step_result is None:
+                continue
+            referenced_ids = (
+                step_result.get("active_request_ids"),
+                step_result.get("finished_request_ids"),
+                step_result.get("newly_paused_request_ids"),
+                step_result.get("evict_request_ids"),
+            )
+            for ids in referenced_ids:
+                if ids is None:
+                    continue
+                if request_id in self._coerce_request_id_set(ids):
+                    return True
+        return False
+
+    @staticmethod
+    def _coerce_request_id_set(ids: Any) -> set[int]:
+        """Return a flat set of integer request IDs from tensor/list/scalar data."""
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        if not isinstance(ids, (list, tuple)):
+            ids = [ids]
+
+        flattened = []
+        stack = list(ids)
+        while stack:
+            value = stack.pop()
+            if isinstance(value, (list, tuple)):
+                stack.extend(value)
+            else:
+                flattened.append(int(value))
+        return set(flattened)
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -988,8 +988,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """Return the conservative queue-depth-two blocker, or None if eligible."""
         if self.context.get_active_request_count() <= 0:
             return "no_active_requests"
-        if len(self.waiting_request_ids) > 0:
-            return "waiting_requests"
         if self.use_coordinator:
             return "coordinator"
         if self.controller.model_is_pipeline_parallel:
@@ -1004,10 +1002,15 @@ class DynamicInferenceEngine(AbstractEngine):
             safe=False
         ) != -1:
             return "chunked_prefill"
+        if self.waiting_request_ids and self.context.enable_prefix_caching:
+            return "prefix_caching_waiting_prefill"
         if not self.context.is_async_overlap_steady_state_decode_ready():
             return "not_steady_state_decode"
         active_slice = slice(self.context.paused_request_count, self.context.total_request_count)
-        for request_id in self.context.request_ids[active_slice].tolist():
+        request_ids = list(self.context.request_ids[active_slice].tolist()) + list(
+            self.waiting_request_ids
+        )
+        for request_id in request_ids:
             request = self.get_request(int(request_id))
             sampling_params = request.sampling_params
             if request.stop_word_ids:

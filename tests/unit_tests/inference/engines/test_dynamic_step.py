@@ -94,6 +94,42 @@ def test_dynamic_async_pipeline_drains_before_shutdown_hooks():
     assert retirement_service.reused_request_ids == [7]
 
 
+def test_dynamic_async_pipeline_allows_unrelated_request_admission_with_pending_launch():
+    engine = FakePipelineEngine()
+    retirement_service = FakeRetirementService()
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=retirement_service, queue_depth=2
+    )
+    pipeline.in_flight_launches.append(
+        (
+            {"active_request_ids": [1], "finished_request_ids": []},
+            {"dynamic_step_id": 0},
+            0.0,
+        )
+    )
+
+    pipeline.drain_for_request_reuse(2)
+
+    assert retirement_service.reused_request_ids == [2]
+
+
+def test_dynamic_async_pipeline_blocks_reused_request_admission_with_pending_launch():
+    engine = FakePipelineEngine()
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=FakeRetirementService(), queue_depth=2
+    )
+    pipeline.in_flight_launches.append(
+        (
+            {"active_request_ids": [1], "finished_request_ids": []},
+            {"dynamic_step_id": 0},
+            0.0,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="Cannot reuse request 1"):
+        pipeline.drain_for_request_reuse(1)
+
+
 def test_dynamic_async_pipeline_queue_depth_two_launches_before_retirement():
     engine = FakePipelineEngine(max_launches=3)
     pipeline = DynamicAsyncPipeline(

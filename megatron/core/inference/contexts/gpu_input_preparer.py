@@ -57,6 +57,7 @@ class GpuInputPreparer:
         decode_count = len(input_plan.decode_input_destination_indices)
         if decode_count and previous_sample_state is None:
             raise RuntimeError("Decode input preparation requires previous sampled-token state")
+        self._validate_decode_prefill_ranges_are_disjoint(input_plan)
 
         token_buffer = snapshot.gpu_view.token_to_input_ids
         debug_expected_metadata = None
@@ -108,6 +109,25 @@ class GpuInputPreparer:
             )
 
         return input_ready_event
+
+    def _validate_decode_prefill_ranges_are_disjoint(self, input_plan: "StepInputPlan") -> None:
+        """Validate decode GPU handoff indices do not overlap CPU prefill ranges."""
+        if not input_plan.decode_input_destination_indices or not input_plan.prefill_prompt_token_ranges:
+            return
+
+        decode_indices = set()
+        for base_idx in input_plan.decode_input_destination_indices:
+            decode_indices.update(
+                int(base_idx) + offset for offset in range(input_plan.speculative_width + 1)
+            )
+
+        for start, end in input_plan.prefill_prompt_token_ranges:
+            prefill_indices = range(int(start), int(end))
+            if any(index in decode_indices for index in prefill_indices):
+                raise RuntimeError(
+                    "Decode GPU input handoff overlaps prefill CPU input range "
+                    f"({start}, {end})"
+                )
 
     def _decode_token_indices(self, input_plan: "StepInputPlan") -> torch.Tensor:
         """Return CPU token indices covered by decode input preparation."""
