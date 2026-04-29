@@ -114,8 +114,8 @@ class HybridStack(MegatronModule):
         )
         self.layer_type_list = layer_type_list
 
-        if layer_config_list is not None:
-            assert len(layer_config_list) == len(layer_type_list), (
+        if layer_config_list is not None and len(layer_config_list) != len(layer_type_list):
+            raise ValueError(
                 f"layer_config_list length ({len(layer_config_list)}) must match "
                 f"layer_type_list length ({len(layer_type_list)})."
             )

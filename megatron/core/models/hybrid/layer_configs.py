@@ -435,12 +435,6 @@ class MTPLayerConfig:
     """Per-depth MTP body — a (possibly nested) list of decoder
     :class:`LayerConfig` instances."""
 
-    extra: Dict[str, Any] = field(default_factory=dict)
-    """Passthrough kwargs forwarded to the per-MTP-layer
-    :class:`TransformerConfig`. Same semantics as
-    :attr:`CommonLayerConfig.extra`. Currently unused by
-    :class:`MultiTokenPredictionBlock` — included for forward compatibility."""
-
 
 @dataclass
 class CrossEntropyLayerConfig:
