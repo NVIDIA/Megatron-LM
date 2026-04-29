@@ -167,7 +167,7 @@ def get_modelopt_torch_quantization_config():
         # cache override; the recipe encodes quant_cfg + algorithm + KV cache directly.
         print_rank_0(f"Use recipe {args.recipe} for quantization")
         recipe = load_recipe(args.recipe)
-        if not isinstance(recipe, ModelOptPTQRecipe), 
+        if not isinstance(recipe, ModelOptPTQRecipe):
             raise TypeError(f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}")
         if args.export_kv_cache_quant != "none":
             print_rank_0(f"Ignoring --export-kv-cache-quant={args.export_kv_cache_quant} since you passed in a YAML recipe.")
