@@ -20,7 +20,6 @@ import itertools
 
 import pytest
 import torch
-import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
@@ -41,8 +40,14 @@ NONE = "none"  # 0 requests (dummy rank)
 DECODE = "decode"  # >0 decode, 0 prefill
 PREFILL = "prefill"  # 0 decode, >0 prefill
 MIXED = "mixed"  # >0 decode, >0 prefill
-
+PREFILL_AT_MAX_TOKENS = "prefill_max_tokens"
+DECODE_AT_MAX_REQUESTS = "decode_max_requests"
+MIXED_GIANT_PREFILL = (
+    "mixed_giant_prefill"  # (max_requests-1) decode + 1 prefill with tokens > max_requests
+)
 ALL_STATES = [NONE, DECODE, PREFILL, MIXED]
+
+_NO_CUDA_GRAPH_STATES = {PREFILL_AT_MAX_TOKENS, MIXED_GIANT_PREFILL}
 
 # Fixed expert-parallel size. When world_size > _EP_SIZE the remaining
 # ranks form data-parallel replicas, each running the same EP combo
@@ -54,7 +59,20 @@ _EP_SIZE = 4
 # with the same multiset of states is not a distinct configuration), we use
 # combinations_with_replacement rather than the full Cartesian product.
 # For _EP_SIZE=4 this gives C(4+4-1, 4) = 35 test cases.
-_STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE))
+#
+# Edge states (PREFILL_AT_MAX_TOKENS, DECODE_AT_MAX_REQUESTS, MIXED_GIANT_PREFILL)
+# are not swept combinatorially — one rank in the edge state against a fixed
+# peer is sufficient.
+_STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE)) + [
+    (PREFILL_AT_MAX_TOKENS, DECODE, DECODE, DECODE),
+    (PREFILL_AT_MAX_TOKENS, MIXED, MIXED, MIXED),
+    (PREFILL_AT_MAX_TOKENS, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS),
+    (DECODE_AT_MAX_REQUESTS, DECODE, DECODE, DECODE),
+    (DECODE_AT_MAX_REQUESTS, MIXED, MIXED, MIXED),
+    (MIXED_GIANT_PREFILL, DECODE, DECODE, DECODE),
+    (MIXED_GIANT_PREFILL, MIXED, MIXED, MIXED),
+    (MIXED_GIANT_PREFILL, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS),
+]
 
 # Batch dimensions used to set up each non-dummy state via
 # add_dummy_requests_for_cudagraph_capture. These are intentionally small
@@ -66,6 +84,16 @@ _STATE_DIMS = {
     PREFILL: InferenceBatchDimensions(token_count=32, prefill_req_count=2, decode_req_count=0),
     # 4 decode (4 tokens) + 2 prefill (60 tokens) = 64 tokens
     MIXED: InferenceBatchDimensions(token_count=64, prefill_req_count=2, decode_req_count=4),
+    PREFILL_AT_MAX_TOKENS: InferenceBatchDimensions(
+        token_count=512, prefill_req_count=1, decode_req_count=0
+    ),
+    DECODE_AT_MAX_REQUESTS: InferenceBatchDimensions(
+        token_count=64, prefill_req_count=0, decode_req_count=64
+    ),
+    # 63 decode (1 token each) + 1 prefill (65 tokens) = 128 tokens; prefill tokens > max_requests=64
+    MIXED_GIANT_PREFILL: InferenceBatchDimensions(
+        token_count=128, prefill_req_count=1, decode_req_count=63
+    ),
 }
 
 
@@ -136,6 +164,7 @@ class TestDynamicInference:
         num_cuda_graphs=16,
         use_cuda_graphs_for_non_decode_steps=True,
         max_requests=None,
+        max_tokens=None,
     ):
         mamba_config = MambaInferenceStateConfig.from_model(model)
         return DynamicInferenceContext(
@@ -149,6 +178,7 @@ class TestDynamicInference:
                 num_cuda_graphs=num_cuda_graphs,
                 use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
                 max_requests=max_requests,
+                max_tokens=max_tokens,
             ),
         )
 
@@ -227,8 +257,8 @@ class TestDynamicInference:
         matches its own batch dimensions independently — no EP all-reduce.
         The context is built with use_cuda_graphs_for_non_decode_steps=True,
         so the CUDA graph list contains decode-only, mixed, and prefill-only
-        graphs, and every rank should always find a matching graph for its
-        own state.
+        graphs, and every rank should find a matching graph for its own state
+        unless its token count exceeds the cuda-graph range (PREFILL_EXCEED).
 
         State setup uses add_dummy_requests_for_cudagraph_capture to populate
         the context directly with the desired request configuration.
@@ -238,7 +268,7 @@ class TestDynamicInference:
         is_dummy = my_state == NONE
 
         model = self._build_model()
-        ctx = self._build_context(model)
+        ctx = self._build_context(model, max_requests=64, max_tokens=512)
 
         # Phase 1: Set up each rank's request state directly.
         if not is_dummy:
@@ -252,17 +282,27 @@ class TestDynamicInference:
 
         # Phase 3: Verify.
         # With NVLS dispatcher each rank matches independently, so every rank
-        # must find a graph for its own state.
-        assert ctx.using_cuda_graph_this_step(), (
-            f"EP rank {ep_rank} (state={my_state}): expected a CUDA graph match "
-            f"with use_cuda_graphs_for_non_decode_steps=True "
-            f"(rank_states={rank_states})"
-        )
+        # must find a graph for its own state — except PREFILL_EXCEED, whose
+        # token count exceeds the max cuda-graph size and falls back to eager.
+        if my_state in _NO_CUDA_GRAPH_STATES:
+            assert not ctx.using_cuda_graph_this_step(), (
+                f"EP rank {ep_rank} (state={my_state}): expected no CUDA graph match "
+                f"(token_count exceeds cuda-graph range) "
+                f"(rank_states={rank_states})"
+            )
+        else:
+            assert ctx.using_cuda_graph_this_step(), (
+                f"EP rank {ep_rank} (state={my_state}): expected a CUDA graph match "
+                f"with use_cuda_graphs_for_non_decode_steps=True "
+                f"(rank_states={rank_states})"
+            )
 
         self._assert_dynamic_inference_shape(model, ctx, ep_rank, my_state)
-        self._assert_cuda_graphs_were_replayed(
-            True, ep_rank, f"state={my_state}, rank_states={rank_states}"
-        )
+
+        if my_state not in _NO_CUDA_GRAPH_STATES:
+            self._assert_cuda_graphs_were_replayed(
+                True, ep_rank, f"state={my_state}, rank_states={rank_states}"
+            )
 
     # ------------------------------------------------------------------
     # test_dummy_bailout_with_decode_only_cuda_graphs: dedicated bail-out

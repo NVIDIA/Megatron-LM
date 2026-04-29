@@ -937,7 +937,7 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch'] = "flashinfer"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'torch'] = "torch"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe. Not compatible with MXFP8.

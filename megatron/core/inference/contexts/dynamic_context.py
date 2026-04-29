@@ -595,7 +595,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # CUDA graph config list.
         self._nccl_ep_dispatcher = (
-            self.expert_model_parallel_group.size() > 1
+            get_pg_size(self.expert_model_parallel_group) > 1
             and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
         )
         # We disable non-decode cuda graphs for the nccl dispatcher.
@@ -621,7 +621,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        if self.expert_model_parallel_group.size() > 1:
+        if get_pg_size(self.expert_model_parallel_group) > 1:
             if self._nccl_ep_dispatcher:
                 NCCLAllGatherDispatcher.allocate_buffers()
             else:
