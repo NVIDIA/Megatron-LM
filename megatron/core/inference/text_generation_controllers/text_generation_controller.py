@@ -5,6 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
@@ -1853,7 +1854,10 @@ class TextGenerationController:
 
         range_push(context.dynamic_step_nvtx_label("update_requests"))
         update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+            active_request_mask,
+            new_sample_copy,
+            sampled_mtp_tokens_cpu,
+            defer_decode_input_tokens=True,
         )
         range_pop()
 
@@ -1966,7 +1970,7 @@ class TextGenerationController:
             active_request_ids=request_plan.active_request_ids,
         )
 
-        return DynamicStepContextSnapshot(
+        prepared_step = DynamicStepContextSnapshot(
             step_id=step_id,
             snapshot_slot_id=snapshot_slot_id,
             request_plan=request_plan,
@@ -1978,6 +1982,14 @@ class TextGenerationController:
             gpu_view=snapshot_slot.gpu_view,
             cpu_staging_buffer=snapshot_slot.cpu_mirror,
         )
+        input_plan = context.build_step_input_plan(
+            step_id=step_id,
+            snapshot_slot_id=snapshot_slot_id,
+        )
+        input_ready_event = context.prepare_gpu_inputs(prepared_step, input_plan)
+        if input_ready_event is not None:
+            prepared_step = replace(prepared_step, input_ready_event=input_ready_event)
+        return prepared_step
 
     def launch_dynamic_forward(
         self, prepared_step: DynamicStepContextSnapshot
@@ -1989,6 +2001,8 @@ class TextGenerationController:
             context.gpu_view,
             debug_enabled=getattr(context.config, "async_overlap_debug_checks", False),
         )
+        if prepared_step.input_ready_event is not None:
+            torch.cuda.current_stream().wait_event(prepared_step.input_ready_event)
 
         # Enable routing recording before forward pass if routing replay is enabled
         config = self.inference_wrapped_model.model.config

@@ -14,6 +14,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.engines.dynamic_step import DynamicStepId
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
@@ -807,6 +808,146 @@ class TestDynamicContext:
                     ]
                 )
             )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_update_requests_defers_decode_input_tokens_to_gpu_preparer(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=128,
+            max_tokens=256,
+            max_requests=256,
+        )
+        dynamic_context.set_current_dynamic_step_id(7)
+
+        dynamic_context.total_request_count = 2
+        dynamic_context.paused_request_count = 0
+        dynamic_context.active_token_count = 2
+        dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
+        dynamic_context.request_query_lengths[:2] = 1
+        dynamic_context.request_in_prefill_status_tensor[:2] = 0
+        dynamic_context.request_kv_length_offsets[:2] = torch.tensor([5, 8], device='cpu')
+        dynamic_context.request_last_kv_block_offset[:2] = torch.tensor([5, 8], device='cpu')
+        dynamic_context.request_kv_block_counts[:2] = 1
+        blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(2)
+        dynamic_context.request_to_kv_block_ids[:2, 0] = blocks
+        dynamic_context.request_last_kv_block_id[:2] = blocks
+
+        dynamic_context.update_requests(
+            active_requests_mask=torch.tensor([1, 1], device='cpu', dtype=torch.int32),
+            new_tokens=torch.tensor([99, 100], device='cpu'),
+            defer_decode_input_tokens=True,
+        )
+
+        assert dynamic_context._gpu_decode_input_pending
+        assert dynamic_context._gpu_decode_input_source_step_id == 7
+        assert torch.equal(
+            dynamic_context.token_to_input_ids[:2],
+            torch.zeros(2, dtype=dynamic_context.token_to_input_ids.dtype, device='cpu'),
+        )
+        assert torch.equal(
+            dynamic_context.token_to_pos_ids[:2], torch.tensor([6, 9], device='cpu')
+        )
+
+        input_plan = dynamic_context.build_step_input_plan(
+            step_id=DynamicStepId(8), snapshot_slot_id=0
+        )
+        assert input_plan.source_step_id == DynamicStepId(7)
+        assert input_plan.decode_request_ids == ("10", "11")
+        assert input_plan.decode_input_destination_indices == (0, 1)
+
+        dynamic_context.reset_metadata()
+        assert not dynamic_context._gpu_decode_input_pending
+        assert dynamic_context._gpu_decode_input_source_step_id is None
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_update_requests_falls_back_to_cpu_decode_tokens_when_requests_finish(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=128,
+            max_tokens=256,
+            max_requests=256,
+        )
+
+        dynamic_context.total_request_count = 3
+        dynamic_context.paused_request_count = 0
+        dynamic_context.active_token_count = 3
+        dynamic_context.request_ids[:3] = torch.tensor([10, 11, 12], device='cpu')
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_in_prefill_status_tensor[:3] = 0
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([5, 8, 11], device='cpu')
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
+            [5, 8, 11], device='cpu'
+        )
+        dynamic_context.request_kv_block_counts[:3] = 1
+        blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(3)
+        dynamic_context.request_to_kv_block_ids[:3, 0] = blocks
+        dynamic_context.request_last_kv_block_id[:3] = blocks
+
+        dynamic_context.update_requests(
+            active_requests_mask=torch.tensor([1, 0, 1], device='cpu', dtype=torch.int32),
+            new_tokens=torch.tensor([99, 100, 101], device='cpu'),
+            defer_decode_input_tokens=True,
+        )
+
+        assert not dynamic_context._gpu_decode_input_pending
+        assert dynamic_context.total_request_count == 2
+        assert torch.equal(
+            dynamic_context.token_to_input_ids[:2],
+            torch.tensor([99, 101], dtype=dynamic_context.token_to_input_ids.dtype, device='cpu'),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_update_requests_clears_deferred_decode_input_on_empty_batch(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.01,
+            block_size_tokens=128,
+            max_tokens=256,
+            max_requests=256,
+        )
+
+        dynamic_context.total_request_count = 1
+        dynamic_context.paused_request_count = 0
+        dynamic_context.active_token_count = 1
+        dynamic_context.request_ids[0] = 10
+        dynamic_context.request_query_lengths[0] = 1
+        dynamic_context.request_in_prefill_status_tensor[0] = 0
+        dynamic_context.request_kv_length_offsets[0] = 5
+        dynamic_context.request_last_kv_block_offset[0] = 5
+        dynamic_context.request_kv_block_counts[0] = 1
+        block = dynamic_context.kv_block_allocator.allocate_memory_blocks(1)
+        dynamic_context.request_to_kv_block_ids[0, 0] = block[0]
+        dynamic_context.request_last_kv_block_id[0] = block[0]
+        dynamic_context._gpu_decode_input_pending = True
+        dynamic_context._gpu_decode_input_source_step_id = 7
+
+        dynamic_context.update_requests(
+            active_requests_mask=torch.tensor([0], device='cpu', dtype=torch.int32),
+            new_tokens=torch.tensor([99], device='cpu'),
+            defer_decode_input_tokens=True,
+        )
+
+        assert dynamic_context.total_request_count == 0
+        assert dynamic_context.active_token_count == 0
+        assert not dynamic_context._gpu_decode_input_pending
+        assert dynamic_context._gpu_decode_input_source_step_id is None
 
     @pytest.mark.internal
     @rounder_override(64)

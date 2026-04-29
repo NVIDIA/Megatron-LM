@@ -1161,6 +1161,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             stream=self.gpu_bookkeeping_stream,
             debug_enabled=self.config.async_overlap_debug_checks,
         )
+        self._gpu_decode_input_pending = False
+        self._gpu_decode_input_source_step_id = None
+        self._gpu_decode_input_debug_expected_input_ids = None
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -2483,6 +2486,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+        self._clear_pending_gpu_decode_input()
         self.sync_optimistic_to_committed_for_queue_depth_one()
 
     def set_current_dynamic_step_id(self, step_id: int) -> None:
@@ -2611,7 +2615,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         source_step_id=None,
     ):
         """Build a GPU input-preparation plan for the current context state."""
-        from megatron.core.inference.engines.dynamic_step import StepInputPlan
+        from megatron.core.inference.engines.dynamic_step import DynamicStepId, StepInputPlan
+
+        if not isinstance(step_id, DynamicStepId):
+            step_id = DynamicStepId(int(step_id))
+        if source_step_id is None:
+            source_step_id = self._gpu_decode_input_source_step_id
+        if source_step_id is not None and not isinstance(source_step_id, DynamicStepId):
+            source_step_id = DynamicStepId(int(source_step_id))
 
         active_slots = tuple(range(int(self.paused_request_count), int(self.total_request_count)))
         active_slice = slice(int(self.paused_request_count), int(self.total_request_count))
@@ -2647,7 +2658,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         debug_expected_input_ids = None
         if self.config.async_overlap_debug_checks:
-            debug_expected_input_ids = self.token_to_input_ids[: self.active_token_count].clone()
+            if self._gpu_decode_input_debug_expected_input_ids is not None:
+                debug_expected_input_ids = self._gpu_decode_input_debug_expected_input_ids.clone()
+            else:
+                debug_expected_input_ids = self.token_to_input_ids[
+                    : self.active_token_count
+                ].clone()
 
         return StepInputPlan(
             step_id=step_id,
@@ -2665,9 +2681,46 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def prepare_gpu_inputs(self, snapshot, input_plan, previous_sample_state=None):
         """Prepare snapshot-bound GPU inputs from a StepInputPlan."""
+        if not self._gpu_decode_input_pending:
+            return None
+        if not input_plan.decode_input_destination_indices:
+            self._clear_pending_gpu_decode_input()
+            return None
         if previous_sample_state is None:
             previous_sample_state = self.gpu_sampled_token_state
-        return self.gpu_input_preparer.prepare(snapshot, input_plan, previous_sample_state)
+        decode_count = len(input_plan.decode_input_destination_indices)
+        if previous_sample_state.last_active_request_count < decode_count:
+            raise RuntimeError(
+                "GPU decode input preparation needs sampled-token state for "
+                f"{decode_count} decode requests, but only "
+                f"{previous_sample_state.last_active_request_count} are available"
+            )
+        input_ready_event = self.gpu_input_preparer.prepare(
+            snapshot, input_plan, previous_sample_state
+        )
+        self._clear_pending_gpu_decode_input()
+        return input_ready_event
+
+    def _clear_pending_gpu_decode_input(self) -> None:
+        """Clear deferred decode-token input state."""
+        self._gpu_decode_input_pending = False
+        self._gpu_decode_input_source_step_id = None
+        self._gpu_decode_input_debug_expected_input_ids = None
+
+    def _record_pending_gpu_decode_input(self, next_tokens: Tensor) -> None:
+        """Record that decode input IDs will be populated from GPU sampled state."""
+        self._gpu_decode_input_pending = True
+        current_step_id = int(getattr(self, "current_dynamic_step_id", -1))
+        self._gpu_decode_input_source_step_id = (
+            current_step_id if current_step_id >= 0 else None
+        )
+        if self.config.async_overlap_debug_checks:
+            self._gpu_decode_input_debug_expected_input_ids = next_tokens.to(
+                dtype=self.token_to_input_ids.dtype
+            ).clone()
+        else:
+            self._gpu_decode_input_debug_expected_input_ids = None
+        self.token_to_input_ids[: self.active_token_count].fill_(0)
 
     def dynamic_step_nvtx_label(self, name: str, step_id: Optional[int] = None) -> str:
         """Return an NVTX range name with the current dynamic step id."""
@@ -3620,6 +3673,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_requests_mask: Tensor,
         new_tokens: Tensor,
         new_speculative_tokens: Tensor = None,
+        defer_decode_input_tokens: bool = False,
     ) -> Tensor:
         """Update context state after calling engine.step().
 
@@ -3658,10 +3712,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_speculative_tokens (Tensor): Newly sampled speculative tokens,
                 with num_speculative tokens per active request.
                 (num_speculative_tokens, active_request_length)
+            defer_decode_input_tokens (bool): If true, leave supported decode input IDs for
+                the GPU input preparer instead of copying CPU sampled-token values into
+                token_to_input_ids.
 
         Return:
             (Tensor) Newly paused request IDs.
         """
+        initial_paused_request_count = int(self.paused_request_count)
+        initial_total_request_count = int(self.total_request_count)
+        initial_chunked_prefill_idx = self.get_index_of_chunked_prefill_request(safe=False)
+
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
@@ -3727,6 +3788,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
+            self._clear_pending_gpu_decode_input()
             self.sync_optimistic_to_committed_for_queue_depth_one()
             return
 
@@ -3783,6 +3845,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         #       b) Move the paused requests to the left, and active requets to the right
         #       c) Update the paused request count and active_request_count appropriately
         newly_paused_request_ids = None
+        active_requests_requiring_new_block_count = 0
         if active_request_count > 0:
             num_tokens_in_last_block = self.request_last_kv_block_offset[
                 self.paused_request_count : (active_request_count + self.paused_request_count)
@@ -3999,7 +4062,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             next_tokens = sampled_tokens
 
-        self.token_to_input_ids[: self.active_token_count] = next_tokens
+        can_defer_decode_input_tokens = (
+            defer_decode_input_tokens
+            and self.active_token_count > 0
+            and active_request_count > 0
+            and initial_paused_request_count == 0
+            and self.paused_request_count == 0
+            and initial_total_request_count == active_request_count
+            and finished_request_count == 0
+            and active_requests_requiring_new_block_count == 0
+            and newly_paused_request_ids is None
+            and evict_request_ids is None
+            and initial_chunked_prefill_idx == -1
+            and self.get_index_of_chunked_prefill_request(safe=False) == -1
+        )
+        if can_defer_decode_input_tokens:
+            self._record_pending_gpu_decode_input(next_tokens)
+        else:
+            self._clear_pending_gpu_decode_input()
+            self.token_to_input_ids[: self.active_token_count] = next_tokens
 
         # Req kv length offsets : [0, 5, 10 ... ]
         # For num spec tokens = 2 , this will become [0, 1, 2, 5, 6, 7 10, 11, 12 ...]
