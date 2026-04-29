@@ -21,7 +21,6 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.engines.dynamic_step import (
-    AsyncStepOutput,
     DynamicStepContextSnapshot,
     DynamicStepGpuLaunch,
     DynamicStepId,
@@ -32,6 +31,11 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.async_output import (
+    AsyncStepOutput,
+    AsyncStepOutputPool,
+    AsyncStepOutputResult,
+)
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
@@ -166,6 +170,10 @@ class TextGenerationController:
             self._torch_sampling_buckets: List[Tuple] = []
 
         self._init_mtp_sampling_tensor()
+        self._async_step_output_pool = AsyncStepOutputPool(
+            max_requests=max_requests,
+            num_speculative_tokens=self.num_speculative_tokens,
+        )
 
     def _init_mtp_sampling_tensor(self):
         """Initialize the MTP sampling tensor after num_speculative_tokens is set."""
@@ -1766,14 +1774,17 @@ class TextGenerationController:
             tuple: (sampled_tokens_cpu, sampled_mtp_tokens_cpu) where
                 sampled_mtp_tokens_cpu is None when speculative decoding is off.
         """
-        sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
-        if self.num_speculative_tokens > 0:
-            sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[
-                :, :active_request_count
-            ].cpu()
-        else:
-            sampled_mtp_tokens_cpu = None
-        return sampled_tokens_cpu, sampled_mtp_tokens_cpu
+        step_output = AsyncStepOutput.begin_copy(
+            pool=self._async_step_output_pool,
+            active_request_count=active_request_count,
+            sampled_tokens_cuda=self._sampled_tokens_cuda,
+            sampled_mtp_tokens_cuda=(
+                self._sampled_mtp_tokens_cuda if self.num_speculative_tokens > 0 else None
+            ),
+            compute_stream=torch.cuda.current_stream(),
+        )
+        result = step_output.result()
+        return result.sampled_tokens_cpu, result.sampled_mtp_tokens_cpu
 
     def _dynamic_step_context_bookkeeping_from_cpu_samples(
         self, sampled_tokens_cpu: Tensor, sampled_mtp_tokens_cpu: Optional[Tensor]
@@ -2042,37 +2053,40 @@ class TextGenerationController:
         active_request_count = prepared_step.active_request_count
 
         range_push(context.dynamic_step_nvtx_label("sampled_output_d2h"))
-        if skip_bookkeeping:
-            # Preserve the old skip-bookkeeping path: copy only the public sample.
-            sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
-            sampled_mtp_tokens_cpu = None
-        else:
-            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-                active_request_count,
-            )
-        range_pop()
-
-        return AsyncStepOutput(
-            step_id=prepared_step.step_id,
-            snapshot_slot_id=prepared_step.snapshot_slot_id,
+        step_output = AsyncStepOutput.begin_copy(
+            pool=self._async_step_output_pool,
             active_request_count=active_request_count,
-            sampled_tokens=self._sampled_tokens_cuda[:active_request_count],
-            sampled_tokens_cpu=sampled_tokens_cpu,
-            sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+            sampled_tokens_cuda=self._sampled_tokens_cuda,
+            sampled_mtp_tokens_cuda=(
+                self._sampled_mtp_tokens_cuda
+                if self.num_speculative_tokens > 0 and not skip_bookkeeping
+                else None
+            ),
+            accepted_tokens_cuda=(
+                self._accepted_tokens_per_request if self.num_speculative_tokens > 0 else None
+            ),
+            accepted_token_counts_cuda=(
+                self._accepted_token_counts_per_request
+                if self.num_speculative_tokens > 0
+                else None
+            ),
+            compute_stream=torch.cuda.current_stream(),
         )
+        range_pop()
+        return step_output
 
-    def collect_dynamic_output(self, step_output: AsyncStepOutput) -> AsyncStepOutput:
+    def collect_dynamic_output(self, step_output: AsyncStepOutput) -> AsyncStepOutputResult:
         """Collect a dynamic step output copy.
 
-        Commit 5 replaces this immediate serial result with an event-gated pinned-buffer result.
+        Queue depth one waits immediately; later pipeline commits defer this collection.
         """
-        return step_output
+        return step_output.result()
 
     def commit_dynamic_bookkeeping(
         self,
         prepared_step: DynamicStepContextSnapshot,
         gpu_launch: DynamicStepGpuLaunch,
-        step_output: AsyncStepOutput,
+        step_output: AsyncStepOutputResult,
         log_probs: Optional[Tensor],
         top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
         skip_bookkeeping: Optional[bool] = False,
@@ -2089,8 +2103,8 @@ class TextGenerationController:
 
         ret = {
             "accepted_tokens": (
-                # Clone needed: .fill_(-1) below would corrupt the returned value.
-                self._accepted_tokens_per_request.clone()
+                # Pinned CPU copy; the GPU scratch buffer is reset below.
+                step_output.accepted_tokens_cpu
                 if self.num_speculative_tokens > 0
                 else None
             ),
