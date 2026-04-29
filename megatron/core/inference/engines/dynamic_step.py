@@ -104,14 +104,22 @@ class DynamicStepContextSnapshot:
     step_id: DynamicStepId
     snapshot_slot_id: int
     request_plan: DynamicStepRequestPlan
+    active_request_count: int = 0
+    cuda_graph_request_count: Optional[int] = None
     metadata_ready_event: Optional[Any] = None
     input_ready_event: Optional[Any] = None
+    input_ids: Optional[Any] = None
+    position_ids: Optional[Any] = None
     gpu_view: Optional[Any] = None
     cpu_staging_buffer: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if self.snapshot_slot_id < 0:
             raise ValueError(f"snapshot_slot_id must be >= 0, got {self.snapshot_slot_id}")
+        if self.active_request_count < 0:
+            raise ValueError(
+                f"active_request_count must be >= 0, got {self.active_request_count}"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -123,6 +131,10 @@ class DynamicStepGpuLaunch:
     metadata_ready_event: Optional[Any] = None
     input_ready_event: Optional[Any] = None
     compute_done_event: Optional[Any] = None
+    input_ids: Optional[Any] = None
+    position_ids: Optional[Any] = None
+    logits: Optional[Any] = None
+    routing_indices_per_request: Optional[Any] = None
     cuda_graph_batch_dimensions: Optional[Any] = None
 
     def __post_init__(self) -> None:
@@ -136,10 +148,12 @@ class AsyncStepOutput:
 
     step_id: DynamicStepId
     snapshot_slot_id: int
+    active_request_count: int = 0
     compute_done_event: Optional[Any] = None
     output_ready_event: Optional[Any] = None
     sampled_tokens: Optional[Any] = None
     sampled_tokens_cpu: Optional[Any] = None
+    sampled_mtp_tokens_cpu: Optional[Any] = None
     accepted_token_counts_cpu: Optional[Any] = None
     logprob_payload_cpu: Optional[Any] = None
     routing_payload_cpu: Optional[Any] = None
@@ -147,6 +161,10 @@ class AsyncStepOutput:
     def __post_init__(self) -> None:
         if self.snapshot_slot_id < 0:
             raise ValueError(f"snapshot_slot_id must be >= 0, got {self.snapshot_slot_id}")
+        if self.active_request_count < 0:
+            raise ValueError(
+                f"active_request_count must be >= 0, got {self.active_request_count}"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
