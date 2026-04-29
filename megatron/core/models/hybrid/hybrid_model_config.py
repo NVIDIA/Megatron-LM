@@ -232,7 +232,7 @@ class HybridModelConfig:
         # MTP: compile the per-depth body (shared across all MTP markers in
         # the pattern) into the single-character form the existing
         # MultiTokenPredictionBlock infrastructure consumes.
-        mtp_layer_pattern, mtp_num_depths = _compile_mtp_markers(mtp_markers)
+        mtp_layer_pattern, mtp_num_depths = _compile_mtp_markers(mtp_markers, self.common_config)
 
         # Stack-level config: a model-wide topology snapshot used for the
         # final norm, embedding init, and the args projection in
@@ -248,7 +248,6 @@ class HybridModelConfig:
             stack_kwargs.setdefault(k, v)
         for k, v in placeholders.items():
             stack_kwargs.setdefault(k, v)
-        stack_kwargs.setdefault("num_attention_heads", 1)
         if self.expert_model_parallel_size > 1:
             stack_kwargs.setdefault("num_moe_experts", 1)
         stack_kwargs["num_layers"] = num_layers
@@ -257,6 +256,8 @@ class HybridModelConfig:
         stack_kwargs["calculate_per_token_loss"] = loss.calculate_per_token_loss
         # Marker-level passthroughs: Embedding and CrossEntropy markers may
         # set TransformerConfig fields the curated DSL surface doesn't cover.
+        # ``extra`` may not name a curated TC field — that would silently shadow
+        # the field set above and obscure the recipe's authoritative source.
         from megatron.core.models.hybrid.common_layer_config import validate_extra_kwargs
 
         if embedding.extra:
@@ -264,6 +265,18 @@ class HybridModelConfig:
             stack_kwargs.update(embedding.extra)
         if loss.extra:
             validate_extra_kwargs(loss.extra, "CrossEntropyLayerConfig.extra")
+            curated = {
+                "cross_entropy_loss_fusion",
+                "cross_entropy_fusion_impl",
+                "calculate_per_token_loss",
+            }
+            shadowed = curated & set(loss.extra)
+            if shadowed:
+                raise ValueError(
+                    f"CrossEntropyLayerConfig.extra cannot override curated fields "
+                    f"{sorted(shadowed)}; set them on the marker directly "
+                    f"(e.g. CrossEntropyLayerConfig(loss_fusion=...))."
+                )
             stack_kwargs.update(loss.extra)
         stack_kwargs = {k: v for k, v in stack_kwargs.items() if v is not None}
         stack_config = TransformerConfig(**stack_kwargs)
@@ -355,7 +368,39 @@ def _split_pattern(pattern: list):
     return pattern[0], body, mtp_markers, pattern[-1]
 
 
-def _compile_mtp_markers(mtp_markers: list):
+_MTP_OVERRIDE_GUIDANCE = (
+    "MTPLayerConfig only forwards the layer-symbol pattern to "
+    "MultiTokenPredictionBlock today; per-MTP-layer config overrides are not yet "
+    "plumbed through and would be silently ignored. Drop the override or wait for "
+    "the MTP follow-up that wires per-layer configs through."
+)
+
+
+def _ensure_mtp_lc_uses_defaults(lc: LayerConfig, recipe_common: CommonLayerConfig) -> None:
+    """Reject per-MTP-layer LayerConfig overrides that would be silently dropped."""
+    if lc.common_config != recipe_common:
+        raise ValueError(
+            f"{type(lc).__name__} inside an MTPLayerConfig.mtp_model_layer body "
+            f"has a custom common_config. {_MTP_OVERRIDE_GUIDANCE}"
+        )
+    if lc.extra:
+        raise ValueError(
+            f"{type(lc).__name__} inside an MTPLayerConfig.mtp_model_layer body "
+            f"has a non-empty extra={lc.extra!r}. {_MTP_OVERRIDE_GUIDANCE}"
+        )
+    default_lc = type(lc)(common_config=recipe_common)
+    for f in dataclasses.fields(type(lc)):
+        if f.name in ("common_config", "extra"):
+            continue
+        if getattr(lc, f.name) != getattr(default_lc, f.name):
+            raise ValueError(
+                f"{type(lc).__name__}.{f.name}={getattr(lc, f.name)!r} inside an "
+                f"MTPLayerConfig.mtp_model_layer body diverges from the default. "
+                f"{_MTP_OVERRIDE_GUIDANCE}"
+            )
+
+
+def _compile_mtp_markers(mtp_markers: list, recipe_common: CommonLayerConfig):
     """Compile trailing MTP markers into ``(mtp_layer_pattern, mtp_num_depths)``.
 
     The existing :class:`MultiTokenPredictionBlock` infrastructure assumes all
@@ -365,6 +410,9 @@ def _compile_mtp_markers(mtp_markers: list):
     shared single-character body string (e.g. ``"MM"``); ``mtp_num_depths``
     is ``len(mtp_markers)``. When ``mtp_markers`` is empty, returns
     ``(None, 0)``.
+
+    Also rejects per-MTP-layer config overrides that would otherwise be
+    silently dropped (see :data:`_MTP_OVERRIDE_GUIDANCE`).
     """
     from megatron.core.models.hybrid.layer_pattern import flatten_decoder_pattern
 
@@ -373,11 +421,22 @@ def _compile_mtp_markers(mtp_markers: list):
 
     bodies: List[str] = []
     for marker in mtp_markers:
+        if marker.common_config != recipe_common:
+            raise ValueError(
+                f"MTPLayerConfig.common_config diverges from the recipe's "
+                f"common_config. {_MTP_OVERRIDE_GUIDANCE}"
+            )
+        if marker.extra:
+            raise ValueError(
+                f"MTPLayerConfig.extra={marker.extra!r} is non-empty. " f"{_MTP_OVERRIDE_GUIDANCE}"
+            )
         flat = flatten_decoder_pattern(marker.mtp_model_layer)
         if not flat:
             raise ValueError(
                 "MTPLayerConfig.mtp_model_layer must contain at least one " "decoder LayerConfig."
             )
+        for lc in flat:
+            _ensure_mtp_lc_uses_defaults(lc, recipe_common)
         bodies.append("".join(type(lc).SYMBOL for lc in flat))
 
     shared = bodies[0]

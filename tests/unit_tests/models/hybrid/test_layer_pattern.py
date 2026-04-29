@@ -389,8 +389,13 @@ class TestMTPLayerConfig:
         common = _make_common()
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
-        m = MambaLayerConfig(common_config=common)
-        mtp = MTPLayerConfig(common_config=common, mtp_model_layer=[a, [m, a]])
+        # MTP body LayerConfigs must use only default-shape overrides — the
+        # MultiTokenPredictionBlock builds layers off the stack-level config.
+        a_default = AttentionLayerConfig(common_config=common)
+        m_default = MambaLayerConfig(common_config=common)
+        mtp = MTPLayerConfig(
+            common_config=common, mtp_model_layer=[a_default, [m_default, a_default]]
+        )
         loss = CrossEntropyLayerConfig()
         compiled = HybridModelConfig(
             common_config=common, layer_pattern=[emb, a, mtp, loss]
@@ -402,7 +407,9 @@ class TestMTPLayerConfig:
         common = _make_common()
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
-        mtp = MTPLayerConfig(common_config=common, mtp_model_layer=[a])
+        mtp = MTPLayerConfig(
+            common_config=common, mtp_model_layer=[AttentionLayerConfig(common_config=common)]
+        )
         loss = CrossEntropyLayerConfig()
         # MTP appearing BEFORE a regular decoder layer (not in the trailing
         # contiguous run) should raise.
@@ -413,10 +420,13 @@ class TestMTPLayerConfig:
     def test_inconsistent_mtp_bodies_rejected(self):
         common = _make_common()
         emb = self._embedding(common)
-        m = MambaLayerConfig(common_config=common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
-        mtp1 = MTPLayerConfig(common_config=common, mtp_model_layer=[m])
-        mtp2 = MTPLayerConfig(common_config=common, mtp_model_layer=[a])
+        mtp1 = MTPLayerConfig(
+            common_config=common, mtp_model_layer=[MambaLayerConfig(common_config=common)]
+        )
+        mtp2 = MTPLayerConfig(
+            common_config=common, mtp_model_layer=[AttentionLayerConfig(common_config=common)]
+        )
         loss = CrossEntropyLayerConfig()
         recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a, mtp1, mtp2, loss])
         with pytest.raises(ValueError, match="identical"):
@@ -430,6 +440,37 @@ class TestMTPLayerConfig:
         loss = CrossEntropyLayerConfig()
         recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a, mtp, loss])
         with pytest.raises(ValueError, match="at least one"):
+            recipe.compile()
+
+    def test_mtp_body_layer_with_field_override_rejected(self):
+        """Per-MTP-layer config overrides are not yet plumbed through; reject
+        them so the user knows the override won't take effect."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a_decoder = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        # Non-default ``head_dim`` on the MTP body Mamba would be silently
+        # dropped today — the rejection makes that loud.
+        mtp = MTPLayerConfig(
+            common_config=common,
+            mtp_model_layer=[MambaLayerConfig(common_config=common, head_dim=128)],
+        )
+        loss = CrossEntropyLayerConfig()
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a_decoder, mtp, loss])
+        with pytest.raises(ValueError, match="MambaLayerConfig.head_dim"):
+            recipe.compile()
+
+    def test_mtp_marker_with_custom_common_rejected(self):
+        common = _make_common()
+        other_common = _make_common(hidden_size=512)
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        mtp = MTPLayerConfig(
+            common_config=other_common,
+            mtp_model_layer=[MambaLayerConfig(common_config=other_common)],
+        )
+        loss = CrossEntropyLayerConfig()
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a, mtp, loss])
+        with pytest.raises(ValueError, match="MTPLayerConfig.common_config"):
             recipe.compile()
 
 
@@ -497,6 +538,17 @@ class TestExtraPassthrough:
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
         with pytest.raises(ValueError, match="EmbeddingLayerConfig.extra"):
+            HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+
+    def test_loss_extra_cannot_shadow_curated_field(self):
+        """``CrossEntropyLayerConfig.extra`` may not name a curated field that
+        the marker already exposes (e.g. ``loss_fusion``). Such an entry would
+        silently override the marker's value otherwise."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig(loss_fusion=True, extra={"cross_entropy_loss_fusion": False})
+        with pytest.raises(ValueError, match="cross_entropy_loss_fusion"):
             HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
 
 

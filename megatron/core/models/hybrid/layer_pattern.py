@@ -11,9 +11,11 @@ path or a filesystem path, with an optional ``:func`` suffix — and returns
 a compiled :class:`CompiledRecipe` ready to feed into :class:`HybridModel`.
 """
 
+import hashlib
 import importlib
 import importlib.util
 import os
+import sys
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
@@ -103,12 +105,19 @@ def _import_from_spec(spec: str):
         if not path.is_file():
             raise ImportError(f"--model-recipe file path {spec!r} does not exist or is not a file.")
         # Use a unique synthetic module name so multiple recipes loaded by
-        # path don't collide in ``sys.modules``.
-        module_name = f"_megatron_recipe_{abs(hash(str(path)))}"
+        # path don't collide in ``sys.modules``. SHA-1 of the absolute path is
+        # stable across processes and avoids the per-process randomization of
+        # builtin ``hash()``.
+        digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:16]
+        module_name = f"_megatron_recipe_{digest}"
+        cached = sys.modules.get(module_name)
+        if cached is not None:
+            return cached
         spec_obj = importlib.util.spec_from_file_location(module_name, path)
         if spec_obj is None or spec_obj.loader is None:
             raise ImportError(f"could not build import spec for {path}")
         module = importlib.util.module_from_spec(spec_obj)
+        sys.modules[module_name] = module
         spec_obj.loader.exec_module(module)
         return module
     try:

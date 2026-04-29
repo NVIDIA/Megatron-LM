@@ -101,8 +101,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self,
         config: TransformerConfig,
         hybrid_stack_spec: Optional[ModuleSpec] = None,
-        vocab_size: int = None,
-        max_sequence_length: int = None,
+        vocab_size: Optional[int] = None,
+        max_sequence_length: Optional[int] = None,
         hybrid_layer_pattern: Optional[str] = None,
         layer_type_list_override: Optional[list] = None,
         layer_config_list_override: Optional[list] = None,
@@ -158,12 +158,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "hybrid_layer_pattern (string DSL) are mutually exclusive; "
                     "pass exactly one."
                 )
-            if layer_config_list_override is None or len(layer_config_list_override) != len(
-                layer_type_list_override
-            ):
+            if layer_config_list_override is None:
                 raise ValueError(
-                    "layer_type_list_override and layer_config_list_override must "
-                    "be passed together and have the same length."
+                    "layer_type_list_override was passed without layer_config_list_override; "
+                    "they must be passed together."
+                )
+            if len(layer_config_list_override) != len(layer_type_list_override):
+                raise ValueError(
+                    f"layer_type_list_override (len={len(layer_type_list_override)}) and "
+                    f"layer_config_list_override (len={len(layer_config_list_override)}) "
+                    f"must have the same length."
                 )
 
         # When using a recipe, fall back to the default hybrid_stack_spec so that
