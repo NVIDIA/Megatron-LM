@@ -2103,10 +2103,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         # Load teacher model in Distillation mode.
         if getattr(args, "export_kd_teacher_load", None):
-            from megatron.post_training.checkpointing import load_modelopt_checkpoint
-
             unwrapped_model = unwrap_model(model)[0]
-            # Note: load_modelopt_checkpoint may call this function so we prevent infinite recursion.
             if hasattr(unwrapped_model, 'teacher_model'):
                 teacher = unwrapped_model.teacher_model
                 print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
@@ -2116,7 +2113,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 args.finetune = True
                 if args.export_kd_teacher_ckpt_format is not None:
                     args.ckpt_format = args.export_kd_teacher_ckpt_format
-                load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
+                load_checkpoint([teacher], None, None, load_arg='export_kd_teacher_load')
                 args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
                 print_rank_0("... teacher loaded successfully.")
 

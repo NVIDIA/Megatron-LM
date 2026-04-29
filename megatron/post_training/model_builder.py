@@ -27,8 +27,6 @@ from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.checkpointing import load_checkpoint
-
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -154,17 +152,7 @@ def _build_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, 
 
     _add_load_convert_hooks(teacher)
 
-    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-    # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
-    # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
-    # True while loading the teacher checkpoint.
-    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
-    args.finetune = True
-    if args.export_kd_teacher_ckpt_format is not None:
-        args.ckpt_format = args.export_kd_teacher_ckpt_format
-    load_checkpoint([teacher], None, None, load_arg='export_kd_teacher_load')
-    args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
-    print_rank_0("...teacher loaded successfully.")
+    # NOTE: Checkpoint loading now handled in `megatron/training/checkpointing.py`.
 
     return teacher
 
