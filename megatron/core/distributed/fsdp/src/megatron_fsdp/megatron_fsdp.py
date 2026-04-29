@@ -49,6 +49,7 @@ try:
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing
     from megatron.core.utils import is_submodule
 
     logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
@@ -57,6 +58,9 @@ except ImportError:
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import is_submodule
+
+    def is_graph_capturing():
+        return torch.cuda.is_current_stream_capturing()
 
 
 class TrainingState(Enum):
@@ -691,6 +695,10 @@ class MegatronFSDP(torch.nn.Module):
                 - In hybrid FSDP configurations, an outer FSDP group gradient reduction
                 may be triggered.
             """
+            # Skip entire gradient processing during CUDA graph capture.
+            if is_graph_capturing():
+                return
+
             # Filter out shared parameters whose gradients are handled by the root hook.
             param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
 
@@ -981,6 +989,12 @@ class MegatronFSDP(torch.nn.Module):
                 )
                 return output
 
+            # Tag for cuda_graphs.py: this forward hook wraps a pre-backward handler.
+            # cuda_graphs.py will withhold it from TE and extract the inner handler
+            # into backward_pre_hooks for per-callable manual invocation.
+            # Attribute name must match _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR in cuda_graphs.py.
+            forward_hook._cuda_graph_backward_pre_handler = custom_backward_handler
+
             # Register the post-forward hook that attaches the custom backward hook
             # on the output tensor(s).
             return module.register_forward_hook(forward_hook)
@@ -1048,13 +1062,16 @@ class MegatronFSDP(torch.nn.Module):
             # and reduce-scatter gradients after the backward pass.
             if isinstance(module, tuple(fsdp_unit_modules)):
                 if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+                    _post_bwd_hook = functools.partial(
+                        _register_post_backward_hook, _post_backward_release_module
+                    )
+                    # Tag for cuda_graphs.py: this forward_pre hook wraps a post-backward handler.
+                    # cuda_graphs.py will withhold it from TE and extract the inner handler
+                    # into backward_hooks for per-callable manual invocation.
+                    # Attribute name must match _CUDA_GRAPH_BACKWARD_HANDLER_ATTR in cuda_graphs.py.
+                    _post_bwd_hook._cuda_graph_backward_handler = _post_backward_release_module
                     self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
-                        module.register_forward_pre_hook(
-                            functools.partial(
-                                _register_post_backward_hook, _post_backward_release_module
-                            ),
-                            with_kwargs=True,
-                        )
+                        module.register_forward_pre_hook(_post_bwd_hook, with_kwargs=True)
                     )
                 grad_acc_param_list = [p for p in module.parameters() if p.requires_grad]
             else:
