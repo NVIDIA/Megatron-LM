@@ -28,7 +28,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -1751,8 +1751,8 @@ def _layer_is_graphable(layer, config):
     if not isinstance(layer, GraphableMegatronModule):
         return False
 
-    # If cuda_graph_scope is not set, every layer is graphed.
-    if not config.cuda_graph_scope:
+    # If cuda_graph_modules is not set, every layer is graphed.
+    if not config.cuda_graph_modules:
         return True
 
     # import modules here to avoid a circular import
@@ -1762,24 +1762,24 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    if isinstance(layer, MambaLayer) and CudaGraphScope.mamba in config.cuda_graph_scope:
+    if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if CudaGraphScope.attn in config.cuda_graph_scope and not (
+        if CudaGraphModule.attn in config.cuda_graph_modules and not (
             isinstance(layer.self_attention, IdentityOp)
             and isinstance(layer.cross_attention, IdentityOp)
         ):
             # attn layer.
             return True
         if (
-            CudaGraphScope.moe in config.cuda_graph_scope
-            or CudaGraphScope.moe_router in config.cuda_graph_scope
-            or CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+            CudaGraphModule.moe in config.cuda_graph_modules
+            or CudaGraphModule.moe_router in config.cuda_graph_modules
+            or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
         ) and isinstance(layer.mlp, MoELayer):
             # moe layer.
             return True
-        if CudaGraphScope.mlp in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
+        if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(layer.mlp, MLP):
             # mlp layer.
             return True
     return False
@@ -1808,11 +1808,6 @@ class TECudaGraphHelper:
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
-        assert CudaGraphScope.full_iteration not in config.cuda_graph_scope, (
-            "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
-            "Please use cuda_graph_impl=local instead."
-        )
-
         self.model = model
         self.config = config
         self.seq_length = seq_length
@@ -2033,8 +2028,8 @@ class TECudaGraphHelper:
                 isinstance(layer, TransformerLayer)
                 and not isinstance(layer.self_attention, IdentityOp)
                 and (
-                    not self.config.cuda_graph_scope
-                    or CudaGraphScope.attn in self.config.cuda_graph_scope
+                    not self.config.cuda_graph_modules
+                    or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
             )
 
@@ -2242,8 +2237,8 @@ class TECudaGraphHelper:
         )
         chunk_id_list = None
         if self.config.overlap_moe_expert_parallel_comm:
-            wgrad_in_graph_scope = CudaGraphScope.attn in self.config.cuda_graph_scope or (
-                CudaGraphScope.moe_router in self.config.cuda_graph_scope
+            wgrad_in_graph_scope = CudaGraphModule.attn in self.config.cuda_graph_modules or (
+                CudaGraphModule.moe_router in self.config.cuda_graph_modules
                 and self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
             )

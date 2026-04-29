@@ -120,7 +120,7 @@ MODEL_ARGS:
   --tensorboard-dir: ${TENSORBOARD_PATH}
   # CUDA Graph args
   --cuda-graph-impl: transformer_engine
-  --cuda-graph-scope: attn
+  --cuda-graph-modules: attn
   --cuda-graph-warmup-steps: 0
   --te-rng-tracker: true
   # Add mixed precision args

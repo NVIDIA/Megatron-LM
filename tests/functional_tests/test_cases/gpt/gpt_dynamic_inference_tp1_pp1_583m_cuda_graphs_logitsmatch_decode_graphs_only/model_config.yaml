@@ -45,7 +45,7 @@ MODEL_ARGS:
   --top_k: 1
   --return-log-probs: true
   --num-tokens-to-generate: 30
-  --enable-cuda-graph: true
+  --cuda-graph-impl: local
   --decode-only-cuda-graphs: true
   --inference-dynamic-batching-buffer-size-gb: 20
   --dist-ckpt-strictness: log_unexpected

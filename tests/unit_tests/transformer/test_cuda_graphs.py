@@ -34,13 +34,14 @@ from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.training import arguments as training_arguments
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -52,6 +53,273 @@ from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, _ = check_fp8_support()
+
+
+def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
+    return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
+
+    warning_messages = []
+    print_messages = []
+
+    monkeypatch.setattr(
+        training_arguments, "warn_rank_0", lambda msg, *args, **kwargs: warning_messages.append(msg)
+    )
+    monkeypatch.setattr(
+        training_arguments, "print_rank_0", lambda msg, *args, **kwargs: print_messages.append(msg)
+    )
+    monkeypatch.setattr(sys, "argv", ["test_cuda_graphs.py", *(cli_args or [])])
+
+    args = parse_args()
+    args.num_layers = 2
+    args.vocab_size = 256
+    args.hidden_size = 64
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 128
+    args.seq_length = 128
+    args.micro_batch_size = 1
+
+    for key, value in overrides.items():
+        setattr(args, key, value)
+
+    args = validate_args(args)
+    return args, warning_messages, print_messages
+
+
+class TestCudaGraphConfigAndArguments:
+    def test_local_impl_defaults_to_layer_scope(self):
+        cfg = _base_cuda_graph_config(cuda_graph_impl='local')
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+
+    def test_full_iteration_impl_requires_empty_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match='cuda_graph_modules must be empty when cuda_graph_impl="full_iteration"',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration', cuda_graph_modules=[CudaGraphModule.attn]
+            )
+
+    def test_full_iteration_scope_string_in_config_migrated(self):
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl='local', cuda_graph_modules='full_iteration'
+            )
+        assert cfg.cuda_graph_impl == 'full_iteration'
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_full_iteration_inference_scope_string_in_config_migrated(self):
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl='local', cuda_graph_modules='full_iteration_inference'
+            )
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_full_iteration_inference_scope_string_noops_without_local_impl(self):
+        with pytest.warns(DeprecationWarning, match="has no effect"):
+            cfg = _base_cuda_graph_config(cuda_graph_modules='full_iteration_inference')
+        assert cfg.cuda_graph_impl == 'none'
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_full_iteration_scope_rejects_conflicting_new_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match="cuda_graph_modules='full_iteration' cannot be combined with "
+            "inference_cuda_graph_scope='block'",
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules='full_iteration',
+                inference_cuda_graph_scope='block',
+            )
+
+    def test_deprecated_full_iteration_inference_scope_rejects_conflicting_new_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match="cuda_graph_modules='full_iteration_inference' cannot be combined with "
+            "inference_cuda_graph_scope='layer'",
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules='full_iteration_inference',
+                inference_cuda_graph_scope='layer',
+            )
+
+    def test_enable_cuda_graph_flag_migrates_to_local_impl(self, monkeypatch):
+        args, _, print_messages = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--enable-cuda-graph']
+        )
+        assert args.cuda_graph_impl == 'local'
+        assert any("--enable-cuda-graph is deprecated" in msg for msg in print_messages)
+
+    def test_full_iteration_inference_scope_cli_migrates_to_block_scope(self, monkeypatch):
+        args, warning_messages, _ = _validated_cuda_graph_cli_args(
+            monkeypatch,
+            ['--cuda-graph-impl', 'local', '--cuda-graph-modules', 'full_iteration_inference'],
+        )
+        assert args.cuda_graph_impl == 'local'
+        assert args.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert args.cuda_graph_modules == []
+        assert any(
+            "--cuda-graph-modules 'full_iteration_inference' is deprecated" in msg
+            for msg in warning_messages
+        )
+
+    def test_full_iteration_inference_scope_cli_noops_without_local_impl(self, monkeypatch):
+        args, warning_messages, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-scope', 'full_iteration_inference']
+        )
+        assert args.cuda_graph_impl == 'none'
+        assert args.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        assert args.cuda_graph_modules == []
+        assert any("has no effect when --cuda-graph-impl=none" in msg for msg in warning_messages)
+
+    def test_full_iteration_inference_scope_cli_rejects_conflicting_new_scope(self, monkeypatch):
+        with pytest.raises(
+            AssertionError,
+            match="cuda_graph_modules='full_iteration_inference' cannot be combined with "
+            "inference_cuda_graph_scope='layer'",
+        ):
+            _validated_cuda_graph_cli_args(
+                monkeypatch,
+                [
+                    '--cuda-graph-impl',
+                    'local',
+                    '--cuda-graph-modules',
+                    'full_iteration_inference',
+                    '--inference-cuda-graph-scope',
+                    'layer',
+                ],
+            )
+
+    def test_new_scope_cli_accepts_block(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'local', '--inference-cuda-graph-scope', 'block']
+        )
+        assert args.cuda_graph_impl == 'local'
+        assert args.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+    def test_new_scope_cli_accepts_layer(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'local', '--inference-cuda-graph-scope', 'layer']
+        )
+        assert args.cuda_graph_impl == 'local'
+        assert args.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+
+    def test_removed_module_scoped_scope_name_is_not_accepted(self, monkeypatch):
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                'test_cuda_graphs.py',
+                '--cuda-graph-impl',
+                'local',
+                '--inference-cuda-graph-scope',
+                'module_scoped',
+            ],
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_removed_old_inference_bool_flag_is_not_accepted(self, monkeypatch):
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        monkeypatch.setattr(
+            sys, "argv", ['test_cuda_graphs.py', '--inference-use-full-iteration-cuda-graph']
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    # --- Backward compat: cuda_graph_scope → cuda_graph_modules rename ---
+
+    def test_deprecated_cuda_graph_scope_kwarg_migrates_to_modules(self):
+        with pytest.warns(DeprecationWarning, match="cuda_graph_scope is deprecated"):
+            cfg = _base_cuda_graph_config(cuda_graph_scope=['attn'])
+        assert cfg.cuda_graph_modules == [CudaGraphModule.attn]
+        assert cfg.cuda_graph_scope is None
+
+    def test_new_cuda_graph_modules_does_not_populate_deprecated_scope(self):
+        cfg = _base_cuda_graph_config(cuda_graph_modules=['attn', 'mlp'])
+        assert cfg.cuda_graph_modules == [CudaGraphModule.attn, CudaGraphModule.mlp]
+        assert cfg.cuda_graph_scope is None
+
+    def test_new_full_iteration_impl_does_not_populate_deprecated_scope(self):
+        cfg = _base_cuda_graph_config(cuda_graph_impl='full_iteration', cuda_graph_modules=[])
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_cuda_graph_scope_cli_migrates_to_modules(self, monkeypatch):
+        args, warning_messages, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'local', '--cuda-graph-scope', 'attn']
+        )
+        assert args.cuda_graph_modules == [CudaGraphModule.attn]
+        assert any('--cuda-graph-scope is deprecated' in msg for msg in warning_messages)
+
+    def test_cuda_graph_scope_is_standalone_class_for_pickle_compat(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        # CudaGraphScope is preserved as a standalone class (not an alias) so that
+        # pre-refactor checkpoints can be deserialized without value-collision errors.
+        assert CudaGraphScope is not CudaGraphModule
+        assert CudaGraphScope.attn.value == 2  # original ordinals preserved
+        assert CudaGraphScope.mamba.value == 7
+
+    def test_cuda_graph_scope_and_inference_scope_in_safe_globals(self):
+        from megatron.core.safe_globals import SAFE_GLOBALS
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        assert CudaGraphScope in SAFE_GLOBALS
+        assert InferenceCudaGraphScope in SAFE_GLOBALS
+
+    def test_deprecated_cuda_graph_scope_enum_instance_migrates_to_modules(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        with pytest.warns(DeprecationWarning, match="cuda_graph_scope is deprecated"):
+            cfg = _base_cuda_graph_config(cuda_graph_scope=[CudaGraphScope.attn])
+        assert cfg.cuda_graph_modules == [CudaGraphModule.attn]
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_cuda_graph_scope_full_iteration_enum_migrates_to_impl(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        with pytest.warns(DeprecationWarning):
+            cfg = _base_cuda_graph_config(cuda_graph_scope=[CudaGraphScope.full_iteration])
+        assert cfg.cuda_graph_impl == "full_iteration"
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_cuda_graph_scope_full_iteration_inference_enum_migrates_to_scope(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        with pytest.warns(DeprecationWarning):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl="local", cuda_graph_scope=[CudaGraphScope.full_iteration_inference]
+            )
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_cuda_graph_scope_full_iteration_inference_noops_without_local_impl(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        with pytest.warns(DeprecationWarning, match="has no effect"):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference]
+            )
+        assert cfg.cuda_graph_impl == "none"
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
 
 
 class TestParallelTransformerBlockCudagraphs:
@@ -872,7 +1140,7 @@ class TestPartialCudaGraph:
         )
 
     def create_test_args(
-        self, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_size, **kwargs
+        self, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, ep_size, **kwargs
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -917,7 +1185,7 @@ class TestPartialCudaGraph:
 
         # CUDA graph settings
         args.cuda_graph_impl = cuda_graph_impl
-        args.cuda_graph_scope = cuda_graph_scope
+        args.cuda_graph_modules = cuda_graph_modules
         args.cuda_graph_warmup_steps = cuda_graph_warmup_steps
 
         # fp8 settings
@@ -948,11 +1216,11 @@ class TestPartialCudaGraph:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def _run_test_helper(
-        self, ep_size, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, **kwargs
+        self, ep_size, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, **kwargs
     ):
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
-            cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_size, **kwargs
+            cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, ep_size, **kwargs
         )
 
         set_args(args)
@@ -1057,20 +1325,20 @@ class TestPartialCudaGraph:
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
 
         loss_list_ref = self._run_test_helper(ep_size, "none", None, 0, **extra_kwargs)
-        for cuda_graph_scope in [
+        for cuda_graph_modules in [
             None,
-            [CudaGraphScope.attn],
-            [CudaGraphScope.moe],
-            [CudaGraphScope.mlp, CudaGraphScope.moe_router],
+            [CudaGraphModule.attn],
+            [CudaGraphModule.moe],
+            [CudaGraphModule.mlp, CudaGraphModule.moe_router],
             [
-                CudaGraphScope.attn,
-                CudaGraphScope.mlp,
-                CudaGraphScope.moe_router,
-                CudaGraphScope.moe_preprocess,
+                CudaGraphModule.attn,
+                CudaGraphModule.mlp,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
             ],
         ]:
             if (moe_dropless_dispatcher or moe_dispatcher_type == "hybridep") and (
-                cuda_graph_scope is None or CudaGraphScope.moe in cuda_graph_scope
+                cuda_graph_modules is None or CudaGraphModule.moe in cuda_graph_modules
             ):
                 # Dropless MoE or Hybrid EP doesn't work with "moe" scope cudagraph. Skip.
                 continue
@@ -1078,7 +1346,7 @@ class TestPartialCudaGraph:
             loss_list = self._run_test_helper(
                 ep_size,
                 "transformer_engine",
-                cuda_graph_scope,
+                cuda_graph_modules,
                 cuda_graph_warmup_steps,
                 **extra_kwargs,
             )

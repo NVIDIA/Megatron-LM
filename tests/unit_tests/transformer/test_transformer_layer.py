@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+import gc
+
 import pytest
 import torch
 
@@ -8,14 +10,22 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    HAVE_TE,
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
     get_transformer_layer_offset,
 )
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -313,3 +323,73 @@ def get_tensor_shapes_for_tp(transformer_config, tp_size):
         'self_attention.linear_qkv.weight': (hs * 3 // tp_size, hs),
         'self_attention.linear_qkv.bias': (hs * 3 // tp_size,),
     }
+
+
+def _make_cuda_graph_gpt_block(**config_kwargs):
+    cfg = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        **config_kwargs,
+    )
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    return TransformerBlock(cfg, get_gpt_layer_with_transformer_engine_spec())
+
+
+def _reset_cudagraph_state():
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+    torch.cuda.synchronize()
+
+
+def _all_layers_have_manager(block) -> bool:
+    return all(hasattr(layer, 'cudagraph_manager') for layer in block.layers)
+
+
+def _no_layers_have_manager(block) -> bool:
+    return all(not hasattr(layer, 'cudagraph_manager') for layer in block.layers)
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="CUDA graph tests require TransformerEngine >= 1.5",
+)
+class TestTransformerLayerCudaGraphManagers:
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _reset_cudagraph_state()
+        gc.collect()
+
+    def test_empty_scope_transformer_layer_has_per_layer_manager(self):
+        block = _make_cuda_graph_gpt_block(
+            cuda_graph_impl='local', cuda_graph_modules=[], inference_cuda_graph_scope='layer'
+        )
+        assert _all_layers_have_manager(block)
+        _reset_cudagraph_state()
+
+    def test_empty_scope_transformer_block_no_per_layer_manager(self):
+        block = _make_cuda_graph_gpt_block(
+            cuda_graph_impl='local', cuda_graph_modules=[], inference_cuda_graph_scope='block'
+        )
+        assert _no_layers_have_manager(block)
+        _reset_cudagraph_state()
+
+    def test_deprecated_full_iteration_inference_scope_string_matches_new_granularity(self):
+        with pytest.warns(
+            DeprecationWarning, match="cuda_graph_modules 'full_iteration_inference' is deprecated"
+        ):
+            block = _make_cuda_graph_gpt_block(
+                cuda_graph_impl='local', cuda_graph_modules='full_iteration_inference'
+            )
+        assert block.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert block.config.cuda_graph_modules == []
+        assert _no_layers_have_manager(block)
+        _reset_cudagraph_state()
