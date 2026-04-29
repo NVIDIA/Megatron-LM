@@ -12,7 +12,6 @@ import warnings
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
@@ -67,6 +66,7 @@ from megatron.core.utils import (
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator
+from .step_retirement import StepRetirementService
 
 try:
     from tqdm import tqdm
@@ -336,6 +336,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.async_overlap_debug_counters = AsyncOverlapDebugCounters(
             queue_depth=getattr(self, "async_overlap_queue_depth", 1)
         )
+        self.step_retirement_service = StepRetirementService(self)
 
         # Coordinator state.
         self.use_coordinator = False
@@ -748,6 +749,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        self.step_retirement_service.drain_for_suspend()
+
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
@@ -919,6 +922,7 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
+        self.step_retirement_service.drain_for_request_reuse(request_id)
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
@@ -1795,227 +1799,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
-        # Increment finished_request_count.
-        step_id = context_state.get("dynamic_step_id", self._current_dynamic_step_id)
-        output_retirement_range = self._step_nvtx_label("output_retirement", step_id)
-        nvtx_range_push(output_retirement_range)
-        cuda_graph_request_count = None
-
-        if step_result is not None:
-            active_request_ids = step_result["active_request_ids"]
-            finished_request_ids = step_result["finished_request_ids"]
-            newly_paused_request_ids = step_result.get("newly_paused_request_ids")
-            evict_request_ids = step_result.get("evict_request_ids")
-            sample = step_result["sample"]
-            accepted_tokens = step_result["accepted_tokens"]
-            log_probs = step_result["log_probs"]
-            top_n_logprobs = step_result.get("top_n_logprobs", None)
-            routing_indices_per_request = step_result.get("routing_indices_per_request", None)
-            cuda_graph_request_count = step_result["cuda_graph_request_count"]
-
-            # Add paused events.
-            if newly_paused_request_ids is not None and self.track_paused_request_events:
-                newly_paused_request_ids = newly_paused_request_ids.tolist()
-                [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
-
-            # Process finished requests (adds FINISH events and returns records).
-            post_process_range = self._step_nvtx_label("post_process_requests", step_id)
-            nvtx_range_push(post_process_range)
-            (active_request_ids, finished_request_records) = self.post_process_requests(
-                active_request_ids,
-                finished_request_ids,
-                evict_request_ids,
-                step_time,
-                sample,
-                accepted_tokens,
-                log_probs,
-                top_n_logprobs,
-                routing_indices_per_request,
-                pre_fwd_active_token_count=context_state.get("active_token_count"),
-                pre_fwd_step_count=context_state.get("step_count"),
-            )
-            nvtx_range_pop(post_process_range)
-
-        else:
-            active_request_ids: list[int] = []
-            finished_request_records: list[DynamicInferenceRequestRecord] = []
-
-        # Failed requests. Status and events were already set in _handle_failed_request;
-        # here we just clean up the entry and include it in finished_request_records.
-        for failed_request_id in self.failed_request_ids:
-            failed_entry = self.requests.pop(failed_request_id)
-            finished_request_records.append(failed_entry.record)
-            assert (
-                failed_entry.future.done()
-            ), f"Failed request {failed_request_id} future has not been properly resolved."
-        self.failed_request_ids.clear()
-
-        nvtx_range_pop(output_retirement_range)
-
-        # Detokenize all finished requests if not using
-        # the coordinator. Otherwise, the coordinator will
-        # overlap detokenization with the engine.
-        if not self.use_coordinator:
-            detokenization_range = self._step_nvtx_label("detokenization", step_id)
-            nvtx_range_push(detokenization_range)
-            for record in finished_request_records:
-                for request in record.requests:
-                    if request.prompt is None:
-                        request.prompt = self.controller.detokenize(
-                            self.controller.tokenizer,
-                            request.prompt_tokens.tolist(),
-                            remove_EOD=False,
-                        )
-                    request.generated_text = self.controller.detokenize(
-                        self.controller.tokenizer,
-                        request.generated_tokens,
-                        remove_EOD=not request.sampling_params.detokenize_stop_sequence,
-                    )
-            nvtx_range_pop(detokenization_range)
-
-        # Handle necessary ZMQ DP coordinator communication.
-        # Failed request replies were already sent in _handle_failed_request,
-        # so only send completed records here.
-        if self.use_coordinator and self.is_mp_coordinator:
-            records_to_send = [
-                r for r in finished_request_records if r.requests[-1].status != Status.FAILED
-            ]
-            if records_to_send:
-                coordinator_range = self._step_nvtx_label("coordinator_send", step_id)
-                nvtx_range_push(coordinator_range)
-                payload = msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
-                    use_bin_type=True,
-                )
-                self.socket_for_receiving_requests.send(payload)
-                nvtx_range_pop(coordinator_range)
-
-        # Drain prefix cache hit counters from context into engine accumulators.
-        if self.context.enable_prefix_caching:
-            self._prefix_cache_hits += self.context.prefix_cache_hits
-            self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
-            self.context.prefix_cache_hits = 0
-            self.context.prefix_cache_blocks_matched = 0
-
-        # Log KV cache utilization stats to W&B
-        if context_state["kv_stats"] is not None:
-            # Prepare metrics dictionary with all stats
-            # Use 'inference/' prefix for all metrics to separate from training metrics
-            metrics = {
-                'inference/inference_step': int(
-                    self.inference_step_offset + int(self.context.step_count)
-                ),
-                'inference/step_time_s': float(step_time),
-                'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
-                'inference/total_requests_dict_size': int(len(self.requests)),
-            }
-            # Add KV stats with inference/ prefix
-            # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
-            for key, value in context_state["kv_stats"].items():
-                if 'utilization' in key:
-                    # Convert to percentage (0-100) and group under kvcache_utilization
-                    metrics[f'inference/{key}'] = float(value * 100.0)
-                else:
-                    metrics[f'inference/{key}'] = value
-
-            # Add speculative decoding acceptance metrics.
-            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
-                acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
-                metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
-                metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
-                metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
-                metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
-
-            # Add prefix caching metrics.
-            if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
-                metrics['inference/prefix_cache_hits'] = int(self._prefix_cache_hits)
-                metrics['inference/prefix_cache_blocks_matched'] = int(
-                    self._prefix_cache_blocks_matched
-                )
-
-            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
-                self.metrics_writer.log(metrics, commit=True)
-            else:
-                raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
-
-        # Print context state.
-        if (
-            self.logging_step_interval > 0
-            and self.context.step_count % self.logging_step_interval == 0
-        ):
-            mem = torch.cuda.memory_stats()
-            step_type = "decode" if context_state["is_decode_only"] else "non-decode"
-            output_str = (
-                "* rank %d | step %d | %s ... time: %.3f ms%s ... "
-                "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
-                "blocks: a %d/%d, p %d/%d ... "
-                "mem: tensors %d, alloc %.1f gb, res %.1f gb."
-                % (
-                    self.rank,
-                    self.context.step_count,
-                    datetime.now().strftime("%H:%M:%S"),
-                    step_time * 1000,
-                    (
-                        " [%s + real config %s + cuda graph %s]"
-                        % (
-                            step_type,
-                            self.context.batch_dimensions,
-                            (
-                                "OFF"
-                                if not self.context.using_cuda_graph_this_step()
-                                else self.context.padded_batch_dimensions
-                            ),
-                        )
-                    ),
-                    context_state["total_request_count"] - context_state["paused_request_count"],
-                    context_state["max_requests"],
-                    context_state["paused_request_count"],
-                    context_state["waiting_request_count"],
-                    context_state["finished_request_count"],
-                    context_state["evicted_request_count"],
-                    context_state["total_active_used_blocks"],
-                    context_state["total_active_block_count"],
-                    context_state["total_paused_used_blocks"],
-                    context_state["total_paused_block_count"],
-                    mem["allocation.all.current"],
-                    mem["allocated_bytes.all.current"] / (1024**3),
-                    mem["reserved_bytes.all.current"] / (1024**3),
-                )
-            )
-            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
-                spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
-                output_str += " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
-                    spec_rate,
-                    self._spec_tokens_accepted,
-                    self._spec_tokens_proposed,
-                    self._spec_steps,
-                )
-            if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
-                output_str += " ... prefix cache: %d hits, %d blocks matched" % (
-                    self._prefix_cache_hits,
-                    self._prefix_cache_blocks_matched,
-                )
-            if context_state["is_decode_only"]:
-                output_str = f"\033[94m{output_str}\033[0m"
-            logging.info(output_str)
-
-            # Reset speculative decoding accumulators after both wandb and console logging.
-            if self.num_speculative_tokens > 0:
-                self._spec_tokens_proposed = 0
-                self._spec_tokens_accepted = 0
-                self._spec_steps = 0
-
-            # Reset prefix caching accumulators after both wandb and console logging.
-            if self.context.enable_prefix_caching:
-                self._prefix_cache_hits = 0
-                self._prefix_cache_blocks_matched = 0
-
-        return {
-            "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
-            "step_time": step_time,
-            "cuda_graph_request_count": cuda_graph_request_count,
-        }
+        return self.step_retirement_service.retire_step(step_result, context_state, step_time)
 
     async def async_step(
         self,
@@ -2258,6 +2042,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
+        self.step_retirement_service.drain_for_shutdown()
 
         # Cleanup the request futures.
         for entry in self.requests.values():
