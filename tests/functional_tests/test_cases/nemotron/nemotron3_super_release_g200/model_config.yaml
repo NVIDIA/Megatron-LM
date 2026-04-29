@@ -131,7 +131,7 @@ MODEL_ARGS:
   --async-save: true
   --use-persistent-ckpt-worker: true
   --save-interval: 100
-  --save-retain-interval: 500
+  --save-retain-interval: 2000
 
   # Validation args
   --eval-interval: 100
