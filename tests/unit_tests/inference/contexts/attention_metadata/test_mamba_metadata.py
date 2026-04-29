@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
+from megatron.core.inference.contexts.gpu_view import ContextGPUView
 
 
 class TestMambaMetadata:
@@ -541,3 +542,55 @@ class TestMambaMetadata:
 
         metadata.release_deferred_slots_for_snapshot(2)
         assert metadata.mamba_state_free_slot_count == 3
+
+    @pytest.mark.internal
+    def test_load_from_cpu_keeps_per_snapshot_gpu_views_distinct(self):
+        """Mamba load_from_cpu stores distinct snapshot-bound GPU views and scratch buffers."""
+        metadata = MambaMetadata(max_requests=4, max_tokens=16, mamba_chunk_size=4, d_conv=4)
+        first_view = ContextGPUView(
+            max_requests=4,
+            max_tokens=16,
+            max_kv_blocks=8,
+            device=torch.cuda.current_device(),
+            max_mamba_chunks=8,
+        )
+        second_view = ContextGPUView(
+            max_requests=4,
+            max_tokens=16,
+            max_kv_blocks=8,
+            device=torch.cuda.current_device(),
+            max_mamba_chunks=8,
+        )
+
+        load_args = {
+            "padded_decode_count": 2,
+            "padded_prefill_count": 1,
+            "padded_token_count": 4,
+            "real_prefill_count": 1,
+            "padded_max_chunks": 2,
+            "cu_seqlens_list": [0, 4],
+            "real_prefill_token_count": 4,
+            "intermediate_offsets_gpu": None,
+            "intermediate_counts_gpu": None,
+            "decode_prefill_0": 2,
+            "decode_prefill_1": 4,
+        }
+
+        first = metadata.load_from_cpu(load_args, gpu_view=first_view, snapshot_slot_id=0)
+        second = metadata.load_from_cpu(load_args, gpu_view=second_view, snapshot_slot_id=1)
+
+        assert first.batch_indices_decode.data_ptr() != second.batch_indices_decode.data_ptr()
+        assert first.batch_indices_prefill.data_ptr() != second.batch_indices_prefill.data_ptr()
+        assert first.device_decode_prefill.data_ptr() != second.device_decode_prefill.data_ptr()
+        assert (
+            first.intermediate_chunk_indices.data_ptr()
+            != second.intermediate_chunk_indices.data_ptr()
+        )
+
+        metadata.activate_snapshot_state(0)
+        assert metadata.batch_indices_decode is first.batch_indices_decode
+        assert metadata.device_decode_prefill is first.device_decode_prefill
+
+        metadata.activate_snapshot_state(1)
+        assert metadata.batch_indices_decode is second.batch_indices_decode
+        assert metadata.device_decode_prefill is second.device_decode_prefill

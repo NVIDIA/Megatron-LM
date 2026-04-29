@@ -1,7 +1,22 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
 import torch
 
 from .metadata_base import MetadataBase
+
+
+@dataclass(frozen=True)
+class MHAMetadataSnapshot:
+    """Per-snapshot MHA launch metadata bound to one GPU view."""
+
+    gpu_view: Any
+    state_data: Dict[str, Any]
+    padded_active_request_count: int
+    max_seqlen_q: int
+    max_seqlen_k: int
+    padded_batch_dimensions: Optional[Any] = None
 
 
 class MHAMetadata(MetadataBase):
@@ -30,6 +45,8 @@ class MHAMetadata(MetadataBase):
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
         self.state_data = {}
+        self.snapshot_state = None
+        self._snapshot_states = {}
         # Set by bind_gpu_buffers(); references shared views in ContextGPUView._buf.
         self._gpu_view = None
 
@@ -42,20 +59,20 @@ class MHAMetadata(MetadataBase):
         """
         self._gpu_view = gpu_view
 
-    def set_state_data(
-        self, padded_active_request_count: int, max_seqlen_q: int, max_seqlen_k: int
-    ) -> None:
-        """Build ``state_data`` slices into the bound GPU buffers.
-
-        Called once per step from ``transfer_bookkeeping_to_gpu`` after the
-        coalesced H2D copy. No ``.copy_()`` calls, no kernel launches.
-        """
-        assert self._gpu_view is not None, "bind_gpu_buffers() must be called first"
+    def make_snapshot_state(
+        self,
+        padded_active_request_count: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        *,
+        gpu_view=None,
+        padded_batch_dimensions=None,
+    ) -> MHAMetadataSnapshot:
+        """Build immutable per-step slices into one snapshot GPU view."""
+        v = gpu_view if gpu_view is not None else self._gpu_view
+        assert v is not None, "bind_gpu_buffers() must be called first"
         n = padded_active_request_count
-        v = self._gpu_view
-        self._max_seqlen_q = max_seqlen_q
-        self._max_seqlen_k = max_seqlen_k
-        self.state_data = {
+        state_data = {
             "query_lengths": v.mha_query_lengths[:n],
             "cu_query_seq_lengths": v.mha_cu_query_seq_lengths[: n + 1],
             "cu_kv_seq_lengths": v.mha_cu_kv_seq_lengths[: n + 1],
@@ -64,6 +81,55 @@ class MHAMetadata(MetadataBase):
             "max_seqlen_q": max_seqlen_q,
             "max_seqlen_k": max_seqlen_k,
         }
+        return MHAMetadataSnapshot(
+            gpu_view=v,
+            state_data=state_data,
+            padded_active_request_count=n,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            padded_batch_dimensions=padded_batch_dimensions,
+        )
+
+    def activate_snapshot_state(self, snapshot_or_slot_id) -> MHAMetadataSnapshot:
+        """Install a stored MHA snapshot state as the active layer-facing view."""
+        if isinstance(snapshot_or_slot_id, MHAMetadataSnapshot):
+            snapshot = snapshot_or_slot_id
+        else:
+            snapshot = self._snapshot_states[int(snapshot_or_slot_id)]
+
+        self._gpu_view = snapshot.gpu_view
+        self._max_seqlen_q = snapshot.max_seqlen_q
+        self._max_seqlen_k = snapshot.max_seqlen_k
+        self.state_data = snapshot.state_data
+        self.snapshot_state = snapshot
+        return snapshot
+
+    def set_state_data(
+        self,
+        padded_active_request_count: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        *,
+        gpu_view=None,
+        snapshot_slot_id: Optional[int] = None,
+        padded_batch_dimensions=None,
+    ) -> MHAMetadataSnapshot:
+        """Build ``state_data`` slices into the bound GPU buffers.
+
+        Called once per step from ``transfer_bookkeeping_to_gpu`` after the
+        coalesced H2D copy. No ``.copy_()`` calls, no kernel launches.
+        """
+        snapshot = self.make_snapshot_state(
+            padded_active_request_count,
+            max_seqlen_q,
+            max_seqlen_k,
+            gpu_view=gpu_view,
+            padded_batch_dimensions=padded_batch_dimensions,
+        )
+        if snapshot_slot_id is not None:
+            self._snapshot_states[int(snapshot_slot_id)] = snapshot
+        self.activate_snapshot_state(snapshot)
+        return snapshot
 
     def reset(self):
         """Reset the metadata for the next batch.
@@ -74,6 +140,9 @@ class MHAMetadata(MetadataBase):
         """
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
+        self.state_data = {}
+        self.snapshot_state = None
+        self._snapshot_states.clear()
 
 
 class GraphedMHAMetadata(MHAMetadata):

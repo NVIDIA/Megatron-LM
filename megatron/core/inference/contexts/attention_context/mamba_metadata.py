@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Dict, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 
@@ -9,6 +10,29 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
 from megatron.core.inference.contexts.step_journal import ResourceReservation
+
+
+@dataclass(frozen=True)
+class MambaMetadataSnapshot:
+    """Per-snapshot Mamba metadata views bound to one GPU view."""
+
+    gpu_view: Any
+    batch_indices_decode: Optional[torch.Tensor] = None
+    batch_indices_prefill: Optional[torch.Tensor] = None
+    cu_seqlens: Optional[torch.Tensor] = None
+    seq_idx: Optional[torch.Tensor] = None
+    device_decode_prefill: Optional[torch.Tensor] = None
+    cu_chunk_seqlens: Optional[torch.Tensor] = None
+    last_chunk_indices: Optional[torch.Tensor] = None
+    seq_idx_for_varlen: Optional[torch.Tensor] = None
+    conv_seq_idx: Optional[torch.Tensor] = None
+    conv_seq_start: Optional[torch.Tensor] = None
+    real_prefill_token_count: int = 0
+    cu_seqlens_list: Sequence[int] = (0,)
+    intermediate_chunk_indices: Optional[torch.Tensor] = None
+    intermediate_abs_positions: Optional[torch.Tensor] = None
+    intermediate_count: int = 0
+    per_request_intermediate_counts: Sequence[int] = ()
 
 
 class MambaMetadata:
@@ -121,6 +145,11 @@ class MambaMetadata:
         # without a context).
         self._cpu_bufs = None
         self._gpu_view = None
+        self.snapshot_state = None
+        self._snapshot_states: Dict[int, MambaMetadataSnapshot] = {}
+        self._snapshot_device_decode_prefill_buffers: Dict[int, torch.Tensor] = {}
+        self._snapshot_intermediate_chunk_indices_buffers: Dict[int, torch.Tensor] = {}
+        self._snapshot_intermediate_abs_positions_buffers: Dict[int, torch.Tensor] = {}
 
         self.reset_varlen_metadata()
 
@@ -137,6 +166,34 @@ class MambaMetadata:
     def bind_gpu_buffers(self, gpu_view) -> None:
         """Attach shared GPU views from the context's :class:`ContextGPUView`."""
         self._gpu_view = gpu_view
+
+    def _device_decode_prefill_buffer_for_snapshot(
+        self, snapshot_slot_id: Optional[int]
+    ) -> torch.Tensor:
+        if snapshot_slot_id is None:
+            return self._device_decode_prefill_buffer
+        slot_id = int(snapshot_slot_id)
+        if slot_id not in self._snapshot_device_decode_prefill_buffers:
+            self._snapshot_device_decode_prefill_buffers[slot_id] = torch.zeros_like(
+                self._device_decode_prefill_buffer
+            )
+        return self._snapshot_device_decode_prefill_buffers[slot_id]
+
+    def _intermediate_buffers_for_snapshot(self, snapshot_slot_id: Optional[int]):
+        if snapshot_slot_id is None:
+            return self._intermediate_chunk_indices_buffer, self._intermediate_abs_positions_buffer
+        slot_id = int(snapshot_slot_id)
+        if slot_id not in self._snapshot_intermediate_chunk_indices_buffers:
+            self._snapshot_intermediate_chunk_indices_buffers[slot_id] = torch.zeros_like(
+                self._intermediate_chunk_indices_buffer
+            )
+            self._snapshot_intermediate_abs_positions_buffers[slot_id] = torch.full_like(
+                self._intermediate_abs_positions_buffer, self.d_conv
+            )
+        return (
+            self._snapshot_intermediate_chunk_indices_buffers[slot_id],
+            self._snapshot_intermediate_abs_positions_buffers[slot_id],
+        )
 
     def reset(self) -> None:
         """
@@ -155,6 +212,7 @@ class MambaMetadata:
         self._committed_reservations.clear()
         self._rolled_back_reservations.clear()
         self._deferred_snapshot_slot_releases.clear()
+        self._snapshot_states.clear()
         self._next_reservation_id = 0
 
     def reset_varlen_metadata(self) -> None:
@@ -181,6 +239,7 @@ class MambaMetadata:
         self.intermediate_abs_positions = None
         self.intermediate_count = 0
         self.per_request_intermediate_counts = []
+        self.snapshot_state = None
 
     def update(
         self,
@@ -374,7 +433,9 @@ class MambaMetadata:
         intermediate_counts_gpu: Optional[torch.Tensor],
         real_prefill_count: int,
         cu_seqlens_gpu: Optional[torch.Tensor] = None,
-    ) -> None:
+        chunk_indices_buffer: Optional[torch.Tensor] = None,
+        abs_positions_buffer: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
         """Precompute intermediate extraction metadata for CUDA graph compatibility.
 
         Converts per-request token offsets to chunk indices and absolute
@@ -396,6 +457,10 @@ class MambaMetadata:
         max_count = self.max_intermediate_count
         if cu_seqlens_gpu is None:
             cu_seqlens_gpu = self._cu_seqlens_buffer
+        if chunk_indices_buffer is None:
+            chunk_indices_buffer = self._intermediate_chunk_indices_buffer
+        if abs_positions_buffer is None:
+            abs_positions_buffer = self._intermediate_abs_positions_buffer
 
         if intermediate_offsets_gpu is not None and real_prefill_count > 0:
             # counts_list is CPU-cheap (source is already CPU from MambaSlotAllocator).
@@ -446,39 +511,44 @@ class MambaMetadata:
                 valid_abs_positions = abs_positions_2d[valid_mask]
 
                 real_count = valid_chunk_indices.numel()
-                self._intermediate_chunk_indices_buffer[:real_count] = valid_chunk_indices
-                self._intermediate_abs_positions_buffer[:real_count] = valid_abs_positions.to(
-                    torch.int32
-                )
+                chunk_indices_buffer[:real_count] = valid_chunk_indices
+                abs_positions_buffer[:real_count] = valid_abs_positions.to(torch.int32)
 
                 # Pad unused slots with safe defaults for CUDA graph replay:
                 # - chunk_indices=0: reads from chunk 0 (always exists), output ignored
                 # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1],
                 #   which are within bounds and produce a valid but unused state
                 if real_count < max_count:
-                    self._intermediate_chunk_indices_buffer[real_count:].fill_(0)
-                    self._intermediate_abs_positions_buffer[real_count:].fill_(self.d_conv)
+                    chunk_indices_buffer[real_count:].fill_(0)
+                    abs_positions_buffer[real_count:].fill_(self.d_conv)
 
                 self.intermediate_count = real_count
                 self.per_request_intermediate_counts = counts_list
             else:
                 # All counts are 0
-                self._intermediate_chunk_indices_buffer.fill_(0)
-                self._intermediate_abs_positions_buffer.fill_(self.d_conv)
+                chunk_indices_buffer.fill_(0)
+                abs_positions_buffer.fill_(self.d_conv)
                 self.intermediate_count = 0
                 self.per_request_intermediate_counts = counts_list
 
-            self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
-            self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            self.intermediate_chunk_indices = chunk_indices_buffer[:max_count]
+            self.intermediate_abs_positions = abs_positions_buffer[:max_count]
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
             # (same rationale as padding comment above)
-            self._intermediate_chunk_indices_buffer.fill_(0)
-            self._intermediate_abs_positions_buffer.fill_(self.d_conv)
+            chunk_indices_buffer.fill_(0)
+            abs_positions_buffer.fill_(self.d_conv)
             self.intermediate_count = 0
             self.per_request_intermediate_counts = []
-            self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
-            self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            self.intermediate_chunk_indices = chunk_indices_buffer[:max_count]
+            self.intermediate_abs_positions = abs_positions_buffer[:max_count]
+
+        return {
+            "intermediate_chunk_indices": self.intermediate_chunk_indices,
+            "intermediate_abs_positions": self.intermediate_abs_positions,
+            "intermediate_count": self.intermediate_count,
+            "per_request_intermediate_counts": tuple(self.per_request_intermediate_counts),
+        }
 
     def compute_cpu_metadata(
         self,
@@ -645,7 +715,36 @@ class MambaMetadata:
 
         return result
 
-    def load_from_cpu(self, d: dict) -> None:
+    def activate_snapshot_state(self, snapshot_or_slot_id) -> MambaMetadataSnapshot:
+        """Install one stored Mamba metadata snapshot as the active layer view."""
+        if isinstance(snapshot_or_slot_id, MambaMetadataSnapshot):
+            snapshot = snapshot_or_slot_id
+        else:
+            snapshot = self._snapshot_states[int(snapshot_or_slot_id)]
+
+        self._gpu_view = snapshot.gpu_view
+        self.batch_indices_decode = snapshot.batch_indices_decode
+        self.batch_indices_prefill = snapshot.batch_indices_prefill
+        self.cu_seqlens = snapshot.cu_seqlens
+        self.seq_idx = snapshot.seq_idx
+        self.device_decode_prefill = snapshot.device_decode_prefill
+        self.cu_chunk_seqlens = snapshot.cu_chunk_seqlens
+        self.last_chunk_indices = snapshot.last_chunk_indices
+        self.seq_idx_for_varlen = snapshot.seq_idx_for_varlen
+        self.conv_seq_idx = snapshot.conv_seq_idx
+        self.conv_seq_start = snapshot.conv_seq_start
+        self.real_prefill_token_count = snapshot.real_prefill_token_count
+        self.cu_seqlens_list = list(snapshot.cu_seqlens_list)
+        self.intermediate_chunk_indices = snapshot.intermediate_chunk_indices
+        self.intermediate_abs_positions = snapshot.intermediate_abs_positions
+        self.intermediate_count = snapshot.intermediate_count
+        self.per_request_intermediate_counts = list(snapshot.per_request_intermediate_counts)
+        self.snapshot_state = snapshot
+        return snapshot
+
+    def load_from_cpu(
+        self, d: dict, *, gpu_view=None, snapshot_slot_id: Optional[int] = None
+    ) -> MambaMetadataSnapshot:
         """Point state attributes at the freshly-transferred shared GPU views.
 
         No H2D copies happen here: the 9 Mamba fields were transferred as
@@ -656,44 +755,97 @@ class MambaMetadata:
         Args:
             d: Dict returned by compute_cpu_metadata().
         """
-        assert self._gpu_view is not None, "bind_gpu_buffers() must be called first"
-        v = self._gpu_view
+        v = gpu_view if gpu_view is not None else self._gpu_view
+        assert v is not None, "bind_gpu_buffers() must be called first"
 
         padded_decode_count = d["padded_decode_count"]
         padded_prefill_count = d["padded_prefill_count"]
         padded_token_count = d["padded_token_count"]
         real_prefill_count = d["real_prefill_count"]
 
+        batch_indices_decode = None
+        batch_indices_prefill = None
+        cu_seqlens = None
+        seq_idx = None
+        device_decode_prefill = None
+        cu_chunk_seqlens = None
+        last_chunk_indices = None
+        seq_idx_for_varlen = None
+        conv_seq_idx = None
+        conv_seq_start = None
+        real_prefill_token_count = 0
+        cu_seqlens_list = (0,)
+        intermediate_state = {
+            "intermediate_chunk_indices": None,
+            "intermediate_abs_positions": None,
+            "intermediate_count": 0,
+            "per_request_intermediate_counts": (),
+        }
+
         if padded_decode_count > 0:
-            self.batch_indices_decode = v.mamba_batch_indices_decode[:padded_decode_count]
+            batch_indices_decode = v.mamba_batch_indices_decode[:padded_decode_count]
 
         if padded_prefill_count > 0:
-            self.batch_indices_prefill = v.mamba_batch_indices_prefill[:padded_prefill_count]
-            self.seq_idx = v.mamba_seq_idx[:, :padded_token_count]
-            self.cu_seqlens = v.mamba_cu_seqlens[: padded_prefill_count + 1]
-            self.cu_seqlens_list = d["cu_seqlens_list"]
-            self.real_prefill_token_count = d["real_prefill_token_count"]
+            batch_indices_prefill = v.mamba_batch_indices_prefill[:padded_prefill_count]
+            seq_idx = v.mamba_seq_idx[:, :padded_token_count]
+            cu_seqlens = v.mamba_cu_seqlens[: padded_prefill_count + 1]
+            cu_seqlens_list = tuple(d["cu_seqlens_list"])
+            real_prefill_token_count = d["real_prefill_token_count"]
 
             padded_max_chunks = d["padded_max_chunks"]
-            self.cu_chunk_seqlens = v.mamba_cu_chunk_seqlens[: padded_max_chunks + 1]
-            self.last_chunk_indices = v.mamba_last_chunk_indices[:padded_prefill_count]
-            self.seq_idx_for_varlen = v.mamba_seq_idx_for_varlen[:padded_max_chunks]
-            self.conv_seq_idx = v.mamba_conv_seq_idx[:padded_token_count]
-            self.conv_seq_start = v.mamba_conv_seq_start[:padded_token_count]
+            cu_chunk_seqlens = v.mamba_cu_chunk_seqlens[: padded_max_chunks + 1]
+            last_chunk_indices = v.mamba_last_chunk_indices[:padded_prefill_count]
+            seq_idx_for_varlen = v.mamba_seq_idx_for_varlen[:padded_max_chunks]
+            conv_seq_idx = v.mamba_conv_seq_idx[:padded_token_count]
+            conv_seq_start = v.mamba_conv_seq_start[:padded_token_count]
 
             # Intermediate metadata reads from the just-transferred cu_seqlens
             # to compute chunk indices & absolute positions for state extraction.
-            self._update_intermediate_metadata(
+            chunk_indices_buffer, abs_positions_buffer = self._intermediate_buffers_for_snapshot(
+                snapshot_slot_id
+            )
+            intermediate_state = self._update_intermediate_metadata(
                 d["intermediate_offsets_gpu"],
                 d["intermediate_counts_gpu"],
                 real_prefill_count,
                 cu_seqlens_gpu=v.mamba_cu_seqlens,
+                chunk_indices_buffer=chunk_indices_buffer,
+                abs_positions_buffer=abs_positions_buffer,
             )
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
-            self._device_decode_prefill_buffer[0] = d["decode_prefill_0"]
-            self._device_decode_prefill_buffer[1] = d["decode_prefill_1"]
-            self.device_decode_prefill = self._device_decode_prefill_buffer
+            device_decode_prefill_buffer = self._device_decode_prefill_buffer_for_snapshot(
+                snapshot_slot_id
+            )
+            device_decode_prefill_buffer[0] = d["decode_prefill_0"]
+            device_decode_prefill_buffer[1] = d["decode_prefill_1"]
+            device_decode_prefill = device_decode_prefill_buffer
+
+        snapshot = MambaMetadataSnapshot(
+            gpu_view=v,
+            batch_indices_decode=batch_indices_decode,
+            batch_indices_prefill=batch_indices_prefill,
+            cu_seqlens=cu_seqlens,
+            seq_idx=seq_idx,
+            device_decode_prefill=device_decode_prefill,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            seq_idx_for_varlen=seq_idx_for_varlen,
+            conv_seq_idx=conv_seq_idx,
+            conv_seq_start=conv_seq_start,
+            real_prefill_token_count=real_prefill_token_count,
+            cu_seqlens_list=cu_seqlens_list,
+            intermediate_chunk_indices=intermediate_state["intermediate_chunk_indices"],
+            intermediate_abs_positions=intermediate_state["intermediate_abs_positions"],
+            intermediate_count=intermediate_state["intermediate_count"],
+            per_request_intermediate_counts=intermediate_state[
+                "per_request_intermediate_counts"
+            ],
+        )
+        if snapshot_slot_id is not None:
+            self._snapshot_states[int(snapshot_slot_id)] = snapshot
+        self.activate_snapshot_state(snapshot)
+        return snapshot
 
     def allocate_slot(self) -> Optional[int]:
         """

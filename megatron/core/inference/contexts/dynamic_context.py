@@ -1134,6 +1134,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+        self._snapshot_metadata_by_slot = {}
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
         # only one is active per step, so sharing storage is safe.
@@ -2324,6 +2325,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
         snapshot_slot = self._snapshot_slot_from_handle(snapshot_slot_handle)
+        snapshot_slot_id = snapshot_slot.slot_id if snapshot_slot is not None else None
         if snapshot_slot is not None:
             self._bind_gpu_view(snapshot_slot.gpu_view)
             source_buffer = snapshot_slot.cpu_mirror
@@ -2342,7 +2344,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         with torch.cuda.stream(self.gpu_bookkeeping_stream):
             self.gpu_view._buf.copy_(source_buffer, non_blocking=True)
             if pending_mamba_transfer is not None:
-                self.mamba_metadata.load_from_cpu(pending_mamba_transfer)
+                mamba_snapshot_state = self.mamba_metadata.load_from_cpu(
+                    pending_mamba_transfer,
+                    gpu_view=self.gpu_view,
+                    snapshot_slot_id=snapshot_slot_id,
+                )
+            else:
+                mamba_snapshot_state = None
             ready_event.record(self.gpu_bookkeeping_stream)
         torch.cuda.current_stream().wait_event(ready_event)
 
@@ -2355,11 +2363,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mha_transfer') and self._pending_mha_transfer is not None:
             mha = self.active_attn_metadata["mha_metadata"]
             d = self._pending_mha_transfer
-            mha.set_state_data(
+            mha_snapshot_state = mha.set_state_data(
                 padded_active_request_count=d["padded_active_request_count"],
                 max_seqlen_q=d["max_seqlen_q"],
                 max_seqlen_k=d["max_seqlen_k"],
+                gpu_view=self.gpu_view,
+                snapshot_slot_id=snapshot_slot_id,
+                padded_batch_dimensions=self.padded_batch_dimensions,
             )
+            if snapshot_slot is not None:
+                self._snapshot_metadata_by_slot[snapshot_slot.slot_id] = {
+                    "mha_metadata": mha_snapshot_state,
+                    "mamba_metadata": mamba_snapshot_state,
+                    "padded_batch_dimensions": self.padded_batch_dimensions,
+                    "padded_active_request_count": self.padded_active_request_count,
+                }
             self._pending_mha_transfer = None
 
         # Mamba metadata: GPU-side views were loaded on gpu_bookkeeping_stream.
