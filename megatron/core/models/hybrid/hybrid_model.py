@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -43,10 +44,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     Args:
         config (TransformerConfig): Model config
-        hybrid_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
+        hybrid_stack_spec (ModuleSpec, optional): Specifies the modules to use for the various
+            layer types. Required when using ``hybrid_layer_pattern`` (the legacy string DSL).
+            When using a compiled :class:`HybridModelConfig` recipe through the internal
+            ``layer_type_list_override`` / ``layer_config_list_override`` path, this is
+            auto-populated from the default hybrid_stack_spec in
+            :mod:`megatron.core.models.hybrid.hybrid_layer_specs`.
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
+        layer_type_list_override (list, optional): Internal compiled recipe output. Recipe
+            authors should use :class:`HybridModelConfig` / ``--model-recipe`` rather than
+            passing this directly.
+        layer_config_list_override (list, optional): Internal compiled recipe output, parallel to
+            ``layer_type_list_override``.
         hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
             pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
@@ -89,10 +100,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        hybrid_stack_spec: ModuleSpec,
-        vocab_size: int,
-        max_sequence_length: int,
+        hybrid_stack_spec: Optional[ModuleSpec] = None,
+        vocab_size: int = None,
+        max_sequence_length: int = None,
         hybrid_layer_pattern: Optional[str] = None,
+        layer_type_list_override: Optional[list] = None,
+        layer_config_list_override: Optional[list] = None,
+        mtp_layer_pattern_override: Optional[str] = None,
+        mtp_num_depths_override: Optional[int] = None,
         hybrid_attention_ratio: Optional[float] = None,
         hybrid_mlp_ratio: Optional[float] = None,
         hybrid_override_pattern: Optional[str] = None,
@@ -123,7 +138,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             HybridModel.mup_warning_printed = True
 
-        self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
@@ -135,6 +149,38 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+
+        recipe_path = layer_type_list_override is not None
+        if recipe_path:
+            if hybrid_layer_pattern is not None:
+                raise ValueError(
+                    "layer_type_list_override (Python DSL recipe) and "
+                    "hybrid_layer_pattern (string DSL) are mutually exclusive; "
+                    "pass exactly one."
+                )
+            if layer_config_list_override is None or len(layer_config_list_override) != len(
+                layer_type_list_override
+            ):
+                raise ValueError(
+                    "layer_type_list_override and layer_config_list_override must "
+                    "be passed together and have the same length."
+                )
+
+        # When using a recipe, fall back to the default hybrid_stack_spec so that
+        # users do not need to construct or pass a ModuleSpec.
+        if recipe_path and hybrid_stack_spec is None:
+            from megatron.core.models.hybrid.hybrid_layer_specs import (
+                hybrid_stack_spec as _default_hybrid_stack_spec,
+            )
+
+            hybrid_stack_spec = _default_hybrid_stack_spec
+        elif hybrid_stack_spec is None:
+            raise ValueError(
+                "hybrid_stack_spec is required when using the legacy string-pattern path "
+                "(hybrid_layer_pattern). Pass a ModuleSpec, or use a Python recipe via "
+                "the --model-recipe path."
+            )
+        self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
 
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_override_pattern is not None:
@@ -175,24 +221,48 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config.num_layers, attn_ratio, mlp_ratio
                 )
 
-        # Parse unified pattern to extract main and MTP components, and
-        # determine the pipeline segment for this model instance.
-        from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            parse_hybrid_pattern,
-            select_pipeline_segment,
-        )
+        if recipe_path:
+            # Recipe path: layer_type_list and layer_config_list are precomputed
+            # by HybridModelConfig.compile() upstream. Pipeline parallelism and
+            # MTP are not yet wired through this path.
+            pp_size = (
+                torch.distributed.get_world_size(self.pg_collection.pp)
+                if self.pg_collection.pp is not None
+                else 1
+            )
+            if pp_size > 1:
+                raise NotImplementedError(
+                    "The Python DSL recipe path does not yet support pipeline "
+                    "parallelism (PP > 1). Use hybrid_layer_pattern (string DSL "
+                    "with '|' separators) for PP."
+                )
+            layer_type_list = layer_type_list_override
+            layer_config_list = layer_config_list_override
+            layer_offset = 0
+            # MTP plumbing supplied by HybridModelConfig.compile() upstream;
+            # falls back to disabled when the recipe has no MTP markers.
+            self.mtp_pattern = mtp_layer_pattern_override
+            self.mtp_num_depths = mtp_num_depths_override or 0
+        else:
+            # Parse unified pattern to extract main and MTP components, and
+            # determine the pipeline segment for this model instance.
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                parse_hybrid_pattern,
+                select_pipeline_segment,
+            )
 
-        parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
-        self.mtp_pattern = parsed.mtp_pattern
-        self.mtp_num_depths = parsed.mtp_num_depths
+            parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
+            self.mtp_pattern = parsed.mtp_pattern
+            self.mtp_num_depths = parsed.mtp_num_depths
 
-        layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
-            self.pg_collection.pp,
-            vp_stage,
-            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-        )
+            layer_type_list, layer_offset = select_pipeline_segment(
+                parsed.main_pattern or '',
+                self.pg_collection.pp,
+                vp_stage,
+                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            )
+            layer_config_list = None
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -255,6 +325,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.config,
             pre_process=self.pre_process,
             layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
