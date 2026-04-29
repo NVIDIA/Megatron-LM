@@ -405,6 +405,34 @@ class EmbeddingLayerConfig:
     scatter_embedding_sequence_parallel: bool = True
     """Scatter the embedding output along the sequence-parallel dim."""
 
+    # YARN scaling (consumed only when ``position_embedding_type == "yarn"``).
+    # These are not :class:`TransformerConfig` dataclass fields today; they are
+    # attached as ad-hoc attributes by :meth:`HybridModelConfig.compile` to
+    # match the existing :func:`getattr` lookups in
+    # :class:`HybridModel.__init__`. When upstream lifts them onto
+    # :class:`TransformerConfig`, this block can collapse to plain ``extra``
+    # passthroughs and the setattr loop in ``compile()`` goes away.
+    yarn_rotary_scaling_factor: Optional[float] = None
+    """YARN scaling factor (s)."""
+
+    yarn_original_max_position_embeddings: Optional[int] = None
+    """Original max position embeddings the model was trained with."""
+
+    yarn_beta_fast: Optional[float] = None
+    """YARN beta-fast schedule parameter."""
+
+    yarn_beta_slow: Optional[float] = None
+    """YARN beta-slow schedule parameter."""
+
+    yarn_mscale: Optional[float] = None
+    """YARN m-scale parameter."""
+
+    yarn_mscale_all_dim: Optional[float] = None
+    """YARN m-scale-all-dim parameter."""
+
+    yarn_correction_range_round_to_int: Optional[bool] = None
+    """Round YARN correction range to int."""
+
     extra: Dict[str, Any] = field(default_factory=dict)
     """Passthrough kwargs forwarded to the stack-level
     :class:`TransformerConfig` (used for the embedding init / final norm).

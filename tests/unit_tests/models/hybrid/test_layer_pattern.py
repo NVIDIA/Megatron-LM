@@ -553,6 +553,78 @@ class TestExtraPassthrough:
 
 
 @pytest.mark.internal
+class TestYarnEmbedding:
+    """``EmbeddingLayerConfig`` exposes curated YARN fields that
+    :meth:`HybridModelConfig.compile` attaches to the stack-level
+    :class:`TransformerConfig` when ``position_embedding_type == "yarn"``.
+    This mirrors the existing setattr pattern in ``model_builder.py`` and
+    matches the ``getattr`` lookups in :class:`HybridModel.__init__`."""
+
+    def _attention_loss(self, common):
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        return a, CrossEntropyLayerConfig()
+
+    def test_yarn_fields_attached_when_position_embedding_is_yarn(self):
+        common = _make_common()
+        emb = EmbeddingLayerConfig(
+            common_config=common,
+            vocab_size=1024,
+            max_sequence_length=512,
+            position_embedding_type="yarn",
+            yarn_rotary_scaling_factor=32.0,
+            yarn_original_max_position_embeddings=131072,
+            yarn_beta_fast=32.0,
+            yarn_beta_slow=1.0,
+            yarn_mscale=1.0,
+            yarn_mscale_all_dim=0.0,
+            yarn_correction_range_round_to_int=True,
+        )
+        a, loss = self._attention_loss(common)
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+        assert compiled.config.yarn_rotary_scaling_factor == 32.0
+        assert compiled.config.yarn_original_max_position_embeddings == 131072
+        assert compiled.config.yarn_beta_fast == 32.0
+        assert compiled.config.yarn_beta_slow == 1.0
+        assert compiled.config.yarn_mscale == 1.0
+        assert compiled.config.yarn_mscale_all_dim == 0.0
+        assert compiled.config.yarn_correction_range_round_to_int is True
+
+    def test_yarn_fields_not_attached_when_position_embedding_is_rope(self):
+        """When ``position_embedding_type != "yarn"``, yarn fields are silently
+        unused — they're a no-op rather than an error so a recipe author can
+        toggle the embedding type without removing the yarn block."""
+        common = _make_common()
+        emb = EmbeddingLayerConfig(
+            common_config=common,
+            vocab_size=1024,
+            max_sequence_length=512,
+            position_embedding_type="rope",
+            yarn_rotary_scaling_factor=32.0,
+        )
+        a, loss = self._attention_loss(common)
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+        assert not hasattr(compiled.config, "yarn_rotary_scaling_factor")
+
+    def test_yarn_none_values_not_attached(self):
+        """Default-None yarn fields are not stamped on the config — useful to
+        avoid masking missing-required-attribute errors with stray None values
+        when ``HybridModel.__init__`` calls ``getattr`` without a default."""
+        common = _make_common()
+        emb = EmbeddingLayerConfig(
+            common_config=common,
+            vocab_size=1024,
+            max_sequence_length=512,
+            position_embedding_type="yarn",
+            yarn_rotary_scaling_factor=32.0,
+            # other yarn fields left as default None
+        )
+        a, loss = self._attention_loss(common)
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+        assert compiled.config.yarn_rotary_scaling_factor == 32.0
+        assert not hasattr(compiled.config, "yarn_beta_fast")
+
+
+@pytest.mark.internal
 class TestNumLayersDerived:
     """The recipe author never sets num_layers; compile derives it."""
 
