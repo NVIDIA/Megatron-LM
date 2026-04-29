@@ -239,6 +239,16 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
+        self.enable_async_overlap_architecture = (
+            inference_config.enable_async_overlap_architecture
+        )
+        self.async_overlap_queue_depth = inference_config.async_overlap_queue_depth
+        self.async_overlap_debug_checks = inference_config.async_overlap_debug_checks
+        if self.enable_async_overlap_architecture and self.async_overlap_queue_depth != 1:
+            raise ValueError(
+                "async_overlap_queue_depth > 1 is not available until the "
+                "queue-depth-two async-overlap pipeline commit"
+            )
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -323,7 +333,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefix_coordination_waits = 0
         self._next_dynamic_step_id = 0
         self._current_dynamic_step_id = -1
-        self.async_overlap_debug_counters = AsyncOverlapDebugCounters()
+        self.async_overlap_debug_counters = AsyncOverlapDebugCounters(
+            queue_depth=getattr(self, "async_overlap_queue_depth", 1)
+        )
 
         # Coordinator state.
         self.use_coordinator = False
@@ -2019,6 +2031,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
+        if self.enable_async_overlap_architecture and self.async_overlap_queue_depth == 1:
+            # TODO(async-overlap commit 23): route queue-depth-one through the
+            # new DynamicAsyncPipeline once its phase contract exists. Until
+            # then this rollout flag is configuration plumbing only.
+            reasons = self.async_overlap_debug_counters.fallback_or_queue_depth_one_reasons
+            reasons["queue_depth_one_debug_mode_pending_pipeline"] = (
+                reasons.get("queue_depth_one_debug_mode_pending_pipeline", 0) + 1
+            )
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
         # Keep for compatibility with current test suite.

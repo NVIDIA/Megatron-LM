@@ -303,6 +303,23 @@ class InferenceConfig:
     consisting of the string label, the target dtype, and whether to store the data on GPU.
     """
 
+    # =================================
+    # Temporary async-overlap rollout config
+    # =================================
+    enable_async_overlap_architecture: bool = False
+    """Enable the async-overlap architecture rollout path.
+
+    This is temporary scaffolding. Queue depth one is the serial correctness/debug mode;
+    later commits replace the old direct serial path with the new queue-depth-one path
+    before queue-depth-two overlap is enabled.
+    """
+
+    async_overlap_queue_depth: int = 1
+    """Maximum async-overlap pipeline depth. ``1`` is serial debug/correctness mode."""
+
+    async_overlap_debug_checks: bool = False
+    """Enable expensive async-overlap invariant checks while the rollout flag exists."""
+
     use_synchronous_zmq_collectives: bool = False
     """Whether to use synchronous ZMQ collectives for inference. If True, the
     all_reduce_max operation will be performed synchronously, which can help reduce
@@ -319,4 +336,8 @@ class InferenceConfig:
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+        if self.async_overlap_queue_depth < 1:
+            raise ValueError(
+                f"async_overlap_queue_depth must be >= 1, got {self.async_overlap_queue_depth}"
             )
