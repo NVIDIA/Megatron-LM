@@ -6,6 +6,54 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from .metadata_base import MetadataBase
 
 
+def update_mha_metadata(
+    query_lengths: torch.Tensor,
+    kv_length_offsets: torch.Tensor,
+    query_lengths_buf: torch.Tensor,
+    cu_query_seq_lengths_buf: torch.Tensor,
+    kv_seq_lengths_buf: torch.Tensor,
+    cu_kv_seq_lengths_buf: torch.Tensor,
+    real_batch_size: int,
+    padded_batch_size: int,
+) -> None:
+    """Compute all 1D MHA metadata buffers using pure PyTorch ops.
+
+    Args:
+        query_lengths: ``[>=real_batch_size]`` int32 - per-request query lengths.
+        kv_length_offsets: ``[>=real_batch_size]`` int32 - per-request KV offsets.
+        query_lengths_buf: ``[>=padded_batch_size]`` int32 - output buffer.
+        cu_query_seq_lengths_buf: ``[>=padded_batch_size+1]`` int32 - output buffer.
+        kv_seq_lengths_buf: ``[>=padded_batch_size]`` int32 - output buffer.
+        cu_kv_seq_lengths_buf: ``[>=padded_batch_size+1]`` int32 - output buffer.
+        real_batch_size: Number of real requests.
+        padded_batch_size: Padded request count (≥ real_batch_size).
+    """
+    rbs = real_batch_size
+    pbs = padded_batch_size
+
+    if pbs == 0:
+        cu_query_seq_lengths_buf[0] = 0
+        cu_kv_seq_lengths_buf[0] = 0
+        return
+
+    # query_lengths_buf: copy real, zero-pad rest
+    query_lengths_buf[:rbs] = query_lengths[:rbs]
+    if pbs > rbs:
+        query_lengths_buf[rbs:pbs] = 0
+
+    # kv_seq_lengths = kv_offsets + query_lengths, zero-padded
+    kv_seq_lengths_buf[:rbs] = kv_length_offsets[:rbs] + query_lengths[:rbs]
+    if pbs > rbs:
+        kv_seq_lengths_buf[rbs:pbs] = 0
+
+    # cumsum on the padded buffer: zeros propagate last real value
+    cu_query_seq_lengths_buf[0] = 0
+    torch.cumsum(query_lengths_buf[:pbs], dim=0, out=cu_query_seq_lengths_buf[1 : pbs + 1])
+
+    cu_kv_seq_lengths_buf[0] = 0
+    torch.cumsum(kv_seq_lengths_buf[:pbs], dim=0, out=cu_kv_seq_lengths_buf[1 : pbs + 1])
+
+
 class MHAMetadata(MetadataBase):
     """
     Metadata for MHA layer using flash-attention.
@@ -62,42 +110,24 @@ class MHAMetadata(MetadataBase):
         assert request_kv_length_offsets.shape[0] == real_batch_size
         assert request_to_kv_block_ids.shape[0] == real_batch_size
 
-        self.tensor_copy_and_pad(
-            self._query_lengths_buf,
-            request_query_lengths,
-            real_batch_size,
-            padded_active_request_count,
+        update_mha_metadata(
+            query_lengths=request_query_lengths,
+            kv_length_offsets=request_kv_length_offsets,
+            query_lengths_buf=self._query_lengths_buf,
+            cu_query_seq_lengths_buf=self._cu_query_seq_lengths_buf,
+            kv_seq_lengths_buf=self._kv_seq_lengths_buf,
+            cu_kv_seq_lengths_buf=self._cu_kv_seq_lengths_buf,
+            real_batch_size=real_batch_size,
+            padded_batch_size=padded_active_request_count,
         )
-        self._cu_query_seq_lengths_buf[0] = 0
-        self.tensor_copy_and_pad(
-            self._cu_query_seq_lengths_buf[1:],
-            torch.cumsum(request_query_lengths, dim=0),
-            real_batch_size,
-            padded_active_request_count,
-            is_cumulative_tensor=True,
-        )
-        self.tensor_copy_and_pad(
-            self._kv_seq_lengths_buf,
-            request_kv_length_offsets + request_query_lengths,
-            real_batch_size,
-            padded_active_request_count,
-        )
+
+        # Block table is 2D — handled separately.
         self.tensor_copy_and_pad(
             self._block_table_buf,
             request_to_kv_block_ids,
             real_batch_size,
             padded_active_request_count,
-            pad_value=torch.tensor(self.max_kv_blocks, dtype=torch.int32, device=self.device).fill_(
-                -1
-            ),
-        )
-        self._cu_kv_seq_lengths_buf[0] = 0
-        self.tensor_copy_and_pad(
-            self._cu_kv_seq_lengths_buf[1:],
-            torch.cumsum(self._kv_seq_lengths_buf, dim=0),
-            real_batch_size,
-            padded_active_request_count,
-            is_cumulative_tensor=True,
+            pad_value=-1,
         )
 
         if padded_batch_dimensions.prefill_req_count == 0:
