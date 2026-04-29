@@ -261,7 +261,9 @@ class TestCompileErrorPropagation:
         def make_recipe() -> HybridModelConfig:
             return bad
 
-        _register_synthetic_module(monkeypatch, "tests._bad_pattern_recipe", make_recipe=make_recipe)
+        _register_synthetic_module(
+            monkeypatch, "tests._bad_pattern_recipe", make_recipe=make_recipe
+        )
         with pytest.raises(TypeError, match="EmbeddingLayerConfig"):
             load_recipe("tests._bad_pattern_recipe")
 
@@ -284,9 +286,7 @@ class TestRecipeArgProjection:
             tensor_model_parallel_size=2,
         )
         _register_synthetic_module(
-            monkeypatch,
-            "tests._args_projection_recipe",
-            make_recipe=lambda: recipe,
+            monkeypatch, "tests._args_projection_recipe", make_recipe=lambda: recipe
         )
         args = types.SimpleNamespace(
             model_recipe="tests._args_projection_recipe",

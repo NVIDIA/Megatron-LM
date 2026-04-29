@@ -38,10 +38,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def _make_common(**overrides) -> CommonLayerConfig:
-    base = dict(
-        hidden_size=256,
-        use_cpu_initialization=True,
-    )
+    base = dict(hidden_size=256, use_cpu_initialization=True)
     base.update(overrides)
     return CommonLayerConfig(**base)
 
@@ -174,8 +171,7 @@ class TestHeterogeneousWithinType:
 
         model_parallel_cuda_manual_seed(123)
         recipe = HybridModelConfig(
-            common_config=common,
-            layer_pattern=[_embedding(common), big, small, _loss()],
+            common_config=common, layer_pattern=[_embedding(common), big, small, _loss()]
         )
         model = _build_model_from_recipe(recipe)
 
