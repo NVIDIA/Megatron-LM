@@ -377,9 +377,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ] or None
         self.shard_params(optimizers, full_param_layouts)
 
+        # When a full_param_layout is available, ddp_config.use_distributed_optimizer
+        # is True and model params are views into the DDP param buffer.  After the
+        # optimizer step copies updated fp32 main params → bf16 model params, the
+        # buffer is already up-to-date in-place.  We can use DDP's buffer-based
+        # all-gather (start_param_sync) instead of the flatten/unflatten allgather_params
+        # path.
+        self.use_buffer_param_sync = full_param_layouts is not None
+        self.model_chunks = model_chunks
+
         # Set up overlap param gather using DDP bucket infrastructure.
         self.overlap_param_gather = config.overlap_param_gather
-        if self.overlap_param_gather:
+        if self.overlap_param_gather and not self.use_buffer_param_sync:
+            # Legacy path: set up per-bucket param lists for variable-size all-gather.
+            # When use_buffer_param_sync is True, the standard distributed optimizer
+            # all-gather path is used and this setup is not needed.
             assert (
                 model_chunks is not None
             ), "model_chunks must be provided if overlap_param_gather is True"
@@ -674,10 +686,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """step function for layer-wise optimizer."""
         update_successful, grad_norm, num_zeros_in_grad = super().step()
 
-        # All gather updated params. If overlap_param_gather is True, the allgather
+        # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
         if not self.overlap_param_gather:
-            self.allgather_params()
+            if self.use_buffer_param_sync:
+                # Model params are views into the DDP param buffer
+                # (ddp_config.use_distributed_optimizer=True).  The optimizer step
+                # already copied updated fp32 main params → bf16 model params (=
+                # buffer views), so the buffer is up-to-date.  Trigger the standard
+                # buffer all-gather.
+                for model_chunk in self.model_chunks:
+                    model_chunk.start_param_sync(force_sync=True)
+            else:
+                self.allgather_params()
 
         return update_successful, grad_norm, num_zeros_in_grad
 
