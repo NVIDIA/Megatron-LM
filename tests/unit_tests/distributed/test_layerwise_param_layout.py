@@ -249,14 +249,14 @@ class TestSizeMatchingLayout:
 
         layout = _LWO._compute_per_buffer_param_layout(params, None, dp_size, cfg)
 
-        # Group params by shard.
+        # Group params by shard in backprop (reverse model) order.
         shard_params: dict[int, list] = {i: [] for i in range(dp_size)}
-        for p in params:
+        for p in reversed(params):
             s = _get_shard_for_param(layout, p, dp_size)
             start, _, _ = layout.param_index_map[p]
             shard_params[s].append((start, p))
 
-        # Within each shard, buffer positions should be increasing.
+        # Within each shard, buffer positions should be increasing in backprop order.
         for s, items in shard_params.items():
             positions = [pos for pos, _ in items]
             assert positions == sorted(positions), f"shard {s} not in order"

@@ -1473,7 +1473,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
             # Layer-wise distributed optimizer uses reduce-scatter like the
             # standard distributed optimizer.
-            if args.use_layer_wise_distributed_optimizer:
+            if getattr(args, 'use_layer_wise_distributed_optimizer', False):
                 ddp_config.use_distributed_optimizer = True
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
@@ -1491,7 +1491,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         # Tag parameters for the layer-wise distributed optimizer before DDP
         # wrapping so that buffer grouping separates layerwise and standard params.
-        if args.use_layer_wise_distributed_optimizer:
+        if getattr(args, 'use_layer_wise_distributed_optimizer', False):
             LayerWiseDistributedOptimizer.tag_params(model, args.optimizer)
 
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
@@ -1516,7 +1516,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
                 # Pre-compute parameter layouts for the distributed optimizer.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer) and DP is DDP:
+                if (args.use_distributed_optimizer or getattr(args, 'use_layer_wise_distributed_optimizer', False)) and DP is DDP:
                     all_params = [
                         p for p in model_chunk.parameters() if p.requires_grad
                     ]
@@ -1526,7 +1526,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                         if disable_bucketing or pp_rank > 0
                         else ddp_config.bucket_size
                     )
-                    if args.use_layer_wise_distributed_optimizer:
+                    if getattr(args, 'use_layer_wise_distributed_optimizer', False):
                         compute_layout_fn = LayerWiseDistributedOptimizer.compute_full_param_layout
                     else:
                         compute_layout_fn = DistributedOptimizer.compute_full_param_layout
@@ -3884,6 +3884,6 @@ def should_disable_forward_pre_hook(args):
     return (
         not args.use_megatron_fsdp
         and has_optimizer
-        and (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
+        and (args.use_distributed_optimizer or getattr(args, 'use_layer_wise_distributed_optimizer', False))
         and args.overlap_param_gather
     )
