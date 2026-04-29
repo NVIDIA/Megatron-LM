@@ -50,6 +50,8 @@ class ResourceReservation:
     kv_block_ids: Sequence[int] = field(default_factory=tuple)
     mamba_slot_ids: Sequence[int] = field(default_factory=tuple)
     prefix_cache_refcount_deltas: Mapping[Any, int] = field(default_factory=dict)
+    mamba_zero_slot_ids: Sequence[int] = field(default_factory=tuple)
+    mamba_restore_block_ids: Mapping[Any, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.step_id < 0:
@@ -62,6 +64,10 @@ class ResourceReservation:
             self,
             "prefix_cache_refcount_deltas",
             _freeze_mapping(self.prefix_cache_refcount_deltas),
+        )
+        object.__setattr__(self, "mamba_zero_slot_ids", _int_tuple(self.mamba_zero_slot_ids))
+        object.__setattr__(
+            self, "mamba_restore_block_ids", _freeze_mapping(self.mamba_restore_block_ids)
         )
 
 
@@ -78,6 +84,8 @@ class StepJournalEntry:
     reserved_kv_blocks: Sequence[int] = field(default_factory=tuple)
     reserved_mamba_slots: Sequence[int] = field(default_factory=tuple)
     prefix_cache_refcount_deltas: Mapping[Any, int] = field(default_factory=dict)
+    mamba_zero_slot_ids: Sequence[int] = field(default_factory=tuple)
+    mamba_restore_block_ids: Mapping[Any, int] = field(default_factory=dict)
     pause_resume_evictions: Sequence[str] = field(default_factory=tuple)
     decode_input_destination_indices: Sequence[int] = field(default_factory=tuple)
     cuda_graph_batch_dimensions: Optional[Any] = None
@@ -100,6 +108,10 @@ class StepJournalEntry:
             self,
             "prefix_cache_refcount_deltas",
             _freeze_mapping(self.prefix_cache_refcount_deltas),
+        )
+        object.__setattr__(self, "mamba_zero_slot_ids", _int_tuple(self.mamba_zero_slot_ids))
+        object.__setattr__(
+            self, "mamba_restore_block_ids", _freeze_mapping(self.mamba_restore_block_ids)
         )
         object.__setattr__(
             self, "pause_resume_evictions", _str_tuple(self.pause_resume_evictions)
@@ -127,6 +139,8 @@ class _MutableStepJournalEntry:
     reserved_kv_blocks: list[int] = field(default_factory=list)
     reserved_mamba_slots: list[int] = field(default_factory=list)
     prefix_cache_refcount_deltas: Dict[Any, int] = field(default_factory=dict)
+    mamba_zero_slot_ids: list[int] = field(default_factory=list)
+    mamba_restore_block_ids: Dict[Any, int] = field(default_factory=dict)
     pause_resume_evictions: list[str] = field(default_factory=list)
     decode_input_destination_indices: Tuple[int, ...] = field(default_factory=tuple)
     cuda_graph_batch_dimensions: Optional[Any] = None
@@ -144,6 +158,8 @@ class _MutableStepJournalEntry:
             reserved_kv_blocks=self.reserved_kv_blocks,
             reserved_mamba_slots=self.reserved_mamba_slots,
             prefix_cache_refcount_deltas=self.prefix_cache_refcount_deltas,
+            mamba_zero_slot_ids=self.mamba_zero_slot_ids,
+            mamba_restore_block_ids=self.mamba_restore_block_ids,
             pause_resume_evictions=self.pause_resume_evictions,
             decode_input_destination_indices=self.decode_input_destination_indices,
             cuda_graph_batch_dimensions=self.cuda_graph_batch_dimensions,
@@ -224,6 +240,11 @@ class StepJournal:
             entry.prefix_cache_refcount_deltas[key] = (
                 entry.prefix_cache_refcount_deltas.get(key, 0) + int(delta)
             )
+        entry.mamba_zero_slot_ids.extend(
+            int(slot_id) for slot_id in getattr(reservation, "mamba_zero_slot_ids", ())
+        )
+        for key, block_id in getattr(reservation, "mamba_restore_block_ids", {}).items():
+            entry.mamba_restore_block_ids[key] = int(block_id)
         return entry.freeze()
 
     def record_snapshot_slot(

@@ -1125,6 +1125,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
+        self.gpu_bookkeeping_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self._gpu_bookkeeping_complete_event = torch.cuda.Event()
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -1823,13 +1825,20 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.is_hybrid_model:
             for logical_idx, request_idx in enumerate(range(start_request_idx, end_request_idx)):
-                mamba_idx = self.mamba_metadata.allocate_slot()
-                if mamba_idx is None:
+                step_id = max(0, int(self.current_dynamic_step_id))
+                mamba_reservation = self.mamba_metadata.reserve_slot(
+                    request_idx, step_id, zero_state=True
+                )
+                if mamba_reservation is None:
                     raise ContextOverflowError(
                         requests[logical_idx].request_id, "No Mamba slots available"
                     )
+                mamba_idx = mamba_reservation.mamba_slot_ids[0]
                 self._pending_mamba_zeros.append(mamba_idx)
+                self.record_resource_reservation(step_id, mamba_reservation)
                 self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
+                self.mamba_metadata.commit_reservation(mamba_reservation)
+                self.async_overlap_debug_counters["mamba_reservation_commits"] += 1
 
         self.active_token_count = token_end
         self.total_request_count = end_request_idx
@@ -2228,28 +2237,29 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
 
-        This runs at the start of transfer_bookkeeping_to_gpu() so that all GPU
-        Mamba state is correct before the forward pass.
+        These kernels are always enqueued on ``gpu_bookkeeping_stream`` so their
+        ordering does not depend on whatever CUDA stream the caller made current.
         """
         if not (self._pending_mamba_restores or self._pending_mamba_zeros):
             return
 
-        # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
-        for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
-            restored = self.mamba_slot_allocator.restore_to_live(request_idx, block_id)
-            if not restored:
-                self._pending_mamba_zeros.append(mamba_idx)
-        self._pending_mamba_restores.clear()
+        with torch.cuda.stream(self.gpu_bookkeeping_stream):
+            # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
+            for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
+                restored = self.mamba_slot_allocator.restore_to_live(request_idx, block_id)
+                if not restored:
+                    self._pending_mamba_zeros.append(mamba_idx)
+            self._pending_mamba_restores.clear()
 
-        # Batch-zero newly allocated Mamba slots.
-        if self._pending_mamba_zeros:
-            device = self.mamba_conv_states.device
-            indices = torch.tensor(
-                self._pending_mamba_zeros, dtype=torch.long, device=device,
-            )
-            self.mamba_conv_states[:, indices] = 0.0
-            self.mamba_ssm_states[:, indices] = 0.0
-            self._pending_mamba_zeros.clear()
+            # Batch-zero newly allocated Mamba slots.
+            if self._pending_mamba_zeros:
+                device = self.mamba_conv_states.device
+                indices = torch.tensor(
+                    self._pending_mamba_zeros, dtype=torch.long, device=device,
+                )
+                self.mamba_conv_states[:, indices] = 0.0
+                self.mamba_ssm_states[:, indices] = 0.0
+                self._pending_mamba_zeros.clear()
 
     def transfer_bookkeeping_to_gpu(self) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
@@ -2279,11 +2289,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_slice
         ]
 
+        pending_mamba_transfer = getattr(self, '_pending_mamba_transfer', None)
+
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        with torch.cuda.stream(self.gpu_bookkeeping_stream):
+            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+            if pending_mamba_transfer is not None:
+                self.mamba_metadata.load_from_cpu(pending_mamba_transfer)
+            self._gpu_bookkeeping_complete_event.record(self.gpu_bookkeeping_stream)
+        torch.cuda.current_stream().wait_event(self._gpu_bookkeeping_complete_event)
 
         # MHA metadata: buffers already covered by the coalesced H2D above.
         # All that's left is pointing state_data at the correct GPU slices and
@@ -2298,9 +2315,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self._pending_mha_transfer = None
 
-        # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
-        if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
-            self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
+        # Mamba metadata: GPU-side views were loaded on gpu_bookkeeping_stream.
+        if pending_mamba_transfer is not None:
             self._pending_mamba_transfer = None
 
     def reset_tensors(self) -> None:
@@ -2373,6 +2389,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 "placeholder_count": 0,
                 "reservation_commits": 0,
                 "reservation_rollbacks": 0,
+                "mamba_reservation_commits": 0,
+                "mamba_reservation_rollbacks": 0,
             }
         )
 
@@ -2945,16 +2963,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
 
         if self.is_hybrid_model and req.finished_chunk_token_count == 0:
-            # Allocate a slot for Mamba states
-            mamba_idx = self.mamba_metadata.allocate_slot()
-            if mamba_idx is None:
-                raise ContextOverflowError(req.request_id, "No Mamba slots available")
-            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
-
             # Restore Mamba state from the block corresponding to prefix_skip_tokens
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
+            restore_block_id = None
             if restore_block_count > 0 and self.mamba_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
+
+            # Allocate a slot for Mamba states through the reservation lifecycle.
+            step_id = max(0, int(self.current_dynamic_step_id))
+            mamba_reservation = self.mamba_metadata.reserve_slot(
+                self.total_request_count,
+                step_id,
+                zero_state=restore_block_id is None,
+                restore_block_id=restore_block_id,
+            )
+            if mamba_reservation is None:
+                raise ContextOverflowError(req.request_id, "No Mamba slots available")
+            mamba_idx = mamba_reservation.mamba_slot_ids[0]
+            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
+            self.record_resource_reservation(step_id, mamba_reservation)
+            self.mamba_metadata.commit_reservation(mamba_reservation)
+            self.async_overlap_debug_counters["mamba_reservation_commits"] += 1
+
+            if restore_block_id is not None:
                 self._pending_mamba_restores.append(
                     (self.total_request_count, restore_block_id, mamba_idx)
                 )

@@ -72,6 +72,7 @@ class MambaSlotAllocator:
 
         # Hash-to-block mapping: only blocks with cached Mamba state
         self.hash_to_block_id: Dict[int, int] = {}
+        self._deferred_snapshot_slot_releases: Dict[int, list[Tensor]] = {}
 
         # Per-request intermediate state storage.
         # offsets_cpu and counts_cpu: CPU source of truth.  GPU copies are
@@ -255,9 +256,7 @@ class MambaSlotAllocator:
             return
         self.block_to_slot[block_id] = -1
         self.slot_to_block[slot] = -1
-        # Return slot to free pool
-        self.free_slots[self.free_count] = slot
-        self.free_count += 1
+        self._return_slots_to_free_pool(torch.tensor([slot], dtype=torch.int32, device='cpu'))
 
     def _invalidate_blocks_batch(self, block_ids_list: list) -> None:
         """Free cache slots and clear mappings for multiple blocks at once.
@@ -279,9 +278,34 @@ class MambaSlotAllocator:
         valid_bids = bid_t[valid_mask]
         self.block_to_slot[valid_bids] = -1
         self.slot_to_block[valid_slots] = -1
-        n = valid_slots.numel()
-        self.free_slots[self.free_count : self.free_count + n] = valid_slots.to(torch.int32)
-        self.free_count += n
+        self._return_slots_to_free_pool(valid_slots.to(torch.int32))
+
+    def defer_release_until_snapshot_retired(
+        self, slot_ids: Tensor, snapshot_slot_id: int
+    ) -> None:
+        """Defer Mamba cache slot reuse until a snapshot no longer reads it."""
+        if slot_ids.numel() == 0:
+            return
+        self._deferred_snapshot_slot_releases.setdefault(int(snapshot_slot_id), []).append(
+            slot_ids.to(dtype=torch.int32, device='cpu').clone()
+        )
+
+    def release_deferred_slots_for_snapshot(self, snapshot_slot_id: int) -> None:
+        """Return deferred Mamba cache slots once the owning snapshot retires."""
+        deferred = self._deferred_snapshot_slot_releases.pop(int(snapshot_slot_id), [])
+        for slot_ids in deferred:
+            self._return_slots_to_free_pool(slot_ids)
+
+    def _return_slots_to_free_pool(self, slot_ids: Tensor) -> None:
+        """Return cache slots to the free pool."""
+        if slot_ids.numel() == 0:
+            return
+        n = slot_ids.numel()
+        end = self.free_count + n
+        if end > self.max_slots:
+            raise RuntimeError("Mamba cache free slot pool overflow")
+        self.free_slots[self.free_count : end] = slot_ids.to(torch.int32)
+        self.free_count = end
 
     def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
         """Handle KV block deregistration by cleaning up Mamba state.
@@ -640,6 +664,7 @@ class MambaSlotAllocator:
         )
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
+        self._deferred_snapshot_slot_releases.clear()
         self.intermediate_ssm_out.zero_()
         self.intermediate_conv_out.zero_()
         self._intermediate_offsets_cpu.fill_(0)

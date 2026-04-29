@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 
@@ -8,6 +8,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
+from megatron.core.inference.contexts.step_journal import ResourceReservation
 
 
 class MambaMetadata:
@@ -89,6 +90,11 @@ class MambaMetadata:
             self.max_requests, dtype=torch.int32, device='cpu',
         )
         self.mamba_state_free_slot_count = self.max_requests
+        self._next_reservation_id = 0
+        self._open_reservations: Dict[int, ResourceReservation] = {}
+        self._committed_reservations: Dict[int, ResourceReservation] = {}
+        self._rolled_back_reservations: Dict[int, ResourceReservation] = {}
+        self._deferred_snapshot_slot_releases: Dict[int, list[torch.Tensor]] = {}
 
         # Intermediate state extraction buffers (CUDA graph compatible)
         # Each prefill request can produce up to 3 intermediate offsets
@@ -145,6 +151,11 @@ class MambaMetadata:
             self.max_requests, dtype=torch.int32, device='cpu',
         )
         self.mamba_state_free_slot_count = self.max_requests
+        self._open_reservations.clear()
+        self._committed_reservations.clear()
+        self._rolled_back_reservations.clear()
+        self._deferred_snapshot_slot_releases.clear()
+        self._next_reservation_id = 0
 
     def reset_varlen_metadata(self) -> None:
         """Resets varlen metadata."""
@@ -701,6 +712,88 @@ class MambaMetadata:
 
         return mamba_idx
 
+    def reserve_slot(
+        self,
+        request_slot: int,
+        step_id: int,
+        snapshot_slot_id: int = 0,
+        *,
+        zero_state: bool = False,
+        restore_block_id: Optional[int] = None,
+    ) -> Optional[ResourceReservation]:
+        """Reserve one live Mamba state slot for a scheduled step."""
+        mamba_idx = self.allocate_slot()
+        if mamba_idx is None:
+            return None
+        slot_id = int(mamba_idx.item() if isinstance(mamba_idx, torch.Tensor) else mamba_idx)
+        reservation = ResourceReservation(
+            step_id=int(step_id),
+            request_slot=int(request_slot),
+            snapshot_slot_id=int(snapshot_slot_id),
+            reservation_id=self._next_reservation_id,
+            mamba_slot_ids=(slot_id,),
+            mamba_zero_slot_ids=(slot_id,) if zero_state else (),
+            mamba_restore_block_ids={slot_id: int(restore_block_id)}
+            if restore_block_id is not None
+            else {},
+        )
+        self._next_reservation_id += 1
+        self._open_reservations[reservation.reservation_id] = reservation
+        return reservation
+
+    def reserve_slots(
+        self,
+        request_slots: Sequence[int],
+        step_id: int,
+        snapshot_slot_id: int = 0,
+        *,
+        zero_state: bool = False,
+    ) -> Optional[ResourceReservation]:
+        """Reserve multiple live Mamba state slots for a scheduled step."""
+        request_slots = tuple(int(slot) for slot in request_slots)
+        if not request_slots:
+            slot_ids = ()
+        else:
+            allocated = self.batch_allocate_slots(len(request_slots))
+            if allocated is None:
+                return None
+            slot_ids = tuple(int(slot) for slot in allocated.tolist())
+        reservation = ResourceReservation(
+            step_id=int(step_id),
+            request_slot=request_slots[0] if request_slots else -1,
+            snapshot_slot_id=int(snapshot_slot_id),
+            reservation_id=self._next_reservation_id,
+            mamba_slot_ids=slot_ids,
+            mamba_zero_slot_ids=slot_ids if zero_state else (),
+        )
+        self._next_reservation_id += 1
+        self._open_reservations[reservation.reservation_id] = reservation
+        return reservation
+
+    def commit_reservation(self, reservation: ResourceReservation) -> None:
+        """Commit a Mamba slot reservation into durable request ownership."""
+        open_reservation = self._open_reservations.pop(reservation.reservation_id, None)
+        if open_reservation is None:
+            if reservation.reservation_id in self._committed_reservations:
+                return
+            raise RuntimeError(f"Mamba reservation {reservation.reservation_id} is not open")
+        self._committed_reservations[reservation.reservation_id] = open_reservation
+
+    def rollback_reservation(self, reservation: ResourceReservation) -> None:
+        """Roll back a Mamba slot reservation and return its slots to the pool."""
+        open_reservation = self._open_reservations.pop(reservation.reservation_id, None)
+        if open_reservation is None:
+            if reservation.reservation_id in self._rolled_back_reservations:
+                return
+            raise RuntimeError(f"Mamba reservation {reservation.reservation_id} is not open")
+        self._release_slot_ids(open_reservation.mamba_slot_ids)
+        request_slot = int(open_reservation.request_slot)
+        if 0 <= request_slot < self.max_requests:
+            current_slot = int(self.request_to_mamba_state_idx[request_slot].item())
+            if current_slot in set(open_reservation.mamba_slot_ids):
+                self.request_to_mamba_state_idx[request_slot] = -1
+        self._rolled_back_reservations[reservation.reservation_id] = open_reservation
+
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """
         Allocates new slots for the given number of requests in the Mamba state buffers.
@@ -735,11 +828,38 @@ class MambaMetadata:
         num_to_free = len(mamba_indices_to_free)
 
         if num_to_free > 0:
-            # Add the freed indices back to the free slot pool
-            start_idx = self.mamba_state_free_slot_count
-            end_idx = start_idx + num_to_free
-            self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
-            self.mamba_state_free_slot_count = end_idx
+            self._release_slot_ids(mamba_indices_to_free.tolist())
 
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1
+
+    def defer_release_until_snapshot_retired(
+        self, slot_ids: torch.Tensor, snapshot_slot_id: int
+    ) -> None:
+        """Defer live Mamba slot reuse until a snapshot no longer reads it."""
+        if slot_ids.numel() == 0:
+            return
+        slot_ids = slot_ids.to(dtype=torch.int32, device='cpu')
+        self._deferred_snapshot_slot_releases.setdefault(int(snapshot_slot_id), []).append(
+            slot_ids.clone()
+        )
+
+    def release_deferred_slots_for_snapshot(self, snapshot_slot_id: int) -> None:
+        """Release live Mamba slots whose snapshot-read dependency has retired."""
+        deferred = self._deferred_snapshot_slot_releases.pop(int(snapshot_slot_id), [])
+        for slot_ids in deferred:
+            self._release_slot_ids(slot_ids.tolist())
+
+    def _release_slot_ids(self, slot_ids) -> None:
+        """Return live Mamba state slots to the free pool."""
+        slot_ids = tuple(int(slot_id) for slot_id in slot_ids)
+        if not slot_ids:
+            return
+        start_idx = self.mamba_state_free_slot_count
+        end_idx = start_idx + len(slot_ids)
+        if end_idx > self.max_requests:
+            raise RuntimeError("Mamba state free slot pool overflow")
+        self.mamba_state_free_slots[start_idx:end_idx] = torch.tensor(
+            slot_ids, dtype=torch.int32, device='cpu'
+        )
+        self.mamba_state_free_slot_count = end_idx

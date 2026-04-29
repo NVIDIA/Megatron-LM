@@ -498,3 +498,46 @@ class TestMambaMetadata:
         expected_seq_idx = torch.cat([expected_seq_idx_0, expected_seq_idx_1], dim=1)
 
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+    @pytest.mark.internal
+    def test_mamba_slot_reservation_commit_and_rollback(self):
+        """Mamba state slots move through reserve/commit/rollback lifecycle."""
+        metadata = MambaMetadata(max_requests=4, max_tokens=128)
+
+        reservation = metadata.reserve_slot(1, step_id=7, zero_state=True)
+        assert reservation is not None
+        assert metadata.mamba_state_free_slot_count == 3
+        assert reservation.mamba_slot_ids == (3,)
+        assert reservation.mamba_zero_slot_ids == (3,)
+        metadata.request_to_mamba_state_idx[1] = reservation.mamba_slot_ids[0]
+        metadata.commit_reservation(reservation)
+        metadata.commit_reservation(reservation)
+        assert metadata.request_to_mamba_state_idx[1].item() == 3
+
+        rollback = metadata.reserve_slot(2, step_id=8, restore_block_id=13)
+        assert rollback is not None
+        assert rollback.mamba_restore_block_ids[2] == 13
+        metadata.request_to_mamba_state_idx[2] = rollback.mamba_slot_ids[0]
+        metadata.rollback_reservation(rollback)
+        metadata.rollback_reservation(rollback)
+        assert metadata.request_to_mamba_state_idx[2].item() == -1
+        assert metadata.mamba_state_free_slot_count == 3
+
+    @pytest.mark.internal
+    def test_mamba_slot_release_can_wait_for_snapshot_retirement(self):
+        """Deferred Mamba slot release prevents reuse until snapshot retirement."""
+        metadata = MambaMetadata(max_requests=4, max_tokens=128)
+        slot = metadata.allocate_slot()
+        assert slot is not None
+        assert metadata.mamba_state_free_slot_count == 3
+
+        slot_tensor = torch.tensor([int(slot.item())], dtype=torch.int32, device='cpu')
+        metadata.defer_release_until_snapshot_retired(slot_tensor, snapshot_slot_id=2)
+        assert metadata.mamba_state_free_slot_count == 3
+
+        second_slot = metadata.allocate_slot()
+        assert int(second_slot.item()) != int(slot.item())
+        assert metadata.mamba_state_free_slot_count == 2
+
+        metadata.release_deferred_slots_for_snapshot(2)
+        assert metadata.mamba_state_free_slot_count == 3

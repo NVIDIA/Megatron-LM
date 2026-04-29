@@ -18,6 +18,8 @@ class FakeResourceReservation:
     kv_block_ids: tuple[int, ...] = field(default_factory=tuple)
     mamba_slot_ids: tuple[int, ...] = field(default_factory=tuple)
     prefix_cache_refcount_deltas: dict[str, int] = field(default_factory=dict)
+    mamba_zero_slot_ids: tuple[int, ...] = field(default_factory=tuple)
+    mamba_restore_block_ids: dict[int, int] = field(default_factory=dict)
 
 
 def _fake_dynamic_context():
@@ -69,12 +71,16 @@ def test_step_journal_records_resource_reservation():
         kv_block_ids=(7, 8),
         mamba_slot_ids=(2,),
         prefix_cache_refcount_deltas={"prefix": 1},
+        mamba_zero_slot_ids=(2,),
+        mamba_restore_block_ids={2: 11},
     )
     entry = journal.record_resource_reservation(4, reservation)
 
     assert entry.reserved_kv_blocks == (7, 8)
     assert entry.reserved_mamba_slots == (2,)
     assert entry.prefix_cache_refcount_deltas["prefix"] == 1
+    assert entry.mamba_zero_slot_ids == (2,)
+    assert entry.mamba_restore_block_ids[2] == 11
     assert entry.resources_waiting_on_snapshot == (reservation,)
 
 
