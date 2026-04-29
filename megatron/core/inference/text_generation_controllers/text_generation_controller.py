@@ -2061,6 +2061,20 @@ class TextGenerationController:
             self._compute_serial_mtp_and_sample()
         else:
             self._dynamic_step_sample_logits(logits)
+        active_request_count = context.total_request_count - context.paused_request_count
+        context.record_sampled_tokens_gpu_state(
+            sampled_tokens=self._sampled_tokens_cuda,
+            active_request_count=active_request_count,
+            source_stream=torch.cuda.current_stream(),
+            sampled_mtp_tokens=(
+                self._sampled_mtp_tokens_cuda if self.num_speculative_tokens > 0 else None
+            ),
+            accepted_token_counts=(
+                self._accepted_token_counts_per_request
+                if self.num_speculative_tokens > 0
+                else None
+            ),
+        )
         range_pop()
 
         log_probs = None
@@ -2133,6 +2147,13 @@ class TextGenerationController:
         skip_bookkeeping: Optional[bool] = False,
     ) -> Dict:
         """Commit serial CPU bookkeeping and return the public dynamic-step result."""
+        context = self.inference_wrapped_model.inference_context
+        context.debug_compare_sampled_tokens_gpu_state(
+            sampled_tokens_cpu=step_output.sampled_tokens_cpu,
+            active_request_count=prepared_step.active_request_count,
+            sampled_mtp_tokens_cpu=step_output.sampled_mtp_tokens_cpu,
+            accepted_token_counts_cpu=step_output.accepted_token_counts_cpu,
+        )
         if skip_bookkeeping:
             request_bookkeeping = {
                 "sample": step_output.sampled_tokens_cpu,
@@ -2158,7 +2179,6 @@ class TextGenerationController:
             self._accepted_tokens_per_request.fill_(-1)
             self._accepted_token_counts_per_request.fill_(0)
         ret.update(request_bookkeeping)
-        context = self.inference_wrapped_model.inference_context
         context.snapshot_pool.release(prepared_step.snapshot_slot_id)
         return ret
 

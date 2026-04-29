@@ -39,6 +39,7 @@ from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_ledgers import DynamicRequestLedgers
+from .gpu_input_state import GpuSampledTokenState
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
@@ -1149,6 +1150,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._pending_mamba_restores: list = []
         self.gpu_bookkeeping_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._gpu_bookkeeping_complete_event = torch.cuda.Event()
+        self.gpu_sampled_token_state = GpuSampledTokenState(
+            max_requests=self.max_requests,
+            num_speculative_tokens=self.num_speculative_tokens,
+            device=torch.cuda.current_device(),
+            stream=self.gpu_bookkeeping_stream,
+        )
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -2548,6 +2555,47 @@ class DynamicInferenceContext(BaseInferenceContext):
             byte_count=byte_count,
             cache_key=cache_key,
             max_captures=max(1, len(self.cuda_graph_batch_dimensions_list)),
+        )
+
+    def record_sampled_tokens_gpu_state(
+        self,
+        *,
+        sampled_tokens,
+        active_request_count: int,
+        source_stream: Optional[torch.cuda.Stream] = None,
+        sampled_mtp_tokens=None,
+        accepted_token_counts=None,
+    ) -> torch.cuda.Event:
+        """Record GPU-resident sampled tokens for the next input-preparation phase."""
+        return self.gpu_sampled_token_state.record(
+            sampled_tokens=sampled_tokens,
+            active_request_count=active_request_count,
+            source_stream=source_stream,
+            sampled_mtp_tokens=sampled_mtp_tokens,
+            accepted_token_counts=accepted_token_counts,
+        )
+
+    @property
+    def sample_gpu_ready_event(self) -> torch.cuda.Event:
+        """Event recorded when GPU-resident sampled-token state is ready."""
+        return self.gpu_sampled_token_state.sample_gpu_ready_event
+
+    def debug_compare_sampled_tokens_gpu_state(
+        self,
+        *,
+        sampled_tokens_cpu,
+        active_request_count: int,
+        sampled_mtp_tokens_cpu=None,
+        accepted_token_counts_cpu=None,
+    ) -> None:
+        """Compare GPU sampled-token state with CPU output copies in debug mode."""
+        if not self.config.async_overlap_debug_checks:
+            return
+        self.gpu_sampled_token_state.debug_compare_cpu(
+            sampled_tokens_cpu=sampled_tokens_cpu,
+            active_request_count=active_request_count,
+            sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+            accepted_token_counts_cpu=accepted_token_counts_cpu,
         )
 
     def dynamic_step_nvtx_label(self, name: str, step_id: Optional[int] = None) -> str:
