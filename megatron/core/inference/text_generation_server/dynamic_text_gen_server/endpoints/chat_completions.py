@@ -699,6 +699,11 @@ try:
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
             message["generation_log_probs"] = result.get("generated_log_probs", [])
+            message["policy_epoch"] = result["policy_epoch"]
+            message["kv_cache_epoch"] = result["kv_cache_epoch"]
+            message["num_evictions"] = sum(
+                1 for e in result["events"] if e.get("type") == "EVICT"
+            )
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -727,11 +732,6 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
             if current_app.config['verbose']:
                 logging.info(_redact_token_id_lists_for_logging(result))
 
