@@ -1159,6 +1159,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.gpu_input_preparer = GpuInputPreparer(
             stream=self.gpu_bookkeeping_stream,
+            block_size_tokens=self.block_size_tokens,
             debug_enabled=self.config.async_overlap_debug_checks,
         )
         self._gpu_decode_input_pending = False
