@@ -37,12 +37,13 @@ class MambaMetadata:
 
         # Map from requests to slots in the static Mamba state buffer (CPU for bookkeeping).
         self.request_to_mamba_state_idx = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device='cpu',
+            (self.max_requests,), -1, dtype=torch.int32, device='cpu'
         )
 
-        # Map from requests to slots in the static Mamba state buffer for active decode requests
+        # Map from requests to slots in the static Mamba state buffer for active decode requests.
+        # int64 so selective_state_update can index directly without a per-layer upcast kernel;
         self._batch_indices_decode_buffer = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=self.device
+            (self.max_requests,), -1, dtype=torch.int64, device=self.device
         )
 
         # Map from requests to slots in the static Mamba state buffer for active prefill requests
@@ -86,7 +87,7 @@ class MambaMetadata:
 
         # Allocator for Mamba state slots (CPU for bookkeeping).
         self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu',
+            self.max_requests, dtype=torch.int32, device='cpu'
         )
         self.mamba_state_free_slot_count = self.max_requests
 
@@ -142,7 +143,7 @@ class MambaMetadata:
 
         # Re-initialize the free slot pool
         self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu',
+            self.max_requests, dtype=torch.int32, device='cpu'
         )
         self.mamba_state_free_slot_count = self.max_requests
 
@@ -394,12 +395,10 @@ class MambaMetadata:
             # Ensure GPU copies for vectorized GPU ops below.
             if not intermediate_offsets_gpu.is_cuda:
                 intermediate_offsets_gpu = intermediate_offsets_gpu.to(
-                    self.device, non_blocking=True,
+                    self.device, non_blocking=True
                 )
             if not intermediate_counts_gpu.is_cuda:
-                intermediate_counts_gpu = intermediate_counts_gpu.to(
-                    self.device, non_blocking=True,
-                )
+                intermediate_counts_gpu = intermediate_counts_gpu.to(self.device, non_blocking=True)
 
             if total > 0:
                 # Compute cumulative chunk counts from cu_seqlens (already on GPU)
@@ -561,7 +560,9 @@ class MambaMetadata:
                 cu_seqlens_view[real_prefill_count + 1 : padded_prefill_count + 1] = last_val
 
             cu_seqlens_list = cu_seqlens_view[: real_prefill_count + 1].tolist()
-            real_prefill_tokens = cu_seqlens_list[real_prefill_count] if real_prefill_count > 0 else 0
+            real_prefill_tokens = (
+                cu_seqlens_list[real_prefill_count] if real_prefill_count > 0 else 0
+            )
             result["cu_seqlens_list"] = cu_seqlens_list
             result["real_prefill_token_count"] = real_prefill_tokens
 
@@ -592,13 +593,13 @@ class MambaMetadata:
 
             n_cu = padded_max_chunks + 1
             bufs['cu_chunk_seqlens'][:n_cu] = torch.tensor(
-                chunk_boundaries[:n_cu], dtype=torch.int32,
+                chunk_boundaries[:n_cu], dtype=torch.int32
             )
             bufs['last_chunk_indices'][:padded_prefill_count] = torch.tensor(
-                last_chunk_idx_list, dtype=torch.int32,
+                last_chunk_idx_list, dtype=torch.int32
             )
             bufs['seq_idx_for_varlen'][:padded_max_chunks] = torch.tensor(
-                chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32,
+                chunk_to_seq_list[:padded_max_chunks], dtype=torch.int32
             )
             result["padded_max_chunks"] = padded_max_chunks
 
@@ -611,10 +612,10 @@ class MambaMetadata:
                 seq_indices = torch.arange(real_prefill_count, dtype=torch.int32)
                 seq_starts = cu_t[:real_prefill_count].to(torch.int32)
                 conv_seq_idx_view[:real_prefill_tokens] = torch.repeat_interleave(
-                    seq_indices, lengths,
+                    seq_indices, lengths
                 )
                 conv_seq_start_view[:real_prefill_tokens] = torch.repeat_interleave(
-                    seq_starts, lengths,
+                    seq_starts, lengths
                 )
             if padded_token_count > real_prefill_tokens:
                 conv_seq_idx_view[real_prefill_tokens:padded_token_count] = 0

@@ -13,6 +13,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
 from megatron.core.utils import configure_nvtx_profiling, trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
+from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 
@@ -76,11 +77,13 @@ async def run_text_generation_server(
 
 if __name__ == "__main__":
     with torch.inference_mode():
-        args = parse_and_validate_args(
+        parse_and_validate_args(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
         initialize_megatron()
+
+        args = get_args()
 
         # Match training's NVTX gating (training.py only flips this when both
         # --profile and --nvtx-ranges are set). Otherwise the engine-side

@@ -3,6 +3,7 @@
 import asyncio
 from collections import deque
 
+import numpy as np
 import pytest
 import torch
 
@@ -10,7 +11,6 @@ from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictio
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
-    HASH_PRIME,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -141,7 +141,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         tokens = self._prompt(32)
         h1 = compute_block_hashes_batched(tokens, 32)
         h2 = compute_block_hashes_batched(tokens, 32)
-        assert h1 == h2 and len(h1) == 1 and 1 <= h1[0] <= HASH_PRIME
+        assert h1 == h2 and len(h1) == 1 and h1[0] >= 1
         assert compute_block_hashes_batched(self._prompt(32, offset=1), 32)[0] != h1[0]
 
         # parent chaining: 4 blocks of all-zero tokens produce distinct hashes
@@ -159,6 +159,47 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
             torch.arange(bs * 120, device=torch.cuda.current_device(), dtype=torch.long), bs
         )
         assert len(long_h) == 120 and all(v > 0 for v in long_h)
+
+    @pytest.mark.internal
+    def test_hash_collision_resistance(self):
+        """Regression tests: old polynomial collision attacks must fail with SHA-256."""
+        bs = 32
+
+        # V2 regression: algebraic attack (token[j] += 31, token[j+1] -= 1)
+        # This was a zero-delta exploit against the old polynomial hash.
+        tokens = self._prompt(bs)
+        collision = tokens.clone()
+        collision[0] += 31
+        collision[1] -= 1
+        h_orig = compute_block_hashes_batched(tokens, bs)
+        h_coll = compute_block_hashes_batched(collision, bs)
+        assert h_orig != h_coll, "V2 algebraic collision: token[j]+=31, token[j+1]-=1"
+
+        # V2 at different positions within the block
+        for j in range(bs - 1):
+            c = tokens.clone()
+            c[j] += 31
+            c[j + 1] -= 1
+            assert compute_block_hashes_batched(c, bs) != h_orig, f"V2 at position {j}"
+
+        # V2 across multiple blocks: modify one block, verify all downstream hashes change
+        tokens_multi = self._prompt(bs * 4)
+        h_multi = compute_block_hashes_batched(tokens_multi, bs)
+        modified = tokens_multi.clone()
+        modified[0] += 31
+        modified[1] -= 1
+        h_mod = compute_block_hashes_batched(modified, bs)
+        assert h_mod[0] != h_multi[0], "modified block hash must differ"
+        # Parent chaining: all subsequent blocks must also differ
+        for i in range(1, 4):
+            assert h_mod[i] != h_multi[i], f"parent chain: block {i} must differ"
+
+        # V2 generalized: arbitrary linear combinations (token[j] += k*31, token[j+1] -= k)
+        for k in [1, 2, 5, 100]:
+            c = tokens.clone()
+            c[0] += k * 31
+            c[1] -= k
+            assert compute_block_hashes_batched(c, bs) != h_orig, f"V2 generalized k={k}"
 
     @pytest.mark.internal
     def test_registration_and_discovery(self):
@@ -1088,3 +1129,213 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
         # Verify _has_intermediates cleared
         assert not msa._has_intermediates
+
+
+class TestPerBlockRouting(PrefixCachingTestBase):
+    """Tests for per-block routing storage and reconstruction."""
+
+    @pytest.mark.internal
+    def test_store_and_get_block_routing(self):
+        """Verify store_block_routing / get_block_routing round-trip."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        num_layers, topk = 4, 2
+
+        # Allocate a block
+        block_ids = alloc.allocate_memory_blocks(1)
+        bid = block_ids[0].item()
+
+        # Store routing for some positions
+        positions = np.array([0, 1, 2])
+        routing = np.random.randint(-100, 100, size=(3, num_layers, topk), dtype=np.int16)
+        alloc.store_block_routing(bid, positions, routing)
+
+        # Retrieve and verify
+        stored = alloc.get_block_routing(bid)
+        assert stored is not None
+        assert isinstance(stored, np.ndarray)
+        assert stored.shape == (bs, num_layers, topk)
+        assert np.allclose(stored[:3], routing)
+        # Remaining positions should be zero
+        assert (stored[3:] == 0).all()
+
+    @pytest.mark.internal
+    def test_routing_cleared_on_allocate(self):
+        """Routing data is cleared when a block is re-allocated."""
+        ctx = self._ctx(enable_prefix_caching=False)
+        alloc = ctx.kv_block_allocator
+
+        # Allocate, store routing, release, re-allocate
+        block_ids = alloc.allocate_memory_blocks(1)
+        bid = block_ids[0].item()
+        positions = np.array([0])
+        routing = np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
+        alloc.store_block_routing(bid, positions, routing)
+        assert alloc.get_block_routing(bid) is not None
+
+        alloc.release_memory_blocks(block_ids)
+        # After release, routing still present (persists until re-alloc)
+        assert alloc.get_block_routing(bid) is not None
+
+        # Re-allocate the same block
+        new_ids = alloc.allocate_memory_blocks(1)
+        new_bid = new_ids[0].item()
+        # The re-allocated block should have routing cleared
+        assert alloc.get_block_routing(new_bid) is None
+
+    @pytest.mark.internal
+    def test_routing_cleared_on_reset(self):
+        """Routing data is cleared on allocator reset."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+
+        block_ids = alloc.allocate_memory_blocks(1)
+        bid = block_ids[0].item()
+        alloc.store_block_routing(
+            bid, np.array([0]), np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
+        )
+        assert alloc.get_block_routing(bid) is not None
+
+        alloc.reset()
+        assert alloc.get_block_routing(bid) is None
+        assert len(alloc.block_routing) == 0
+
+    @pytest.mark.internal
+    def test_routing_persists_through_deregister(self):
+        """Routing data persists through block deregister (needed for reconstruction)."""
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        # Add a request so blocks get allocated and registered
+        prompt = self._prompt(bs * 2)
+        req = self._req(ctx, prompt)
+        ctx.add_request(req)
+        b0, b1 = self._block_ids(ctx, 0, 2)
+
+        # Store routing for both blocks
+        for bid in [b0, b1]:
+            alloc.store_block_routing(
+                bid, np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
+            )
+
+        # Release blocks (REF_ZERO deregisters immediately)
+        blocks = ctx.request_to_kv_block_ids[0]
+        valid_blocks = blocks[blocks >= 0]
+        alloc.release_memory_blocks(valid_blocks)
+
+        # Routing data should still be present
+        assert alloc.get_block_routing(b0) is not None
+        assert alloc.get_block_routing(b1) is not None
+
+    @pytest.mark.internal
+    def test_reconstruct_routing_from_blocks(self):
+        """Test reconstruction of routing indices from per-block storage."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        num_layers, topk = 4, 2
+
+        # Allocate 3 blocks
+        block_ids = alloc.allocate_memory_blocks(3)
+        bids = block_ids.tolist()
+
+        # Store routing for all positions in first two blocks (full)
+        for bid in bids[:2]:
+            alloc.store_block_routing(
+                bid,
+                np.arange(bs),
+                np.arange(bs * num_layers * topk, dtype=np.int16).reshape(bs, num_layers, topk)
+                + bid,
+            )
+
+        # Store routing for partial last block (e.g., 5 tokens)
+        partial = 5
+        alloc.store_block_routing(
+            bids[2],
+            np.arange(partial),
+            np.arange(partial * num_layers * topk, dtype=np.int16).reshape(
+                partial, num_layers, topk
+            )
+            + bids[2],
+        )
+
+        # total_routing_tokens = 2 full blocks + 5 partial = 2*bs + 5
+        total_routing_tokens = 2 * bs + partial
+
+        result = alloc.reconstruct_routing_from_blocks(bids, total_routing_tokens)
+
+        assert result is not None
+        assert isinstance(result, np.ndarray)
+        assert result.shape == (total_routing_tokens, num_layers, topk)
+
+        # Verify content: first block
+        expected_b0 = (
+            np.arange(bs * num_layers * topk, dtype=np.int16).reshape(bs, num_layers, topk)
+            + bids[0]
+        )
+        assert np.allclose(result[:bs], expected_b0)
+
+        # Verify content: partial last block
+        expected_partial = (
+            np.arange(partial * num_layers * topk, dtype=np.int16).reshape(
+                partial, num_layers, topk
+            )
+            + bids[2]
+        )
+        assert np.allclose(result[2 * bs :], expected_partial)
+
+    @pytest.mark.internal
+    def test_reconstruct_returns_none_for_missing_block(self):
+        """Reconstruction returns None if a block has no routing data."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        block_ids = alloc.allocate_memory_blocks(2)
+        bids = block_ids.tolist()
+
+        # Only store routing for the first block
+        alloc.store_block_routing(
+            bids[0], np.arange(bs), np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
+        )
+
+        result = alloc.reconstruct_routing_from_blocks(bids, 2 * bs)
+        assert result is None
+
+    @pytest.mark.internal
+    def test_routing_survives_prefix_match_lru(self):
+        """In LRU mode, matched blocks' routing persists for the new request."""
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        # First request: 2 full blocks
+        prompt = self._prompt(bs * 2)
+        req1 = self._req(ctx, prompt, request_id=1)
+        ctx.add_request(req1)
+        b0, b1 = self._block_ids(ctx, 0, 2)
+
+        # Store routing for both blocks
+        routing_b0 = np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
+        routing_b1 = np.random.randint(-100, 100, size=(bs, 4, 2), dtype=np.int16)
+        alloc.store_block_routing(b0, np.arange(bs), routing_b0)
+        alloc.store_block_routing(b1, np.arange(bs), routing_b1)
+
+        # Release first request's blocks (LRU: blocks stay cached)
+        blocks = ctx.request_to_kv_block_ids[0]
+        valid_blocks = blocks[blocks >= 0]
+        active_mask = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.int32)
+        new_tokens = torch.tensor([100], device=torch.cuda.current_device())
+        ctx.update_requests(active_mask, new_tokens)
+
+        # Second request with same prefix should match
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        ctx.add_request(req2)
+
+        # The matched blocks should still have routing data
+        assert alloc.get_block_routing(b0) is not None
+        assert np.allclose(alloc.get_block_routing(b0), routing_b0)
+        assert alloc.get_block_routing(b1) is not None
+        assert np.allclose(alloc.get_block_routing(b1), routing_b1)

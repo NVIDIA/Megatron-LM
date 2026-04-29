@@ -118,15 +118,13 @@ class ContextGPUView:
         off += tok_int64_bytes
         self.token_to_block_idx = self._buf[off : off + tok_int32_bytes].view(torch.int32)
         off += tok_int32_bytes
-        self.token_to_local_position_within_kv_block = self._buf[
-            off : off + tok_int32_bytes
-        ].view(torch.int32)
+        self.token_to_local_position_within_kv_block = self._buf[off : off + tok_int32_bytes].view(
+            torch.int32
+        )
         off += tok_int32_bytes
         self.token_to_request_idx = self._buf[off : off + tok_int32_bytes].view(torch.int32)
         off += tok_int32_bytes
-        self.token_to_position_in_request = self._buf[off : off + tok_int32_bytes].view(
-            torch.int32
-        )
+        self.token_to_position_in_request = self._buf[off : off + tok_int32_bytes].view(torch.int32)
         off += tok_int32_bytes
 
         # Request-level tensors (consumed by sampling, log-probs, speculative verification, MTP).
@@ -141,15 +139,15 @@ class ContextGPUView:
         # NonGraphedMHAMetadata — only one is active per step).
         self.mha_query_lengths = self._buf[off : off + mha_query_lengths_bytes].view(torch.int32)
         off += mha_query_lengths_bytes
-        self.mha_cu_query_seq_lengths = self._buf[
-            off : off + mha_cu_query_seq_lengths_bytes
-        ].view(torch.int32)
+        self.mha_cu_query_seq_lengths = self._buf[off : off + mha_cu_query_seq_lengths_bytes].view(
+            torch.int32
+        )
         off += mha_cu_query_seq_lengths_bytes
         self.mha_kv_seq_lengths = self._buf[off : off + mha_kv_seq_lengths_bytes].view(torch.int32)
         off += mha_kv_seq_lengths_bytes
-        self.mha_cu_kv_seq_lengths = self._buf[
-            off : off + mha_cu_kv_seq_lengths_bytes
-        ].view(torch.int32)
+        self.mha_cu_kv_seq_lengths = self._buf[off : off + mha_cu_kv_seq_lengths_bytes].view(
+            torch.int32
+        )
         off += mha_cu_kv_seq_lengths_bytes
         self.mha_block_table = (
             self._buf[off : off + mha_block_table_bytes]
@@ -172,18 +170,14 @@ class ContextGPUView:
             ].view(torch.int32)
             off += mamba_batch_indices_prefill_bytes
             self.mamba_seq_idx = (
-                self._buf[off : off + mamba_seq_idx_bytes]
-                .view(torch.int32)
-                .view(1, max_tokens)
+                self._buf[off : off + mamba_seq_idx_bytes].view(torch.int32).view(1, max_tokens)
             )
             off += mamba_seq_idx_bytes
-            self.mamba_cu_seqlens = self._buf[off : off + mamba_cu_seqlens_bytes].view(
+            self.mamba_cu_seqlens = self._buf[off : off + mamba_cu_seqlens_bytes].view(torch.int32)
+            off += mamba_cu_seqlens_bytes
+            self.mamba_cu_chunk_seqlens = self._buf[off : off + mamba_cu_chunk_seqlens_bytes].view(
                 torch.int32
             )
-            off += mamba_cu_seqlens_bytes
-            self.mamba_cu_chunk_seqlens = self._buf[
-                off : off + mamba_cu_chunk_seqlens_bytes
-            ].view(torch.int32)
             off += mamba_cu_chunk_seqlens_bytes
             self.mamba_last_chunk_indices = self._buf[
                 off : off + mamba_last_chunk_indices_bytes
@@ -193,13 +187,13 @@ class ContextGPUView:
                 off : off + mamba_seq_idx_for_varlen_bytes
             ].view(torch.int32)
             off += mamba_seq_idx_for_varlen_bytes
-            self.mamba_conv_seq_idx = self._buf[
-                off : off + mamba_conv_seq_idx_bytes
-            ].view(torch.int32)
+            self.mamba_conv_seq_idx = self._buf[off : off + mamba_conv_seq_idx_bytes].view(
+                torch.int32
+            )
             off += mamba_conv_seq_idx_bytes
-            self.mamba_conv_seq_start = self._buf[
-                off : off + mamba_conv_seq_start_bytes
-            ].view(torch.int32)
+            self.mamba_conv_seq_start = self._buf[off : off + mamba_conv_seq_start_bytes].view(
+                torch.int32
+            )
             off += mamba_conv_seq_start_bytes
         else:
             self.mamba_batch_indices_decode = None

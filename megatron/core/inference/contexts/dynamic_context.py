@@ -2,6 +2,7 @@
 
 import logging
 import math
+import operator
 import warnings
 from contextlib import nullcontext
 from typing import List, Optional, Sequence, Tuple
@@ -28,8 +29,11 @@ from megatron.core.inference.unified_memory import (
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    Symbols,
+    get_layer_maps_from_layer_type_list,
+)
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
@@ -339,16 +343,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
-            mamba_layer_map, gdn_layer_map, attention_layer_map, _, _ = (
-                get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list)
+            attention_layer_map, dsa_layer_map, gdn_layer_map, mamba_layer_map = (
+                operator.itemgetter(
+                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
+                )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
             )
 
             if len(gdn_layer_map) > 0:
                 raise NotImplementedError("GDN layers are not supported for inference.")
 
-            self.num_attention_layers = len(attention_layer_map)
+            self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
-            self.layer_map = attention_layer_map | mamba_layer_map
+            self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = model_config.num_layers // pp_size
@@ -837,33 +843,33 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-request state (CPU, pinned memory for fast H2D transfer).
         self.request_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device='cpu', pin_memory=True,
+            (self.max_requests,), -1, dtype=torch.int32, device='cpu', pin_memory=True
         )
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty(
-            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         # True only for a new request , then after a forward pass it is set to False
         self.request_in_prefill_status_tensor = torch.empty(
-            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
         self.request_output_lengths = torch.empty(
-            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_kv_length_offsets = torch.empty(
-            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         self.request_kv_block_counts = torch.empty(
-            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         self.request_last_kv_block_id = torch.empty(
-            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         # request_last_kv_block_offset represents number of tokens in the last kv block
         self.request_last_kv_block_offset = torch.empty(
-            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
+            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
         self.request_to_kv_block_ids = torch.full(
             (self.max_requests, self.max_kv_block_count),
@@ -875,9 +881,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Track request metadata.
         self.request_metadata = {
-            label: torch.empty(
-                (self.max_requests,), dtype=dtype, device='cpu', pin_memory=True,
-            )
+            label: torch.empty((self.max_requests,), dtype=dtype, device='cpu', pin_memory=True)
             for label, dtype, _ in self.request_metadata_types
         }
 
@@ -916,9 +920,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Mamba section: 9 int32 fields (hybrid models only). Must match the
         # MambaMetadata shapes (mirrors the layout documented in ContextGPUView).
         if self.is_hybrid_model:
-            self._max_mamba_chunks = (
-                self.max_tokens // self.mamba_chunk_size + self.max_requests
-            )
+            self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
             _mamba_batch_indices_decode_bytes = self.max_requests * 4
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
             _mamba_seq_idx_bytes = self.max_tokens * 4
@@ -959,7 +961,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mamba_conv_seq_start_bytes
         )
         self._cpu_bookkeeping_buf = torch.empty(
-            _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True,
+            _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True
         )
         # token_to_input_ids and token_to_pos_ids were previously torch.full(0);
         # zero the whole buffer so their views start at 0 too, and so the
@@ -989,9 +991,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off : _off + _tok_int32_bytes
         ].view(torch.int32)
         _off += _tok_int32_bytes
-        self.token_to_request_idx = self._cpu_bookkeeping_buf[
-            _off : _off + _tok_int32_bytes
-        ].view(torch.int32)
+        self.token_to_request_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int32_bytes].view(
+            torch.int32
+        )
         _off += _tok_int32_bytes
         self.token_to_position_in_request = self._cpu_bookkeeping_buf[
             _off : _off + _tok_int32_bytes
@@ -1644,7 +1646,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype, _) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
-                metadata_cols[i], dtype=dtype, device='cpu',
+                metadata_cols[i], dtype=dtype, device='cpu'
             )
 
         dummy_block_idx = self.kv_block_allocator.dummy_block_idx
@@ -1725,7 +1727,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)
         shared_sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
         shared_decode_tokens = torch.zeros(
-            self.num_speculative_tokens + 1, dtype=torch.long, device='cpu',
+            self.num_speculative_tokens + 1, dtype=torch.long, device='cpu'
         )
 
         decode_requests = [
@@ -1755,9 +1757,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert per_prefill_tokens > 0
         # Create a single large tensor and slice from it for each prefill request
         max_prefill_tokens = per_prefill_tokens + (1 if rem_prefill_tokens > 0 else 0)
-        shared_prefill_tokens = torch.zeros(
-            max_prefill_tokens, dtype=torch.long, device='cpu',
-        )
+        shared_prefill_tokens = torch.zeros(max_prefill_tokens, dtype=torch.long, device='cpu')
 
         prefill_requests = [
             DynamicInferenceRequest(
@@ -2113,9 +2113,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Batch-zero newly allocated Mamba slots.
         if self._pending_mamba_zeros:
             device = self.mamba_conv_states.device
-            indices = torch.tensor(
-                self._pending_mamba_zeros, dtype=torch.long, device=device,
-            )
+            indices = torch.tensor(self._pending_mamba_zeros, dtype=torch.long, device=device)
             self.mamba_conv_states[:, indices] = 0.0
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
@@ -2140,9 +2138,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # CPU-to-CPU slice assignment on pinned memory (~7.5 KB total for 3
         # int32 fields at max_requests=624). Negligible vs. the launch overhead
         # we save by merging 9 H2D memcpys into 1.
-        self._staging_request_in_prefill_status[:n_active] = (
-            self.request_in_prefill_status_tensor[active_slice]
-        )
+        self._staging_request_in_prefill_status[:n_active] = self.request_in_prefill_status_tensor[
+            active_slice
+        ]
         self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
         self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
             active_slice
@@ -2551,9 +2549,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Increment ref counts and update timestamps for matched (shared) blocks
         if num_matched_blocks > 0:
-            matched_tensor = torch.tensor(
-                matched_block_ids, dtype=torch.int32, device='cpu',
-            )
+            matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
             self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.kv_block_allocator.update_timestamps(matched_tensor)
@@ -2960,9 +2956,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Eviction index range.
         evict_start_idx = self.paused_request_count - evict_request_count
         evict_end_idx = self.paused_request_count
-        evict_request_idxs = torch.arange(
-            evict_start_idx, evict_end_idx, device='cpu',
-        )
+        evict_request_idxs = torch.arange(evict_start_idx, evict_end_idx, device='cpu')
         # Clone needed: subsequent release_memory_blocks_from_request_indexes and
         # _swap_book_keeping_tensors calls mutate self.request_ids in place.
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()

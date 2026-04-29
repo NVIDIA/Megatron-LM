@@ -79,23 +79,23 @@ class MambaSlotAllocator:
         # block_ids and eos_cache_block_id: CPU only (consumed by CPU code).
         k = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
         self._intermediate_offsets_cpu = torch.zeros(
-            (context.max_requests, k), dtype=torch.int32, device='cpu',
+            (context.max_requests, k), dtype=torch.int32, device='cpu'
         )
         self._intermediate_counts_cpu = torch.zeros(
-            context.max_requests, dtype=torch.int32, device='cpu',
+            context.max_requests, dtype=torch.int32, device='cpu'
         )
         self._intermediate_offsets_gpu = torch.zeros(
-            (context.max_requests, k), dtype=torch.int32, device=gpu_device,
+            (context.max_requests, k), dtype=torch.int32, device=gpu_device
         )
         self._intermediate_counts_gpu = torch.zeros(
-            context.max_requests, dtype=torch.int32, device=gpu_device,
+            context.max_requests, dtype=torch.int32, device=gpu_device
         )
         # CPU-only: consumed by _collect_commit_data() which needs .tolist() anyway.
         self._intermediate_block_ids_cpu = torch.full(
-            (context.max_requests, k), -1, dtype=torch.int32, device='cpu',
+            (context.max_requests, k), -1, dtype=torch.int32, device='cpu'
         )
         self._eos_cache_block_id_cpu = torch.full(
-            (context.max_requests,), -1, dtype=torch.int32, device='cpu',
+            (context.max_requests,), -1, dtype=torch.int32, device='cpu'
         )
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
@@ -428,14 +428,12 @@ class MambaSlotAllocator:
 
         # CPU bookkeeping writes (no GPU kernel launches).
         if count > 0:
-            abs_tokens_cpu = torch.tensor(
-                [skip_tokens + o for o in offsets], dtype=torch.int64,
-            )
+            abs_tokens_cpu = torch.tensor([skip_tokens + o for o in offsets], dtype=torch.int64)
             block_indices_cpu = abs_tokens_cpu // ctx.block_size_tokens - 1
             bids_cpu = ctx.request_to_kv_block_ids[current_id][block_indices_cpu]
 
             self._intermediate_offsets_cpu[current_id, :count] = torch.tensor(
-                offsets, dtype=torch.int32,
+                offsets, dtype=torch.int32
             )
             self._intermediate_block_ids_cpu[current_id, :count] = bids_cpu.to(torch.int32)
             self._has_intermediates = True
@@ -486,18 +484,10 @@ class MambaSlotAllocator:
         """
         if prefill_count == 0:
             return None, None
-        offsets_cpu = self._intermediate_offsets_cpu[
-            prefill_start : prefill_start + prefill_count
-        ]
-        counts_cpu = self._intermediate_counts_cpu[
-            prefill_start : prefill_start + prefill_count
-        ]
-        offsets_gpu = self._intermediate_offsets_gpu[
-            prefill_start : prefill_start + prefill_count
-        ]
-        counts_gpu = self._intermediate_counts_gpu[
-            prefill_start : prefill_start + prefill_count
-        ]
+        offsets_cpu = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
+        counts_cpu = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
+        offsets_gpu = self._intermediate_offsets_gpu[prefill_start : prefill_start + prefill_count]
+        counts_gpu = self._intermediate_counts_gpu[prefill_start : prefill_start + prefill_count]
         offsets_gpu.copy_(offsets_cpu, non_blocking=True)
         counts_gpu.copy_(counts_cpu, non_blocking=True)
         return offsets_gpu, counts_gpu
@@ -635,9 +625,7 @@ class MambaSlotAllocator:
         """Reset all state (mappings, free pool, cache, intermediate tracking)."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
-        self.free_slots = torch.arange(
-            self.max_slots, dtype=torch.int32, device='cpu',
-        )
+        self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
         self.intermediate_ssm_out.zero_()

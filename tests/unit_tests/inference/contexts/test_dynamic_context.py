@@ -16,7 +16,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -1871,8 +1871,7 @@ class TestDynamicContext:
             ctx.request_query_lengths[:2], torch.tensor([3, 3], dtype=torch.int32, device='cpu')
         )
         assert torch.equal(
-            ctx.request_kv_length_offsets[:2],
-            torch.tensor([6, 9], dtype=torch.int32, device='cpu'),
+            ctx.request_kv_length_offsets[:2], torch.tensor([6, 9], dtype=torch.int32, device='cpu')
         )
 
         # Check interleaving: [sampled_1, spec1_1, spec2_1, sampled_2, spec1_2, spec2_2]

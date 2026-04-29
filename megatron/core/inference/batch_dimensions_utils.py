@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 
 @dataclass(order=True, frozen=True)
@@ -85,6 +85,10 @@ class InferenceBatchDimensions:
         Returns:
             True if the config is valid, False otherwise
         """
+        # A dimension with no tokens serves no requests.
+        if self.token_count <= 0:
+            return False
+
         # Check if total requests exceed maximum
         if self.prefill_req_count + self.decode_req_count > max_requests:
             return False
@@ -175,16 +179,13 @@ class InferenceBatchDimensions:
         if ep_zmq_communicator is not None:
             # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
             # compute stream plus the H2D/D2H pair that sandwiches it.
-            (
-                max_token_count,
-                max_is_non_decode,
-                max_prefill_count,
-                max_decode_count,
-            ) = ep_zmq_communicator.sync_all_reduce_max(
-                local_batch_dims.token_count,
-                int(is_non_decode),
-                local_batch_dims.prefill_req_count,
-                local_batch_dims.decode_req_count,
+            (max_token_count, max_is_non_decode, max_prefill_count, max_decode_count) = (
+                ep_zmq_communicator.sync_all_reduce_max(
+                    local_batch_dims.token_count,
+                    int(is_non_decode),
+                    local_batch_dims.prefill_req_count,
+                    local_batch_dims.decode_req_count,
+                )
             )
         else:
             sync_tensor = torch.tensor(
@@ -293,7 +294,9 @@ class CUDAGraphBatchDimensionBuilder:
             )
             # Align each entry to TP size
             cuda_graph_token_counts = list(
-                dict.fromkeys(math.ceil(s / tp_size) * tp_size for s in cuda_graph_token_counts)
+                dict.fromkeys(
+                    round_up_to_nearest_multiple(s, tp_size) for s in cuda_graph_token_counts
+                )
             )
             # Clamp to max tokens
             cuda_graph_token_counts = [
@@ -315,7 +318,7 @@ class CUDAGraphBatchDimensionBuilder:
             math.ceil(int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER)
         )
         # Make sure divisible by TP size
-        cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
+        cuda_graph_step_size = round_up_to_nearest_multiple(cuda_graph_step_size, tp_size)
 
         # round down cuda graph max tokens to be multiple of TP size
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
