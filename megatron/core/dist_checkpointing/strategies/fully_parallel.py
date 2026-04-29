@@ -97,10 +97,15 @@ class FullyParallelSaveStrategyWrapper:
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+        use_dtensor_format: bool = False,
+    ):
         """ """
         self.apply_saving_parallelization(sharded_state_dict)
-        return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
+        return self.base_strategy.save(sharded_state_dict, checkpoint_dir, use_dtensor_format)
 
     def apply_saving_parallelization(self, sharded_state_dict: ShardedStateDict) -> None:
         """Distributes the save across ranks by exchanging metadata.
@@ -190,6 +195,7 @@ class FullyParallelLoadStrategyWrapper:
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
         async_strategy: str = "nvrx",
+        use_dtensor_format: bool = False,
     ) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
 
@@ -224,7 +230,9 @@ class FullyParallelLoadStrategyWrapper:
         loaded_state_dict = {}
 
         if get_pg_size(self.parallelization_group) <= 1:
-            return self.base_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+            return self.base_strategy.load(
+                sharded_state_dict, checkpoint_dir, async_strategy, use_dtensor_format
+            )
 
         # Step 1 and 2: exchange load metadata and distribute the load
         with debug_time("self.apply_loading_parallelization", logger):
@@ -252,12 +260,14 @@ class FullyParallelLoadStrategyWrapper:
         with debug_time("base_load_ShardedObjects", logger):
             # Load sharded objects first
             loaded_objects = self.base_strategy.load(
-                to_load_objects, checkpoint_dir, async_strategy
+                to_load_objects, checkpoint_dir, async_strategy, use_dtensor_format
             )
 
         with debug_time("base_load_ShardedTensors", logger):
             # Load sharded tensors separately
-            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
+            loaded_tensors = self.base_strategy.load(
+                to_load_shards, checkpoint_dir, async_strategy, use_dtensor_format
+            )
 
         with debug_time("self.exchange_loaded_tensors", logger):
 

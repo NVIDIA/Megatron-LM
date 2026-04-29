@@ -9,6 +9,7 @@ import warnings
 from abc import ABC
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import product
 from logging import getLogger
 from pathlib import Path
@@ -40,7 +41,7 @@ from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
 from ..core import CheckpointingException
-from ..dict_utils import nested_values
+from ..dict_utils import dict_list_map_inplace, nested_values
 from ..mapping import (
     ShardedBase,
     ShardedObject,
@@ -404,6 +405,92 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
+def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -> StateDict:
+    """Converts ShardedTensor-based state dict to DTensor-based state dict."""
+    num_dtensors = 0
+
+    def sh_ten_to_dtensor(x: Union[ShardedTensor, Any]) -> Union[Any, DTensor]:
+        """Converts ShardedTensor to DTensor."""
+        nonlocal num_dtensors
+
+        if isinstance(x, ShardedTensor):
+            x = x.to_dtensor()
+            num_dtensors += 1
+        elif isinstance(x, ShardedObject):
+            if not all(dim_size == 1 for dim_size in x.global_shape):
+                # Non-trivially-sharded ShardedObjects (e.g. rerun_state_machine with
+                # global_shape=(world_size,)) cannot be represented as DTensors.
+                logger.warning(
+                    f"ShardedObject '{x.key}' has non-trivial global_shape {x.global_shape}. "
+                    "Only coordinator rank's data will be saved in DTensor format."
+                )
+        return x
+
+    dict_list_map_inplace(sh_ten_to_dtensor, sharded_state_dict)
+    logger.info(f"Num of converted ShardedTensors to DTensors: {num_dtensors}")
+    return sharded_state_dict
+
+
+def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
+    """ """
+
+    def dtensor_to_ten(x: Union[DTensor, Any]) -> Union[Any, torch.Tensor]:
+        if isinstance(x, DTensor):
+            x = x.to_local()
+        elif isinstance(x, CheckpointableShardedTensor):
+            x = x._sh_ten.data
+        elif isinstance(x, ShardedObject):
+            x = x.data
+        return x
+
+    dict_list_map_inplace(dtensor_to_ten, state_dict)
+    return state_dict
+
+
+@dataclass
+class PlaceholderValue:
+    """ """
+
+    key: str
+
+
+def inject_placeholders(sharded_state_dict: ShardedStateDict) -> Dict[str, Any]:
+    """Replaces values in state dict with ValuePlaceholders.
+
+    Extracts all values from a given state dict to a flat dict, injecting
+    placeholders instead to allow later recovery with `fill_placeholders`.
+    """
+    # TODO: in order to handle arbitrary DTensors (without `.key` attribute)
+    #  an additional step computing FQNs might be needed (`traverse_state_dict`?)
+    #  which computes DTensor.key
+    extracted_values = {}
+
+    def _replace_with_placeholder(x: Union[ShardedBase, DTensor]):
+        if isinstance(x, DTensor):
+            if not hasattr(x, 'key'):
+                raise NotImplementedError(f'DTensors currently require `key` attribute, got: {x}')
+        elif not isinstance(x, ShardedBase):
+            raise RuntimeError(f'Unexpected type {x} during placeholders injection')
+
+        if x.key in extracted_values:
+            raise RuntimeError(f'Duplicated sharded key encountered: {x.key}')
+        extracted_values[x.key] = x
+        return PlaceholderValue(x.key)
+
+    dict_list_map_inplace(_replace_with_placeholder, sharded_state_dict)
+    return extracted_values
+
+
+def fill_placeholders(sharded_state_dict: ShardedStateDict, loaded_values: Dict[str, Any]) -> None:
+    """Inverse of `inject_placeholders`."""
+
+    def _fill_placeholder(x: PlaceholderValue):
+        assert isinstance(x, PlaceholderValue)
+        return loaded_values[x.key]
+
+    dict_list_map_inplace(_fill_placeholder, sharded_state_dict)
+
+
 class MCoreSavePlanner(DefaultSavePlanner):
     """Differs with the default planner by saving BytesIO objects on all ranks.
 
@@ -650,12 +737,37 @@ class TorchDistSaveShardedStrategy:
 
         self.validated_loaded_metadata_reuse = False
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+        use_dtensor_format: bool = False,
+    ):
         """Each async strategy can be trivially used as a sync strategy."""
-        strategy = "nvrx" if HAVE_NVRX else "mcore"
-        async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy=strategy)
-        async_request.execute_sync()
-        del async_request
+        if use_dtensor_format:
+            values_to_save = inject_placeholders(sharded_state_dict)
+            values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
+            fill_placeholders(sharded_state_dict, values_to_save)
+            # With PP > 1 different pipeline stages hold different parameters that
+            # share the same local optimizer-state index (e.g. "state.1.exp_avg_sq").
+            # Wrapping each stage's dict under a "ppN" key gives every stage a unique
+            # DCP path, preventing shape-mismatch collisions on save and load.
+            from megatron.core import parallel_state as mpu
+
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            if pp_size > 1:
+                pp_rank = mpu.get_pipeline_model_parallel_rank()
+                dcp_state_dict = {f"pp{pp_rank}": sharded_state_dict}
+            else:
+                dcp_state_dict = sharded_state_dict
+            return torch.distributed.checkpoint.save(dcp_state_dict, checkpoint_id=checkpoint_dir)
+        else:
+            strategy = "nvrx" if HAVE_NVRX else "mcore"
+            async_request = self.async_save(
+                sharded_state_dict, checkpoint_dir, async_strategy=strategy
+            )
+            async_request.execute_sync()
+            del async_request
 
     def async_save(
         self,
@@ -847,6 +959,7 @@ class TorchDistLoadShardedStrategy:
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
         async_strategy: str = "nvrx",
+        use_dtensor_format: bool = False,
     ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
@@ -857,6 +970,26 @@ class TorchDistLoadShardedStrategy:
 
         Returns: loaded state dict
         """
+        if use_dtensor_format:
+            values_to_load = inject_placeholders(sharded_state_dict)
+            values_to_load = convert_state_dict_to_dcp_compatible(values_to_load)
+            fill_placeholders(sharded_state_dict, values_to_load)
+
+            from megatron.core import parallel_state as mpu
+
+            pp_size = mpu.get_pipeline_model_parallel_world_size()
+            if pp_size > 1:
+                pp_rank = mpu.get_pipeline_model_parallel_rank()
+                dcp_state_dict = {f"pp{pp_rank}": sharded_state_dict}
+            else:
+                dcp_state_dict = sharded_state_dict
+            torch.distributed.checkpoint.load(
+                state_dict=dcp_state_dict, checkpoint_id=checkpoint_dir
+            )
+            unwrap_dtensors_and_sh_ten(sharded_state_dict)
+
+            return sharded_state_dict
+
         flexible_shape_sharded_tensors = [
             sh_ten
             for sh_ten in nested_values(sharded_state_dict)

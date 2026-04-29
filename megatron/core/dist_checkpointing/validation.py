@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
+from torch.distributed.tensor import DTensor
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import (
@@ -396,8 +397,10 @@ def validate_sharding_integrity(
     for key, shardings in key_shardings.items():
         if isinstance(shardings[0][1], ShardedObject):
             errors.extend(_validate_objects_for_key(shardings))
-        else:
+        elif isinstance(shardings[0][1], ShardedTensor):
             errors.extend(_validate_sharding_for_key(shardings))
+        else:
+            assert isinstance(shardings[0][1], DTensor), type(shardings[0][1])
 
     if errors:
         errors = '\n'.join(str(e) for e in errors)

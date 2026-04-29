@@ -563,6 +563,9 @@ class CheckpointConfig:
     by using Gloo (instead of NCCL) and only one rank for saving. Turn on only if experiencing host or device memory
     issues. Has affect only with `dist_ckpt_optim_fully_reshardable` flag."""
 
+    dist_ckpt_use_dtensor_format: bool = False
+    """Sets distributed checkpoint tensors fromat to torch's DTensor."""
+
     save_tokenizer_assets: bool = True
     """Save tokenizer files to checkpoint directory. When enabled, saves all tokenizer artifacts
     (vocab files, special tokens, tokenizer config) to make checkpoints self-contained and portable.
@@ -594,6 +597,11 @@ class CheckpointConfig:
                 "Please, install nvidia-resiliency-ext to enable async save."
             )
 
+        if self.dist_ckpt_use_dtensor_format:
+            assert self.ckpt_format == "torch_dist", \
+                "`dist_ckpt_use_dtensor_format` is only supported with `torch_dist` format."
+            assert not self.async_save, \
+                "`dist_ckpt_use_dtensor_format` is not supported with `--async-save.`"
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
                 f"`verify_integrity` is only supported with torch_dist checkpoint format."

@@ -29,6 +29,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
+    get_dtensor_metadata,
     get_tensor_model_parallel_group_if_none,
     nvtx_range_pop,
     nvtx_range_push,
@@ -357,7 +358,10 @@ class MLP(MegatronModule):
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
                         sub_sd[k] = apply_swiglu_sharded_factory(
-                            v, sharded_offsets, singleton_local_shards
+                            v,
+                            sharded_offsets,
+                            singleton_local_shards,
+                            metadata.get("use_dtensor_format", False),
                         )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
@@ -369,7 +373,10 @@ class MLP(MegatronModule):
 
 # pylint: disable=missing-function-docstring
 def apply_swiglu_sharded_factory(
-    original_sh_ten, sharded_offsets, singleton_local_shards: bool = False
+    original_sh_ten,
+    sharded_offsets,
+    singleton_local_shards: bool = False,
+    use_dtensor_format: bool = False,
 ):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
@@ -408,6 +415,14 @@ def apply_swiglu_sharded_factory(
             v_key = key
 
         tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
+
+        kwargs = {}
+        if use_dtensor_format:
+            placements, device_mesh = get_dtensor_metadata(tp=True, tp_axis=swiglu_shard_axis)
+            kwargs.update(
+                dict(dtensor_ckpt_device_mesh=device_mesh, dtensor_ckpt_placements=placements)
+            )
+
         return [
             ShardedTensor.from_rank_offsets(
                 w_key,
@@ -416,6 +431,7 @@ def apply_swiglu_sharded_factory(
                 offset_w,
                 replica_id=replica_id,
                 prepend_axis_num=prepend_axis_num,
+                **kwargs,
             ),
             ShardedTensor.from_rank_offsets(
                 v_key,
@@ -424,6 +440,7 @@ def apply_swiglu_sharded_factory(
                 offset_v,
                 replica_id=replica_id,
                 prepend_axis_num=prepend_axis_num,
+                **kwargs,
             ),
         ]
 

@@ -93,6 +93,7 @@ class MegatronModule(torch.nn.Module):
             sharded_offsets=sharded_offsets,
             tp_group=tp_group,
             dp_cp_group=metadata['dp_cp_group'],
+            use_dtensor_format=metadata.get("use_dtensor_format", False),
         )
         # Recurse into submodules
         for name, module in self.named_children():
