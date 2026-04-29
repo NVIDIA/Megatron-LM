@@ -2065,13 +2065,17 @@ class DynamicInferenceEngine(AbstractEngine):
         async-scheduling fired a rejection), drain it on the stream so the
         canonical state can launch step N afresh without races.
         """
-        # Drain a stale speculative pre-launch (and roll back its RNG / clear
-        # rejection state) only when one is actually pending. When there is no
-        # pre-launch in flight this branch is a no-op so the serial path is
-        # byte-identical to the pre-async-scheduling code path.
+        # Drain a stale speculative pre-launch (and roll back its RNG) only
+        # when one is actually pending. When there is no pre-launch in flight
+        # this branch is a no-op so the serial path is byte-identical to the
+        # pre-async-scheduling code path.
         if self._pending_launch_state is not None:
             self._drain_pending_launch()
-            self._clear_rejection()
+        # Always clear the rejection flag here. The flag is set when a future
+        # iter's pre-launch is invalidated; once we're in the serial path and
+        # any pending launch has been drained, the flag has done its job and
+        # leaving it set would prevent async-scheduling from ever resuming.
+        self._clear_rejection()
         last_step_data = await self.async_forward()
         return await self.async_bookkeep(*last_step_data)
 
@@ -2293,6 +2297,12 @@ class DynamicInferenceEngine(AbstractEngine):
         #     finished requests and would corrupt downstream state.
         #   - newly_paused: memory pressure forced a request out mid-step.
         #   - evict: paused-pool overflow forced a request out.
+        # Signal unconditionally to keep ranks in lockstep (rejection state
+        # must agree across EP ranks — _async_scheduling_active is a per-rank
+        # gate, so divergent _rejection_pending would put ranks on different
+        # paths and desynchronize NCCL/ZMQ collectives). The serial path's
+        # drain helper at line 2079+ tolerates pending=None (no-op drain) and
+        # always clears the flag so the engine returns to async-scheduling.
         finished_ids = bookkeep_state.get("finished_request_ids")
         if finished_ids is not None and len(finished_ids) > 0:
             self._signal_rejection()
