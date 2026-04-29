@@ -32,6 +32,11 @@ class ContextGPUView:
         device: torch.device,
         max_mamba_chunks: int = 0,
     ):
+        # CPU-side debug identity for trace correlation. Later snapshot-pool
+        # work will replace this singleton identity with per-slot handles.
+        self.current_dynamic_step_id = -1
+        self.current_snapshot_slot_id = 0
+
         # Field layout (must match DynamicInferenceContext's CPU buffer layout):
         #   int64 token fields first (auto 8-byte alignment), then int32 token
         #   fields, then int32 request fields, then int32 MHA fields, then

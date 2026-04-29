@@ -11,7 +11,7 @@ import time
 import warnings
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
@@ -150,6 +150,20 @@ class RequestEntry:
 
     record: DynamicInferenceRequestRecord
     future: asyncio.Future
+
+
+@dataclass
+class AsyncOverlapDebugCounters:
+    """Debug counters used by the async-overlap rollout path."""
+
+    queue_depth: int = 1
+    snapshot_slot_waits: int = 0
+    output_event_waits: int = 0
+    fallback_or_queue_depth_one_reasons: Dict[str, int] = field(default_factory=dict)
+    discarded_lookahead_tokens: int = 0
+    placeholder_count: int = 0
+    reservation_commits: int = 0
+    reservation_rollbacks: int = 0
 
 
 # pylint: disable=line-too-long
@@ -307,9 +321,26 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefix_cache_hits = 0
         self._prefix_cache_blocks_matched = 0
         self._prefix_coordination_waits = 0
+        self._next_dynamic_step_id = 0
+        self._current_dynamic_step_id = -1
+        self.async_overlap_debug_counters = AsyncOverlapDebugCounters()
 
         # Coordinator state.
         self.use_coordinator = False
+
+    def _step_nvtx_label(self, name: str, step_id: Optional[int] = None) -> str:
+        """Return an NVTX range name with a dynamic step id."""
+        if step_id is None:
+            step_id = self._current_dynamic_step_id
+        return f"{name}[step={step_id}]"
+
+    def _begin_dynamic_step(self) -> int:
+        """Allocate and publish the next monotonic dynamic step id."""
+        step_id = self._next_dynamic_step_id
+        self._next_dynamic_step_id += 1
+        self._current_dynamic_step_id = step_id
+        self.context.set_current_dynamic_step_id(step_id)
+        return step_id
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -1651,8 +1682,13 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
+        step_id = self._begin_dynamic_step()
+
         # schedule requests
+        scheduling_range = self._step_nvtx_label("scheduling", step_id)
+        nvtx_range_push(scheduling_range)
         self.schedule_waiting_requests()
+        nvtx_range_pop(scheduling_range)
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
@@ -1672,6 +1708,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 "paused_request_count": self.context.paused_request_count,
                 "active_token_count": self.context.active_token_count,
                 "step_count": self.context.step_count,
+                "dynamic_step_id": step_id,
             }
         else:
             # active_token_count and step_count are still consumed by
@@ -1680,10 +1717,14 @@ class DynamicInferenceEngine(AbstractEngine):
             pre_step_context_state = {
                 "active_token_count": self.context.active_token_count,
                 "step_count": self.context.step_count,
+                "dynamic_step_id": step_id,
             }
 
         # Generate tokens.
-        nvtx_range_push("Prefill" if not is_decode_only else "Decode")
+        step_type_range = self._step_nvtx_label(
+            "Prefill" if not is_decode_only else "Decode", step_id
+        )
+        nvtx_range_push(step_type_range)
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
@@ -1699,7 +1740,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
-        nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
+        nvtx_range_pop(step_type_range)
 
         if will_log_this_step:
             kvcache_util_stats = (
@@ -1743,7 +1784,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
         # Increment finished_request_count.
-        nvtx_range_push("bookkeeping")
+        step_id = context_state.get("dynamic_step_id", self._current_dynamic_step_id)
+        output_retirement_range = self._step_nvtx_label("output_retirement", step_id)
+        nvtx_range_push(output_retirement_range)
         cuda_graph_request_count = None
 
         if step_result is not None:
@@ -1764,6 +1807,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests (adds FINISH events and returns records).
+            post_process_range = self._step_nvtx_label("post_process_requests", step_id)
+            nvtx_range_push(post_process_range)
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
@@ -1777,6 +1822,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
             )
+            nvtx_range_pop(post_process_range)
 
         else:
             active_request_ids: list[int] = []
@@ -1792,13 +1838,14 @@ class DynamicInferenceEngine(AbstractEngine):
             ), f"Failed request {failed_request_id} future has not been properly resolved."
         self.failed_request_ids.clear()
 
-        nvtx_range_pop("bookkeeping")
+        nvtx_range_pop(output_retirement_range)
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will
         # overlap detokenization with the engine.
         if not self.use_coordinator:
-            nvtx_range_push("detokenization")
+            detokenization_range = self._step_nvtx_label("detokenization", step_id)
+            nvtx_range_push(detokenization_range)
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
@@ -1812,7 +1859,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.generated_tokens,
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
-            nvtx_range_pop("detokenization")
+            nvtx_range_pop(detokenization_range)
 
         # Handle necessary ZMQ DP coordinator communication.
         # Failed request replies were already sent in _handle_failed_request,
@@ -1822,13 +1869,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
             if records_to_send:
-                nvtx_range_push("coordinator_communication")
+                coordinator_range = self._step_nvtx_label("coordinator_send", step_id)
+                nvtx_range_push(coordinator_range)
                 payload = msgpack.packb(
                     [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
                     use_bin_type=True,
                 )
                 self.socket_for_receiving_requests.send(payload)
-                nvtx_range_pop("coordinator_communication")
+                nvtx_range_pop(coordinator_range)
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
@@ -2068,7 +2116,8 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
-        nvtx_range_push("drain_zmq_socket")
+        drain_range = self._step_nvtx_label("event_polling.drain_zmq_socket")
+        nvtx_range_push(drain_range)
         all_messages = []
         if self.is_mp_coordinator:
             while True:
@@ -2101,7 +2150,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 all_messages = []
 
-        nvtx_range_pop("drain_zmq_socket")
+        nvtx_range_pop(drain_range)
 
         # First pass: add requests.
         # Control signals are queued for the second pass.
@@ -2112,9 +2161,10 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                nvtx_range_push("add_request")
+                add_request_range = self._step_nvtx_label("scheduling.add_request")
+                nvtx_range_push(add_request_range)
                 self.add_request(request_id, prompt, sampling_params)
-                nvtx_range_pop("add_request")
+                nvtx_range_pop(add_request_range)
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:
@@ -2258,7 +2308,8 @@ class DynamicInferenceEngine(AbstractEngine):
             (global_work, all_pausing): max work across EP, and whether
             all peers signaled consensus.
         """
-        nvtx_range_push("_ep_establish_consensus")
+        consensus_range = self._step_nvtx_label("event_polling.ep_consensus")
+        nvtx_range_push(consensus_range)
 
         consensus_val = -1 if signal_consensus else 0
 
@@ -2283,7 +2334,7 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             global_work, global_consensus = local_work, consensus_val
 
-        nvtx_range_pop("_ep_establish_consensus")
+        nvtx_range_pop(consensus_range)
         return global_work, global_consensus == -1
 
     async def _world_barrier(self):
@@ -2295,12 +2346,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         No-op when world_size == 1 (communicator is not created).
         """
-        nvtx_range_push("world_barrier")
+        barrier_range = self._step_nvtx_label("event_polling.world_barrier")
+        nvtx_range_push(barrier_range)
         if hasattr(self, 'world_zmq_communicator'):
             await self.world_zmq_communicator.all_reduce_max(
                 1, async_op=(not self.use_synchronous_zmq_collectives)
             )
-        nvtx_range_pop("world_barrier")
+        nvtx_range_pop(barrier_range)
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(

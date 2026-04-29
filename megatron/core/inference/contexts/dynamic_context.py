@@ -33,7 +33,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_pg_size, internal_api
+from megatron.core.utils import get_pg_size, internal_api, nvtx_range_pop, nvtx_range_push
 
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -270,6 +270,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
+        self.current_dynamic_step_id = -1
+        self.async_overlap_debug_counters = {
+            "queue_depth": 1,
+            "snapshot_slot_waits": 0,
+            "output_event_waits": 0,
+            "fallback_or_queue_depth_one_reasons": {},
+            "discarded_lookahead_tokens": 0,
+            "placeholder_count": 0,
+            "reservation_commits": 0,
+            "reservation_rollbacks": 0,
+        }
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -1095,6 +1106,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+        self.gpu_view.current_dynamic_step_id = self.current_dynamic_step_id
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
         # only one is active per step, so sharing storage is safe.
@@ -1995,6 +2007,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         assert self.active_attn_metadata is not None
 
+        metadata_range = self.dynamic_step_nvtx_label("attention_metadata_build")
+        nvtx_range_push(metadata_range)
+
         # Compute MHA metadata directly into the pinned CPU section of
         # _cpu_bookkeeping_buf. The single coalesced H2D in
         # transfer_bookkeeping_to_gpu() covers these fields along with the rest
@@ -2087,6 +2102,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_offsets_gpu=intermediate_offsets_gpu,
                 intermediate_counts_gpu=intermediate_counts_gpu,
             )
+
+        nvtx_range_pop(metadata_range)
 
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
@@ -2230,6 +2247,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset step counter and LRU clock
         self.step_count = 0
         self.prefix_cache_lru_clock = 0
+        self.set_current_dynamic_step_id(-1)
+        self.async_overlap_debug_counters.update(
+            {
+                "queue_depth": 1,
+                "snapshot_slot_waits": 0,
+                "output_event_waits": 0,
+                "fallback_or_queue_depth_one_reasons": {},
+                "discarded_lookahead_tokens": 0,
+                "placeholder_count": 0,
+                "reservation_commits": 0,
+                "reservation_rollbacks": 0,
+            }
+        )
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
@@ -2239,6 +2269,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+
+    def set_current_dynamic_step_id(self, step_id: int) -> None:
+        """Set the CPU/GPU debug step identity used for trace labels."""
+        self.current_dynamic_step_id = step_id
+        if hasattr(self, "gpu_view"):
+            self.gpu_view.current_dynamic_step_id = step_id
+
+    def dynamic_step_nvtx_label(self, name: str, step_id: Optional[int] = None) -> str:
+        """Return an NVTX range name with the current dynamic step id."""
+        if step_id is None:
+            step_id = self.current_dynamic_step_id
+        return f"{name}[step={step_id}]"
 
     def reset(self) -> None:
         """Reset entire context.

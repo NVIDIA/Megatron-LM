@@ -577,7 +577,7 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state (100% CPU computation).
-        range_push("initialize_attention_state")
+        range_push(context.dynamic_step_nvtx_label("context_init"))
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
@@ -585,7 +585,7 @@ class TextGenerationController:
         range_pop()
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
-        range_push("transfer_bookkeeping_to_gpu")
+        range_push(context.dynamic_step_nvtx_label("transfer_bookkeeping_to_gpu"))
         context.transfer_bookkeeping_to_gpu()
         range_pop()
 
@@ -1788,13 +1788,13 @@ class TextGenerationController:
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Batch GPU-to-CPU transfer of all sampled tokens.
-        range_push("transfer_samples_to_cpu")
+        range_push(context.dynamic_step_nvtx_label("sampled_output_d2h"))
         sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
             active_request_count,
         )
         range_pop()
 
-        range_push("active_request_mask")
+        range_push(context.dynamic_step_nvtx_label("active_request_mask"))
         # Everything below is 100% CPU.
         active_request_ids = context.request_ids[active_request_slice].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
@@ -1830,7 +1830,7 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
-        range_push("update_requests")
+        range_push(context.dynamic_step_nvtx_label("update_requests"))
         update_result = context.update_requests(
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
         )
@@ -1887,7 +1887,7 @@ class TextGenerationController:
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
-            range_push("forward_pass")
+            range_push(context.dynamic_step_nvtx_label("forward"))
             logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
             # Commit Mamba intermediate states before update_requests, which
@@ -1911,11 +1911,12 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         with torch.inference_mode():
-            range_push("sampling")
+            range_push(context.dynamic_step_nvtx_label("sampling"))
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             self._dynamic_step_sample_bookkeeping()
 
+            range_push(context.dynamic_step_nvtx_label("sampled_token_gpu_handoff"))
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 self._dynamic_step_sample_logits_and_verify_tokens(logits, input_ids)
@@ -1931,6 +1932,7 @@ class TextGenerationController:
                 self._compute_serial_mtp_and_sample()
             else:
                 self._dynamic_step_sample_logits(logits)
+            range_pop()
 
             log_probs = None
             top_n_logprobs = None
@@ -1955,9 +1957,11 @@ class TextGenerationController:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
                 # downstream consumers.
+                range_push(context.dynamic_step_nvtx_label("sampled_output_d2h"))
                 request_bookkeeping = {
                     "sample": self._sampled_tokens_cuda[:active_request_count].cpu(),
                 }
+                range_pop()
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
