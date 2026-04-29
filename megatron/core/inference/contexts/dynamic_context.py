@@ -2803,21 +2803,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
 
-        new_block_ids = None
-        if num_blocks_from_pool > 0:
-            new_block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks_from_pool)
-            if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
-                raise BlockOverflowError(req.request_id)
-
-        # Increment ref counts and update timestamps for matched (shared) blocks
-        if num_matched_blocks > 0:
-            matched_tensor = torch.tensor(
-                matched_block_ids, dtype=torch.int32, device='cpu',
-            )
-            self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                self.kv_block_allocator.update_timestamps(matched_tensor)
-
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
         # make the last request the continuing chunked prefill request if one exists.
@@ -2831,6 +2816,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             > self.max_tokens
         ):
             raise TokenOverflowError(req.request_id)
+
+        new_block_ids = None
+        new_block_reservation = None
+        if num_blocks_from_pool > 0:
+            step_id = max(0, int(self.current_dynamic_step_id))
+            new_block_reservation = self.kv_block_allocator.reserve_blocks(
+                current_id, num_blocks_from_pool, step_id
+            )
+            if new_block_reservation is None:
+                raise BlockOverflowError(req.request_id)
+            self.record_resource_reservation(step_id, new_block_reservation)
+            new_block_ids = torch.tensor(
+                new_block_reservation.kv_block_ids, dtype=torch.int32, device='cpu'
+            )
+
+        # Increment ref counts and update timestamps for matched (shared) blocks
+        if num_matched_blocks > 0:
+            matched_tensor = torch.tensor(
+                matched_block_ids, dtype=torch.int32, device='cpu',
+            )
+            self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+                self.kv_block_allocator.update_timestamps(matched_tensor)
 
         self.request_ids[current_id] = req.request_id
 
@@ -2873,6 +2881,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_to_kv_block_ids[current_id][
                 new_block_start : new_block_start + len(new_block_ids)
             ] = new_block_ids
+            self.kv_block_allocator.commit_reservation(new_block_reservation)
 
         self.request_kv_length_offsets[current_id] = effective_kv_offset
         self.request_kv_block_counts[current_id] = overall_required_blocks
@@ -3167,7 +3176,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if num_new_blocks > 0:
                 assert num_new_blocks <= self.kv_block_allocator.total_avail
-                block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
+                step_id = max(0, int(self.current_dynamic_step_id))
+                reservation = self.kv_block_allocator.reserve_blocks(
+                    resume_start, num_new_blocks, step_id
+                )
+                if reservation is None:
+                    raise BlockOverflowError(int(self.request_ids[resume_start].item()))
+                self.record_resource_reservation(step_id, reservation)
+                block_ids = torch.tensor(reservation.kv_block_ids, dtype=torch.int32, device='cpu')
 
                 # Apply updates only to the requests that required a new block
                 relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)
@@ -3177,6 +3193,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
                 self.request_kv_block_counts[row_idx] += 1
                 self.request_last_kv_block_id[row_idx] = block_ids
+                self.kv_block_allocator.commit_reservation(reservation)
 
         # Remove resumed requests from newly_paused_request_ids. We do this by
         # truncating the end of newly_paused_request_ids, which works because we

@@ -8,6 +8,8 @@ from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
+from .step_journal import ResourceReservation
+
 
 class KVBlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
@@ -39,6 +41,11 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self._next_reservation_id = 0
+        self._open_reservations: Dict[int, ResourceReservation] = {}
+        self._committed_reservations: Dict[int, ResourceReservation] = {}
+        self._rolled_back_reservations: Dict[int, ResourceReservation] = {}
+        self._deferred_snapshot_block_releases: Dict[int, list[Tensor]] = {}
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -185,6 +192,67 @@ class KVBlockAllocator:
 
         return block_ids
 
+    def reserve_blocks(
+        self, request_slot: int, count: int, step_id: int, snapshot_slot_id: int = 0
+    ) -> Optional[ResourceReservation]:
+        """Reserve KV blocks for a scheduled-but-not-retired step."""
+        if count == 0:
+            block_ids = torch.empty(0, dtype=torch.int32, device='cpu')
+        else:
+            block_ids = self.allocate_memory_blocks(count)
+            if block_ids is None:
+                return None
+        reservation = ResourceReservation(
+            step_id=int(step_id),
+            request_slot=int(request_slot),
+            snapshot_slot_id=int(snapshot_slot_id),
+            reservation_id=self._next_reservation_id,
+            kv_block_ids=tuple(int(block_id) for block_id in block_ids.tolist()),
+        )
+        self._next_reservation_id += 1
+        self._open_reservations[reservation.reservation_id] = reservation
+        return reservation
+
+    def commit_reservation(self, reservation: ResourceReservation) -> None:
+        """Commit a KV reservation into durable request ownership."""
+        open_reservation = self._open_reservations.pop(reservation.reservation_id, None)
+        if open_reservation is None:
+            if reservation.reservation_id in self._committed_reservations:
+                return
+            raise RuntimeError(f"KV reservation {reservation.reservation_id} is not open")
+        self._committed_reservations[reservation.reservation_id] = open_reservation
+        if hasattr(self.context, "async_overlap_debug_counters"):
+            self.context.async_overlap_debug_counters["reservation_commits"] += 1
+
+    def rollback_reservation(self, reservation: ResourceReservation) -> None:
+        """Roll back a KV reservation and return its blocks to the allocator."""
+        open_reservation = self._open_reservations.pop(reservation.reservation_id, None)
+        if open_reservation is None:
+            if reservation.reservation_id in self._rolled_back_reservations:
+                return
+            raise RuntimeError(f"KV reservation {reservation.reservation_id} is not open")
+        block_ids = torch.tensor(open_reservation.kv_block_ids, dtype=torch.int32, device='cpu')
+        self.release_memory_blocks(block_ids)
+        self._rolled_back_reservations[reservation.reservation_id] = open_reservation
+        if hasattr(self.context, "async_overlap_debug_counters"):
+            self.context.async_overlap_debug_counters["reservation_rollbacks"] += 1
+
+    def defer_release_until_snapshot_retired(
+        self, block_ids: Tensor, snapshot_slot_id: int
+    ) -> None:
+        """Defer block release until the owning snapshot can no longer read them."""
+        if block_ids.numel() == 0:
+            return
+        self._deferred_snapshot_block_releases.setdefault(int(snapshot_slot_id), []).append(
+            block_ids.to(dtype=torch.int32, device='cpu').clone()
+        )
+
+    def release_deferred_blocks_for_snapshot(self, snapshot_slot_id: int) -> None:
+        """Release blocks whose snapshot-read dependency has retired."""
+        deferred = self._deferred_snapshot_block_releases.pop(int(snapshot_slot_id), [])
+        for block_ids in deferred:
+            self.release_memory_blocks(block_ids)
+
     def release_memory_blocks(self, blocks: Tensor) -> None:
         """Release memory blocks by decrementing reference counts.
 
@@ -244,6 +312,11 @@ class KVBlockAllocator:
         )
 
         self.total_avail = self.total_count - 1
+        self._open_reservations.clear()
+        self._committed_reservations.clear()
+        self._rolled_back_reservations.clear()
+        self._deferred_snapshot_block_releases.clear()
+        self._next_reservation_id = 0
 
         if self.enable_prefix_caching:
             # Reset all block hashes

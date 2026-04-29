@@ -40,6 +40,32 @@ def _freeze_mapping(value: Optional[Mapping[Any, Any]]) -> Mapping[Any, Any]:
 
 
 @dataclass(frozen=True, kw_only=True)
+class ResourceReservation:
+    """Allocator resources reserved for a scheduled step."""
+
+    step_id: int
+    request_slot: int
+    snapshot_slot_id: int = 0
+    reservation_id: int = -1
+    kv_block_ids: Sequence[int] = field(default_factory=tuple)
+    mamba_slot_ids: Sequence[int] = field(default_factory=tuple)
+    prefix_cache_refcount_deltas: Mapping[Any, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.step_id < 0:
+            raise ValueError(f"step_id must be >= 0, got {self.step_id}")
+        if self.snapshot_slot_id < 0:
+            raise ValueError(f"snapshot_slot_id must be >= 0, got {self.snapshot_slot_id}")
+        object.__setattr__(self, "kv_block_ids", _int_tuple(self.kv_block_ids))
+        object.__setattr__(self, "mamba_slot_ids", _int_tuple(self.mamba_slot_ids))
+        object.__setattr__(
+            self,
+            "prefix_cache_refcount_deltas",
+            _freeze_mapping(self.prefix_cache_refcount_deltas),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
 class StepJournalEntry:
     """Immutable journal record for one dynamic step."""
 
