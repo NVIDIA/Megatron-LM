@@ -2,6 +2,7 @@
 
 import torch
 
+from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 
 
@@ -11,6 +12,7 @@ class FakeContext:
             "reservation_commits": 0,
             "reservation_rollbacks": 0,
         }
+        self.prefix_cache_lru_clock = 1
 
 
 def test_kv_reservation_commit_keeps_blocks_owned():
@@ -81,3 +83,49 @@ def test_reset_clears_reservation_state():
     assert allocator._committed_reservations == {}
     assert allocator._rolled_back_reservations == {}
     assert allocator._deferred_snapshot_block_releases == {}
+
+
+def test_prefix_refcount_reservation_commit_keeps_increment():
+    context = FakeContext()
+    allocator = KVBlockAllocator(
+        context,
+        total_count=5,
+        paused_count=0,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+    )
+    block = allocator.allocate_memory_blocks(1)
+    allocator.register_kv_block_hashes([int(block.item())], [123])
+    allocator.release_memory_blocks(block)
+
+    reservation = allocator.reserve_prefix_refcounts(
+        request_slot=0, block_ids=block, step_id=7
+    )
+    allocator.commit_reservation(reservation)
+
+    assert allocator.block_ref_counts[block].item() == 1
+    assert reservation.prefix_cache_refcount_deltas[int(block.item())] == 1
+    assert context.async_overlap_debug_counters["reservation_commits"] == 1
+
+
+def test_prefix_refcount_reservation_rollback_undoes_increment():
+    context = FakeContext()
+    allocator = KVBlockAllocator(
+        context,
+        total_count=5,
+        paused_count=0,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+    )
+    block = allocator.allocate_memory_blocks(1)
+    allocator.register_kv_block_hashes([int(block.item())], [123])
+    allocator.release_memory_blocks(block)
+
+    reservation = allocator.reserve_prefix_refcounts(
+        request_slot=0, block_ids=block, step_id=8
+    )
+    allocator.rollback_reservation(reservation)
+
+    assert allocator.block_ref_counts[block].item() == 0
+    assert allocator.kv_hash_to_block_id[123] == int(block.item())
+    assert context.async_overlap_debug_counters["reservation_rollbacks"] == 1

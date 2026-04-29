@@ -213,6 +213,30 @@ class KVBlockAllocator:
         self._open_reservations[reservation.reservation_id] = reservation
         return reservation
 
+    def reserve_prefix_refcounts(
+        self,
+        request_slot: int,
+        block_ids: Tensor,
+        step_id: int,
+        snapshot_slot_id: int = 0,
+        refcount_delta: int = 1,
+    ) -> ResourceReservation:
+        """Reserve prefix-cache refcount deltas for matched KV blocks."""
+        block_ids = block_ids.to(dtype=torch.int32, device='cpu')
+        unique_block_ids = torch.unique(block_ids)
+        deltas = {int(block_id): int(refcount_delta) for block_id in unique_block_ids.tolist()}
+        self._apply_prefix_refcount_deltas(deltas)
+        reservation = ResourceReservation(
+            step_id=int(step_id),
+            request_slot=int(request_slot),
+            snapshot_slot_id=int(snapshot_slot_id),
+            reservation_id=self._next_reservation_id,
+            prefix_cache_refcount_deltas=deltas,
+        )
+        self._next_reservation_id += 1
+        self._open_reservations[reservation.reservation_id] = reservation
+        return reservation
+
     def commit_reservation(self, reservation: ResourceReservation) -> None:
         """Commit a KV reservation into durable request ownership."""
         open_reservation = self._open_reservations.pop(reservation.reservation_id, None)
@@ -233,9 +257,31 @@ class KVBlockAllocator:
             raise RuntimeError(f"KV reservation {reservation.reservation_id} is not open")
         block_ids = torch.tensor(open_reservation.kv_block_ids, dtype=torch.int32, device='cpu')
         self.release_memory_blocks(block_ids)
+        self._apply_prefix_refcount_deltas(
+            {
+                block_id: -delta
+                for block_id, delta in open_reservation.prefix_cache_refcount_deltas.items()
+            }
+        )
         self._rolled_back_reservations[reservation.reservation_id] = open_reservation
         if hasattr(self.context, "async_overlap_debug_counters"):
             self.context.async_overlap_debug_counters["reservation_rollbacks"] += 1
+
+    def _apply_prefix_refcount_deltas(self, deltas: Dict[int, int]) -> None:
+        """Apply prefix-cache refcount deltas with normal cache-release semantics."""
+        if not deltas:
+            return
+        if not self.enable_prefix_caching:
+            raise RuntimeError("Prefix-cache refcount deltas require prefix caching")
+        for block_id, delta in deltas.items():
+            block_tensor = torch.tensor([int(block_id)], dtype=torch.int32, device='cpu')
+            if delta > 0:
+                self.block_ref_counts[block_tensor] += int(delta)
+                if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+                    self.update_timestamps(block_tensor)
+            elif delta < 0:
+                for _ in range(-int(delta)):
+                    self.release_memory_blocks(block_tensor)
 
     def defer_release_until_snapshot_retired(
         self, block_ids: Tensor, snapshot_slot_id: int

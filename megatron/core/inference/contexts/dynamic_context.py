@@ -2836,9 +2836,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             matched_tensor = torch.tensor(
                 matched_block_ids, dtype=torch.int32, device='cpu',
             )
-            self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
-            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
-                self.kv_block_allocator.update_timestamps(matched_tensor)
+            step_id = max(0, int(self.current_dynamic_step_id))
+            prefix_ref_reservation = self.kv_block_allocator.reserve_prefix_refcounts(
+                current_id, matched_tensor, step_id
+            )
+            self.record_resource_reservation(step_id, prefix_ref_reservation)
+            self.kv_block_allocator.commit_reservation(prefix_ref_reservation)
 
         self.request_ids[current_id] = req.request_id
 
