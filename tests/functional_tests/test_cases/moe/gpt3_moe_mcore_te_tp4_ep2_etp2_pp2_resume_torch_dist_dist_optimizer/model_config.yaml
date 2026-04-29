@@ -66,5 +66,6 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --async-save: true
   --use-persistent-ckpt-worker: true
-  --log-moe-overload-factor: true
+  --async-ckpt-use-cpu-shm: true
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher

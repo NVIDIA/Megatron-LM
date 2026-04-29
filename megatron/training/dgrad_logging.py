@@ -3,10 +3,12 @@
 """dgrad logging using backward hooks."""
 
 from collections import defaultdict
+
 import torch
 import torch.nn as nn
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.moe.router import Router
 
 from .checkpointing import save_grads
 from .utils import unwrap_model
@@ -14,30 +16,41 @@ from .utils import unwrap_model
 
 def _get_linear_types():
     """Build tuple of linear layer types to capture gradients from."""
-    types = [nn.Linear, nn.Embedding, ColumnParallelLinear, RowParallelLinear]
+    types = [nn.Linear, nn.Embedding, ColumnParallelLinear, RowParallelLinear, Router]
 
     # Add Transformer Engine layers if available.
     try:
         from megatron.core.extensions.transformer_engine import (
-            TELinear,
             TEColumnParallelLinear,
-            TERowParallelLinear,
             TELayerNormColumnParallelLinear,
+            TELinear,
+            TENorm,
+            TERowParallelLinear,
         )
-        types.extend([TELinear, TEColumnParallelLinear, TERowParallelLinear,
-                      TELayerNormColumnParallelLinear])
+
+        types.extend(
+            [
+                TELinear,
+                TENorm,
+                TEColumnParallelLinear,
+                TERowParallelLinear,
+                TELayerNormColumnParallelLinear,
+            ]
+        )
     except ImportError:
         pass
 
     try:
         from megatron.core.extensions.transformer_engine import (
-            TEGroupedLinear,
             TEColumnParallelGroupedLinear,
+            TEGroupedLinear,
             TERowParallelGroupedLinear,
         )
+
         if TEGroupedLinear is not None:
-            types.extend([TEGroupedLinear, TEColumnParallelGroupedLinear,
-                          TERowParallelGroupedLinear])
+            types.extend(
+                [TEGroupedLinear, TEColumnParallelGroupedLinear, TERowParallelGroupedLinear]
+            )
     except ImportError:
         pass
 
@@ -49,7 +62,7 @@ LINEAR_TYPES = _get_linear_types()
 
 class DataGradLogger:
     """Captures and saves gradients from all linear layers using backward hooks.
-    
+
     NOTE: Right now, we only save the dgrads for the last microbatch in a batch on DP replica 0.
     The code below would need to be extended to save dgrads for all microbatches in a batch."""
 
@@ -60,15 +73,17 @@ class DataGradLogger:
 
     def _make_hook(self, model_chunk_name: str, module_name: str):
         """Create a backward hook for a named module."""
+
         def hook(_, grad_input, grad_output):
             for idx, grad in enumerate(grad_output):
                 if grad is not None:
-                    grad_name = f"{module_name}/output{idx}"
-                    self._dgrads_state_dict[model_chunk_name][grad_name] = grad.detach().cpu()
+                    key = f"{module_name}/output{idx}"
+                    self._dgrads_state_dict[model_chunk_name][key] = grad.detach().cpu()
             for idx, grad in enumerate(grad_input):
                 if grad is not None:
-                    grad_name = f"{module_name}/input{idx}"
-                    self._dgrads_state_dict[model_chunk_name][grad_name] = grad.detach().cpu()
+                    key = f"{module_name}/input{idx}"
+                    self._dgrads_state_dict[model_chunk_name][key] = grad.detach().cpu()
+
         return hook
 
     def save(self, iteration: int):
