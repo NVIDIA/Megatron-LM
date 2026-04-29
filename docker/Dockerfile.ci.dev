@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     export NVTE_CUDA_ARCHS="80;90;100"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra ${IMAGE_TYPE} --extra mlm --extra ssm --link-mode copy --locked \
+    uv sync --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
