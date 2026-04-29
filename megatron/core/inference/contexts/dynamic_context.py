@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import List, Mapping, Optional, Sequence, Tuple
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -2608,6 +2608,161 @@ class DynamicInferenceContext(BaseInferenceContext):
             accepted_token_counts_cpu=accepted_token_counts_cpu,
         )
 
+    def _coerce_dynamic_step_id(self, step_id):
+        """Return a DynamicStepId for public split-step APIs."""
+        from megatron.core.inference.engines.dynamic_step import DynamicStepId
+
+        if isinstance(step_id, DynamicStepId):
+            return step_id
+        return DynamicStepId(int(step_id))
+
+    def _build_dynamic_step_request_plan(self, step_id):
+        """Build the scheduler-visible request plan for the current context state."""
+        from megatron.core.inference.engines.dynamic_step import DynamicStepRequestPlan
+
+        step_id = self._coerce_dynamic_step_id(step_id)
+        active_request_count = int(self.total_request_count) - int(self.paused_request_count)
+        active_slice = slice(int(self.paused_request_count), int(self.total_request_count))
+
+        if active_request_count == 0:
+            return DynamicStepRequestPlan(step_id=step_id)
+
+        active_request_ids = tuple(
+            str(int(request_id)) for request_id in self.request_ids[active_slice].tolist()
+        )
+        request_in_prefill = self.request_in_prefill_status_tensor[active_slice].tolist()
+        prefill_request_ids = tuple(
+            request_id
+            for request_id, is_prefill in zip(active_request_ids, request_in_prefill)
+            if is_prefill
+        )
+        decode_request_ids = tuple(
+            request_id
+            for request_id, is_prefill in zip(active_request_ids, request_in_prefill)
+            if not is_prefill
+        )
+        speculative_request_ids = (
+            decode_request_ids if int(self.num_speculative_tokens) > 0 else ()
+        )
+        placeholder_token_counts = (
+            {request_id: int(self.num_speculative_tokens) for request_id in speculative_request_ids}
+            if int(self.num_speculative_tokens) > 0
+            else {}
+        )
+
+        return DynamicStepRequestPlan(
+            step_id=step_id,
+            active_request_ids=active_request_ids,
+            decode_request_ids=decode_request_ids,
+            prefill_request_ids=prefill_request_ids,
+            speculative_request_ids=speculative_request_ids,
+            placeholder_token_counts=placeholder_token_counts,
+        )
+
+    def prepare_next_step_optimistic(
+        self,
+        step_id,
+        request_plan=None,
+        *,
+        record_journal: bool = True,
+    ):
+        """Prepare the optimistic request plan for one serial dynamic step.
+
+        Queue depth one still executes this in serial order. Later commits can run this
+        before the previous step retires, then reconcile through the journal.
+        """
+        step_id = self._coerce_dynamic_step_id(step_id)
+        if request_plan is None:
+            request_plan = self._build_dynamic_step_request_plan(step_id)
+
+        if record_journal and not self.step_journal.has_terminal_entry(step_id):
+            if self.step_journal.get_open_entry(step_id) is None:
+                self.begin_step_journal(step_id.value)
+            self.record_request_slot_transition(
+                step_id.value,
+                request_slots_after=tuple(range(int(self.total_request_count))),
+                active_request_ids=request_plan.active_request_ids,
+            )
+
+        return request_plan
+
+    def _extract_step_output_attr(self, output: Any, name: str, default: Any = None) -> Any:
+        """Read a field from either a dataclass-like output or a mapping."""
+        if isinstance(output, Mapping):
+            return output.get(name, default)
+        return getattr(output, name, default)
+
+    def commit_step_output(
+        self,
+        step_id,
+        output,
+        *,
+        active_requests_mask: Optional[Tensor] = None,
+        new_speculative_tokens: Optional[Tensor] = None,
+        defer_decode_input_tokens: bool = False,
+        commit_journal: bool = True,
+    ):
+        """Commit a dynamic step output into the context's ordered ledger."""
+        from megatron.core.inference.engines.dynamic_step import StepRetirementResult
+
+        step_id = self._coerce_dynamic_step_id(step_id)
+        if hasattr(output, "result") and callable(output.result):
+            output = output.result()
+
+        if active_requests_mask is None:
+            active_requests_mask = self._extract_step_output_attr(output, "active_requests_mask")
+        if active_requests_mask is None:
+            raise ValueError("commit_step_output requires active_requests_mask")
+
+        new_tokens = self._extract_step_output_attr(output, "sampled_tokens_cpu")
+        if new_tokens is None:
+            new_tokens = self._extract_step_output_attr(output, "new_tokens")
+        if new_tokens is None:
+            raise ValueError("commit_step_output requires sampled_tokens_cpu or new_tokens")
+
+        if new_speculative_tokens is None:
+            new_speculative_tokens = self._extract_step_output_attr(
+                output, "sampled_mtp_tokens_cpu"
+            )
+        if new_speculative_tokens is None:
+            new_speculative_tokens = self._extract_step_output_attr(
+                output, "new_speculative_tokens"
+            )
+
+        active_request_slice = slice(int(self.paused_request_count), int(self.total_request_count))
+        step_request_ids = self.request_ids[active_request_slice].long().clone()
+        active_mask_cpu = active_requests_mask.cpu() if active_requests_mask.is_cuda else active_requests_mask
+        completed_request_ids = tuple(
+            str(int(request_id))
+            for request_id in step_request_ids[active_mask_cpu == 0].tolist()
+        )
+        committed_request_ids = tuple(str(int(request_id)) for request_id in step_request_ids.tolist())
+
+        update_result = self._update_requests_serial_impl(
+            active_mask_cpu,
+            new_tokens,
+            new_speculative_tokens,
+            defer_decode_input_tokens=defer_decode_input_tokens,
+        )
+
+        open_entry = self.step_journal.get_open_entry(step_id)
+        snapshot_slot_id = (
+            int(open_entry.snapshot_slot_id)
+            if open_entry is not None
+            else int(getattr(self.gpu_view, "current_snapshot_slot_id", 0))
+        )
+        if commit_journal:
+            self.commit_step_journal(step_id.value)
+
+        return StepRetirementResult(
+            step_id=step_id,
+            snapshot_slot_id=snapshot_slot_id,
+            output_ready_event=self._extract_step_output_attr(output, "output_ready_event"),
+            committed_request_ids=committed_request_ids,
+            completed_request_ids=completed_request_ids,
+            context_update_result=update_result,
+        )
+
     def build_step_input_plan(
         self,
         *,
@@ -3670,6 +3825,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         return evict_request_ids
 
     def update_requests(
+        self,
+        active_requests_mask: Tensor,
+        new_tokens: Tensor,
+        new_speculative_tokens: Tensor = None,
+        defer_decode_input_tokens: bool = False,
+    ) -> Tensor:
+        """Compatibility wrapper for the split optimistic-prepare/ordered-commit path."""
+        current_step_id = int(getattr(self, "current_dynamic_step_id", -1))
+        record_journal = current_step_id >= 0
+        step_id = current_step_id if record_journal else 0
+        request_plan = self.prepare_next_step_optimistic(
+            step_id,
+            record_journal=record_journal,
+        )
+        output = {
+            "active_requests_mask": active_requests_mask,
+            "sampled_tokens_cpu": new_tokens,
+            "sampled_mtp_tokens_cpu": new_speculative_tokens,
+        }
+        retirement = self.commit_step_output(
+            request_plan.step_id,
+            output,
+            defer_decode_input_tokens=defer_decode_input_tokens,
+            commit_journal=record_journal,
+        )
+        return retirement.context_update_result
+
+    def _update_requests_serial_impl(
         self,
         active_requests_mask: Tensor,
         new_tokens: Tensor,

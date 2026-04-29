@@ -867,6 +867,72 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_split_commit_matches_serial_update_requests_for_decode(self):
+        def make_context():
+            dynamic_context = self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=2,
+                kv_channels=8,
+                num_attention_heads=2,
+                max_sequence_length=128,
+                buffer_size_gb=0.01,
+                block_size_tokens=128,
+                max_tokens=256,
+                max_requests=256,
+            )
+            dynamic_context.total_request_count = 2
+            dynamic_context.paused_request_count = 0
+            dynamic_context.active_token_count = 2
+            dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
+            dynamic_context.request_query_lengths[:2] = 1
+            dynamic_context.request_in_prefill_status_tensor[:2] = 0
+            dynamic_context.request_kv_length_offsets[:2] = torch.tensor([5, 8], device='cpu')
+            dynamic_context.request_last_kv_block_offset[:2] = torch.tensor([5, 8], device='cpu')
+            dynamic_context.request_kv_block_counts[:2] = 1
+            blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(2)
+            dynamic_context.request_to_kv_block_ids[:2, 0] = blocks
+            dynamic_context.request_last_kv_block_id[:2] = blocks
+            return dynamic_context
+
+        baseline_context = make_context()
+        split_context = make_context()
+        active_requests_mask = torch.tensor([1, 1], device='cpu', dtype=torch.int32)
+        new_tokens = torch.tensor([99, 100], device='cpu')
+
+        baseline_context._update_requests_serial_impl(
+            active_requests_mask.clone(),
+            new_tokens.clone(),
+            defer_decode_input_tokens=True,
+        )
+        split_context.set_current_dynamic_step_id(21)
+        request_plan = split_context.prepare_next_step_optimistic(DynamicStepId(21))
+        retirement = split_context.commit_step_output(
+            DynamicStepId(21),
+            {
+                "active_requests_mask": active_requests_mask.clone(),
+                "sampled_tokens_cpu": new_tokens.clone(),
+            },
+            defer_decode_input_tokens=True,
+        )
+
+        assert request_plan.decode_request_ids == ("10", "11")
+        assert retirement.committed_request_ids == ("10", "11")
+        assert retirement.completed_request_ids == ()
+        assert split_context.step_journal.get_committed_entry(21) is not None
+        assert split_context.total_request_count == baseline_context.total_request_count
+        assert split_context.active_token_count == baseline_context.active_token_count
+        assert torch.equal(
+            split_context.token_to_pos_ids[:2],
+            baseline_context.token_to_pos_ids[:2],
+        )
+        assert torch.equal(
+            split_context.token_to_block_idx[:2],
+            baseline_context.token_to_block_idx[:2],
+        )
+        assert split_context._gpu_decode_input_pending == baseline_context._gpu_decode_input_pending
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_update_requests_falls_back_to_cpu_decode_tokens_when_requests_finish(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,

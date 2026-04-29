@@ -1852,13 +1852,17 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
-        range_push(context.dynamic_step_nvtx_label("update_requests"))
-        update_result = context.update_requests(
-            active_request_mask,
-            new_sample_copy,
-            sampled_mtp_tokens_cpu,
+        range_push(context.dynamic_step_nvtx_label("commit_step_output"))
+        retirement = context.commit_step_output(
+            self._current_dynamic_step_record(),
+            {
+                "active_requests_mask": active_request_mask,
+                "sampled_tokens_cpu": new_sample_copy,
+                "sampled_mtp_tokens_cpu": sampled_mtp_tokens_cpu,
+            },
             defer_decode_input_tokens=True,
         )
+        update_result = retirement.context_update_result
         range_pop()
 
         return {
@@ -1953,7 +1957,7 @@ class TextGenerationController:
             snapshot_slot_handle=snapshot_handle
         )
         active_request_count = context.total_request_count - context.paused_request_count
-        request_plan = self._dynamic_step_request_plan(step_id)
+        request_plan = context.prepare_next_step_optimistic(step_id)
 
         cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
@@ -1963,11 +1967,6 @@ class TextGenerationController:
             step_id.value,
             snapshot_slot_id,
             cuda_graph_batch_dimensions=cuda_graph_request_count,
-        )
-        context.record_request_slot_transition(
-            step_id.value,
-            request_slots_after=tuple(range(int(context.total_request_count))),
-            active_request_ids=request_plan.active_request_ids,
         )
 
         prepared_step = DynamicStepContextSnapshot(
@@ -2155,13 +2154,15 @@ class TextGenerationController:
         self,
         prepared_step: DynamicStepContextSnapshot,
         gpu_launch: DynamicStepGpuLaunch,
-        step_output: AsyncStepOutputResult,
+        step_output: Union[AsyncStepOutput, AsyncStepOutputResult],
         log_probs: Optional[Tensor],
         top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
         skip_bookkeeping: Optional[bool] = False,
     ) -> Dict:
         """Commit serial CPU bookkeeping and return the public dynamic-step result."""
         context = self.inference_wrapped_model.inference_context
+        if isinstance(step_output, AsyncStepOutput):
+            step_output = self.collect_dynamic_output(step_output)
         context.debug_compare_sampled_tokens_gpu_state(
             sampled_tokens_cpu=step_output.sampled_tokens_cpu,
             active_request_count=prepared_step.active_request_count,
@@ -2231,7 +2232,6 @@ class TextGenerationController:
         with torch.inference_mode():
             log_probs, top_n_logprobs = self.launch_dynamic_sampling(gpu_launch)
             step_output = self.begin_dynamic_output_copy(prepared_step, skip_bookkeeping)
-            step_output = self.collect_dynamic_output(step_output)
             return self.commit_dynamic_bookkeeping(
                 prepared_step,
                 gpu_launch,

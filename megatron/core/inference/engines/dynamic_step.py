@@ -200,6 +200,7 @@ class AsyncStepOutput:
     active_request_count: int = 0
     compute_done_event: Optional[Any] = None
     output_ready_event: Optional[Any] = None
+    active_requests_mask: Optional[Any] = None
     sampled_tokens: Optional[Any] = None
     sampled_tokens_cpu: Optional[Any] = None
     sampled_mtp_tokens_cpu: Optional[Any] = None
@@ -298,6 +299,7 @@ class StepRetirementResult:
     rolled_back_request_ids: Sequence[str] = field(default_factory=tuple)
     reservation_commits: int = 0
     reservation_rollbacks: int = 0
+    context_update_result: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.snapshot_slot_id < 0:
@@ -307,3 +309,7 @@ class StepRetirementResult:
         object.__setattr__(
             self, "rolled_back_request_ids", _as_tuple(self.rolled_back_request_ids)
         )
+        if self.context_update_result is not None:
+            object.__setattr__(
+                self, "context_update_result", _freeze_mapping(self.context_update_result)
+            )

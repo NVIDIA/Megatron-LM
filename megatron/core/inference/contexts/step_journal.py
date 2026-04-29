@@ -189,6 +189,11 @@ class StepJournal:
         """Return whether any journal entry is still open."""
         return bool(self._open_entries)
 
+    def has_terminal_entry(self, step_id) -> bool:
+        """Return whether a step already reached commit or rollback."""
+        step_value = _step_id_value(step_id)
+        return step_value in self._committed_entries or step_value in self._rolled_back_entries
+
     def begin_step_journal(
         self,
         step_id,
