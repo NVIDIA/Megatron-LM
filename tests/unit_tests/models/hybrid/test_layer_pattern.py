@@ -473,6 +473,72 @@ class TestMTPLayerConfig:
         with pytest.raises(ValueError, match="MTPLayerConfig.common_config"):
             recipe.compile()
 
+    def test_mtp_num_layers_set_on_stack_config(self):
+        """Regression: ``HybridModel.forward`` gates ``process_mtp_loss`` on
+        ``self.config.mtp_num_layers is not None``. If the recipe builds an
+        MTP block but the stack TC has ``mtp_num_layers=None``, the auxiliary
+        loss never aggregates and training silently ignores the MTP head."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        m = MambaLayerConfig(common_config=common)
+        mtp = MTPLayerConfig(common_config=common, mtp_model_layer=[m])
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common, layer_pattern=[emb, a, mtp, mtp, loss]
+        ).compile()
+        assert compiled.mtp_num_depths == 2
+        assert compiled.config.mtp_num_layers == compiled.mtp_num_depths
+
+    def test_mtp_num_layers_none_when_no_mtp_markers(self):
+        """No MTP markers → ``mtp_num_layers`` stays at the TC default (None),
+        so the loss-aggregation gate stays closed."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+        assert compiled.config.mtp_num_layers is None
+
+    def test_mtp_loss_scaling_factor_propagates(self):
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        m = MambaLayerConfig(common_config=common)
+        mtp = MTPLayerConfig(common_config=common, mtp_model_layer=[m], loss_scaling_factor=0.25)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common, layer_pattern=[emb, a, mtp, loss]
+        ).compile()
+        assert compiled.config.mtp_loss_scaling_factor == 0.25
+
+    def test_mtp_use_repeated_layer_propagates(self):
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        m = MambaLayerConfig(common_config=common)
+        mtp = MTPLayerConfig(common_config=common, mtp_model_layer=[m], use_repeated_layer=True)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common, layer_pattern=[emb, a, mtp, loss]
+        ).compile()
+        assert compiled.config.mtp_use_repeated_layer is True
+
+    def test_mtp_stack_field_disagreement_rejected(self):
+        """``loss_scaling_factor`` and ``use_repeated_layer`` are stack-level —
+        if two MTP markers set them to different values, raise so the user
+        knows only one value can take effect."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        m = MambaLayerConfig(common_config=common)
+        mtp_a = MTPLayerConfig(common_config=common, mtp_model_layer=[m], loss_scaling_factor=0.1)
+        mtp_b = MTPLayerConfig(common_config=common, mtp_model_layer=[m], loss_scaling_factor=0.5)
+        loss = CrossEntropyLayerConfig()
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a, mtp_a, mtp_b, loss])
+        with pytest.raises(ValueError, match="loss_scaling_factor"):
+            recipe.compile()
+
 
 @pytest.mark.internal
 class TestExtraPassthrough:
