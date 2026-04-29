@@ -100,7 +100,6 @@ class TextGenerationController:
 
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
         self.num_mtp_heads = self._get_mtp_num_heads()
-        self.has_mtp_cuda_graphs = False
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
         if (
@@ -618,7 +617,7 @@ class TextGenerationController:
         # Derive the MTP padded batch size from the existing padded graph dimensions.
         # For MoE models this is post EP sync. In eager mode MTP uses locally SP-aligned
         # batch size instead.
-        if self.has_mtp_cuda_graphs and context.using_cuda_graph_this_step():
+        if context.using_cuda_graph_this_step():
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
             if self._sp_enabled:
                 self._mtp_resolved_padded_count = round_up_to_nearest_multiple(
@@ -626,13 +625,6 @@ class TextGenerationController:
                 )
         else:
             self._mtp_resolved_padded_count = None
-
-        # Tell the model whether to use MTP CUDA graphs this step. When the
-        # main model falls back to eager mode, MTP must also run eagerly across
-        # all EP ranks — otherwise some ranks may replay a captured graph while
-        # others run eagerly, causing EP collectives to hang.
-        if self.has_mtp_cuda_graphs:
-            unwrapped_model.use_mtp_cuda_graphs = context.using_cuda_graph_this_step()
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -937,6 +929,12 @@ class TextGenerationController:
                     next_token_ids=token_ids_buf,
                     position_ids=position_ids_buf,
                     depth=mtp_depth,
+                    eager=not context.using_cuda_graph_this_step(),
+                    cache_key=(
+                        ("mtp", padded_count, mtp_depth)
+                        if context.using_cuda_graph_this_step()
+                        else None
+                    ),
                 )
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
@@ -1689,6 +1687,8 @@ class TextGenerationController:
             dummy_token_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
             dummy_position_ids = torch.zeros((1, padded_count), device=device, dtype=torch.long)
 
+        context = self.inference_wrapped_model.inference_context
+
         for depth in range(self._num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
@@ -1699,6 +1699,12 @@ class TextGenerationController:
                     next_token_ids=dummy_token_ids,
                     position_ids=dummy_position_ids,
                     depth=mtp_depth,
+                    eager=not context.using_cuda_graph_this_step(),
+                    cache_key=(
+                        ("mtp", padded_count, mtp_depth)
+                        if context.using_cuda_graph_this_step()
+                        else None
+                    ),
                 )
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 

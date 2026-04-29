@@ -16,7 +16,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=FutureWarning)
 
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -275,7 +275,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
         return is_first_or_last_pipeline_stage(vp_stage)
 
 
-def core_gpt_dataset_config_from_args(args):
+def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -294,6 +294,8 @@ def core_gpt_dataset_config_from_args(args):
         blend=blend,
         blend_per_split=blend_per_split,
         split=args.split,
+        multiple_validation_sets=args.multiple_validation_sets,
+        full_validation=args.full_validation,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
         mmap_bin_files=args.mmap_bin_files,
@@ -353,7 +355,7 @@ if __name__ == "__main__":
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
-    train_valid_test_datasets_provider.is_distributed = True
+    setattr(train_valid_test_datasets_provider, "is_distributed", True)
 
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
