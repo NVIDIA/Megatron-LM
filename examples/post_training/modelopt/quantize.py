@@ -2,7 +2,6 @@
 
 """Script for quantizing a HuggingFace or Megatron-LM checkpoint using ModelOpt."""
 
-import copy
 import functools
 import inspect
 import json
