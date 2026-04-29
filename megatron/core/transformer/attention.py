@@ -381,6 +381,7 @@ class Attention(MegatronModule, ABC):
 
         # Per-layer RotaryEmbedding (used when rotary_base_per_layer is set in config).
         self.rotary_pos_emb = None
+        print(f'for debug, in Attention.__init__, rank: {torch.distributed.get_rank()}, self.configr: {type(self.config)}')
         if getattr(self.config, 'rotary_base_per_layer', None):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
@@ -435,7 +436,11 @@ class Attention(MegatronModule, ABC):
                 self.mrope_section is not None
             ), "mrope require mrope_section setting, but we got None from TransformerConfig"
         else:
-            assert False, "Invalid position embedding type"
+            raise NotImplementedError(
+                f"rotary_base_per_layer does not support "
+                f"position_embedding_type={self.config.position_embedding_type!r} "
+                f"(only 'rope' / 'yarn' / 'mrope' are supported)."
+            )
 
     def _checkpointed_attention_forward(
         self,
