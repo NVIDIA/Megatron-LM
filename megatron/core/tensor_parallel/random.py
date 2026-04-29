@@ -793,7 +793,10 @@ class CheckpointWithoutOutput(object):
         #   - No tensor version-counter bump (no autograd complaint)
         share_storage = _get_share_storage()
         for output, recomputation_output in zip(self.outputs, outputs):
-            if output.untyped_storage().data_ptr() != recomputation_output.untyped_storage().data_ptr():
+            if (
+                output.untyped_storage().data_ptr()
+                != recomputation_output.untyped_storage().data_ptr()
+            ):
                 share_storage(output, recomputation_output)
 
         self.ctx.outputs = outputs
@@ -819,7 +822,7 @@ class CheckpointWithoutOutput(object):
         # Release output tensor memory while keeping metadata for backward.
         if self.retain_input_tensors:
             # Skip outputs whose storage is shared with a saved input — freeing those
-            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential 
+            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
             # operations with MakeExtraOutput).
             for output in self.outputs:
                 if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
