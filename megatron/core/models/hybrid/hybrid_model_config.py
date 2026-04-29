@@ -203,9 +203,7 @@ class HybridModelConfig:
         # with their real value via ``_layer_specific_kwargs``.
         attention_metadata = _infer_uniform_attention_metadata(decoder_flat)
 
-        placeholders: dict = {
-            "num_attention_heads": max(1, self.tensor_model_parallel_size),
-        }
+        placeholders: dict = {"num_attention_heads": max(1, self.tensor_model_parallel_size)}
         # If the recipe contains a uniform attention geometry, use it as the
         # semantic placeholder for non-attention layer TransformerConfigs.
         # This keeps recipe authors out of TransformerConfig compatibility
@@ -378,8 +376,7 @@ def _compile_mtp_markers(mtp_markers: list):
         flat = flatten_decoder_pattern(marker.mtp_model_layer)
         if not flat:
             raise ValueError(
-                "MTPLayerConfig.mtp_model_layer must contain at least one "
-                "decoder LayerConfig."
+                "MTPLayerConfig.mtp_model_layer must contain at least one " "decoder LayerConfig."
             )
         bodies.append("".join(type(lc).SYMBOL for lc in flat))
 

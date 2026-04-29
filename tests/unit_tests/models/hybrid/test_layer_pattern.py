@@ -76,11 +76,7 @@ class TestCommonLayerConfig:
     }
 
     def test_common_fields_are_explicitly_audited_as_shared(self):
-        common_fields = {
-            f.name
-            for f in dataclasses.fields(CommonLayerConfig)
-            if f.name != "extra"
-        }
+        common_fields = {f.name for f in dataclasses.fields(CommonLayerConfig) if f.name != "extra"}
         assert common_fields == set(self.COMMON_FIELD_LAYER_COVERAGE)
         for field_name, layer_families in self.COMMON_FIELD_LAYER_COVERAGE.items():
             assert len(layer_families) >= 2, field_name
@@ -98,9 +94,7 @@ class TestCommonLayerConfig:
 
     def test_mixed_precision_dtype_bf16_maps_to_bf16_true(self):
         common = _make_common(mixed_precision_dtype="bf16")
-        layer = MambaLayerConfig(
-            common_config=common, head_dim=64, state_size=128, num_groups=8
-        )
+        layer = MambaLayerConfig(common_config=common, head_dim=64, state_size=128, num_groups=8)
         tc = layer.to_transformer_config(num_layers=4)
         assert tc.bf16 is True
         assert tc.fp16 is False
@@ -138,10 +132,7 @@ class TestCommonLayerConfig:
     def test_moe_specific_fields_live_on_moe_layer_config(self):
         common = _make_common(activation_func="squared_relu")
         layer = MoELayerConfig(
-            common_config=common,
-            num_experts=8,
-            top_k=2,
-            use_fused_weighted_squared_relu=True,
+            common_config=common, num_experts=8, top_k=2, use_fused_weighted_squared_relu=True
         )
 
         tc = layer.to_transformer_config(num_layers=2)
@@ -178,9 +169,7 @@ class TestLayerConfigToTransformerConfig:
 
     def test_mamba_layer_config(self):
         common = _make_common()
-        layer = MambaLayerConfig(
-            common_config=common, head_dim=64, state_size=128, num_groups=8
-        )
+        layer = MambaLayerConfig(common_config=common, head_dim=64, state_size=128, num_groups=8)
         tc = layer.to_transformer_config(num_layers=4)
         assert tc.mamba_head_dim == 64
         assert tc.mamba_state_dim == 128
@@ -273,9 +262,7 @@ class TestHybridModelConfigCompile:
         m = MambaLayerConfig(common_config=common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        recipe = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, m, a, m, a, loss]
-        )
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, m, a, loss])
         compiled = recipe.compile()
         assert isinstance(compiled, CompiledRecipe)
         assert compiled.layer_type_list == ["M", "*", "M", "*"]
@@ -291,16 +278,11 @@ class TestHybridModelConfigCompile:
         emb = self._embedding(common)
         m = MambaLayerConfig(common_config=common)
         a = AttentionLayerConfig(
-            common_config=common,
-            num_attention_heads=8,
-            num_query_groups=2,
-            kv_channels=16,
+            common_config=common, num_attention_heads=8, num_query_groups=2, kv_channels=16
         )
         loss = CrossEntropyLayerConfig()
         recipe = HybridModelConfig(
-            common_config=common,
-            layer_pattern=[emb, m, a, m, loss],
-            tensor_model_parallel_size=2,
+            common_config=common, layer_pattern=[emb, m, a, m, loss], tensor_model_parallel_size=2
         )
 
         compiled = recipe.compile()
@@ -359,9 +341,7 @@ class TestHybridModelConfigCompile:
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         d = DSALayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        recipe = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, a, d, loss]
-        )
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a, d, loss])
         with pytest.raises(ValueError, match="Attention.*MLA/DSA|MLA/DSA.*Attention"):
             recipe.compile()
 
@@ -426,9 +406,7 @@ class TestMTPLayerConfig:
         loss = CrossEntropyLayerConfig()
         # MTP appearing BEFORE a regular decoder layer (not in the trailing
         # contiguous run) should raise.
-        recipe = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, mtp, a, loss]
-        )
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, mtp, a, loss])
         with pytest.raises(TypeError, match="trailing"):
             recipe.compile()
 
@@ -440,9 +418,7 @@ class TestMTPLayerConfig:
         mtp1 = MTPLayerConfig(common_config=common, mtp_model_layer=[m])
         mtp2 = MTPLayerConfig(common_config=common, mtp_model_layer=[a])
         loss = CrossEntropyLayerConfig()
-        recipe = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, a, mtp1, mtp2, loss]
-        )
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a, mtp1, mtp2, loss])
         with pytest.raises(ValueError, match="identical"):
             recipe.compile()
 
@@ -452,9 +428,7 @@ class TestMTPLayerConfig:
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         mtp = MTPLayerConfig(common_config=common, mtp_model_layer=[])
         loss = CrossEntropyLayerConfig()
-        recipe = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, a, mtp, loss]
-        )
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a, mtp, loss])
         with pytest.raises(ValueError, match="at least one"):
             recipe.compile()
 
@@ -485,9 +459,7 @@ class TestExtraPassthrough:
     def test_layer_extra_overrides_common_extra(self):
         common = _make_common(extra={"qk_layernorm": False})
         layer = AttentionLayerConfig(
-            common_config=common,
-            num_attention_heads=4,
-            extra={"qk_layernorm": True},
+            common_config=common, num_attention_heads=4, extra={"qk_layernorm": True}
         )
         tc = layer.to_transformer_config(num_layers=2)
         assert tc.qk_layernorm is True
@@ -499,10 +471,7 @@ class TestExtraPassthrough:
 
     def test_layer_extra_unknown_field_raises(self):
         common = _make_common()
-        layer = MambaLayerConfig(
-            common_config=common,
-            extra={"another_typo_field": 1.0},
-        )
+        layer = MambaLayerConfig(common_config=common, extra={"another_typo_field": 1.0})
         with pytest.raises(ValueError, match="MambaLayerConfig.extra"):
             layer.to_transformer_config(num_layers=2)
 
@@ -511,9 +480,7 @@ class TestExtraPassthrough:
         emb = self._embedding(common, extra={"qk_layernorm": True})
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, a, loss]
-        ).compile()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
         assert compiled.config.qk_layernorm is True
 
     def test_loss_extra_propagates_to_stack_tc(self):
@@ -521,9 +488,7 @@ class TestExtraPassthrough:
         emb = self._embedding(common)
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig(extra={"qk_layernorm": True})
-        compiled = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, a, loss]
-        ).compile()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
         assert compiled.config.qk_layernorm is True
 
     def test_embedding_extra_unknown_field_raises(self):
@@ -532,9 +497,7 @@ class TestExtraPassthrough:
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
         with pytest.raises(ValueError, match="EmbeddingLayerConfig.extra"):
-            HybridModelConfig(
-                common_config=common, layer_pattern=[emb, a, loss]
-            ).compile()
+            HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
 
 
 @pytest.mark.internal
@@ -556,9 +519,7 @@ class TestNumLayersDerived:
         a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
         # 5 decoder layers.
-        recipe = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, m, a, m, a, m, loss]
-        )
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, m, a, m, a, m, loss])
         compiled = recipe.compile()
         assert len(compiled.layer_config_list) == 5
         for tc in compiled.layer_config_list:

@@ -101,9 +101,7 @@ def _import_from_spec(spec: str):
     if _is_file_path(spec):
         path = Path(spec).expanduser().resolve()
         if not path.is_file():
-            raise ImportError(
-                f"--model-recipe file path {spec!r} does not exist or is not a file."
-            )
+            raise ImportError(f"--model-recipe file path {spec!r} does not exist or is not a file.")
         # Use a unique synthetic module name so multiple recipes loaded by
         # path don't collide in ``sys.modules``.
         module_name = f"_megatron_recipe_{abs(hash(str(path)))}"
@@ -137,8 +135,7 @@ def _resolve_recipe_object(module, func_name: Optional[str], origin: str) -> Hyb
     if func_name is not None:
         if not hasattr(module, func_name):
             raise AttributeError(
-                f"--model-recipe {origin!r}: module has no attribute "
-                f"{func_name!r}."
+                f"--model-recipe {origin!r}: module has no attribute " f"{func_name!r}."
             )
         return _call_recipe_function(getattr(module, func_name), origin, source=func_name)
 
