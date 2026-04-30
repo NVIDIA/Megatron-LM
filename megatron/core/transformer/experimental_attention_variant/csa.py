@@ -25,7 +25,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
-
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
 # ---------------------------------------------------------------------------

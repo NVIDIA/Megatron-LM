@@ -6,25 +6,24 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttention,
+    CompressedSparseAttentionSubmodules,
+    Compressor,
+    CompressorSubmodules,
+    CSAIndexer,
+    CSAIndexerSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+    DSv4HybridSelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
 )
-from megatron.core.transformer.experimental_attention_variant.csa import (
-    Compressor,
-    CompressorSubmodules,
-    CSAIndexer,
-    CSAIndexerSubmodules,
-    CompressedSparseAttention,
-    CompressedSparseAttentionSubmodules,
-)
-from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-    DSv4HybridSelfAttention,
-    DSv4HybridSelfAttentionSubmodules,
-)
-
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import (
