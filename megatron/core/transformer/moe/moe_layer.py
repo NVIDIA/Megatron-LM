@@ -356,8 +356,8 @@ class MoELayer(BaseMoELayer):
         which is swapped in during CUDA-graphed forward passes.
         """
 
-        assert self.config.moe_token_dispatcher_type == "alltoall", (
-            f"Inference-optimized MoE requires 'alltoall' dispatcher, "
+        assert self.config.moe_token_dispatcher_type in ("alltoall", "flex"), (
+            f"Inference-optimized MoE requires 'alltoall' or 'flex' dispatcher, "
             f"got '{self.config.moe_token_dispatcher_type}'"
         )
         self.is_inference_cuda_graphed_iteration = False
