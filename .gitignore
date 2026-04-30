@@ -22,4 +22,5 @@ docs/_build
 docs/apidocs
 
 # Git worktrees
-.worktrees/
+.worktrees/tests/test_muon_cpu_offload.py
+muon_slurm.slurm
