@@ -144,9 +144,11 @@ class GPTModel(LanguageModule):
             self.rotary_base = rotary_base
         self.rotary_scaling = rope_scaling
         self.mtp_block_spec = mtp_block_spec
-        self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
+        self.mtp_process =  mtp_on_this_rank(
             self.config, ignore_virtual=False, vp_stage=vp_stage
         )
+        if self.mtp_process:
+            assert mtp_block_spec is not None, f"mtp_block_spec should not be none when mtp_process is true"
 
         self.fuse_linear_cross_entropy = (
             self.config.cross_entropy_loss_fusion
@@ -662,13 +664,21 @@ class GPTModel(LanguageModule):
                 # after speculative token verification.
                 self._decoder_hidden_states_cache = hidden_states
             else:
+                ############# for online rl mtp sft ##################
+                # 2、stop grad flow of output layer from mtp
+                output_weight_for_mtp = output_weight
+                if self.config.online_mtp_sft:
+                    if output_weight_for_mtp is None:
+                        output_weight_for_mtp = self.output_layer.weight
+                    output_weight_for_mtp = output_weight_for_mtp.detach()
+                #######################################################
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
                     loss_mask=loss_mask,
                     output_layer=self.output_layer,
-                    output_weight=output_weight,
+                    output_weight=output_weight_for_mtp,
                     runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
@@ -677,6 +687,12 @@ class GPTModel(LanguageModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                 )
+                ############# for online rl mtp sft ##################
+                # label is only used for mtp loss, set labels to None to make this method return logit (instead of loss)
+                if self.config.online_mtp_sft:
+                    labels = None
+                #######################################################
+
         sequence_parallel_override = False
 
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
