@@ -2,7 +2,7 @@
 name: build-and-dependency
 description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, updating uv.lock, and linting.
 TRIGGER when: user asks to add, remove, or update a dependency; user edits or asks about pyproject.toml or uv.lock; uv.lock has a merge conflict; user asks to set up a dev environment or pull/build the CI container; user hits a container build error or uv error; user asks to run linting or autoformat.
-DO NOT TRIGGER when: user is only running tests, investigating CI failures, or opening a PR (use testsystem instead).
+DO NOT TRIGGER when: user is only running tests, investigating CI failures, or opening a PR (use ci-test-system instead).
 ---
 
 # Build & Dependency Guide
@@ -209,3 +209,4 @@ files before committing (repo CLAUDE.md requirement).
 | `No space left on device` during uv ops | Cache fills container's `/root/.cache/` | Mount a host cache dir via `-v $HOME/.cache/uv:/root/.cache/uv` |
 | Pre-commit fails with linting errors | Code style violations | Run `BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh` |
 | `docker build` fails with secret-related error | `Dockerfile.ci.dev` has a `jet` stage that requires an internal secret | Add `--target main` to stop before the `jet` stage |
+| `access forbidden` when pulling | Registry URL includes an explicit port (e.g. `:5005`) | Use `${GITLAB_HOST}/adlr/...` with no port — the sed extracts the hostname only |
