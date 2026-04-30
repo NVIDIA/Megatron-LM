@@ -319,3 +319,86 @@ class TestFp32ResidualStreamAcrossLayers:
             f"fp32 residual error ({err_fp32:.6e}) should be less than "
             f"bf16 residual error ({err_bf16:.6e})"
         )
+
+
+# ============================================================================
+# Tests for the mHC recompute path of get_bias_dropout_add
+# ============================================================================
+#
+# When ``mhc_recompute_manager`` is provided, ``get_bias_dropout_add`` returns
+# a closure that wraps the underlying BDA in ``CheckpointWithoutOutput`` and
+# auto-registers with the supplied ``CheckpointManager``. These tests cover
+# that branch (which is otherwise only invoked indirectly from the mHC layer
+# forward path).
+
+
+class TestBiasDropoutAddMhcRecompute:
+    """Direct coverage for ``_get_checkpointed_bda``."""
+
+    def setup_method(self, method):
+        from megatron.core.tensor_parallel.random import initialize_rng_tracker
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.initialize_model_parallel()
+        initialize_rng_tracker(force_reset=True)
+
+    def teardown_method(self, method):
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("fused", [False, True])
+    @pytest.mark.parametrize("with_bias", [True, False])
+    def test_checkpointed_bda_forward_backward(self, fused, with_bias):
+        """Closure runs forward+backward and registers with the manager."""
+        from megatron.core.tensor_parallel.random import CheckpointManager
+
+        torch.manual_seed(0)
+        manager = CheckpointManager()
+        bda = get_bias_dropout_add(training=True, fused=fused, mhc_recompute_manager=manager)
+
+        x = torch.randn(8, 4, 16, device="cuda", requires_grad=True)
+        residual = torch.randn_like(x, requires_grad=True)
+        bias = torch.zeros(16, device="cuda") if with_bias else None
+        x_with_bias = (x, bias) if with_bias else x
+
+        out = bda(x_with_bias, residual, 0.0)
+        assert out.shape == x.shape
+        assert out.dtype == x.dtype
+        assert len(manager.checkpoints) == 1, "checkpoint should auto-register with manager"
+
+        loss = out.sum()
+        manager.discard_all_outputs_and_register_unified_recompute(loss)
+        loss.backward()
+
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        assert residual.grad is not None and torch.isfinite(residual.grad).all()
+
+    def test_checkpointed_bda_chained_managers(self):
+        """Two checkpointed BDAs chained on one manager both register."""
+        from megatron.core.tensor_parallel.random import CheckpointManager
+
+        torch.manual_seed(0)
+        manager = CheckpointManager()
+        bda = get_bias_dropout_add(training=True, fused=False, mhc_recompute_manager=manager)
+
+        x = torch.randn(4, 2, 8, device="cuda", requires_grad=True)
+        residual = torch.randn_like(x, requires_grad=True)
+
+        y1 = bda((x, None), residual, 0.0)
+        y2 = bda((y1, None), residual, 0.0)
+
+        assert len(manager.checkpoints) == 2, "each call should register a new checkpoint"
+        loss = y2.sum()
+        manager.discard_all_outputs_and_register_unified_recompute(loss)
+        loss.backward()
+        assert x.grad is not None
+
+    def test_get_bda_without_manager_unchanged(self):
+        """The default (manager=None) path returns the regular BDA, not a closure."""
+        unfused = get_bias_dropout_add(training=True, fused=False)
+        fused = get_bias_dropout_add(training=False, fused=True)
+        # Both must be callable; neither should be the mHC closure (which has __closure__ over manager).
+        assert callable(unfused) and callable(fused)
+        assert getattr(unfused, "__name__", "") != "_checkpointed_bda"
+        assert getattr(fused, "__name__", "") != "_checkpointed_bda"
