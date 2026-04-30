@@ -147,7 +147,6 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
-    deferred_request_bookkeeping: bool = True
 
     def __post_init__(self):
 
@@ -277,7 +276,6 @@ class DynamicInferenceEngineTestBase:
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
-                deferred_request_bookkeeping=test_config.deferred_request_bookkeeping,
             ),
         )
 
@@ -912,9 +910,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("deferred_request_bookkeeping", [False, True])
-    async def test_run_engine_with_deferred_bookkeeping(self, deferred_request_bookkeeping: bool):
-        """Correctness of the async bookkeep path in both sync and deferred modes.
+    async def test_run_engine_with_deferred_bookkeeping(self):
+        """Correctness of the deferred bookkeep path.
 
         Exercises length-based termination, stop words, eviction,
         failed-request cleanup, and deferred log-prob accumulation all in a
@@ -942,7 +939,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 context_paused_buffer_size_gb=0.0,
                 model_provider="gpt",
                 materialize_only_last_token_logits=False,
-                deferred_request_bookkeeping=deferred_request_bookkeeping,
             )
             env = self._build_test_env(test_config)
 
@@ -1049,12 +1045,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     exp = expected[rid]
 
                     assert req.status == exp["status"], (
-                        f"Request {rid}: expected {exp['status']}, got {req.status} "
-                        f"(deferred={deferred_request_bookkeeping})"
+                        f"Request {rid}: expected {exp['status']}, got {req.status}"
                     )
                     assert req.generated_tokens == exp["generated"], (
                         f"Request {rid}: expected tokens {exp['generated']}, "
-                        f"got {req.generated_tokens} (deferred={deferred_request_bookkeeping})"
+                        f"got {req.generated_tokens}"
                     )
 
                     if exp.get("check_log_probs"):
@@ -1093,7 +1088,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 # --- Verify eviction fired ---
                 assert (
                     env.engine.evicted_request_count > 0
-                ), f"No evictions triggered (deferred={deferred_request_bookkeeping})"
+                ), "No evictions triggered"
 
                 # --- Verify failed request was cleaned up ---
                 await env.engine._bookkeep_queue.join()

@@ -223,7 +223,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
-        self.deferred_request_bookkeeping = inference_config.deferred_request_bookkeeping
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
@@ -2280,8 +2279,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_data = await self.async_forward()
                 work = self._prepare_bookkeep_work_item(*step_data)
                 await self._bookkeep_queue.put(work)
-                if not self.deferred_request_bookkeeping:
-                    await self._bookkeep_queue.join()
         except asyncio.CancelledError:
             pass
         finally:
@@ -2393,8 +2390,6 @@ class DynamicInferenceEngine(AbstractEngine):
                             step_data = await self.async_forward()
                             work = self._prepare_bookkeep_work_item(*step_data)
                             await self._bookkeep_queue.put(work)
-                            if not self.deferred_request_bookkeeping:
-                                await self._bookkeep_queue.join()
                         else:
                             # Dummy forward to participate in the EP collective.
                             self.step_start_event.record()
