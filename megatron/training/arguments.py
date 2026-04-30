@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import types
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -1011,10 +1012,11 @@ def validate_args(args, defaults={}):
         try:
             import flashinfer  # noqa: F401
         except ImportError:
-            raise ValueError(
-                "--inference-dynamic-batching-sampling-backend=flashinfer "
-                "requires flashinfer to be installed."
+            warnings.warn(
+                "--inference-dynamic-batching-sampling-backend=flashinfer requested "
+                "but flashinfer is not installed; falling back to 'torch'."
             )
+            args.inference_dynamic_batching_sampling_backend = 'torch'
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -2004,9 +2006,11 @@ def _add_inference_args(parser):
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
-                       type=str, default='torch',
+                       type=str, default='flashinfer',
                        choices=['torch', 'flashinfer'],
-                       help='Which sampling kernels to use during inference.')
+                       help='Which sampling kernels to use during inference. '
+                            'Falls back to "torch" with a warning if "flashinfer" '
+                            'is requested but the package is not installed.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')

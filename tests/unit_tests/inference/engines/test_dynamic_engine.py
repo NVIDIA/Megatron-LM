@@ -146,6 +146,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
+    sampling_backend: str = 'torch'
 
     def __post_init__(self):
 
@@ -274,6 +275,7 @@ class DynamicInferenceEngineTestBase:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                sampling_backend=test_config.sampling_backend,
             ),
         )
 
@@ -2261,10 +2263,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
-    def test_speculative_decoding_with_early_termination(self, materialize_only_last_token_logits):
+    def test_speculative_decoding_with_early_termination(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that speculative decoding handles premature request termination safely
         (e.g. hitting max_sequence_length mid-speculative-batch)."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         # Set max_sequence_length tight so it terminates during a speculative step
         test_config = DynamicEngineTestConfig(
@@ -2276,6 +2283,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             model_provider="gpt",
             num_speculative_tokens=3,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+            sampling_backend=sampling_backend,
         )
 
         env = self._build_test_env(test_config)
@@ -2338,13 +2346,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @pytest.mark.internal
     @torch.inference_mode()
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
-    def test_speculative_block_boundary_crossing(self, materialize_only_last_token_logits):
+    def test_speculative_block_boundary_crossing(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test to verify KV cache block boundary crossing logic.
 
         When a request fills exactly one block and speculative decoding generates
         multiple tokens, the first new token shouldn't incorrectly overwrite the old block.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         test_config = DynamicEngineTestConfig(
             num_requests=1,
             min_prompt_length=256,
@@ -2356,6 +2369,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             model_provider="gpt",
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             use_fixed_output_lengths=True,
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2395,10 +2409,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
-    def test_speculative_stop_word_hit(self, materialize_only_last_token_logits):
+    def test_speculative_stop_word_hit(self, materialize_only_last_token_logits, sampling_backend):
         """Test that if an accepted speculative token completes a stop word,
         the request correctly triggers the stop logic without crashing."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,  # We will manually add our request cleanly
@@ -2408,6 +2425,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2484,10 +2502,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
-    def test_speculative_long_stop_word_hit(self, materialize_only_last_token_logits):
+    def test_speculative_long_stop_word_hit(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that if an accepted speculative token completes a long stop word
         (length > num_speculative_tokens), it is correctly detected."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,
@@ -2497,6 +2520,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2569,9 +2593,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_speculative_stop_word_truncates_trailing_tokens(
-        self, materialize_only_last_token_logits
+        self, materialize_only_last_token_logits, sampling_backend
     ):
         """Test that when a stop word lands in the middle of speculative tokens,
         the extra tokens generated after the stop word are removed.
@@ -2580,6 +2605,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         (1 base + 2 speculative). If the stop word is [6] and the engine
         generates [5, 6, 7] in one step, token 7 must be truncated so the
         output ends with the stop word [6]."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,
@@ -2589,6 +2616,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2692,6 +2720,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             "non_divisible_boundary",
         ],
     )
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @torch.inference_mode()
     def test_speculative_tokens_exceed_max_sequence_length(
@@ -2700,6 +2729,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         num_tokens_to_generate,
         num_speculative_tokens,
         materialize_only_last_token_logits,
+        sampling_backend,
     ):
         """Test that speculative decoding correctly trims output when speculative
         tokens would push the sequence beyond max_sequence_length.
@@ -2709,6 +2739,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         speculative tokens are accepted and the boundary trimming logic is
         actually exercised.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         max_sequence_length = prompt_length + num_tokens_to_generate
 
         test_config = DynamicEngineTestConfig(
@@ -2723,6 +2755,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # Disable positional embeddings so speculative position IDs
             # beyond max_sequence_length don't cause out-of-bounds lookups.
             position_embedding_type="none",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2825,10 +2858,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.parametrize(
         "acceptance_mode", ["all_rejected", "all_accepted"], ids=["all_rejected", "all_accepted"]
     )
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @torch.inference_mode()
     def test_speculative_sequence_length_double_counting(
-        self, acceptance_mode, materialize_only_last_token_logits
+        self, acceptance_mode, materialize_only_last_token_logits, sampling_backend
     ):
         """Test to verify active_sequence_lengths is not double-counted.
 
@@ -2841,6 +2875,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         a faulty formula that adds accepted_tokens on top of the KV length will
         over-count by 2 per step, finishing the request after only 4 of 6 tokens.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         test_config = DynamicEngineTestConfig(
             num_requests=0,
             min_prompt_length=4,
@@ -2854,6 +2890,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             use_fixed_output_lengths=False,
             context_max_tokens=512,
             position_embedding_type="none",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -2950,15 +2987,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_speculative_decoding_with_eviction_and_swapping(
-        self, materialize_only_last_token_logits
+        self, materialize_only_last_token_logits, sampling_backend
     ):
         """Test that speculative decoding works correctly when requests are paused and evicted.
 
         This exercises the `_swap_book_keeping_tensors` logic with the 2D `new_speculative_tokens`
         tensor, ensuring no dimensional mismatch or index errors occur during tensor swapping.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         # Very constrained memory environment to force pausing and eviction
         test_config = DynamicEngineTestConfig(
             num_requests=3,
@@ -2972,6 +3012,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             model_provider="gpt",
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             use_fixed_output_lengths=True,
+            sampling_backend=sampling_backend,
         )
 
         env = self._build_test_env(test_config)
