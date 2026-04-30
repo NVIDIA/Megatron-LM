@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
@@ -328,9 +327,8 @@ class InferenceConfig:
         if self.sampling_backend == 'flashinfer':
             try:
                 import flashinfer  # noqa: F401
-            except ImportError:
-                warnings.warn(
-                    "sampling_backend='flashinfer' requested but flashinfer is not "
-                    "installed; falling back to 'torch'."
-                )
-                self.sampling_backend = 'torch'
+            except ImportError as e:
+                raise ImportError(
+                    "sampling_backend='flashinfer' requires the flashinfer package; "
+                    "install it or set sampling_backend='torch'."
+                ) from e
