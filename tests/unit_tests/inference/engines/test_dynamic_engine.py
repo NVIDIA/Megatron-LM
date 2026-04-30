@@ -145,7 +145,6 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
-    enable_async_overlap_architecture: bool = True
     async_overlap_queue_depth: int = 2
 
     def __post_init__(self):
@@ -341,7 +340,6 @@ class TestDynamicInferenceEngine:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
-                enable_async_overlap_architecture=test_config.enable_async_overlap_architecture,
                 async_overlap_queue_depth=test_config.async_overlap_queue_depth,
             ),
         )
@@ -787,7 +785,6 @@ class TestDynamicInferenceEngine:
             force_build_cuda_graphs=True,
             context_max_requests=16,
             context_block_size_tokens=256,
-            enable_async_overlap_architecture=True,
             async_overlap_queue_depth=2,
             **parallel_kwargs,
         )
@@ -853,7 +850,6 @@ class TestDynamicInferenceEngine:
             context_max_requests=16,
             num_gap_steps=0,
             suspend_resume_interval=1,
-            enable_async_overlap_architecture=True,
             async_overlap_queue_depth=2,
         )
 
@@ -881,7 +877,6 @@ class TestDynamicInferenceEngine:
                 cuda_graph_scope=[],
                 force_build_cuda_graphs=True,
                 context_max_requests=128,
-                enable_async_overlap_architecture=True,
                 async_overlap_queue_depth=queue_depth,
             )
             env = self._build_test_env(test_config)
@@ -973,7 +968,6 @@ class TestDynamicInferenceEngine:
             context_block_size_tokens=256,
             enable_chunked_prefill=True,
             use_cuda_graphs_for_non_decode_steps=False,
-            enable_async_overlap_architecture=True,
             async_overlap_queue_depth=queue_depth,
         )
         env = self._build_test_env(test_config)
@@ -1131,7 +1125,6 @@ class TestDynamicInferenceEngine:
             force_build_cuda_graphs=True,
             context_max_requests=128,
             materialize_only_last_token_logits=False,
-            enable_async_overlap_architecture=True,
             async_overlap_queue_depth=queue_depth,
         )
         env = self._build_test_env(test_config)
@@ -1268,7 +1261,6 @@ class TestDynamicInferenceEngine:
             context_max_tokens=512,
             context_block_size_tokens=64,
             position_embedding_type="none",
-            enable_async_overlap_architecture=True,
             async_overlap_queue_depth=queue_depth,
         )
         env = self._build_test_env(test_config)
@@ -1427,7 +1419,6 @@ class TestDynamicInferenceEngine:
             context_block_size_tokens=256,
             enable_chunked_prefill=enable_chunked_prefill,
             use_cuda_graphs_for_non_decode_steps=False,
-            enable_async_overlap_architecture=True,
             async_overlap_queue_depth=queue_depth,
         )
         env = self._build_test_env(test_config)

@@ -306,13 +306,6 @@ class InferenceConfig:
     # =================================
     # Async-overlap config
     # =================================
-    enable_async_overlap_architecture: bool = True
-    """Deprecated compatibility flag for async-overlap architecture rollout.
-
-    The dynamic engine now always uses the async-overlap architecture. This flag is
-    retained only so older configs continue to load until the rollout cleanup removes it.
-    """
-
     async_overlap_queue_depth: int = 2
     """Maximum async-overlap pipeline depth. ``1`` is debug/correctness mode."""
 

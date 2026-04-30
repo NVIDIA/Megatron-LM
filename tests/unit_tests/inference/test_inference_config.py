@@ -21,7 +21,6 @@ class TestInferenceConfig:
     def test_async_overlap_defaults_enable_queue_depth_two(self):
         config = InferenceConfig()
 
-        assert config.enable_async_overlap_architecture is True
         assert config.async_overlap_queue_depth == 2
         assert config.async_overlap_debug_checks is False
 
