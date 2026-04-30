@@ -330,8 +330,13 @@ class RolloutStream(AsyncIterator):
     async def aclose(self):
         self._buffer.clear()
         if self._pending_task is not None:
-            self._pending_task.cancel()
+            pending = self._pending_task
             self._pending_task = None
+            pending.cancel()
+            try:
+                await pending
+            except (asyncio.CancelledError, Exception):
+                pass
         await self._inner.aclose()
 
     async def _try_next(self):
