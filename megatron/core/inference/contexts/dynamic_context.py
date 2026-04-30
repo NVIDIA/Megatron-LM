@@ -1411,6 +1411,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         full delta.
         """
         entry = self.journal.commit_step_transaction(step_id)
+        from megatron.core.inference.engines.async_pipeline_types import ResourceKind
+
+        for r in entry.reservations:
+            if r.resource_kind is ResourceKind.KV_BLOCK:
+                self.kv_block_allocator.commit(r)
         for slot, delta in entry.placeholder_deltas.items():
             decrement = (
                 accepted_token_counts[slot]
@@ -1425,6 +1430,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         increment recorded during the step.
         """
         entry = self.journal.rollback_step_transaction(step_id)
+        from megatron.core.inference.engines.async_pipeline_types import ResourceKind
+
+        for r in entry.reservations:
+            if r.resource_kind is ResourceKind.KV_BLOCK:
+                self.kv_block_allocator.rollback(r)
         for slot, delta in entry.placeholder_deltas.items():
             self.num_output_placeholders[slot] -= delta
         return entry
@@ -3021,7 +3031,21 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if num_new_blocks > 0:
                 assert num_new_blocks <= self.kv_block_allocator.total_avail
-                block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
+                # v3 plan §commit 7 — resume-time KV block allocation flows
+                # through the journal as a Reservation. With overlap off the
+                # reservation is committed in this same step (identity vs
+                # allocate_memory_blocks); commits 18+ defer the release of
+                # blocks held by an in-flight snapshot.
+                resume_step_id = self.step_count
+                journal_id = self.journal.issue_journal_id()
+                reservation = self.kv_block_allocator.reserve(
+                    request_idx=-1,  # batch resume; per-row binding below
+                    block_count=num_new_blocks,
+                    journal_id=journal_id,
+                    must_outlast_snapshot_step_id=resume_step_id,
+                )
+                self.record_resource_reservation(resume_step_id, reservation)
+                block_ids = reservation.resource_handle[1]
 
                 # Apply updates only to the requests that required a new block
                 relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)

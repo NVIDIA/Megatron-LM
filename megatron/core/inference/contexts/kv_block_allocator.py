@@ -1,12 +1,21 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from collections import deque
-from typing import Callable, Dict, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+
+if TYPE_CHECKING:
+    # Lazy import inside ``reserve`` to avoid the engines/__init__.py
+    # circular path; the dataclass + enum are referenced only as types here.
+    from megatron.core.inference.engines.async_pipeline_types import (
+        Reservation,
+        ReservationState,
+        ResourceKind,
+    )
 
 
 class KVBlockAllocator:
@@ -184,6 +193,74 @@ class KVBlockAllocator:
                 self.update_timestamps(block_ids)
 
         return block_ids
+
+    # ------------------------------------------------------------------
+    # Reservation API (v3 plan commit 7)
+    # ------------------------------------------------------------------
+
+    def reserve(
+        self,
+        request_idx: int,
+        block_count: int,
+        journal_id: int,
+        must_outlast_snapshot_step_id: int = -1,
+    ) -> "Reservation":
+        """Allocate ``block_count`` blocks for ``request_idx`` and return a
+        ``Reservation`` whose ``resource_handle`` carries the block IDs.
+
+        The blocks are taken from the free pool immediately. With overlap
+        off the reservation is committed in the same step (no behavior
+        change vs ``allocate_memory_blocks``); commits 18+ defer release
+        until ``must_outlast_snapshot_step_id`` retires.
+        """
+        from megatron.core.inference.engines.async_pipeline_types import (
+            Reservation,
+            ReservationState,
+            ResourceKind,
+        )
+
+        block_ids = self.allocate_memory_blocks(block_count)
+        return Reservation(
+            journal_id=journal_id,
+            resource_kind=ResourceKind.KV_BLOCK,
+            resource_handle=(request_idx, block_ids),
+            state=ReservationState.RESERVED,
+            must_outlast_snapshot_step_id=must_outlast_snapshot_step_id,
+        )
+
+    def commit(self, reservation: "Reservation") -> None:
+        """Mark ``reservation`` committed.
+
+        Today this is a state-only transition: the blocks are already owned
+        by the request and remain so. Commit 27 hooks deferred-release
+        behavior in here.
+        """
+        from megatron.core.inference.engines.async_pipeline_types import (
+            ReservationState,
+            ResourceKind,
+        )
+
+        assert reservation.resource_kind is ResourceKind.KV_BLOCK, (
+            "KVBlockAllocator.commit only handles KV_BLOCK reservations; got "
+            f"{reservation.resource_kind}"
+        )
+        reservation.state = ReservationState.COMMITTED
+
+    def rollback(self, reservation: "Reservation") -> None:
+        """Roll back ``reservation`` and release the blocks back to the pool."""
+        from megatron.core.inference.engines.async_pipeline_types import (
+            ReservationState,
+            ResourceKind,
+        )
+
+        assert reservation.resource_kind is ResourceKind.KV_BLOCK, (
+            "KVBlockAllocator.rollback only handles KV_BLOCK reservations; got "
+            f"{reservation.resource_kind}"
+        )
+        _, block_ids = reservation.resource_handle
+        if block_ids is not None and block_ids.numel() > 0:
+            self.release_memory_blocks(block_ids)
+        reservation.state = ReservationState.ROLLED_BACK
 
     def release_memory_blocks(self, blocks: Tensor) -> None:
         """Release memory blocks by decrementing reference counts.
