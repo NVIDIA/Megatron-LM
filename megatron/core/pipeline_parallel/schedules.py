@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import threading
 from functools import partial
 from itertools import zip_longest
 from typing import Callable, Dict, Iterator, List, Optional, Union
@@ -679,6 +680,7 @@ def forward_backward_no_pipelining(
         )
     else:
         with no_sync_func():
+            output_tensors_to_free = []
             for i in range(num_microbatches - 1):
                 output_tensor, num_tokens = forward_step(
                     forward_step_func,
@@ -696,6 +698,15 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                    # Free the output tensor from the forward pass since it's no longer needed.
+                    output_tensors_to_free.append(output_tensor)
+                    output_tensor = None
+
+            def _async_free(tensors: List[torch.Tensor]):
+                tensors.clear()
+
+            threading.Thread(target=_async_free, args=(output_tensors_to_free,)).start()
+
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
