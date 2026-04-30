@@ -167,8 +167,8 @@ class TestManagerOrdering:
         original = _make_original_forward(log)
         model = _attach_forward(_StubModelWithManager, original)
 
-        def _loss_func(kwargs, budget_item, original_model):
-            log.note("loss_func", budget_item=budget_item, original_model=original_model)
+        def _loss_func(kwargs, budget_item):
+            log.note("loss_func", budget_item=budget_item)
             return "budget-loss"
 
         model._flextron_manager = _make_manager(log, loss_func=_loss_func)
@@ -186,11 +186,6 @@ class TestManagerOrdering:
 
 
 class TestOverrideSelectedBudget:
-    # Note: the override_selected_budget==1.0 path with an attached router
-    # currently crashes in production code because the `else: budget_item = 1.0;
-    # original_model = True` branch in flextron_forward is commented out. Not
-    # tested here — see CLEANUP.md item 11 to resolve.
-
     def test_override_non_one_sets_budget_from_override(self):
         log = _CallLog()
         original = _make_original_forward(log)

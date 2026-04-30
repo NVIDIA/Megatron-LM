@@ -556,7 +556,10 @@ class FlextronRouter(MegatronModule):
                 len(self.config.budget_list),
             ).to(device=device, dtype=dtype)
         else:
-            # budgets must be sorted ascending for bucketize
+            # budget_list is enforced descending by sort_budget_list_descending
+            # at config-injection time. We re-sort ascending locally for
+            # bucketize, then flip(0) below to land back in the descending
+            # one-hot coordinate system the router was trained against.
             budget_values = torch.tensor(
                 sorted(self.config.budget_list), device=device, dtype=dtype
             )

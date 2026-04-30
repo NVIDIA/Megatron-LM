@@ -96,11 +96,16 @@ def inject_flextron_config(args, config) -> None:
     falls back to FlextronConfig defaults via getattr.  After this call every
     FlextronConfig field is accessible directly as config.<field>.
     """
-    # Validate per-list/int-list mutual exclusion and apply default fallbacks
-    # before copying onto config so downstream code sees the resolved state.
-    from megatron.elastification.arguments import validate_flextron_per_int_lists
+    # Validate per-list/int-list mutual exclusion, apply default fallbacks,
+    # and sort the budget list descending before copying onto config so
+    # downstream code sees the resolved + ordered state.
+    from megatron.elastification.arguments import (
+        sort_budget_list_descending,
+        validate_flextron_per_int_lists,
+    )
 
     validate_flextron_per_int_lists(args)
+    sort_budget_list_descending(args)
 
     defaults = FlextronConfig()
     for f in dataclasses.fields(defaults):

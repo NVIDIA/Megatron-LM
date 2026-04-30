@@ -136,7 +136,7 @@ class FlextronModelManager:
             f"param_target={self.memory_config.param_budget_target})"
         )
 
-    def budget_loss_func(self, flextron_kwargs, budget_item=0, original_model=True):
+    def budget_loss_func(self, flextron_kwargs, budget_item=0):
         """Calculate budget-based loss exactly as in the original implementation."""
         dtype, device = (
             flextron_kwargs['router_mlp'][0].dtype,
@@ -304,10 +304,7 @@ class FlextronModelManager:
                 + mse_loss_emb
             )
 
-        if original_model:
-            return diff * 0.0, {}
-        else:
-            return diff.bfloat16(), {}
+        return diff.bfloat16(), {}
 
     def get_loss_func(self):
         """Get the budget loss function."""
@@ -405,10 +402,12 @@ def inject_flextron_forward_logic(model):
             assert (
                 self.config.is_flex_eval
             ), "Override selected budget should only be set in flex eval mode"
-            if self.config.override_selected_budget[0] == 1.0:
-                flextron_kwargs = {}
-            else:
-                flextron_kwargs = {'budget': self.config.override_selected_budget[0]}
+            # Both branches must populate the 'budget' key — downstream code
+            # at line 422 reads it unconditionally. Setting budget=1.0 routes
+            # the override-1.0 case through the regular router-forward path,
+            # which after training produces near-identity router outputs that
+            # mask down to the full model.
+            flextron_kwargs = {'budget': self.config.override_selected_budget[0]}
 
         # Initialize budget_loss
         budget_loss = None
@@ -419,25 +418,21 @@ def inject_flextron_forward_logic(model):
             and self._flextron_manager is not None
             and self._flextron_manager.router is not None
         ):
-
-            if 'budget' in flextron_kwargs:
-                budget_item = flextron_kwargs['budget']
-                original_model = False
-            else:
-                budget_item = 1.0
-                original_model = True
+            # Every step is router-driven, including budget=1.0 (which now
+            # propagates the identity-MSE regularization that the old
+            # ``original_model`` kill-switch silently zeroed out). Use
+            # ``freeze_router`` if you need to train without router gradients.
+            budget_item = flextron_kwargs['budget']
 
             # Get router output and loss function
             flextron_kwargs, loss_func = self._flextron_manager.process_router_output(budget_item)
 
             # Calculate loss
             if loss_func:
-                budget_loss = loss_func(flextron_kwargs, budget_item, original_model)
+                budget_loss = loss_func(flextron_kwargs, budget_item)
 
-            if original_model:
-                flextron_kwargs = {}
-
-            # Update hook elasticity parameters
+            # Push router outputs into the elasticity hook managers so masks
+            # fire on this forward.
             self._flextron_manager.update_hook_elasticity_params(flextron_kwargs)
         else:
             # If no Flextron manager, clear flextron_kwargs to avoid passing unknown args

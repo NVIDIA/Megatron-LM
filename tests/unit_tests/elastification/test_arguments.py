@@ -8,6 +8,7 @@ import pytest
 
 from megatron.elastification.arguments import (
     convert_per_lists_to_int_lists,
+    sort_budget_list_descending,
     validate_flextron_per_int_lists,
 )
 
@@ -118,3 +119,53 @@ class TestValidateFlextronPerIntLists:
         args = self._make_args(emb_per_list=[-0.1])
         with pytest.raises(AssertionError, match=r"\[0, 1\]"):
             validate_flextron_per_int_lists(args)
+
+
+class TestSortBudgetListDescending:
+    def test_ascending_input_gets_reversed(self):
+        args = Namespace(budget_list=[0.5, 0.7, 1.0], budget_probs=[0.1, 0.4, 0.5])
+        sort_budget_list_descending(args)
+        assert args.budget_list == [1.0, 0.7, 0.5]
+        assert args.budget_probs == [0.5, 0.4, 0.1]
+
+    def test_descending_input_unchanged(self):
+        args = Namespace(budget_list=[1.0, 0.5], budget_probs=[0.7, 0.3])
+        sort_budget_list_descending(args)
+        assert args.budget_list == [1.0, 0.5]
+        assert args.budget_probs == [0.7, 0.3]
+
+    def test_unsorted_input_paired_correctly(self):
+        # Verify probs follow the same permutation as budgets.
+        args = Namespace(budget_list=[0.5, 1.0, 0.7], budget_probs=[0.1, 0.5, 0.4])
+        sort_budget_list_descending(args)
+        assert args.budget_list == [1.0, 0.7, 0.5]
+        assert args.budget_probs == [0.5, 0.4, 0.1]
+
+    def test_no_probs_only_sorts_budgets(self):
+        args = Namespace(budget_list=[0.5, 1.0], budget_probs=None)
+        sort_budget_list_descending(args)
+        assert args.budget_list == [1.0, 0.5]
+        assert args.budget_probs is None
+
+    def test_single_element_unchanged(self):
+        args = Namespace(budget_list=[1.0], budget_probs=[1.0])
+        sort_budget_list_descending(args)
+        assert args.budget_list == [1.0]
+        assert args.budget_probs == [1.0]
+
+    def test_none_budget_list_skipped(self):
+        args = Namespace(budget_list=None, budget_probs=None)
+        sort_budget_list_descending(args)  # must not raise
+        assert args.budget_list is None
+
+    def test_length_mismatch_raises(self):
+        args = Namespace(budget_list=[1.0, 0.5], budget_probs=[1.0])
+        with pytest.raises(AssertionError, match="length"):
+            sort_budget_list_descending(args)
+
+    def test_idempotent(self):
+        args = Namespace(budget_list=[0.5, 0.7, 1.0], budget_probs=[0.1, 0.4, 0.5])
+        sort_budget_list_descending(args)
+        sort_budget_list_descending(args)  # second call must be a no-op
+        assert args.budget_list == [1.0, 0.7, 0.5]
+        assert args.budget_probs == [0.5, 0.4, 0.1]

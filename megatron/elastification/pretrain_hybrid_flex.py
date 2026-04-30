@@ -385,8 +385,11 @@ def forward_step(data_iterator, model: HybridModel):
     timers('batch-generator').stop()
 
     if get_grad_acc_based_random_choice(args=args) < args.original_model_sample_prob:
-        flextron_kwargs = {}
-        selected_budget = 1.0  # Full model
+        # Funnel "full-model sample" through the regular router-driven path
+        # with budget=1.0. flextron_forward unconditionally reads
+        # flextron_kwargs['budget'], so an empty dict would KeyError here.
+        flextron_kwargs = {'budget': 1.0}
+        selected_budget = 1.0
     else:
         if args.budget_probs is None:
             budget_probs = [1.0 for _ in args.budget_list]

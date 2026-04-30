@@ -23,6 +23,31 @@ def convert_per_lists_to_int_lists(config):
             setattr(config, per_attr, None)
 
 
+def sort_budget_list_descending(args):
+    """Sort ``budget_list`` descending and permute ``budget_probs`` to match.
+
+    The Flextron router's interpolation branch and the elasticity hooks
+    implicitly assume budget_list is descending (largest first). Sort once
+    here so downstream code can rely on that invariant regardless of the
+    order the user passed on the CLI. Idempotent: a list already in
+    descending order is unchanged.
+    """
+    bl = getattr(args, 'budget_list', None)
+    if bl is None or len(bl) <= 1:
+        return
+
+    bp = getattr(args, 'budget_probs', None)
+    if bp is not None:
+        assert len(bp) == len(bl), (
+            f'budget_probs length {len(bp)} does not match budget_list length {len(bl)}'
+        )
+
+    order = sorted(range(len(bl)), key=lambda i: bl[i], reverse=True)
+    args.budget_list = [bl[i] for i in order]
+    if bp is not None:
+        args.budget_probs = [bp[i] for i in order]
+
+
 def validate_flextron_per_int_lists(args):
     """
     Enforce mutual exclusion between ratio per-lists and integer choice lists.
