@@ -56,10 +56,10 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
     prepare_next_forward_pass,
-    rewind_kv_cache,
     verify_speculative_tokens,
 )
 
@@ -757,9 +757,10 @@ class TextGenerationController:
         """Update the KV cache bookkeeping for speculative decoding.
 
         After forward pass with speculative tokens, some tokens may be rejected.
-        This function "rewinds" the KV cache bookkeeping to reflect only the accepted
-        tokens. The core bookkeeping is handled by a Triton kernel (one thread per
-        request). Mamba hybrid-model state updates remain in PyTorch.
+        This function "rewinds" the KV cache bookkeeping to reflect only the
+        accepted tokens. The core bookkeeping rewind runs on CPU (mutating the
+        CPU source-of-truth tensors in place); the Mamba hybrid-model state
+        update stays on GPU because it operates on GPU-resident state buffers.
 
         Returns (blocks_to_release, remove_mask) for the caller to release blocks
         back to the allocator outside the compiled graph.
@@ -768,76 +769,55 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Note: _accepted_token_counts is indexed from 0 to active_request_count-1.
-        # Triton kernels below need GPU tensors, so move the CPU-resident
-        # bookkeeping slices to GPU and copy results back after the kernel runs.
-        accepted_tokens_per_request = self._accepted_token_counts_per_request[:active_request_count]
-        cuda_device = torch.cuda.current_device()
+        # accepted_counts is the only GPU input; D2H a small slice so the
+        # CPU rewind can read its values via .tolist() inside a Python loop.
+        accepted_tokens_per_request_cpu = self._accepted_token_counts_per_request[
+            :active_request_count
+        ].cpu()
 
-        request_in_prefill_status_cpu = context.request_in_prefill_status_tensor[
-            active_request_slice
-        ]
-        request_last_kv_block_offset_cpu = context.request_last_kv_block_offset[
-            active_request_slice
-        ]
-        request_kv_length_offsets_cpu = context.request_kv_length_offsets[active_request_slice]
-        request_kv_block_counts_cpu = context.request_kv_block_counts[active_request_slice]
-        request_last_kv_block_id_cpu = context.request_last_kv_block_id[active_request_slice]
-        request_to_kv_block_ids_cpu = context.request_to_kv_block_ids[active_request_slice]
-
-        accepted_tokens_per_request_gpu = accepted_tokens_per_request.to(
-            cuda_device, non_blocking=True
-        )
-        request_in_prefill_status = request_in_prefill_status_cpu.to(cuda_device, non_blocking=True)
-        request_last_kv_block_offset = request_last_kv_block_offset_cpu.to(
-            cuda_device, non_blocking=True
-        )
-        request_kv_length_offsets = request_kv_length_offsets_cpu.to(cuda_device, non_blocking=True)
-        request_kv_block_counts = request_kv_block_counts_cpu.to(cuda_device, non_blocking=True)
-        request_last_kv_block_id = request_last_kv_block_id_cpu.to(cuda_device, non_blocking=True)
-        request_to_kv_block_ids = request_to_kv_block_ids_cpu.to(cuda_device, non_blocking=True)
-
-        # --- Triton kernel: core KV-cache rewind ---
         blocks_to_release, remove_mask = rewind_kv_cache(
-            accepted_counts=accepted_tokens_per_request_gpu,
-            prefill_status=request_in_prefill_status,
-            last_kv_block_offset=request_last_kv_block_offset,
-            kv_length_offsets=request_kv_length_offsets,
-            kv_block_counts=request_kv_block_counts,
-            last_kv_block_id=request_last_kv_block_id,
-            kv_block_ids=request_to_kv_block_ids,
+            accepted_counts=accepted_tokens_per_request_cpu,
+            prefill_status=context.request_in_prefill_status_tensor[active_request_slice],
+            last_kv_block_offset=context.request_last_kv_block_offset[active_request_slice],
+            kv_length_offsets=context.request_kv_length_offsets[active_request_slice],
+            kv_block_counts=context.request_kv_block_counts[active_request_slice],
+            last_kv_block_id=context.request_last_kv_block_id[active_request_slice],
+            kv_block_ids=context.request_to_kv_block_ids[active_request_slice],
             num_speculative_tokens=self.num_speculative_tokens,
             block_size_tokens=context.block_size_tokens,
             num_active_requests=active_request_count,
         )
 
-        # Copy mutated bookkeeping back to the CPU source-of-truth tensors.
-        request_last_kv_block_offset_cpu.copy_(request_last_kv_block_offset, non_blocking=True)
-        request_kv_length_offsets_cpu.copy_(request_kv_length_offsets, non_blocking=True)
-        request_kv_block_counts_cpu.copy_(request_kv_block_counts, non_blocking=True)
-        request_last_kv_block_id_cpu.copy_(request_last_kv_block_id, non_blocking=True)
-        request_to_kv_block_ids_cpu.copy_(request_to_kv_block_ids, non_blocking=True)
-
-        # Mamba speculative rewind: copy accepted intermediate states in-place.
+        # Mamba speculative rewind stays on GPU because it mutates GPU-resident
+        # SSM/conv state that the next forward pass reads directly.
         if context.is_hybrid_model:
-            mamba_state_idx_cpu = context.mamba_metadata.request_to_mamba_state_idx[
-                active_request_slice
+            cuda_device = torch.cuda.current_device()
+            # gpu_view.request_in_prefill_status was uploaded by this step's
+            # coalesced H2D and mirrors the active-slice CPU values, so we
+            # don't need to re-upload prefill_status for the Mamba kernels.
+            prefill_status_gpu = context.gpu_view.request_in_prefill_status[
+                :active_request_count
             ]
-            mamba_state_idx = mamba_state_idx_cpu.to(cuda_device, non_blocking=True)
+            accepted_counts_gpu = self._accepted_token_counts_per_request[
+                :active_request_count
+            ]
+            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
+                active_request_slice
+            ].to(cuda_device, non_blocking=True)
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
-                prefill_status=request_in_prefill_status,
+                prefill_status=prefill_status_gpu,
                 state_idx=mamba_state_idx,
-                accepted_counts=accepted_tokens_per_request_gpu,
+                accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_ssm_states,
                 current_states=context.mamba_ssm_states,
-                prefill_status=request_in_prefill_status,
+                prefill_status=prefill_status_gpu,
                 state_idx=mamba_state_idx,
-                accepted_counts=accepted_tokens_per_request_gpu,
+                accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
 
