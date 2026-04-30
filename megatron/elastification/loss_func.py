@@ -26,7 +26,6 @@ def _mask_loss(output_tensor, loss_mask):
 
     num_tokens = loss_mask.sum().float()
 
-    # Sharath: param loss for flextron copied from Ali
     if param_loss is not None:
         if param_loss > 0:
             pass
@@ -42,7 +41,6 @@ def _mask_loss(output_tensor, loss_mask):
     loss_mask = loss_mask.reshape(-1).float()
     loss = torch.sum(losses * loss_mask)
 
-    # Ali: param loss for flextron
     alpha = args.loss_alpha
     if not args.freeze_router and param_loss is not None:
         param_loss_item = param_loss[0] * num_tokens * alpha

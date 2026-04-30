@@ -67,7 +67,6 @@ class FlextronConfig:
     # ── Choice lists (converted to int at model-setup time) ───────────────────
     mamba_per_list: Optional[List[float]] = None
     mlp_per_list: Optional[List[float]] = None
-    mha_per_list: Optional[List[float]] = None
     emb_per_list: Optional[List[float]] = None
     head_per_list: Optional[List[float]] = None
     moe_expert_per_list: Optional[List[float]] = None
