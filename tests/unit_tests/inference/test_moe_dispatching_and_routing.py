@@ -338,7 +338,7 @@ class TestNVLSAllGatherVDispatcher:
             hidden_size=NANOV3_BASE["hidden_size"],
             ep_group=ep_group,
         )
-    
+
         return NVLSAllGatherVDispatcher(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
