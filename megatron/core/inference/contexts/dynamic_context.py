@@ -351,6 +351,22 @@ class UpdateRequestsScratch:
             (max_requests + 1,), -1, dtype=torch.int32, device=device
         )
 
+        # Post-finalize newly-paused IDs buffer. Holds the survivor IDs at
+        # ``[0, final_newly_paused)`` with ``-1`` sentinels at the tail, so
+        # ``_finalize_update_requests`` can return a shape-stable buffer
+        # without slicing on a synced count. Distinct from
+        # ``newly_paused_ids_buf`` because graph 1's
+        # ``_capture_newly_paused_ids`` would clobber it before the engine
+        # consumes the post-finalize result.
+        self.newly_paused_ids_post_buf = torch.full(
+            (max_requests,), -1, dtype=torch.int32, device=device
+        )
+
+        # Survivor count from the survivor formula in ``_finalize_update_requests``.
+        # Used to slice ``newly_paused_ids_post_buf`` for the engine return value;
+        # syncing this 1-element tensor is the only D2H finalize does.
+        self.final_newly_paused_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+
         # Static buffer for paused tokens, avoiding a per-step clone.
         # In _finalize_update_requests, the paused region of `next_tokens` is
         # copied here (GPU→GPU, no alloc) instead of cloned.
@@ -3939,21 +3955,66 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             self.mamba_metadata.mamba_state_free_slot_count = int(vals[4])
 
+        # Refresh the paused-tokens convenience views. Callers that read
+        # ``ctx.paused_tokens`` (mostly tests) expect these to mirror the
+        # current paused region of the static buffers.
+        # ``_finalize_update_requests`` no longer slices these views — the
+        # next step's ``_prepare_update_requests_metadata`` gathers from
+        # ``paused_tokens_buf`` / ``paused_spec_tokens_buf`` directly using
+        # GPU scalars — but the convenience attribute stays for ergonomics.
+        if self.paused_request_count > 0:
+            self.paused_tokens = self._ur.paused_tokens_buf[: self.paused_request_count]
+            if self._ur.paused_spec_tokens_buf is not None:
+                self.paused_speculative_tokens = self._ur.paused_spec_tokens_buf[
+                    :, : self.paused_request_count
+                ]
+            else:
+                self.paused_speculative_tokens = None
+        else:
+            self.paused_tokens = None
+            self.paused_speculative_tokens = None
+
         self._counters_stale = False
 
     def _finalize_update_requests(self, has_chunked: bool) -> Dict:
-        """Phase 3: read sync values for local use; CPU mirrors stay stale.
+        """Phase 3: GPU-side finalization with a 2-int count sync.
 
-        The ``.cpu().tolist()`` here used to also write back the per-context
-        CPU mirrors (``total_request_count``, ``paused_request_count``,
-        ``active_token_count``, ``kv_block_allocator.total_avail``,
-        ``mamba_state_free_slot_count``). It no longer does. The graphed
-        bodies' ``_writeback_gpu_count_mirrors`` keeps the GPU bridge scalars
-        authoritative, and host-side consumers refresh the CPU mirrors via
-        ``sync_counters_to_cpu`` exactly when they need Python ints — see
-        ``prepare_attn_init`` and ``add_request``. The ``sv`` ints below are
-        used only locally for variable-length slicing and the survivor
-        formula.
+        The prior version did an 11-int ``.cpu().tolist()`` to drive a
+        host-side survivor formula, the variable-length slicing of
+        ``newly_paused_ids_buf`` / ``evict_ids_buf``, the paused-tokens
+        copy, and a special empty-batch reset branch. After this rewrite:
+
+        - Survivor formula runs on GPU using ``bucket_counts``,
+          ``resume_count_gpu`` (read from ``_ur.combined_sync``), and
+          ``evict_count_gpu``. Output: ``final_newly_paused_gpu`` and the
+          GPU-resident ``survivor_start``.
+        - Survivor newly-paused IDs are scatter-gathered into a separate
+          ``newly_paused_ids_post_buf`` with ``-1`` sentinels for the
+          tail. This buffer is the engine-facing one; the original
+          ``newly_paused_ids_buf`` is reused by graph 1 of the next step.
+        - The paused-tokens copy and the speculative-paused-tokens copy
+          become gather-with-clamp ops keyed on ``_ur.new_active_gpu``,
+          dropping the Python-int slice bounds.
+        - The empty-batch branch is removed: the body's
+          ``_release_blocks_from_mask_gpu`` already invalidates the
+          released rows of ``request_to_kv_block_ids`` and
+          ``request_to_mamba_state_idx``, and the writeback ops zero out
+          the per-slot length/offset state for non-alive slots — so the
+          host-side defensive resets it ran (``request_to_kv_block_ids.fill_(-1)``,
+          ``reset_mamba_state``) are redundant.
+        - CPU mirrors are not written here; ``sync_counters_to_cpu`` is
+          the single host-visible refresh point.
+        - The drain gate switches from ``bucket4 + evict_count > 0``
+          (which needed the host-side bucket counts) to
+          ``total_pre > 0`` (a CPU mirror that's already current). This
+          slightly overgates: the drain runs on a step where the
+          previous step's finishes happened to have no releases, but the
+          drain's internal ``_pc_pending_dereg_count.item()`` then
+          short-circuits without doing real work.
+
+        The remaining D2H is a 2-int stack-and-cpu for
+        ``final_newly_paused`` and ``evict_count`` — required because the
+        engine API expects a sized clone of each.
         """
         # Graph 2's ``_writeback_gpu_count_mirrors`` already advanced the GPU
         # bridge scalars beyond the CPU mirrors; mark the mirrors stale so
@@ -3961,103 +4022,117 @@ class DynamicInferenceContext(BaseInferenceContext):
         # the dedup short-circuit.
         self._counters_stale = True
 
-        # THE sync: one .cpu().tolist() consumes everything the graphed bodies
-        # wrote into _ur.combined_sync. Values are consumed locally below.
-        sv = UpdateRequestsSyncedCounters.from_buffer(self._ur.combined_sync.cpu().tolist())
-
-        # Pre-step total, captured from the (still-stale) mirror. The mirror
-        # was last refreshed by ``sync_counters_to_cpu`` at the start of
-        # ``prepare_attn_init`` and adjusted incrementally by any in-step
-        # ``add_request`` calls, so it correctly reflects the pre-step total.
-        # Used to gate the prefix-caching dereg drain.
+        # Pre-step total from the (still-stale) mirror, refreshed by
+        # ``prepare_attn_init`` or ``add_request``. Used only to gate the
+        # prefix-caching dereg drain.
         total_pre = self.total_request_count
 
         self.reset_attention_state()
 
-        if sv.total_final == 0 and not has_chunked:
-            self.request_to_kv_block_ids.fill_(-1)
-            self.reset_mamba_state()
-            # CPU mirrors for total/paused/active/total_avail are NOT written
-            # here. They'll be refreshed by the next ``sync_counters_to_cpu``
-            # call (start of next ``prepare_attn_init``, or when ``add_request``
-            # admits a new request between steps). The GPU bridge scalars and
-            # the allocator's ``total_avail_gpu`` already reflect the empty
-            # state via the graphed body's writeback.
-            # Body 1 just released every active request's blocks. If
-            # prefix caching is on, that release enqueued dereg events
-            # we need to drain so the host-side hash dict stays in sync.
-            if self.enable_prefix_caching and total_pre > 0:
-                self.kv_block_allocator._pc_dereg_may_have_events = True
-            self.kv_block_allocator.drain_pending_dereg()
-            return {"newly_paused_request_ids": None, "evict_request_ids": None}
+        # GPU-side: survivor formula, repack newly-paused, paused-tokens copy.
+        self._gpu_finalize_outputs()
 
-        # [active | paused]: paused_count = total - active. These are kept
-        # as locals; the matching CPU mirrors are NOT written. See class-level
-        # ``sync_counters_to_cpu`` for the refresh contract.
-        new_paused_final = sv.total_final - sv.active_final
-        active_request_count = sv.active_final
-        num_gen = self._ur.num_generated_tokens
-
-        # The pre-resume newly-paused buffer holds bucket3 entries in slot
-        # order; resume eats stayed-paused (bucket2) first from the LEFT
-        # of the paused region, and graphed eviction takes from the RIGHT
-        # (newly-paused side). Tracking each pass's contribution exactly
-        # gives the correct surviving slice — naive ``bucket3 - (resume1
-        # + resume2)`` undercounts whenever bucket2 absorbed some resume.
-        left_eaten_by_r1 = max(0, sv.resume1 - sv.bucket2)
-        newly_after_r1 = sv.bucket3 - left_eaten_by_r1
-        stayed_after_r1 = max(0, sv.bucket2 - sv.resume1)
-        right_eaten_by_evict = min(sv.evict_count, newly_after_r1)
-        newly_after_evict = newly_after_r1 - right_eaten_by_evict
-        stayed_after_evict = stayed_after_r1 - (sv.evict_count - right_eaten_by_evict)
-        left_eaten_by_r2 = max(0, sv.resume2 - stayed_after_evict)
-        final_newly_paused = newly_after_evict - left_eaten_by_r2
-
-        newly_paused_request_ids = None
-        if final_newly_paused > 0:
-            # Survivors live at the right of the original buffer's bucket3
-            # range — eviction trimmed the rightmost end and the two
-            # resume passes peeled off from the leftmost newly-paused.
-            survivor_start = left_eaten_by_r1 + left_eaten_by_r2
-            newly_paused_request_ids = self._ur.newly_paused_ids_buf[
-                survivor_start : survivor_start + final_newly_paused
-            ].clone()
-        evict_request_ids = None
-        if sv.evict_count > 0:
-            evict_request_ids = self._ur.evict_ids_buf[: sv.evict_count].clone()
-
-        # [active | paused]: paused tokens are at [active_final:total_final].
-        if new_paused_final > 0:
-            self._ur.paused_tokens_buf[:new_paused_final].copy_(
-                self._ur.next_tokens[sv.active_final : sv.total_final]
-            )
-            self.paused_tokens = self._ur.paused_tokens_buf[:new_paused_final]
-            if self._ur.spec_tokens is not None:
-                self._ur.paused_spec_tokens_buf[:, :new_paused_final].copy_(
-                    self._ur.spec_tokens[:, sv.active_final : sv.total_final]
-                )
-                self.paused_speculative_tokens = self._ur.paused_spec_tokens_buf[
-                    :, :new_paused_final
-                ]
-
-        # bucket4 (finished count) = pre-step total minus the four kept
-        # buckets; together with eviction it covers every release this
-        # step. Skip the drain — and its .item() sync — when nothing was
-        # released, even with prefix caching enabled.
-        bucket4 = total_pre - sv.bucket0 - sv.bucket1 - sv.bucket2 - sv.bucket3
-        if self.enable_prefix_caching and (bucket4 + sv.evict_count) > 0:
+        # Drain the dereg queue. Conditional on PC + pre-step requests; the
+        # drain's internal short-circuit handles the no-events case.
+        if self.enable_prefix_caching and total_pre > 0:
             self.kv_block_allocator._pc_dereg_may_have_events = True
         self.kv_block_allocator.drain_pending_dereg()
 
-        if __debug__:
-            assert active_request_count > 0 or self.chunked_prefill_request_id != -1, (
-                "active_request_count == %d with no hidden chunked prefill." % active_request_count
+        # The engine API returns sliced+cloned tensors sized to the actual
+        # count; sync the two counts in a single transfer.
+        counts = (
+            torch.stack(
+                [
+                    self._ur.final_newly_paused_gpu.view(()),
+                    self._ur.evict_count_gpu.view(()),
+                ]
             )
+            .cpu()
+            .tolist()
+        )
+        final_newly_paused = int(counts[0])
+        evict_count = int(counts[1])
+
+        newly_paused_request_ids = None
+        if final_newly_paused > 0:
+            newly_paused_request_ids = self._ur.newly_paused_ids_post_buf[
+                :final_newly_paused
+            ].clone()
+        evict_request_ids = None
+        if evict_count > 0:
+            evict_request_ids = self._ur.evict_ids_buf[:evict_count].clone()
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
             "evict_request_ids": evict_request_ids,
         }
+
+    def _gpu_finalize_outputs(self) -> None:
+        """GPU-side finalize work: survivor formula, repacks, paused copy.
+
+        Computes the survivor formula on GPU, repacks survivor newly-paused
+        IDs into ``newly_paused_ids_post_buf`` with ``-1`` sentinels, and
+        copies the paused-region tokens (and speculative paused tokens)
+        from ``next_tokens`` / ``spec_tokens`` into the corresponding
+        ``paused_*_buf`` static buffers. Does no host sync.
+
+        The survivor formula tracks how each of the resume / eviction
+        passes consumes the ``[stayed-paused | newly-paused]`` paused
+        region: resume eats from the LEFT (stayed-paused first, then
+        newly-paused), eviction eats from the RIGHT (newly-paused).
+        Tracking each pass's contribution exactly is the only way to
+        recover the surviving slice — a naive ``bucket3 - (resume1 +
+        resume2)`` undercounts whenever bucket2 absorbed some resume.
+        """
+        S = DynamicInferenceContext
+
+        # Survivor formula. Mirror of the old host-side max/min/clamp
+        # expressions, lifted to GPU int64 arithmetic.
+        bucket = self._ur.bucket_counts  # (5,) int64
+        bucket2 = bucket[2:3]
+        bucket3 = bucket[3:4]
+        resume1 = self._ur.combined_sync[S._SYNC_RESUME1 : S._SYNC_RESUME1 + 1]
+        resume2 = self._ur.combined_sync[S._SYNC_RESUME2 : S._SYNC_RESUME2 + 1]
+        evict_count = self._ur.evict_count_gpu
+
+        left_eaten_by_r1 = (resume1 - bucket2).clamp(min=0)
+        newly_after_r1 = bucket3 - left_eaten_by_r1
+        stayed_after_r1 = (bucket2 - resume1).clamp(min=0)
+        right_eaten_by_evict = torch.minimum(evict_count, newly_after_r1)
+        newly_after_evict = newly_after_r1 - right_eaten_by_evict
+        stayed_after_evict = stayed_after_r1 - (evict_count - right_eaten_by_evict)
+        left_eaten_by_r2 = (resume2 - stayed_after_evict).clamp(min=0)
+        final_newly_paused = newly_after_evict - left_eaten_by_r2  # (1,)
+        survivor_start = left_eaten_by_r1 + left_eaten_by_r2  # (1,)
+
+        # Stash the count for the post-finalize 2-int sync.
+        self._ur.final_newly_paused_gpu.copy_(final_newly_paused)
+
+        # Repack newly-paused survivors into a separate post-buffer:
+        #   post_buf[i] = newly_paused_ids_buf[survivor_start + i]  if i < final_newly_paused
+        #   post_buf[i] = -1                                         otherwise
+        # ``newly_paused_ids_buf`` has shape ``(max_requests + 1,)`` with the
+        # sink slot at index ``max_requests``; clamping OOB indices to the
+        # sink keeps the gather safe, and the ``where`` mask scrubs whatever
+        # the sink happened to hold.
+        slot_idx = self._ur.arange_long
+        np_src_idx = (survivor_start + slot_idx).clamp(max=self.max_requests)
+        in_range = slot_idx < final_newly_paused
+        gathered = self._ur.newly_paused_ids_buf[np_src_idx]
+        self._ur.newly_paused_ids_post_buf.copy_(
+            torch.where(in_range, gathered, torch.full_like(gathered, -1))
+        )
+
+        # Paused-tokens copy.  ``paused_tokens_buf[i] = next_tokens[active + i]``
+        # for ``i in [0, paused_count)``.  Tail positions read garbage indices
+        # (clamped to the last valid slot) and are never read by the next
+        # step's ``_prepare_update_requests_metadata`` gather.
+        pt_src_idx = (self._ur.new_active_gpu + slot_idx).clamp(
+            max=self.max_requests - 1
+        )
+        self._ur.paused_tokens_buf.copy_(self._ur.next_tokens[pt_src_idx])
+        if self._ur.spec_tokens is not None and self._ur.paused_spec_tokens_buf is not None:
+            self._ur.paused_spec_tokens_buf.copy_(self._ur.spec_tokens[:, pt_src_idx])
 
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
