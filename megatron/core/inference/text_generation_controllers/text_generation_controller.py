@@ -106,6 +106,12 @@ class TextGenerationController:
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
+        # Debug-only counter for the commit 1 invariant: forward kernel launch
+        # must be preceded only by CUDA event waits, never by CPU future awaits.
+        # Incremented (in future commits) if a CPU future is awaited before
+        # forward kernel launch. Test harness reads via `controller._forward_kernel_launch_cpu_await_count`.
+        self._forward_kernel_launch_cpu_await_count = 0
+
     def _get_mtp_num_heads(self) -> int:
         """Get the number of MTP layers from the model config."""
         model = self.inference_wrapped_model.model
@@ -576,8 +582,9 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
+        step_id = context.step_count
         # Initialize attention state (100% CPU computation).
-        range_push("initialize_attention_state")
+        range_push(f"initialize_attention_state[step={step_id}]")
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
@@ -585,7 +592,7 @@ class TextGenerationController:
         range_pop()
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
-        range_push("transfer_bookkeeping_to_gpu")
+        range_push(f"transfer_bookkeeping_to_gpu[step={step_id}]")
         context.transfer_bookkeeping_to_gpu()
         range_pop()
 
@@ -1786,15 +1793,16 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        step_id = context.step_count
 
         # Batch GPU-to-CPU transfer of all sampled tokens.
-        range_push("transfer_samples_to_cpu")
+        range_push(f"transfer_samples_to_cpu[step={step_id}]")
         sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
             active_request_count,
         )
         range_pop()
 
-        range_push("active_request_mask")
+        range_push(f"active_request_mask[step={step_id}]")
         # Everything below is 100% CPU.
         active_request_ids = context.request_ids[active_request_slice].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
@@ -1830,7 +1838,7 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
-        range_push("update_requests")
+        range_push(f"update_requests[step={step_id}]")
         update_result = context.update_requests(
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
         )
@@ -1866,6 +1874,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
+        step_id = context.step_count
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
@@ -1887,7 +1896,7 @@ class TextGenerationController:
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
-            range_push("forward_pass")
+            range_push(f"forward_pass[step={step_id}]")
             logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
             # Commit Mamba intermediate states before update_requests, which
@@ -1911,7 +1920,7 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         with torch.inference_mode():
-            range_push("sampling")
+            range_push(f"sampling[step={step_id}]")
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             self._dynamic_step_sample_bookkeeping()

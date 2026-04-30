@@ -1683,7 +1683,9 @@ class DynamicInferenceEngine(AbstractEngine):
             }
 
         # Generate tokens.
-        nvtx_range_push("Prefill" if not is_decode_only else "Decode")
+        forward_step_id = self.context.step_count
+        forward_range_name = "Prefill" if not is_decode_only else "Decode"
+        nvtx_range_push(forward_range_name, suffix=f"step={forward_step_id}")
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
@@ -1699,7 +1701,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
-        nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
+        nvtx_range_pop(forward_range_name, suffix=f"step={forward_step_id}")
 
         if will_log_this_step:
             kvcache_util_stats = (
@@ -1743,7 +1745,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
         # Increment finished_request_count.
-        nvtx_range_push("bookkeeping")
+        bookkeep_step_id = self.context.step_count
+        nvtx_range_push("bookkeeping", suffix=f"step={bookkeep_step_id}")
         cuda_graph_request_count = None
 
         if step_result is not None:
@@ -1792,7 +1795,7 @@ class DynamicInferenceEngine(AbstractEngine):
             ), f"Failed request {failed_request_id} future has not been properly resolved."
         self.failed_request_ids.clear()
 
-        nvtx_range_pop("bookkeeping")
+        nvtx_range_pop("bookkeeping", suffix=f"step={bookkeep_step_id}")
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will
