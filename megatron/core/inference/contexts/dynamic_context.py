@@ -864,9 +864,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_metadata = {
             label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
         }
-        self.active_request_query_lengths = torch.zeros_like(self.request_ids)
-        self.active_request_last_token_idxs = torch.zeros_like(self.request_ids)
-
         # Static tensor addresses to make `last_token_logits` graphable with speculative decoding.
         max_logit_idxs = self.max_requests * (self.num_speculative_tokens + 1)
         self.active_logit_idxs = torch.zeros(
@@ -1088,18 +1085,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Request metadata all needs to be sliced.
         for label in self.request_metadata:
             self.active_request_metadata[label][:batch_size].copy_(
-                self.request_metadata[label][padded_slice],
+                self.request_metadata[label][padded_slice], non_blocking=True
             )
-
-        self.active_request_query_lengths[:batch_size].copy_(
-            self.request_query_lengths[padded_slice],
-        )
-        torch.cumsum(
-            self.active_request_query_lengths[:batch_size],
-            dim=0,
-            out=self.active_request_last_token_idxs[:batch_size],
-        )
-        self.active_request_last_token_idxs[:batch_size].sub_(1)
 
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
@@ -1108,15 +1095,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_prefill_count = active_request_count - active_decode_count
         active_decode_token_count = active_decode_count * (self.num_speculative_tokens + 1)
 
-        # Assemble a correct view of the last token indices for the current step's output logits.
+        # Decode prefix: positions [0, 1, ..., active_decode_token_count - 1].
         self.active_logit_idxs[:active_decode_token_count].copy_(
             self._decode_logit_idxs[:active_decode_token_count]
         )
-        self.active_logit_idxs[
+
+        # Prefill last-token positions: cumsum the prefill query lengths in place,
+        # then shift by (active_decode_token_count - 1) to get absolute positions.
+        prefill_dst = self.active_logit_idxs[
             active_decode_token_count : active_decode_token_count + active_prefill_count
-        ].copy_(
-            self.active_request_last_token_idxs[active_decode_count:active_request_count]
+        ]
+        prefill_idxs = self.paused_request_count + active_decode_count
+        torch.cumsum(
+            self.request_query_lengths[prefill_idxs : self.total_request_count],
+            dim=0,
+            out=prefill_dst,
         )
+        prefill_dst.add_(active_decode_token_count - 1)
+
         self.active_logit_idxs[active_decode_token_count + active_prefill_count :].zero_()
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
