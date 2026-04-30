@@ -1489,6 +1489,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_output_placeholders[slot] -= delta
         return entry
 
+    def _record_metadata_ready_event(self, view, event) -> None:
+        """Track the most recent ``metadata_ready_event`` for a snapshot view.
+
+        The pool surfaces these events through ``snapshot_metadata_event``;
+        commit 18's pipeline reads them to gate forward kernel launch.
+        """
+        if not hasattr(self, "_snapshot_metadata_events"):
+            self._snapshot_metadata_events = {}
+        # Match the pool slot that owns this view so consumers can index by
+        # slot id.
+        for slot_idx in range(self.snapshot_pool.buffer_count):
+            if self.snapshot_pool.slot(slot_idx) is view:
+                self._snapshot_metadata_events[slot_idx] = event
+                return
+        self._snapshot_metadata_events[-1] = event
+
+    def snapshot_metadata_event(self, slot_idx: int):
+        """Return the most recent ``metadata_ready_event`` for ``slot_idx``."""
+        return getattr(self, "_snapshot_metadata_events", {}).get(slot_idx)
+
     # ------------------------------------------------------------------
     # prepare_next_step_optimistic (v3 plan §commit 13)
     # ------------------------------------------------------------------
@@ -2480,7 +2500,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def transfer_bookkeeping_to_gpu(self, snapshot=None) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2492,6 +2512,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         Request-level staging slots are refreshed from the persistent CPU
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+
+        ``snapshot`` is the destination ContextGPUView (the acquired pool
+        slot for this step). When ``None`` (today's default) the H2D
+        targets the currently active slot via ``self.gpu_view``; commit 18
+        passes the per-step snapshot explicitly. After the H2D is enqueued
+        a ``metadata_ready_event`` is recorded on the snapshot so the
+        forward stream can stream-wait on it (v3 plan §2.6).
         """
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -2512,7 +2539,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        target_view = snapshot if snapshot is not None else self.gpu_view
+        target_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        # v3 plan §commit 15 — record metadata_ready_event on the destination
+        # snapshot. The forward stream stream-waits on this event before
+        # launching kernels that read the snapshot's _buf. Today the event is
+        # recorded on the current (compute) stream; commit 18 moves the H2D
+        # itself onto a dedicated h2d_metadata stream.
+        meta_ready = torch.cuda.Event()
+        meta_ready.record()
+        self._record_metadata_ready_event(target_view, meta_ready)
 
         # MHA metadata: buffers already covered by the coalesced H2D above.
         # All that's left is pointing state_data at the correct GPU slices and
