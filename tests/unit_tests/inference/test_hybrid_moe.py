@@ -29,8 +29,9 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stac
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.test_moe_dispatching_and_routing import (
     NANOV3_BASE,
@@ -77,6 +78,8 @@ _STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZ
     (MIXED_GIANT_PREFILL, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS),
 ]
 
+_STATE_COMBOS = [(PREFILL_AT_MAX_TOKENS, DECODE, DECODE, DECODE),]
+
 # Batch dimensions used to set up each non-dummy state via
 # add_dummy_requests_for_cudagraph_capture. These are intentionally small
 # to keep the tests fast while still exercising the EP padding logic.
@@ -100,42 +103,55 @@ _STATE_DIMS = {
 }
 
 
-@pytest.mark.internal
-class TestDynamicInference:
-    """Verify full HybridModel output shapes under EP strict matching scenarios."""
+def setup_module(module):
+    available, reason = _check_mamba_sequence_packing_support(for_inference_not_training=True)
+    if not available:
+        pytest.skip(reason, allow_module_level=True)
+    if not is_fa_min_version("2.7.3"):
+        pytest.skip("need flash-attn >= 2.7.3 for dynamic batching", allow_module_level=True)
+    if Utils.world_size < _EP_SIZE:
+        pytest.skip(f"EP test requires at least {_EP_SIZE} GPUs", allow_module_level=True)
+    if Utils.world_size % _EP_SIZE != 0:
+        pytest.skip(
+            f"world_size ({Utils.world_size}) must be divisible by EP size ({_EP_SIZE})",
+            allow_module_level=True,
+        )
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=_EP_SIZE,
+    )
+
+
+def teardown_module(module):
+    NVLSAllGatherVDispatcher._delete_buffers()
+    SymmetricMemoryManager.destroy()
+    Utils.destroy_model_parallel()
+
+
+class _TestDynamicInferenceBase:
+    """Shared helpers for NVLS and NCCL inference test classes.
+
+    Model-parallel is initialized once for the entire module (see setup_module /
+    teardown_module above) so that NVLS sym-mem handles are never alive across a
+    destroy/reinit cycle of the EP process group.
+    """
 
     MAX_SEQ_LEN = 512
     VOCAB_SIZE = 128
 
-    def setup_method(self, method):
-        available, reason = _check_mamba_sequence_packing_support(for_inference_not_training=True)
-        if not available:
-            pytest.skip(reason, allow_module_level=True)
-        if not is_fa_min_version("2.7.3"):
-            pytest.skip("need flash-attn >= 2.7.3 for dynamic batching", allow_module_level=True)
-        if Utils.world_size < _EP_SIZE:
-            pytest.skip(f"EP test requires at least {_EP_SIZE} GPUs", allow_module_level=True)
-        if Utils.world_size % _EP_SIZE != 0:
-            pytest.skip(
-                f"world_size ({Utils.world_size}) must be divisible by EP size ({_EP_SIZE})",
-                allow_module_level=True,
-            )
-
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            expert_model_parallel_size=_EP_SIZE,
-        )
-
     def teardown_method(self, method):
+        # CUDA-graph replay is asynchronous at the CPU level. Synchronize device
+        # then barrier so no rank races into the next test's collectives while
+        # another rank is still executing the previous step on the GPU.
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
         delete_cuda_graphs()
-        Utils.destroy_model_parallel()
 
     def _build_model(self, inference_moe_token_dispatcher_type='nvls'):
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = _make_base_config(
             num_layers=3,
-            attention_backend=AttnBackend.fused,
             inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
         )
         model = HybridModel(
@@ -220,19 +236,10 @@ class TestDynamicInference:
                 f"but cudagraph_inference_record has {len(record)} entries"
             )
 
-    def _assert_dummy_forward_shape(self, model, rank):
-        """Run model.forward with a single dummy token (no inference context),
-        mirroring the real engine's dummy_forward fallback, and verify the
-        logits shape."""
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        dummy_tokens = torch.zeros(1, tp_size, dtype=torch.long, device="cuda")
-        position_ids = torch.zeros(1, tp_size, dtype=torch.long, device="cuda")
-        out = model.forward(input_ids=dummy_tokens, position_ids=position_ids, attention_mask=None)
-        expected = (1, tp_size, self.VOCAB_SIZE)
-        assert out.shape == expected, (
-            f"Rank {rank} (dummy bail-out): expected out shape "
-            f"{expected}, got {tuple(out.shape)}"
-        )
+
+@pytest.mark.internal
+class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
+    """NVLS dispatcher: combinatorial sweep of EP request states."""
 
     # ------------------------------------------------------------------
     # test_ep_state_cross_product: combinatorial sweep with mixed CUDA graphs
@@ -296,6 +303,11 @@ class TestDynamicInference:
                 True, ep_rank, f"state={my_state}, rank_states={rank_states}"
             )
 
+
+@pytest.mark.internal
+class TestDynamicInferenceNCCL(_TestDynamicInferenceBase):
+    """NCCL dispatcher: dummy-rank bail-out and eager-fallback tests."""
+
     # ------------------------------------------------------------------
     # Cuda-graph bail-out tests for the NCCLAllGatherDispatcher
     # ------------------------------------------------------------------
@@ -347,8 +359,9 @@ class TestDynamicInference:
         )
 
         if is_even:
-            # Dummy rank bailed out — exercise the eager fallback.
-            self._assert_dummy_forward_shape(model, ep_rank)
+            # Dummy rank: context has one dummy decode request. Mimic the real
+            # engine's dummy_forward, which always uses inference_context.
+            self._assert_dynamic_inference_shape(model, ctx, ep_rank, "dummy")
         else:
             # Non-dummy rank: padded_batch_dimensions is set via the
             # non-graph fallback path in initialize_attention_state.
@@ -423,8 +436,9 @@ class TestDynamicInference:
         )
 
         if is_even:
-            # Dummy rank bailed out — exercise the eager fallback.
-            self._assert_dummy_forward_shape(model, ep_rank)
+            # Dummy rank: context has one dummy decode request. Mimic the real
+            # engine's dummy_forward, which always uses inference_context.
+            self._assert_dynamic_inference_shape(model, ctx, ep_rank, "dummy")
         else:
             # Non-dummy rank: padded_batch_dimensions is set via the
             # eager fallback path.  Verify shape correctness.

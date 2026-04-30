@@ -628,7 +628,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
                 moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
                 NVLSAllGatherVDispatcher.allocate_buffers(
-                    engine_max_tokens=self.max_tokens,
+                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
+                    // tp_size,
                     topk=model_config.moe_router_topk,
                     hidden_size=moe_hidden_size,
                     ep_group=self.expert_model_parallel_group,

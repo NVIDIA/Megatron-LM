@@ -334,7 +334,7 @@ class TestNVLSAllGatherVDispatcher:
 
         try:
             NVLSAllGatherVDispatcher.allocate_buffers(
-                engine_max_tokens=_NVLS_ENGINE_MAX_TOKENS,
+                per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
                 topk=NANOV3_BASE["moe_router_topk"],
                 hidden_size=NANOV3_BASE["hidden_size"],
                 ep_group=ep_group,
