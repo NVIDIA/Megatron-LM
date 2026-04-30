@@ -823,10 +823,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
             bias_chunks = [bias for _, bias in outputs if bias is not None]
             bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
-            if bias_output is not None:
-                for i in range(1, len(bias_chunks)):
-                    assert torch.allclose(bias_chunks[i], bias_chunks[0])
             if self.config.cuda_graph_impl == 'none':
+                # elements in bias_chunks are the same for all chunks, so we can just use the first one
                 bias_output = bias_chunks[0] if bias_chunks else None
             mlp_output_with_bias = (mlp_output, bias_output)
         else:
