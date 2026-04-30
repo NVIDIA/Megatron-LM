@@ -33,7 +33,6 @@ def _flextron_fields(hidden_size, num_heads):
         soft_mask=True,
         flex_hetero_mamba=False,
         flex_hetero_ffn=False,
-        flex_hetero_head=False,
         flex_hetero_moe_expert=False,
         hybrid_layer_pattern="M",
         emb_int_list=[hidden_size, hidden_size // 2],

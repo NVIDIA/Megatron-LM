@@ -40,7 +40,6 @@ def _router_config(
         add_skipping=False,
         flex_hetero_ffn=False,
         flex_hetero_mamba=False,
-        flex_hetero_head=False,
         flex_hetero_moe_expert=False,
         hybrid_layer_pattern="ME",
         normalize_router_logits=False,
@@ -66,7 +65,6 @@ def _router_config(
         mamba_num_heads=mamba_num_heads,
         emb_int_list=[hidden_size, hidden_size // 2],
         mlp_int_list=[ffn_hidden_size, ffn_hidden_size // 2],
-        head_int_list=[num_heads, num_heads // 2],
         mamba_int_list=[mamba_num_heads, mamba_num_heads // 2],
         moe_expert_int_list=[num_moe_experts, num_moe_experts // 2],
         override_selected_budget=None,
@@ -122,8 +120,9 @@ class TestFlextronRouter:
         assert hasattr(router, "gate_mlp")
         assert hasattr(router, "gate_emb")
         assert hasattr(router, "gate_mamba")
-        assert hasattr(router, "gate_head")
         assert hasattr(router, "gate_moe_expert")
+        # Attention head elasticity is not supported.
+        assert not hasattr(router, "gate_head")
         # Skipping was disabled in the config.
         assert not hasattr(router, "gate_skip_layer")
 
@@ -135,24 +134,24 @@ class TestFlextronRouter:
             # trainable parameter so the PP gradient sync picks them up.
             assert getattr(p, "pipeline_parallel", False) is True
 
-    def test_forward_returns_six_axis_outputs(self):
+    def test_forward_returns_five_axis_outputs(self):
         config = _router_config()
         router = FlextronRouter(config).cuda()
         out = router(1.0)
-        assert len(out) == 6
+        assert len(out) == 5
         # Order (per hybrid_flex_router.forward):
-        # (mlp, skipping, emb, mamba, head, moe_expert)
-        mlp, skipping, emb, mamba, head, moe_expert = out
+        # (mlp, skipping, emb, mamba, moe_expert)
+        mlp, skipping, emb, mamba, moe_expert = out
         # Skipping is None when add_skipping=False.
         assert skipping is None
         # Each axis output is a (logits, choice) tuple.
-        for axis in (mlp, emb, mamba, head, moe_expert):
+        for axis in (mlp, emb, mamba, moe_expert):
             assert isinstance(axis, tuple) and len(axis) == 2
 
     def test_emb_output_shape_matches_choice_count(self):
         config = _router_config()
         router = FlextronRouter(config).cuda()
-        _, _, emb, _, _, _ = router(1.0)
+        _, _, emb, _, _ = router(1.0)
         logits, choice = emb
         # Logits have one entry per emb_int_list choice.
         assert logits.numel() == len(config.emb_int_list)
@@ -208,6 +207,6 @@ class TestFlextronRouter:
         out_iter_100 = router(1.0)
 
         # Emb-axis logits should differ between iterations.
-        _, _, emb_0, _, _, _ = out_iter_0
-        _, _, emb_100, _, _, _ = out_iter_100
+        _, _, emb_0, _, _ = out_iter_0
+        _, _, emb_100, _, _ = out_iter_100
         assert not torch.allclose(emb_0[0], emb_100[0])

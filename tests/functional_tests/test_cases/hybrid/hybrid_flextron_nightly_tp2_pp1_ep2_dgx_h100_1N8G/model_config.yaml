@@ -118,7 +118,6 @@ MODEL_ARGS:
   --budget-type: param
   --emb-int-list: "[1024 768 512]"
   --mlp-int-list: "[512 384 256]"
-  --head-int-list: "[32 24 16]"
   --mamba-int-list: "[32 24 16]"
   --moe-expert-int-list: "[32 24 16]"
   --linear-scaler-start: 1.0
