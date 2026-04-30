@@ -326,10 +326,11 @@ class TestStreamCkptDequant:
         assert planner.stream_ckpt_dequant is True
 
     def test_planner_state_cleanup_after_load(self, tmp_path_dist_ckpt):
-        """``_intermediate_read_items`` must be empty after a streaming load completes.
+        """Per-target streaming state must be empty after a streaming load completes.
 
-        Lingering entries would indicate a scratch tensor we forgot to drop, defeating
-        the memory win.
+        Lingering entries in ``_intermediate_read_items`` (per-read-item) or
+        ``_stream_targets`` (per-target BF16 buffer) would indicate a scratch
+        tensor we forgot to drop, defeating the memory win.
         """
         Utils.initialize_model_parallel(1, 1)
 
@@ -370,6 +371,10 @@ class TestStreamCkptDequant:
             assert captured[0]._intermediate_read_items == {}, (
                 f"Planner left intermediate state after load: "
                 f"{list(captured[0]._intermediate_read_items.keys())}"
+            )
+            assert captured[0]._stream_targets == {}, (
+                f"Planner left per-target streaming buffers after load: "
+                f"{list(captured[0]._stream_targets.keys())}"
             )
 
     def test_streaming_flag_forwards_through_fpsl_wrapper(self):
