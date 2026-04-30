@@ -395,3 +395,124 @@ class TestCheckpointManagerPartialCheckpoint:
             f"Gradients for residual mismatch!\n"
             f"With manager: {grad_residual_ckpt}\nReference: {grad_residual_ref}"
         )
+
+
+# ============================================================================
+# Block-level mHC recompute coverage
+# ============================================================================
+#
+# These tests instantiate a full ``TransformerBlock`` with mHC enabled to
+# exercise:
+#   * ``_build_mhc_recompute_layer_plan`` (per-layer ``CheckpointManager``
+#     allocation, including the ``mhc_recompute_layer_num`` boundary case),
+#   * ``_finalize_mhc_recompute_layer`` (manager finalization at block end),
+#   * the ``HyperConnectionModule.input_expand`` / ``output_contract`` calls
+#     in ``TransformerBlock.forward`` for ``pre_process`` / ``post_process``
+#     stages.
+#
+# Single-process (no PP) so they can run on a single-GPU CI lane.
+
+
+class TestTransformerBlockMHCRecompute:
+    """End-to-end ``TransformerBlock`` forward with mHC selective recompute."""
+
+    def setup_method(self, method):
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _make_mhc_block(num_layers, num_streams=4, mhc_recompute_layer_num=None):
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.transformer.hyper_connection import HyperConnectionModule
+        from megatron.core.transformer.transformer_block import TransformerBlock
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
+
+        config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+            mhc_recompute_layer_num=mhc_recompute_layer_num,
+            recompute_granularity='selective',
+            recompute_modules=['mhc'],
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec()
+        spec.module = HyperConnectionTransformerLayer
+        spec.submodules.self_attention_hyper_connection = HyperConnectionModule
+        spec.submodules.mlp_hyper_connection = HyperConnectionModule
+        return TransformerBlock(config, spec, pre_process=True, post_process=True).cuda(), config
+
+    def _check_recompute_plan(self, block, expected_block_ends):
+        """Drive ``_build_mhc_recompute_layer_plan`` directly and check the boundary list."""
+        block.train()
+        managers, ends = block._build_mhc_recompute_layer_plan(use_mhc_recompute=True)
+        assert len(managers) == len(block.layers)
+        assert ends == expected_block_ends, f"got {ends}, expected {expected_block_ends}"
+        # Layers in the same recompute block share a manager; new block → new manager.
+        last_was_end = True
+        last_mgr = None
+        for mgr, end in zip(managers, ends):
+            assert mgr is not None
+            if last_was_end:
+                assert mgr is not last_mgr, "new recompute block should get a new manager"
+            else:
+                assert mgr is last_mgr, "layers within a recompute block share a manager"
+            last_was_end = end
+            last_mgr = mgr
+
+    def test_recompute_plan_no_layer_num(self):
+        """Without ``mhc_recompute_layer_num`` only the final layer ends a recompute block."""
+        block, _ = self._make_mhc_block(num_layers=4)
+        self._check_recompute_plan(block, expected_block_ends=[False, False, False, True])
+
+    def test_recompute_plan_with_layer_num(self):
+        """With ``mhc_recompute_layer_num=2`` every other layer ends a recompute block."""
+        block, _ = self._make_mhc_block(num_layers=4, mhc_recompute_layer_num=2)
+        self._check_recompute_plan(block, expected_block_ends=[False, True, False, True])
+
+    def test_recompute_plan_disabled(self):
+        """``use_mhc_recompute=False`` returns an all-None / all-False plan."""
+        block, _ = self._make_mhc_block(num_layers=3)
+        managers, ends = block._build_mhc_recompute_layer_plan(use_mhc_recompute=False)
+        assert managers == [None, None, None]
+        assert ends == [False, False, False]
+
+    def test_block_forward_input_expand_output_contract(self):
+        """Forward exercises ``input_expand`` (pre) and ``output_contract`` (post)."""
+        block, config = self._make_mhc_block(num_layers=2, mhc_recompute_layer_num=2)
+        block.train()
+
+        seq_len = 8
+        batch_size = 2
+        # Input is [s, b, hidden_size]; the block must expand to [s, b, n*hidden_size]
+        # internally, then contract back to [s, b, hidden_size] before final layernorm.
+        hidden_states = torch.randn(
+            seq_len, batch_size, config.hidden_size, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones(
+            (1, 1, seq_len, seq_len), dtype=torch.bool, device='cuda'
+        )
+
+        out = block(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert out.shape == hidden_states.shape, (
+            f"output_contract should restore original shape, got {tuple(out.shape)} "
+            f"vs expected {tuple(hidden_states.shape)}"
+        )
+        # Backward should flow through the recompute path without error.
+        out.sum().backward()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
