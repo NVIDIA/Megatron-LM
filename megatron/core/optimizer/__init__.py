@@ -823,6 +823,10 @@ def _get_megatron_emerging_optimizer(
             fallback_config.optimizer = opt_name
             fallback_config.use_distributed_optimizer = False
             if use_layer_wise:
+                # Disable per-optimizer CPU offload (HybridDeviceOptimizer) for the
+                # Adam fallback when LayerWiseDistributedOptimizer is active.
+                # CPU offloading is handled uniformly by LayerWiseDistributedOptimizer
+                # for all sub-optimizers (Muon + Adam), preventing double-offloading.
                 fallback_config.optimizer_cpu_offload = False
             result = _get_megatron_optimizer_based_on_param_groups(
                 config=fallback_config,
