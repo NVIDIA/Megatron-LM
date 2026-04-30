@@ -1407,6 +1407,8 @@ class TestDynamicInferenceEngine:
         enable_chunked_prefill: bool = False,
         context_max_tokens: Optional[int] = None,
         termination_id: Optional[int] = None,
+        num_cuda_graphs: Optional[int] = None,
+        max_steps: int = 128,
     ) -> Tuple[Dict[int, List[int]], DynamicEngineTestEnv, int]:
         """Run a hybrid Mamba qd1/qd2 case and summarize completed requests."""
         test_config = DynamicEngineTestConfig(
@@ -1415,7 +1417,7 @@ class TestDynamicInferenceEngine:
             max_prompt_length=max(prompt_lengths),
             num_tokens_to_generate=num_tokens_to_generate,
             model_provider="mamba",
-            num_cuda_graphs=None,
+            num_cuda_graphs=num_cuda_graphs,
             cuda_graph_scope=[],
             force_build_cuda_graphs=True,
             context_max_requests=16,
@@ -1461,7 +1463,7 @@ class TestDynamicInferenceEngine:
                 assert request.status == Status.COMPLETED
                 finished[int(request.request_id)] = list(request.generated_tokens)
             step_count += 1
-            assert step_count < 128, "Engine did not converge"
+            assert step_count < max_steps, "Engine did not converge"
 
         return finished, env, max_pending_launches
 
@@ -1491,6 +1493,35 @@ class TestDynamicInferenceEngine:
         metadata = qd2_env.engine.context.mamba_metadata
         assert metadata.mamba_state_free_slot_count == metadata.max_requests
         assert torch.all(metadata.request_to_mamba_state_idx == -1)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_hybrid_mamba_long_cuda_graphs_matches_queue_depth_one(
+        self,
+    ) -> None:
+        """Queue-depth-two preserves long hybrid Mamba output with CUDA graphs."""
+        skip_if_mamba_sequence_packing_not_available("mamba")
+        qd1_finished, _, _ = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=1,
+            prompt_lengths=(16,),
+            num_tokens_to_generate=128,
+            num_cuda_graphs=4,
+            max_steps=256,
+        )
+        qd2_finished, qd2_env, qd2_max_pending = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=2,
+            prompt_lengths=(16,),
+            num_tokens_to_generate=128,
+            num_cuda_graphs=4,
+            max_steps=256,
+        )
+
+        assert qd2_finished == qd1_finished
+        assert qd2_max_pending > 0
+        assert qd2_env.engine.context.snapshot_pool.slot_count == 3
 
     @pytest.mark.internal
     @pytest.mark.skipif(

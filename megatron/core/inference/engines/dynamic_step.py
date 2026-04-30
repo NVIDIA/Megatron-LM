@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -107,19 +108,28 @@ class DynamicAsyncPipeline:
         launched = False
         launch_count = 0
         launch_limit = self.queue_depth if max_forward_launches is None else max_forward_launches
-        while (
+        if launch_limit is None:
+            launch_limit = self.queue_depth
+        launch_limit = int(launch_limit)
+
+        if (
             launch_count < launch_limit
-            and self.pending_launch_count < self.queue_depth
+            and self.pending_launch_count == 0
             and self._has_launch_work()
         ):
-            if self.pending_launch_count > 0 and not self._can_launch_lookahead():
-                break
             self.in_flight_launches.append(await self.engine.async_forward())
             self._record_pending_launch_count()
             launched = True
             launch_count += 1
-            if self.pending_launch_count > 1:
-                break
+
+        if (
+            launch_count < launch_limit
+            and self.pending_launch_count > 0
+            and self.pending_launch_count < self.queue_depth
+            and self._has_launch_work()
+            and self._can_launch_lookahead()
+        ):
+            return await self._launch_lookahead_and_drain_next()
 
         if self.pending_launch_count > 1:
             return await self.drain_next()
@@ -127,6 +137,33 @@ class DynamicAsyncPipeline:
             if not launched or not self._has_launch_work() or not self._can_launch_lookahead():
                 return await self.drain_next()
         return None
+
+    async def _launch_lookahead_and_drain_next(self):
+        """Run the next forward to its yield point, then retire older CPU output."""
+        launch_task = asyncio.create_task(self.engine.async_forward())
+
+        # ``async_forward`` yields immediately after enqueueing forward kernels.
+        # Give it one event-loop turn so retirement can run while those kernels
+        # are active instead of after the entire lookahead step has completed.
+        await asyncio.sleep(0)
+
+        if launch_task.done():
+            self.in_flight_launches.append(launch_task.result())
+            self._record_pending_launch_count()
+            return await self.drain_next()
+
+        try:
+            result = await self.drain_next(hidden_under_gpu=True)
+        except BaseException:
+            if not launch_task.done():
+                try:
+                    await launch_task
+                except BaseException:
+                    pass
+            raise
+        self.in_flight_launches.append(await launch_task)
+        self._record_pending_launch_count()
+        return result
 
     def _has_launch_work(self) -> bool:
         """Return whether the engine can launch another dynamic step."""
@@ -145,7 +182,7 @@ class DynamicAsyncPipeline:
             return bool(checker())
         return True
 
-    async def drain_next(self):
+    async def drain_next(self, *, hidden_under_gpu: bool = False):
         """Retire the oldest launched step, if one is pending."""
         if not self.in_flight_launches:
             return None
@@ -155,7 +192,7 @@ class DynamicAsyncPipeline:
             return await self.engine.async_bookkeep(step_result, context_state, step_time)
         finally:
             counters = getattr(self.engine, "async_overlap_debug_counters", None)
-            if counters is not None and self.pending_launch_count > 0:
+            if counters is not None and (hidden_under_gpu or self.pending_launch_count > 0):
                 counters.cpu_time_hidden_under_gpu_s += time.perf_counter() - hidden_start
 
     async def drain_all(self):

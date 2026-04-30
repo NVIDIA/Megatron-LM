@@ -39,19 +39,29 @@ class FakeRetirementService:
 
 
 class FakePipelineEngine:
-    def __init__(self, *, max_launches=1, lookahead_allowed=True):
+    def __init__(
+        self, *, max_launches=1, lookahead_allowed=True, yield_after_forward_launch=False
+    ):
         self.context = SimpleNamespace(snapshot_pool=object())
         self.max_launches = max_launches
         self.lookahead_allowed = lookahead_allowed
+        self.yield_after_forward_launch = yield_after_forward_launch
+        self.event_log = []
         self.forward_calls = []
         self.bookkeep_calls = []
 
     async def async_forward(self):
         step_id = len(self.forward_calls)
+        self.event_log.append(("forward_start", step_id))
         self.forward_calls.append(step_id)
+        if self.yield_after_forward_launch:
+            self.event_log.append(("forward_yield", step_id))
+            await asyncio.sleep(0)
+            self.event_log.append(("forward_finish", step_id))
         return ({"step": step_id}, {"dynamic_step_id": step_id}, float(step_id))
 
     async def async_bookkeep(self, step_result, context_state, step_time):
+        self.event_log.append(("bookkeep", context_state["dynamic_step_id"]))
         self.bookkeep_calls.append((step_result, context_state, step_time))
         return {"retired_step": context_state["dynamic_step_id"]}
 
@@ -168,6 +178,27 @@ def test_dynamic_async_pipeline_records_overlap_metrics():
     assert counters.queue_depth_two_steps == 1
     assert counters.max_pending_launches_observed == 2
     assert counters.cpu_time_hidden_under_gpu_s >= 0.0
+
+
+def test_dynamic_async_pipeline_retires_older_step_while_lookahead_yields():
+    engine = FakePipelineEngine(max_launches=2, yield_after_forward_launch=True)
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=FakeRetirementService(), queue_depth=2
+    )
+
+    result = asyncio.run(pipeline.step())
+
+    assert result == {"retired_step": 0}
+    assert engine.event_log == [
+        ("forward_start", 0),
+        ("forward_yield", 0),
+        ("forward_finish", 0),
+        ("forward_start", 1),
+        ("forward_yield", 1),
+        ("bookkeep", 0),
+        ("forward_finish", 1),
+    ]
+    assert pipeline.pending_launch_count == 1
 
 
 def test_dynamic_async_pipeline_can_stage_one_launch_per_distributed_tick():
