@@ -147,18 +147,13 @@ class TextGenerationController:
         self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
-        logits_dtype = self.inference_wrapped_model.config.params_dtype
 
         self._sampling_backend = "torch"
-        self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
 
         # Initialize bookkeeping tensors.
-        if self._enable_cuda_graph:
-            self._all_logits_cuda = torch.zeros(
-                (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
-            )
-        else:
-            self._all_logits_cuda = None
+        self._all_logits_cuda = torch.zeros(
+            (1, max_logits, self.vocab_size), dtype=torch.float32, device=device
+        )
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
 
         # Used for inefficient torch sampling.
@@ -682,7 +677,12 @@ class TextGenerationController:
 
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
-                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+                {
+                    "tokens": input_ids,
+                    "position_ids": position_ids,
+                    "attention_mask": None,
+                    "logits_out": self._all_logits_cuda,
+                }
             )
             # logits shape: [1, seq_len, vocab_size]
 
@@ -706,16 +706,14 @@ class TextGenerationController:
 
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
-                dtype=self.model_config.params_dtype,
+                dtype=torch.float32,
                 tensor=logits,
                 pp_group=self.pp_group,
             )
-
-        # Copy logits to contiguous buffer.
-        if self._enable_cuda_graph:
-            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
-        else:
-            self._all_logits_cuda = logits
+            if not is_pipeline_last_stage(self.pp_group):
+                self._all_logits_cuda[:, :logits_seq_len, :].copy_(
+                    logits[:, :logits_seq_len, :]
+                )
 
     def _dynamic_step_sample_bookkeeping(self):
         """Perform bookkeeping necessary to sample logits for dynamic batching."""
@@ -1302,7 +1300,7 @@ class TextGenerationController:
         only_last = context.config.materialize_only_last_token_logits
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
-        logits_squeezed = logits.squeeze(0).float()
+        logits_squeezed = logits.squeeze(0)
         if only_last:
             log_probs_tensor = F.log_softmax(logits_squeezed, dim=-1)
         else:

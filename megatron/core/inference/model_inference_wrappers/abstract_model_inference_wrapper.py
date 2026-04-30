@@ -118,12 +118,14 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
+        logits_out = inference_input.get("logits_out")
         return self.model(
             tokens,
             position_ids,
             attention_mask,
             inference_context=self.inference_context,
             runtime_gather_output=True,  # Inference should always gather the logits
+            logits_out=logits_out,
         )
 
     @torch.inference_mode()
@@ -246,9 +248,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = None
         if is_pipeline_last_stage(self.pp_group):
             logits = output_tensor
-
-            # Explicitly cast logits to expected dtype
-            logits = logits.to(self.config.params_dtype)
 
         return logits
 

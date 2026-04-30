@@ -393,6 +393,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         is_spec_decode: Optional[bool] = None,
+        logits_out: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -561,6 +562,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.output_layer.sequence_parallel = True
 
         if labels is None:
+            if (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+            ):
+                logits_out[:, :logits.shape[0], :].copy_(logits.transpose(0, 1))
+                return logits_out[:, :logits.shape[0], :]
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 

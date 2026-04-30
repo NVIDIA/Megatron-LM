@@ -19,7 +19,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import CudaGraphScope, LayerType
+from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -609,38 +609,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def _should_call_local_cudagraph(self, *args, **kwargs):
-        """
-        Check if we should call the local cudagraph path.
-        """
-        if (
-            not self.training
-            and hasattr(self, 'cudagraph_manager')
-            and kwargs['attention_mask'] is None
-            and (
-                kwargs.get('inference_context') is not None
-                or kwargs.get('inference_params') is not None
-            )
-            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
-        ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
-            else:
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
-
-            if using_cuda_graph:
-                return True
-        return False
-
-    def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            kwargs['hidden_states'] = (
-                kwargs['hidden_states'].unwrap()
-                if isinstance(kwargs['hidden_states'], WrappedTensor)
-                else kwargs['hidden_states']
-            )
-            return super().__call__(*args, **kwargs)[0]
-        return super().__call__(*args, **kwargs)
+    def create_mcore_cudagraph_manager(self, config):
+        """No-op: full_iteration_inference cuda graphs are owned by the parent model
+        (e.g., GPTModel, HybridModel), and other scopes are owned at the layer level."""
 
     def forward(
         self,
