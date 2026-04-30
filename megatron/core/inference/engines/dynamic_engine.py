@@ -1004,8 +1004,6 @@ class DynamicInferenceEngine(AbstractEngine):
             return "pipeline_parallel"
         if getattr(self, "ep_world_size", 1) > 1:
             return "expert_parallel"
-        if self.num_speculative_tokens > 0:
-            return "speculative"
         if self.context.is_hybrid_model:
             return "hybrid_mamba"
         if self.waiting_request_ids and self.context.enable_prefix_caching:

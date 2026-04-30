@@ -81,6 +81,8 @@ class StepJournalEntry:
     request_slots_after: Sequence[int] = field(default_factory=tuple)
     active_request_ids: Sequence[str] = field(default_factory=tuple)
     placeholder_token_counts: Mapping[str, int] = field(default_factory=dict)
+    speculative_accepted_token_counts: Mapping[str, int] = field(default_factory=dict)
+    kv_rewind_token_counts: Mapping[str, int] = field(default_factory=dict)
     reserved_kv_blocks: Sequence[int] = field(default_factory=tuple)
     reserved_mamba_slots: Sequence[int] = field(default_factory=tuple)
     prefix_cache_refcount_deltas: Mapping[Any, int] = field(default_factory=dict)
@@ -101,6 +103,14 @@ class StepJournalEntry:
         object.__setattr__(self, "active_request_ids", _str_tuple(self.active_request_ids))
         object.__setattr__(
             self, "placeholder_token_counts", _freeze_mapping(self.placeholder_token_counts)
+        )
+        object.__setattr__(
+            self,
+            "speculative_accepted_token_counts",
+            _freeze_mapping(self.speculative_accepted_token_counts),
+        )
+        object.__setattr__(
+            self, "kv_rewind_token_counts", _freeze_mapping(self.kv_rewind_token_counts)
         )
         object.__setattr__(self, "reserved_kv_blocks", _int_tuple(self.reserved_kv_blocks))
         object.__setattr__(self, "reserved_mamba_slots", _int_tuple(self.reserved_mamba_slots))
@@ -136,6 +146,8 @@ class _MutableStepJournalEntry:
     request_slots_after: Tuple[int, ...] = field(default_factory=tuple)
     active_request_ids: Tuple[str, ...] = field(default_factory=tuple)
     placeholder_token_counts: Dict[str, int] = field(default_factory=dict)
+    speculative_accepted_token_counts: Dict[str, int] = field(default_factory=dict)
+    kv_rewind_token_counts: Dict[str, int] = field(default_factory=dict)
     reserved_kv_blocks: list[int] = field(default_factory=list)
     reserved_mamba_slots: list[int] = field(default_factory=list)
     prefix_cache_refcount_deltas: Dict[Any, int] = field(default_factory=dict)
@@ -155,6 +167,8 @@ class _MutableStepJournalEntry:
             request_slots_after=self.request_slots_after,
             active_request_ids=self.active_request_ids,
             placeholder_token_counts=self.placeholder_token_counts,
+            speculative_accepted_token_counts=self.speculative_accepted_token_counts,
+            kv_rewind_token_counts=self.kv_rewind_token_counts,
             reserved_kv_blocks=self.reserved_kv_blocks,
             reserved_mamba_slots=self.reserved_mamba_slots,
             prefix_cache_refcount_deltas=self.prefix_cache_refcount_deltas,
@@ -250,6 +264,23 @@ class StepJournal:
         )
         for key, block_id in getattr(reservation, "mamba_restore_block_ids", {}).items():
             entry.mamba_restore_block_ids[key] = int(block_id)
+        return entry.freeze()
+
+    def record_speculative_acceptance(
+        self,
+        step_id,
+        *,
+        accepted_token_counts: Optional[Mapping[Any, int]] = None,
+        kv_rewind_token_counts: Optional[Mapping[Any, int]] = None,
+    ) -> StepJournalEntry:
+        """Record speculative acceptance and rejected-token KV rewind counts."""
+        entry = self._require_open_entry(step_id)
+        if accepted_token_counts is not None:
+            for request_id, token_count in accepted_token_counts.items():
+                entry.speculative_accepted_token_counts[str(request_id)] = int(token_count)
+        if kv_rewind_token_counts is not None:
+            for request_id, token_count in kv_rewind_token_counts.items():
+                entry.kv_rewind_token_counts[str(request_id)] = int(token_count)
         return entry.freeze()
 
     def record_snapshot_slot(

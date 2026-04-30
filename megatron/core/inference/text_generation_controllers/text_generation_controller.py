@@ -759,6 +759,26 @@ class TextGenerationController:
         # so there is nothing to rewind.
         request_in_prefill_status = context.request_in_prefill_status_tensor[active_request_slice]
         num_tokens_to_rewind[request_in_prefill_status == 1] = 0
+        current_step_id = int(getattr(context, "current_dynamic_step_id", -1))
+        if current_step_id >= 0:
+            active_request_ids = context.request_ids[active_request_slice].tolist()
+            accepted_counts_by_request = {}
+            rewind_counts_by_request = {}
+            for request_id, is_prefill, accepted_count, rewind_count in zip(
+                active_request_ids,
+                request_in_prefill_status.tolist(),
+                accepted_tokens_per_request.tolist(),
+                num_tokens_to_rewind.tolist(),
+            ):
+                if not is_prefill:
+                    accepted_counts_by_request[int(request_id)] = int(accepted_count)
+                    rewind_counts_by_request[int(request_id)] = int(rewind_count)
+            if accepted_counts_by_request:
+                context.record_speculative_acceptance(
+                    current_step_id,
+                    accepted_token_counts=accepted_counts_by_request,
+                    kv_rewind_token_counts=rewind_counts_by_request,
+                )
 
         # Save the original offset BEFORE modifying to correctly detect block boundary crossing
         original_offset = context.request_last_kv_block_offset[active_request_slice].clone()

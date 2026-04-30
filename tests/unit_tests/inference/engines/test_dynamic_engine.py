@@ -1120,6 +1120,159 @@ class TestDynamicInferenceEngine:
             assert len(summary["prompt_top_n"]) == 3
             assert len(summary["generated_top_n"]) == 4
 
+    def _run_async_overlap_speculative_case(
+        self, *, queue_depth: int, mtp_token: int
+    ) -> Tuple[Dict[int, List[int]], DynamicEngineTestEnv, int]:
+        """Run deterministic speculative generation and return completed outputs."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            num_speculative_tokens=2,
+            model_provider="gpt",
+            materialize_only_last_token_logits=False,
+            num_cuda_graphs=None,
+            cuda_graph_scope=[],
+            force_build_cuda_graphs=True,
+            context_max_requests=16,
+            context_max_tokens=512,
+            context_block_size_tokens=64,
+            position_embedding_type="none",
+            enable_async_overlap_architecture=True,
+            async_overlap_queue_depth=queue_depth,
+        )
+        env = self._build_test_env(test_config)
+        model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = model.config.hidden_size
+
+        def deterministic_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            batch, sequence = tokens.shape
+            logits = torch.zeros(
+                batch,
+                sequence,
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            logits[..., 0] = 100.0
+            model._decoder_hidden_states_cache = torch.zeros(
+                sequence, batch, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            return logits
+
+        def deterministic_mtp(hidden_states, next_token_ids, position_ids, depth):
+            del next_token_ids, position_ids, depth
+            logits = torch.zeros(
+                hidden_states.size(0),
+                1,
+                test_config.vocab_size,
+                device=hidden_states.device,
+                dtype=torch.bfloat16,
+            )
+            logits[..., mtp_token] = 100.0
+            return hidden_states, logits
+
+        model.forward = deterministic_forward
+        model.compute_mtp_single_step = deterministic_mtp
+
+        for request_id in range(2):
+            env.engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.full(
+                        (4,), request_id, dtype=torch.int64, device="cuda"
+                    ),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=6,
+                        termination_id=test_config.vocab_size - 1,
+                        top_k=1,
+                    ),
+                    block_size_tokens=env.engine.context.block_size_tokens,
+                )
+            )
+
+        finished = {}
+        max_pending_launches = 0
+        step_count = 0
+        while env.engine.has_unfinished_requests():
+            result = env.engine.step_modern()
+            max_pending_launches = max(
+                max_pending_launches, env.engine.async_pipeline.pending_launch_count
+            )
+            for record in result["finished_request_records"]:
+                request = record.merge()
+                assert request.status == Status.COMPLETED
+                finished[int(request.request_id)] = list(request.generated_tokens)
+            step_count += 1
+            assert step_count < 64, "Engine did not converge"
+
+        return finished, env, max_pending_launches
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_speculative_mtp_matches_queue_depth_one(
+        self,
+    ) -> None:
+        """Queue-depth-two preserves speculative full-acceptance output ordering."""
+        qd1_finished, _, _ = self._run_async_overlap_speculative_case(
+            queue_depth=1, mtp_token=0
+        )
+        qd2_finished, qd2_env, qd2_max_pending = self._run_async_overlap_speculative_case(
+            queue_depth=2, mtp_token=0
+        )
+
+        assert qd2_finished == qd1_finished
+        assert qd2_finished == {0: [0] * 6, 1: [0] * 6}
+        assert qd2_max_pending > 0
+        counters = qd2_env.engine.async_overlap_debug_counters
+        assert "speculative" not in counters.fallback_or_queue_depth_one_reasons
+        assert counters.accepted_output_tokens == 12
+        assert counters.speculative_rejected_tokens == 0
+        first_decode_entry = qd2_env.engine.context.step_journal.get_committed_entry(1)
+        assert first_decode_entry is not None
+        assert dict(first_decode_entry.speculative_accepted_token_counts) == {
+            "0": 2,
+            "1": 2,
+        }
+        assert dict(first_decode_entry.kv_rewind_token_counts) == {"0": 0, "1": 0}
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_speculative_rejection_rolls_back(self) -> None:
+        """Queue-depth-two rejects speculative tokens without leaking context state."""
+        qd1_finished, _, _ = self._run_async_overlap_speculative_case(
+            queue_depth=1, mtp_token=50
+        )
+        qd2_finished, qd2_env, _ = self._run_async_overlap_speculative_case(
+            queue_depth=2, mtp_token=50
+        )
+
+        assert qd2_finished == qd1_finished
+        assert qd2_finished == {0: [0] * 6, 1: [0] * 6}
+        counters = qd2_env.engine.async_overlap_debug_counters
+        assert counters.accepted_output_tokens == 12
+        assert counters.speculative_rejected_tokens > 0
+        first_decode_entry = qd2_env.engine.context.step_journal.get_committed_entry(1)
+        assert first_decode_entry is not None
+        assert dict(first_decode_entry.speculative_accepted_token_counts) == {
+            "0": 0,
+            "1": 0,
+        }
+        assert dict(first_decode_entry.kv_rewind_token_counts) == {"0": 2, "1": 2}
+        context = qd2_env.engine.context
+        assert context.active_token_count == 0
+        assert context.total_request_count == 0
+        assert int(context.num_output_placeholders.sum().item()) == 0
+        assert torch.all(context.request_to_kv_block_ids == -1)
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

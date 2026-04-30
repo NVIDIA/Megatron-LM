@@ -2949,6 +2949,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         return self.step_journal.record_resource_reservation(step_id, reservation)
 
+    def record_speculative_acceptance(
+        self,
+        step_id: int,
+        *,
+        accepted_token_counts: Optional[Mapping[int, int]] = None,
+        kv_rewind_token_counts: Optional[Mapping[int, int]] = None,
+    ):
+        """Record speculative acceptance and KV rewind counts in the step journal."""
+        if self.step_journal.get_open_entry(step_id) is None:
+            return None
+        return self.step_journal.record_speculative_acceptance(
+            step_id,
+            accepted_token_counts=accepted_token_counts,
+            kv_rewind_token_counts=kv_rewind_token_counts,
+        )
+
     def record_snapshot_slot(
         self, step_id: int, snapshot_slot_id: int, cuda_graph_batch_dimensions=None
     ):
