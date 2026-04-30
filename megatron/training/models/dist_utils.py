@@ -20,13 +20,20 @@ logger = logging.getLogger(__name__)
 from typing import Any, Callable
 
 import torch
-from megatron.core import tensor_parallel
+from megatron.core import tensor_parallel, mpu
 from megatron.core.distributed import (
     DistributedDataParallel,
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
-    TorchFullyShardedDataParallel,
 )
+
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel
+
+    HAVE_FSDP2 = True
+except ImportError:
+    HAVE_FSDP2 = False
+
 from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
@@ -220,9 +227,31 @@ def _ddp_wrap(
         if use_torch_fsdp2:
             raise ValueError("Using use_megatron_fsdp and use_torch_fsdp2 at the same time is not supported.")
     elif use_torch_fsdp2:
+        assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
         DP = TorchFullyShardedDataParallel
     else:
         DP = DistributedDataParallel
+
+
+    if not use_torch_fsdp2:
+        if ddp_config.num_buckets is not None:
+            num_parameters = sum(
+                [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
+            )
+            ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
+
+        # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
+        # If bucket_size is not provided as an input, use sane default.
+        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
+        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
+        # latency-bound.
+        if ddp_config.bucket_size is None:
+            ddp_config.bucket_size = max(
+                40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+            )
+        # Set bucket_size to infinity if overlap_grad_reduce is False.
+        if not ddp_config.overlap_grad_reduce:
+            ddp_config.bucket_size = None
 
     # DDP initialization is required to be on a side-stream for the full-iteration CUDA graph.
     #  this side-stream may be nested if being called from within the get_model function, but it
