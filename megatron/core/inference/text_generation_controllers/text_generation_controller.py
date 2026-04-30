@@ -1942,15 +1942,56 @@ class TextGenerationController:
         snapshot: _SerialStepSnapshot,
         prev_sample_state: Optional[Any] = None,
     ) -> None:
-        """Phase 2: GPU input prep — no-op stub at commit 3.
+        """Phase 2: GPU input prep via ``GpuInputPreparer``.
 
-        Commit 17 introduces ``GpuInputPreparer`` and fills in the real body
-        (D2D copy of the previous step's sampled tokens, then scatter into
-        the snapshot's ``token_to_input_ids``). The serial legacy path
-        produces input ids on CPU inside ``_dynamic_step_context_init`` so
-        no GPU scatter is needed today.
+        v3 plan §commit 17 wires the GPU scatter that populates the
+        snapshot's ``token_to_input_ids`` from the previous step's
+        ``prev_sampled_token_ids`` (D2D copy already enqueued in
+        ``launch_dynamic_sampling`` by commit 16).
+
+        With ``enable_async_overlap=False`` (today's default) the legacy
+        serial path is authoritative — ``_dynamic_step_context_init``
+        already populated input ids on CPU and the H2D in
+        ``transfer_bookkeeping_to_gpu`` carried them to the snapshot's
+        buffer. The GPU scatter is a no-op on this path; it is consumed
+        only by commit 18's pipeline when the flag is on.
         """
-        del snapshot, prev_sample_state  # placeholder
+        context = self.inference_wrapped_model.inference_context
+        config = context.config
+        if not getattr(config, "enable_async_overlap", False):
+            return
+        if not hasattr(self, "_gpu_input_preparer"):
+            from megatron.core.inference.contexts.gpu_input_preparer import GpuInputPreparer
+
+            self._gpu_input_preparer = GpuInputPreparer(self._gpu_bookkeeping_stream)
+        from megatron.core.inference.contexts.gpu_input_preparer import PrevSampleState
+        from megatron.core.inference.engines.async_pipeline_types import StepInputPlan
+
+        n = context.total_request_count - context.paused_request_count
+        is_first_step = self._prev_sample_ready_event is None or n == 0
+        state = PrevSampleState(
+            prev_sampled_token_ids=context._prev_sampled_token_ids,
+            sample_done_event=self._sample_done_event,
+            prev_sample_ready_event=self._prev_sample_ready_event,
+        )
+        # The serial legacy path doesn't carry an explicit StepInputPlan;
+        # commit 18 produces one in prepare_next_step_optimistic. Build a
+        # minimal plan here that maps decode slots 1:1 into
+        # token_to_input_ids; commit 22 generalizes to mixed prefill+decode.
+        decode_indices = tuple(range(n))
+        input_plan = StepInputPlan(
+            decode_request_slots=decode_indices,
+            decode_token_destination_indices=decode_indices,
+            prefill_cpu_token_ranges=tuple(),
+            speculative_width=self.num_speculative_tokens,
+            previous_sample_source_step=None,
+        )
+        self._gpu_input_preparer.prepare(
+            snapshot=context.gpu_view,
+            input_plan=input_plan,
+            prev_sample_state=state,
+            is_first_step=is_first_step,
+        )
 
     def launch_dynamic_forward(self, snapshot: _SerialStepSnapshot) -> _ForwardArtifacts:
         """Phase 3: forward kernels + Mamba commit + routing record."""
