@@ -346,7 +346,6 @@ def apply_rotary_pos_emb(
                     t,
                     freqs,
                     interleaved=config.rotary_interleaved,
-                    mla_output_remove_interleaving=mla_output_remove_interleaving,
                 )
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
@@ -357,7 +356,6 @@ def apply_rotary_pos_emb(
                 cp_size=cp_group.size(),
                 cp_rank=cp_group.rank(),
                 interleaved=config.rotary_interleaved,
-                mla_output_remove_interleaving=mla_output_remove_interleaving,
             )
     # use unfused implementation
     if cu_seqlens is None:
