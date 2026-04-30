@@ -723,7 +723,7 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_async_overlap_queue_depth_one_simple(self) -> None:
-        """Queue-depth-one pipeline matches the serial GPT output path."""
+        """Default queue-depth-one engine path uses the async pipeline."""
         env = self._run_test(
             num_tokens_to_generate=16,
             model_provider="gpt",
@@ -731,7 +731,6 @@ class TestDynamicInferenceEngine:
             cuda_graph_scope=[],
             force_build_cuda_graphs=True,
             context_max_requests=128,
-            enable_async_overlap_architecture=True,
             async_overlap_queue_depth=1,
         )
 

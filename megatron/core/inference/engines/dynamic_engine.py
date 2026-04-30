@@ -267,12 +267,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
-        self.enable_async_overlap_architecture = (
-            inference_config.enable_async_overlap_architecture
-        )
         self.async_overlap_queue_depth = inference_config.async_overlap_queue_depth
         self.async_overlap_debug_checks = inference_config.async_overlap_debug_checks
-        if self.enable_async_overlap_architecture and self.async_overlap_queue_depth > 2:
+        if self.async_overlap_queue_depth > 2:
             raise ValueError(
                 "async_overlap_queue_depth > 2 is not available until wider async-overlap "
                 "pipeline depths are validated"
@@ -834,10 +831,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.state != EngineState.SUSPENDING:
             self.state = EngineState.SUSPENDING
-        if hasattr(self, "async_pipeline"):
-            self._run_coroutine_sync(self.async_pipeline.drain_for_suspend_barrier())
-        elif hasattr(self, "step_retirement_service"):
-            self.step_retirement_service.drain_for_suspend()
+        self._run_coroutine_sync(self.async_pipeline.drain_for_suspend_barrier())
         if hasattr(self.context, "suspend_async_overlap_runtime_state"):
             self.context.suspend_async_overlap_runtime_state()
 
@@ -1019,7 +1013,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def can_launch_async_overlap_lookahead(self) -> bool:
         """Return whether queue-depth-two lookahead is safe for the current step."""
-        if not self.enable_async_overlap_architecture or self.async_overlap_queue_depth < 2:
+        if self.async_overlap_queue_depth < 2:
             return False
         reason = self._async_overlap_lookahead_blocker()
         if reason is not None:
@@ -1034,7 +1028,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def can_plan_async_overlap_lookahead(self) -> bool:
         """Return queue-depth-two eligibility without mutating debug counters."""
-        if not self.enable_async_overlap_architecture or self.async_overlap_queue_depth < 2:
+        if self.async_overlap_queue_depth < 2:
             return False
         return self._async_overlap_lookahead_blocker() is None
 
@@ -1042,13 +1036,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self, *, max_forward_launches: Optional[int] = None
     ) -> int:
         """Return how many real dynamic forwards the next async step can launch."""
-        if getattr(self, "enable_async_overlap_architecture", False):
-            return self.async_pipeline.planned_launch_count(
-                max_forward_launches=max_forward_launches
-            )
-        if max_forward_launches is not None and max_forward_launches <= 0:
-            return 0
-        return 1 if self.has_async_overlap_launch_work() else 0
+        return self.async_pipeline.planned_launch_count(max_forward_launches=max_forward_launches)
 
     def _async_overlap_lookahead_blocker(self) -> Optional[str]:
         """Return the conservative queue-depth-two blocker, or None if eligible."""
@@ -2048,13 +2036,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 3. The step time in seconds.
         """
         try:
-            if self.enable_async_overlap_architecture:
-                ret = await self.async_pipeline.step(
-                    max_forward_launches=max_forward_launches
-                )
-            else:
-                last_step_data = await self.async_forward()
-                ret = await self.async_bookkeep(*last_step_data)
+            ret = await self.async_pipeline.step(max_forward_launches=max_forward_launches)
         except BaseException:
             self.context.rollback_step_journal(
                 self._current_dynamic_step_id, reason="async_step_exception"
@@ -2615,12 +2597,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             missing_dummy_launches = max(0, global_launches - local_launches)
                             if missing_dummy_launches:
                                 self._run_dummy_forward_launches(missing_dummy_launches)
-                            if getattr(self, "enable_async_overlap_architecture", False):
-                                await self.async_step(
-                                    max_forward_launches=max_launches_per_tick
-                                )
-                            else:
-                                await self.async_step()
+                            await self.async_step(max_forward_launches=max_launches_per_tick)
                         else:
                             self._run_dummy_forward_launches(global_launches)
                     else:

@@ -2758,9 +2758,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         record_journal: bool = True,
     ):
-        """Prepare the optimistic request plan for one serial dynamic step.
+        """Prepare the optimistic request plan for one dynamic step.
 
-        Queue depth one still executes this in serial order. Later commits can run this
+        Queue depth one executes this in retirement order. Larger queue depths can run this
         before the previous step retires, then reconcile through the journal.
         """
         step_id = self._coerce_dynamic_step_id(step_id)
@@ -2977,7 +2977,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return f"{name}[step={step_id}]"
 
     def sync_optimistic_to_committed_for_queue_depth_one(self) -> None:
-        """Synchronize committed and optimistic ledgers to the live serial context."""
+        """Synchronize committed and optimistic ledgers in queue-depth-one mode."""
         self.request_ledgers.sync_from_context_for_queue_depth_one(self)
         if self.config.async_overlap_debug_checks:
             self.request_ledgers.assert_committed_matches_optimistic()
@@ -3073,7 +3073,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def commit_step_journal(self, step_id: int):
-        """Commit the journal entry for one serial dynamic step."""
+        """Commit the journal entry for one dynamic step."""
         if self.step_journal.get_open_entry(step_id) is None:
             return None
         return self.step_journal.commit_step_journal(

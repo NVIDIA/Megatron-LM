@@ -1990,7 +1990,7 @@ class TextGenerationController:
         )
 
     def prepare_dynamic_step(self) -> Optional[DynamicStepContextSnapshot]:
-        """Prepare the dynamic context snapshot for the next serial forward."""
+        """Prepare the dynamic context snapshot for the next forward."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
@@ -2042,7 +2042,7 @@ class TextGenerationController:
     def launch_dynamic_forward(
         self, prepared_step: DynamicStepContextSnapshot
     ) -> DynamicStepGpuLaunch:
-        """Launch the dynamic forward phase for a prepared serial step."""
+        """Launch the dynamic forward phase for a prepared step."""
         context = self.inference_wrapped_model.inference_context
         assert_snapshot_gpu_view_bound(
             prepared_step,
@@ -2099,7 +2099,7 @@ class TextGenerationController:
     def launch_dynamic_sampling(
         self, gpu_launch: DynamicStepGpuLaunch
     ) -> Tuple[Optional[Tensor], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
-        """Launch serial sampling and log-prob work for a completed forward."""
+        """Launch sampling and log-prob work for a completed forward."""
         context = self.inference_wrapped_model.inference_context
         logits = gpu_launch.logits
         input_ids = gpu_launch.input_ids
@@ -2170,7 +2170,7 @@ class TextGenerationController:
         routing_indices_per_request: Optional[Dict[int, Tensor]] = None,
         skip_bookkeeping: Optional[bool] = False,
     ) -> AsyncStepOutput:
-        """Begin the serial sampled-output D2H copy for one dynamic step."""
+        """Begin the sampled-output D2H copy for one dynamic step."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = prepared_step.active_request_count
 
