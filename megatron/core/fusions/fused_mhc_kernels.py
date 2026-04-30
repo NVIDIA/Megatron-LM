@@ -1848,9 +1848,10 @@ if _CUTILE_AVAILABLE:
 # The public fused API chooses the fastest validated backend per operation:
 #
 #   sinkhorn fwd/bwd:       Triton -> cuTile -> torch
-#   h_post_bda fwd:         cuTile -> torch
-#   h_post_bda bwd:         Triton -> cuTile -> torch
-#   h_aggregate/proj_rms:   cuTile -> torch
+#   h_post_bda fwd/bwd:     Triton -> cuTile -> torch
+#   h_aggregate fwd:        Triton -> cuTile -> torch
+#   h_aggregate bwd:        cuTile -> torch
+#   proj_rms/proj_rms_compute_h: cuTile -> torch
 #
 # Runtime CUDA launch failures are intentionally not swallowed; after such an
 # error the CUDA context may not be safely reusable for fallback work.
@@ -1876,6 +1877,28 @@ def _get_triton_sinkhorn():
         return None
 
 
+def _get_triton_h_aggregate_fwd():
+    if not _TRITON_AVAILABLE:
+        return None
+    try:
+        from megatron.core.fusions.triton_mhc_kernels import _triton_h_aggregate_fwd
+
+        return _triton_h_aggregate_fwd
+    except ImportError:
+        return None
+
+
+def _get_triton_h_post_bda_fwd():
+    if not _TRITON_AVAILABLE:
+        return None
+    try:
+        from megatron.core.fusions.triton_mhc_kernels import _triton_h_post_bda_fwd
+
+        return _triton_h_post_bda_fwd
+    except ImportError:
+        return None
+
+
 def _get_triton_h_post_bda_bwd():
     if not _TRITON_AVAILABLE:
         return None
@@ -1885,6 +1908,14 @@ def _get_triton_h_post_bda_bwd():
         return _triton_h_post_bda_bwd
     except ImportError:
         return None
+
+
+def _torch_h_aggregate_bwd(
+    grad_output: Tensor, x: Tensor, h_pre: Tensor
+) -> Tuple[Tensor, Tensor]:
+    grad_x = grad_output.unsqueeze(2) * h_pre.unsqueeze(-1)
+    grad_h = torch.sum(grad_output.unsqueeze(2) * x, dim=-1)
+    return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)
 
 
 def _torch_h_post_bda_bwd(
@@ -2038,8 +2069,31 @@ if _CUTILE_AVAILABLE:
             return grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias, None, None
 
 
+class FusedHAggregate(torch.autograd.Function):
+    """H_aggregate with Triton/cuTile/torch forward and cuTile/torch backward."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor, h_pre: Tensor):
+        triton_fwd = _get_triton_h_aggregate_fwd()
+        if triton_fwd is not None:
+            output = triton_fwd(x, h_pre)
+        elif _CUTILE_AVAILABLE:
+            output = _cutile_h_aggregate_fwd(x, h_pre)
+        else:
+            output = native_h_aggregate(x, h_pre)
+        ctx.save_for_backward(x, h_pre)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, h_pre = ctx.saved_tensors
+        if _CUTILE_AVAILABLE:
+            return _cutile_h_aggregate_bwd(grad_output, x, h_pre)
+        return _torch_h_aggregate_bwd(grad_output, x, h_pre)
+
+
 class FusedHPostBDA(torch.autograd.Function):
-    """H_post_bda with cuTile/torch forward and Triton/cuTile/torch backward."""
+    """H_post_bda with Triton/cuTile/torch forward and backward."""
 
     @staticmethod
     def forward(
@@ -2050,7 +2104,10 @@ class FusedHPostBDA(torch.autograd.Function):
         x: Tensor,
         bias: Optional[Tensor],
     ):
-        if _CUTILE_AVAILABLE:
+        triton_fwd = _get_triton_h_post_bda_fwd()
+        if triton_fwd is not None:
+            output = triton_fwd(h_res, original_residual, h_post, x, bias)
+        elif _CUTILE_AVAILABLE:
             output = _cutile_h_post_bda_fwd(h_res, original_residual, h_post, x, bias)
         else:
             output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
@@ -2089,9 +2146,9 @@ def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6)
 
 
 def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
-    """Weighted n-stream to 1-stream aggregation using cuTile, then torch."""
-    if _CUTILE_AVAILABLE:
-        return CutileHAggregate.apply(x, h_pre)
+    """Weighted n-stream to 1-stream aggregation using Triton/cuTile/torch."""
+    if _TRITON_AVAILABLE or _CUTILE_AVAILABLE:
+        return FusedHAggregate.apply(x, h_pre)
     return native_h_aggregate(x, h_pre)
 
 

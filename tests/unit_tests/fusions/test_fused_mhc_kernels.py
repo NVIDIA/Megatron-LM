@@ -245,6 +245,24 @@ class TestFusedHAggregate:
         torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
 
 
+class TestTritonHAggregate:
+    """Tests for Triton h_aggregate forward against PyTorch reference."""
+
+    @_require_triton
+    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256), (64, 8, 4, 4096)])
+    def test_fwd_vs_reference(self, s, b, n, C):
+        from megatron.core.fusions.triton_mhc_kernels import _triton_h_aggregate_fwd
+
+        _info()
+        x_data = _rand(s, b, n, C)
+        h_data = _rand(s, b, n)
+
+        out_t = _triton_h_aggregate_fwd(x_data, h_data)
+        out_r = _ref_h_aggregate(x_data, h_data)
+
+        torch.testing.assert_close(out_t, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+
+
 # ============================================================================
 # H_post BDA
 # ============================================================================
@@ -345,8 +363,27 @@ class TestFusedHPostBDA:
             )
 
 
-class TestTritonHPostBDABwd:
-    """Tests for Triton h_post_bda backward kernels against PyTorch reference."""
+class TestTritonHPostBDA:
+    """Tests for Triton h_post_bda kernels against PyTorch reference."""
+
+    @_require_triton
+    @pytest.mark.parametrize("with_bias", [True, False])
+    @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256), (64, 8, 4, 4096)])
+    def test_fwd_vs_reference(self, s, b, n, C, with_bias):
+        """Triton hpb forward output must match the PyTorch reference."""
+        from megatron.core.fusions.triton_mhc_kernels import _triton_h_post_bda_fwd
+
+        _info()
+        hr_data = _rand(s, b, n, n)
+        orig_data = _rand(s, b, n, C)
+        hp_data = _rand(s, b, n)
+        x_data = _rand(s, b, C)
+        bias_data = _rand(C) if with_bias else None
+
+        out_t = _triton_h_post_bda_fwd(hr_data, orig_data, hp_data, x_data, bias_data)
+        out_r = _ref_h_post_bda(hr_data, orig_data, hp_data, x_data, bias_data)
+
+        torch.testing.assert_close(out_t, out_r, atol=FWD_ATOL, rtol=FWD_RTOL)
 
     @_require_triton
     @pytest.mark.parametrize("with_bias", [True, False])
