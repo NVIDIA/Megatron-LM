@@ -2,6 +2,7 @@
 
 import asyncio
 import concurrent.futures
+import hashlib
 import logging
 import math
 import multiprocessing
@@ -131,6 +132,19 @@ class EngineState(Enum):
     STOPPED = auto()  # All ranks confirmed; teardown complete
 
 
+DISTRIBUTED_PREPARE_CONSENSUS_FIELDS = (
+    "step_id",
+    "queue_depth",
+    "optimistic_ledger_version",
+    "committed_ledger_version",
+    "request_plan_digest",
+    "placeholder_token_count",
+    "placeholder_prefill_count",
+    "placeholder_decode_count",
+    "snapshot_slot_generation",
+)
+
+
 class EngineSuspendedError(Exception):
     """Engine is currently suspended and not performing steps."""
 
@@ -166,6 +180,8 @@ class AsyncOverlapDebugCounters:
     discarded_lookahead_tokens: int = 0
     dummy_forward_launches: int = 0
     distributed_consensus_mismatches: int = 0
+    distributed_prepare_reconciliations: int = 0
+    distributed_prepare_downgrades: int = 0
     speculative_rejected_tokens: int = 0
     placeholder_count: int = 0
     reservation_commits: int = 0
@@ -345,6 +361,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefix_coordination_waits = 0
         self._next_dynamic_step_id = 0
         self._current_dynamic_step_id = -1
+        self._distributed_prepare_mismatch_streak = 0
+        self._distributed_prepare_reconcile_retry_limit = 2
         self.async_overlap_debug_counters = AsyncOverlapDebugCounters(
             queue_depth=getattr(self, "async_overlap_queue_depth", 1)
         )
@@ -2320,6 +2338,7 @@ class DynamicInferenceEngine(AbstractEngine):
         local_launches: int = 0,
         local_queue_depth: Optional[int] = None,
         local_step_id: Optional[int] = None,
+        local_prepare_metadata: Optional[Dict[str, int]] = None,
     ) -> tuple[int, bool, int, bool]:
         """EP all-reduce to share work counts and pause consensus.
 
@@ -2327,7 +2346,7 @@ class DynamicInferenceEngine(AbstractEngine):
         - local_work: actual pending request count (always >= 0).
         - consensus flag: -1 if this rank wants to pause, 0 otherwise.
         - local_launches: number of real forwards this rank will launch this tick.
-        - queue depth and next step ID: debug consensus fields that detect drift.
+        - optimistic-prepare metadata fields that detect distributed drift.
 
         Using max for both:
         - max(work) > 0 means at least one EP peer has real work.
@@ -2340,22 +2359,29 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             (global_work, all_pausing, global_launches, metadata_agrees): max work
             across EP, whether all peers signaled consensus, the forward-launch
-            count all ranks must participate in, and whether queue-depth/step-ID
-            debug metadata agrees.
+            count all ranks must participate in, and whether prepare metadata agrees.
         """
         consensus_range = self._step_nvtx_label("event_polling.ep_consensus")
         nvtx_range_push(consensus_range)
 
         consensus_val = -1 if signal_consensus else 0
-        queue_depth = (
-            int(getattr(self, "async_overlap_queue_depth", 1))
-            if local_queue_depth is None
-            else int(local_queue_depth)
+        prepare_metadata = dict(
+            local_prepare_metadata
+            if local_prepare_metadata is not None
+            else self._distributed_prepare_consensus_metadata()
         )
-        step_id = (
-            int(getattr(self, "_next_dynamic_step_id", 0))
-            if local_step_id is None
-            else int(local_step_id)
+        if local_queue_depth is not None:
+            prepare_metadata["queue_depth"] = int(local_queue_depth)
+        if local_step_id is not None:
+            prepare_metadata["step_id"] = int(local_step_id)
+        metadata_values = tuple(
+            int(prepare_metadata.get(field, 0))
+            for field in DISTRIBUTED_PREPARE_CONSENSUS_FIELDS
+        )
+        metadata_reduce_values = tuple(
+            value
+            for metadata_value in metadata_values
+            for value in (metadata_value, -metadata_value)
         )
 
         # Signals can be received asynchronously on EP ranks.
@@ -2375,19 +2401,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 global_work,
                 global_consensus,
                 global_launches,
-                max_queue_depth,
-                neg_min_queue_depth,
-                max_step_id,
-                neg_min_step_id,
+                *global_metadata_values,
             ) = (
                 await self.expert_parallel_zmq_communicator.all_reduce_max(
                     local_work,
                     consensus_val,
                     int(local_launches),
-                    queue_depth,
-                    -queue_depth,
-                    step_id,
-                    -step_id,
+                    *metadata_reduce_values,
                     async_op=(not self.use_synchronous_zmq_collectives),
                 )
             )
@@ -2395,16 +2415,117 @@ class DynamicInferenceEngine(AbstractEngine):
             global_work = local_work
             global_consensus = consensus_val
             global_launches = int(local_launches)
-            max_queue_depth = queue_depth
-            neg_min_queue_depth = -queue_depth
-            max_step_id = step_id
-            neg_min_step_id = -step_id
+            global_metadata_values = metadata_reduce_values
 
         nvtx_range_pop(consensus_range)
-        metadata_agrees = (
-            max_queue_depth == -neg_min_queue_depth and max_step_id == -neg_min_step_id
+        metadata_agrees = all(
+            global_metadata_values[idx] == -global_metadata_values[idx + 1]
+            for idx in range(0, len(global_metadata_values), 2)
         )
         return global_work, global_consensus == -1, global_launches, metadata_agrees
+
+    @staticmethod
+    def _stable_consensus_digest(value) -> int:
+        """Return a stable positive 31-bit digest for distributed consensus."""
+        payload = repr(value).encode("utf-8")
+        digest = hashlib.blake2b(payload, digest_size=4).digest()
+        return int.from_bytes(digest, byteorder="big", signed=False) & 0x7FFFFFFF
+
+    def _distributed_prepare_consensus_metadata(self) -> Dict[str, int]:
+        """Build drift-detection metadata for distributed optimistic prepare."""
+        step_id = int(getattr(self, "_next_dynamic_step_id", 0))
+        request_plan = self.context._build_dynamic_step_request_plan(step_id)
+        batch_dimensions = getattr(self.context, "batch_dimensions", None)
+        placeholder_token_count = int(self.context.get_placeholder_adjusted_active_token_count())
+        placeholder_prefill_count = (
+            int(getattr(batch_dimensions, "prefill_req_count", 0))
+            if batch_dimensions is not None
+            else 0
+        )
+        placeholder_decode_count = (
+            int(getattr(batch_dimensions, "decode_req_count", 0))
+            if batch_dimensions is not None
+            else 0
+        )
+        waiting_request_ids = tuple(int(request_id) for request_id in self.waiting_request_ids)
+        request_plan_digest = self._stable_consensus_digest(
+            (
+                tuple(request_plan.active_request_ids),
+                tuple(request_plan.decode_request_ids),
+                tuple(request_plan.prefill_request_ids),
+                tuple(request_plan.speculative_request_ids),
+                tuple(sorted(request_plan.placeholder_token_counts.items())),
+                waiting_request_ids,
+                int(self.context.total_request_count),
+                int(self.context.paused_request_count),
+                int(self.context.active_token_count),
+            )
+        )
+        return {
+            "step_id": step_id,
+            "queue_depth": int(getattr(self, "async_overlap_queue_depth", 1)),
+            "optimistic_ledger_version": self._stable_consensus_digest(
+                self.context.get_optimistic_request_state()
+            ),
+            "committed_ledger_version": self._stable_consensus_digest(
+                self.context.get_committed_request_state()
+            ),
+            "request_plan_digest": request_plan_digest,
+            "placeholder_token_count": placeholder_token_count,
+            "placeholder_prefill_count": placeholder_prefill_count,
+            "placeholder_decode_count": placeholder_decode_count,
+            "snapshot_slot_generation": self._snapshot_slot_generation_digest(),
+        }
+
+    def _snapshot_slot_generation_digest(self) -> int:
+        """Return a stable digest of snapshot-slot ownership generations."""
+        snapshot_pool = getattr(self.context, "snapshot_pool", None)
+        if snapshot_pool is None:
+            return 0
+        slot_state = tuple(
+            (
+                int(slot.slot_id),
+                str(slot.state),
+                -1 if slot.owning_step_id is None else int(slot.owning_step_id),
+                int(bool(slot.journal_retired)),
+                int(slot.graph_capture_count),
+            )
+            for slot in snapshot_pool.slots
+        )
+        return self._stable_consensus_digest(slot_state)
+
+    def _record_distributed_prepare_convergence(self) -> None:
+        """Reset mismatch streak after all ranks agree on prepare metadata."""
+        self._distributed_prepare_mismatch_streak = 0
+
+    def _handle_distributed_prepare_divergence(self) -> None:
+        """Record a prepare mismatch and downgrade after bounded retries."""
+        counters = getattr(self, "async_overlap_debug_counters", None)
+        if counters is not None:
+            counters.distributed_consensus_mismatches += 1
+            counters.distributed_prepare_reconciliations += 1
+        self._distributed_prepare_mismatch_streak = (
+            getattr(self, "_distributed_prepare_mismatch_streak", 0) + 1
+        )
+        retry_limit = max(1, int(getattr(self, "_distributed_prepare_reconcile_retry_limit", 2)))
+        if self._distributed_prepare_mismatch_streak >= retry_limit:
+            self._downgrade_async_overlap_queue_depth_one("distributed_prepare_divergence")
+
+    def _downgrade_async_overlap_queue_depth_one(self, reason: str) -> None:
+        """Downgrade the new architecture to queue depth one after unsafe divergence."""
+        self.async_overlap_queue_depth = 1
+        if hasattr(self, "async_pipeline"):
+            self.async_pipeline.queue_depth = 1
+        if hasattr(self, "step_retirement_service"):
+            self.step_retirement_service.max_retirement_backlog = 1
+            self.step_retirement_service._update_backlog_counters()
+        counters = getattr(self, "async_overlap_debug_counters", None)
+        if counters is not None:
+            counters.queue_depth = 1
+            counters.distributed_prepare_downgrades += 1
+            counters.fallback_or_queue_depth_one_reasons[reason] = (
+                counters.fallback_or_queue_depth_one_reasons.get(reason, 0) + 1
+            )
 
     def _run_dummy_forward_launches(self, count: int) -> None:
         """Run dummy forwards so ranks without real work match distributed launches."""
@@ -2478,8 +2599,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         local_step_id=getattr(self, "_next_dynamic_step_id", 0),
                     )
                     if not metadata_agrees:
-                        if hasattr(self, "async_overlap_debug_counters"):
-                            self.async_overlap_debug_counters.distributed_consensus_mismatches += 1
+                        self._handle_distributed_prepare_divergence()
+                        await asyncio.sleep(0)
+                        continue
+                    self._record_distributed_prepare_convergence()
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.

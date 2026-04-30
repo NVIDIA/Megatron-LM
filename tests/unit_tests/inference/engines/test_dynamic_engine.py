@@ -30,7 +30,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import AsyncOverlapDebugCounters, EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -181,6 +181,70 @@ class DynamicEngineTestEnv:
 
 
 class TestDynamicInferenceEngine:
+    class _DivergentPrepareCommunicator:
+        async def all_reduce_max(self, *values, async_op=True):
+            del async_op
+            reduced = list(values)
+            # First prepare-metadata max value starts after work/consensus/launches.
+            reduced[3] += 1
+            return tuple(reduced)
+
+    class _FakeRetirementService:
+        def __init__(self):
+            self.max_retirement_backlog = 2
+            self.updated = False
+
+        def _update_backlog_counters(self):
+            self.updated = True
+
+    def _minimal_engine_for_prepare_consensus(self):
+        engine = object.__new__(DynamicInferenceEngine)
+        engine.ep_world_size = 2
+        engine.use_synchronous_zmq_collectives = True
+        engine.expert_parallel_zmq_communicator = self._DivergentPrepareCommunicator()
+        engine._step_nvtx_label = lambda name, step_id=None: name
+        return engine
+
+    def test_ep_consensus_detects_prepare_metadata_divergence(self) -> None:
+        engine = self._minimal_engine_for_prepare_consensus()
+
+        global_work, all_pausing, global_launches, metadata_agrees = asyncio.run(
+            engine._ep_establish_consensus(
+                1,
+                signal_consensus=False,
+                local_launches=1,
+                local_prepare_metadata={"step_id": 7, "queue_depth": 2},
+            )
+        )
+
+        assert global_work == 1
+        assert not all_pausing
+        assert global_launches == 1
+        assert not metadata_agrees
+
+    def test_prepare_divergence_downgrades_after_bounded_retry(self) -> None:
+        engine = object.__new__(DynamicInferenceEngine)
+        engine.async_overlap_queue_depth = 2
+        engine.async_pipeline = types.SimpleNamespace(queue_depth=2)
+        engine.step_retirement_service = self._FakeRetirementService()
+        engine.async_overlap_debug_counters = AsyncOverlapDebugCounters(queue_depth=2)
+        engine._distributed_prepare_mismatch_streak = 0
+        engine._distributed_prepare_reconcile_retry_limit = 1
+
+        engine._handle_distributed_prepare_divergence()
+
+        counters = engine.async_overlap_debug_counters
+        assert engine.async_overlap_queue_depth == 1
+        assert engine.async_pipeline.queue_depth == 1
+        assert engine.step_retirement_service.max_retirement_backlog == 1
+        assert engine.step_retirement_service.updated
+        assert counters.queue_depth == 1
+        assert counters.distributed_consensus_mismatches == 1
+        assert counters.distributed_prepare_reconciliations == 1
+        assert counters.distributed_prepare_downgrades == 1
+        assert counters.fallback_or_queue_depth_one_reasons == {
+            "distributed_prepare_divergence": 1
+        }
 
     @classmethod
     def _build_requests(cls, test_config: DynamicEngineTestConfig) -> List[DynamicInferenceRequest]:

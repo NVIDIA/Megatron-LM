@@ -330,6 +330,12 @@ class StepRetirementService:
             'inference/speculative_rejected_tokens': int(
                 engine.async_overlap_debug_counters.speculative_rejected_tokens
             ),
+            'inference/distributed_prepare_reconciliations': int(
+                engine.async_overlap_debug_counters.distributed_prepare_reconciliations
+            ),
+            'inference/distributed_prepare_downgrades': int(
+                engine.async_overlap_debug_counters.distributed_prepare_downgrades
+            ),
         }
         for key, value in context_state["kv_stats"].items():
             if 'utilization' in key:
