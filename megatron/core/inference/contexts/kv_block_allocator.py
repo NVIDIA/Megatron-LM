@@ -90,19 +90,12 @@ class KVBlockAllocator:
 
     def get_active_used(self):
         """Compute number of active blocks used."""
+        active_count = self.context.total_request_count - self.context.paused_request_count
         if not self.enable_prefix_caching:
-            return (
-                self.context.request_kv_block_counts[
-                    self.context.paused_request_count : self.context.total_request_count
-                ]
-                .sum()
-                .item()
-            )
+            return self.context.request_kv_block_counts[:active_count].sum().item()
 
-        active_start = self.context.paused_request_count
-        active_end = self.context.total_request_count
-        if active_end > active_start:
-            active_rows = self.context.request_to_kv_block_ids[active_start:active_end]
+        if active_count > 0:
+            active_rows = self.context.request_to_kv_block_ids[:active_count]
             valid_ids = active_rows[active_rows >= 0]
             if valid_ids.numel() > 0:
                 return int(torch.unique(valid_ids).numel())
@@ -110,15 +103,13 @@ class KVBlockAllocator:
 
     def get_paused_used(self):
         """Compute number of paused blocks used."""
+        active_count = self.context.total_request_count - self.context.paused_request_count
+        paused_end = self.context.total_request_count
         if not self.enable_prefix_caching:
-            return (
-                self.context.request_kv_block_counts[: self.context.paused_request_count]
-                .sum()
-                .item()
-            )
+            return self.context.request_kv_block_counts[active_count:paused_end].sum().item()
 
         if self.context.paused_request_count > 0:
-            paused_rows = self.context.request_to_kv_block_ids[: self.context.paused_request_count]
+            paused_rows = self.context.request_to_kv_block_ids[active_count:paused_end]
             valid_ids = paused_rows[paused_rows >= 0]
             if valid_ids.numel() > 0:
                 return int(torch.unique(valid_ids).numel())

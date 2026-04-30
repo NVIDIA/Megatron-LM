@@ -596,7 +596,6 @@ class MambaMixer(MegatronModule):
         # Use precomputed metadata (no .item() calls, no stripping).
         cu_seqlens = metadata.cu_seqlens
         batch_indices = metadata.batch_indices_prefill
-        real_token_count = metadata.real_prefill_token_count
         seq_idx = metadata.seq_idx
 
         # Pass full padded tensor — SSM kernel uses cu_chunk_seqlens for
@@ -629,8 +628,6 @@ class MambaMixer(MegatronModule):
             cu_chunk_seqlens=metadata.cu_chunk_seqlens,
             last_chunk_indices=metadata.last_chunk_indices,
             seq_idx_for_varlen=metadata.seq_idx_for_varlen,
-            cu_seqlens_list=metadata.cu_seqlens_list,
-            real_token_count=real_token_count,
             conv_seq_idx=metadata.conv_seq_idx,
             conv_seq_start=metadata.conv_seq_start,
         )
@@ -743,8 +740,6 @@ class MambaMixer(MegatronModule):
         cu_chunk_seqlens: Optional[torch.Tensor] = None,
         last_chunk_indices: Optional[torch.Tensor] = None,
         seq_idx_for_varlen: Optional[torch.Tensor] = None,
-        cu_seqlens_list: Optional[List[int]] = None,
-        real_token_count: Optional[int] = None,
         conv_seq_idx: Optional[torch.Tensor] = None,
         conv_seq_start: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -773,8 +768,6 @@ class MambaMixer(MegatronModule):
             cu_chunk_seqlens: Precomputed chunk boundaries from MambaMetadata.
             last_chunk_indices: Precomputed last chunk index per sequence.
             seq_idx_for_varlen: Precomputed request ID per chunk.
-            cu_seqlens_list: Python list of cumulative sequence lengths (avoids .item()).
-            real_token_count: Number of real (non-padding) tokens.
             conv_seq_idx: Precomputed per-token request ID for Triton conv1d.
             conv_seq_start: Precomputed per-token request start for Triton conv1d.
 
