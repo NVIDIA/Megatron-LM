@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -206,36 +206,6 @@ class ContextErrorFactory:
         return error
 
 
-class UpdateRequestsSyncedCounters(NamedTuple):
-    """Typed view of the once-per-step ``_ur.combined_sync`` GPU->CPU copy.
-
-    Construct via :meth:`from_buffer` immediately after the ``.cpu().tolist()``.
-    Field order matches the index constants
-    ``DynamicInferenceContext._SYNC_*``; if those constants change, update
-    :meth:`from_buffer` so it stays in sync — the buffer slot order is the
-    only place this layout is asserted.
-    """
-
-    bucket0: int      # bucket_counts[0] (continuing)
-    bucket1: int      # bucket_counts[1] (chunked)
-    bucket2: int      # bucket_counts[2] (stayed-paused)
-    bucket3: int      # bucket_counts[3] (newly paused)
-    resume1: int      # resume_count from graph-1 resume
-    resume2: int      # resume_count from graph-2 resume
-    active_final: int  # new_active after evict+resume
-    total_final: int   # new_total after evict+resume+chunked
-    total_avail: int   # kv_block_allocator.total_avail_gpu
-    mamba_free: int    # mamba free slot count
-    evict_count: int   # eviction count
-
-    @classmethod
-    def from_buffer(cls, sv: List[int]) -> "UpdateRequestsSyncedCounters":
-        """Wrap the int list returned by ``_ur.combined_sync.cpu().tolist()``."""
-        # INVARIANT: positional construction; argument order must match the
-        # _SYNC_* constants.
-        return cls(*sv)
-
-
 class UpdateRequestsScratch:
     """Static GPU scratch tensors and constants for the graphed update_requests path.
 
@@ -252,7 +222,6 @@ class UpdateRequestsScratch:
         num_speculative_tokens: int,
         max_release_per_step: int,
         kv_dummy_block_idx: int,
-        sync_size: int,
         is_hybrid_model: bool,
     ):
         device = torch.cuda.current_device()
@@ -374,9 +343,15 @@ class UpdateRequestsScratch:
             max_requests, dtype=torch.int64, device=device
         )
 
-        # Combined sync buffer for the graph, read in a single .cpu().
-        # Named offsets (DynamicInferenceContext._SYNC_*) index into it.
-        self.combined_sync = torch.zeros(sync_size, dtype=torch.int64, device=device)
+        # Resume counts captured by graph 1 and graph 2 respectively.
+        # ``resume_count_gpu`` is overwritten by each graph's resume body, so
+        # graph 1 copies its post-resume value here before graph 2 runs;
+        # ``_gpu_finalize_outputs`` reads both as inputs to the GPU survivor
+        # formula. They used to be slots inside a larger ``combined_sync``
+        # buffer that fed an 11-int .cpu().tolist() in finalize — that sync
+        # is gone, so the buffer is reduced to just these two scalars.
+        self.resume1_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+        self.resume2_gpu = torch.zeros(1, dtype=torch.int64, device=device)
 
 
 def get_mem_size_str(n_bytes: int) -> str:
@@ -415,23 +390,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
-
-    # Named offsets into ``_ur.combined_sync`` (the single GPU->CPU sync
-    # buffer read once per ``update_requests`` call).
-    # Graph 1 outputs:
-    _SYNC_BUCKET0 = 0  # bucket_counts[0] (continuing)
-    _SYNC_BUCKET1 = 1  # bucket_counts[1] (chunked)
-    _SYNC_BUCKET2 = 2  # bucket_counts[2] (stayed-paused)
-    _SYNC_BUCKET3 = 3  # bucket_counts[3] (newly paused)
-    _SYNC_RESUME1 = 4  # resume_count from graph-1 resume
-    # Graph 2 outputs:
-    _SYNC_RESUME2 = 5  # resume_count from graph-2 resume
-    _SYNC_ACTIVE_FINAL = 6  # new_active after evict+resume
-    _SYNC_TOTAL_FINAL = 7  # new_total after evict+resume+chunked
-    _SYNC_TOTAL_AVAIL = 8  # kv_block_allocator.total_avail_gpu
-    _SYNC_MAMBA_FREE = 9  # mamba free slot count
-    _SYNC_EVICT_COUNT = 10  # eviction count
-    _SYNC_SIZE = 11
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -1075,6 +1033,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # steps) and ``prepare_attn_init`` (start of step) both want fresh
         # mirrors but only one of them needs to do the actual D2H.
         self._counters_stale = False
+
+        # Latest finalize-step output counts, populated by ``sync_counters_to_cpu``
+        # alongside the mirror counts. ``_finalize_update_requests`` reads these
+        # to size the ``newly_paused_request_ids`` / ``evict_request_ids``
+        # clones it returns to the engine — folding what used to be a separate
+        # 2-int finalize sync into the existing mirror sync.
+        self._last_final_newly_paused = 0
+        self._last_evict_count = 0
 
         # Pre-allocated index tensors for graphable ops (static addresses).
         self._arange_requests = torch.arange(
@@ -2991,7 +2957,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_speculative_tokens=self.num_speculative_tokens,
             max_release_per_step=self.kv_block_allocator.max_release_per_step,
             kv_dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
-            sync_size=self._SYNC_SIZE,
             is_hybrid_model=self.is_hybrid_model,
         )
 
@@ -3447,18 +3412,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._classify_and_resume_body()
         self._evict_resume_chunked_tokens_body()
-        result = self._finalize_update_requests(has_chunked)
-
-        # Refresh CPU mirrors before returning. Test/eager callers expect
-        # ``self.total_request_count`` etc. to reflect post-step state on
-        # return; without this, the staleness flag from finalize would
-        # leave mirrors stale until the next ``has_unfinished_requests``
-        # or ``prepare_attn_init`` call. Production callers (the controller's
-        # ``_run_update_requests``) skip this entry point — the engine's
-        # ``has_unfinished_requests`` does the equivalent sync between steps.
-        self.sync_counters_to_cpu()
-
-        return result
+        # ``_finalize_update_requests`` calls ``sync_counters_to_cpu`` itself
+        # to read the slice counts for the engine return values, so by the
+        # time it returns, both the CPU mirrors and the convenience views
+        # (``self.paused_tokens`` etc.) are already up to date for
+        # test/eager callers.
+        return self._finalize_update_requests(has_chunked)
 
     def _prepare_update_requests_metadata(self) -> None:
         """Pre-forward prep: work that depends only on previous-step state.
@@ -3662,11 +3621,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _classify_and_resume_body(self) -> Tensor:
         """Graph body 1: classify, permute, release finished, resume.
 
-        Returns ``_ur.combined_sync`` so ``CudaGraphManager`` has a tensor
+        Returns ``_ur.resume1_gpu`` so ``CudaGraphManager`` has a tensor
         to register as the captured graph's output. Callers ignore the
         return value; the actual outputs are the in-place writes to
-        bookkeeping tensors and the bucket/resume slots of
-        ``_ur.combined_sync``.
+        bookkeeping tensors plus the resume-count snapshot in
+        ``_ur.resume1_gpu`` (read by ``_gpu_finalize_outputs``).
         """
         slot_idx = self._ur.arange_long
         max_req = self.max_requests
@@ -3693,16 +3652,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._capture_newly_paused_ids(slot_idx)
         self._graphed_resume_body()
 
-        # Stage graph-1 outputs into the combined sync buffer.
-        S = DynamicInferenceContext
-        self._ur.combined_sync[S._SYNC_BUCKET0 : S._SYNC_BUCKET3 + 1].copy_(
-            self._ur.bucket_counts[:4]
-        )
-        self._ur.combined_sync[S._SYNC_RESUME1 : S._SYNC_RESUME1 + 1].copy_(
-            self._ur.resume_count_gpu
-        )
+        # Snapshot graph 1's resume count before graph 2 overwrites
+        # ``resume_count_gpu`` with its own resume's value. Read by
+        # ``_gpu_finalize_outputs`` as input to the survivor formula.
+        self._ur.resume1_gpu.copy_(self._ur.resume_count_gpu)
 
-        return self._ur.combined_sync
+        return self._ur.resume1_gpu
 
     def _writeback_request_offsets(
         self,
@@ -3828,31 +3783,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx[:max_tok].copy_(block_idx_2d.reshape(-1))
 
     def _write_phase2_sync_outputs(self) -> None:
-        """Pack the graph-2 outputs into the combined sync buffer.
+        """Snapshot graph 2's resume count for the survivor formula.
 
-        Slots written here are read alongside graph 1's outputs by the single
-        ``.cpu()`` in ``_finalize_update_requests``.
+        Mirrors graph 1's ``resume1_gpu`` capture. Other graph 2 outputs
+        (``new_active_gpu``, ``new_total_gpu``, ``total_avail_gpu``, the
+        Mamba free-slot count, ``evict_count_gpu``) are read directly from
+        their primary tensors by the host-side finalize and by
+        ``sync_counters_to_cpu``, so they don't need a separate snapshot.
         """
-        S = DynamicInferenceContext
-        self._ur.combined_sync[S._SYNC_RESUME2 : S._SYNC_RESUME2 + 1].copy_(
-            self._ur.resume_count_gpu
-        )
-        self._ur.combined_sync[S._SYNC_ACTIVE_FINAL : S._SYNC_ACTIVE_FINAL + 1].copy_(
-            self._ur.new_active_gpu
-        )
-        self._ur.combined_sync[S._SYNC_TOTAL_FINAL : S._SYNC_TOTAL_FINAL + 1].copy_(
-            self._ur.new_total_gpu
-        )
-        self._ur.combined_sync[S._SYNC_TOTAL_AVAIL : S._SYNC_TOTAL_AVAIL + 1].copy_(
-            self.kv_block_allocator.total_avail_gpu.to(torch.int64)
-        )
-        if self.is_hybrid_model:
-            self._ur.combined_sync[S._SYNC_MAMBA_FREE : S._SYNC_MAMBA_FREE + 1].copy_(
-                self.mamba_metadata._free_slot_count_gpu.to(torch.int64)
-            )
-        self._ur.combined_sync[S._SYNC_EVICT_COUNT : S._SYNC_EVICT_COUNT + 1].copy_(
-            self._ur.evict_count_gpu
-        )
+        self._ur.resume2_gpu.copy_(self._ur.resume_count_gpu)
 
     def _writeback_gpu_count_mirrors(self) -> None:
         """Refresh the bridge GPU scalars consumed by the next step.
@@ -3874,15 +3813,15 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _evict_resume_chunked_tokens_body(self) -> Tensor:
         """Graph body 2: evict, resume, chunked positioning, token bookkeeping.
 
-        Returns ``_ur.combined_sync`` so ``CudaGraphManager`` has a tensor
+        Returns ``_ur.resume2_gpu`` so ``CudaGraphManager`` has a tensor
         to register as the captured graph's output (same reason as
         :meth:`_classify_and_resume_body`).
 
-        # INVARIANT: graph 1 (`_classify_and_resume_body`) must run before this
-        # graph 2; graph 1 writes BUCKET*/RESUME1 into `_ur.combined_sync`,
-        # and this body writes RESUME2/ACTIVE_FINAL/TOTAL_FINAL/etc. into
-        # different slots. The single `.cpu()` in `_finalize_update_requests`
-        # reads everything — re-ordering the bodies invalidates the buffer.
+        # INVARIANT: graph 1 (`_classify_and_resume_body`) must run before
+        # this graph 2; graph 1 writes ``_ur.resume1_gpu`` and this body
+        # writes ``_ur.resume2_gpu``. ``_gpu_finalize_outputs`` reads both
+        # as inputs to the survivor formula, so re-ordering or sharing a
+        # single resume buffer would lose graph 1's value.
         """
         self._graphed_eviction_body()
         self._graphed_resume_body()
@@ -3907,28 +3846,36 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._write_phase2_sync_outputs()
         self._writeback_gpu_count_mirrors()
 
-        return self._ur.combined_sync
+        return self._ur.resume2_gpu
 
     def sync_counters_to_cpu(self) -> None:
         """Refresh CPU counter mirrors from the GPU bridge scalars (one D2H).
 
-        The graphed ``update_requests`` body keeps the bridge GPU scalars
-        (``_real_request_count_gpu``, ``_total_request_count_gpu``,
-        ``_real_token_count_gpu``, the allocator's ``total_avail_gpu``, and
-        the Mamba ``_free_slot_count_gpu``) authoritative via
-        ``_writeback_gpu_count_mirrors``. The corresponding CPU mirrors used
-        by host-side consumers — ``prepare_attn_init`` for cuda-graph
-        dimension matching, ``add_request`` for slot accounting, and various
-        legacy hot-loop slicing — are intentionally left stale by
-        ``_finalize_update_requests`` so the bookkeeping graphs don't have to
-        block on a host transfer.
+        Reads, in a single batched ``.cpu()``:
 
-        Callers invoke this method to do a deferred refresh: a single
-        batched D2H reads every counter the host needs and writes the
-        corresponding mirror. Idempotent — safe to call back-to-back. Skips
-        the D2H entirely when ``_counters_stale`` is False, which dedups the
-        engine-loop pair (``has_unfinished_requests`` then
-        ``prepare_attn_init``) into a single transfer per step.
+        - The bridge mirrors (``_real_request_count_gpu``,
+          ``_total_request_count_gpu``, ``_real_token_count_gpu``,
+          ``kv_block_allocator.total_avail_gpu``, and on hybrid models
+          ``mamba_metadata._free_slot_count_gpu``) — these populate the
+          per-context CPU mirror counts that hot-loop callers (graph
+          dimension matching in ``prepare_attn_init``, slot accounting in
+          ``add_request``, host-side slicing) read.
+        - The latest finalize outputs (``_ur.final_newly_paused_gpu``,
+          ``_ur.evict_count_gpu``) — stashed on
+          ``self._last_final_newly_paused`` / ``self._last_evict_count``
+          so ``_finalize_update_requests`` can size its return-value clones
+          without a separate D2H. When this method is called from
+          contexts other than finalize (e.g. ``add_request``), the stashed
+          values are simply ignored; reading them adds two int32 to the
+          transfer, which is negligible.
+
+        Idempotent: returns immediately when ``_counters_stale`` is
+        False. The flag is set True only by ``_finalize_update_requests``
+        (after graph 2 advances the bridge scalars without touching the
+        mirrors), and is cleared here. That dedups the trio
+        ``finalize → has_unfinished_requests → prepare_attn_init`` into
+        a single D2H per step: whichever runs first does the transfer
+        and clears the flag, the rest short-circuit.
         """
         if not self._counters_stale:
             return
@@ -3946,6 +3893,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             parts.append(self.mamba_metadata._free_slot_count_gpu.view(()))
 
+        # Finalize outputs (int64 GPU scalars) — cast to int32 to share the
+        # stack with the int32 mirrors. Counts fit in int32 (max_requests is
+        # tiny relative to int32 range).
+        ur = self._ur
+        finalize_offset = len(parts)
+        parts.append(ur.final_newly_paused_gpu.view(()).to(torch.int32))
+        parts.append(ur.evict_count_gpu.view(()).to(torch.int32))
+
         vals = torch.stack(parts).cpu().tolist()
         active = int(vals[0])
         self.total_request_count = int(vals[1])
@@ -3954,6 +3909,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.total_avail = int(vals[3])
         if self.is_hybrid_model:
             self.mamba_metadata.mamba_state_free_slot_count = int(vals[4])
+
+        # Stash finalize counts for ``_finalize_update_requests`` to read
+        # without issuing its own D2H.
+        self._last_final_newly_paused = int(vals[finalize_offset])
+        self._last_evict_count = int(vals[finalize_offset + 1])
 
         # Refresh the paused-tokens convenience views. Callers that read
         # ``ctx.paused_tokens`` (mostly tests) expect these to mirror the
@@ -3985,9 +3945,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         copy, and a special empty-batch reset branch. After this rewrite:
 
         - Survivor formula runs on GPU using ``bucket_counts``,
-          ``resume_count_gpu`` (read from ``_ur.combined_sync``), and
-          ``evict_count_gpu``. Output: ``final_newly_paused_gpu`` and the
-          GPU-resident ``survivor_start``.
+          the ``resume1_gpu`` / ``resume2_gpu`` snapshots written by the
+          two graph bodies, and ``evict_count_gpu``. Output:
+          ``final_newly_paused_gpu`` and the GPU-resident ``survivor_start``.
         - Survivor newly-paused IDs are scatter-gathered into a separate
           ``newly_paused_ids_post_buf`` with ``-1`` sentinels for the
           tail. This buffer is the engine-facing one; the original
@@ -4012,9 +3972,11 @@ class DynamicInferenceContext(BaseInferenceContext):
           drain's internal ``_pc_pending_dereg_count.item()`` then
           short-circuits without doing real work.
 
-        The remaining D2H is a 2-int stack-and-cpu for
-        ``final_newly_paused`` and ``evict_count`` — required because the
-        engine API expects a sized clone of each.
+        The remaining D2H is folded into ``sync_counters_to_cpu``: the
+        finalize counts ride along in the same ``.cpu()`` that refreshes
+        the CPU mirrors, so the steady-state cost is one transfer per
+        step (the one that previously belonged to ``has_unfinished_requests``
+        between steps).
         """
         # Graph 2's ``_writeback_gpu_count_mirrors`` already advanced the GPU
         # bridge scalars beyond the CPU mirrors; mark the mirrors stale so
@@ -4038,20 +4000,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.kv_block_allocator._pc_dereg_may_have_events = True
         self.kv_block_allocator.drain_pending_dereg()
 
-        # The engine API returns sliced+cloned tensors sized to the actual
-        # count; sync the two counts in a single transfer.
-        counts = (
-            torch.stack(
-                [
-                    self._ur.final_newly_paused_gpu.view(()),
-                    self._ur.evict_count_gpu.view(()),
-                ]
-            )
-            .cpu()
-            .tolist()
-        )
-        final_newly_paused = int(counts[0])
-        evict_count = int(counts[1])
+        # Single combined D2H: refreshes CPU mirrors AND stashes the
+        # finalize counts (``_last_final_newly_paused`` / ``_last_evict_count``)
+        # used to size the engine-facing clones below. The next
+        # ``has_unfinished_requests`` → ``prepare_attn_init`` pair sees
+        # ``_counters_stale = False`` and skips its own sync, so this is
+        # the only transfer per step.
+        self.sync_counters_to_cpu()
+        final_newly_paused = self._last_final_newly_paused
+        evict_count = self._last_evict_count
 
         newly_paused_request_ids = None
         if final_newly_paused > 0:
@@ -4084,15 +4041,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         recover the surviving slice — a naive ``bucket3 - (resume1 +
         resume2)`` undercounts whenever bucket2 absorbed some resume.
         """
-        S = DynamicInferenceContext
-
         # Survivor formula. Mirror of the old host-side max/min/clamp
         # expressions, lifted to GPU int64 arithmetic.
         bucket = self._ur.bucket_counts  # (5,) int64
         bucket2 = bucket[2:3]
         bucket3 = bucket[3:4]
-        resume1 = self._ur.combined_sync[S._SYNC_RESUME1 : S._SYNC_RESUME1 + 1]
-        resume2 = self._ur.combined_sync[S._SYNC_RESUME2 : S._SYNC_RESUME2 + 1]
+        resume1 = self._ur.resume1_gpu
+        resume2 = self._ur.resume2_gpu
         evict_count = self._ur.evict_count_gpu
 
         left_eaten_by_r1 = (resume1 - bucket2).clamp(min=0)
