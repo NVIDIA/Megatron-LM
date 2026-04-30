@@ -2,7 +2,7 @@
 
 from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
@@ -297,6 +297,9 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
+    sampling_backend: Literal['torch', 'flashinfer'] = 'flashinfer'
+    """Which sampling kernels to use during inference."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
@@ -320,3 +323,12 @@ class InferenceConfig:
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+
+        if self.sampling_backend == 'flashinfer':
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "sampling_backend='flashinfer' requires the flashinfer package; "
+                    "install it or set sampling_backend='torch'."
+                ) from e

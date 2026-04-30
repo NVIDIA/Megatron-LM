@@ -151,6 +151,7 @@ class TestMTPCudaGraphInference:
                 block_size_tokens=256,
                 max_requests=max_requests,
                 num_cuda_graphs=-1,
+                sampling_backend='torch',
             ),
         )
         wrapped = GPTInferenceWrapper(model, context)
@@ -418,10 +419,10 @@ class TestMTPCudaGraphInference:
             ctrl._mtp_resolved_padded_count = padded_count
             context._using_cuda_graph_this_step = True
 
-            ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
-            ctrl._torch_sampling_bucket_index_tensors = [
-                torch.arange(active_request_count, device='cuda', dtype=torch.long)
-            ]
+            # Greedy sampling for all active requests.
+            context.active_request_metadata["temperature"][:active_request_count] = 1.0
+            context.active_request_metadata["top_k"][:active_request_count] = 1
+            context.active_request_metadata["top_p"][:active_request_count] = 0.0
 
             ctrl._compute_serial_mtp_and_sample()
 
@@ -519,10 +520,10 @@ class TestMTPCudaGraphInference:
                 unwrapped._decoder_hidden_states_cache = local_hidden
 
                 ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
-                ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
-                ctrl._torch_sampling_bucket_index_tensors = [
-                    torch.arange(active_request_count, device='cuda', dtype=torch.long)
-                ]
+                # Greedy sampling for all active requests.
+                context.active_request_metadata["temperature"][:active_request_count] = 1.0
+                context.active_request_metadata["top_k"][:active_request_count] = 1
+                context.active_request_metadata["top_p"][:active_request_count] = 0.0
 
                 ctrl._compute_serial_mtp_and_sample()
 
@@ -788,6 +789,7 @@ class TestMTPCudaGraphExpertParallel:
                 num_cuda_graphs=num_cuda_graphs,
                 use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
                 max_requests=max_requests,
+                sampling_backend='torch',
             ),
         )
 
