@@ -244,12 +244,6 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
-    use_head_wise_attn_gate: bool = False
-    """Apply a per-head scalar output gate (e.g., Step-3.5-Flash g_proj).
-    Adds a separate ColumnParallelLinear(hidden_size → num_attention_heads) whose
-    sigmoid output gates each attention head independently. Distinct from
-    attention_output_gate which fuses a full head_dim gate into linear_qkv."""
-
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;

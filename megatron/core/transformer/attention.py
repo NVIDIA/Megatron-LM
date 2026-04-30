@@ -1371,13 +1371,10 @@ class Attention(MegatronModule, ABC):
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
 
-        # Output gate (attention_output_gate: full head_dim gate fused into QKV)
+        # Output gate
         if gate is not None:
             nvtx_range_push(suffix="output_gate")
-            if self.config.use_head_wise_attn_gate:
-                core_attn_out = self._apply_output_gate_per_head(core_attn_out, gate)
-            else:
-                core_attn_out = self._apply_output_gate(core_attn_out, gate)
+            core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
         # =================
@@ -1392,16 +1389,6 @@ class Attention(MegatronModule, ABC):
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
-
-    @jit_fuser
-    def _apply_output_gate_per_head(self, x, gate):
-        x_dtype = x.dtype
-        gate = gate.view(*gate.shape[:2], -1, 1)  # [sq, b, np, 1]
-        x = x.view(*gate.shape[:3], -1)  # [sq, b, np, hn]
-        x = x * torch.sigmoid(gate.float()).to(x.dtype)
-        x = x.view(*gate.shape[:2], -1)  # [sq, b, np*hn]
-        x = x.to(x_dtype)
-        return x
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):
