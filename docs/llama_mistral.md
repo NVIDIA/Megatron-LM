@@ -48,7 +48,6 @@ Architecturally Llama-2, Llama-3 and Mistral-7b are very similar. As such Megatr
   - [Launch model](#launch-model)
 - [Other Llama-like model support](#other-llama-like-model-support)
 - [Known numerical differences](#known-numerical-differences)
-- [Using legacy model format](#using-legacy-model-format)
 
 # Llama-2
 
@@ -143,8 +142,6 @@ If loading for either inference or finetuning, use the following arguments:
 --no-masked-softmax-fusion \
 --attention-softmax-in-fp32
 ```
-
-**Note:** If you converted to the legacy model format (i.e., `--saver legacy`), please see [here](#using-legacy-model-format).
 
 ### Launch Meta
 
@@ -345,8 +342,6 @@ For Llama3.1 please use the following arguments:
 --bf16 \
 ```
 
-**Note:** If you converted to the legacy model format (i.e., `--saver legacy`), please see [here](#using-legacy-model-format).
-
 # Mistral-7b
 
 Megatron currently supports loading the v0.3 release of Mistral-7b (which does not use sliding window attention and offers a larger 32768 vocabulary) for inference and finetuning. Loading these checkpoints consists of several steps:
@@ -424,8 +419,6 @@ If loading for either inference or finetuning, use the following arguments:
 --num-attention-heads 32
 ```
 
-**Note:** If you converted to the legacy model format (i.e., `--saver legacy`), please see [here](#using-legacy-model-format).
-
 # Other Llama-like model support
 
 *Note: Experimental*
@@ -438,15 +431,3 @@ It is not expected that the megatron and Huggingface implementations of llama3.x
 
 1. TransformerEngine (TE) uses the model params_dtype inside RMSNorm whereas the Huggingface implementation uses fp32. See for details: <https://github.com/NVIDIA/TransformerEngine/issues/1132>
 2. Huggingface `transformers` implements the q, k and v projections in self-attention as separate GEMMs whereas Megatron core combines them into a single GEMM for efficiency. This leads to small numerical differences.
-
-# Using legacy model format
-
-In all the checkpoint conversion examples used in this document, the saver format `--saver core` is used, signifying that the newer (and recommended) Megatron GPT model class will be used. I.e.:
-
-- old class: `megatron.legacy.model.gpt_model.GPTModel`
-- new class: `megatron.core.models.gpt.gpt_model.GPTModel`
-
-Using this new format is the recommended approach. However, if your use case requires using the older class (i.e., convert using `--saver legacy`), then when launching training or finetuning, the following args must be added:
-
-- `--use-legacy-models`: use the older model class
-- `--ckpt-format torch`: use the `torch` checkpoint format, which is the only checkpoint format that is compatible with the legacy model format
