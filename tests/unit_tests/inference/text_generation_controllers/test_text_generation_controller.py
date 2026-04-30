@@ -358,9 +358,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # our constraint reduces to top_k alone.
         start_idx = torch.clamp(self.vocab_size - top_k_values, min=0).long()
         first_excluded = torch.where(
-            top_p_mask.any(dim=-1),
-            top_p_mask.float().argmax(dim=-1),
-            start_idx + 1,
+            top_p_mask.any(dim=-1), top_p_mask.float().argmax(dim=-1), start_idx + 1
         )
         last_included = torch.clamp(first_excluded - 1, min=0)
         last_included = torch.max(last_included, start_idx)
