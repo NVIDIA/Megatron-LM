@@ -31,6 +31,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.engines.admission_gate import StepBoundaryAdmissionGate
 from megatron.core.inference.engines.retirement import StepRetirementService
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -356,6 +357,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # v3 plan §commit 18 — async-overlap pipeline. Default off until
         # commit 30 flips ``enable_async_overlap``.
         self.async_pipeline = DynamicAsyncPipeline(self)
+        # v3 plan §commit 29 — step-boundary admission gate. The DP
+        # coordinator publishes admission sets per step; the engine waits
+        # on them at the step boundary so cross-rank divergence is
+        # prevented rather than detected.
+        self.admission_gate = StepBoundaryAdmissionGate()
 
         # Set callback for getting stop word finished request IDs
         self.controller.set_stop_word_finished_ids_callback(
