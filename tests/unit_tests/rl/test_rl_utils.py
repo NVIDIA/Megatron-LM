@@ -593,6 +593,7 @@ class TestRLUtils:
     )
     def test_optimizer_offload(self, initialize_model_parallel):
         """Test that optimizer offload_to_cpu/restore_from_cpu correctly moves state to/from CPU."""
+        pytest.importorskip("torch_memory_saver")
         world_size, dp, tp, pp = initialize_model_parallel
         self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
         model_parallel_cuda_manual_seed(123)
@@ -621,7 +622,10 @@ class TestRLUtils:
 
         # Create optimizer
         optimizer_config = OptimizerConfig(
-            optimizer='adam', bf16=True, use_distributed_optimizer=True
+            optimizer='adam',
+            bf16=True,
+            use_distributed_optimizer=True,
+            rl_offload_optimizer_during_inference=True,
         )
         optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
 
