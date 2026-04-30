@@ -211,8 +211,6 @@ class FlextronModelManager:
             moe_router_topk=self.config.moe_router_topk,
         )
 
-        current_param_all = current_param_all
-        current_param_active = current_param_active
 
         if self.config.budget_type == 'param':
             if self.memory_config.param_budget_target == 'active':

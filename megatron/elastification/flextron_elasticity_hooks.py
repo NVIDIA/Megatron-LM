@@ -706,16 +706,7 @@ def topk_softmax_with_capacity(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    if score_function == "softmax":
-        if use_pre_softmax:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        else:
-            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
-            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
-    elif score_function == "sigmoid":
-        # logits[:, 96:] = float('-inf')
-        # expert_bias[96:] = 0
+    if score_function == "sigmoid":
         scores_for_routing = 0
         scores_for_topk = 0
         for router_moe_expert_logits, router_moe_expert_per in zip(
