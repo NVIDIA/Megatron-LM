@@ -474,7 +474,6 @@ def _load_checkpoint(queue, args):
 
     margs = validate_args(margs)
 
-    margs.use_legacy_models = True
     margs.transformer_impl = args.loader_transformer_impl
 
     margs.position_embedding_type = "rope"

@@ -203,10 +203,6 @@ def modelopt_gpt_hybrid_builder(
 
     if vp_stage is not None:
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
-    if args.use_legacy_models:
-        raise ValueError(
-            "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
-        )
     if args.spec is not None:
         raise ValueError("ModelOpt integration does not support custom args.spec.")
 

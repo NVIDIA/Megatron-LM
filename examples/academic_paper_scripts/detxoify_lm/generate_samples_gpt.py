@@ -28,8 +28,6 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 def model_provider(pre_process=True, post_process=True) -> GPTModel:
     """Builds the model.
 
-    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the core GPT model.
-
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
