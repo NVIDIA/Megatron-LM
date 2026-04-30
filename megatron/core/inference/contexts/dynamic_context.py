@@ -1097,7 +1097,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             dim=0,
             out=self.active_request_last_token_idxs[:batch_size],
         )
-        self.active_request_last_token_idxs[:batch_size] -= 1
+        self.active_request_last_token_idxs[:batch_size].sub_(1)
 
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
@@ -1981,8 +1981,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     def padded_num_last_token_logits(self) -> int:
         """Graph-invariant padded version of `num_last_token_logits`."""
         if self.num_speculative_tokens > 0:
-            pbd = self.padded_batch_dimensions
-            return pbd.decode_req_count * (self.num_speculative_tokens + 1) + pbd.prefill_req_count
+            return (
+                self.padded_batch_dimensions.decode_req_count * (self.num_speculative_tokens + 1)
+                + self.padded_batch_dimensions.prefill_req_count
+            )
         return self.padded_active_request_count
 
     def last_token_logits(self, logits: Tensor) -> Tensor:

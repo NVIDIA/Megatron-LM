@@ -1124,9 +1124,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 continue
 
             # Generated log probs must align 1:1 with generated tokens.
-            assert request.generated_log_probs is not None, (
-                f"Request {request.request_id}: generated_log_probs should not be None"
-            )
+            assert (
+                request.generated_log_probs is not None
+            ), f"Request {request.request_id}: generated_log_probs should not be None"
             assert len(request.generated_log_probs) == len(request.generated_tokens), (
                 f"Request {request.request_id}: expected "
                 f"{len(request.generated_tokens)} generated log probs, "
@@ -1143,8 +1143,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     f"token_id {token_id} out of range [0, {env.config.vocab_size})"
                 )
                 assert not math.isnan(log_prob) and not math.isinf(log_prob), (
-                    f"Request {request.request_id}, token {i}: "
-                    f"log_prob {log_prob} is NaN/inf"
+                    f"Request {request.request_id}, token {i}: " f"log_prob {log_prob} is NaN/inf"
                 )
                 assert -100.0 <= log_prob <= 0.0, (
                     f"Request {request.request_id}, token {i}: "

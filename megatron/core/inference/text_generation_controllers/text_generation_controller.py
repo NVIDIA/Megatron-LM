@@ -1247,8 +1247,11 @@ class TextGenerationController:
     def _dynamic_step_log_probs_indexing(self):
         """Conditionally launch log-prob indexing kernels on the bookkeeping stream."""
         # CPU-side sync: must read pinned count before deciding whether to launch.
+        # `top_n > 0 implies return_log_probs=True` is enforced at request-add
+        # time (see DynamicInferenceEngine.add_request), so checking
+        # log_prob_count alone covers the top-n case too.
         self._pre_init_bookkeeping_event.synchronize()
-        if self._log_prob_count_pinned.item() == 0 and self._top_n_max_pinned.item() == 0:
+        if self._log_prob_count_pinned.item() == 0:
             return
 
         context = self.inference_wrapped_model.inference_context
@@ -1265,7 +1268,7 @@ class TextGenerationController:
 
     def _dynamic_step_log_probs_softmax(self):
         """Conditionally launch the speculative softmax kernel on the bookkeeping stream."""
-        if self._log_prob_count_pinned.item() == 0 and self._top_n_max_pinned.item() == 0:
+        if self._log_prob_count_pinned.item() == 0:
             return
 
         context = self.inference_wrapped_model.inference_context
@@ -1342,7 +1345,7 @@ class TextGenerationController:
         """Calculate log probs from logits."""
         log_prob_request_count = self._log_prob_count_pinned.item()
         top_n_max = self._top_n_max_pinned.item()
-        if log_prob_request_count == 0 and top_n_max == 0:
+        if log_prob_request_count == 0:
             return None
 
         context = self.inference_wrapped_model.inference_context

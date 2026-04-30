@@ -59,16 +59,21 @@ class LogProbsDecode:
 
         Args:
             context: The active DynamicInferenceContext.
+            eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
             padded (request_indices, padded_arange)
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
+        # Pick rows whose request asked for log probs.
+        # nonzero_static keeps the output shape fixed (= padded_count) for graph capture;
+        # trailing entries past log_prob_request_count are sliced off later, during extract.
         padded_count = context.padded_active_request_count
         request_indices = torch.nonzero_static(
             context.active_request_metadata["return_log_probs"][:padded_count], size=padded_count
         ).squeeze(1)
+        # Row range over the gather space; used by softmax_kernel to address per-row sampled tokens.
         padded_arange = torch.arange(padded_count, device=request_indices.device)
         return request_indices, padded_arange
 
@@ -89,14 +94,18 @@ class LogProbsDecode:
             new_tokens: shape [total_active_requests]
             request_indices: shape [padded_active_requests]
             padded_arange: shape [padded_active_requests]
+            eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
             (selected_log_probs, lse)
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
+        # Gather only the rows we need; the same indices select the matching sampled token per row.
         selected_tokens = new_tokens[request_indices]
         selected_logits = logits.squeeze(0)[request_indices].float()
+        # LSE trick: log_prob(t) = logit(t) - logsumexp(logits).
+        # Avoids materializing a full [padded, V] log_softmax tensor.
         lse = torch.logsumexp(selected_logits, dim=-1)
         selected_log_probs = selected_logits[padded_arange, selected_tokens] - lse
         return selected_log_probs, lse
@@ -125,14 +134,18 @@ class LogProbsDecode:
         Returns:
             (per_request_log_probs, top_n_dict) tuple.
         """
+        # Single D2H per tensor; trailing entries past log_prob_request_count are filler.
         req_idx_list = request_indices[:log_prob_request_count].tolist()
         lp_list = selected_log_probs[:log_prob_request_count].tolist()
+        # Pre-fill with None; only requests that asked for log probs are populated.
         result: List[Optional[List[float]]] = [None] * active_request_count
         for i, req_idx in enumerate(req_idx_list):
             result[req_idx] = [lp_list[i]]
 
         top_n_dict: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]] = None
         if top_n_values is not None and top_n_indices is not None:
+            # Top-n was computed at top_n_max columns for every requesting row;
+            # per-request top_n_per_req[i] tells us how many to actually return.
             top_n_v_cpu = top_n_values[:log_prob_request_count].cpu()
             top_n_i_cpu = top_n_indices[:log_prob_request_count].cpu()
             top_n_per_req: List[int] = context.active_request_metadata["top_n_logprobs"][
@@ -146,10 +159,13 @@ class LogProbsDecode:
             top_n_dict = built or None
         return result, top_n_dict
 
-    # -- public API --
-
     def indexing(self, context, *, eager: bool = False) -> None:
-        """Run indexing kernel with optional CUDA graph capture/replay."""
+        """Run indexing kernel with optional CUDA graph capture/replay.
+
+        Args:
+            context: The active DynamicInferenceContext.
+            eager (bool): If True, skip CUDA graph capture/replay for the kernels.
+        """
         key = ("decode_idx", context.padded_batch_dimensions)
         self._ri, self._padded_arange = self.indexing_kernel(context, eager=eager, cache_key=key)
 
@@ -176,6 +192,8 @@ class LogProbsDecode:
         Returns:
             A callable that returns (per_request_log_probs, top_n_dict).
         """
+        # Indices were stashed by the earlier `indexing` call.
+        # Run softmax on the main stream (graph-captured under a per-shape key).
         ri, padded_arange = self._ri, self._padded_arange
         key = ("decode_sm", context.padded_batch_dimensions)
         slp, lse = self.softmax_kernel(
@@ -184,19 +202,27 @@ class LogProbsDecode:
 
         top_n_v = top_n_i = None
         if top_n_max > 0:
+            # Run top-n on a side stream so it overlaps the main-stream
+            # downstream sampling / extract work. wait_stream defers the side
+            # stream until the softmax above is queued so it can read `logits`.
             if self._topn_stream is not None:
                 self._topn_stream.wait_stream(torch.cuda.current_stream())
                 stream_ctx = torch.cuda.stream(self._topn_stream)
             else:
                 stream_ctx = nullcontext()
             with stream_ctx:
+                # Reuse the LSE from softmax_kernel: top_n_log_probs = topk_raw - lse.
                 raw = logits.squeeze(0)[ri].float()
                 top_n_v_raw, top_n_i = _topk(raw, k=top_n_max)
                 top_n_v = top_n_v_raw - lse.unsqueeze(-1)
             if self._topn_event is not None:
+                # Signals the next step's main stream that side-stream reads
+                # of `_all_logits_cuda` are done, so it can safely overwrite it.
                 self._topn_event.record(self._topn_stream)
 
         active_request_count = context.total_request_count - context.paused_request_count
+        # Defer the CPU-side extract: caller invokes the partial after step bookkeeping
+        # so D2H copies pay their synchronization cost as late as possible.
         return functools.partial(
             self.extract,
             context,

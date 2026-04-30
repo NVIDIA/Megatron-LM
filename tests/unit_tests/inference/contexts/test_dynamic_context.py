@@ -1557,9 +1557,7 @@ class TestDynamicContext:
                 )
             )
 
-        num_active = (
-            dynamic_context.total_request_count - dynamic_context.paused_request_count
-        )
+        num_active = dynamic_context.total_request_count - dynamic_context.paused_request_count
 
         # Prefill step + transition to decode-only via update_requests.
         dynamic_context.initialize_attention_state()
@@ -1595,10 +1593,7 @@ class TestDynamicContext:
         spec_tokens = [(42, 17), (99, -1), (-1, -1)]
         accepted_counts = [2, 1, 0]
         accepted_tokens = torch.full(
-            (dynamic_context.max_requests, num_spec),
-            -1,
-            device='cuda',
-            dtype=torch.long,
+            (dynamic_context.max_requests, num_spec), -1, device='cuda', dtype=torch.long
         )
         for i, (a, b) in enumerate(spec_tokens):
             accepted_tokens[i, 0] = a
@@ -1625,34 +1620,32 @@ class TestDynamicContext:
         # Reference: log_softmax row-wise over the decode logit rows. Then for
         # each request, verify that log_probs[i][j] matches the expected token
         # at row (i * spec_plus_one + j) for j in [0, accepted_count + 1).
-        expected_log_softmax = torch.nn.functional.log_softmax(
-            decode_logits.squeeze(0), dim=-1
-        )
+        expected_log_softmax = torch.nn.functional.log_softmax(decode_logits.squeeze(0), dim=-1)
 
         for i in range(num_active):
             ac = accepted_counts[i]
             expected_count = ac + 1  # accepted spec tokens + new token
             assert log_probs[i] is not None
-            assert len(log_probs[i]) == expected_count, (
-                f"Request {i}: expected {expected_count} log_probs, got {len(log_probs[i])}"
-            )
+            assert (
+                len(log_probs[i]) == expected_count
+            ), f"Request {i}: expected {expected_count} log_probs, got {len(log_probs[i])}"
 
             # Positions 0..ac-1: log_prob of accepted spec tokens.
             for j in range(ac):
                 spec_token = spec_tokens[i][j]
                 row = i * spec_plus_one + j
                 expected = expected_log_softmax[row, spec_token].item()
-                assert abs(log_probs[i][j] - expected) < 1e-5, (
-                    f"Request {i}, position {j}: got {log_probs[i][j]}, expected {expected}"
-                )
+                assert (
+                    abs(log_probs[i][j] - expected) < 1e-5
+                ), f"Request {i}, position {j}: got {log_probs[i][j]}, expected {expected}"
 
             # Position ac: log_prob of the newly sampled token.
             new_token = new_tokens[i].item()
             row = i * spec_plus_one + ac
             expected = expected_log_softmax[row, new_token].item()
-            assert abs(log_probs[i][ac] - expected) < 1e-5, (
-                f"Request {i}, new token: got {log_probs[i][ac]}, expected {expected}"
-            )
+            assert (
+                abs(log_probs[i][ac] - expected) < 1e-5
+            ), f"Request {i}, new token: got {log_probs[i][ac]}, expected {expected}"
 
     @pytest.mark.internal
     @rounder_override(64)
