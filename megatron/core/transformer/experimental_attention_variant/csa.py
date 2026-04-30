@@ -140,7 +140,7 @@ def _apply_rope(
             None,
             cp_group.rank(),
             cp_group.size(),
-            mla_output_remove_interleaving=True,
+            remove_interleaving=True,
         )
     else:
         x_nope, x_pe = torch.split(x, [nope_dim, pos_dim], dim=-1)

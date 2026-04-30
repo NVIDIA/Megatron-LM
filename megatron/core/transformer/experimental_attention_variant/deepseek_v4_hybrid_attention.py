@@ -341,7 +341,7 @@ class DSv4HybridAttention(Attention):
                 self.pg_collection.cp.rank(),
                 self.pg_collection.cp.size(),
                 inverse=True,
-                mla_output_remove_interleaving=True,
+                remove_interleaving=True,
             )
         else:
             content_part, rot_part = torch.split(
@@ -601,7 +601,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cu_seqlens_q,
                     cp_rank,
                     cp_size,
-                    mla_output_remove_interleaving=True,
+                    remove_interleaving=True,
                 )
                 kv = kv.unsqueeze(-2)
                 kv = fused_mla_rope_inplace(
@@ -613,7 +613,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cu_seqlens_q,
                     cp_rank,
                     cp_size,
-                    mla_output_remove_interleaving=True,
+                    remove_interleaving=True,
                 )
                 key = kv
                 value = kv
