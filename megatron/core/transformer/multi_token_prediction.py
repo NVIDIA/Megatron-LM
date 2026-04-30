@@ -236,7 +236,16 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         dims == -1 or dims == tensor.dim() - 1
     ), "Packed sequence roll only supports the last dimension."
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
-    cu_seqlens = packed_seq_params.cu_seqlens_q
+    # Prefer the padded cumulative seqlens because, with CP, the local THD layout is
+    # produced by `tex.thd_get_partitioned_indices(cu_seqlens_padded, ...)` and requires
+    # each per-sequence padded length to be divisible by 2*cp_size. Indexing with the
+    # unpadded cu_seqlens then produces wrong local boundaries when seqlens are not
+    # already multiples of 2*cp_size (e.g. odd seqlens).
+    cu_seqlens = (
+        packed_seq_params.cu_seqlens_q_padded
+        if getattr(packed_seq_params, 'cu_seqlens_q_padded', None) is not None
+        else packed_seq_params.cu_seqlens_q
+    )
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
 
     rolled_tensor = tensor.clone()
