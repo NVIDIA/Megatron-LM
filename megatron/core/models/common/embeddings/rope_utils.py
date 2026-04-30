@@ -342,11 +342,7 @@ def apply_rotary_pos_emb(
                 use_unfused = True
             if not use_unfused:
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
-                return fused_apply_rotary_pos_emb(
-                    t,
-                    freqs,
-                    interleaved=config.rotary_interleaved,
-                )
+                return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
             return fused_apply_rotary_pos_emb_thd(
