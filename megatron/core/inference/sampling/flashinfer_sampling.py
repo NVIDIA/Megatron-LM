@@ -36,9 +36,6 @@ class FlashInferSampling(Sampling):
                 inline_capture=True,
             )
 
-    def pre_forward_bookkeeping(self, context) -> None:
-        """No-op; FlashInfer needs no per-step bookkeeping."""
-
     def sample_kernel(
         self,
         logits: Tensor,
@@ -63,6 +60,7 @@ class FlashInferSampling(Sampling):
         Returns:
             Sampled token ids of shape `[n]`. Under CUDA graph replay, this is a static buffer.
         """
+        # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
         md = context.active_request_metadata
         if token_to_request_index is None:

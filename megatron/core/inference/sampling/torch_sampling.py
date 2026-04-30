@@ -18,8 +18,6 @@ class TorchSampling(Sampling):
     def __init__(self, rng: torch.Generator, vocab_size: int) -> None:
         self._rng = rng
         self._vocab_size = vocab_size
-        self._buckets: List[Tuple] = []
-        self._bucket_index_tensors: List[Tensor] = []
 
     @staticmethod
     def sample_from_logits(
@@ -33,7 +31,7 @@ class TorchSampling(Sampling):
     ) -> Tensor:
         """Sample tokens from logits with temperature, top-k, and top-p filtering.
 
-        Shared between dynamic batching (`TorchSampling._sampling_func`) and static
+        Shared between dynamic batching (`TorchSampling.sample_kernel`) and static
         batching (`TextGenerationController.sample_from_logits`).
 
         Args:
@@ -96,28 +94,6 @@ class TorchSampling(Sampling):
 
         return sampled
 
-    def pre_forward_bookkeeping(self, context) -> None:
-        """Group active requests into sampling buckets by `(temperature, top_k, top_p)`.
-
-        Pre-computes a GPU index tensor per bucket so subsequent steps avoid H2D copies.
-        """
-        active_request_count = context.total_request_count - context.paused_request_count
-        md = context.active_request_metadata
-        device = torch.cuda.current_device()
-
-        bucket_map: dict = defaultdict(list)
-        temp = md["temperature"][:active_request_count].tolist()
-        top_k = md["top_k"][:active_request_count].tolist()
-        top_p = md["top_p"][:active_request_count].tolist()
-
-        for request_index, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
-            bucket_map[(t, k, p)].append(request_index)
-
-        self._buckets = [(indices, *params) for params, indices in bucket_map.items()]
-        self._bucket_index_tensors = [
-            torch.tensor(indices, device=device, dtype=torch.long) for indices, *_ in self._buckets
-        ]
-
     def sample_kernel(
         self,
         logits: Tensor,
@@ -129,13 +105,13 @@ class TorchSampling(Sampling):
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
     ) -> Tensor:
-        """Sample by iterating over pre-computed sampling buckets.
+        """Bucket active requests by `(temperature, top_k, top_p)` and sample each bucket.
 
         Args:
             logits: Logits tensor of shape `[>=n, vocab_size]`.
             n: Number of rows to sample.
-            context: The active DynamicInferenceContext (unused; kept for ABC parity).
-            eager: Accepted for API symmetry with FlashInfer; ignored (no wrapper here).
+            context: The active DynamicInferenceContext.
+            eager: Accepted for API symmetry; ignored (TorchSampling has no graph wrapper).
             cache_key: Accepted for API symmetry; ignored.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
@@ -144,14 +120,33 @@ class TorchSampling(Sampling):
         Returns:
             Sampled token ids of shape `[n]`.
         """
+        # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
+
+        # Group active requests into sampling buckets by (temperature, top_k, top_p).
+        active_request_count = context.total_request_count - context.paused_request_count
+        md = context.active_request_metadata
+        device = torch.cuda.current_device()
+
+        bucket_map: dict = defaultdict(list)
+        temp = md["temperature"][:active_request_count].tolist()
+        top_k = md["top_k"][:active_request_count].tolist()
+        top_p = md["top_p"][:active_request_count].tolist()
+        for request_index, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
+            bucket_map[(t, k, p)].append(request_index)
+
+        buckets: List[Tuple] = [(indices, *params) for params, indices in bucket_map.items()]
+        bucket_index_tensors: List[Tensor] = [
+            torch.tensor(indices, device=device, dtype=torch.long) for indices, *_ in buckets
+        ]
+
         if gather_indices is not None:
             logits = logits[gather_indices[:n], :]
 
         output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
         indices_list = []
-        for idx_tensor, (_, temp, top_k, top_p) in zip(self._bucket_index_tensors, self._buckets):
+        for idx_tensor, (_, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):
             if token_to_request_index is None:
                 row_indices = idx_tensor
             else:

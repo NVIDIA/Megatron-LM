@@ -331,9 +331,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.paused_request_count = 0
         context.total_request_count = batch_size
 
-        # Bookkeeping.
-        self.text_generation_controller._dynamic_step_sample_bookkeeping()
-
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
         self.text_generation_controller._all_logits_cuda = logits
@@ -998,11 +995,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 # The verification logic only uses base tokens, so we can return zeros here.
                 return torch.zeros((12,), dtype=torch.long, device='cuda')
 
-        # Override sampling to return our predictable mock outputs
-        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 1, 0.0)]
-        self.text_generation_controller._sampling._bucket_index_tensors = [
-            torch.tensor([0, 1], device='cuda', dtype=torch.long)
-        ]
+        # Drive both requests into a single greedy bucket via metadata, then mock
+        # the per-bucket sampling function to return our predictable outputs.
+        ctx.active_request_metadata["temperature"][:2] = 1.0
+        ctx.active_request_metadata["top_k"][:2] = 1
+        ctx.active_request_metadata["top_p"][:2] = 0.0
         self.text_generation_controller._sampling._sampling_func = mock.MagicMock(
             side_effect=mock_sampling_func
         )
@@ -1230,15 +1227,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # Base logits shape: [1, 8, vocab_size]
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
 
-        # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
-        # _buckets format: (indices, temp, top_k, top_p)
-        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 0, 0.9)]
-        self.text_generation_controller._sampling._bucket_index_tensors = [
-            torch.tensor([0, 1], device='cuda', dtype=torch.long)
-        ]
-
-        # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
-        # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
+        # Drive sampling onto the multinomial path (top_p > 0, top_k == 0) via metadata.
+        # We do NOT mock `_sampling_func`: we want it to run natively to prove it doesn't crash.
+        ctx.active_request_metadata["temperature"][:2] = 1.0
+        ctx.active_request_metadata["top_k"][:2] = 0
+        ctx.active_request_metadata["top_p"][:2] = 0.9
 
         self.text_generation_controller._all_logits_cuda = logits
         try:
@@ -1477,10 +1470,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._sampling._buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
-        ctrl._sampling._bucket_index_tensors = [
-            torch.arange(active_request_count, device='cuda', dtype=torch.long)
-        ]
+        ctx.active_request_metadata["temperature"][:active_request_count] = 1.0
+        ctx.active_request_metadata["top_k"][:active_request_count] = 1
+        ctx.active_request_metadata["top_p"][:active_request_count] = 0.0
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()

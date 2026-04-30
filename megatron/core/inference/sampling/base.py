@@ -10,16 +10,11 @@ from torch import Tensor
 class Sampling(ABC):
     """Abstract base for inference sampling backends.
 
-    Subclasses implement `pre_forward_bookkeeping` (per-step setup) and `sample_kernel`
-    (the GPU kernel). CUDA graph wrapping, when applicable, is added by the subclass via
-    `CudaGraphManager`. The wrapper consumes `eager` and `cache_key` kwargs; concrete
-    subclasses without a wrapper still accept and ignore them.
+    Subclasses implement `sample_kernel` (the GPU kernel). CUDA graph wrapping, when
+    applicable, is added by the subclass via `CudaGraphManager`. The wrapper consumes
+    `eager` and `cache_key` kwargs; concrete subclasses without a wrapper still accept
+    and ignore them.
     """
-
-    @abstractmethod
-    def pre_forward_bookkeeping(self, context) -> None:
-        """Prepare sampling state before the forward pass."""
-        ...
 
     @abstractmethod
     def sample_kernel(
@@ -52,28 +47,6 @@ class Sampling(ABC):
             Sampled token ids of shape `[n]`. Under CUDA graph replay, this is a static buffer.
         """
         ...
-
-    def sample(
-        self,
-        logits: Tensor,
-        n: int,
-        context,
-        *,
-        eager: bool = False,
-        cache_key: Any = None,
-        gather_indices: Optional[Tensor] = None,
-        token_to_request_index: Optional[Tensor] = None,
-    ) -> Tensor:
-        """Sample `n` tokens, optionally with CUDA graph capture/replay."""
-        return self.sample_kernel(
-            logits,
-            n,
-            context,
-            eager=eager,
-            cache_key=cache_key,
-            gather_indices=gather_indices,
-            token_to_request_index=token_to_request_index,
-        )
 
     def sample_speculative(
         self,

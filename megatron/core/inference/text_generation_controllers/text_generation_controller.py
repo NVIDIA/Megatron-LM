@@ -164,11 +164,11 @@ class TextGenerationController:
         #     - `self._sampled_tokens_cuda` is pre-allocated by `_init_mtp_sampling_tensors`.
         #     - The tensor cannot be reused between the Triton kernel and the sampling graph.
         # Non-speculative path:
-        #     - `self._sampled_tokens_cuda` is rebound to the output of `sample()`,
+        #     - `self._sampled_tokens_cuda` is rebound to the output of `sample_kernel`,
         #     which uses CudaGraphManager syntactic sugar to keep it as a static tensor.
         self._sampled_tokens_cuda = None
 
-        # Sampling backend: dispatches per-step bookkeeping and the sampling kernel.
+        # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
             self._sampling: Sampling = FlashInferSampling(
                 self.vocab_size,
@@ -647,16 +647,8 @@ class TextGenerationController:
         # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
             self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits[:, :logits_seq_len, :])
-        elif self._sampling_backend == "flashinfer":
-            # FlashInfer kernels require contiguous inputs.
-            self._all_logits_cuda = logits.contiguous()
         else:
             self._all_logits_cuda = logits
-
-    def _dynamic_step_sample_bookkeeping(self):
-        """Perform bookkeeping necessary to sample logits for dynamic batching."""
-        context = self.inference_wrapped_model.inference_context
-        self._sampling.pre_forward_bookkeeping(context)
 
     def _rewind_kv_cache(self) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
@@ -729,7 +721,7 @@ class TextGenerationController:
         Returns:
             Tensor: Sampled tokens of shape [num_requests].
         """
-        return self._sampling.sample(
+        return self._sampling.sample_kernel(
             logits_2d,
             logits_2d.shape[0],
             self.inference_wrapped_model.inference_context,
@@ -1041,7 +1033,7 @@ class TextGenerationController:
             if context.config.materialize_only_last_token_logits
             else context.active_request_last_token_idxs
         )
-        self._sampled_tokens_cuda = self._sampling.sample(
+        self._sampled_tokens_cuda = self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
             n,
             context,
@@ -1739,8 +1731,6 @@ class TextGenerationController:
 
         with torch.inference_mode():
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
-
-            self._dynamic_step_sample_bookkeeping()
 
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
