@@ -1004,8 +1004,6 @@ class DynamicInferenceEngine(AbstractEngine):
             return "pipeline_parallel"
         if getattr(self, "ep_world_size", 1) > 1:
             return "expert_parallel"
-        if self.context.is_hybrid_model:
-            return "hybrid_mamba"
         if self.waiting_request_ids and self.context.enable_prefix_caching:
             return "prefix_caching_waiting_prefill"
         if has_chunked_prefill_work:

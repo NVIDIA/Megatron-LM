@@ -2544,6 +2544,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         slot.cpu_view.current_dynamic_step_id = self.current_dynamic_step_id
         return slot
 
+    def acquire_snapshot_slot(self, step_id: int):
+        """Acquire a snapshot slot after releasing Mamba slots from reusable snapshots."""
+        self.snapshot_pool.poll_retired()
+        self._release_deferred_mamba_slots_for_free_snapshots()
+        return self.snapshot_pool.acquire(step_id)
+
+    def release_snapshot_slot(self, snapshot_slot_id: int):
+        """Release a snapshot slot and any Mamba slots whose snapshot dependency is done."""
+        slot = self.snapshot_pool.release(snapshot_slot_id)
+        self._release_deferred_mamba_slots_for_free_snapshots()
+        return slot
+
+    def _release_deferred_mamba_slots_for_free_snapshots(self) -> None:
+        """Release deferred Mamba slots only after their snapshot slot is reusable."""
+        if not self.is_hybrid_model:
+            return
+        for slot in self.snapshot_pool.slots:
+            if not slot.is_free:
+                continue
+            if self.mamba_metadata is not None:
+                self.mamba_metadata.release_deferred_slots_for_snapshot(slot.slot_id)
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.release_deferred_slots_for_snapshot(slot.slot_id)
+
     @property
     def cuda_graph_capture_slot_ids(self) -> Tuple[int, ...]:
         """Return snapshot slot IDs that need CUDA graph captures."""

@@ -1273,6 +1273,165 @@ class TestDynamicInferenceEngine:
         assert int(context.num_output_placeholders.sum().item()) == 0
         assert torch.all(context.request_to_kv_block_ids == -1)
 
+    def _run_async_overlap_hybrid_mamba_case(
+        self,
+        *,
+        queue_depth: int,
+        prompt_lengths: Tuple[int, ...],
+        num_tokens_to_generate: int,
+        enable_chunked_prefill: bool = False,
+        context_max_tokens: Optional[int] = None,
+        termination_id: Optional[int] = None,
+    ) -> Tuple[Dict[int, List[int]], DynamicEngineTestEnv, int]:
+        """Run a hybrid Mamba qd1/qd2 case and summarize completed requests."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=min(prompt_lengths),
+            max_prompt_length=max(prompt_lengths),
+            num_tokens_to_generate=num_tokens_to_generate,
+            model_provider="mamba",
+            num_cuda_graphs=None,
+            cuda_graph_scope=[],
+            force_build_cuda_graphs=True,
+            context_max_requests=16,
+            context_max_tokens=context_max_tokens,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=enable_chunked_prefill,
+            use_cuda_graphs_for_non_decode_steps=False,
+            enable_async_overlap_architecture=True,
+            async_overlap_queue_depth=queue_depth,
+        )
+        env = self._build_test_env(test_config)
+
+        for request_id, prompt_length in enumerate(prompt_lengths):
+            prompt_tokens = torch.arange(prompt_length, dtype=torch.int64, device="cuda") % (
+                test_config.vocab_size - 1
+            )
+            env.engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=num_tokens_to_generate,
+                        termination_id=(
+                            test_config.vocab_size - 1
+                            if termination_id is None
+                            else termination_id
+                        ),
+                        top_k=1,
+                    ),
+                    block_size_tokens=env.engine.context.block_size_tokens,
+                )
+            )
+
+        finished = {}
+        max_pending_launches = 0
+        step_count = 0
+        while env.engine.has_unfinished_requests():
+            result = env.engine.step_modern()
+            max_pending_launches = max(
+                max_pending_launches, env.engine.async_pipeline.pending_launch_count
+            )
+            for record in result["finished_request_records"]:
+                request = record.merge()
+                assert request.status == Status.COMPLETED
+                finished[int(request.request_id)] = list(request.generated_tokens)
+            step_count += 1
+            assert step_count < 128, "Engine did not converge"
+
+        return finished, env, max_pending_launches
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_hybrid_mamba_matches_queue_depth_one(self) -> None:
+        """Queue-depth-two preserves hybrid Mamba decode output and slot cleanup."""
+        skip_if_mamba_sequence_packing_not_available("mamba")
+        qd1_finished, _, _ = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=1,
+            prompt_lengths=(4, 5),
+            num_tokens_to_generate=4,
+        )
+        qd2_finished, qd2_env, qd2_max_pending = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=2,
+            prompt_lengths=(4, 5),
+            num_tokens_to_generate=4,
+        )
+
+        assert qd2_finished == qd1_finished
+        assert qd2_max_pending > 0
+        counters = qd2_env.engine.async_overlap_debug_counters
+        assert "hybrid_mamba" not in counters.fallback_or_queue_depth_one_reasons
+        metadata = qd2_env.engine.context.mamba_metadata
+        assert metadata.mamba_state_free_slot_count == metadata.max_requests
+        assert torch.all(metadata.request_to_mamba_state_idx == -1)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_hybrid_mamba_eos_cleanup(self) -> None:
+        """Queue-depth-two frees hybrid Mamba live slots after EOS completion."""
+        skip_if_mamba_sequence_packing_not_available("mamba")
+        baseline, _, _ = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=1,
+            prompt_lengths=(4,),
+            num_tokens_to_generate=4,
+        )
+        termination_id = baseline[0][0]
+
+        qd1_finished, _, _ = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=1,
+            prompt_lengths=(4,),
+            num_tokens_to_generate=4,
+            termination_id=termination_id,
+        )
+        qd2_finished, qd2_env, _ = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=2,
+            prompt_lengths=(4,),
+            num_tokens_to_generate=4,
+            termination_id=termination_id,
+        )
+
+        assert qd2_finished == qd1_finished
+        assert qd2_finished[0][-1] == termination_id
+        metadata = qd2_env.engine.context.mamba_metadata
+        assert metadata.mamba_state_free_slot_count == metadata.max_requests
+        assert torch.all(metadata.request_to_mamba_state_idx == -1)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_hybrid_mamba_chunked_prefill_matches_queue_depth_one(
+        self,
+    ) -> None:
+        """Queue-depth-two preserves hybrid Mamba chunked-prefill output and slots."""
+        skip_if_mamba_sequence_packing_not_available("mamba")
+        qd1_finished, _, _ = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=1,
+            prompt_lengths=(28,),
+            num_tokens_to_generate=2,
+            enable_chunked_prefill=True,
+            context_max_tokens=16,
+        )
+        qd2_finished, qd2_env, _ = self._run_async_overlap_hybrid_mamba_case(
+            queue_depth=2,
+            prompt_lengths=(28,),
+            num_tokens_to_generate=2,
+            enable_chunked_prefill=True,
+            context_max_tokens=16,
+        )
+
+        assert qd2_finished == qd1_finished
+        metadata = qd2_env.engine.context.mamba_metadata
+        assert metadata.mamba_state_free_slot_count == metadata.max_requests
+        assert torch.all(metadata.request_to_mamba_state_idx == -1)
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

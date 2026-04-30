@@ -1998,7 +1998,7 @@ class TextGenerationController:
             return None
 
         step_id = self._current_dynamic_step_record()
-        snapshot_slot = context.snapshot_pool.acquire(step_id.value)
+        snapshot_slot = context.acquire_snapshot_slot(step_id.value)
         snapshot_handle = SnapshotSlotHandle(
             step_id=step_id, snapshot_slot_id=snapshot_slot.slot_id
         )
@@ -2257,7 +2257,7 @@ class TextGenerationController:
         # Request-object mutation is owned by StepRetirementService so public
         # outputs are retired in strict step order.
         ret.update(request_bookkeeping)
-        context.snapshot_pool.release(prepared_step.snapshot_slot_id)
+        context.release_snapshot_slot(prepared_step.snapshot_slot_id)
         return ret
 
     async def async_generate_output_tokens_dynamic_batch(
