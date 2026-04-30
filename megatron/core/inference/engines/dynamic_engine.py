@@ -205,10 +205,10 @@ class DynamicAsyncPipeline:
         # 1. Reap completed steps non-blockingly.
         await engine.retirement.retire_all_ready()
 
-        # 2. Backpressure: block if the pool is exhausted.
-        if self._capacity_full():
-            entry = self._inflight.popleft()
-            await engine.retirement.retire(entry.output, entry.payload)
+        # 2. Backpressure: ask the retirement service to drain until the
+        # service holds fewer than queue_size in-flight entries (v3 plan
+        # §commit 19). The engine cannot run away from retirement.
+        await engine.retirement.wait_for_capacity(self.queue_size)
 
         # 3-9. Drive one step through the legacy controller. Commits 19+
         # split this into the explicit phase-by-phase pipeline; today the

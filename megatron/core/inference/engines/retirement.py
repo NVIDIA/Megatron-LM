@@ -142,6 +142,22 @@ class StepRetirementService:
             results.append(await self.retire(entry.output, entry.payload))
         return results
 
+    async def wait_for_capacity(self, max_inflight: int) -> List[Any]:
+        """v3 plan §commit 19 — backpressure rule.
+
+        Blocks (by retiring the oldest in-flight entry) until
+        ``inflight_count < max_inflight``. The engine cannot launch a new
+        step if all snapshot pool slots are held by outputs awaiting
+        retirement; this ensures the engine waits rather than crashing on
+        pool exhaustion when the retirement coroutine stalls (e.g.,
+        coordinator I/O).
+        """
+        results: List[Any] = []
+        while len(self._inflight) >= max_inflight:
+            entry = self._inflight.popleft()
+            results.append(await self.retire(entry.output, entry.payload))
+        return results
+
     async def await_request_id_release(self, request_id: int) -> List[Any]:
         """Drain prefix entries until no in-flight entry references
         ``request_id``. Caller must call this before reusing the id.
