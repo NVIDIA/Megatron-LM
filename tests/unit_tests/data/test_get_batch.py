@@ -133,14 +133,16 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
     seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seqlen = torch.tensor([seg_lengths.max().item()], dtype=torch.int32)
 
-    # Add batch dimension to sequence tensors (mimics DataLoader default_collate).
-    # cu_seqlens and max_seqlen stay 1D — get_batch_on_this_tp_rank expects them without batch dim.
+    # Add batch dimension to all per-sample tensors to mimic DataLoader default_collate.
+    # The dataset emits cu_seqlens as 1-D (S+1,) and max_seqlen as 0-D; default_collate
+    # stacks them with a leading batch dim of 1. get_batch_on_this_tp_rank's sender is
+    # responsible for squeezing the batch dim of cu_seqlens before broadcast.
     batch = {
         "tokens": tokens.unsqueeze(0),
         "labels": labels.unsqueeze(0),
         "loss_mask": loss_mask.unsqueeze(0),
         "position_ids": position_ids.unsqueeze(0),
-        "cu_seqlens": cu_seqlens,
+        "cu_seqlens": cu_seqlens.unsqueeze(0),
         "max_seqlen": max_seqlen,
     }
     return iter([batch]), num_real_tokens
