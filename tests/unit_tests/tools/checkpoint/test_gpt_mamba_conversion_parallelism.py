@@ -53,16 +53,13 @@ from gpt_mamba_conversion import main as conversion_main
 # default PG is already multi-rank.
 @pytest.fixture(autouse=True)
 def _skip_when_multi_rank_pg():
-    if (
-        dist.is_available()
-        and dist.is_initialized()
-        and dist.get_world_size() > 1
-    ):
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         pytest.skip(
             "Synthetic single-rank tests skipped under a multi-rank default "
             "process group; multi-rank coverage is in "
             "test_distributed_round_trip.py."
         )
+
 
 # ---------------------------------------------------------------------------
 # Synthetic-checkpoint helpers
