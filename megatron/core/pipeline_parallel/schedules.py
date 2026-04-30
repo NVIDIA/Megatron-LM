@@ -1065,22 +1065,6 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    # Determine hidden dimension for P2P communication.
-    # `forward_backward_pipelining_with_interleaving` is only reached when VPP is
-    # set (see `get_forward_backward_func` selection logic). VPP + mHC is rejected
-    # in `TransformerConfig.__post_init__` for explicit-VPP and re-checked here as
-    # a layout-VPP backstop; either way, mHC never reaches the n*C path inside
-    # this function.
-    if (
-        config.enable_hyper_connections
-        and pipeline_parallel_size > 1
-        and config.virtual_pipeline_model_parallel_size is not None
-    ):
-        raise ValueError(
-            "enable_hyper_connections is not yet supported with "
-            "virtual_pipeline_model_parallel_size set in the interleaved pipeline "
-            "schedule. Disable VPP or wait for per-virtual-chunk shape support."
-        )
     hidden_dim = config.hidden_size
 
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]
@@ -2055,22 +2039,6 @@ def get_tensor_shapes(
 
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
-
-    if (
-        getattr(config, 'enable_hyper_connections', False)
-        and getattr(config, 'virtual_pipeline_model_parallel_size', None) is not None
-        and pp_group is not None
-    ):
-        # Backstop in case `TransformerConfig.__post_init__`'s VPP+mHC check is
-        # skipped (e.g., when callers pass a non-TransformerConfig object). The
-        # config-level guard remains the user-facing error; this duplicate keeps
-        # the schedule path safe against silently producing wrong shapes.
-        raise ValueError(
-            "enable_hyper_connections is not yet supported with "
-            "virtual_pipeline_model_parallel_size set. Disable VPP or wait for "
-            "per-virtual-chunk shape support. (Same constraint enforced in "
-            "TransformerConfig.__post_init__.)"
-        )
 
     if (
         getattr(config, 'enable_hyper_connections', False)
