@@ -1600,10 +1600,7 @@ class TransformerConfig(ModelParallelConfig):
                 "single-stream residual tensors."
             )
 
-        if (
-            self.enable_hyper_connections
-            and self.virtual_pipeline_model_parallel_size is not None
-        ):
+        if self.enable_hyper_connections and self.virtual_pipeline_model_parallel_size is not None:
             # The interleaved schedule allocates a single tensor_shape for all P2P
             # exchanges per physical rank, but VPP straddles pre/post-process
             # boundaries on each physical rank — intermediate virtual chunks need
@@ -1625,8 +1622,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.enable_hyper_connections:
             if self.mhc_sinkhorn_iterations < 1:
                 raise ValueError(
-                    f"mhc_sinkhorn_iterations must be >= 1; got "
-                    f"{self.mhc_sinkhorn_iterations}."
+                    f"mhc_sinkhorn_iterations must be >= 1; got " f"{self.mhc_sinkhorn_iterations}."
                 )
             if self.mhc_init_gating_factor < 0:
                 raise ValueError(

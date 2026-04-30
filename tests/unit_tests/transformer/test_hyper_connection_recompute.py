@@ -406,8 +406,7 @@ class TestTransformerConfigRecomputeMhc:
     def test_config_rejects_too_few_residual_streams(self):
         """mHC requires at least two residual streams."""
         with pytest.raises(
-            ValueError,
-            match="num_residual_streams must be >= 2 when hyper connections are enabled",
+            ValueError, match="num_residual_streams must be >= 2 when hyper connections are enabled"
         ):
             TransformerConfig(
                 num_layers=2,
