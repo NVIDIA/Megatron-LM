@@ -22,7 +22,6 @@ class FlashInferSampling(Sampling):
     ) -> None:
         self._vocab_size = vocab_size
         self._rng = rng
-        self._enable_cuda_graph = enable_cuda_graph
         if enable_cuda_graph and config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
                 config,

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
@@ -297,7 +298,7 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    sampling_backend: Literal['torch', 'flashinfer'] = 'flashinfer'
     """Which sampling kernels to use during inference."""
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
@@ -328,6 +329,8 @@ class InferenceConfig:
             try:
                 import flashinfer  # noqa: F401
             except ImportError:
-                raise ValueError(
-                    "sampling_backend='flashinfer' requires flashinfer to be installed."
+                warnings.warn(
+                    "sampling_backend='flashinfer' requested but flashinfer is not "
+                    "installed; falling back to 'torch'."
                 )
+                self.sampling_backend = 'torch'
