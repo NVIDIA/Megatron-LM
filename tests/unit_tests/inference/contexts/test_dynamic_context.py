@@ -2987,9 +2987,7 @@ class TestDynamicContext:
             num_speculative_tokens=num_speculative_tokens,
             unified_memory_level=0,
         )
-        return DynamicInferenceContext(
-            model_config=model_config, inference_config=inference_config
-        )
+        return DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
     def _add_and_step_decode_requests(self, ctx, num_requests, prompt_length=10):
         """Add prefill requests, then step them into decode state with speculative tokens.
@@ -3010,14 +3008,11 @@ class TestDynamicContext:
         active_mask = torch.ones(num_requests, device='cuda', dtype=torch.int32)
         new_tokens = torch.arange(num_requests, device='cuda')
         num_spec = ctx.num_speculative_tokens
-        new_spec = (
-            torch.arange(num_spec * num_requests, device='cuda')
-            .reshape(num_spec, num_requests)
+        new_spec = torch.arange(num_spec * num_requests, device='cuda').reshape(
+            num_spec, num_requests
         )
         ctx.update_requests(
-            active_requests_mask=active_mask,
-            new_tokens=new_tokens,
-            new_speculative_tokens=new_spec,
+            active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
         )
         return ctx
 
@@ -3039,9 +3034,9 @@ class TestDynamicContext:
         decode_token_count = num_decode * tokens_per_decode
         expected_decode = torch.arange(decode_token_count, dtype=torch.int32, device='cuda')
         actual = ctx.active_logit_idxs[:decode_token_count]
-        assert torch.equal(actual, expected_decode), (
-            f"decode indices mismatch: {actual.tolist()} vs {expected_decode.tolist()}"
-        )
+        assert torch.equal(
+            actual, expected_decode
+        ), f"decode indices mismatch: {actual.tolist()} vs {expected_decode.tolist()}"
 
         assert ctx.num_last_token_logits == decode_token_count
         assert ctx.active_logit_idxs[decode_token_count:].sum().item() == 0
@@ -3080,9 +3075,9 @@ class TestDynamicContext:
             cumulative += pl
             expected_prefill_idx = decode_token_count + cumulative - 1
             actual_prefill_idx = ctx.active_logit_idxs[decode_token_count + i].item()
-            assert actual_prefill_idx == expected_prefill_idx, (
-                f"prefill request {i}: expected idx {expected_prefill_idx}, got {actual_prefill_idx}"
-            )
+            assert (
+                actual_prefill_idx == expected_prefill_idx
+            ), f"prefill request {i}: expected idx {expected_prefill_idx}, got {actual_prefill_idx}"
 
         expected_num_logits = decode_token_count + len(prefill_lengths)
         assert ctx.num_last_token_logits == expected_num_logits
@@ -3113,9 +3108,9 @@ class TestDynamicContext:
             cumulative += pl
             expected_idx = cumulative - 1
             actual_idx = ctx.active_logit_idxs[i].item()
-            assert actual_idx == expected_idx, (
-                f"prefill request {i}: expected idx {expected_idx}, got {actual_idx}"
-            )
+            assert (
+                actual_idx == expected_idx
+            ), f"prefill request {i}: expected idx {expected_idx}, got {actual_idx}"
 
         expected_num_logits = len(prefill_lengths)
         assert ctx.num_last_token_logits == expected_num_logits
@@ -3157,9 +3152,9 @@ class TestDynamicContext:
         expected_idxs = torch.cumsum(all_query_lengths, dim=0) - 1
         num_logits = ctx.num_last_token_logits
         actual_idxs = ctx.active_logit_idxs[:num_logits]
-        assert torch.equal(actual_idxs, expected_idxs.to(torch.int32)), (
-            f"non-speculative mismatch: {actual_idxs.tolist()} vs {expected_idxs.tolist()}"
-        )
+        assert torch.equal(
+            actual_idxs, expected_idxs.to(torch.int32)
+        ), f"non-speculative mismatch: {actual_idxs.tolist()} vs {expected_idxs.tolist()}"
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -3183,16 +3178,14 @@ class TestDynamicContext:
 
         vocab_size = 32
         logits = torch.arange(
-            ctx.padded_active_token_count * vocab_size,
-            dtype=torch.float32,
-            device='cuda',
+            ctx.padded_active_token_count * vocab_size, dtype=torch.float32, device='cuda'
         ).reshape(1, ctx.padded_active_token_count, vocab_size)
 
         result = ctx.last_token_logits(logits)
         expected_num_logits = ctx.num_last_token_logits
         assert result.shape == (expected_num_logits, vocab_size)
 
-        idxs = ctx.active_logit_idxs[: expected_num_logits].long()
+        idxs = ctx.active_logit_idxs[:expected_num_logits].long()
         expected = logits.squeeze(0)[idxs, :]
         assert torch.equal(result, expected)
 

@@ -684,10 +684,7 @@ class TestMTPCudaGraphInference:
         """
         num_spec = 2
         max_requests = 16
-        engine = self._build_engine(
-            num_speculative_tokens=num_spec,
-            max_requests=max_requests,
-        )
+        engine = self._build_engine(num_speculative_tokens=num_spec, max_requests=max_requests)
         context = engine.context
         tokens_per_decode = num_spec + 1
 
@@ -722,9 +719,9 @@ class TestMTPCudaGraphInference:
 
             active_mask = torch.ones(active_decode_count, device='cuda', dtype=torch.int32)
             new_tokens = torch.arange(active_decode_count, device='cuda')
-            new_spec = torch.arange(
-                num_spec * active_decode_count, device='cuda'
-            ).reshape(num_spec, active_decode_count)
+            new_spec = torch.arange(num_spec * active_decode_count, device='cuda').reshape(
+                num_spec, active_decode_count
+            )
             context.update_requests(
                 active_requests_mask=active_mask,
                 new_tokens=new_tokens,
@@ -734,9 +731,9 @@ class TestMTPCudaGraphInference:
             # Now all requests are decode. initialize_attention_state should match a graph.
             context.initialize_attention_state()
 
-            assert context.using_cuda_graph_this_step(), (
-                f"Expected CUDA graph for active={active_decode_count}"
-            )
+            assert (
+                context.using_cuda_graph_this_step()
+            ), f"Expected CUDA graph for active={active_decode_count}"
 
             # Read the actually matched graph dimensions.
             matched = context.padded_batch_dimensions
@@ -755,17 +752,17 @@ class TestMTPCudaGraphInference:
             real_token_count = active_decode_count * tokens_per_decode
             real_slice = context.active_logit_idxs[:real_token_count]
             expected_real = torch.arange(real_token_count, dtype=torch.int32, device='cuda')
-            assert torch.equal(real_slice, expected_real), (
-                f"real decode indices: {real_slice.tolist()} vs {expected_real.tolist()}"
-            )
+            assert torch.equal(
+                real_slice, expected_real
+            ), f"real decode indices: {real_slice.tolist()} vs {expected_real.tolist()}"
 
             # Padding indices should be zero (indexing into logits[0]).
             padding_count = expected_padded_logits - real_token_count
             if padding_count > 0:
                 padding_slice = context.active_logit_idxs[real_token_count:expected_padded_logits]
-                assert padding_slice.sum().item() == 0, (
-                    f"padding indices should be zero, got {padding_slice.tolist()}"
-                )
+                assert (
+                    padding_slice.sum().item() == 0
+                ), f"padding indices should be zero, got {padding_slice.tolist()}"
 
             # Verify last_token_logits produces a tensor with the padded row count.
             vocab_size = 64
