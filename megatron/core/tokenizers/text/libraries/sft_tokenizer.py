@@ -122,7 +122,10 @@ class SFTTokenizer:
         if isinstance(result, list):
             return np.array(result)
 
-        return np.array(result)
+        # Handles raw ndarray returned by transformers v4 apply_chat_template with
+        # return_tensors="np": shape is (1, seq_len), so squeeze the batch dimension.
+        arr = np.asarray(result)
+        return arr[0] if arr.ndim == 2 and arr.shape[0] == 1 else arr
 
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
@@ -174,8 +177,10 @@ class SFTTokenizer:
             if turn["role"].lower() == "assistant":
                 assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
 
-            turn_tokens = self._tokenizer.apply_chat_template(
-                [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
+            turn_tokens = self._extract_token_ids(
+                self._tokenizer.apply_chat_template(
+                    [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
+                )
             )
 
             # There should be only one BOS at the very beginning.
