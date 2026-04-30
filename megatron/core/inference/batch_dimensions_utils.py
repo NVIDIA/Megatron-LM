@@ -251,6 +251,39 @@ class InferenceBatchDimensions:
 
         return adjusted_batch_dim
 
+    @staticmethod
+    def adjust_batch_dims_for_expert_parallelism_async(
+        local_batch_dims,
+        strict: bool,
+        decode_only_cuda_graphs: bool,
+        smallest_non_decode_cuda_graph_size: int,
+        ep_group=None,
+        num_speculative_tokens: int = 0,
+        ep_zmq_communicator=None,
+    ):
+        """v3 plan §commit 20 — non-blocking variant.
+
+        Launches the EP rank-sync round-trip on a CPU thread via
+        ``asyncio.to_thread`` and returns an awaitable that resolves to the
+        same value the synchronous version returns. The pipeline
+        (commit 18+) launches this at the end of step N's
+        ``prepare_next_step_optimistic`` and awaits the result at the top
+        of step N+1's prepare so the AllReduce overlaps with step N's
+        forward.
+        """
+        import asyncio
+
+        return asyncio.to_thread(
+            InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism,
+            local_batch_dims,
+            strict,
+            decode_only_cuda_graphs,
+            smallest_non_decode_cuda_graph_size,
+            ep_group,
+            num_speculative_tokens,
+            ep_zmq_communicator,
+        )
+
 
 class CUDAGraphBatchDimensionBuilder:
     """Builder for creating and managing CUDA graph batch dimensions.
