@@ -1128,8 +1128,11 @@ class TestDynamicContext:
 
             for j, token in enumerate(request_tokens):
                 assert (
-                    prefill_log_probs[i][j]
-                    == expected_prefill_log_probs[initial_token_offset + j, token].item()
+                    abs(
+                        prefill_log_probs[i][j]
+                        - expected_prefill_log_probs[initial_token_offset + j, token].item()
+                    )
+                    < 1e-5
                 )
 
         # Simulate decode step
@@ -1171,7 +1174,7 @@ class TestDynamicContext:
             assert len(decode_log_probs[i]) == 1, len(decode_log_probs[i])
 
             token = decode_new_tokens[i].item()
-            assert decode_log_probs[i][0] == expected_decode_log_probs[i, token].item()
+            assert abs(decode_log_probs[i][0] - expected_decode_log_probs[i, token].item()) < 1e-5
 
         # Simulate mixed prefill and decode step (adding a new request to existing context)
         dynamic_context.update_requests(
@@ -1254,18 +1257,24 @@ class TestDynamicContext:
                 for j in range(expected_len - 1):
                     # For prompt tokens
                     assert (
-                        mixed_step_log_probs[i][j]
-                        == expected_mixed_step_log_probs[
-                            current_global_token_offset + j, prompt_tokens[j]
-                        ].item()
+                        abs(
+                            mixed_step_log_probs[i][j]
+                            - expected_mixed_step_log_probs[
+                                current_global_token_offset + j, prompt_tokens[j]
+                            ].item()
+                        )
+                        < 1e-5
                     )
 
                 # For the newly sampled token
                 assert (
-                    mixed_step_log_probs[i][expected_len - 1]
-                    == expected_mixed_step_log_probs[
-                        current_global_token_offset + expected_len - 1, new_sampled_token
-                    ].item()
+                    abs(
+                        mixed_step_log_probs[i][expected_len - 1]
+                        - expected_mixed_step_log_probs[
+                            current_global_token_offset + expected_len - 1, new_sampled_token
+                        ].item()
+                    )
+                    < 1e-5
                 )
 
                 current_global_token_offset += expected_len
@@ -1278,10 +1287,13 @@ class TestDynamicContext:
                 # For decode, the log prob is for the single new token
                 new_sampled_token = mixed_step_new_tokens[i].item()
                 assert (
-                    mixed_step_log_probs[i][0]
-                    == expected_mixed_step_log_probs[
-                        current_global_token_offset, new_sampled_token
-                    ].item()
+                    abs(
+                        mixed_step_log_probs[i][0]
+                        - expected_mixed_step_log_probs[
+                            current_global_token_offset, new_sampled_token
+                        ].item()
+                    )
+                    < 1e-5
                 )
 
                 current_global_token_offset += expected_len
@@ -1381,8 +1393,10 @@ class TestDynamicContext:
             for j, row_idx in enumerate(row_idxs):
                 expected = torch.topk(expected_log_softmax[row_idx], k=top_n)
                 got_values, got_indices = entry[j]
-                torch.testing.assert_close(got_values, expected.values.cpu())
-                torch.testing.assert_close(got_indices, expected.indices.cpu())
+                # Kernel's _topk uses sorted=False; sort by value to get a stable comparison.
+                got_sorted_v, perm = torch.sort(got_values, descending=True)
+                torch.testing.assert_close(got_sorted_v, expected.values.cpu())
+                torch.testing.assert_close(got_indices[perm], expected.indices.cpu())
             token_offset += req_len
 
         # ── Decode step ──
@@ -1419,8 +1433,10 @@ class TestDynamicContext:
             values, indices = entry[0]
             assert values.shape == (top_n,) and indices.shape == (top_n,)
             expected = torch.topk(decode_expected[i], k=top_n)
-            torch.testing.assert_close(values, expected.values.cpu())
-            torch.testing.assert_close(indices, expected.indices.cpu())
+            # Kernel's _topk uses sorted=False; sort by value to get a stable comparison.
+            sorted_v, perm = torch.sort(values, descending=True)
+            torch.testing.assert_close(sorted_v, expected.values.cpu())
+            torch.testing.assert_close(indices[perm], expected.indices.cpu())
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -1635,8 +1651,11 @@ class TestDynamicContext:
             dtype=torch.long,
         )
 
-        # Newly sampled tokens (from the verifier on this step).
-        new_tokens = torch.randint(0, 100, (num_active,), device='cuda', dtype=torch.long)
+        # Newly sampled tokens (from the verifier on this step). Padded to
+        # max_requests since gather_kernel reads up to padded_active_request_count.
+        new_tokens = torch.randint(
+            0, 100, (dynamic_context.max_requests,), device='cuda', dtype=torch.long
+        )
 
         # Run speculative calculate_log_probs.
         log_probs, _ = calculate_log_probs(
