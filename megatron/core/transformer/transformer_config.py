@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope, LayerType
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
 
