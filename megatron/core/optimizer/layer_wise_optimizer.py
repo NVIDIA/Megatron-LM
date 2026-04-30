@@ -12,12 +12,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
-from .optimizer import (
-    ChainedOptimizer,
-    Float16OptimizerWithFloat16Params,
-    FP32Optimizer,
-    MegatronOptimizer,
-)
+from .optimizer import (ChainedOptimizer, Float16OptimizerWithFloat16Params, FP32Optimizer,
+                        MegatronOptimizer)
 from .optimizer_config import OptimizerConfig
 
 logger = logging.getLogger(__name__)

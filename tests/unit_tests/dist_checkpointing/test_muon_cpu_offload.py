@@ -15,17 +15,17 @@ from typing import Generator
 
 import pytest
 import torch
+from tests.unit_tests.test_utilities import Utils
 
 from megatron.core import parallel_state
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
 
 
 def _create_model(seed: int, tp: int, pp: int) -> GPTModel:
@@ -62,9 +62,7 @@ def _create_model(seed: int, tp: int, pp: int) -> GPTModel:
     return model
 
 
-def _create_optimizer(
-    model: GPTModel, cpu_offload: bool = True
-) -> LayerWiseDistributedOptimizer:
+def _create_optimizer(model: GPTModel, cpu_offload: bool = True) -> LayerWiseDistributedOptimizer:
     """Create a Muon LayerWise optimizer with optional CPU offloading.
 
     Args:
@@ -141,15 +139,15 @@ class TestMuonCPUOffload:
         for opt in _iter_fp16_opts(optimizer):
             for group in opt.fp32_from_float16_groups:
                 for param in group:
-                    assert not param.data.is_cuda, (
-                        f"fp32 master weight should be on CPU, got {param.data.device}"
-                    )
+                    assert (
+                        not param.data.is_cuda
+                    ), f"fp32 master weight should be on CPU, got {param.data.device}"
             for state_vals in opt.optimizer.state.values():
                 for key, val in state_vals.items():
                     if isinstance(val, torch.Tensor):
-                        assert not val.is_cuda, (
-                            f"optimizer state '{key}' should be on CPU, got {val.device}"
-                        )
+                        assert (
+                            not val.is_cuda
+                        ), f"optimizer state '{key}' should be on CPU, got {val.device}"
 
     @pytest.mark.parametrize('tp,pp', [(2, 2), (1, 4), (4, 1)])
     def test_roundtrip_correctness(self, tp: int, pp: int) -> None:
@@ -176,9 +174,9 @@ class TestMuonCPUOffload:
                 for pidx, param in enumerate(group):
                     assert param.data.is_cuda, "After reload, param should be on GPU"
                     expected = snapshots[(id(opt), gidx, pidx)].to(param.data.device)
-                    assert torch.equal(param.data, expected), (
-                        "Master weight mismatch after offload->reload roundtrip"
-                    )
+                    assert torch.equal(
+                        param.data, expected
+                    ), "Master weight mismatch after offload->reload roundtrip"
 
         optimizer.offload_optimizer_states()
 
@@ -211,9 +209,9 @@ class TestMuonCPUOffload:
         for opt in _iter_fp16_opts(optimizer):
             for group in opt.fp32_from_float16_groups:
                 for param in group:
-                    assert not param.data.is_cuda, (
-                        "After step, fp32 master weights should be back on CPU"
-                    )
+                    assert (
+                        not param.data.is_cuda
+                    ), "After step, fp32 master weights should be back on CPU"
 
     @pytest.mark.parametrize('tp,pp', [(2, 2), (4, 1)])
     @pytest.mark.parametrize('n_steps', [3, 5])
@@ -259,9 +257,7 @@ class TestMuonCPUOffload:
         opt_off.reload_optimizer_states()
 
         for opt_o, opt_r in zip(_iter_fp16_opts(opt_off), _iter_fp16_opts(opt_ref)):
-            for grp_o, grp_r in zip(
-                opt_o.fp32_from_float16_groups, opt_r.fp32_from_float16_groups
-            ):
+            for grp_o, grp_r in zip(opt_o.fp32_from_float16_groups, opt_r.fp32_from_float16_groups):
                 for pidx, (p_o, p_r) in enumerate(zip(grp_o, grp_r)):
                     p_o_gpu = p_o.data.to('cuda') if not p_o.data.is_cuda else p_o.data
                     assert torch.equal(p_o_gpu, p_r.data), (
