@@ -16,7 +16,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=FutureWarning)
 
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -229,7 +229,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     )
 
 
-def core_gpt_dataset_config_from_args(args):
+def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -242,35 +242,33 @@ def core_gpt_dataset_config_from_args(args):
         with open(args.per_dataset_sequences_path, "r") as f:
             sequences_per_dataset = json.load(f)
 
-    data_args = {
-        "random_seed": args.seed,
-        "sequence_length": args.seq_length,
-        "blend": blend,
-        "blend_per_split": blend_per_split,
-        "split": args.split,
-        "multiple_validation_sets": args.multiple_validation_sets,
-        "full_validation": args.full_validation,
-        "num_dataset_builder_threads": args.num_dataset_builder_threads,
-        "path_to_cache": args.data_cache_path,
-        "mmap_bin_files": args.mmap_bin_files,
-        "tokenizer": tokenizer,
-        "reset_position_ids": args.reset_position_ids,
-        "reset_attention_mask": args.reset_attention_mask,
-        "eod_mask_loss": args.eod_mask_loss,
-        "create_attention_mask": args.create_attention_mask_in_dataloader,
-        "object_storage_cache_path": args.object_storage_cache_path,
-        "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
-        "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
-        "fast_cache_load": args.dataloader_fast_cache_load,
-        "sequences_per_dataset": sequences_per_dataset,
-        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
-        "context_parallel_size": args.context_parallel_size,
-        "data_parallel_size": args.data_parallel_size,
-        "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
-    }
-
-    return GPTDatasetConfig(**data_args)
+    return GPTDatasetConfig(
+        random_seed=args.seed,
+        sequence_length=args.seq_length,
+        blend=blend,
+        blend_per_split=blend_per_split,
+        split=args.split,
+        multiple_validation_sets=args.multiple_validation_sets,
+        full_validation=args.full_validation,
+        num_dataset_builder_threads=args.num_dataset_builder_threads,
+        path_to_cache=args.data_cache_path,
+        mmap_bin_files=args.mmap_bin_files,
+        tokenizer=tokenizer,
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+        eod_mask_loss=args.eod_mask_loss,
+        create_attention_mask=args.create_attention_mask_in_dataloader,
+        object_storage_cache_path=args.object_storage_cache_path,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
+        fast_cache_load=args.dataloader_fast_cache_load,
+        sequences_per_dataset=sequences_per_dataset,
+        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        context_parallel_size=args.context_parallel_size,
+        data_parallel_size=args.data_parallel_size,
+        sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
+        hybrid_context_parallel=args.hybrid_context_parallel,
+    )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
@@ -314,7 +312,7 @@ if __name__ == "__main__":
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
-    train_valid_test_datasets_provider.is_distributed = True
+    setattr(train_valid_test_datasets_provider, "is_distributed", True)
 
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
