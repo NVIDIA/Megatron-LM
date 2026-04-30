@@ -2,7 +2,7 @@
 name: build-and-dependency
 description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, updating uv.lock, and linting.
 TRIGGER when: user asks to add, remove, or update a dependency; user edits or asks about pyproject.toml or uv.lock; uv.lock has a merge conflict; user asks to set up a dev environment or pull/build the CI container; user hits a container build error or uv error; user asks to run linting or autoformat.
-DO NOT TRIGGER when: user is only running tests, investigating CI failures, or opening a PR (use testsystem instead).
+DO NOT TRIGGER when: user is only running tests, investigating CI failures, or opening a PR (use ci-test-system instead).
 ---
 
 # Build & Dependency Guide
@@ -33,7 +33,7 @@ dependency.
 **Option A — NVIDIA-internal: pull a CI-built image**
 
 > ⚠️ Requires access to the internal GitLab instance.
-> See `tools/trigger_internal_ci.md` for setup (adding the git remote, obtaining a token).
+> See @tools/trigger_internal_ci.md for setup (adding the git remote, obtaining a token).
 
 The internal GitLab CI publishes images to its container registry.
 Derive the registry host from your configured `gitlab` remote — the same
