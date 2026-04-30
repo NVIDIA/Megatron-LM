@@ -270,14 +270,20 @@ def _run_scenario(
         # --- GPT -> Hybrid ---
         conversion_main(
             argparse.Namespace(
-                direction='gpt-to-hybrid', load_dir=src_gpt_dir, save_dir=hybrid_dir, **common_kwargs
+                direction='gpt-to-hybrid',
+                load_dir=src_gpt_dir,
+                save_dir=hybrid_dir,
+                **common_kwargs,
             )
         )
 
         # --- Hybrid -> GPT ---
         conversion_main(
             argparse.Namespace(
-                direction='hybrid-to-gpt', load_dir=hybrid_dir, save_dir=dst_gpt_dir, **common_kwargs
+                direction='hybrid-to-gpt',
+                load_dir=hybrid_dir,
+                save_dir=dst_gpt_dir,
+                **common_kwargs,
             )
         )
 
