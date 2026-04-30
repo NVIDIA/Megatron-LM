@@ -255,9 +255,9 @@ class HyperConnectionModule(MegatronModule):
         h_pre = h[..., : self._h_pre_end].sigmoid().to(dtype=proj.dtype)  # [s, b, n]
 
         # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
-        h_post = (
-            h[..., self._h_pre_end : self._h_post_end].sigmoid() * 2
-        ).to(dtype=proj.dtype)  # [s, b, n]
+        h_post = (h[..., self._h_pre_end : self._h_post_end].sigmoid() * 2).to(
+            dtype=proj.dtype
+        )  # [s, b, n]
         h_res = h[..., self._h_post_end :].to(dtype=proj.dtype)
         return h_pre, h_post, h_res
 
