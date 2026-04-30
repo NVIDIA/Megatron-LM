@@ -1176,6 +1176,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # Force the prefill kernel to launch for prefill graphs.
                 self._max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
             self._max_seqlen_k = self.max_sequence_length
+            self.padding_slice = slice(
+                self.active_token_count, self.padded_active_token_count
+            )
 
         self._context_op_metadata_gpu.copy_(self._context_op_metadata_cpu, non_blocking=True)
         self.build_active_slices()
@@ -1877,7 +1880,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
         # Non-graph mode: recompute max_seqlen from the just-populated buffers.
-        # Graph mode set these in `prepare_attn_init` from padded dims.
         if not self.using_cuda_graph_this_step():
             n = self.padded_active_request_count
             if n > 0:
@@ -1886,6 +1888,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self._max_seqlen_q = self.num_speculative_tokens + 1
                 self._max_seqlen_k = 1
+            self.padding_slice = slice(
+                self.active_token_count, self.padded_active_token_count
+            )
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""
