@@ -17,7 +17,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
