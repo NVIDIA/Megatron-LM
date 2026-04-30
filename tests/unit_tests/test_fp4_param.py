@@ -138,7 +138,7 @@ class TestFP4Param:
         # CUDA graph settings (must be set before kwargs to allow override)
         if kwargs.get("enable_cuda_graph", False):
             args.cuda_graph_impl = "transformer_engine"
-            args.cuda_graph_warmup_steps = 0
+            args.cuda_graph_warmup_steps = 1
             args.cuda_graph_scope = "full"
 
         for key, value in kwargs.items():
@@ -226,8 +226,8 @@ class TestFP4Param:
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
 
-            # CUDA graph: capture after warmup steps (warmup_steps=0 means capture on first iter)
-            cuda_graph_warmup_steps = 0
+            # CUDA graph: capture after warmup steps.
+            cuda_graph_warmup_steps = 1
             if cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
                 if should_disable_forward_pre_hook(args):
                     disable_forward_pre_hook(gpt_model, param_sync=False)
