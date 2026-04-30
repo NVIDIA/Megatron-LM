@@ -25,6 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -40,7 +41,7 @@ from megatron.core.utils import (
 )
 
 
-class GPTModel(LanguageModule):
+class GPTModel(LanguageModule, GraphableMegatronModule):
     """GPT Transformer language model.
 
     Args:
@@ -476,6 +477,42 @@ class GPTModel(LanguageModule):
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if (
+            not self.training
+            and hasattr(self, 'cudagraph_manager')
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+
+    def __call__(self, *args, **kwargs):
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            return super().__call__(*args, **kwargs)[0]
+        return super().__call__(*args, **kwargs)
+
+    def create_mcore_cudagraph_manager(self, config):
+        """
+        Create the cudagraph manager for the full iteration inference scope
+        """
+        if CudaGraphScope.full_iteration_inference in config.cuda_graph_scope:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+            self.cudagraph_manager = CudaGraphManager(config)
+
     def forward(
         self,
         input_ids: Tensor,
@@ -569,6 +606,7 @@ class GPTModel(LanguageModule):
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
             is_spec_decode=is_spec_decode,
+            logits_out=logits_out,
         )
 
     def _postprocess(
@@ -591,6 +629,7 @@ class GPTModel(LanguageModule):
         extra_block_kwargs=None,
         inference_context=None,
         is_spec_decode=None,
+        logits_out=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -706,6 +745,9 @@ class GPTModel(LanguageModule):
             log_config_to_disk(self.config, payload, prefix='input_and_logits')
 
         if labels is None:
+            if in_inference_mode and inference_context.is_dynamic_batching():
+                logits_out[:, : logits.shape[0], :].copy_(logits.transpose(0, 1))
+                return logits_out[:, : logits.shape[0], :]
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
