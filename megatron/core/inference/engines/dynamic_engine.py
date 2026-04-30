@@ -170,6 +170,10 @@ class AsyncOverlapDebugCounters:
     placeholder_count: int = 0
     reservation_commits: int = 0
     reservation_rollbacks: int = 0
+    rollback_status_counts: Dict[str, int] = field(default_factory=dict)
+    partial_reservation_rollbacks: int = 0
+    resource_already_evicted_rollbacks: int = 0
+    deferred_reservation_rollbacks: int = 0
     retirement_backlog: int = 0
     max_retirement_backlog: int = 1
 

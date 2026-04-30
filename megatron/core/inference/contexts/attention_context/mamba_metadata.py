@@ -9,7 +9,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
-from megatron.core.inference.contexts.step_journal import ResourceReservation
+from megatron.core.inference.contexts.step_journal import ResourceReservation, RollbackStatus
 
 
 @dataclass(frozen=True)
@@ -931,20 +931,32 @@ class MambaMetadata:
             raise RuntimeError(f"Mamba reservation {reservation.reservation_id} is not open")
         self._committed_reservations[reservation.reservation_id] = open_reservation
 
-    def rollback_reservation(self, reservation: ResourceReservation) -> None:
+    def rollback_reservation(
+        self, reservation: ResourceReservation, *, defer_until_snapshot_retired: bool = False
+    ) -> RollbackStatus:
         """Roll back a Mamba slot reservation and return its slots to the pool."""
         open_reservation = self._open_reservations.pop(reservation.reservation_id, None)
         if open_reservation is None:
             if reservation.reservation_id in self._rolled_back_reservations:
-                return
-            raise RuntimeError(f"Mamba reservation {reservation.reservation_id} is not open")
-        self._release_slot_ids(open_reservation.mamba_slot_ids)
+                return RollbackStatus.ALREADY_ROLLED_BACK
+            if reservation.reservation_id in self._committed_reservations:
+                return RollbackStatus.ALREADY_COMMITTED
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
         request_slot = int(open_reservation.request_slot)
         if 0 <= request_slot < self.max_requests:
             current_slot = int(self.request_to_mamba_state_idx[request_slot].item())
             if current_slot in set(open_reservation.mamba_slot_ids):
                 self.request_to_mamba_state_idx[request_slot] = -1
+        if defer_until_snapshot_retired:
+            self.defer_release_until_snapshot_retired(
+                torch.tensor(open_reservation.mamba_slot_ids, dtype=torch.int32, device='cpu'),
+                open_reservation.snapshot_slot_id,
+            )
+            status = RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED
+        else:
+            status = self._release_slot_ids(open_reservation.mamba_slot_ids)
         self._rolled_back_reservations[reservation.reservation_id] = open_reservation
+        return status
 
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """
@@ -1002,16 +1014,33 @@ class MambaMetadata:
         for slot_ids in deferred:
             self._release_slot_ids(slot_ids.tolist())
 
-    def _release_slot_ids(self, slot_ids) -> None:
+    def _release_slot_ids(self, slot_ids) -> RollbackStatus:
         """Return live Mamba state slots to the free pool."""
-        slot_ids = tuple(int(slot_id) for slot_id in slot_ids)
+        slot_ids = tuple(dict.fromkeys(int(slot_id) for slot_id in slot_ids))
         if not slot_ids:
-            return
+            return RollbackStatus.FULLY_RELEASED
+        valid_slot_ids = tuple(slot_id for slot_id in slot_ids if 0 <= slot_id < self.max_requests)
+        if not valid_slot_ids:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+        free_ids = set(
+            int(slot_id)
+            for slot_id in self.mamba_state_free_slots[
+                : self.mamba_state_free_slot_count
+            ].tolist()
+        )
+        releasable_slot_ids = tuple(slot_id for slot_id in valid_slot_ids if slot_id not in free_ids)
+        if not releasable_slot_ids:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
         start_idx = self.mamba_state_free_slot_count
-        end_idx = start_idx + len(slot_ids)
-        if end_idx > self.max_requests:
-            raise RuntimeError("Mamba state free slot pool overflow")
+        capacity = max(0, self.max_requests - start_idx)
+        if capacity == 0:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+        releasable_slot_ids = releasable_slot_ids[:capacity]
+        end_idx = start_idx + len(releasable_slot_ids)
         self.mamba_state_free_slots[start_idx:end_idx] = torch.tensor(
-            slot_ids, dtype=torch.int32, device='cpu'
+            releasable_slot_ids, dtype=torch.int32, device='cpu'
         )
         self.mamba_state_free_slot_count = end_idx
+        if len(releasable_slot_ids) < len(valid_slot_ids) or len(valid_slot_ids) < len(slot_ids):
+            return RollbackStatus.PARTIALLY_RELEASED
+        return RollbackStatus.FULLY_RELEASED

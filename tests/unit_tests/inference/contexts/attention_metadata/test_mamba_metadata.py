@@ -6,6 +6,7 @@ import torch
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
 from megatron.core.inference.contexts.gpu_view import ContextGPUView
+from megatron.core.inference.contexts.step_journal import RollbackStatus
 
 
 class TestMambaMetadata:
@@ -519,10 +520,30 @@ class TestMambaMetadata:
         assert rollback is not None
         assert rollback.mamba_restore_block_ids[2] == 13
         metadata.request_to_mamba_state_idx[2] = rollback.mamba_slot_ids[0]
-        metadata.rollback_reservation(rollback)
-        metadata.rollback_reservation(rollback)
+        status = metadata.rollback_reservation(rollback)
+        assert status == RollbackStatus.FULLY_RELEASED
+        status = metadata.rollback_reservation(rollback)
+        assert status == RollbackStatus.ALREADY_ROLLED_BACK
         assert metadata.request_to_mamba_state_idx[2].item() == -1
         assert metadata.mamba_state_free_slot_count == 3
+
+        status = metadata.rollback_reservation(reservation)
+        assert status == RollbackStatus.ALREADY_COMMITTED
+
+    @pytest.mark.internal
+    def test_mamba_slot_rollback_skips_already_released_slot(self):
+        """Mamba rollback is idempotent if pressure cleanup already returned a slot."""
+        metadata = MambaMetadata(max_requests=4, max_tokens=128)
+        reservation = metadata.reserve_slot(1, step_id=7, zero_state=True)
+        assert reservation is not None
+        metadata.request_to_mamba_state_idx[1] = reservation.mamba_slot_ids[0]
+
+        metadata._release_slot_ids(reservation.mamba_slot_ids)
+        status = metadata.rollback_reservation(reservation)
+
+        assert status == RollbackStatus.RESOURCE_ALREADY_EVICTED
+        assert metadata.request_to_mamba_state_idx[1].item() == -1
+        assert metadata.mamba_state_free_slot_count == 4
 
     @pytest.mark.internal
     def test_mamba_slot_release_can_wait_for_snapshot_retirement(self):

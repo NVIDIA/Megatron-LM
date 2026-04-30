@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -37,6 +38,48 @@ def _freeze_mapping(value: Optional[Mapping[Any, Any]]) -> Mapping[Any, Any]:
     if value is None:
         return MappingProxyType({})
     return MappingProxyType(dict(value))
+
+
+class RollbackStatus(str, Enum):
+    """Terminal cleanup status for a journal or resource rollback."""
+
+    FULLY_RELEASED = "fully_released"
+    ALREADY_COMMITTED = "already_committed"
+    ALREADY_ROLLED_BACK = "already_rolled_back"
+    RESOURCE_ALREADY_EVICTED = "resource_already_evicted"
+    PARTIALLY_RELEASED = "partially_released"
+    DEFERRED_UNTIL_SNAPSHOT_RETIRED = "deferred_until_snapshot_retired"
+
+
+@dataclass(frozen=True, kw_only=True)
+class RollbackResult:
+    """Result returned by an idempotent dynamic-step rollback."""
+
+    step_id: int
+    status: RollbackStatus
+    entry: Optional["StepJournalEntry"] = None
+    reason: Optional[str] = None
+    resource_statuses: Sequence[RollbackStatus] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.step_id < 0:
+            raise ValueError(f"step_id must be >= 0, got {self.step_id}")
+        object.__setattr__(self, "status", RollbackStatus(self.status))
+        object.__setattr__(
+            self,
+            "resource_statuses",
+            tuple(RollbackStatus(status) for status in self.resource_statuses),
+        )
+
+    def with_resource_statuses(self, statuses: Sequence[RollbackStatus]) -> "RollbackResult":
+        """Return a copy with allocator rollback statuses attached."""
+        return RollbackResult(
+            step_id=self.step_id,
+            status=self.status,
+            entry=self.entry,
+            reason=self.reason,
+            resource_statuses=statuses,
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -341,18 +384,36 @@ class StepJournal:
         self._committed_entries[step_value] = frozen_entry
         return frozen_entry
 
-    def rollback_step_journal(
-        self, step_id, *, reason: Optional[str] = None
-    ) -> StepJournalEntry:
-        """Roll back an open journal entry."""
-        del reason
+    def rollback_step_journal(self, step_id, *, reason: Optional[str] = None) -> RollbackResult:
+        """Roll back an open journal entry, idempotently."""
         step_value = _step_id_value(step_id)
-        entry = self._open_entries.pop(step_value)
-        frozen_entry = entry.freeze()
-        self._rolled_back_entries[step_value] = frozen_entry
-        return frozen_entry
+        entry = self._open_entries.pop(step_value, None)
+        if entry is not None:
+            frozen_entry = entry.freeze()
+            self._rolled_back_entries[step_value] = frozen_entry
+            return RollbackResult(
+                step_id=step_value,
+                status=RollbackStatus.FULLY_RELEASED,
+                entry=frozen_entry,
+                reason=reason,
+            )
+        committed_entry = self._committed_entries.get(step_value)
+        if committed_entry is not None:
+            return RollbackResult(
+                step_id=step_value,
+                status=RollbackStatus.ALREADY_COMMITTED,
+                entry=committed_entry,
+                reason=reason,
+            )
+        rolled_back_entry = self._rolled_back_entries.get(step_value)
+        return RollbackResult(
+            step_id=step_value,
+            status=RollbackStatus.ALREADY_ROLLED_BACK,
+            entry=rolled_back_entry,
+            reason=reason,
+        )
 
-    def rollback_all_open(self, *, reason: Optional[str] = None) -> Tuple[StepJournalEntry, ...]:
+    def rollback_all_open(self, *, reason: Optional[str] = None) -> Tuple[RollbackResult, ...]:
         """Roll back every open entry in step order."""
         return tuple(
             self.rollback_step_journal(step_id, reason=reason) for step_id in self.open_step_ids

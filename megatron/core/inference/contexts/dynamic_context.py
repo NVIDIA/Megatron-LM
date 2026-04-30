@@ -46,7 +46,7 @@ from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
 from .snapshot_pool import GpuSnapshotBufferPool
-from .step_journal import StepJournal
+from .step_journal import RollbackStatus, StepJournal
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -287,6 +287,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             "placeholder_count": 0,
             "reservation_commits": 0,
             "reservation_rollbacks": 0,
+            "rollback_status_counts": {},
+            "partial_reservation_rollbacks": 0,
+            "resource_already_evicted_rollbacks": 0,
+            "deferred_reservation_rollbacks": 0,
         }
 
         self.cache_mla_latent = (
@@ -2495,6 +2499,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 "reservation_rollbacks": 0,
                 "mamba_reservation_commits": 0,
                 "mamba_reservation_rollbacks": 0,
+                "rollback_status_counts": {},
+                "partial_reservation_rollbacks": 0,
+                "resource_already_evicted_rollbacks": 0,
+                "deferred_reservation_rollbacks": 0,
             }
         )
 
@@ -2598,16 +2606,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._clear_pending_gpu_decode_input()
 
     def _release_deferred_mamba_slots_for_free_snapshots(self) -> None:
-        """Release deferred Mamba slots only after their snapshot slot is reusable."""
-        if not self.is_hybrid_model:
-            return
+        """Release deferred resources only after their snapshot slot is reusable."""
         for slot in self.snapshot_pool.slots:
             if not slot.is_free:
                 continue
-            if self.mamba_metadata is not None:
-                self.mamba_metadata.release_deferred_slots_for_snapshot(slot.slot_id)
-            if self.mamba_slot_allocator is not None:
-                self.mamba_slot_allocator.release_deferred_slots_for_snapshot(slot.slot_id)
+            self.kv_block_allocator.release_deferred_blocks_for_snapshot(slot.slot_id)
+            if self.is_hybrid_model:
+                if self.mamba_metadata is not None:
+                    self.mamba_metadata.release_deferred_slots_for_snapshot(slot.slot_id)
+                if self.mamba_slot_allocator is not None:
+                    self.mamba_slot_allocator.release_deferred_slots_for_snapshot(slot.slot_id)
 
     @property
     def cuda_graph_capture_slot_ids(self) -> Tuple[int, ...]:
@@ -3076,13 +3084,108 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def rollback_step_journal(self, step_id: int, reason: Optional[str] = None):
         """Roll back the journal entry for one dynamic step."""
-        if self.step_journal.get_open_entry(step_id) is None:
-            return None
-        return self.step_journal.rollback_step_journal(step_id, reason=reason)
+        result = self.step_journal.rollback_step_journal(step_id, reason=reason)
+        if result.entry is None or result.status != RollbackStatus.FULLY_RELEASED:
+            self._record_rollback_status(result.status)
+            return result
+
+        resource_statuses = []
+        for reservation in result.entry.resources_waiting_on_snapshot:
+            resource_statuses.append(self._rollback_resource_reservation(reservation))
+        if resource_statuses:
+            result = result.with_resource_statuses(tuple(resource_statuses))
+            for status in resource_statuses:
+                self._record_rollback_status(status)
+        self._record_rollback_status(result.status)
+        return result
 
     def rollback_all_open_step_journals(self, reason: Optional[str] = None):
         """Roll back every open dynamic-step journal entry."""
-        return self.step_journal.rollback_all_open(reason=reason)
+        return tuple(
+            self.rollback_step_journal(step_id, reason=reason)
+            for step_id in self.step_journal.open_step_ids
+        )
+
+    def _rollback_resource_reservation(self, reservation) -> RollbackStatus:
+        """Roll back one allocator reservation recorded in a step journal."""
+        statuses = []
+        if getattr(reservation, "kv_block_ids", ()) or getattr(
+            reservation, "prefix_cache_refcount_deltas", {}
+        ):
+            statuses.append(self.kv_block_allocator.rollback_reservation(reservation))
+        if (
+            getattr(reservation, "mamba_slot_ids", ())
+            or getattr(reservation, "mamba_zero_slot_ids", ())
+            or getattr(reservation, "mamba_restore_block_ids", {})
+        ):
+            if self.mamba_metadata is None:
+                statuses.append(RollbackStatus.RESOURCE_ALREADY_EVICTED)
+            else:
+                statuses.append(
+                    self.mamba_metadata.rollback_reservation(
+                        reservation,
+                        defer_until_snapshot_retired=not self._snapshot_slot_is_free(
+                            reservation.snapshot_slot_id
+                        ),
+                    )
+                )
+                self.async_overlap_debug_counters["mamba_reservation_rollbacks"] = (
+                    self.async_overlap_debug_counters.get("mamba_reservation_rollbacks", 0) + 1
+                )
+        return self._merge_rollback_statuses(statuses)
+
+    def _snapshot_slot_is_free(self, snapshot_slot_id: int) -> bool:
+        """Return whether a snapshot slot can no longer be read by GPU work."""
+        if not hasattr(self, "snapshot_pool"):
+            return True
+        try:
+            return bool(self.snapshot_pool.get_slot(int(snapshot_slot_id)).is_free)
+        except (AttributeError, IndexError):
+            return True
+
+    def _record_rollback_status(self, status: RollbackStatus) -> None:
+        """Record rollback outcome counters for diagnostics and metrics."""
+        if not hasattr(self, "async_overlap_debug_counters"):
+            return
+        status = RollbackStatus(status)
+        status_counts = self.async_overlap_debug_counters.setdefault("rollback_status_counts", {})
+        status_counts[status.value] = status_counts.get(status.value, 0) + 1
+        if status == RollbackStatus.PARTIALLY_RELEASED:
+            self.async_overlap_debug_counters["partial_reservation_rollbacks"] = (
+                self.async_overlap_debug_counters.get("partial_reservation_rollbacks", 0) + 1
+            )
+        elif status == RollbackStatus.RESOURCE_ALREADY_EVICTED:
+            self.async_overlap_debug_counters["resource_already_evicted_rollbacks"] = (
+                self.async_overlap_debug_counters.get(
+                    "resource_already_evicted_rollbacks", 0
+                )
+                + 1
+            )
+        elif status == RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED:
+            self.async_overlap_debug_counters["deferred_reservation_rollbacks"] = (
+                self.async_overlap_debug_counters.get("deferred_reservation_rollbacks", 0) + 1
+            )
+
+    @staticmethod
+    def _merge_rollback_statuses(statuses) -> RollbackStatus:
+        """Merge per-resource rollback outcomes into one journal-facing status."""
+        statuses = tuple(status for status in statuses if status is not None)
+        if not statuses:
+            return RollbackStatus.FULLY_RELEASED
+        if all(status == RollbackStatus.FULLY_RELEASED for status in statuses):
+            return RollbackStatus.FULLY_RELEASED
+        if all(status == RollbackStatus.RESOURCE_ALREADY_EVICTED for status in statuses):
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+        if (
+            RollbackStatus.PARTIALLY_RELEASED in statuses
+            or RollbackStatus.RESOURCE_ALREADY_EVICTED in statuses
+        ):
+            return RollbackStatus.PARTIALLY_RELEASED
+        if RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED in statuses:
+            return RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED
+        if RollbackStatus.ALREADY_COMMITTED in statuses:
+            return RollbackStatus.ALREADY_COMMITTED
+        return RollbackStatus.ALREADY_ROLLED_BACK
 
     def reset(self) -> None:
         """Reset entire context.

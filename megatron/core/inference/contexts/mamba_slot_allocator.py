@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.contexts.step_journal import RollbackStatus
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
@@ -296,16 +297,34 @@ class MambaSlotAllocator:
         for slot_ids in deferred:
             self._return_slots_to_free_pool(slot_ids)
 
-    def _return_slots_to_free_pool(self, slot_ids: Tensor) -> None:
+    def _return_slots_to_free_pool(self, slot_ids: Tensor) -> RollbackStatus:
         """Return cache slots to the free pool."""
         if slot_ids.numel() == 0:
-            return
-        n = slot_ids.numel()
+            return RollbackStatus.FULLY_RELEASED
+        slot_ids = torch.unique(slot_ids.to(dtype=torch.int32, device='cpu').flatten())
+        requested_count = int(slot_ids.numel())
+        valid_mask = (slot_ids >= 0) & (slot_ids < self.max_slots)
+        valid_slot_ids = slot_ids[valid_mask]
+        if valid_slot_ids.numel() == 0:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+        free_ids = set(int(slot_id) for slot_id in self.free_slots[: self.free_count].tolist())
+        releasable_slot_ids = [
+            int(slot_id) for slot_id in valid_slot_ids.tolist() if int(slot_id) not in free_ids
+        ]
+        if not releasable_slot_ids:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+        capacity = max(0, self.max_slots - self.free_count)
+        if capacity == 0:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+        releasable_slot_ids = releasable_slot_ids[:capacity]
+        slot_ids = torch.tensor(releasable_slot_ids, dtype=torch.int32, device='cpu')
+        n = int(slot_ids.numel())
         end = self.free_count + n
-        if end > self.max_slots:
-            raise RuntimeError("Mamba cache free slot pool overflow")
         self.free_slots[self.free_count : end] = slot_ids.to(torch.int32)
         self.free_count = end
+        if n < int(valid_slot_ids.numel()) or int(valid_slot_ids.numel()) < requested_count:
+            return RollbackStatus.PARTIALLY_RELEASED
+        return RollbackStatus.FULLY_RELEASED
 
     def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
         """Handle KV block deregistration by cleaning up Mamba state.

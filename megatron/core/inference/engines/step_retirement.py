@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Deque, Dict, Optional
 
 import torch
 
+from megatron.core.inference.contexts.step_journal import RollbackStatus
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord, Status
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
@@ -112,7 +113,7 @@ class StepRetirementService:
         can leave an open journal entry that must not survive shutdown.
         """
         self.drain_pending()
-        self.engine.context.rollback_all_open_step_journals(reason="shutdown_drain")
+        self._rollback_open_journals("shutdown_drain")
 
     def drain_for_suspend(self) -> None:
         """Drain in-flight retirement work before suspend.
@@ -121,7 +122,7 @@ class StepRetirementService:
         can leave an open journal entry that must not survive suspend.
         """
         self.drain_pending()
-        self.engine.context.rollback_all_open_step_journals(reason="suspend_drain")
+        self._rollback_open_journals("suspend_drain")
 
     def drain_for_request_reuse(self, request_id: int) -> None:
         """Drain work that could still reference a request ID before reuse.
@@ -270,6 +271,36 @@ class StepRetirementService:
         setattr(counters, "retirement_backlog", self.pending_count)
         setattr(counters, "max_retirement_backlog", self.max_retirement_backlog)
 
+    def _rollback_open_journals(self, reason: str) -> None:
+        """Roll back open journals and record the cleanup outcomes."""
+        rollback_range = self.engine._step_nvtx_label(f"rollback_{reason}")
+        nvtx_range_push(rollback_range)
+        try:
+            rollback_results = self.engine.context.rollback_all_open_step_journals(
+                reason=reason
+            )
+        finally:
+            nvtx_range_pop(rollback_range)
+        self._record_rollback_results(rollback_results or ())
+
+    def _record_rollback_results(self, rollback_results) -> None:
+        counters = getattr(self.engine, "async_overlap_debug_counters", None)
+        if counters is None:
+            return
+        for result in rollback_results:
+            statuses = (result.status,) + tuple(result.resource_statuses)
+            for status in statuses:
+                status_value = RollbackStatus(status).value
+                counters.rollback_status_counts[status_value] = (
+                    counters.rollback_status_counts.get(status_value, 0) + 1
+                )
+                if status == RollbackStatus.PARTIALLY_RELEASED:
+                    counters.partial_reservation_rollbacks += 1
+                elif status == RollbackStatus.RESOURCE_ALREADY_EVICTED:
+                    counters.resource_already_evicted_rollbacks += 1
+                elif status == RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED:
+                    counters.deferred_reservation_rollbacks += 1
+
     def _drain_prefix_cache_counters(self) -> None:
         engine = self.engine
         if engine.context.enable_prefix_caching:
@@ -321,6 +352,8 @@ class StepRetirementService:
             metrics['inference/prefix_cache_blocks_matched'] = int(
                 engine._prefix_cache_blocks_matched
             )
+        for status, count in engine.async_overlap_debug_counters.rollback_status_counts.items():
+            metrics[f'inference/rollback_{status}'] = int(count)
 
         if HAVE_WANDB and engine.metrics_writer.__name__ == "wandb":
             engine.metrics_writer.log(metrics, commit=True)

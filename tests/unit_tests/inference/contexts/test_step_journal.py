@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.contexts.step_journal import StepJournal
+from megatron.core.inference.contexts.step_journal import RollbackStatus, StepJournal
 
 
 class FakeGpuView:
@@ -91,10 +91,29 @@ def test_step_journal_rolls_back_open_entries():
 
     rolled_back = journal.rollback_all_open(reason="test")
 
-    assert [entry.step_id for entry in rolled_back] == [1, 2]
+    assert [result.entry.step_id for result in rolled_back] == [1, 2]
+    assert [result.status for result in rolled_back] == [
+        RollbackStatus.FULLY_RELEASED,
+        RollbackStatus.FULLY_RELEASED,
+    ]
     assert journal.open_step_ids == ()
     assert journal.get_rolled_back_entry(1).step_id == 1
     assert journal.get_rolled_back_entry(2).step_id == 2
+
+    rolled_back_again = journal.rollback_step_journal(1, reason="again")
+    assert rolled_back_again.status == RollbackStatus.ALREADY_ROLLED_BACK
+    assert rolled_back_again.entry.step_id == 1
+
+
+def test_step_journal_rollback_after_commit_is_idempotent():
+    journal = StepJournal()
+    journal.begin_step_journal(3)
+    journal.commit_step_journal(3)
+
+    result = journal.rollback_step_journal(3, reason="after_commit")
+
+    assert result.status == RollbackStatus.ALREADY_COMMITTED
+    assert result.entry.step_id == 3
 
 
 def test_step_journal_rejects_duplicate_or_terminal_entry():

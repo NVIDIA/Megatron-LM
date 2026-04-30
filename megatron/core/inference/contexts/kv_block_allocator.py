@@ -8,7 +8,47 @@ from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
-from .step_journal import ResourceReservation
+from .step_journal import ResourceReservation, RollbackStatus
+
+
+def _merge_rollback_statuses(statuses) -> RollbackStatus:
+    """Merge per-resource rollback outcomes into one reservation status."""
+    statuses = tuple(status for status in statuses if status is not None)
+    if not statuses:
+        return RollbackStatus.FULLY_RELEASED
+    if all(status == RollbackStatus.FULLY_RELEASED for status in statuses):
+        return RollbackStatus.FULLY_RELEASED
+    if all(status == RollbackStatus.RESOURCE_ALREADY_EVICTED for status in statuses):
+        return RollbackStatus.RESOURCE_ALREADY_EVICTED
+    if (
+        RollbackStatus.PARTIALLY_RELEASED in statuses
+        or RollbackStatus.RESOURCE_ALREADY_EVICTED in statuses
+    ):
+        return RollbackStatus.PARTIALLY_RELEASED
+    if RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED in statuses:
+        return RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED
+    if RollbackStatus.ALREADY_COMMITTED in statuses:
+        return RollbackStatus.ALREADY_COMMITTED
+    return RollbackStatus.ALREADY_ROLLED_BACK
+
+
+def _record_rollback_status(counters: Dict, status: RollbackStatus) -> None:
+    """Record allocator rollback status in a debug-counter mapping."""
+    status_value = RollbackStatus(status).value
+    status_counts = counters.setdefault("rollback_status_counts", {})
+    status_counts[status_value] = status_counts.get(status_value, 0) + 1
+    if status == RollbackStatus.PARTIALLY_RELEASED:
+        counters["partial_reservation_rollbacks"] = (
+            counters.get("partial_reservation_rollbacks", 0) + 1
+        )
+    elif status == RollbackStatus.RESOURCE_ALREADY_EVICTED:
+        counters["resource_already_evicted_rollbacks"] = (
+            counters.get("resource_already_evicted_rollbacks", 0) + 1
+        )
+    elif status == RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED:
+        counters["deferred_reservation_rollbacks"] = (
+            counters.get("deferred_reservation_rollbacks", 0) + 1
+        )
 
 
 class KVBlockAllocator:
@@ -46,6 +86,7 @@ class KVBlockAllocator:
         self._committed_reservations: Dict[int, ResourceReservation] = {}
         self._rolled_back_reservations: Dict[int, ResourceReservation] = {}
         self._deferred_snapshot_block_releases: Dict[int, list[Tensor]] = {}
+        self._deferred_snapshot_prefix_refcount_deltas: Dict[int, list[Dict[int, int]]] = {}
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -248,24 +289,48 @@ class KVBlockAllocator:
         if hasattr(self.context, "async_overlap_debug_counters"):
             self.context.async_overlap_debug_counters["reservation_commits"] += 1
 
-    def rollback_reservation(self, reservation: ResourceReservation) -> None:
+    def rollback_reservation(self, reservation: ResourceReservation) -> RollbackStatus:
         """Roll back a KV reservation and return its blocks to the allocator."""
         open_reservation = self._open_reservations.pop(reservation.reservation_id, None)
         if open_reservation is None:
             if reservation.reservation_id in self._rolled_back_reservations:
-                return
-            raise RuntimeError(f"KV reservation {reservation.reservation_id} is not open")
+                return RollbackStatus.ALREADY_ROLLED_BACK
+            if reservation.reservation_id in self._committed_reservations:
+                return RollbackStatus.ALREADY_COMMITTED
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
         block_ids = torch.tensor(open_reservation.kv_block_ids, dtype=torch.int32, device='cpu')
-        self.release_memory_blocks(block_ids)
-        self._apply_prefix_refcount_deltas(
-            {
-                block_id: -delta
-                for block_id, delta in open_reservation.prefix_cache_refcount_deltas.items()
-            }
+        has_resources = bool(open_reservation.kv_block_ids) or bool(
+            open_reservation.prefix_cache_refcount_deltas
         )
+        if has_resources and self._should_defer_for_snapshot(open_reservation):
+            self.defer_release_until_snapshot_retired(
+                block_ids, open_reservation.snapshot_slot_id
+            )
+            self.defer_prefix_refcount_deltas_until_snapshot_retired(
+                {
+                    block_id: -delta
+                    for block_id, delta in open_reservation.prefix_cache_refcount_deltas.items()
+                },
+                open_reservation.snapshot_slot_id,
+            )
+            status = RollbackStatus.DEFERRED_UNTIL_SNAPSHOT_RETIRED
+        else:
+            statuses = []
+            if open_reservation.kv_block_ids:
+                statuses.append(self.release_memory_blocks(block_ids))
+            if open_reservation.prefix_cache_refcount_deltas:
+                statuses.append(
+                    self._rollback_prefix_refcount_deltas(
+                        open_reservation.prefix_cache_refcount_deltas
+                    )
+                )
+            status = _merge_rollback_statuses(statuses)
         self._rolled_back_reservations[reservation.reservation_id] = open_reservation
         if hasattr(self.context, "async_overlap_debug_counters"):
-            self.context.async_overlap_debug_counters["reservation_rollbacks"] += 1
+            counters = self.context.async_overlap_debug_counters
+            counters["reservation_rollbacks"] = counters.get("reservation_rollbacks", 0) + 1
+            _record_rollback_status(counters, status)
+        return status
 
     def _apply_prefix_refcount_deltas(self, deltas: Dict[int, int]) -> None:
         """Apply prefix-cache refcount deltas with normal cache-release semantics."""
@@ -280,8 +345,82 @@ class KVBlockAllocator:
                 if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                     self.update_timestamps(block_tensor)
             elif delta < 0:
-                for _ in range(-int(delta)):
+                release_count = min(-int(delta), int(self.block_ref_counts[block_tensor].item()))
+                for _ in range(release_count):
                     self.release_memory_blocks(block_tensor)
+
+    def _rollback_prefix_refcount_deltas(self, deltas: Dict[int, int]) -> RollbackStatus:
+        """Undo prefix-cache refcount deltas without underflowing shared refs."""
+        if not deltas:
+            return RollbackStatus.FULLY_RELEASED
+        if not self.enable_prefix_caching:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+
+        expected_release_count = 0
+        released_count = 0
+        for block_id, delta in deltas.items():
+            release_count = max(0, int(delta))
+            if release_count == 0:
+                continue
+            expected_release_count += release_count
+            block_id = int(block_id)
+            if block_id < 0 or block_id >= self.dummy_block_idx:
+                continue
+            block_tensor = torch.tensor([block_id], dtype=torch.int32, device='cpu')
+            current_ref_count = int(self.block_ref_counts[block_tensor].item())
+            safe_release_count = min(release_count, current_ref_count)
+            for _ in range(safe_release_count):
+                self.release_memory_blocks(block_tensor)
+            released_count += safe_release_count
+
+        if expected_release_count == 0:
+            return RollbackStatus.FULLY_RELEASED
+        if released_count == 0:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+        if released_count < expected_release_count:
+            return RollbackStatus.PARTIALLY_RELEASED
+        return RollbackStatus.FULLY_RELEASED
+
+    def _should_defer_for_snapshot(self, reservation: ResourceReservation) -> bool:
+        """Return whether a reservation's snapshot can still read its blocks."""
+        snapshot_pool = getattr(self.context, "snapshot_pool", None)
+        if snapshot_pool is None:
+            return False
+        try:
+            slot = snapshot_pool.get_slot(int(reservation.snapshot_slot_id))
+        except (AttributeError, IndexError):
+            return False
+        return not getattr(slot, "is_free", True)
+
+    def _valid_unique_blocks(self, blocks: Tensor) -> tuple[Tensor, int]:
+        """Return valid unique non-dummy block IDs and the expected unique count."""
+        if blocks.numel() == 0:
+            return torch.empty(0, dtype=torch.int32, device='cpu'), 0
+        block_ids = torch.unique(blocks.to(dtype=torch.int32, device='cpu').flatten())
+        expected_count = int(block_ids.numel())
+        valid_mask = (block_ids >= 0) & (block_ids < self.dummy_block_idx)
+        return block_ids[valid_mask], expected_count
+
+    def _return_blocks_to_free_pool(self, blocks: Tensor) -> int:
+        """Return blocks to the free pool, skipping blocks already present there."""
+        valid_blocks, _ = self._valid_unique_blocks(blocks)
+        if valid_blocks.numel() == 0:
+            return 0
+        free_ids = set(int(block_id) for block_id in self.block_bag[: self.total_avail].tolist())
+        block_ids = [
+            int(block_id) for block_id in valid_blocks.tolist() if int(block_id) not in free_ids
+        ]
+        if not block_ids:
+            return 0
+        capacity = max(0, self.total_count - 1 - self.total_avail)
+        if capacity == 0:
+            return 0
+        block_ids = block_ids[:capacity]
+        block_tensor = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
+        num_blocks = int(block_tensor.numel())
+        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_tensor
+        self.total_avail += num_blocks
+        return num_blocks
 
     def defer_release_until_snapshot_retired(
         self, block_ids: Tensor, snapshot_slot_id: int
@@ -293,13 +432,28 @@ class KVBlockAllocator:
             block_ids.to(dtype=torch.int32, device='cpu').clone()
         )
 
+    def defer_prefix_refcount_deltas_until_snapshot_retired(
+        self, deltas: Dict[int, int], snapshot_slot_id: int
+    ) -> None:
+        """Defer prefix-cache refcount cleanup until a snapshot no longer reads blocks."""
+        if not deltas:
+            return
+        self._deferred_snapshot_prefix_refcount_deltas.setdefault(int(snapshot_slot_id), []).append(
+            {int(block_id): int(delta) for block_id, delta in deltas.items()}
+        )
+
     def release_deferred_blocks_for_snapshot(self, snapshot_slot_id: int) -> None:
         """Release blocks whose snapshot-read dependency has retired."""
         deferred = self._deferred_snapshot_block_releases.pop(int(snapshot_slot_id), [])
         for block_ids in deferred:
             self.release_memory_blocks(block_ids)
+        deferred_deltas = self._deferred_snapshot_prefix_refcount_deltas.pop(
+            int(snapshot_slot_id), []
+        )
+        for deltas in deferred_deltas:
+            self._apply_prefix_refcount_deltas(deltas)
 
-    def release_memory_blocks(self, blocks: Tensor) -> None:
+    def release_memory_blocks(self, blocks: Tensor) -> RollbackStatus:
         """Release memory blocks by decrementing reference counts.
 
         Blocks with ref_count == 0 remain cached (in hash map) for potential reuse.
@@ -312,31 +466,52 @@ class KVBlockAllocator:
             None
         """
         if blocks.numel() == 0:
-            return
+            return RollbackStatus.FULLY_RELEASED
 
         if self.enable_prefix_caching:
-            self.block_ref_counts[blocks] -= 1
+            block_ids = blocks.to(dtype=torch.int32, device='cpu').flatten()
+            expected_count = int(block_ids.numel())
+            valid_mask = (block_ids >= 0) & (block_ids < self.dummy_block_idx)
+            valid_blocks = block_ids[valid_mask]
+            if valid_blocks.numel() == 0:
+                return RollbackStatus.RESOURCE_ALREADY_EVICTED
+            unique_blocks, release_counts = torch.unique(valid_blocks, return_counts=True)
+            current_ref_counts = self.block_ref_counts[unique_blocks]
+            safe_release_counts = torch.minimum(
+                release_counts.to(dtype=torch.int32), current_ref_counts
+            )
+            releasable_mask = safe_release_counts > 0
+            releasable_blocks = unique_blocks[releasable_mask]
+            if releasable_blocks.numel() == 0:
+                return RollbackStatus.RESOURCE_ALREADY_EVICTED
+            self.block_ref_counts[releasable_blocks] -= safe_release_counts[releasable_mask]
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
-                zero_mask = self.block_ref_counts[blocks] == 0
+                zero_mask = self.block_ref_counts[releasable_blocks] == 0
                 if zero_mask.any():
-                    self._deregister_blocks(blocks[zero_mask])
+                    self._deregister_blocks(releasable_blocks[zero_mask])
             elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 # Unregistered blocks (hash == -1, ref_count == 0) have no hash
                 # entry to preserve for reuse (e.g., partial blocks at the end of
                 # a request). Return them directly to the free pool so they are not
                 # leaked.
-                unreg_mask = (self.block_ref_counts[blocks] == 0) & (
-                    self.block_hashes[blocks] == -1
+                unreg_mask = (self.block_ref_counts[releasable_blocks] == 0) & (
+                    self.block_hashes[releasable_blocks] == -1
                 )
                 if unreg_mask.any():
-                    unreg_blocks = blocks[unreg_mask]
-                    num_unreg = unreg_blocks.numel()
-                    self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
-                    self.total_avail += num_unreg
+                    self._return_blocks_to_free_pool(releasable_blocks[unreg_mask])
+            released_count = int(safe_release_counts[releasable_mask].sum().item())
         else:
-            num_blocks = blocks.numel()
-            self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
-            self.total_avail += num_blocks
+            valid_blocks, expected_count = self._valid_unique_blocks(blocks)
+            if expected_count == 0:
+                return RollbackStatus.FULLY_RELEASED
+            if valid_blocks.numel() == 0:
+                return RollbackStatus.RESOURCE_ALREADY_EVICTED
+            released_count = self._return_blocks_to_free_pool(valid_blocks)
+        if released_count == 0:
+            return RollbackStatus.RESOURCE_ALREADY_EVICTED
+        if released_count < expected_count:
+            return RollbackStatus.PARTIALLY_RELEASED
+        return RollbackStatus.FULLY_RELEASED
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -362,6 +537,7 @@ class KVBlockAllocator:
         self._committed_reservations.clear()
         self._rolled_back_reservations.clear()
         self._deferred_snapshot_block_releases.clear()
+        self._deferred_snapshot_prefix_refcount_deltas.clear()
         self._next_reservation_id = 0
 
         if self.enable_prefix_caching:
@@ -426,8 +602,7 @@ class KVBlockAllocator:
             self.block_timestamps[block_ids] = 0
 
         # Return blocks to free pool
-        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
-        self.total_avail += num_blocks
+        self._return_blocks_to_free_pool(block_ids)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
