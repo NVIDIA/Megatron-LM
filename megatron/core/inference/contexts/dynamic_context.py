@@ -1522,12 +1522,39 @@ class DynamicInferenceContext(BaseInferenceContext):
         # All requests that were in prefill become decode requests.
         self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
 
+        # v3 plan §commit 14 — open the journal entry and record per-slot
+        # output placeholders + snapshot owner. ``begin_step_transaction``
+        # is idempotent: the engine opens the entry in async_forward
+        # (commit 6) so this call is a no-op there. Placeholder delta is
+        # ``1 + speculative_width`` per active slot, decremented in
+        # ``commit_step_transaction`` by the actual accepted count. The
+        # snapshot owner is recorded with the currently active pool slot;
+        # commit 15 promotes this to the per-step acquired slot.
+        self.begin_step_transaction(step_id)
+        active_request_count = self.total_request_count - self.paused_request_count
+        active_slots: List[int] = []
+        if active_request_count > 0:
+            active_slots = list(
+                range(self.paused_request_count, self.total_request_count)
+            )
+            self.add_output_placeholders(
+                step_id=step_id,
+                slot_indices=active_slots,
+                delta=1 + self.num_speculative_tokens,
+            )
+        active_slot_id = getattr(self, "_active_snapshot_slot", -1)
+        self.record_snapshot_owner(
+            step_id=step_id, snapshot_buffer_id=active_slot_id
+        )
+
         return DynamicStepPlan(
             step_id=step_id,
-            request_slots=tuple(),
-            placeholder_deltas=tuple(),
+            request_slots=tuple(active_slots),
+            placeholder_deltas=tuple(
+                1 + self.num_speculative_tokens for _ in active_slots
+            ),
             input_plan=StepInputPlan(
-                decode_request_slots=tuple(),
+                decode_request_slots=tuple(active_slots),
                 decode_token_destination_indices=tuple(),
                 prefill_cpu_token_ranges=tuple(),
                 speculative_width=self.num_speculative_tokens,
@@ -1537,7 +1564,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             intended_batch_dimensions=InferenceBatchDimensions(
                 token_count=self.active_token_count,
                 prefill_req_count=0,
-                decode_req_count=self.total_request_count - self.paused_request_count,
+                decode_req_count=active_request_count,
             ),
         )
 
