@@ -26,9 +26,6 @@ from megatron.core.inference.contexts.dynamic_context import (
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
 )
-from megatron.core.inference.data_parallel_inference_coordinator import (
-    DataParallelInferenceCoordinator,
-)
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_step import (
     DynamicAsyncPipeline,
@@ -167,6 +164,8 @@ class AsyncOverlapDebugCounters:
     fallback_or_queue_depth_one_reasons: Dict[str, int] = field(default_factory=dict)
     accepted_output_tokens: int = 0
     discarded_lookahead_tokens: int = 0
+    dummy_forward_launches: int = 0
+    distributed_consensus_mismatches: int = 0
     speculative_rejected_tokens: int = 0
     placeholder_count: int = 0
     reservation_commits: int = 0
@@ -358,7 +357,7 @@ class DynamicInferenceEngine(AbstractEngine):
     def _step_nvtx_label(self, name: str, step_id: Optional[int] = None) -> str:
         """Return an NVTX range name with a dynamic step id."""
         if step_id is None:
-            step_id = self._current_dynamic_step_id
+            step_id = getattr(self, "_current_dynamic_step_id", -1)
         return f"{name}[step={step_id}]"
 
     def _begin_dynamic_step(self) -> int:
@@ -570,6 +569,9 @@ class DynamicInferenceEngine(AbstractEngine):
         assert HAVE_MSGPACK, (
             "please install the messagepack library to use InferenceCoordinator\n"
             "pip install msgpack"
+        )
+        from megatron.core.inference.data_parallel_inference_coordinator import (
+            DataParallelInferenceCoordinator,
         )
 
         self.zmq_context = zmq.Context.instance()
@@ -986,6 +988,24 @@ class DynamicInferenceEngine(AbstractEngine):
             return False
         return True
 
+    def can_plan_async_overlap_lookahead(self) -> bool:
+        """Return queue-depth-two eligibility without mutating debug counters."""
+        if not self.enable_async_overlap_architecture or self.async_overlap_queue_depth < 2:
+            return False
+        return self._async_overlap_lookahead_blocker() is None
+
+    def planned_async_overlap_forward_launches(
+        self, *, max_forward_launches: Optional[int] = None
+    ) -> int:
+        """Return how many real dynamic forwards the next async step can launch."""
+        if getattr(self, "enable_async_overlap_architecture", False):
+            return self.async_pipeline.planned_launch_count(
+                max_forward_launches=max_forward_launches
+            )
+        if max_forward_launches is not None and max_forward_launches <= 0:
+            return 0
+        return 1 if self.has_async_overlap_launch_work() else 0
+
     def _async_overlap_lookahead_blocker(self) -> Optional[str]:
         """Return the conservative queue-depth-two blocker, or None if eligible."""
         active_request_count = self.context.get_active_request_count()
@@ -998,12 +1018,6 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         if active_request_count <= 0 and not has_chunked_prefill_work:
             return "no_active_requests"
-        if self.use_coordinator:
-            return "coordinator"
-        if self.controller.model_is_pipeline_parallel:
-            return "pipeline_parallel"
-        if getattr(self, "ep_world_size", 1) > 1:
-            return "expert_parallel"
         if self.waiting_request_ids and self.context.enable_prefix_caching:
             return "prefix_caching_waiting_prefill"
         if has_chunked_prefill_work:
@@ -1975,6 +1989,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
     async def async_step(
         self,
+        *,
+        max_forward_launches: Optional[int] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -1989,7 +2005,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         try:
             if self.enable_async_overlap_architecture:
-                ret = await self.async_pipeline.step()
+                ret = await self.async_pipeline.step(
+                    max_forward_launches=max_forward_launches
+                )
             else:
                 last_step_data = await self.async_forward()
                 ret = await self.async_bookkeep(*last_step_data)
@@ -2215,7 +2233,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
-        self.async_pipeline.drain_for_shutdown()
+        async_pipeline = getattr(self, "async_pipeline", None)
+        if async_pipeline is not None:
+            async_pipeline.drain_for_shutdown()
 
         # Cleanup the request futures.
         for entry in self.requests.values():
@@ -2267,13 +2287,21 @@ class DynamicInferenceEngine(AbstractEngine):
             pass
 
     async def _ep_establish_consensus(
-        self, local_work: int, signal_consensus: bool
-    ) -> tuple[int, bool]:
+        self,
+        local_work: int,
+        signal_consensus: bool,
+        *,
+        local_launches: int = 0,
+        local_queue_depth: Optional[int] = None,
+        local_step_id: Optional[int] = None,
+    ) -> tuple[int, bool, int, bool]:
         """EP all-reduce to share work counts and pause consensus.
 
         All-reduces two integers at once:
         - local_work: actual pending request count (always >= 0).
         - consensus flag: -1 if this rank wants to pause, 0 otherwise.
+        - local_launches: number of real forwards this rank will launch this tick.
+        - queue depth and next step ID: debug consensus fields that detect drift.
 
         Using max for both:
         - max(work) > 0 means at least one EP peer has real work.
@@ -2284,13 +2312,25 @@ class DynamicInferenceEngine(AbstractEngine):
             local_work: Pending request count for this rank.
             signal_consensus: True if this rank is ready to pause.
         Returns:
-            (global_work, all_pausing): max work across EP, and whether
-            all peers signaled consensus.
+            (global_work, all_pausing, global_launches, metadata_agrees): max work
+            across EP, whether all peers signaled consensus, the forward-launch
+            count all ranks must participate in, and whether queue-depth/step-ID
+            debug metadata agrees.
         """
         consensus_range = self._step_nvtx_label("event_polling.ep_consensus")
         nvtx_range_push(consensus_range)
 
         consensus_val = -1 if signal_consensus else 0
+        queue_depth = (
+            int(getattr(self, "async_overlap_queue_depth", 1))
+            if local_queue_depth is None
+            else int(local_queue_depth)
+        )
+        step_id = (
+            int(getattr(self, "_next_dynamic_step_id", 0))
+            if local_step_id is None
+            else int(local_step_id)
+        )
 
         # Signals can be received asynchronously on EP ranks.
         # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
@@ -2305,16 +2345,54 @@ class DynamicInferenceEngine(AbstractEngine):
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
             # We have tried that and it blocks the event loop in megatron-rl.
-            global_work, global_consensus = (
+            (
+                global_work,
+                global_consensus,
+                global_launches,
+                max_queue_depth,
+                neg_min_queue_depth,
+                max_step_id,
+                neg_min_step_id,
+            ) = (
                 await self.expert_parallel_zmq_communicator.all_reduce_max(
-                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
+                    local_work,
+                    consensus_val,
+                    int(local_launches),
+                    queue_depth,
+                    -queue_depth,
+                    step_id,
+                    -step_id,
+                    async_op=(not self.use_synchronous_zmq_collectives),
                 )
             )
         else:
-            global_work, global_consensus = local_work, consensus_val
+            global_work = local_work
+            global_consensus = consensus_val
+            global_launches = int(local_launches)
+            max_queue_depth = queue_depth
+            neg_min_queue_depth = -queue_depth
+            max_step_id = step_id
+            neg_min_step_id = -step_id
 
         nvtx_range_pop(consensus_range)
-        return global_work, global_consensus == -1
+        metadata_agrees = (
+            max_queue_depth == -neg_min_queue_depth and max_step_id == -neg_min_step_id
+        )
+        return global_work, global_consensus == -1, global_launches, metadata_agrees
+
+    def _run_dummy_forward_launches(self, count: int) -> None:
+        """Run dummy forwards so ranks without real work match distributed launches."""
+        for _ in range(int(count)):
+            if hasattr(self, "_next_dynamic_step_id"):
+                self._begin_dynamic_step()
+            self.step_start_event.record()
+            self.controller.dummy_forward()
+            self.step_end_event.record()
+            self.step_end_event.synchronize()
+            self.context.step_count += 1
+            self.context.prefix_cache_lru_clock += 1
+            if hasattr(self, "async_overlap_debug_counters"):
+                self.async_overlap_debug_counters.dummy_forward_launches += 1
 
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
@@ -2357,9 +2435,25 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     ) + int(self.has_async_overlap_pending_work())
-                    global_work, all_pausing = await self._ep_establish_consensus(
-                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                    max_launches_per_tick = 1 if self.use_coordinator else None
+                    local_launches = self.planned_async_overlap_forward_launches(
+                        max_forward_launches=max_launches_per_tick
                     )
+                    (
+                        global_work,
+                        all_pausing,
+                        global_launches,
+                        metadata_agrees,
+                    ) = await self._ep_establish_consensus(
+                        local_pending,
+                        signal_consensus=(self.state == EngineState.PAUSING),
+                        local_launches=local_launches,
+                        local_queue_depth=getattr(self, "async_overlap_queue_depth", 1),
+                        local_step_id=getattr(self, "_next_dynamic_step_id", 0),
+                    )
+                    if not metadata_agrees:
+                        if hasattr(self, "async_overlap_debug_counters"):
+                            self.async_overlap_debug_counters.distributed_consensus_mismatches += 1
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
@@ -2369,15 +2463,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_pending > 0:
-                            await self.async_step()
+                            missing_dummy_launches = max(0, global_launches - local_launches)
+                            if missing_dummy_launches:
+                                self._run_dummy_forward_launches(missing_dummy_launches)
+                            if getattr(self, "enable_async_overlap_architecture", False):
+                                await self.async_step(
+                                    max_forward_launches=max_launches_per_tick
+                                )
+                            else:
+                                await self.async_step()
                         else:
-                            # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            self._run_dummy_forward_launches(global_launches)
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

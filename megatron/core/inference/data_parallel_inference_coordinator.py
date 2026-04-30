@@ -17,9 +17,7 @@ import torch
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
+from megatron.core.utils import accepts_parameter
 
 try:
     import zmq
@@ -587,17 +585,30 @@ class DataParallelInferenceCoordinator:
                 generated tokens to be detokenized. It is modified in place.
         """
         if finished_request["prompt"] is None:
-            finished_request["prompt"] = TextGenerationController.detokenize(
+            finished_request["prompt"] = self._detokenize(
                 self.tokenizer, finished_request["prompt_tokens"][1], remove_EOD=False
             )
         detokenize_stop_sequence = (finished_request.get("sampling_params", {}) or {}).get(
             "detokenize_stop_sequence", False
         )
-        finished_request["generated_text"] = TextGenerationController.detokenize(
+        finished_request["generated_text"] = self._detokenize(
             self.tokenizer,
             finished_request["generated_tokens"],
             remove_EOD=not detokenize_stop_sequence,
         )
+
+    @staticmethod
+    def _detokenize(
+        tokenizer, tokens: list[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+    ) -> str:
+        """Detokenize without importing the full text generation controller."""
+        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
+            while tokens and tokens[-1] == tokenizer.eod:
+                tokens = tokens[:-1]
+
+        if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
+            return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+        return tokenizer.detokenize(tokens)
 
     @classmethod
     def entrypoint(

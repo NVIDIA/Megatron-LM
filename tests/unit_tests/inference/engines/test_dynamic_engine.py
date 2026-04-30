@@ -697,6 +697,45 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize(
+        "parallel_kwargs,blocked_reason",
+        [
+            pytest.param({"pipeline_model_parallel_size": 2}, "pipeline_parallel", id="pp2"),
+            pytest.param({"expert_model_parallel_size": 2}, "expert_parallel", id="ep2"),
+        ],
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_distributed_parallel_decode(
+        self, parallel_kwargs, blocked_reason
+    ) -> None:
+        """Queue-depth-two is not gated off for validated distributed parallel modes."""
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env = self._run_test(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_cuda_graphs=None,
+            cuda_graph_scope=[],
+            force_build_cuda_graphs=True,
+            context_max_requests=16,
+            context_block_size_tokens=256,
+            enable_async_overlap_architecture=True,
+            async_overlap_queue_depth=2,
+            **parallel_kwargs,
+        )
+
+        assert env.engine.async_pipeline.pending_launch_count == 0
+        counters = env.engine.async_overlap_debug_counters
+        assert counters.queue_depth == 2
+        assert blocked_reason not in counters.fallback_or_queue_depth_one_reasons
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_overlap_queue_depth_two_decode_simple(self) -> None:
         """Queue-depth-two steady-state decode matches the serial GPT output path."""
         env = self._run_test(

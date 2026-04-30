@@ -68,30 +68,52 @@ class DynamicAsyncPipeline:
         """Number of launched steps awaiting ordered retirement."""
         return len(self.in_flight_launches)
 
-    async def step(self):
+    async def step(self, max_forward_launches: Optional[int] = None):
         """Run one queue-depth-limited pipeline step."""
         if self.queue_depth == 1:
-            return await self._step_queue_depth_one()
-        return await self._step_with_lookahead()
+            return await self._step_queue_depth_one(max_forward_launches=max_forward_launches)
+        return await self._step_with_lookahead(max_forward_launches=max_forward_launches)
 
-    async def _step_queue_depth_one(self):
+    def planned_launch_count(self, max_forward_launches: Optional[int] = None) -> int:
+        """Return how many real forwards the next :meth:`step` call can launch."""
+        if max_forward_launches is not None and max_forward_launches <= 0:
+            return 0
+        if self.pending_launch_count >= self.queue_depth:
+            return 0
+        if not self._has_launch_work():
+            return 0
+        if self.pending_launch_count > 0 and not self._can_launch_lookahead(record_blocker=False):
+            return 0
+        if max_forward_launches is None:
+            return 1
+        return min(1, int(max_forward_launches))
+
+    async def _step_queue_depth_one(self, max_forward_launches: Optional[int] = None):
         """Run the serial queue-depth-one pipeline."""
         if self.pending_launch_count >= self.queue_depth:
             await self.drain_next()
-        self.in_flight_launches.append(await self.engine.async_forward())
+        if self.planned_launch_count(max_forward_launches=max_forward_launches) > 0:
+            self.in_flight_launches.append(await self.engine.async_forward())
         return await self.drain_next()
 
-    async def _step_with_lookahead(self):
+    async def _step_with_lookahead(self, max_forward_launches: Optional[int] = None):
         """Launch one lookahead step before retiring the oldest pending step."""
         if self.pending_launch_count >= self.queue_depth:
             return await self.drain_next()
 
         launched = False
-        while self.pending_launch_count < self.queue_depth and self._has_launch_work():
+        launch_count = 0
+        launch_limit = self.queue_depth if max_forward_launches is None else max_forward_launches
+        while (
+            launch_count < launch_limit
+            and self.pending_launch_count < self.queue_depth
+            and self._has_launch_work()
+        ):
             if self.pending_launch_count > 0 and not self._can_launch_lookahead():
                 break
             self.in_flight_launches.append(await self.engine.async_forward())
             launched = True
+            launch_count += 1
             if self.pending_launch_count > 1:
                 break
 
@@ -109,8 +131,11 @@ class DynamicAsyncPipeline:
             return bool(checker())
         return True
 
-    def _can_launch_lookahead(self) -> bool:
+    def _can_launch_lookahead(self, *, record_blocker: bool = True) -> bool:
         """Return whether a pending step can safely be left for ordered retirement."""
+        planning_checker = getattr(self.engine, "can_plan_async_overlap_lookahead", None)
+        if not record_blocker and planning_checker is not None:
+            return bool(planning_checker())
         checker = getattr(self.engine, "can_launch_async_overlap_lookahead", None)
         if checker is not None:
             return bool(checker())

@@ -148,6 +148,30 @@ def test_dynamic_async_pipeline_queue_depth_two_launches_before_retirement():
     assert pipeline.pending_launch_count == 0
 
 
+def test_dynamic_async_pipeline_can_stage_one_launch_per_distributed_tick():
+    engine = FakePipelineEngine(max_launches=3)
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=FakeRetirementService(), queue_depth=2
+    )
+
+    assert pipeline.planned_launch_count(max_forward_launches=1) == 1
+    first = asyncio.run(pipeline.step(max_forward_launches=1))
+    assert first is None
+    assert engine.forward_calls == [0]
+    assert pipeline.pending_launch_count == 1
+
+    assert pipeline.planned_launch_count(max_forward_launches=1) == 1
+    second = asyncio.run(pipeline.step(max_forward_launches=1))
+    assert second == {"retired_step": 0}
+    assert engine.forward_calls == [0, 1]
+    assert pipeline.pending_launch_count == 1
+
+    third = asyncio.run(pipeline.step(max_forward_launches=0))
+    assert third == {"retired_step": 1}
+    assert engine.forward_calls == [0, 1]
+    assert pipeline.pending_launch_count == 0
+
+
 def test_dynamic_async_pipeline_queue_depth_two_falls_back_when_lookahead_blocked():
     engine = FakePipelineEngine(max_launches=2, lookahead_allowed=False)
     pipeline = DynamicAsyncPipeline(
