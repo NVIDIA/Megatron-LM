@@ -103,6 +103,7 @@ _STATE_DIMS = {
 @pytest.mark.internal
 class TestDynamicInference:
     """Verify full HybridModel output shapes under EP strict matching scenarios."""
+
     MAX_SEQ_LEN = 512
     VOCAB_SIZE = 128
 

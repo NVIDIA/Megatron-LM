@@ -760,8 +760,7 @@ class TestMTPCudaGraphExpertParallel:
             mtp_num_layers=2,
             cuda_graph_impl="local",
             moe_pad_experts_for_cuda_graph_inference=True,
-            inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type
-
+            inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
         )
         layer_spec = get_gpt_layer_local_spec(num_experts=self.NUM_MOE_EXPERTS)
         mtp_block_spec = get_gpt_mtp_block_spec(

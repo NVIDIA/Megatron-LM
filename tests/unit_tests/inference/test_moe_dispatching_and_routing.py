@@ -69,7 +69,7 @@ NANOV3_BASE = dict(
     mamba_state_dim=128,
     mamba_head_dim=64,
     mamba_num_groups=8,
-    mamba_num_heads=64
+    mamba_num_heads=64,
 )
 
 
