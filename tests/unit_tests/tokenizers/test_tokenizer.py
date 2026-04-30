@@ -523,4 +523,3 @@ class TestExtractTokenIds:
     # --- 2D raw ndarray (1, seq_len) — the bug fixed in this PR ---
     def test_2d_ndarray_batch1(self):
         self._check(np.array([_IDS]))  # shape (1, 5)
-
