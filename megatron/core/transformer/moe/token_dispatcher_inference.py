@@ -57,7 +57,7 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     # so that experts.py can always call _valid_tokens() on this base class.
     _valid_tokens_tensor: Optional[torch.Tensor] = None
 
-    def __init__(self, *args, runs_metadata_sync: bool = False, **kwargs) -> None:
+    def __init__(self, *args, runs_metadata_sync: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._runs_metadata_sync = runs_metadata_sync
 
@@ -97,7 +97,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        runs_metadata_sync: bool = False,
+        runs_metadata_sync: bool = True,
     ) -> None:
         super().__init__(
             num_local_experts=num_local_experts,
@@ -398,7 +398,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        runs_metadata_sync: bool = False,
+        runs_metadata_sync: bool = True,
     ) -> None:
         super().__init__(
             num_local_experts=num_local_experts,

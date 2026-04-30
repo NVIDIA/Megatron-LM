@@ -358,22 +358,21 @@ class TestNVLSAllGatherVDispatcher:
 
     @pytest.mark.parametrize("seed", [42, 123, 7])
     @pytest.mark.parametrize(
-        "num_local_tokens",
+        "max_rank_tokens",
         # Covers: small, unaligned, power-of-2, and large up to engine_max
         [1, 7, 16, 24, 64, 128, 256, 512],
     )
-    def test_cuda_graph_dispatch_combine(self, num_local_tokens, seed):
+    def test_cuda_graph_dispatch_combine(self, max_rank_tokens, seed):
         """Dispatch+combine can be captured in a CUDA graph and replayed.
 
-        Creates global buffers, shards per rank, and verifies:
+        Uses uneven token counts across EP ranks (rank r gets
+        max(1, max_rank_tokens + r - (ep_size - 1)) tokens) to exercise the
+        AllGatherV variable-length path. Verifies:
         - AllGatherV output matches the global reference (valid prefix only)
         - ReduceScatterV output matches fp32-accumulated reference
         Exact match (atol=0) is possible because the NVLS triton kernels
         accumulate in fp32 before writing bf16 output.
         """
-        from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NVLSAllGatherVDispatcher,
-        )
 
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
@@ -384,21 +383,25 @@ class TestNVLSAllGatherVDispatcher:
         topk = NANOV3_BASE["moe_router_topk"]
         num_experts = NANOV3_BASE["num_moe_experts"]
         rank = torch.distributed.get_rank() if ep_size > 1 else 0
-        num_global_tokens = num_local_tokens * ep_size
+
+        # Uneven token counts: rank r gets max(1, max_rank_tokens + r - (ep_size-1))
+        # so the last rank always has max_rank_tokens (≤ engine_max) and earlier
+        # ranks have fewer, exercising the variable-length AllGatherV path.
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
         global_max = _NVLS_ENGINE_MAX_TOKENS * ep_size
 
-        global_hidden = torch.randn(
-            num_global_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
-        )
-        global_probs = torch.randn(num_global_tokens, topk, device="cuda", dtype=torch.float32)
-        global_routing_map = torch.randint(0, num_experts, (num_global_tokens, topk), device="cuda")
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
+        global_routing_map = torch.randint(0, num_experts, (total_tokens, topk), device="cuda")
         if ep_size > 1:
             torch.distributed.broadcast(global_hidden, src=0)
             torch.distributed.broadcast(global_probs, src=0)
             torch.distributed.broadcast(global_routing_map, src=0)
 
-        start = rank * num_local_tokens
-        end = start + num_local_tokens
+        start = sum(tokens_per_rank[:rank])
+        end = start + local_tokens
         static_hidden = global_hidden[start:end].contiguous()
         static_probs = global_probs[start:end].contiguous()
         static_routing_map = global_routing_map[start:end].contiguous()
@@ -413,7 +416,7 @@ class TestNVLSAllGatherVDispatcher:
             with torch.cuda.stream(s):
                 for _ in range(3):
                     dispatcher.routing_map = static_routing_map
-                    dispatcher._local_tokens = num_local_tokens
+                    dispatcher._local_tokens = local_tokens
                     d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
                     dispatcher.token_combine(d_hidden.clone())
             torch.cuda.current_stream().wait_stream(s)
@@ -422,17 +425,17 @@ class TestNVLSAllGatherVDispatcher:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             dispatcher.routing_map = static_routing_map
-            dispatcher._local_tokens = num_local_tokens
+            dispatcher._local_tokens = local_tokens
             d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
-            graph_hidden = d_hidden[:num_global_tokens].clone()
-            graph_probs = d_probs[:num_global_tokens].clone()
-            graph_routing_map = dispatcher.routing_map[:num_global_tokens].clone()
+            graph_hidden = d_hidden[:total_tokens].clone()
+            graph_probs = d_probs[:total_tokens].clone()
+            graph_routing_map = dispatcher.routing_map[:total_tokens].clone()
             graph_combined = dispatcher.token_combine(d_hidden.clone())
 
-        # dispatch output is (global_max, *); only first num_global_tokens are valid
+        # dispatch output is (global_max, *); only first total_tokens are valid
         assert d_hidden.shape == (global_max, hidden_size)
         assert d_probs.shape == (global_max, topk)
-        assert graph_combined.shape == (num_local_tokens, hidden_size)
+        assert graph_combined.shape == (local_tokens, hidden_size)
 
         graph.replay()
 
