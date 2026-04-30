@@ -1554,22 +1554,52 @@ class DynamicInferenceContext(BaseInferenceContext):
         # output placeholders + snapshot owner. ``begin_step_transaction``
         # is idempotent: the engine opens the entry in async_forward
         # (commit 6) so this call is a no-op there. Placeholder delta is
-        # ``1 + speculative_width`` per active slot, decremented in
+        # ``1 + speculative_width`` per active decode slot, decremented in
         # ``commit_step_transaction`` by the actual accepted count. The
         # snapshot owner is recorded with the currently active pool slot;
         # commit 15 promotes this to the per-step acquired slot.
+        # v3 plan §commit 22 — chunked-prefill non-final chunks contribute
+        # placeholder_delta=0 (no output token this step) so the request
+        # stays active across the placeholder boundary; the final chunk
+        # contributes the standard 1 + speculative_width.
         self.begin_step_transaction(step_id)
         active_request_count = self.total_request_count - self.paused_request_count
         active_slots: List[int] = []
+        chunked_prefill_idx = -1
+        if self.chunked_prefill_request_id != -1:
+            chunked_prefill_idx = self.get_index_of_chunked_prefill_request(safe=True)
         if active_request_count > 0:
             active_slots = list(
                 range(self.paused_request_count, self.total_request_count)
             )
-            self.add_output_placeholders(
-                step_id=step_id,
-                slot_indices=active_slots,
-                delta=1 + self.num_speculative_tokens,
-            )
+            standard_delta = 1 + self.num_speculative_tokens
+            if chunked_prefill_idx == -1:
+                self.add_output_placeholders(
+                    step_id=step_id,
+                    slot_indices=active_slots,
+                    delta=standard_delta,
+                )
+            else:
+                # Non-final chunked-prefill slot gets delta=0; the rest get
+                # standard_delta. Recorded in two passes so the journal
+                # accounting is straightforward.
+                non_chunked_slots = [
+                    s for s in active_slots if s != chunked_prefill_idx
+                ]
+                if non_chunked_slots:
+                    self.add_output_placeholders(
+                        step_id=step_id,
+                        slot_indices=non_chunked_slots,
+                        delta=standard_delta,
+                    )
+                # delta=0 still produces a journaled record so the request
+                # is tracked across the placeholder boundary even though the
+                # placeholder count is unchanged.
+                self.add_output_placeholders(
+                    step_id=step_id,
+                    slot_indices=[chunked_prefill_idx],
+                    delta=0,
+                )
         active_slot_id = getattr(self, "_active_snapshot_slot", -1)
         self.record_snapshot_owner(
             step_id=step_id, snapshot_buffer_id=active_slot_id
