@@ -1995,6 +1995,12 @@ def _add_inference_args(parser):
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
+    group.add_argument('--inference-deferred-request-bookkeeping',
+                       action=argparse.BooleanOptionalAction,
+                       required=False, default=True,
+                       help='Run request bookkeeping asynchronously, one step behind '
+                            'the forward loop. Use --no-inference-deferred-request-bookkeeping '
+                            'to run synchronously.')
     group.add_argument('--inference-text-gen-server-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False,
                        help='Enable per-request logging in the inference text generation server.')
