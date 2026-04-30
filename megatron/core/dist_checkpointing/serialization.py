@@ -149,7 +149,12 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    async_strategy = getattr(common_state_dict.get("args"), "async_strategy", "nvrx")
+    ckpt_args = common_state_dict.get("args")
+    async_strategy = (
+        getattr(ckpt_args, "async_strategy", "mcore")
+        if getattr(ckpt_args, "async_save", False)
+        else "mcore"
+    )
     # ``replicate_local_replicas`` is plumbed at .load()-time rather than at
     # strategy construction so the same strategy object can be reused across
     # different load runs with different knob values (e.g. for A/B

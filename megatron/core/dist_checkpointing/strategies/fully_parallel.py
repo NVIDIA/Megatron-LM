@@ -249,7 +249,7 @@ class FullyParallelLoadStrategyWrapper:
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
-        async_strategy: str = "nvrx",
+        async_strategy: str = "mcore",
         replicate_local_replicas: bool = False,
     ) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
@@ -276,7 +276,7 @@ class FullyParallelLoadStrategyWrapper:
             checkpoint_dir (Path): checkpoint directory to load from
             async_strategy (str): which async backend to use for the
                 base-strategy load (``"nvrx"`` or ``"mcore"``). Defaults
-                to ``"nvrx"``.
+                to ``"mcore"``.
             replicate_local_replicas (bool): forwarded to the base
                 strategy's ``.load`` so the rank that the load picker
                 chose to read each shard can route to its own
