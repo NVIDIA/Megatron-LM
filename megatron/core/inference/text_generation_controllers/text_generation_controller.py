@@ -5,6 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
@@ -52,6 +53,65 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+
+# ---------------------------------------------------------------------------
+# Per-step carrier types (v3 plan commit 3 — phased controller).
+#
+# These private dataclasses carry per-step state between the seven phase
+# methods extracted from `async_generate_output_tokens_dynamic_batch`. They
+# are placeholders used by the legacy serial path; commits 9 (snapshot pool)
+# and 17 (GpuInputPreparer) replace ``_SerialStepSnapshot`` with the real
+# ``DynamicStepSnapshot`` from ``async_pipeline_types`` and tighten the
+# typed interface across phase boundaries.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SerialStepSnapshot:
+    """Per-step state for the legacy serial controller path.
+
+    Replaced by ``DynamicStepSnapshot`` (see v3 plan §2.5) in commit 9 once
+    the snapshot pool exists.
+    """
+
+    step_id: int
+    input_ids: Tensor
+    position_ids: Tensor
+    cuda_graph_request_count: Optional[int]
+
+
+@dataclass
+class _ForwardArtifacts:
+    """Output of ``launch_dynamic_forward``."""
+
+    logits: Optional[Tensor]
+    routing_indices_per_request: Any
+
+
+@dataclass
+class _SamplingArtifacts:
+    """Output of ``launch_dynamic_sampling``."""
+
+    return_log_probs: bool
+    return_top_n_logprobs: bool
+    log_probs: Any = None
+    top_n_logprobs: Any = None
+
+
+@dataclass
+class _CollectedOutput:
+    """Output of ``collect_dynamic_output``.
+
+    Holds every per-step value that ``commit_dynamic_step`` needs to build
+    the public step-result dict for the engine.
+    """
+
+    request_bookkeeping: Dict[str, Any]
+    accepted_tokens: Optional[Tensor]
+    log_probs: Any
+    top_n_logprobs: Any
+    routing_indices_per_request: Any
+    cuda_graph_request_count: Optional[int]
 
 
 # pylint: disable=line-too-long
@@ -1855,6 +1915,212 @@ class TextGenerationController:
             **(update_result or {}),
         }
 
+    # ------------------------------------------------------------------
+    # Phase methods (v3 plan commit 3 — phased controller).
+    #
+    # These seven methods replace the monolithic body of
+    # ``async_generate_output_tokens_dynamic_batch``. Each method owns one
+    # phase from §2.1 of the v3 plan; the public async method below is now
+    # a thin wrapper that calls them in order. Behavior is bit-identical to
+    # the prior monolith for the legacy serial path.
+    # ------------------------------------------------------------------
+
+    def prepare_dynamic_step_snapshot(
+        self, step_id: int, plan: Optional[Any] = None
+    ) -> _SerialStepSnapshot:
+        """Phase 1: snapshot prep — populate per-step input/position IDs.
+
+        ``plan`` is unused at this commit; commit 13 introduces
+        ``DynamicStepPlan`` and commit 15 wires the snapshot pool.
+        """
+        del plan  # not consumed in the legacy serial path
+        context = self.inference_wrapped_model.inference_context
+        input_ids, position_ids = self._dynamic_step_context_init()
+        cuda_graph_request_count = (
+            context.padded_active_request_count
+            if context.using_cuda_graph_this_step()
+            else None
+        )
+        return _SerialStepSnapshot(
+            step_id=step_id,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            cuda_graph_request_count=cuda_graph_request_count,
+        )
+
+    def prepare_dynamic_gpu_inputs(
+        self,
+        snapshot: _SerialStepSnapshot,
+        prev_sample_state: Optional[Any] = None,
+    ) -> None:
+        """Phase 2: GPU input prep — no-op stub at commit 3.
+
+        Commit 17 introduces ``GpuInputPreparer`` and fills in the real body
+        (D2D copy of the previous step's sampled tokens, then scatter into
+        the snapshot's ``token_to_input_ids``). The serial legacy path
+        produces input ids on CPU inside ``_dynamic_step_context_init`` so
+        no GPU scatter is needed today.
+        """
+        del snapshot, prev_sample_state  # placeholder
+
+    def launch_dynamic_forward(self, snapshot: _SerialStepSnapshot) -> _ForwardArtifacts:
+        """Phase 3: forward kernels + Mamba commit + routing record."""
+        context = self.inference_wrapped_model.inference_context
+        config = self.inference_wrapped_model.model.config
+        if config.moe_enable_routing_replay:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+        range_push(f"forward_pass[step={snapshot.step_id}]")
+        logits = self._dynamic_step_forward_logits(snapshot.input_ids, snapshot.position_ids)
+
+        # Commit Mamba intermediate states before update_requests, which may
+        # swap request indices. The Python lists tracking EOS block IDs and
+        # intermediate offsets are not swapped along with tensors, so commit
+        # must run while indices are still valid.
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
+
+        # Collect routing indices per request (must be done before context transitions)
+        routing_indices_per_request = self._router_record_bookkeeping()
+        range_pop()
+
+        return _ForwardArtifacts(
+            logits=logits,
+            routing_indices_per_request=routing_indices_per_request,
+        )
+
+    def launch_dynamic_sampling(
+        self,
+        snapshot: _SerialStepSnapshot,
+        forward_artifacts: _ForwardArtifacts,
+    ) -> _SamplingArtifacts:
+        """Phase 4: sampling, optional speculative verify + rewind, log-probs."""
+        range_push(f"sampling[step={snapshot.step_id}]")
+        return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        self._dynamic_step_sample_bookkeeping()
+
+        logits = forward_artifacts.logits
+        if self.num_speculative_tokens > 0:
+            # Phase 1: Verify speculative tokens using base logits only.
+            self._dynamic_step_sample_logits_and_verify_tokens(logits, snapshot.input_ids)
+            # Phase 2: Rewind KV cache for rejected tokens.
+            self._rewind_kv_cache()
+
+            # Disable MoE padding for MTP computation
+            if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                set_decode_expert_padding(unwrapped_model, False)
+
+            # Phase 3: Compute MTP serially with correct (verified) inputs.
+            self._compute_serial_mtp_and_sample()
+        else:
+            self._dynamic_step_sample_logits(logits)
+
+        log_probs = None
+        top_n_logprobs = None
+        if return_log_probs or return_top_n_logprobs:
+            if self.num_speculative_tokens > 0:
+                log_probs, log_probs_tensor = (
+                    self._dynamic_step_calculate_log_probs_speculative(logits)
+                )
+                if return_top_n_logprobs:
+                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
+                        log_probs_tensor
+                    )
+            else:
+                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+                if return_top_n_logprobs:
+                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                        logits, log_probs_tensor
+                    )
+        range_pop()
+
+        return _SamplingArtifacts(
+            return_log_probs=return_log_probs,
+            return_top_n_logprobs=return_top_n_logprobs,
+            log_probs=log_probs,
+            top_n_logprobs=top_n_logprobs,
+        )
+
+    def begin_dynamic_output_copy(
+        self,
+        snapshot: _SerialStepSnapshot,
+        sampling_artifacts: _SamplingArtifacts,
+        skip_bookkeeping: bool = False,
+    ) -> Dict[str, Any]:
+        """Phase 5: D2H of CPU-visible outputs.
+
+        Today this still runs synchronously; commit 4 rewrites this to
+        populate an ``AsyncStepOutput`` on the dedicated d2h_output stream.
+        Returns the request_bookkeeping dict the legacy path consumes.
+        """
+        del sampling_artifacts  # only consumed by collect/commit phases below
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        del snapshot
+        if skip_bookkeeping:
+            # _transfer_samples_to_cpu wasn't invoked on this path, so do a
+            # one-shot D2H here to keep "sample" as a CPU tensor for
+            # downstream consumers.
+            return {
+                "sample": self._sampled_tokens_cuda[:active_request_count].cpu(),
+            }
+        # request_bookkeeping supplies "sample" as the already-CPU tensor
+        # produced by _transfer_samples_to_cpu.
+        return self._dynamic_step_context_bookkeeping()
+
+    def collect_dynamic_output(
+        self,
+        snapshot: _SerialStepSnapshot,
+        forward_artifacts: _ForwardArtifacts,
+        sampling_artifacts: _SamplingArtifacts,
+        request_bookkeeping: Dict[str, Any],
+    ) -> _CollectedOutput:
+        """Phase 6: assemble the structured output bundle.
+
+        At this commit this is a pure CPU assembly — no D2H synchronization
+        needed (``begin_dynamic_output_copy`` already finished it). Commit 18
+        replaces this with a sync on ``AsyncStepOutput.d2h_done_event``.
+        """
+        accepted_tokens = (
+            # Clone needed: .fill_(-1) below would corrupt the returned value.
+            self._accepted_tokens_per_request.clone()
+            if self.num_speculative_tokens > 0
+            else None
+        )
+        return _CollectedOutput(
+            request_bookkeeping=request_bookkeeping,
+            accepted_tokens=accepted_tokens,
+            log_probs=sampling_artifacts.log_probs,
+            top_n_logprobs=sampling_artifacts.top_n_logprobs,
+            routing_indices_per_request=forward_artifacts.routing_indices_per_request,
+            cuda_graph_request_count=snapshot.cuda_graph_request_count,
+        )
+
+    def commit_dynamic_step(
+        self,
+        snapshot: _SerialStepSnapshot,
+        collected: _CollectedOutput,
+    ) -> Dict[str, Any]:
+        """Phase 7: build the final step-result dict and reset spec scratch.
+
+        Commit 6 augments this with journal commit; commit 18 wires it
+        through ``StepRetirementService``.
+        """
+        del snapshot
+        ret = {
+            "accepted_tokens": collected.accepted_tokens,
+            "log_probs": collected.log_probs,
+            "top_n_logprobs": collected.top_n_logprobs,
+            "routing_indices_per_request": collected.routing_indices_per_request,
+            "cuda_graph_request_count": collected.cuda_graph_request_count,
+        }
+        if self.num_speculative_tokens > 0:
+            self._accepted_tokens_per_request.fill_(-1)
+            self._accepted_token_counts_per_request.fill_(0)
+        ret.update(collected.request_bookkeeping)
+        return ret
+
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
@@ -1874,121 +2140,33 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        step_id = context.step_count
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
+        step_id = context.step_count
+
+        # Phases 1-3 (snapshot prep, GPU input prep, forward) under inference_mode.
         with torch.inference_mode():
-            input_ids, position_ids = self._dynamic_step_context_init()
+            snapshot = self.prepare_dynamic_step_snapshot(step_id)
+            self.prepare_dynamic_gpu_inputs(snapshot)
+            forward_artifacts = self.launch_dynamic_forward(snapshot)
 
-            cuda_graph_request_count = (
-                context.padded_active_request_count
-                if context.using_cuda_graph_this_step()
-                else None
-            )
-
-            # Enable routing recording before forward pass if routing replay is enabled
-            config = self.inference_wrapped_model.model.config
-            if config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
-
-            # Forward pass produces only base logits. When speculative decoding is
-            # active, MTP logits are computed serially after verification.
-            range_push(f"forward_pass[step={step_id}]")
-            logits = self._dynamic_step_forward_logits(input_ids, position_ids)
-
-            # Commit Mamba intermediate states before update_requests, which
-            # may swap request indices. The Python lists tracking EOS block IDs
-            # and intermediate offsets are not swapped along with tensors, so
-            # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
-
-            # Collect routing indices per request (must be done before context transitions)
-            routing_indices_per_request = self._router_record_bookkeeping()
-            range_pop()
-
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
+        # Yield control to the event loop while forward kernels run on GPU.
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
+        # Phases 4-7 (sampling, output copy, collect, commit) under inference_mode.
         with torch.inference_mode():
-            range_push(f"sampling[step={step_id}]")
-            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
-
-            self._dynamic_step_sample_bookkeeping()
-
-            if self.num_speculative_tokens > 0:
-                # Phase 1: Verify speculative tokens using base logits only.
-                self._dynamic_step_sample_logits_and_verify_tokens(logits, input_ids)
-                # Phase 2: Rewind KV cache for rejected tokens.
-                self._rewind_kv_cache()
-
-                # Disable MoE padding for MTP computation
-                if self.model_config.moe_pad_experts_for_cuda_graph_inference:
-                    unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-                    set_decode_expert_padding(unwrapped_model, False)
-
-                # Phase 3: Compute MTP serially with correct (verified) inputs.
-                self._compute_serial_mtp_and_sample()
-            else:
-                self._dynamic_step_sample_logits(logits)
-
-            log_probs = None
-            top_n_logprobs = None
-            if return_log_probs or return_top_n_logprobs:
-                if self.num_speculative_tokens > 0:
-                    log_probs, log_probs_tensor = (
-                        self._dynamic_step_calculate_log_probs_speculative(logits)
-                    )
-                    if return_top_n_logprobs:
-                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
-                            log_probs_tensor
-                        )
-                else:
-                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
-                    if return_top_n_logprobs:
-                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
-                            logits, log_probs_tensor
-                        )
-            range_pop()
-
-            if skip_bookkeeping:
-                # _transfer_samples_to_cpu wasn't invoked on this path, so do
-                # a one-shot D2H here to keep "sample" as a CPU tensor for
-                # downstream consumers.
-                request_bookkeeping = {
-                    "sample": self._sampled_tokens_cuda[:active_request_count].cpu(),
-                }
-            else:
-                # request_bookkeeping supplies "sample" as the already-CPU
-                # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
-
-            ret = {
-                "accepted_tokens": (
-                    # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
-                    self._accepted_tokens_per_request.clone()
-                    if self.num_speculative_tokens > 0
-                    else None
-                ),
-                "log_probs": log_probs,
-                "top_n_logprobs": top_n_logprobs,
-                "routing_indices_per_request": routing_indices_per_request,
-                "cuda_graph_request_count": cuda_graph_request_count,
-            }
-            if self.num_speculative_tokens > 0:
-                self._accepted_tokens_per_request.fill_(-1)
-                self._accepted_token_counts_per_request.fill_(0)
-            ret.update(request_bookkeeping)
-            return ret
+            sampling_artifacts = self.launch_dynamic_sampling(snapshot, forward_artifacts)
+            request_bookkeeping = self.begin_dynamic_output_copy(
+                snapshot, sampling_artifacts, skip_bookkeeping=skip_bookkeeping
+            )
+            collected = self.collect_dynamic_output(
+                snapshot, forward_artifacts, sampling_artifacts, request_bookkeeping
+            )
+            return self.commit_dynamic_step(snapshot, collected)
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
