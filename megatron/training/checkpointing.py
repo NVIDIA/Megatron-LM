@@ -2064,7 +2064,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         print_distributed_quant_summary(model, msg="After loading checkpoint")
 
         # Load teacher model in Distillation mode.
-        if args.export_kd_teacher_load:
+        if getattr(args, "export_kd_teacher_load", None):
             from megatron.post_training.checkpointing import load_modelopt_checkpoint
 
             unwrapped_model = unwrap_model(model)[0]
