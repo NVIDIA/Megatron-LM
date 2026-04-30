@@ -510,12 +510,28 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         self.shapes_validation_sharded_tensors = shapes_validation_sharded_tensors
         self.allow_shape_mismatch_sharded_tensors = allow_shape_mismatch_sharded_tensors
         self.stream_ckpt_dequant = stream_ckpt_dequant
-        # Maps id(read_item) -> (read_item, target_tensor, amax_snapshot_or_None, kind)
-        # kind is "stream" for the streaming per-tensor dequant path and "noncontig"
-        # for the existing contiguity-fix path.
+        # Per-read-item bookkeeping. Maps id(read_item) -> tuple
+        #   (read_item, target_tensor, kind, target_id_or_None)
+        # ``kind`` is "stream" for the streaming per-tensor dequantize path or
+        # "noncontig" for the contiguity-fix path. ``target_id`` is set only
+        # for "stream" entries and indexes ``self._stream_targets``.
         self._intermediate_read_items: Dict[
-            int, Tuple[ReadItem, torch.Tensor, Optional[torch.Tensor], str]
+            int, Tuple[ReadItem, torch.Tensor, str, Optional[int]]
         ] = {}
+        # Per-quantized-target streaming state. Keyed by id(full_target_tensor)
+        # (the un-narrowed QuantizedTensor returned by ``lookup_tensor``).
+        # Each entry holds:
+        #   "target":        the full QuantizedTensor (model param)
+        #   "buffer":        full-shape BF16 buffer; DCP fills slices of it
+        #                    via the views returned by ``resolve_tensor``
+        #   "remaining":     read_items still pending ``commit_tensor``
+        #   "amax_snapshot": pre-load amax snapshot for delayed-scaling
+        # The buffer-then-quantize-once design (rather than quantize-per-slice)
+        # is required for tensorwise / current-scaling FP8: each per-slice
+        # ``copy_`` would recompute the per-tensor scale from that slice's
+        # amax and corrupt earlier slices' data — visible when loading a
+        # checkpoint saved at a different parallelism (resharding).
+        self._stream_targets: Dict[int, Dict[str, Any]] = {}
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -560,11 +576,52 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
                 md.size = size
 
     def create_local_plan(self) -> LoadPlan:
-        """Runs additional shapes validation."""
+        """Runs additional shapes validation and pre-counts streaming targets."""
         self._validate_global_shapes(self.metadata, self.shapes_validation_sharded_tensors)
 
         with self._temporarily_bypass_shape_validation():
             local_plan = super().create_local_plan()
+
+        # Pre-count read_items per quantized target so that ``commit_tensor``
+        # knows when the last slice has been written and can do the single
+        # quantize-on-copy. With resharding (e.g. TP=8 saved -> TP=1 loaded)
+        # one quantized destination receives multiple read_items; quantizing
+        # per slice would recompute the global scale on each commit and
+        # corrupt earlier slices.
+        if self.stream_ckpt_dequant and HAVE_TE:
+            from ...fp8_utils import is_float8tensor as _is_quantized_tensor
+
+            for read_item in local_plan.items:
+                full_target = self.lookup_tensor(read_item.dest_index)
+                if not (
+                    isinstance(full_target, torch.Tensor)
+                    and _is_quantized_tensor(full_target)
+                    and full_target.is_cuda
+                ):
+                    continue
+                tid = id(full_target)
+                entry = self._stream_targets.get(tid)
+                if entry is None:
+                    # Snapshot amax for delayed-scaling quantizers so the
+                    # subsequent BF16->FP8 quantize-copy does not pollute
+                    # amax_history. For current-scaling / MXFP8 / blockwise /
+                    # NVFP4 quantizers, amax is None or absent and the
+                    # snapshot is a no-op.
+                    amax_snapshot: Optional[torch.Tensor] = None
+                    quantizer = getattr(full_target, "_quantizer", None)
+                    amax = (
+                        getattr(quantizer, "amax", None) if quantizer is not None else None
+                    )
+                    if isinstance(amax, torch.Tensor):
+                        amax_snapshot = amax.detach().clone()
+                    self._stream_targets[tid] = {
+                        "target": full_target,
+                        "buffer": None,  # lazily allocated on first resolve
+                        "remaining": 1,
+                        "amax_snapshot": amax_snapshot,
+                    }
+                else:
+                    entry["remaining"] += 1
 
         return local_plan
 
@@ -576,16 +633,19 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         1. Streaming per-tensor dequantize (when ``stream_ckpt_dequant`` is True
            and the destination is a TE ``QuantizedTensor`` — covers Float8,
            MXFP8, blockwise FP8, and NVFP4 via the common base class). We
-           allocate a per-tensor high-precision scratch buffer, return it as
-           the load destination, and quantize-copy it back into the original
-           tensor in ``commit_tensor``. This replaces the upfront bulk
-           dequantize done by ``force_all_tensors_to_non_fp8`` and keeps at
-           most one scratch tensor live at a time.
+           allocate a single full-shape BF16 buffer per quantized destination
+           (lazily, on the first read_item that targets it) and return slice
+           views of that buffer to DCP for each read_item. ``commit_tensor``
+           refcounts the read_items and triggers a single quantize-on-copy
+           into the original quantized tensor when the last slice has been
+           written. This replaces the upfront bulk dequantize done by
+           ``force_all_tensors_to_non_fp8`` while preserving correctness
+           under resharding (one quantize per tensor, not per slice).
 
         2. Non-contiguous Float8 fix: narrowing a Float8Tensor can produce a
            non-contiguous view for which no ``copy_`` kernel exists. We fall
            back to a contiguous Float8 clone and copy it back in
-           ``commit_tensor``.
+           ``commit_tensor``. Only used when streaming is disabled.
 
         Both cases stash state in ``self._intermediate_read_items``, keyed by
         ``id(read_item)``, so ``commit_tensor`` can undo them.
@@ -601,26 +661,38 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
             and _is_quantized_tensor(target_tensor)
             and target_tensor.is_cuda
         ):
-            # Snapshot amax for delayed-scaling quantizers so the subsequent
-            # BF16->FP8 quantize-copy does not pollute amax_history. For
-            # current-scaling / MXFP8 / blockwise / NVFP4 quantizers, amax is
-            # None or absent on the quantizer and the snapshot is a no-op.
-            amax_snapshot: Optional[torch.Tensor] = None
-            quantizer = getattr(target_tensor, "_quantizer", None)
-            amax = getattr(quantizer, "amax", None) if quantizer is not None else None
-            if isinstance(amax, torch.Tensor):
-                amax_snapshot = amax.detach().clone()
-
-            scratch = torch.empty(
-                target_tensor.shape, dtype=target_tensor.dtype, device=target_tensor.device
+            # ``target_tensor`` may be a narrowed view of the underlying full
+            # QuantizedTensor (one read_item == one disk shard's region of
+            # the destination). The full tensor — needed both as the key for
+            # buffer reuse and as the eventual quantize-copy destination — is
+            # ``lookup_tensor``'s un-narrowed result.
+            full_target = self.lookup_tensor(read_item.dest_index)
+            tid = id(full_target)
+            entry = self._stream_targets.get(tid)
+            assert entry is not None, (
+                "Streaming target was not pre-counted in create_local_plan. "
+                "resolve_tensor should never see a quantized destination that "
+                "create_local_plan didn't enumerate; finalizing without the "
+                "true read_item count would quantize too early and corrupt "
+                "later slices."
             )
+            if entry["buffer"] is None:
+                entry["buffer"] = torch.empty(
+                    full_target.shape,
+                    dtype=full_target.dtype,
+                    device=full_target.device,
+                )
+            # Hand DCP a narrow BF16 view matching this read_item's slice;
+            # DCP will write the disk bytes into it. The single ``copy_``
+            # into ``full_target`` happens after the last slice commits.
+            buffer_slice = self.transform_tensor(read_item, entry["buffer"])
             self._intermediate_read_items[id(read_item)] = (
                 read_item,
                 target_tensor,
-                amax_snapshot,
                 "stream",
+                tid,
             )
-            return scratch
+            return buffer_slice
 
         if (
             not target_tensor.is_contiguous()
@@ -630,8 +702,8 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
             self._intermediate_read_items[id(read_item)] = (
                 read_item,
                 target_tensor,
-                None,
                 "noncontig",
+                None,
             )
             target_tensor = Float8Tensor.make_like(
                 target_tensor, data=target_tensor._data.contiguous()
@@ -641,20 +713,37 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
         """Undo the detours stashed in ``resolve_tensor``.
 
-        - Streaming case: copy the high-precision scratch back into the
-          original quantized tensor (quantize-on-copy), then restore the
-          pre-load ``amax`` for delayed-scaling quantizers.
+        - Streaming case: decrement the per-target read_item refcount. When
+          it reaches zero (last slice), copy the full BF16 buffer back into
+          the original QuantizedTensor in a single quantize-on-copy, then
+          restore the pre-load ``amax`` for delayed-scaling quantizers.
         - Non-contiguous case: copy the contiguous clone back into the
           original narrowed Float8Tensor view.
         """
         entry = self._intermediate_read_items.pop(id(read_item), None)
         if entry is not None:
-            _, target_tensor, amax_snapshot, kind = entry
-            target_tensor.copy_(tensor)
-            if kind == "stream" and amax_snapshot is not None:
-                # quantizer was non-None when we took the snapshot
-                target_tensor._quantizer.amax.copy_(amax_snapshot)
-            tensor = target_tensor
+            _, target_tensor, kind, tid = entry
+            if kind == "stream":
+                stream_entry = self._stream_targets[tid]
+                stream_entry["remaining"] -= 1
+                if stream_entry["remaining"] == 0:
+                    full_target = stream_entry["target"]
+                    full_buffer = stream_entry["buffer"]
+                    # Single BF16 -> FP8 quantize-copy with one consistent
+                    # global scale, regardless of how many disk shards fed
+                    # this destination.
+                    full_target.copy_(full_buffer)
+                    amax_snapshot = stream_entry["amax_snapshot"]
+                    if amax_snapshot is not None:
+                        # quantizer was non-None when we took the snapshot
+                        full_target._quantizer.amax.copy_(amax_snapshot)
+                    del self._stream_targets[tid]
+                # Pass the original FP8 slice up to super() for API hygiene;
+                # the default planner's commit_tensor is a no-op anyway.
+                tensor = target_tensor
+            elif kind == "noncontig":
+                target_tensor.copy_(tensor)
+                tensor = target_tensor
         return super().commit_tensor(read_item, tensor)
 
 
