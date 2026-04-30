@@ -914,9 +914,8 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Sampling-side request counts: padded when running a captured graph so the
-        # cache key buckets, actual otherwise. Verify uses the actual counts so the
-        # downstream Triton kernels still operate on the real workload.
+        # Sampling-side request counts: padded when running a captured graph.
+        # Verify uses the actual counts so the Triton kernels operate on the real workload.
         use_graph_for_sampling = (
             self._sampling_backend == "flashinfer"
             and self._enable_cuda_graph
@@ -961,13 +960,13 @@ class TextGenerationController:
             sample_num_prefill,
             self.num_speculative_tokens,
             context,
+            gather_indices=sample_gather_indices,
             eager=not use_graph_for_sampling,
             cache_key=(
                 ("sample_speculative", sample_num_decode, sample_num_prefill)
                 if use_graph_for_sampling
                 else None
             ),
-            gather_indices=sample_gather_indices,
         )
         nvtx_range_pop("mtp-spec-decoding/verify/sample")
 
@@ -1059,9 +1058,9 @@ class TextGenerationController:
             self._all_logits_cuda.squeeze(0),
             n,
             context,
+            gather_indices=gather_indices,
             eager=not use_graph,
             cache_key=("sample", n) if use_graph else None,
-            gather_indices=gather_indices,
         )
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:

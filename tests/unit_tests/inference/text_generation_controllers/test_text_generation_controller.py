@@ -1248,7 +1248,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
 
         # Drive sampling onto the multinomial path (top_p > 0, top_k == 0) via metadata.
-        # We do NOT mock `_sampling_func`: we want it to run natively to prove it doesn't crash.
+        # We do NOT mock the sampling kernel: we want it to run natively to prove it doesn't crash.
         ctx.active_request_metadata["temperature"][:2] = 1.0
         ctx.active_request_metadata["top_k"][:2] = 0
         ctx.active_request_metadata["top_p"][:2] = 0.9
