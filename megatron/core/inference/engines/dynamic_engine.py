@@ -395,10 +395,11 @@ class DynamicInferenceEngine(AbstractEngine):
             with torch.inference_mode():
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-                if controller.num_speculative_tokens > 0:
-                    controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
-                else:
-                    controller._dynamic_step_sample_logits()
+                if controller._sampling_backend == "flashinfer":
+                    if controller.num_speculative_tokens > 0:
+                        controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                    else:
+                        controller._dynamic_step_sample_logits()
 
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:
