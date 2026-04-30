@@ -29,11 +29,11 @@ from megatron.core.inference.unified_memory import (
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_layer_maps_from_layer_type_list,
 )
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
@@ -844,7 +844,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             label: torch.empty(
                 (self.max_requests,), dtype=dtype, device=torch.cuda.current_device()
             )
-            for label, dtype, _ in self.request_metadata_types
+            for label, dtype in self.request_metadata_types
         }
 
         # Per-token state.
@@ -859,6 +859,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
+
+        # Static tensor addresses of active slices to enable fast inference kernels.
+        self.active_request_metadata = {
+            label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
+        }
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
@@ -1061,6 +1066,23 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_active_request_count(self):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
+
+    def build_active_slices(self, batch_size: int):
+        """Build the active slices of specific tensors. This is run on every forward step.
+
+        If the context is reordered to active -> paused -> finished, this can be graphed.
+        """
+        padded_slice = slice(self.paused_request_count, self.paused_request_count + batch_size)
+
+        # Request metadata all needs to be sliced.
+        for label in self.request_metadata:
+            self.active_request_metadata[label][:batch_size].copy_(
+                self.request_metadata[label][padded_slice], non_blocking=True
+            )
+
+    def pad_active_slices(self):
+        """Pad the active slices of specific tensors."""
+        pass
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1391,7 +1413,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
-        for i, (label, dtype, _) in enumerate(self.request_metadata_types):
+        for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
                 metadata_cols[i], dtype=dtype, device=torch.cuda.current_device()
             )
@@ -1702,6 +1724,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
+        self.build_active_slices(self.padded_active_request_count)
+        self.pad_active_slices()
+
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
             self.kv_block_allocator.dummy_block_idx
@@ -1912,6 +1937,20 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return torch.cat([decode_indices, prefill_last_indices])
 
+    @property
+    def num_last_token_logits(self) -> int:
+        """Number of rows produced by `last_token_logits` for the current step.
+
+        Single source of truth for the bound: one row per request, with
+        `(num_speculative_tokens + 1)` rows per decode request when MTP is active.
+        """
+        if self.num_speculative_tokens > 0:
+            return (
+                self.num_decode_requests * (self.num_speculative_tokens + 1)
+                + self.num_prefill_requests
+            )
+        return self.total_request_count - self.paused_request_count
+
     def last_token_logits(self, logits: Tensor) -> Tensor:
         """Select the logit positions needed for token generation.
 
@@ -1925,7 +1964,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits (Tensor): Output logits of forward pass, shape [1, S, H].
 
         Return:
-            (Tensor) Selected logits, shape [N, H].
+            (Tensor) Selected logits, shape [N, H], where N == num_last_token_logits.
         """
         # todo: @lmcafee, remove these asserts?
         assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
@@ -1937,12 +1976,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.num_speculative_tokens > 0:
             selected = self.speculative_required_logit_indices(logits.device)
+            assert selected.numel() == self.num_last_token_logits
             return logits_2d[selected, :]
 
         paused = self.paused_request_count
         total = self.total_request_count
         query_lengths = self.request_query_lengths[paused:total]
         last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
+        assert last_token_idxs.numel() == self.num_last_token_logits
         return logits_2d[last_token_idxs, :]
 
     def _compute_prefix_match(
@@ -2183,7 +2224,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metadata = req.tracked_metadata
         metadata_types = req.get_metadata_types()
         for m, m_type in zip(metadata, metadata_types):
-            label, _, _ = m_type
+            label, _ = m_type
             if not isinstance(m, torch.Tensor):
                 m = torch.as_tensor(
                     m,

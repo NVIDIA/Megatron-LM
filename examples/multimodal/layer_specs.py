@@ -1,9 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
@@ -125,15 +125,15 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
     )
 
 
-def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
+def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
     attn_mask_type = AttnMaskType.causal
     # Padding mask is needed for e.g. Context Parallel.
     if padding:
         attn_mask_type = AttnMaskType.padding_causal
 
     return ModuleSpec(
-        module=MambaStack,
-        submodules=MambaStackSubmodules(
+        module=HybridStack,
+        submodules=HybridStackSubmodules(
             mamba_layer=ModuleSpec(
                 module=MambaLayer,
                 submodules=MambaLayerSubmodules(
