@@ -188,9 +188,8 @@ def forward_step(data_iterator, model: HybridModel):
     if cu_seqlens is not None:
         # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
         # PackedSeqParams (and TE attention) expect 1-D, so squeeze before use.
-        if cu_seqlens.dim() == 2:
-            cu_seqlens = cu_seqlens[0]
-        if cu_seqlens_padded is not None and cu_seqlens_padded.dim() == 2:
+        cu_seqlens = cu_seqlens[0]
+        if cu_seqlens_padded is not None:
             cu_seqlens_padded = cu_seqlens_padded[0]
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
         packed_seq_params = PackedSeqParams(

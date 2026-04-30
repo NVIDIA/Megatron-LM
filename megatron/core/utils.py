@@ -2289,9 +2289,7 @@ def get_sft_batch_on_this_cp_rank(
             batch["cu_seqlens_padded"]
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
-        )
-        if cu_seqlens_for_te.dim() == 2:
-            cu_seqlens_for_te = cu_seqlens_for_te[0]
+        )[0]
         index = tex.thd_get_partitioned_indices(
             cu_seqlens_for_te,
             (
@@ -2337,33 +2335,33 @@ def get_pretrain_batch_on_this_cp_rank(
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
-    # HybridCP metadata is not partitioned along the sequence dim. cu_seqlens /
-    # cu_seqlens_padded carry the dataloader's batch dim (1, n_seqs+1) so they
-    # would otherwise satisfy the dim-based skip below; skip by key explicitly.
+    # HybridCP metadata is not partitioned along the sequence dim — skip by key.
+    # Intermediate PP stages set non-metadata keys to None, so still skip those.
     METADATA_KEYS = (
-        'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen', 'local_cp_size', 'hybrid_cp_group'
+        'cu_seqlens',
+        'cu_seqlens_padded',
+        'max_seqlen',
+        'local_cp_size',
+        'hybrid_cp_group',
     )
 
     if cp_size > 1:
         for key, val in batch.items():
-            if key in METADATA_KEYS:
+            if key in METADATA_KEYS or val is None:
                 continue
-            if val is not None:
-                seq_dim = 2 if key == 'attention_mask' else 1
-                if not isinstance(val, torch.Tensor) or val.dim() <= seq_dim:
-                    continue
-                val = val.view(
-                    *val.shape[0:seq_dim],
-                    2 * cp_size,
-                    val.shape[seq_dim] // (2 * cp_size),
-                    *val.shape[(seq_dim + 1) :],
-                )
-                index = torch.zeros(2, dtype=torch.int64, device=val.device)
-                index[0].fill_(cp_rank)
-                index[1].fill_(2 * cp_size - cp_rank - 1)
-                val = val.index_select(seq_dim, index)
-                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
-                batch[key] = val
+            seq_dim = 2 if key == 'attention_mask' else 1
+            val = val.view(
+                *val.shape[0:seq_dim],
+                2 * cp_size,
+                val.shape[seq_dim] // (2 * cp_size),
+                *val.shape[(seq_dim + 1) :],
+            )
+            index = torch.zeros(2, dtype=torch.int64, device=val.device)
+            index[0].fill_(cp_rank)
+            index[1].fill_(2 * cp_size - cp_rank - 1)
+            val = val.index_select(seq_dim, index)
+            val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+            batch[key] = val
 
     return batch
 
