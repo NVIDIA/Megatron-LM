@@ -124,9 +124,22 @@ def _calculate_log_probs_speculative(
     spec_plus_one = context.num_speculative_tokens + 1
     result = [None] * active_request_count
 
-    decode_lse, prefill_lse = LogProbsSpeculative.softmax_kernel(context, logits)
+    prefill_offset_gpu = torch.tensor(
+        num_decode * spec_plus_one, dtype=torch.int64, device=logits.device
+    )
+
+    decode_lse, prefill_lse = LogProbsSpeculative.softmax_kernel(
+        context, logits, prefill_offset_gpu
+    )
     decode_gathered, prefill_gathered = LogProbsSpeculative.gather_kernel(
-        context, logits, decode_lse, prefill_lse, new_tokens, accepted_tokens, accepted_token_counts
+        context,
+        logits,
+        decode_lse,
+        prefill_lse,
+        new_tokens,
+        accepted_tokens,
+        accepted_token_counts,
+        prefill_offset_gpu,
     )
 
     decode_top_n_v = decode_top_n_i = None
@@ -160,8 +173,10 @@ def _calculate_log_probs_speculative(
 
     # Full prefill path when logits are materialized for all tokens.
     if not only_last_token_logits and num_prefill > 0:
-        ri, cu_ml, li, li_range, mt, count_gpu = LogProbsSpeculative.prefill_indexing_kernel(
-            context
+        prefill_offset_pinned = torch.tensor([num_decode * spec_plus_one], dtype=torch.int64)
+        # The kernel also returns a GPU copy of the offset; we already have one above, drop it.
+        _, ri, cu_ml, li, li_range, mt, count_gpu = LogProbsSpeculative.prefill_indexing_kernel(
+            context, prefill_offset_pinned
         )
         slp, fp_lse = LogProbsPrefill.softmax_kernel(
             logits, new_tokens, ri, cu_ml, li, li_range, mt

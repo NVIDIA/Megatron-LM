@@ -49,7 +49,9 @@ class LogProbsPrefill:
             )
 
     @staticmethod
-    def indexing_kernel(context) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def indexing_kernel(
+        context, *, eager: bool = False, cache_key=None
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Build per-token indices for prefill log probs.
 
         Args:
@@ -58,6 +60,8 @@ class LogProbsPrefill:
         Returns:
             (request_indices, cu_masked_lengths, logit_indices, logit_indices_range, masked_tokens)
         """
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
         padded_count = context.padded_active_request_count
         padded_token_count = context.padded_active_token_count
 
@@ -83,7 +87,11 @@ class LogProbsPrefill:
         logit_indices_range = torch.arange(padded_token_count, device=torch.cuda.current_device())
         logit_indices = logit_indices_offset + logit_indices_range
         # Roll by 1 because the newly-generated tokens are not present yet.
-        masked_tokens = context.token_to_input_ids[logit_indices].roll(-1, 0)
+        # Append one scratch slot at the end; softmax_kernel routes all sentinel
+        # writes there to avoid duplicate-destination races on real positions.
+        masked_tokens = torch.nn.functional.pad(
+            context.token_to_input_ids[logit_indices].roll(-1, 0), (0, 1)
+        )
 
         return request_indices, cu_masked_lengths, logit_indices, logit_indices_range, masked_tokens
 
@@ -96,6 +104,9 @@ class LogProbsPrefill:
         logit_indices: Tensor,
         logit_indices_range: Tensor,
         masked_tokens: Tensor,
+        *,
+        eager: bool = False,
+        cache_key=None,
     ) -> Tuple[Tensor, Tensor]:
         """Insert sampled tokens, compute prefill log probs and per-row lse.
 
@@ -111,11 +122,26 @@ class LogProbsPrefill:
         Returns:
             (selected_log_probs, lse)
         """
-        # Insert the newly-generated tokens at request boundaries.
-        masked_tokens[cu_masked_lengths - 1] = new_tokens[request_indices]
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
+        # `nonzero_static` fills unused entries of `request_indices` with
+        # `context.max_requests`. Middle sentinels have masked_length == 0 so their
+        # `cu_masked_lengths-1` collides with the real-last entry's, and they would
+        # also OOB-read `new_tokens` at index max_requests. Redirect every sentinel
+        # write to the scratch slot at the end of `masked_tokens`, and clamp the
+        # source index to a safe in-range value.
+        # `cu_masked_lengths.shape[0] - 1 == padded_active_request_count`; sentinel
+        # `request_indices` values equal max_requests, which is >= padded count.
+        real_mask = request_indices < (cu_masked_lengths.shape[0] - 1)
+        write_idx = torch.where(real_mask, cu_masked_lengths - 1, masked_tokens.shape[0] - 1)
+        safe_indices = torch.where(real_mask, request_indices, 0)
+        masked_tokens[write_idx] = new_tokens[safe_indices]
+
+        # Drop the scratch slot for the log-prob computation.
+        masked_tokens_real = masked_tokens[:-1]
         selected_logits = logits.squeeze(0)[logit_indices].float()
         lse = torch.logsumexp(selected_logits, dim=-1)
-        selected_log_probs = selected_logits[logit_indices_range, masked_tokens] - lse
+        selected_log_probs = selected_logits[logit_indices_range, masked_tokens_real] - lse
         return selected_log_probs, lse
 
     @staticmethod

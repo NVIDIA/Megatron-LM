@@ -160,7 +160,8 @@ class TextGenerationController:
             )
         else:
             self._all_logits_cuda = None
-        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        # Need a sentinel slot for `nonzero_static`.
+        self._sampled_tokens_cuda = torch.empty(max_requests + 1, dtype=torch.int64, device=device)
 
         # Side stream with pre-init bookkeeping.
         # Runs concurrently with attention mask initialization.
@@ -1249,7 +1250,7 @@ class TextGenerationController:
             return
 
         context = self.inference_wrapped_model.inference_context
-        eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
+        eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 
         if context.num_speculative_tokens > 0:
             self._log_probs_speculative.prefill_indexing(context, eager=eager)
@@ -1275,7 +1276,7 @@ class TextGenerationController:
             else context.padded_active_token_count
         )
         logits = self._all_logits_cuda[:, :logits_seq_len, :]
-        eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
+        eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
         self._log_probs_speculative.softmax(context, logits, eager=eager)
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
@@ -1353,7 +1354,7 @@ class TextGenerationController:
         )
         logits = self._all_logits_cuda[:, :logits_seq_len, :]
         new_tokens = self._sampled_tokens_cuda[: context.padded_active_request_count]
-        eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
+        eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 
         if context.num_speculative_tokens > 0:
             return self._log_probs_speculative.calculate(

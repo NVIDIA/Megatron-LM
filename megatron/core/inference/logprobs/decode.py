@@ -54,7 +54,7 @@ class LogProbsDecode:
             )
 
     @staticmethod
-    def indexing_kernel(context) -> Tuple[Tensor, Tensor]:
+    def indexing_kernel(context, *, eager: bool = False, cache_key=None) -> Tuple[Tensor, Tensor]:
         """Select which requests need decode log probs.
 
         Args:
@@ -63,6 +63,8 @@ class LogProbsDecode:
         Returns:
             padded (request_indices, padded_arange)
         """
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
         padded_count = context.padded_active_request_count
         request_indices = torch.nonzero_static(
             context.active_request_metadata["return_log_probs"][:padded_count], size=padded_count
@@ -72,7 +74,13 @@ class LogProbsDecode:
 
     @staticmethod
     def softmax_kernel(
-        logits: Tensor, new_tokens: Tensor, request_indices: Tensor, padded_arange: Tensor
+        logits: Tensor,
+        new_tokens: Tensor,
+        request_indices: Tensor,
+        padded_arange: Tensor,
+        *,
+        eager: bool = False,
+        cache_key=None,
     ) -> Tuple[Tensor, Tensor]:
         """Gather logits, compute decode log probs and per-row lse.
 
@@ -85,6 +93,8 @@ class LogProbsDecode:
         Returns:
             (selected_log_probs, lse)
         """
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
         selected_tokens = new_tokens[request_indices]
         selected_logits = logits.squeeze(0)[request_indices].float()
         lse = torch.logsumexp(selected_logits, dim=-1)

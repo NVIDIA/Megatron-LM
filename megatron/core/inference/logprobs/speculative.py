@@ -67,7 +67,12 @@ class LogProbsSpeculative:
 
     @staticmethod
     def softmax_kernel(
-        context, logits: Tensor, prefill_offset_gpu: Tensor
+        context,
+        logits: Tensor,
+        prefill_offset_gpu: Tensor,
+        *,
+        eager: bool = False,
+        cache_key=None,
     ) -> Tuple[Tensor, Tensor]:
         """Post-forward: per-row log-sum-exp over all speculative logit rows.
 
@@ -79,6 +84,8 @@ class LogProbsSpeculative:
         Returns:
             (decode_lse [padded_decode, spec+1], prefill_lse [padded_prefill])
         """
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
         padded_prefill_count = context.padded_batch_dimensions.prefill_req_count
         spec_plus_one = context.num_speculative_tokens + 1
@@ -107,6 +114,9 @@ class LogProbsSpeculative:
         accepted_tokens: Tensor,
         accepted_token_counts: Tensor,
         prefill_offset_gpu: Tensor,
+        *,
+        eager: bool = False,
+        cache_key=None,
     ) -> Tuple[Tensor, Tensor]:
         """Post-verification: gather log probs for speculative decode and materialized prefill.
 
@@ -123,6 +133,8 @@ class LogProbsSpeculative:
         Returns:
             (decode_gathered [padded_decode, spec+1], prefill_gathered [padded_prefill])
         """
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
         padded_prefill_count = context.padded_batch_dimensions.prefill_req_count
         spec_plus_one = context.num_speculative_tokens + 1
@@ -162,7 +174,11 @@ class LogProbsSpeculative:
 
     @staticmethod
     def prefill_indexing_kernel(
-        context, prefill_offset_pinned: Tensor
+        context,
+        prefill_offset_pinned: Tensor,
+        *,
+        eager: bool = False,
+        cache_key=None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Build prefill offset, mask out decode entries, build prefill indices, restore mask.
 
@@ -174,6 +190,8 @@ class LogProbsSpeculative:
             (prefill_offset_gpu, request_indices, cu_masked_lengths, logit_indices,
              logit_indices_range, masked_tokens, prefill_log_prob_count_gpu).
         """
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
         device = torch.cuda.current_device()
         prefill_offset_gpu = prefill_offset_pinned.to(device, non_blocking=True)
 
@@ -199,8 +217,12 @@ class LogProbsSpeculative:
 
         return prefill_offset_gpu, ri, cu_ml, li, li_range, mt, prefill_log_prob_count_gpu
 
-    def _prefill_softmax(self, logits, new_tokens, ri, cu_ml, li, li_range, mt):
+    def _prefill_softmax(
+        self, logits, new_tokens, ri, cu_ml, li, li_range, mt, *, eager: bool = False, cache_key=None
+    ):
         """Delegate to LogProbsPrefill's softmax kernel (cross-class call)."""
+        # CudaGraphManager consumes these args, if it exists.
+        del eager, cache_key
         return LogProbsPrefill.softmax_kernel(logits, new_tokens, ri, cu_ml, li, li_range, mt)
 
     @staticmethod
@@ -233,26 +255,39 @@ class LogProbsSpeculative:
         """
         num_decode = context.num_decode_requests
         num_prefill = context.total_request_count - context.paused_request_count - num_decode
+        active_request_count = num_decode + num_prefill
+
+        # D2H pulls.
+        full_mask_cpu: List[bool] = context.active_request_metadata["return_log_probs"][
+            :active_request_count
+        ].tolist()
+        need_top_n_per_req = (
+            decode_top_n_values is not None and decode_top_n_indices is not None and num_decode > 0
+        ) or (
+            prefill_top_n_values is not None
+            and prefill_top_n_indices is not None
+            and num_prefill > 0
+        )
+        if need_top_n_per_req:
+            top_n_per_req_cpu: List[int] = context.active_request_metadata["top_n_logprobs"][
+                :active_request_count
+            ].tolist()
+        mask_cpu = full_mask_cpu[:num_decode]
+        prefill_mask_cpu = full_mask_cpu[num_decode:]
 
         # Decode: variable-length list per request.
         decode_gathered_cpu = decode_gathered[:num_decode].cpu()
         accepted_counts_cpu = accepted_token_counts[:num_decode].tolist()
-        mask_cpu: List[bool] = context.active_request_metadata["return_log_probs"][
-            :num_decode
-        ].tolist()
         for i in range(num_decode):
             if mask_cpu[i]:
                 result[i] = decode_gathered_cpu[i, : accepted_counts_cpu[i] + 1].tolist()
 
-        top_n_dict: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
 
         # Decode top-n.
+        top_n_dict: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
         if decode_top_n_values is not None and decode_top_n_indices is not None and num_decode > 0:
             top_n_v_cpu = decode_top_n_values.cpu()
             top_n_i_cpu = decode_top_n_indices.cpu()
-            top_n_per_req_cpu: List[int] = context.active_request_metadata[
-                "top_n_logprobs"
-            ].tolist()
             for i in range(num_decode):
                 if not mask_cpu[i]:
                     continue
@@ -267,9 +302,6 @@ class LogProbsSpeculative:
 
         # Materialized prefill: single log prob per request.
         prefill_gathered_cpu = prefill_gathered[:num_prefill].cpu()
-        prefill_mask_cpu: List[bool] = context.active_request_metadata["return_log_probs"][
-            num_decode : num_decode + num_prefill
-        ].tolist()
         for i in range(num_prefill):
             if prefill_mask_cpu[i]:
                 result[num_decode + i] = [prefill_gathered_cpu[i].item()]
@@ -282,14 +314,11 @@ class LogProbsSpeculative:
         ):
             top_n_v_cpu = prefill_top_n_values.cpu()
             top_n_i_cpu = prefill_top_n_indices.cpu()
-            top_n_per_req_cpu2: List[int] = context.active_request_metadata[
-                "top_n_logprobs"
-            ].tolist()
             for i in range(num_prefill):
                 req_idx = num_decode + i
                 if not prefill_mask_cpu[i]:
                     continue
-                req_top_n = top_n_per_req_cpu2[req_idx]
+                req_top_n = top_n_per_req_cpu[req_idx]
                 if req_top_n == 0:
                     continue
                 top_n_dict[req_idx] = [(top_n_v_cpu[i, :req_top_n], top_n_i_cpu[i, :req_top_n])]
