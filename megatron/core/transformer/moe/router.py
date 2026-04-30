@@ -179,7 +179,9 @@ class TopKRouter(Router):
         if self.config.moe_n_hash_layers > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
         self.is_hash_layer = (
-            self.config.moe_n_hash_layers > 0 and layer_number <= self.config.moe_n_hash_layers
+            not self.is_mtp_layer
+            and self.config.moe_n_hash_layers > 0
+            and layer_number <= self.config.moe_n_hash_layers
         )
         if self.is_hash_layer:
             # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
