@@ -130,7 +130,7 @@ class MambaMetadata:
         self.cu_seqlens = None
         self.cum_chunks = None
         self.seq_idx = None
-        self.device_decode_prefill = None
+        self.device_decode_prefill = self._device_decode_prefill_buffer
 
         # SSM/conv1d precomputed views
         self.cu_chunk_seqlens = None
