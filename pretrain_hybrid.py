@@ -43,7 +43,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args, hybrid_config_from_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -364,7 +364,8 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    model_cfg = hybrid_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(full_config,
              train_valid_test_datasets_provider,
              partial(model_provider, hybrid_builder),

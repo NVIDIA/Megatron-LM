@@ -11,6 +11,7 @@ import builtins
 import ast
 import enum
 from dataclasses import Field, fields
+import warnings
 import torch.nn.functional as F
 import torch
 
@@ -429,9 +430,16 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     return HybridModelConfig(**kwargs)
 
 
-def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer:
+def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
+
+    if model_cfg is None:
+        msg = """
+        It is recommended to use a ModelConfig (e.g. megatron.training.models.HybridModelConfig) instead
+        of a model builder/model provider function pointer.
+        """
+        warnings.warn(msg)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
     ckpt_kwargs["save_optim"] = not args.no_save_optim
@@ -453,6 +461,7 @@ def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer
     cfg = PretrainConfigContainer(
         train=_default_config_from_args(TrainingConfig, args),
         validation=_default_config_from_args(ValidationConfig, args),
+        model=model_cfg,
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
         ddp=ddp_config,
