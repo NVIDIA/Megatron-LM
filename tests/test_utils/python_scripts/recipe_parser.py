@@ -81,9 +81,7 @@ def flatten_products(workload_manifest: dotdict) -> dotdict:
             cartesian_values = [param_dict[k] for k in cartesian_keys]
 
             # Resolve effective cadence: inner overrides outer, default loose.
-            effective_cadence = (
-                inner_cadence if inner_cadence is not None else outer_cadence
-            )
+            effective_cadence = inner_cadence if inner_cadence is not None else outer_cadence
             if effective_cadence is None:
                 effective_cadence = list(DEFAULT_CADENCE)
 
@@ -171,9 +169,7 @@ def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdi
     return workload_manifests
 
 
-def filter_by_cadence(
-    workload_manifests: List[dotdict], cadence: Optional[str]
-) -> List[dotdict]:
+def filter_by_cadence(workload_manifests: List[dotdict], cadence: Optional[str]) -> List[dotdict]:
     """Returns workloads whose cadence list includes the requested cadence value.
 
     A cadence of None disables the filter (used for the label-based bypass path).
@@ -183,9 +179,7 @@ def filter_by_cadence(
         return workload_manifests
 
     if cadence not in ALLOWED_CADENCE_VALUES:
-        raise ValueError(
-            f"Invalid cadence {cadence!r}. Allowed: {sorted(ALLOWED_CADENCE_VALUES)}"
-        )
+        raise ValueError(f"Invalid cadence {cadence!r}. Allowed: {sorted(ALLOWED_CADENCE_VALUES)}")
 
     filtered = list(
         workload_manifest
