@@ -38,8 +38,11 @@ def validate_flextron_per_int_lists(args):
         ('moe-expert', 'moe_expert_per_list', 'moe_expert_int_list'),
     )
     for cli_name, per_attr, int_attr in pairs:
-        per_val = getattr(args, per_attr)
-        int_val = getattr(args, int_attr)
+        # Default to None when the attribute is missing - happens when
+        # flextron args weren't registered on the parser (the docstring
+        # promises we skip in that case).
+        per_val = getattr(args, per_attr, None)
+        int_val = getattr(args, int_attr, None)
         per_set = per_val is not None
         int_set = int_val is not None
         if per_set:
