@@ -123,6 +123,29 @@ class TestCommonLayerConfig:
         assert tc.bf16 is True
         assert tc.fp16 is False
 
+    def test_params_dtype_auto_derives_from_mixed_precision_when_unset(self):
+        """Setting ``mixed_precision_dtype="bf16"`` without overriding
+        ``params_dtype`` (still "fp32" by default) should produce a TC whose
+        params live in bf16 — matching the legacy --bf16 CLI flag's
+        behaviour."""
+        import torch
+
+        common = _make_common(mixed_precision_dtype="bf16")
+        layer = MambaLayerConfig(common_config=common, head_dim=64, state_size=128, num_groups=8)
+        tc = layer.to_transformer_config(num_layers=4)
+        assert tc.params_dtype == torch.bfloat16
+
+    def test_explicit_params_dtype_override_preserved(self):
+        """An explicit ``params_dtype`` from the recipe author wins over the
+        auto-derive. Useful when a recipe wants bf16 mixed precision but
+        keeps params in fp32 (e.g. for fp32 master-weight workflows)."""
+        import torch
+
+        common = _make_common(mixed_precision_dtype="bf16", params_dtype="fp16")
+        layer = MambaLayerConfig(common_config=common, head_dim=64, state_size=128, num_groups=8)
+        tc = layer.to_transformer_config(num_layers=4)
+        assert tc.params_dtype == torch.float16
+
     def test_invalid_mixed_precision_dtype_raises(self):
         common = _make_common(mixed_precision_dtype="nope")
         with pytest.raises(ValueError, match="mixed_precision_dtype"):
@@ -340,6 +363,43 @@ class TestHybridModelConfigCompile:
         # Default untie=False → share=True.
         assert compiled.share_embeddings_and_output_weights is True
 
+    def test_common_config_auto_inherited_into_layers_without_explicit_common(self):
+        """A recipe author who omits ``common_config=common`` on a layer
+        should still get the recipe's common_config injected — otherwise the
+        layer compiles with ``hidden_size=0`` and silently produces an
+        invalid model."""
+        common = _make_common()
+        emb = EmbeddingLayerConfig(
+            vocab_size=1024, max_sequence_length=512, position_embedding_type="rope"
+        )
+        m = MambaLayerConfig()  # No common_config — should auto-inherit.
+        a = AttentionLayerConfig(num_attention_heads=4)  # Same.
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common, layer_pattern=[emb, m, a, loss]
+        ).compile()
+        # All per-layer TCs see the recipe's hidden_size, not 0.
+        for tc in compiled.layer_config_list:
+            assert tc.hidden_size == common.hidden_size
+
+    def test_common_config_explicit_override_preserved(self):
+        """An explicit non-default ``common_config`` on a layer wins over
+        the auto-inherit path — auto-inherit only fills in defaults."""
+        common = _make_common(hidden_size=256)
+        other_common = _make_common(hidden_size=512)
+        emb = self._embedding(common)
+        # Layer carries an explicit, non-default common_config.
+        m = MambaLayerConfig(common_config=other_common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common, layer_pattern=[emb, m, a, loss]
+        ).compile()
+        # Mamba layer (idx 0) keeps its explicit hidden_size=512.
+        assert compiled.layer_config_list[0].hidden_size == 512
+        # Attention layer (idx 1) uses the recipe common's 256.
+        assert compiled.layer_config_list[1].hidden_size == 256
+
     def test_compile_infers_uniform_attention_metadata(self):
         common = _make_common()
         emb = self._embedding(common)
@@ -436,6 +496,57 @@ class TestHybridModelConfigCompile:
             stack_spec="my_pkg.my_module.my_stack_spec",
         ).compile()
         assert compiled.stack_spec == "my_pkg.my_module.my_stack_spec"
+
+    def test_dsa_recipe_promotes_multi_latent_attention_to_stack(self):
+        """DSA / MLA layers use their own decoupled RoPE.
+        ``HybridModel.__init__`` skips global RoPE construction when
+        ``self.config.multi_latent_attention`` (stack TC) is True. Compile
+        must promote the flag whenever the decoder contains any DSA layer."""
+        common = _make_common()
+        emb = self._embedding(common)
+        d = DSALayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, d, loss]).compile()
+        assert compiled.config.multi_latent_attention is True
+
+    def test_no_dsa_layers_keeps_multi_latent_attention_default(self):
+        """A recipe without DSA must not flip the stack-level flag — that
+        would silently disable global RoPE construction for ordinary
+        Attention layers."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+        assert compiled.config.multi_latent_attention is False
+
+    def test_heterogeneous_attention_under_rope_rejected(self):
+        """Two attention layers with different ``num_attention_heads`` under
+        RoPE produce a single global rotary sized for a placeholder; the
+        layer with the non-matching head count would hit shape mismatches
+        at runtime. Reject at compile time until per-layer rotary lands."""
+        common = _make_common()
+        emb = self._embedding(common, position_embedding_type="rope")
+        a1 = AttentionLayerConfig(common_config=common, num_attention_heads=8)
+        a2 = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        recipe = HybridModelConfig(common_config=common, layer_pattern=[emb, a1, a2, loss])
+        with pytest.raises(NotImplementedError, match="[Hh]eterogeneous attention geometry"):
+            recipe.compile()
+
+    def test_heterogeneous_attention_under_none_position_embedding_allowed(self):
+        """Without RoPE/YARN, no global rotary is built — heterogeneous
+        attention geometry is fine."""
+        common = _make_common()
+        emb = self._embedding(common, position_embedding_type="none")
+        a1 = AttentionLayerConfig(common_config=common, num_attention_heads=8)
+        a2 = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common, layer_pattern=[emb, a1, a2, loss]
+        ).compile()
+        assert compiled.layer_config_list[0].num_attention_heads == 8
+        assert compiled.layer_config_list[1].num_attention_heads == 4
 
 
 @pytest.mark.internal
@@ -756,6 +867,24 @@ class TestExtraPassthrough:
         layer = MambaLayerConfig(common_config=common, extra={"another_typo_field": 1.0})
         with pytest.raises(ValueError, match="MambaLayerConfig.extra"):
             layer.to_transformer_config(num_layers=2)
+
+    def test_layer_extra_cannot_shadow_parallelism(self):
+        """Per-layer ``extra`` cannot override model-wide topology fields —
+        process groups are global and a per-layer disagreement would be
+        invalid sharding."""
+        common = _make_common()
+        a = AttentionLayerConfig(
+            common_config=common,
+            num_attention_heads=4,
+            extra={"tensor_model_parallel_size": 8},  # Conflicts with TP=2 below.
+        )
+        emb = self._embedding(common)
+        loss = CrossEntropyLayerConfig()
+        recipe = HybridModelConfig(
+            common_config=common, layer_pattern=[emb, a, loss], tensor_model_parallel_size=2
+        )
+        with pytest.raises(ValueError, match="tensor_model_parallel_size"):
+            recipe.compile()
 
     def test_embedding_extra_propagates_to_stack_tc(self):
         common = _make_common()

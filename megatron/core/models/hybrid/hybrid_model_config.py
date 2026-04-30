@@ -163,6 +163,16 @@ class HybridModelConfig:
 
         embedding, decoder_leaves, mtp_markers, loss = _split_pattern(self.layer_pattern)
 
+        # Auto-inherit the recipe's common_config into any layer/marker that
+        # was constructed without an explicit ``common_config=`` argument.
+        # Without this, a layer like ``MambaLayerConfig(head_dim=64)`` carries
+        # a default-constructed CommonLayerConfig with ``hidden_size=0``,
+        # silently producing an invalid model.
+        embedding = _inherit_common_if_default(embedding, self.common_config)
+        loss = _inherit_common_if_default(loss, self.common_config)
+        decoder_leaves = _inherit_common_in_pattern(decoder_leaves, self.common_config)
+        mtp_markers = [_inherit_common_in_marker(m, self.common_config) for m in mtp_markers]
+
         decoder_flat: List[LayerConfig] = flatten_decoder_pattern(decoder_leaves)
         if not decoder_flat:
             raise ValueError(
@@ -229,6 +239,16 @@ class HybridModelConfig:
         # with their real value via ``_layer_specific_kwargs``.
         attention_metadata = _infer_uniform_attention_metadata(decoder_flat)
 
+        # Heterogeneous attention geometry under RoPE/YARN is not supported:
+        # HybridModel builds one global rotary embedding from the stack TC
+        # and passes it to every attention layer. If layers disagree on
+        # ``num_attention_heads`` / ``num_query_groups`` / ``kv_channels``,
+        # the rotary tensor is sized for the placeholder value and at
+        # runtime layers with different geometry hit shape mismatches.
+        # Reject at compile time until per-layer rotary lands.
+        if embedding.position_embedding_type in ("rope", "yarn"):
+            _reject_heterogeneous_attention_geometry(decoder_flat, attention_metadata)
+
         placeholders: dict = {"num_attention_heads": max(1, self.tensor_model_parallel_size)}
         # If the recipe contains a uniform attention geometry, use it as the
         # semantic placeholder for non-attention layer TransformerConfigs.
@@ -282,6 +302,13 @@ class HybridModelConfig:
             stack_kwargs.setdefault(k, v)
         if self.expert_model_parallel_size > 1:
             stack_kwargs.setdefault("num_moe_experts", 1)
+        # DSA / MLA layers carry their own decoupled RoPE; HybridModel uses
+        # ``self.config.multi_latent_attention`` (the stack TC) to decide
+        # whether to construct the global RoPE embedding. Without this flag
+        # promoted to the stack, recipes containing DSALayerConfig get a
+        # global rotary built and passed in alongside the MLA-internal one.
+        if any(isinstance(lc, DSALayerConfig) for lc in decoder_flat):
+            stack_kwargs["multi_latent_attention"] = True
         stack_kwargs["num_layers"] = num_layers
         stack_kwargs["cross_entropy_loss_fusion"] = loss.loss_fusion
         stack_kwargs["cross_entropy_fusion_impl"] = loss.fusion_impl
@@ -357,6 +384,40 @@ class HybridModelConfig:
 
 
 # --- pattern-structure helpers --------------------------------------------
+
+
+_DEFAULT_COMMON = CommonLayerConfig()
+
+
+def _inherit_common_if_default(node: Any, recipe_common: CommonLayerConfig) -> Any:
+    """If ``node`` carries a default-constructed common_config, replace it
+    with ``recipe_common`` via :func:`dataclasses.replace`. Otherwise return
+    unchanged. Applies to LayerConfig instances and pattern markers."""
+    if not hasattr(node, "common_config"):
+        return node
+    if node.common_config == _DEFAULT_COMMON:
+        return dataclasses.replace(node, common_config=recipe_common)
+    return node
+
+
+def _inherit_common_in_pattern(node: Any, recipe_common: CommonLayerConfig) -> Any:
+    """Recursive variant: walks lists/tuples and applies
+    :func:`_inherit_common_if_default` to every leaf."""
+    if isinstance(node, list):
+        return [_inherit_common_in_pattern(child, recipe_common) for child in node]
+    if isinstance(node, tuple):
+        return tuple(_inherit_common_in_pattern(child, recipe_common) for child in node)
+    return _inherit_common_if_default(node, recipe_common)
+
+
+def _inherit_common_in_marker(marker: Any, recipe_common: CommonLayerConfig) -> Any:
+    """Apply common-inheritance to an MTP marker and recurse into its
+    ``mtp_model_layer`` body."""
+    marker = _inherit_common_if_default(marker, recipe_common)
+    if hasattr(marker, "mtp_model_layer"):
+        new_body = _inherit_common_in_pattern(marker.mtp_model_layer, recipe_common)
+        marker = dataclasses.replace(marker, mtp_model_layer=new_body)
+    return marker
 
 
 def _split_pattern(pattern: list):
@@ -558,3 +619,38 @@ def _infer_uniform_attention_metadata(decoder_flat: List[LayerConfig]) -> dict[s
         if all(v == first for v in values[1:]):
             metadata[field_name] = first
     return metadata
+
+
+def _reject_heterogeneous_attention_geometry(
+    decoder_flat: List[LayerConfig], attention_metadata: dict[str, Any]
+) -> None:
+    """Raise if attention layers under RoPE/YARN disagree on rotary geometry.
+
+    HybridModel builds a single global rotary embedding from the stack TC's
+    ``num_attention_heads`` / ``kv_channels``. When per-layer attention
+    configs diverge on those fields, the rotary tensor is sized for the
+    placeholder and runtime hits shape mismatches. Until per-layer rotary
+    lands, force recipes under RoPE/YARN to use uniform attention geometry.
+    """
+
+    attention_layers = [
+        lc for lc in decoder_flat if isinstance(lc, (AttentionLayerConfig, DSALayerConfig))
+    ]
+    if not attention_layers:
+        return
+    for field_name in ("num_attention_heads", "num_query_groups", "kv_channels"):
+        # If inference produced this field, all layers agree; skip.
+        if field_name in attention_metadata:
+            continue
+        values = [getattr(lc, field_name) for lc in attention_layers]
+        non_none = {v for v in values if v is not None}
+        if len(non_none) > 1:
+            raise NotImplementedError(
+                f"Heterogeneous attention geometry under RoPE/YARN is not "
+                f"supported: attention layers disagree on {field_name!r} "
+                f"(values: {sorted(non_none)}). HybridModel builds one global "
+                f"rotary embedding from the stack TC and passes it to every "
+                f"attention layer; per-layer rotary support is a follow-up. "
+                f"Use uniform attention geometry, or position_embedding_type="
+                f"\"none\" / \"learned_absolute\"."
+            )

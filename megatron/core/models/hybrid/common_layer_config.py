@@ -284,9 +284,21 @@ class CommonLayerConfig:
             (``CommonLayerConfig`` fields, ``LayerConfig`` subclasses) is
             preserved. Recipe code does not need to touch this method.
         """
+        # Derive params_dtype from mixed_precision_dtype when the recipe
+        # author left it at the fp32 default. The legacy --bf16 / --fp16 CLI
+        # flags do this same mapping (megatron/training/arguments.py around
+        # ``args.params_dtype = torch.bfloat16``); without this, a recipe with
+        # ``mixed_precision_dtype="bf16"`` and an unset ``params_dtype`` would
+        # produce a TC with ``bf16=True`` but ``params_dtype=torch.float32``,
+        # silently diverging from its legacy-CLI counterpart in memory
+        # footprint and checkpoint shape.
+        params_dtype_resolved = _resolve_dtype(self.params_dtype)
+        if self.params_dtype == "fp32" and self.mixed_precision_dtype in ("bf16", "fp16"):
+            params_dtype_resolved = _resolve_dtype(self.mixed_precision_dtype)
+
         kwargs: Dict[str, Any] = {
             "hidden_size": self.hidden_size,
-            "params_dtype": _resolve_dtype(self.params_dtype),
+            "params_dtype": params_dtype_resolved,
             "sequence_parallel": self.sequence_parallel,
             "init_method_std": self.init_method_std,
             "perform_initialization": self.perform_initialization,
