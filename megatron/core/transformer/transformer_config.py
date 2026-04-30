@@ -820,6 +820,12 @@ class TransformerConfig(ModelParallelConfig):
     When permute_fusion_into_hybridep is True, this sets the number
     of SMs for the unpermute part (only 1 block per SM)."""
 
+
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
+    exceeding this budget will be dropped. None means no token will be dropped. 
+    The default is None."""
+
     ##################
     # Context Parallel
     ##################
@@ -1023,6 +1029,24 @@ class TransformerConfig(ModelParallelConfig):
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
+
+
+    moe_paged_stash: bool = False
+    """If True, enable paged stash for all routed-expert activations needed for backward"""
+
+    moe_paged_stash_page_size: int = 64
+    """Number of tokens per page for paged stash memory management."""
+
+    moe_paged_stash_buffer_size_factor_cuda: float = 1.10
+    """Scale factor for paged stash CUDA buffer allocation.
+
+    Sign selects sizing: positive = avg-based, negative = actual-max. Magnitude is headroom
+    (e.g. 1.10 = 10%)."""
+
+    moe_paged_stash_buffer_size_factor_cpu: float = 0.0
+    """Scale factor for paged stash host buffer. 0 disables host buffer.
+    Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
+    negative = actual-max; scale = abs(factor)."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -1327,6 +1351,18 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
                 )
 
+        if self.moe_expert_rank_capacity_factor is not None:
+            if not self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires use_transformer_engine_op_fuser to "
+                    "be enabled."
+                )
+            if self.moe_flex_dispatcher_backend != "hybridep":
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
+                    "'hybridep'."
+                )
+
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
         ):
@@ -1483,6 +1519,18 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+        if self.moe_paged_stash:
+            assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
+            assert self.moe_expert_rank_capacity_factor is not None, (
+                "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
+                "there is no need to use paged stashing without it."
+            )
+            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            assert not moe_offload_conflict, (
+                "When moe_paged_stash is enabled, offload_modules must not include "
+                f"expert_fc1 or moe_act (paged stash covers those activations). "
+                f"Remove: {moe_offload_conflict}"
+            )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -2158,14 +2206,15 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if self.cuda_graph_impl != "none":
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                    and CudaGraphScope.moe not in self.cuda_graph_scope
-                    and CudaGraphScope.mlp not in self.cuda_graph_scope
-                ), (
-                    'CUDA graph scope on moe and mlp is not '
-                    'supported with overlap_moe_expert_parallel_comm'
-                )
+                if self.cuda_graph_impl == "transformer_engine":
+                    assert (
+                        self.cuda_graph_impl == "transformer_engine"
+                        and CudaGraphScope.moe not in self.cuda_graph_scope
+                        and CudaGraphScope.mlp not in self.cuda_graph_scope
+                    ), (
+                        'CUDA graph scope on moe and mlp is not '
+                        'supported with overlap_moe_expert_parallel_comm'
+                    )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
