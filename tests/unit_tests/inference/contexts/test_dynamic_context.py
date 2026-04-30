@@ -1080,12 +1080,7 @@ class TestDynamicContext:
             current_token_idx += data["prefill_len"]
 
         # Simulate prefill step
-        total_active_tokens = dynamic_context.active_token_count
         vocab_size = 50000
-        # logits will have shape [1, total_active_tokens, vocab_size]
-        prefill_logits = torch.randn(
-            1, total_active_tokens, vocab_size, device='cuda', dtype=torch.float32
-        )
 
         # New tokens from prefill (one token per active request)
         num_active_requests = (
@@ -1094,6 +1089,14 @@ class TestDynamicContext:
         prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
         dynamic_context.initialize_attention_state()
+        # Match production: logits shape is [1, padded_active_token_count, vocab_size].
+        prefill_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
         # Mark all active requests as wanting log probs.
         dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
         dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
@@ -1138,12 +1141,16 @@ class TestDynamicContext:
         )
 
         # Generate new logits for the decode step. Now each request contributes 1 token.
-        decode_logits = torch.randn(
-            1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
-        )
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
         dynamic_context.initialize_attention_state()
+        decode_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
         # Mark all active requests as wanting log probs.
         dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
         dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
@@ -1196,9 +1203,12 @@ class TestDynamicContext:
 
         dynamic_context.initialize_attention_state()
 
-        total_active_tokens_mixed_step = dynamic_context.active_token_count
         mixed_step_logits = torch.randn(
-            1, total_active_tokens_mixed_step, vocab_size, device='cuda', dtype=torch.float32
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
         )
 
         num_active_requests_mixed_step = (
@@ -1316,7 +1326,6 @@ class TestDynamicContext:
         num_active_requests = (
             dynamic_context.total_request_count - dynamic_context.paused_request_count
         )
-        total_active_tokens = dynamic_context.active_token_count
         vocab_size = 50000
         top_n = 5
 
@@ -1330,12 +1339,16 @@ class TestDynamicContext:
             dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
             dynamic_context.active_request_metadata["return_log_probs"][:n] = True
 
-        prefill_logits = torch.randn(
-            1, total_active_tokens, vocab_size, device='cuda', dtype=torch.float32
-        )
         prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
         dynamic_context.initialize_attention_state()
+        prefill_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
         _set_active_metadata(num_active_requests)
 
         _, top_n_dict = calculate_log_probs(
@@ -1378,12 +1391,16 @@ class TestDynamicContext:
             active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
         )
 
-        decode_logits = torch.randn(
-            1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
-        )
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
         dynamic_context.initialize_attention_state()
+        decode_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
         _set_active_metadata(num_active_requests)
 
         _, decode_top_n = calculate_log_probs(
@@ -1444,7 +1461,6 @@ class TestDynamicContext:
             )
 
         num_active = dynamic_context.total_request_count - dynamic_context.paused_request_count
-        total_tokens = dynamic_context.active_token_count
         vocab_size = 50000
         log_prob_request_count = len(log_prob_indices)
 
@@ -1454,10 +1470,16 @@ class TestDynamicContext:
                 dynamic_context.active_request_metadata["return_log_probs"][i] = True
 
         # ── Prefill step ──
-        logits = torch.randn(1, total_tokens, vocab_size, device='cuda', dtype=torch.float32)
         new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
 
         dynamic_context.initialize_attention_state()
+        logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
         _set_mask()
 
         log_probs, _ = calculate_log_probs(
@@ -1486,10 +1508,16 @@ class TestDynamicContext:
         active_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
         dynamic_context.update_requests(active_requests_mask=active_mask, new_tokens=new_tokens)
 
-        decode_logits = torch.randn(1, num_active, vocab_size, device='cuda', dtype=torch.float32)
         decode_new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
 
         dynamic_context.initialize_attention_state()
+        decode_logits = torch.randn(
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
+        )
         _set_mask()
 
         decode_log_probs, _ = calculate_log_probs(
@@ -1581,11 +1609,14 @@ class TestDynamicContext:
         dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
         dynamic_context.active_request_metadata["return_log_probs"][:num_active] = True
 
-        # Decode logits: each decode request produces `spec_plus_one` rows.
+        # Decode logits: padded to padded_active_token_count to match production.
         vocab_size = 50000
-        total_logit_rows = num_active * spec_plus_one
         decode_logits = torch.randn(
-            1, total_logit_rows, vocab_size, device='cuda', dtype=torch.float32
+            1,
+            dynamic_context.padded_active_token_count,
+            vocab_size,
+            device='cuda',
+            dtype=torch.float32,
         )
 
         # accepted_tokens layout matches the controller's `_accepted_tokens_per_request`:
