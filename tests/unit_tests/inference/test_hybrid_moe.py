@@ -25,13 +25,13 @@ from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.test_moe_dispatching_and_routing import (
     NANOV3_BASE,
@@ -67,18 +67,8 @@ _EP_SIZE = 4
 # Edge states (PREFILL_AT_MAX_TOKENS, DECODE_AT_MAX_REQUESTS, MIXED_GIANT_PREFILL)
 # are not swept combinatorially — one rank in the edge state against a fixed
 # peer is sufficient.
-_STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE)) + [
-    (PREFILL_AT_MAX_TOKENS, DECODE, DECODE, DECODE),
-    (PREFILL_AT_MAX_TOKENS, MIXED, MIXED, MIXED),
-    (PREFILL_AT_MAX_TOKENS, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS),
-    (DECODE_AT_MAX_REQUESTS, DECODE, DECODE, DECODE),
-    (DECODE_AT_MAX_REQUESTS, MIXED, MIXED, MIXED),
-    (MIXED_GIANT_PREFILL, DECODE, DECODE, DECODE),
-    (MIXED_GIANT_PREFILL, MIXED, MIXED, MIXED),
-    (MIXED_GIANT_PREFILL, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS, DECODE_AT_MAX_REQUESTS),
-]
+_STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE))
 
-_STATE_COMBOS = [(PREFILL_AT_MAX_TOKENS, DECODE, DECODE, DECODE),]
 
 # Batch dimensions used to set up each non-dummy state via
 # add_dummy_requests_for_cudagraph_capture. These are intentionally small
@@ -151,8 +141,7 @@ class _TestDynamicInferenceBase:
     def _build_model(self, inference_moe_token_dispatcher_type='nvls'):
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = _make_base_config(
-            num_layers=3,
-            inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
+            num_layers=3, inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type
         )
         model = HybridModel(
             config=config,

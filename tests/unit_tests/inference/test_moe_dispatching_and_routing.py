@@ -332,16 +332,13 @@ class TestNVLSAllGatherVDispatcher:
         local_expert_indices = [ep_rank * num_local_experts + i for i in range(num_local_experts)]
         ep_group = get_expert_model_parallel_group()
 
-        try:
-            NVLSAllGatherVDispatcher.allocate_buffers(
-                per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
-                topk=NANOV3_BASE["moe_router_topk"],
-                hidden_size=NANOV3_BASE["hidden_size"],
-                ep_group=ep_group,
-            )
-        except RuntimeError:
-            pytest.skip("NVLS symmetric memory not available on this hardware")
-
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=NANOV3_BASE["moe_router_topk"],
+            hidden_size=NANOV3_BASE["hidden_size"],
+            ep_group=ep_group,
+        )
+    
         return NVLSAllGatherVDispatcher(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
@@ -405,9 +402,6 @@ class TestNVLSAllGatherVDispatcher:
         static_hidden = global_hidden[start:end].contiguous()
         static_probs = global_probs[start:end].contiguous()
         static_routing_map = global_routing_map[start:end].contiguous()
-
-        if not are_tensors_nvls_eligible(static_hidden, static_probs, static_routing_map):
-            pytest.skip("Tensors are not NVLS-eligible (need SM>=9 and 16-byte aligned memory)")
 
         # Warmup on a side stream
         with torch.no_grad():
