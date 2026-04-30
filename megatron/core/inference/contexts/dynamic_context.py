@@ -869,6 +869,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.num_output_placeholders = torch.zeros(
             self.max_requests, dtype=torch.int32, device='cpu',
         )
+        # v3 plan §2.7 / §commit 16 — GPU-resident snapshot of the previous
+        # step's sampled tokens. Decoupled from the D2H output bundle: the
+        # gpu_bookkeeping stream copies _sampled_tokens_cuda → here, and the
+        # next step's GpuInputPreparer scatters from this tensor into the
+        # snapshot's token_to_input_ids. Commit 17 wires the consumer.
+        self._prev_sampled_token_ids = torch.empty(
+            self.max_requests, dtype=torch.int64, device=torch.cuda.current_device(),
+        )
         # True only for a new request , then after a forward pass it is set to False
         self.request_in_prefill_status_tensor = torch.empty(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,

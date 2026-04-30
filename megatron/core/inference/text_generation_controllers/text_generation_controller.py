@@ -226,6 +226,13 @@ class TextGenerationController:
             num_speculative_tokens=spec_tokens,
             device=device,
         )
+        # v3 plan §2.6 / §commit 16 — dedicated gpu_bookkeeping stream for the
+        # D2D copy ``_sampled_tokens_cuda → _prev_sampled_token_ids`` and (in
+        # commit 17) the input-id scatter. The next-step input prep waits on
+        # ``self._prev_sample_ready_event``.
+        self._gpu_bookkeeping_stream = torch.cuda.Stream(device=device)
+        self._sample_done_event: Optional[torch.cuda.Event] = None
+        self._prev_sample_ready_event: Optional[torch.cuda.Event] = None
 
         # Keep track of request metadata.
         self._request_metadata: Dict[str, Tensor] = {}
@@ -2016,6 +2023,25 @@ class TextGenerationController:
                         logits, log_probs_tensor
                     )
         range_pop()
+
+        # v3 plan §commit 16 — record sample_done_event on the compute
+        # stream and enqueue the D2D copy
+        # ``_sampled_tokens_cuda → context._prev_sampled_token_ids`` on the
+        # gpu_bookkeeping stream. Commit 17 consumes
+        # ``_prev_sample_ready_event`` as the input-scatter dependency.
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count > 0:
+            self._sample_done_event = torch.cuda.Event()
+            self._sample_done_event.record()
+            self._gpu_bookkeeping_stream.wait_event(self._sample_done_event)
+            with torch.cuda.stream(self._gpu_bookkeeping_stream):
+                context._prev_sampled_token_ids[:active_request_count].copy_(
+                    self._sampled_tokens_cuda[:active_request_count],
+                    non_blocking=True,
+                )
+                self._prev_sample_ready_event = torch.cuda.Event()
+                self._prev_sample_ready_event.record(self._gpu_bookkeeping_stream)
 
         return _SamplingArtifacts(
             return_log_probs=return_log_probs,
