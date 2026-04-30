@@ -110,11 +110,7 @@ class MHAMetadata(MetadataBase):
             is_cumulative_tensor=True,
         )
 
-        # When phantom padding is enabled and there are phantom requests with
-        # phantom tokens, fill phantom slots with correct query/kv lengths so
-        # that sum(query_lengths) == padded_token_count.  Without this, padding
-        # slots have query_length=0, leaving token positions unowned during
-        # CUDA graph replay.
+        # If phantom requests have been added, the metadata must be adjusted.
         phantom_count = padded_active_request_count - real_batch_size
         phantom_tokens = padded_active_token_count - batch_dimensions.token_count
         if self._enable_phantom_padding and phantom_count > 0 and phantom_tokens > 0:

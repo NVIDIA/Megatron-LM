@@ -561,20 +561,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             "to have consistency between cuda graph sizes and the block table size."
         )
 
-        # Phantom padding: when EP + Mamba requires all EP ranks to agree on padded batch dimensions
-        # a rank may end up with padded_batch_dimensions that asks for more than `max_requests`.
-        # Phantom padding reserves a spare request slot and handles the attention metadata.
-
+        # Phantom padding: when EP-sync requires all EP ranks to agree on (P, D) request counts,
+        # a rank may end up with padded_batch_dimensions whose total exceeds max_requests.
+        # Example: rank A w/ P=4 D=max-4; rank B w/ P=0 D=max.
+        # The sync in this case would give P=4 D=max, which exceeds max_requests.
+        # Phantom padding reserves spare request slots to prevent this issue.
         # If the MoE dispatcher can handle variable token counts natively, this flag is not needed.
         self._enable_phantom_padding = True
 
-        # Reserve request slots so that after strict EP sync the total
-        # (prefill + decode) fits within max_requests.
         model_sync_needs_reservation = (
             self._enable_phantom_padding
             and self.expert_model_parallel_group is not None
             and get_pg_size(self.expert_model_parallel_group) > 1
-            and self.is_hybrid_model
+            and (self.is_hybrid_model or self.num_speculative_tokens > 0)
         )
         prefill_reservation = (
             (inference_config.cuda_graph_mixed_prefill_count or 1)
@@ -1719,11 +1718,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:
-            if self.num_prefill_requests == 0:
+            if self.is_decode_only():
                 if self.num_speculative_tokens > 0:
                     padded_decode_req_count = min(
-                        self.max_schedulable_requests,
-                        self.round_up_requests(self.num_decode_requests),
+                        self.max_requests, self.round_up_requests(self.num_decode_requests)
                     )
                     padded_token_count = min(
                         self.max_tokens, padded_decode_req_count * (self.num_speculative_tokens + 1)
@@ -1731,7 +1729,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 else:
                     padded_token_count = min(
                         self.max_tokens,
-                        self.max_schedulable_requests,
+                        self.max_requests,
                         self.round_up_tokens(self.active_token_count),
                     )
                     padded_decode_req_count = padded_token_count
@@ -2112,7 +2110,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # Note that for hybrid models checking the total request count is sufficient
         # because we allocate a single set of Mamba state tensors for each request.
-        # Use max_schedulable_requests (which reserves extra slots for EP + Mamba).
         request_can_be_added = (
             self.total_request_count < self.max_schedulable_requests
             and self.paused_request_count == 0
