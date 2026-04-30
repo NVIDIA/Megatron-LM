@@ -356,7 +356,6 @@ def _apply_model_recipe_to_args(args):
         "max_position_embeddings": compiled.max_sequence_length,
         "padded_vocab_size": compiled.vocab_size,
         "tensor_model_parallel_size": cfg.tensor_model_parallel_size,
-        "pipeline_model_parallel_size": cfg.pipeline_model_parallel_size,
         "context_parallel_size": cfg.context_parallel_size,
         "expert_model_parallel_size": cfg.expert_model_parallel_size,
         "expert_tensor_parallel_size": cfg.expert_tensor_parallel_size,
