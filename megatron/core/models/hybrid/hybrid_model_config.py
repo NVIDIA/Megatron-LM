@@ -93,6 +93,9 @@ class CompiledRecipe:
     # like ``"M*M*/MM/MM"``. ``None`` when the recipe has no MTP markers.
     mtp_layer_pattern: Optional[str]
     mtp_num_depths: int
+    # Dotted path to a custom HybridStack ``ModuleSpec``; the builder
+    # imports it. ``None`` lets the builder auto-pick by ``transformer_impl``.
+    stack_spec: Optional[str]
 
 
 @dataclass
@@ -140,6 +143,14 @@ class HybridModelConfig:
 
     pipeline_dtype: Optional[str] = None
     """Pipeline P2P communication dtype name. ``None`` keeps TC default."""
+
+    stack_spec: Optional[str] = None
+    """Dotted Python path to a custom :class:`ModuleSpec` for
+    :class:`HybridStack` (e.g. ``"my_pkg.my_module.my_stack_spec"``). When
+    set, the builder imports and uses this spec; otherwise the spec is
+    auto-picked from ``transformer_impl`` (the legacy ``--spec`` /
+    ``hybrid_inference_stack_spec`` selection). The string form keeps
+    recipes serialisable; resolution happens in ``hybrid_builder``."""
 
     def compile(self) -> CompiledRecipe:
         """Process the layer pattern into a :class:`CompiledRecipe`.
@@ -337,6 +348,7 @@ class HybridModelConfig:
             parallel_output=loss.parallel_output,
             mtp_layer_pattern=mtp_layer_pattern,
             mtp_num_depths=mtp_num_depths,
+            stack_spec=self.stack_spec,
         )
 
 

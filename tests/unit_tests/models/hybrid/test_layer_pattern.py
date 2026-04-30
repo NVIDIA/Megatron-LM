@@ -345,6 +345,31 @@ class TestHybridModelConfigCompile:
         with pytest.raises(ValueError, match="Attention.*MLA/DSA|MLA/DSA.*Attention"):
             recipe.compile()
 
+    def test_stack_spec_default_none(self):
+        """A recipe without an explicit ``stack_spec`` leaves
+        :attr:`CompiledRecipe.stack_spec` ``None``; the builder is then free
+        to auto-pick by ``transformer_impl``."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+        assert compiled.stack_spec is None
+
+    def test_stack_spec_propagates_through_compile(self):
+        """An explicit ``stack_spec`` dotted path on the recipe flows through
+        to :class:`CompiledRecipe`. Resolution happens later in the builder."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, loss],
+            stack_spec="my_pkg.my_module.my_stack_spec",
+        ).compile()
+        assert compiled.stack_spec == "my_pkg.my_module.my_stack_spec"
+
 
 @pytest.mark.internal
 class TestMTPLayerConfig:
