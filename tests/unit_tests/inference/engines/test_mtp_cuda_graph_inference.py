@@ -678,7 +678,7 @@ class TestMTPCudaGraphInference:
 
         Uses add_request + update_requests to build real decode batches, then
         verifies that under CUDA graph matching:
-        1. num_last_token_logits uses the padded decode count
+        1. num_last_token_logits uses the padded decode count from the matched graph
         2. last_token_logits returns the padded number of rows
         3. The real (unpadded) index positions are sequential 0..N-1
         """
@@ -691,22 +691,21 @@ class TestMTPCudaGraphInference:
         context = engine.context
         tokens_per_decode = num_spec + 1
 
-        # Find decode-only graph dims with room for sub-capacity batches.
-        test_cases = []
-        for graph_dim in context.cuda_graph_batch_dimensions_list:
-            if graph_dim.prefill_req_count > 0:
-                continue
-            padded_decode = graph_dim.decode_req_count
-            for active in range(max(1, padded_decode - 2), padded_decode):
-                if active < padded_decode and active > 0:
-                    test_cases.append((active, graph_dim))
-                    break
-        assert len(test_cases) > 0, "No sub-capacity decode graph dims found"
+        # Collect decode-only graph sizes to pick active counts that will match.
+        decode_graph_sizes = sorted(
+            {
+                dim.decode_req_count
+                for dim in context.cuda_graph_batch_dimensions_list
+                if dim.prefill_req_count == 0 and dim.decode_req_count > 1
+            }
+        )
+        assert len(decode_graph_sizes) > 0, "No decode-only graph dims found"
 
-        for active_decode_count, graph_dim in test_cases[:3]:
-            padded_decode = graph_dim.decode_req_count
-            padded_token_count = graph_dim.token_count
+        # Use active counts 1 less than some graph sizes to guarantee padding.
+        active_counts = [s - 1 for s in decode_graph_sizes if s >= 2][:3]
+        assert len(active_counts) > 0, "No sub-capacity decode graph dims found"
 
+        for active_decode_count in active_counts:
             context.reset()
 
             # Add prefill requests, then step them into decode state.
@@ -736,12 +735,19 @@ class TestMTPCudaGraphInference:
             context.initialize_attention_state()
 
             assert context.using_cuda_graph_this_step(), (
-                f"Expected CUDA graph for active={active_decode_count}, graph={graph_dim}"
+                f"Expected CUDA graph for active={active_decode_count}"
             )
+
+            # Read the actually matched graph dimensions.
+            matched = context.padded_batch_dimensions
+            padded_decode = matched.decode_req_count
+            padded_token_count = matched.token_count
+            assert padded_decode >= active_decode_count
 
             expected_padded_logits = padded_decode * tokens_per_decode
             assert context.num_last_token_logits == expected_padded_logits, (
-                f"num_last_token_logits: expected {expected_padded_logits}, "
+                f"active={active_decode_count}, padded={padded_decode}: "
+                f"num_last_token_logits expected {expected_padded_logits}, "
                 f"got {context.num_last_token_logits}"
             )
 
@@ -752,6 +758,14 @@ class TestMTPCudaGraphInference:
             assert torch.equal(real_slice, expected_real), (
                 f"real decode indices: {real_slice.tolist()} vs {expected_real.tolist()}"
             )
+
+            # Padding indices should be zero (indexing into logits[0]).
+            padding_count = expected_padded_logits - real_token_count
+            if padding_count > 0:
+                padding_slice = context.active_logit_idxs[real_token_count:expected_padded_logits]
+                assert padding_slice.sum().item() == 0, (
+                    f"padding indices should be zero, got {padding_slice.tolist()}"
+                )
 
             # Verify last_token_logits produces a tensor with the padded row count.
             vocab_size = 64
