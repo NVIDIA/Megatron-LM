@@ -949,7 +949,19 @@ if _CUTILE_AVAILABLE:
         for tile_m in tile_ms:
             for tile_k in tile_ks:
                 for split_k in split_ks:
-                        yield {"TILE_M": tile_m, "TILE_N": TILE_N, "TILE_K": tile_k, 'SPLIT_K': split_k}
+                    yield {"TILE_M": tile_m, "TILE_N": TILE_N, "TILE_K": tile_k, 'SPLIT_K': split_k}
+
+    def _default_tile_m(M: int) -> int:
+        """Pick a tile size that avoids unmasked stores past the M dimension."""
+        for tile_m in (128, 64, 32, 16, 8, 4, 2, 1):
+            if tile_m <= M and M % tile_m == 0:
+                return tile_m
+        return 1
+
+    def _default_proj_rms_fwd_config(M: int, K: int, TILE_N: int):
+        """Static fallback for skinny MHC projection when autotune cache is absent."""
+        split_k = 16 if K >= 16384 else 8 if K >= 8192 else 1
+        return _default_tile_m(M), TILE_N, min(128, K), split_k
 
     # Cache the best config across calls (keyed by M, N, K).
     _proj_rms_fwd_best_cfg: dict = {}
@@ -971,7 +983,7 @@ if _CUTILE_AVAILABLE:
             if cached is not None:
                 tm, tn, tk, split_k = cached
             else:
-                tm, tn, tk, split_k = 128, TILE_N, 128, 1
+                tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
 
             # print(cached)
             # print('hahahahahah')
@@ -995,43 +1007,56 @@ if _CUTILE_AVAILABLE:
 
             configs = [SimpleNamespace(**c) for c in _proj_rms_fwd_autotune_configs(N)]
             # filter out configs with TILE_K > K or TILE_M > M
-            configs = [cfg for cfg in configs if cfg.TILE_K <= K and cfg.TILE_M <= M]
-            # if no valid config, set a default config with TILE_M = M and TILE_K = K and SPLIT_K = 1
-            # if len(configs) == 0:
-            #     configs = [SimpleNamespace(TILE_M=M, TILE_N=TILE_N, TILE_K=K, SPLIT_K=1)]
-            mx_split_k = max(cfg.SPLIT_K for cfg in configs)
-            proj = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
-            norm = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
-            r = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
-            tuned = ct_experimental.autotune_launch(
-                stream,
-                grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M), cfg.SPLIT_K),
-                kernel=_ct_proj_rms_fwd_kernel,
-                args_fn=lambda cfg: (
-                    x, weight, proj, norm, r, M, N, K, eps,
-                    cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.SPLIT_K,
-                ),
-                search_space=configs,
-            )
-            best = tuned.tuned_config
-            # print(best)
-            # print('hahahahahah')
-            # best.SPLIT_K = 1
-            _proj_rms_fwd_best_cfg[cache_key] = (best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K)
-            proj = torch.empty(best.SPLIT_K * M, N, dtype=x.dtype, device=dev)
-            norm = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
-            r = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
-            # Re-launch with best config for correct output.
-            ct.launch(
-                stream,
-                (math.ceil(M / best.TILE_M), best.SPLIT_K),
-                _ct_proj_rms_fwd_kernel,
-                (x, weight, proj, norm, r, M, N, K, eps,
-                 best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K),
-            )
+            configs = [cfg for cfg in configs if cfg.TILE_K <= K and M % cfg.TILE_M == 0]
+            if len(configs) == 0:
+                tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
+                proj = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
+                norm = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                r = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                ct.launch(
+                    stream,
+                    (math.ceil(M / tm), split_k),
+                    _ct_proj_rms_fwd_kernel,
+                    (x, weight, proj, norm, r, M, N, K, eps, tm, tn, tk, split_k),
+                )
+                proj = proj.view(split_k, M, N).sum(dim=0)
+                norm = norm.view(split_k, M, 1).sum(dim=0)
+            else:
+                mx_split_k = max(cfg.SPLIT_K for cfg in configs)
+                proj = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
+                norm = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                r = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                tuned = ct_experimental.autotune_launch(
+                    stream,
+                    grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M), cfg.SPLIT_K),
+                    kernel=_ct_proj_rms_fwd_kernel,
+                    args_fn=lambda cfg: (
+                        x, weight, proj, norm, r, M, N, K, eps,
+                        cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.SPLIT_K,
+                    ),
+                    search_space=configs,
+                )
+                best = tuned.tuned_config
+                # print(best)
+                # print('hahahahahah')
+                # best.SPLIT_K = 1
+                _proj_rms_fwd_best_cfg[cache_key] = (
+                    best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K
+                )
+                proj = torch.empty(best.SPLIT_K * M, N, dtype=x.dtype, device=dev)
+                norm = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
+                r = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
+                # Re-launch with best config for correct output.
+                ct.launch(
+                    stream,
+                    (math.ceil(M / best.TILE_M), best.SPLIT_K),
+                    _ct_proj_rms_fwd_kernel,
+                    (x, weight, proj, norm, r, M, N, K, eps,
+                     best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K),
+                )
 
-            proj = proj.view(best.SPLIT_K, M, N).sum(dim=0)
-            norm = norm.view(best.SPLIT_K, M, 1).sum(dim=0)
+                proj = proj.view(best.SPLIT_K, M, N).sum(dim=0)
+                norm = norm.view(best.SPLIT_K, M, 1).sum(dim=0)
         norm = torch.sqrt(norm)
         # r = r.view(split_k, M, 1).sum(dim=0)
         r = 1.0 / (norm / math.sqrt(K) + eps)
@@ -1041,8 +1066,8 @@ if _CUTILE_AVAILABLE:
 
     def _reduce_compute_h_autotune_configs(M):
         """Generate autotune search space for reduce_compute_h kernel."""
-        for tile_m in (1, 2, 4, 8, 16, 32, 64, 128):
-            if tile_m <= M:
+        for tile_m in (128, 64, 32, 16, 8, 4, 2, 1):
+            if tile_m <= M and M % tile_m == 0:
                 yield tile_m
 
     _reduce_compute_h_best_cfg: dict = {}
@@ -1059,6 +1084,7 @@ if _CUTILE_AVAILABLE:
         N: int,
         K: int,
         eps: float,
+        tile_m: int,
         tile_n: int,
         split_k: int,
     ) -> Tuple[Tensor, Tensor, Tensor]:
@@ -1078,7 +1104,7 @@ if _CUTILE_AVAILABLE:
         r_out = torch.empty(M, 1, dtype=proj_acc.dtype, device=dev)
         proj_out = torch.empty(M, N, dtype=proj_acc.dtype, device=dev)
 
-        cache_key = (M, N, K, n, split_k)
+        cache_key = (M, N, K, n, tile_m, split_k)
         cached = _reduce_compute_h_best_cfg.get(cache_key)
 
         def _make_args(tm):
@@ -1091,7 +1117,7 @@ if _CUTILE_AVAILABLE:
             )
 
         if cached is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
-            tm = cached if cached is not None else min(128, M)
+            tm = cached if cached is not None else tile_m
             ct.launch(stream, (math.ceil(M / tm),), _ct_reduce_compute_h_kernel, _make_args(tm))
         else:
             from types import SimpleNamespace
@@ -1099,6 +1125,7 @@ if _CUTILE_AVAILABLE:
             configs = [
                 SimpleNamespace(TILE_M=tm)
                 for tm in _reduce_compute_h_autotune_configs(M)
+                if tm == tile_m
             ]
             tuned = ct_experimental.autotune_launch(
                 stream,
@@ -1151,7 +1178,7 @@ if _CUTILE_AVAILABLE:
             if cached is not None:
                 tm, tn, tk, split_k = cached
             else:
-                tm, tn, tk, split_k = 128, TILE_N, 128, 1
+                tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
 
             proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
             norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
@@ -1167,41 +1194,61 @@ if _CUTILE_AVAILABLE:
             from types import SimpleNamespace
 
             configs = [SimpleNamespace(**c) for c in _proj_rms_fwd_autotune_configs(N)]
-            configs = [cfg for cfg in configs if cfg.TILE_K <= K and cfg.TILE_M <= M]
-            mx_split_k = max(cfg.SPLIT_K for cfg in configs)
-            proj_acc = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
-            norm_acc = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
-            r_placeholder = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
-            tuned = ct_experimental.autotune_launch(
-                stream,
-                grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M), cfg.SPLIT_K),
-                kernel=_ct_proj_rms_fwd_kernel,
-                args_fn=lambda cfg: (
-                    x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps,
-                    cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.SPLIT_K,
-                ),
-                search_space=configs,
-            )
-            best = tuned.tuned_config
-            _proj_rms_fwd_best_cfg[cache_key] = (best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K)
-            tm, tn, tk, split_k = best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K
+            configs = [cfg for cfg in configs if cfg.TILE_K <= K and M % cfg.TILE_M == 0]
+            if len(configs) == 0:
+                tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
+                proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
+                norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                ct.launch(
+                    stream,
+                    (math.ceil(M / tm), split_k),
+                    _ct_proj_rms_fwd_kernel,
+                    (
+                        x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps,
+                        tm, tn, tk, split_k,
+                    ),
+                )
+            else:
+                mx_split_k = max(cfg.SPLIT_K for cfg in configs)
+                proj_acc = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
+                norm_acc = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                r_placeholder = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                tuned = ct_experimental.autotune_launch(
+                    stream,
+                    grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M), cfg.SPLIT_K),
+                    kernel=_ct_proj_rms_fwd_kernel,
+                    args_fn=lambda cfg: (
+                        x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps,
+                        cfg.TILE_M, cfg.TILE_N, cfg.TILE_K, cfg.SPLIT_K,
+                    ),
+                    search_space=configs,
+                )
+                best = tuned.tuned_config
+                _proj_rms_fwd_best_cfg[cache_key] = (
+                    best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K
+                )
+                tm, tn, tk, split_k = best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K
 
-            proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
-            norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
-            r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
-            ct.launch(
-                stream,
-                (math.ceil(M / tm), split_k),
-                _ct_proj_rms_fwd_kernel,
-                (x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps, tm, tn, tk, split_k),
-            )
+                proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
+                norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                ct.launch(
+                    stream,
+                    (math.ceil(M / tm), split_k),
+                    _ct_proj_rms_fwd_kernel,
+                    (
+                        x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps,
+                        tm, tn, tk, split_k,
+                    ),
+                )
 
         # Launch reduce + compute_h kernel
         y_activated, r, proj_reduced = _cutile_reduce_compute_h(
             proj_acc, norm_acc, bias,
             alpha_pre, alpha_post, alpha_res,
             n, M, N, K, eps,
-            TILE_N, split_k,
+            tm, TILE_N, split_k,
         )
         return y_activated, r, proj_reduced
 
