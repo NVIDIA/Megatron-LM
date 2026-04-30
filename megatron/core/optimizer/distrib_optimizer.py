@@ -2686,6 +2686,69 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 shard_param_buffer.copy_(shard_main_param)
 
+    @staticmethod
+    def _normalize_state_dict_for_grouped_params(state_dict_flat, model_chunk):
+        """Normalize state dict keys when grouped/indexed parameter formats differ.
+
+        TEGroupedLinear modules can store weights as either a single grouped tensor
+        (single_grouped_weight=True, key "weight") or individually indexed tensors
+        (single_grouped_weight=False, keys "weight0", "weight1", ...).  When the
+        checkpoint was saved with a different setting, the keys won't match the
+        current model's parameters.  This mirrors the
+        normalize_grouped_parameter_keys hook registered in TEGroupedLinear.__init__
+        which only fires during load_state_dict and therefore does not cover the
+        optimizer reload_model_params path.
+        """
+        for module_name, module in model_chunk.named_modules():
+            if not (
+                hasattr(module, 'num_gemms')
+                and hasattr(module, '_split_grouped_checkpoint_tensor')
+            ):
+                continue
+
+            clean_name = module_name
+            while clean_name.startswith("module."):
+                clean_name = clean_name[len("module."):]
+
+            num_gemms = module.num_gemms
+
+            params_to_check = [("weight", getattr(module, "single_grouped_weight", False))]
+            if getattr(module, "use_bias", False):
+                params_to_check.append(
+                    ("bias", getattr(module, "single_grouped_bias", False))
+                )
+
+            for param_name, single_grouped in params_to_check:
+                grouped_suffix = f"{clean_name}.{param_name}" if clean_name else param_name
+                indexed_suffixes = [f"{grouped_suffix}{i}" for i in range(num_gemms)]
+
+                grouped_matches = [k for k in state_dict_flat if k.endswith(grouped_suffix)]
+                indexed_match_map = {}
+                for i, idx_suffix in enumerate(indexed_suffixes):
+                    matches = [k for k in state_dict_flat if k.endswith(idx_suffix)]
+                    if len(matches) == 1:
+                        indexed_match_map[i] = matches[0]
+
+                if single_grouped:
+                    if grouped_matches or len(indexed_match_map) != num_gemms:
+                        continue
+                    indexed_keys = [indexed_match_map[i] for i in range(num_gemms)]
+                    grouped_tensor = torch.stack(
+                        [state_dict_flat.pop(k) for k in indexed_keys], dim=0
+                    )
+                    key_prefix = indexed_keys[0][: len(indexed_keys[0]) - len(indexed_suffixes[0])]
+                    state_dict_flat[f"{key_prefix}{grouped_suffix}"] = grouped_tensor
+                else:
+                    if indexed_match_map or len(grouped_matches) != 1:
+                        continue
+                    grouped_key = grouped_matches[0]
+                    split_tensors = module._split_grouped_checkpoint_tensor(
+                        state_dict_flat.pop(grouped_key), grouped_key
+                    )
+                    key_prefix = grouped_key[: len(grouped_key) - len(grouped_suffix)]
+                    for i, tensor in enumerate(split_tensors):
+                        state_dict_flat[f"{key_prefix}{indexed_suffixes[i]}"] = tensor
+
     def _build_model_param_to_state_dict_param_map(self, state_dict):
         """Create a map from model params to tensors in state_dict based on their names."""
         state_dict_list = []
@@ -2707,6 +2770,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         model_param_to_state_dict_param_map = {}
         for chunk_idx, model_chunk in enumerate(self.model_chunks):
+            self._normalize_state_dict_for_grouped_params(
+                state_dict_list[chunk_idx], model_chunk
+            )
             names_in_state_dict = set(state_dict_list[chunk_idx].keys())
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
