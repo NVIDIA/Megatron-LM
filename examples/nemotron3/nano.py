@@ -63,7 +63,7 @@ common_config = CommonLayerConfig(
     # Precision
     mixed_precision_dtype="bf16",
     first_last_layers_bf16=True,
-    # Layer-level parallelism (TP/PP/CP/EP sizes live on HybridModelConfig)
+    # Layer-level parallelism (TP/CP/EP sizes live on HybridModelConfig).
     sequence_parallel=True,
     # Initialisation
     init_method_std=0.0173,
@@ -74,6 +74,11 @@ common_config = CommonLayerConfig(
     activation_func="squared_relu",
     # Fusions
     persist_layer_norm=True,
+    # ``tp_comm_overlap`` is not a curated DSL field today; the Bridge config
+    # sets it via CommOverlapConfig. Use ``extra`` to project it onto every
+    # per-layer TransformerConfig (matches the legacy ``--tp-comm-overlap``
+    # CLI flag).
+    extra={"tp_comm_overlap": True},
 )
 
 
@@ -87,11 +92,7 @@ Embedding = EmbeddingLayerConfig(
 )
 
 Mamba = MambaLayerConfig(
-    common_config=common_config,
-    head_dim=64,
-    state_size=128,
-    num_groups=8,
-    num_heads=64,
+    common_config=common_config, head_dim=64, state_size=128, num_groups=8, num_heads=64
 )
 
 Att = AttentionLayerConfig(
@@ -129,10 +130,7 @@ MoE = MoELayerConfig(
     use_fused_weighted_squared_relu=True,
 )
 
-Loss = CrossEntropyLayerConfig(
-    loss_fusion=True,
-    fusion_impl="native",
-)
+Loss = CrossEntropyLayerConfig(loss_fusion=True, fusion_impl="native")
 
 
 # --- Layer pattern composition ---------------------------------------------
@@ -164,11 +162,11 @@ def make_recipe() -> HybridModelConfig:
         common_config=common_config,
         layer_pattern=layer_pattern,
         untie_embeddings_and_output_weights=True,
-        # Model-level parallelism
+        # Model-level parallelism (PP intentionally absent — the recipe DSL
+        # is PP-free; recipes that need PP must use the legacy string DSL).
         tensor_model_parallel_size=4,
         expert_model_parallel_size=8,
         expert_tensor_parallel_size=1,
-        pipeline_dtype="bf16",
     )
 
 

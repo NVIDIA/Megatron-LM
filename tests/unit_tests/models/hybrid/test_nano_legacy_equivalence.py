@@ -40,9 +40,7 @@ from pathlib import Path
 
 import pytest
 
-NANO_SH = (
-    Path(__file__).resolve().parents[4] / "examples" / "nemotron3" / "nano.sh"
-)
+NANO_SH = Path(__file__).resolve().parents[4] / "examples" / "nemotron3" / "nano.sh"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -100,10 +98,7 @@ ATTENTION_BACKEND_REPR_PATCHES: dict[str, str] = {
 
 #: Argparse flags with ``nargs='+'``: parsed as singleton lists; the recipe
 #: stores scalars. Same value semantically.
-NARGS_PLUS_FIELDS: tuple[str, ...] = (
-    "moe_router_load_balancing_type",
-    "moe_aux_loss_coeff",
-)
+NARGS_PLUS_FIELDS: tuple[str, ...] = ("moe_router_load_balancing_type", "moe_aux_loss_coeff")
 
 
 #: Architectural TransformerConfig fields applied uniformly to every per-layer
@@ -151,16 +146,21 @@ MODEL_WIDE_FIELDS: tuple[str, ...] = (
 
 
 def _extract_args_from_sh(sh_path: Path) -> list[str]:
-    """Return the flat list of ``--*`` flags + values found in nano.sh."""
+    """Return the flat list of ``--*`` flags + values found in nano.sh.
+
+    Uses :func:`shlex.split` so values that the shell needs quoted (e.g.
+    ``--hybrid-layer-pattern "M*M*..."`` whose ``*`` would otherwise glob)
+    are tokenised correctly without the quote characters being passed
+    through as part of the value.
+    """
+    import shlex
+
     args: list[str] = []
     for raw in sh_path.read_text().splitlines():
         line = raw.strip().rstrip("\\").strip()
         if not line.startswith("--"):
             continue
-        parts = line.split(maxsplit=1)
-        args.append(parts[0])
-        if len(parts) == 2:
-            args.append(parts[1])
+        args.extend(shlex.split(line))
     return args
 
 
@@ -278,9 +278,7 @@ def _diff_fields(legacy_tc, candidate_tc, fields, label: str) -> list[str]:
         if legacy_val is _MISSING and recipe_val is _MISSING:
             continue
         if not _eq(legacy_val, recipe_val):
-            diffs.append(
-                f"  [{label}] {f}: legacy={legacy_val!r}  recipe={recipe_val!r}"
-            )
+            diffs.append(f"  [{label}] {f}: legacy={legacy_val!r}  recipe={recipe_val!r}")
     return diffs
 
 
@@ -386,11 +384,10 @@ class TestNanoArchitecturalEquivalence:
 
     def test_first_mamba_layer_matches(self, legacy, recipe):
         _, legacy_tc, _ = legacy
-        mamba_tc = _first_layer_of_type(
-            recipe.layer_type_list, recipe.layer_config_list, "M"
-        )
+        mamba_tc = _first_layer_of_type(recipe.layer_type_list, recipe.layer_config_list, "M")
         diffs = _diff_fields(
-            legacy_tc, mamba_tc,
+            legacy_tc,
+            mamba_tc,
             ("mamba_num_heads", "mamba_head_dim", "mamba_state_dim", "mamba_num_groups"),
             "mamba_layer",
         )
@@ -398,11 +395,10 @@ class TestNanoArchitecturalEquivalence:
 
     def test_first_attention_layer_matches(self, legacy, recipe):
         _, legacy_tc, _ = legacy
-        att_tc = _first_layer_of_type(
-            recipe.layer_type_list, recipe.layer_config_list, "*"
-        )
+        att_tc = _first_layer_of_type(recipe.layer_type_list, recipe.layer_config_list, "*")
         diffs = _diff_fields(
-            legacy_tc, att_tc,
+            legacy_tc,
+            att_tc,
             (
                 "num_attention_heads",
                 "num_query_groups",
@@ -417,11 +413,10 @@ class TestNanoArchitecturalEquivalence:
 
     def test_first_moe_layer_matches(self, legacy, recipe):
         _, legacy_tc, _ = legacy
-        moe_tc = _first_layer_of_type(
-            recipe.layer_type_list, recipe.layer_config_list, "E"
-        )
+        moe_tc = _first_layer_of_type(recipe.layer_type_list, recipe.layer_config_list, "E")
         diffs = _diff_fields(
-            legacy_tc, moe_tc,
+            legacy_tc,
+            moe_tc,
             (
                 "num_moe_experts",
                 "moe_router_topk",
