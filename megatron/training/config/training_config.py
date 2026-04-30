@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass, field
+import argparse
 import signal
+from dataclasses import dataclass, field
 from typing import Literal, Optional
+
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -581,6 +583,21 @@ class CheckpointConfig:
 
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
+
+    stream_ckpt_dequant: bool = field(
+        default=True,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--stream-ckpt-dequant"],
+                "action": argparse.BooleanOptionalAction,
+            }
+        },
+    )
+    """Per-tensor streaming dequantize when loading checkpoints with quantized model params
+    (FP8, MXFP8, blockwise FP8, NVFP4). The LoadPlanner dequantizes one destination at a time,
+    instead of dequantizing the entire state dict to high precision before the load starts
+    (which allocates N simultaneous scratch tensors and can OOM on large models). On by
+    default; pass --no-stream-ckpt-dequant to fall back to the legacy upfront pass."""
 
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_installed

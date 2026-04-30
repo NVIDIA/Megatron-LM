@@ -2701,15 +2701,6 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
-    group.add_argument('--stream-ckpt-dequant', action=argparse.BooleanOptionalAction,
-                       dest='stream_ckpt_dequant', default=True,
-                       help='Per-tensor streaming dequantize when loading checkpoints '
-                            'with quantized model params (FP8, MXFP8, blockwise FP8, NVFP4). '
-                            'The LoadPlanner dequantizes one destination at a time, instead '
-                            'of dequantizing the entire state dict to high precision before '
-                            'the load starts (which allocates N simultaneous scratch tensors '
-                            'and can OOM on large models). On by default; pass '
-                            '--no-stream-ckpt-dequant to fall back to the legacy upfront pass.')
     return parser
 
 
