@@ -957,10 +957,22 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                     ), f"Request {req_idx}, token {token_idx}: expected {top_n} indices"
 
     @pytest.mark.internal
-    def test_speculative_verify_tokens(self):
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_verify_tokens(
+        self, backend: str, materialize_only_last_token_logits: bool
+    ):
         """Test consecutive token acceptance logic for speculative decoding."""
+        if backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         self.setup_model(
-            torch.float32, static=False, num_speculative_tokens=2, max_requests=2, mtp_num_layers=2
+            torch.float32,
+            static=False,
+            num_speculative_tokens=2,
+            max_requests=2,
+            mtp_num_layers=2,
+            sampling_backend=backend,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
         )
 
         # Enable speculative decoding
@@ -995,12 +1007,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 # The verification logic only uses base tokens, so we can return zeros here.
                 return torch.zeros((12,), dtype=torch.long, device='cuda')
 
-        # Drive both requests into a single greedy bucket via metadata, then mock
-        # the per-bucket sampling function to return our predictable outputs.
-        ctx.active_request_metadata["temperature"][:2] = 1.0
-        ctx.active_request_metadata["top_k"][:2] = 1
-        ctx.active_request_metadata["top_p"][:2] = 0.0
-        self.text_generation_controller._sampling._sampling_func = mock.MagicMock(
+        # Override sampling to return our predictable mock outputs.
+        self.text_generation_controller._sampling.sample_kernel = mock.MagicMock(
             side_effect=mock_sampling_func
         )
 
