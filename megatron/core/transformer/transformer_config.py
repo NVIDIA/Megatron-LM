@@ -1145,6 +1145,13 @@ class TransformerConfig(ModelParallelConfig):
     activation_offload_fraction: float = 1.0
     """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
 
+    fine_grained_offloading_max_inflight_offloads: Optional[int] = None
+    """Per FGO group name, max number of inflight offloads for that name not
+    yet joined on the main stream (wait_event on D2H). The same cap applies to
+    every name (e.g. ``moe_act`` and ``qkv_linear`` each have their own pending
+    queue). 0 = wait after every offload for that name. 1 = at most one
+    not-yet-waited offload per name, etc. None = do not insert these joins."""
+
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward"""
 
@@ -1754,6 +1761,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
+            if self.fine_grained_offloading_max_inflight_offloads is not None:
+                assert (
+                    self.fine_grained_offloading_max_inflight_offloads >= 0
+                ), "fine_grained_offloading_max_inflight_offloads must be non-negative when set."
         if self.moe_paged_stash:
             assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
             assert self.moe_expert_rank_capacity_factor is not None, (
@@ -2418,7 +2429,8 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.fine_grained_activation_offloading:
                 assert self.cuda_graph_impl == "transformer_engine" or (
-                    self.cuda_graph_impl == "local" and self.cuda_graph_scope == "full_iteration"
+                    self.cuda_graph_impl == "local"
+                    and self.cuda_graph_scope == [CudaGraphScope.full_iteration]
                 ), (
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
