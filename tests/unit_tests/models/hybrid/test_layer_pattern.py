@@ -566,6 +566,89 @@ class TestMTPLayerConfig:
 
 
 @pytest.mark.internal
+class TestHeterogeneousMoE:
+    """Two distinct MoELayerConfig instances in one recipe must produce two
+    per-layer TransformerConfigs whose MoE fields actually differ. This is
+    the headline DSL capability the legacy single-character pattern can't
+    express."""
+
+    def _embedding(self, common):
+        return EmbeddingLayerConfig(
+            common_config=common,
+            vocab_size=1024,
+            max_sequence_length=512,
+            position_embedding_type="rope",
+        )
+
+    def test_two_moe_configs_produce_distinct_tcs(self):
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        dense = MoELayerConfig(common_config=common, num_experts=8, top_k=4, ffn_hidden_size=256)
+        sparse = MoELayerConfig(common_config=common, num_experts=4, top_k=2, ffn_hidden_size=128)
+        loss = CrossEntropyLayerConfig()
+        # Pattern: [emb, a, dense, a, sparse, loss] — 4 decoder layers, 2 MoE.
+        compiled = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, dense, a, sparse, loss],
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        ).compile()
+        tcs = compiled.layer_config_list
+        # Decoder indices: 0=att, 1=dense MoE, 2=att, 3=sparse MoE.
+        dense_tc, sparse_tc = tcs[1], tcs[3]
+        assert dense_tc.num_moe_experts == 8 and sparse_tc.num_moe_experts == 4
+        assert dense_tc.moe_router_topk == 4 and sparse_tc.moe_router_topk == 2
+        assert dense_tc.moe_ffn_hidden_size == 256 and sparse_tc.moe_ffn_hidden_size == 128
+        # And the two are not the same Python object (no aliasing).
+        assert dense_tc is not sparse_tc
+
+    def test_two_moe_configs_share_global_ep(self):
+        """EP is a model-wide topology fact — both MoE TCs must agree on it
+        regardless of any per-layer-config differences."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        dense = MoELayerConfig(common_config=common, num_experts=8, top_k=2)
+        sparse = MoELayerConfig(common_config=common, num_experts=4, top_k=2)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, dense, a, sparse, loss],
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        ).compile()
+        dense_tc, sparse_tc = compiled.layer_config_list[1], compiled.layer_config_list[3]
+        assert dense_tc.expert_model_parallel_size == 2
+        assert sparse_tc.expert_model_parallel_size == 2
+
+    def test_non_moe_tcs_carry_no_expert_parallelism(self):
+        """The other half of the EP-only-on-MoE invariant: non-MoE TCs in a
+        heterogeneous-MoE recipe default to EP=1 and ``num_moe_experts=None``,
+        which is what the runtime layer construction actually consumes."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        dense = MoELayerConfig(common_config=common, num_experts=8, top_k=2)
+        sparse = MoELayerConfig(common_config=common, num_experts=4, top_k=2)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, dense, a, sparse, loss],
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        ).compile()
+        # Indices 0 and 2 are attention layers in the pattern above.
+        att_tc_0, att_tc_2 = compiled.layer_config_list[0], compiled.layer_config_list[2]
+        for tc in (att_tc_0, att_tc_2):
+            assert tc.expert_model_parallel_size == 1
+            assert tc.num_moe_experts is None
+
+
+@pytest.mark.internal
 class TestExtraPassthrough:
     """Every config exposes an ``extra: dict`` escape hatch for any
     TransformerConfig field not in the curated DSL surface."""
