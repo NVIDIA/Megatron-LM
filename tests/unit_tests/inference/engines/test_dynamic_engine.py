@@ -1098,6 +1098,65 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     assert not math.isnan(log_prob) and not math.isinf(log_prob)
                     assert -100.0 <= log_prob <= 0.0
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_return_log_probs_speculative(self):
+        """Verify log probs are returned and well-formed in speculative-decoding mode.
+
+        Exercises the production deferred-extract path end-to-end: each step the
+        controller's `_dynamic_step_calculate_log_probs` constructs a callable
+        wrapping `LogProbsSpeculative.gather_kernel` + extract, and the engine
+        invokes it post-step to populate per-request log probs.
+        """
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=True,
+            skip_prompt_log_probs=True,  # required under only-last-token mode
+            num_speculative_tokens=2,
+            num_tokens_to_generate=8,
+            num_requests=4,
+        )
+
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # Generated log probs must align 1:1 with generated tokens.
+            assert request.generated_log_probs is not None, (
+                f"Request {request.request_id}: generated_log_probs should not be None"
+            )
+            assert len(request.generated_log_probs) == len(request.generated_tokens), (
+                f"Request {request.request_id}: expected "
+                f"{len(request.generated_tokens)} generated log probs, "
+                f"got {len(request.generated_log_probs)}"
+            )
+
+            # Each generated token id is valid; each log prob is finite,
+            # non-positive, in a reasonable range.
+            for i, (token_id, log_prob) in enumerate(
+                zip(request.generated_tokens, request.generated_log_probs)
+            ):
+                assert 0 <= token_id < env.config.vocab_size, (
+                    f"Request {request.request_id}, token {i}: "
+                    f"token_id {token_id} out of range [0, {env.config.vocab_size})"
+                )
+                assert not math.isnan(log_prob) and not math.isinf(log_prob), (
+                    f"Request {request.request_id}, token {i}: "
+                    f"log_prob {log_prob} is NaN/inf"
+                )
+                assert -100.0 <= log_prob <= 0.0, (
+                    f"Request {request.request_id}, token {i}: "
+                    f"log_prob {log_prob} out of expected range [-100, 0]"
+                )
+
+            # skip_prompt_log_probs=True means prompt log probs are absent.
+            assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
+                f"Request {request.request_id}: prompt_log_probs should be empty when "
+                f"skip_prompt_log_probs=True, got {len(request.prompt_log_probs)} items"
+            )
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

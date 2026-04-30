@@ -1515,6 +1515,147 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_calculate_log_probs_speculative(self):
+        """Speculative-decoding path of calculate_log_probs (decode-only batch).
+
+        Validates that the gather kernel returns `accepted_count + 1` log-probs
+        per request: log-probs of the accepted speculative tokens (positions
+        `0..k-1`) followed by the freshly sampled token at position `k`.
+
+        Covers all three accepted_count regimes in a single batch:
+          - request 0: both spec tokens accepted (k = num_speculative_tokens)
+          - request 1: first spec token accepted, second rejected
+          - request 2: no spec tokens accepted
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        num_spec = 2
+        spec_plus_one = num_spec + 1
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.05,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_speculative_tokens=num_spec,
+        )
+
+        # Add 3 prefill requests; we'll transition them to decode below.
+        request_lengths = [10, 5, 7]
+        for i, req_len in enumerate(request_lengths):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=1001 + i,
+                    prompt_tokens=torch.randint(0, 100, (req_len,), device='cuda'),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=dynamic_context.max_tokens - req_len
+                    ),
+                )
+            )
+
+        num_active = (
+            dynamic_context.total_request_count - dynamic_context.paused_request_count
+        )
+
+        # Prefill step + transition to decode-only via update_requests.
+        dynamic_context.initialize_attention_state()
+        active_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
+        prefill_new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
+        # Speculative-token layout matches `_sampled_mtp_tokens_cuda`: [num_spec, num_active].
+        new_speculative_tokens = torch.randint(
+            0, 100, (num_spec, num_active), device='cuda', dtype=torch.long
+        )
+        dynamic_context.update_requests(
+            active_requests_mask=active_mask,
+            new_tokens=prefill_new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # Decode step setup.
+        dynamic_context.initialize_attention_state()
+        assert dynamic_context.num_decode_requests == num_active
+
+        # Mark all requests as wanting log probs.
+        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.active_request_metadata["return_log_probs"][:num_active] = True
+
+        # Decode logits: each decode request produces `spec_plus_one` rows.
+        vocab_size = 50000
+        total_logit_rows = num_active * spec_plus_one
+        decode_logits = torch.randn(
+            1, total_logit_rows, vocab_size, device='cuda', dtype=torch.float32
+        )
+
+        # accepted_tokens layout matches the controller's `_accepted_tokens_per_request`:
+        # shape [max_requests, num_speculative_tokens]; -1 marks rejected slots.
+        spec_tokens = [(42, 17), (99, -1), (-1, -1)]
+        accepted_counts = [2, 1, 0]
+        accepted_tokens = torch.full(
+            (dynamic_context.max_requests, num_spec),
+            -1,
+            device='cuda',
+            dtype=torch.long,
+        )
+        for i, (a, b) in enumerate(spec_tokens):
+            accepted_tokens[i, 0] = a
+            accepted_tokens[i, 1] = b
+        accepted_token_counts = torch.tensor(
+            accepted_counts + [0] * (dynamic_context.max_requests - num_active),
+            device='cuda',
+            dtype=torch.long,
+        )
+
+        # Newly sampled tokens (from the verifier on this step).
+        new_tokens = torch.randint(0, 100, (num_active,), device='cuda', dtype=torch.long)
+
+        # Run speculative calculate_log_probs.
+        log_probs, _ = calculate_log_probs(
+            dynamic_context,
+            decode_logits,
+            new_tokens,
+            log_prob_request_count=num_active,
+            accepted_tokens=accepted_tokens,
+            accepted_token_counts=accepted_token_counts,
+        )
+
+        # Reference: log_softmax row-wise over the decode logit rows. Then for
+        # each request, verify that log_probs[i][j] matches the expected token
+        # at row (i * spec_plus_one + j) for j in [0, accepted_count + 1).
+        expected_log_softmax = torch.nn.functional.log_softmax(
+            decode_logits.squeeze(0), dim=-1
+        )
+
+        for i in range(num_active):
+            ac = accepted_counts[i]
+            expected_count = ac + 1  # accepted spec tokens + new token
+            assert log_probs[i] is not None
+            assert len(log_probs[i]) == expected_count, (
+                f"Request {i}: expected {expected_count} log_probs, got {len(log_probs[i])}"
+            )
+
+            # Positions 0..ac-1: log_prob of accepted spec tokens.
+            for j in range(ac):
+                spec_token = spec_tokens[i][j]
+                row = i * spec_plus_one + j
+                expected = expected_log_softmax[row, spec_token].item()
+                assert abs(log_probs[i][j] - expected) < 1e-5, (
+                    f"Request {i}, position {j}: got {log_probs[i][j]}, expected {expected}"
+                )
+
+            # Position ac: log_prob of the newly sampled token.
+            new_token = new_tokens[i].item()
+            row = i * spec_plus_one + ac
+            expected = expected_log_softmax[row, new_token].item()
+            assert abs(log_probs[i][ac] - expected) < 1e-5, (
+                f"Request {i}, new token: got {log_probs[i][ac]}, expected {expected}"
+            )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_pipeline_parallel_uneven_layers(self):
         """
         Test that DynamicInferenceContext synchronizes the total block count across
