@@ -151,6 +151,7 @@ class TestMTPCudaGraphInference:
                 block_size_tokens=256,
                 max_requests=max_requests,
                 num_cuda_graphs=-1,
+                sampling_backend='torch',
             ),
         )
         wrapped = GPTInferenceWrapper(model, context)
@@ -788,6 +789,7 @@ class TestMTPCudaGraphExpertParallel:
                 num_cuda_graphs=num_cuda_graphs,
                 use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
                 max_requests=max_requests,
+                sampling_backend='torch',
             ),
         )
 

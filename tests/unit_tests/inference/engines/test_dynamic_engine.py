@@ -4665,6 +4665,7 @@ class TestChunkedPrefillCudaGraphs:
             enable_chunked_prefill=enable_chunked_prefill,
             max_tokens=context_max_tokens,
             max_requests=128,
+            sampling_backend='torch',
         )
         if mamba_config is not None:
             inference_config_kwargs.update(mamba_inference_state_config=mamba_config)
