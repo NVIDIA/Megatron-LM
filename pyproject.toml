@@ -89,16 +89,12 @@ mlm = [
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]",
     "nvidia-resiliency-ext",
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "nvtx~=0.2",
     "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
     "flash-linear-attention~=0.4.0",
     "megatron-energon[av_decode]~=6.0",
     "av",
@@ -118,11 +114,8 @@ lts = [
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
-    "nvtx~=0.2",
     "multi-storage-client~=0.27",
     "opentelemetry-api~=1.33.1",
-    "mamba-ssm~=2.2",
-    "causal-conv1d~=1.5",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -131,6 +124,15 @@ lts = [
     "fastapi~=0.50",                      # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers",
+]
+
+te = [
+    "transformer-engine[pytorch,core_cu13]",
+]
+
+ssm = [
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
 ]
 
 [dependency-groups]
