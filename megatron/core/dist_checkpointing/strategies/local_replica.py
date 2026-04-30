@@ -5,28 +5,58 @@
 Background
 ----------
 
-In the standard ``FullyParallelSaveStrategyWrapper`` flow, every parameter that
-is replicated across the parallelization group (the ``ep_dp`` group in our
-production setup) is written by exactly one rank inside the group. The other
-ranks have ``replica_id != 0`` and the underlying torch_dist save drops their
-write items via ``keep_only_main_replica``. The metadata records a single
-``(file, offset, length)`` triple per replicated chunk, and at load time every
-peer that needs the chunk opens that single file — producing read-side
-contention on the file system when the world is large.
+In the standard ``FullyParallelSaveStrategyWrapper`` flow, parameters that
+are replicated across the parallelization group (the ``ep_dp`` group in our
+production setup) are written by exactly one rank inside each group. The
+other ranks have ``replica_id != 0`` and the underlying torch_dist save
+drops their write items via ``keep_only_main_replica``. The metadata
+records a single ``(file, offset, length)`` triple per replicated chunk,
+and at load time every peer that needs the chunk opens that single file —
+producing read-side contention on the file system when the world is large.
 
-The *local replica* mode opts into trading extra disk for read locality:
-every rank that holds a replica writes its own copy. So that the metadata
-can record one storage entry per copy without breaking PyT DCP's
-``MetadataIndex``-keyed dedup (``MetadataIndex.index`` is declared
-``compare=False``, so two copies under the same ``(fqn, offset)`` collapse on
-write), each non-main rank's copy is published under a per-rank renamed FQN:
-``__shadow_<global_rank>__<original_fqn>``. The double-underscore prefix is
-unique enough that no real Megatron parameter starts with it.
+The *local replica* mode opts into trading extra disk for read locality.
+For each shard, the load-side picker (``ignore_groups=True`` in
+``determine_main_replica_uniform_distribution``) selects one rank per
+parallelization group to actually issue the read; everyone else in the
+group receives the data by broadcast. The save-side picker
+(``ignore_groups=False``) selects one rank per group as the save winner.
+When the two pickers select the **same** rank — which is the common case
+for tensors whose ``replica_id == (0, 0, 0)`` exists somewhere in every
+parallelization group, e.g. expert weights — the load reader is also the
+save writer and the read is local. No shadow needed.
 
-At load time the rank simply rewrites its requested FQNs to point at its own
-shadow key when one is in the metadata; the ``_StorageInfo`` for the shadow
-key was authored by this rank during save, so the file the reader opens is
-its local ``__<rank>_*.distcp``. No cross-rank reads.
+Cross-reads happen exactly when load picks a different rank from save in
+the same group. There are two ways for that to occur:
+
+1. The shard has no save main in this parallelization group at all
+   (``shards_in_this_group`` excludes it in save mode but includes it in
+   load mode) — typical of fully replicated parameters whose global main
+   lives in a single group while every other group has only non-main
+   replicas. Save mode writes nothing in those groups; load mode picks a
+   reader and that reader cross-reads the lone main's file.
+2. The save and load greedy assignments happen to pick different ranks
+   inside the same group because the load scope contains shards that the
+   save scope ignores, perturbing the load-balancing.
+
+In both cases the rank picked by load is exactly the rank that benefits
+from a local copy. So the filter — encoded in
+:func:`compute_shadow_shard_ids` — emits a shadow on a rank iff that rank
+is the load picker for the shard *and* the save picker did not pick the
+same rank in the group.
+
+The shadow copy is published under a per-rank renamed FQN
+``__shadow_<global_rank>__<original_fqn>``. The rename is required because
+PyT DCP's ``MetadataIndex.index`` is declared ``compare=False``, so two
+copies under the same ``(fqn, offset)`` collapse on write and only one
+``_StorageInfo`` would survive in the metadata. Each shadow key gets its
+own ``state_dict_metadata`` entry pointing at the writing rank's
+``__<rank>_*.distcp``. The double-underscore prefix is unique enough that
+no real Megatron parameter starts with it.
+
+At load time the rank rewrites its requested FQNs to point at its own
+shadow key when one is in the metadata; the ``_StorageInfo`` for the
+shadow key was authored by this rank during save, so the file the reader
+opens is its local ``__<rank>_*.distcp``. No cross-rank reads.
 
 This module hosts the FQN-rename helpers used by both
 ``FullyParallelSaveStrategyWrapper`` (for save-time renaming) and
@@ -38,7 +68,7 @@ audit.
 from __future__ import annotations
 
 import re
-from typing import Dict, Iterable, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Dict, Optional, Set, Tuple, TYPE_CHECKING
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
@@ -169,34 +199,23 @@ def compute_shadow_shard_ids(
 def rewrite_replicas_to_shadow(
     sharded_state_dict: ShardedStateDict,
     global_rank: int,
-    shadow_shard_ids: Optional[Set[_ShardId]] = None,
+    shadow_shard_ids: Set[_ShardId],
 ) -> int:
     """Promote selected local replicas to shadow savers in place.
 
-    Two filtering modes:
-
-    * ``shadow_shard_ids is None`` — *legacy mode*. Every non-main local
-      replica (``replica_id != 0`` after the wrapper's parallelization
-      step) is renamed. This pessimistically shadows replicas that may
-      not actually cross-read, but it is the original behaviour before
-      the algorithmic filter was added; we keep it as the fallback.
-
-    * ``shadow_shard_ids`` is a set — *filtered mode*. Only shards whose
-      id is in the set are renamed, regardless of their current
-      ``replica_id``. The set is expected to come from
-      :func:`compute_shadow_shard_ids` and contains exactly the shards
-      this rank should write to avoid a cross-read at load time.
-
-    For each renamed tensor we set ``replica_id = 0`` so the underlying
+    Walks every :class:`ShardedTensor` in ``sharded_state_dict``. If the
+    tensor's shard id is in ``shadow_shard_ids`` — the per-rank set
+    produced by :func:`compute_shadow_shard_ids` — we set
+    ``replica_id = 0`` so the underlying
     ``TorchDistSaveShardedStrategy``'s ``keep_only_main_replica`` filter
-    keeps the write item. We rewrite ``sh_ten.key`` to the per-rank
+    keeps the write item, and rename ``sh_ten.key`` to the per-rank
     shadow FQN so PyT DCP's ``MetadataIndex``-keyed dedup does not
     collapse two ranks' copies into a single storage entry.
 
     The state dict is mutated in place. Callers are expected to pass the
-    *save-only view* used by :meth:`FullyParallelSaveStrategyWrapper.async_save`
-    — never the live training state — so this mutation does not leak to
-    the user.
+    *save-only view* used by
+    :meth:`FullyParallelSaveStrategyWrapper.async_save` — never the live
+    training state — so this mutation does not leak to the user.
 
     Decision: we don't deep-copy the ShardedTensor because the underlying
     ``data`` tensor is the same object the rank already holds — a copy
@@ -211,12 +230,8 @@ def rewrite_replicas_to_shadow(
     for sh in nested_values(sharded_state_dict):
         if not isinstance(sh, ShardedTensor):
             continue
-        if shadow_shard_ids is None:
-            if sh.replica_id == 0:
-                continue
-        else:
-            if _sharded_tensor_shard_id(sh) not in shadow_shard_ids:
-                continue
+        if _sharded_tensor_shard_id(sh) not in shadow_shard_ids:
+            continue
         print(f"[DEBUG shadow keys | {global_rank}] {sh.key} -> {shadow_key(global_rank, sh.key)}")
         sh.key = shadow_key(global_rank, sh.key)
         sh.replica_id = 0

@@ -59,6 +59,7 @@ def load(
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
     verify_integrity: bool = False,
+    replicate_local_replicas: bool = False,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -149,7 +150,17 @@ def load(
     )
 
     async_strategy = getattr(common_state_dict.get("args"), "async_strategy", "nvrx")
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+    # ``replicate_local_replicas`` is plumbed at .load()-time rather than at
+    # strategy construction so the same strategy object can be reused across
+    # different load runs with different knob values (e.g. for A/B
+    # benchmarking the legacy cross-read path against the local-read path on
+    # the same on-disk checkpoint).
+    loaded_state_dict = sharded_strategy.load(
+        sharded_state_dict,
+        checkpoint_dir,
+        async_strategy,
+        replicate_local_replicas=replicate_local_replicas,
+    )
 
     merge(common_state_dict, loaded_state_dict)
 

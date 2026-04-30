@@ -250,6 +250,7 @@ class FullyParallelLoadStrategyWrapper:
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
         async_strategy: str = "nvrx",
+        replicate_local_replicas: bool = False,
     ) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
 
@@ -273,6 +274,16 @@ class FullyParallelLoadStrategyWrapper:
         Args:
             sharded_state_dict (ShardedStateDict): sharded state dict to load
             checkpoint_dir (Path): checkpoint directory to load from
+            async_strategy (str): which async backend to use for the
+                base-strategy load (``"nvrx"`` or ``"mcore"``). Defaults
+                to ``"nvrx"``.
+            replicate_local_replicas (bool): forwarded to the base
+                strategy's ``.load`` so the rank that the load picker
+                chose to read each shard can route to its own
+                ``__shadow_<rank>__<fqn>`` entry in the metadata. Only
+                the picker rank performs the read; the other ranks in
+                the parallelization group receive the data via
+                ``exchange_by_distribution`` and never see the redirect.
 
         Returns:
             StateDict: loaded state dict. The state dict should be equivalent to
@@ -284,7 +295,12 @@ class FullyParallelLoadStrategyWrapper:
         loaded_state_dict = {}
 
         if get_pg_size(self.parallelization_group) <= 1:
-            return self.base_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+            return self.base_strategy.load(
+                sharded_state_dict,
+                checkpoint_dir,
+                async_strategy,
+                replicate_local_replicas=replicate_local_replicas,
+            )
 
         # Step 1 and 2: exchange load metadata and distribute the load
         with debug_time("self.apply_loading_parallelization", logger):
@@ -316,8 +332,15 @@ class FullyParallelLoadStrategyWrapper:
             )
 
         with debug_time("base_load_ShardedTensors", logger):
-            # Load sharded tensors separately
-            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
+            # Load sharded tensors separately. The picker chose this rank
+            # to read these shards, so this is where the shadow redirect
+            # has to fire if it is going to fire at all.
+            loaded_tensors = self.base_strategy.load(
+                to_load_shards,
+                checkpoint_dir,
+                async_strategy,
+                replicate_local_replicas=replicate_local_replicas,
+            )
 
         with debug_time("self.exchange_loaded_tensors", logger):
 

@@ -900,36 +900,22 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(
-        self,
-        cache_metadata: bool = False,
-        replicate_local_replicas: bool = False,
-    ):
+    def __init__(self, cache_metadata: bool = False):
         """
         Args:
             cache_metadata (bool): keep the parsed ``.metadata`` pickle alive
                 across calls so the second and later loads avoid re-parsing
                 it. Defaults to False.
-            replicate_local_replicas (bool): when True, requests for an FQN
-                whose ``__shadow_<rank>__<fqn>`` is present in the
-                checkpoint metadata are routed to that shadow entry — i.e.
-                to the rank's own ``__<rank>_*.distcp`` file. When False
-                (default) the redirect is skipped, so the load uses the
-                metadata's deduped storage entry exactly as today, even if
-                the checkpoint *does* contain shadow keys. This is
-                deliberately a separate knob from the save side so the
-                legacy load path can be benchmarked against the local-read
-                path on the same on-disk checkpoint.
         """
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
-        self.replicate_local_replicas = replicate_local_replicas
 
     def load(
         self,
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
         async_strategy: str = "nvrx",
+        replicate_local_replicas: bool = False,
     ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
@@ -937,6 +923,24 @@ class TorchDistLoadShardedStrategy:
             sharded_state_dict (ShardedStateDict): sharded state dict with mapping
                 information to instruct loading
             checkpoint_dir (Path): checkpoint directory
+            async_strategy (str): which async backend to use for the load
+                (``"nvrx"`` or ``"mcore"``). Defaults to ``"nvrx"``.
+            replicate_local_replicas (bool): when True, requests for an FQN
+                whose ``__shadow_<rank>__<fqn>`` is present in the
+                checkpoint metadata are routed to that shadow entry —
+                i.e. to the rank's own ``__<rank>_*.distcp`` file. When
+                False (default) the redirect is skipped, so the load uses
+                the metadata's deduped storage entry exactly as today,
+                even if the checkpoint *does* contain shadow keys.
+                Decision: this is a per-call kwarg rather than a
+                constructor argument because the value depends on
+                runtime/training configuration (``args.ckpt_fully_parallel
+                _load_replicate_local``) while the strategy itself is
+                often built by callers (see ``serialization.py``
+                defaults) that do not have access to the args namespace.
+                Putting it on ``.load`` mirrors how ``async_strategy`` is
+                already plumbed and avoids threading the knob through
+                every constructor site.
 
         Returns: loaded state dict
         """
@@ -977,7 +981,7 @@ class TorchDistLoadShardedStrategy:
         )
 
         shadow_renames: Dict[str, str] = {}
-        if self.replicate_local_replicas and torch.distributed.is_initialized():
+        if replicate_local_replicas and torch.distributed.is_initialized():
             metadata = fsr.read_metadata()  # cached when cache_metadata=True
             shadow_renames = redirect_pyt_state_dict_to_shadows(
                 pyt_state_dict, metadata, torch.distributed.get_rank()
