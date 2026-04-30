@@ -173,9 +173,11 @@ class TextGenerationController:
             self._torch_sampling_buckets: List[Tuple] = []
 
         self._init_mtp_sampling_tensor()
+        output_pool_depth = max(2, int(context.config.async_overlap_queue_depth) + 1)
         self._async_step_output_pool = AsyncStepOutputPool(
             max_requests=max_requests,
             num_speculative_tokens=self.num_speculative_tokens,
+            depth=output_pool_depth,
         )
 
     def _init_mtp_sampling_tensor(self):

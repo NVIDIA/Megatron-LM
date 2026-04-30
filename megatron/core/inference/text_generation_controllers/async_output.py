@@ -80,6 +80,11 @@ class AsyncStepOutputPool:
             _AsyncStepOutputSlot(max_requests, num_speculative_tokens) for _ in range(depth)
         ]
 
+    @property
+    def depth(self) -> int:
+        """Number of pinned output-copy slots."""
+        return len(self._slots)
+
     def acquire(self) -> _AsyncStepOutputSlot:
         """Acquire a free pinned-buffer slot."""
         for slot in self._slots:

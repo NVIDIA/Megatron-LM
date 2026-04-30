@@ -17,4 +17,5 @@ API reference documentation for Megatron Core components.
 models/index
 core/index
 internal/index
+dynamic-inference-async-overlap
 ```

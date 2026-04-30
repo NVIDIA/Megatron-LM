@@ -144,6 +144,8 @@ DISTRIBUTED_PREPARE_CONSENSUS_FIELDS = (
     "snapshot_slot_generation",
 )
 
+ASYNC_OVERLAP_IDLE_POLL_INTERVAL_S = 0.005
+
 
 class EngineSuspendedError(Exception):
     """Engine is currently suspended and not performing steps."""
@@ -194,6 +196,12 @@ class AsyncOverlapDebugCounters:
     deferred_reservation_rollbacks: int = 0
     retirement_backlog: int = 0
     max_retirement_backlog: int = 1
+    queue_depth_one_steps: int = 0
+    queue_depth_two_steps: int = 0
+    max_pending_launches_observed: int = 0
+    cpu_time_hidden_under_gpu_s: float = 0.0
+    gpu_gap_sampling_to_next_forward_s: float = 0.0
+    gpu_gap_observations: int = 0
 
 
 # pylint: disable=line-too-long
@@ -360,6 +368,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefix_coordination_waits = 0
         self._next_dynamic_step_id = 0
         self._current_dynamic_step_id = -1
+        self._last_dynamic_sampling_end_perf: Optional[float] = None
         self._distributed_prepare_mismatch_streak = 0
         self._distributed_prepare_reconcile_retry_limit = 2
         self.async_overlap_debug_counters = AsyncOverlapDebugCounters(
@@ -1970,7 +1979,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
+        forward_start_perf = time.perf_counter()
+        if self._last_dynamic_sampling_end_perf is not None:
+            gap_s = max(0.0, forward_start_perf - self._last_dynamic_sampling_end_perf)
+            self.async_overlap_debug_counters.gpu_gap_sampling_to_next_forward_s += gap_s
+            self.async_overlap_debug_counters.gpu_gap_observations += 1
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        self._last_dynamic_sampling_end_perf = time.perf_counter()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
@@ -2620,10 +2635,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             self._run_dummy_forward_launches(global_launches)
                     else:
                         # No work, but not all pausing: idle.
-                        await asyncio.sleep(0.02)
+                        await asyncio.sleep(ASYNC_OVERLAP_IDLE_POLL_INTERVAL_S)
 
                 elif self.state == EngineState.PAUSED:
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(ASYNC_OVERLAP_IDLE_POLL_INTERVAL_S)
 
                 elif self.state == EngineState.UNPAUSING:
                     await self._world_barrier()
@@ -2637,7 +2652,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._state_events[EngineState.SUSPENDED].set()
 
                 elif self.state == EngineState.SUSPENDED:
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(ASYNC_OVERLAP_IDLE_POLL_INTERVAL_S)
 
                 elif self.state == EngineState.RESUMING:
                     await self._world_barrier()

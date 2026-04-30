@@ -737,6 +737,8 @@ class TestDynamicInferenceEngine:
         assert env.engine.async_pipeline.pending_launch_count == 0
         assert env.engine.step_retirement_service.pending_count == 0
         assert env.engine.async_overlap_debug_counters.queue_depth == 1
+        assert env.engine.context.snapshot_pool.slot_count == 1
+        assert env.engine.controller._async_step_output_pool.depth == 2
         assert env.requests[0].generated_tokens == [
             69,
             85,
@@ -813,6 +815,8 @@ class TestDynamicInferenceEngine:
         assert env.engine.async_pipeline.pending_launch_count == 0
         assert env.engine.step_retirement_service.pending_count == 0
         assert env.engine.async_overlap_debug_counters.queue_depth == 2
+        assert env.engine.context.snapshot_pool.slot_count == 3
+        assert env.engine.controller._async_step_output_pool.depth == 3
         assert env.requests[0].generated_tokens == [
             69,
             85,

@@ -327,6 +327,31 @@ class StepRetirementService:
             'inference/async_overlap_queue_depth_two_active': int(
                 engine.async_overlap_debug_counters.queue_depth >= 2
             ),
+            'inference/queue_depth_one_steps': int(
+                engine.async_overlap_debug_counters.queue_depth_one_steps
+            ),
+            'inference/queue_depth_two_steps': int(
+                engine.async_overlap_debug_counters.queue_depth_two_steps
+            ),
+            'inference/max_pending_launches_observed': int(
+                engine.async_overlap_debug_counters.max_pending_launches_observed
+            ),
+            'inference/cpu_time_hidden_under_gpu_s': float(
+                engine.async_overlap_debug_counters.cpu_time_hidden_under_gpu_s
+            ),
+            'inference/gpu_gap_sampling_to_next_forward_s': float(
+                engine.async_overlap_debug_counters.gpu_gap_sampling_to_next_forward_s
+            ),
+            'inference/gpu_gap_sampling_to_next_forward_avg_s': float(
+                engine.async_overlap_debug_counters.gpu_gap_sampling_to_next_forward_s
+                / max(1, engine.async_overlap_debug_counters.gpu_gap_observations)
+            ),
+            'inference/snapshot_slot_waits': int(
+                engine.async_overlap_debug_counters.snapshot_slot_waits
+            ),
+            'inference/output_event_waits': int(
+                engine.async_overlap_debug_counters.output_event_waits
+            ),
             'inference/accepted_output_tokens': int(
                 engine.async_overlap_debug_counters.accepted_output_tokens
             ),
@@ -345,7 +370,51 @@ class StepRetirementService:
             'inference/queue_depth_one_downgrades': int(
                 engine.async_overlap_debug_counters.queue_depth_one_downgrades
             ),
+            'inference/reservation_commits': int(
+                engine.async_overlap_debug_counters.reservation_commits
+            ),
+            'inference/reservation_rollbacks': int(
+                engine.async_overlap_debug_counters.reservation_rollbacks
+            ),
+            'inference/partial_reservation_rollbacks': int(
+                engine.async_overlap_debug_counters.partial_reservation_rollbacks
+            ),
+            'inference/resource_already_evicted_rollbacks': int(
+                engine.async_overlap_debug_counters.resource_already_evicted_rollbacks
+            ),
+            'inference/deferred_reservation_rollbacks': int(
+                engine.async_overlap_debug_counters.deferred_reservation_rollbacks
+            ),
         }
+        snapshot_pool = getattr(engine.context, "snapshot_pool", None)
+        if snapshot_pool is not None:
+            snapshot_accounting = snapshot_pool.memory_accounting()
+            metrics.update(
+                {
+                    'inference/snapshot_slot_count': int(
+                        snapshot_accounting["snapshot_slot_count"]
+                    ),
+                    'inference/snapshot_graph_cache_hits': int(
+                        snapshot_accounting["graph_cache_hits"]
+                    ),
+                    'inference/snapshot_graph_cache_misses': int(
+                        snapshot_accounting["graph_cache_misses"]
+                    ),
+                    'inference/snapshot_graph_capture_count': int(
+                        snapshot_accounting["graph_capture_count"]
+                    ),
+                    'inference/snapshot_graph_capture_bytes': int(
+                        snapshot_accounting["graph_capture_bytes"]
+                    ),
+                }
+            )
+            for slot in snapshot_pool.slots:
+                metrics[f'inference/snapshot_slot_{slot.slot_id}_graph_cache_hits'] = int(
+                    slot.graph_cache_hits
+                )
+                metrics[f'inference/snapshot_slot_{slot.slot_id}_graph_cache_misses'] = int(
+                    slot.graph_cache_misses
+                )
         for key, value in context_state["kv_stats"].items():
             if 'utilization' in key:
                 metrics[f'inference/{key}'] = float(value * 100.0)

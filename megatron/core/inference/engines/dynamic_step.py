@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -70,6 +71,7 @@ class DynamicAsyncPipeline:
 
     async def step(self, max_forward_launches: Optional[int] = None):
         """Run one queue-depth-limited pipeline step."""
+        self._record_queue_depth_sample()
         if self.queue_depth == 1:
             return await self._step_queue_depth_one(max_forward_launches=max_forward_launches)
         return await self._step_with_lookahead(max_forward_launches=max_forward_launches)
@@ -94,6 +96,7 @@ class DynamicAsyncPipeline:
             await self.drain_next()
         if self.planned_launch_count(max_forward_launches=max_forward_launches) > 0:
             self.in_flight_launches.append(await self.engine.async_forward())
+            self._record_pending_launch_count()
         return await self.drain_next()
 
     async def _step_with_lookahead(self, max_forward_launches: Optional[int] = None):
@@ -112,6 +115,7 @@ class DynamicAsyncPipeline:
             if self.pending_launch_count > 0 and not self._can_launch_lookahead():
                 break
             self.in_flight_launches.append(await self.engine.async_forward())
+            self._record_pending_launch_count()
             launched = True
             launch_count += 1
             if self.pending_launch_count > 1:
@@ -146,7 +150,13 @@ class DynamicAsyncPipeline:
         if not self.in_flight_launches:
             return None
         step_result, context_state, step_time = self.in_flight_launches.popleft()
-        return await self.engine.async_bookkeep(step_result, context_state, step_time)
+        hidden_start = time.perf_counter()
+        try:
+            return await self.engine.async_bookkeep(step_result, context_state, step_time)
+        finally:
+            counters = getattr(self.engine, "async_overlap_debug_counters", None)
+            if counters is not None and self.pending_launch_count > 0:
+                counters.cpu_time_hidden_under_gpu_s += time.perf_counter() - hidden_start
 
     async def drain_all(self):
         """Retire every pending launched step."""
@@ -179,6 +189,26 @@ class DynamicAsyncPipeline:
                 f"Cannot reuse request {request_id} with unretired launched steps"
             )
         self.retirement_service.drain_for_request_reuse(request_id)
+
+    def _record_queue_depth_sample(self) -> None:
+        """Update per-step queue-depth distribution counters."""
+        counters = getattr(self.engine, "async_overlap_debug_counters", None)
+        if counters is None:
+            return
+        if self.queue_depth <= 1:
+            counters.queue_depth_one_steps += 1
+        else:
+            counters.queue_depth_two_steps += 1
+        self._record_pending_launch_count()
+
+    def _record_pending_launch_count(self) -> None:
+        """Track the maximum observed in-flight launch count."""
+        counters = getattr(self.engine, "async_overlap_debug_counters", None)
+        if counters is None:
+            return
+        counters.max_pending_launches_observed = max(
+            counters.max_pending_launches_observed, self.pending_launch_count
+        )
 
     def _pending_launch_references_request(self, request_id: int) -> bool:
         """Return whether pending launched work references a request ID."""

@@ -148,6 +148,28 @@ def test_dynamic_async_pipeline_queue_depth_two_launches_before_retirement():
     assert pipeline.pending_launch_count == 0
 
 
+def test_dynamic_async_pipeline_records_overlap_metrics():
+    engine = FakePipelineEngine(max_launches=2)
+    engine.async_overlap_debug_counters = SimpleNamespace(
+        queue_depth_one_steps=0,
+        queue_depth_two_steps=0,
+        max_pending_launches_observed=0,
+        cpu_time_hidden_under_gpu_s=0.0,
+    )
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=FakeRetirementService(), queue_depth=2
+    )
+
+    result = asyncio.run(pipeline.step())
+
+    assert result == {"retired_step": 0}
+    counters = engine.async_overlap_debug_counters
+    assert counters.queue_depth_one_steps == 0
+    assert counters.queue_depth_two_steps == 1
+    assert counters.max_pending_launches_observed == 2
+    assert counters.cpu_time_hidden_under_gpu_s >= 0.0
+
+
 def test_dynamic_async_pipeline_can_stage_one_launch_per_distributed_tick():
     engine = FakePipelineEngine(max_launches=3)
     pipeline = DynamicAsyncPipeline(

@@ -1136,7 +1136,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.gpu_view.current_dynamic_step_id = self.current_dynamic_step_id
         self.snapshot_pool = GpuSnapshotBufferPool(
-            slot_count=max(1, int(self.config.async_overlap_queue_depth)),
+            slot_count=self._async_overlap_snapshot_slot_count(),
             max_requests=self.max_requests,
             max_tokens=self.max_tokens,
             max_kv_blocks=self.max_kv_block_count,
@@ -2519,6 +2519,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._clear_pending_gpu_decode_input()
         self.sync_optimistic_to_committed_for_queue_depth_one()
 
+    def _async_overlap_snapshot_slot_count(self) -> int:
+        """Return snapshot slots needed for the configured queue depth plus one spare."""
+        queue_depth = max(1, int(self.config.async_overlap_queue_depth))
+        return queue_depth + (1 if queue_depth > 1 else 0)
+
     def set_current_dynamic_step_id(self, step_id: int) -> None:
         """Set the CPU/GPU debug step identity used for trace labels."""
         self.current_dynamic_step_id = step_id
@@ -2584,7 +2589,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.gpu_bookkeeping_stream = torch.cuda.Stream(device=torch.cuda.current_device())
         self._gpu_bookkeeping_complete_event = torch.cuda.Event()
         self.snapshot_pool = GpuSnapshotBufferPool(
-            slot_count=max(1, int(self.config.async_overlap_queue_depth)),
+            slot_count=self._async_overlap_snapshot_slot_count(),
             max_requests=self.max_requests,
             max_tokens=self.max_tokens,
             max_kv_blocks=self.max_kv_block_count,
