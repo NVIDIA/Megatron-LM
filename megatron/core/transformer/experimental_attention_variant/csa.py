@@ -31,6 +31,7 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 # ---------------------------------------------------------------------------
 
 
+# TODO: the lru_cache may not work well with packed sequence
 @lru_cache(maxsize=8)
 def _get_window_topk_idxs_cached(window_size: int, seqlen: int, device_str: str) -> torch.Tensor:
     """Compute sliding-window indices for a single sequence (cached).
@@ -53,6 +54,7 @@ def get_window_topk_idxs(
     return matrix.unsqueeze(0).expand(batch_size, -1, -1)
 
 
+# TODO: the lru_cache may not work well with packed sequence
 @lru_cache(maxsize=8)
 def _get_compress_topk_idxs_cached(
     ratio: int, seqlen: int, offset: int, device_str: str

@@ -33,7 +33,7 @@ except Exception:
 
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input,
+    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
     from megatron.core.post_training.modelopt.layers import Linear
 else:
     (TEColumnParallelLinear, TELinear, Linear, set_save_original_input) = (None, None, None, None)

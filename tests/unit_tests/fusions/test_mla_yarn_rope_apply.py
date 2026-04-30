@@ -110,7 +110,7 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False):
     pytorch_output.backward(pytorch_bwd_input, retain_graph=True)
 
     fused_output = fused_mla_rope_inplace(
-        fused_fwd_input, cos, sin, q_dim, emb_dim, cu_seqlens_q=cu_seqlens, inverse=inverse,
+        fused_fwd_input, cos, sin, q_dim, emb_dim, cu_seqlens_q=cu_seqlens, inverse=inverse
     )
     fused_output.backward(fused_bwd_input, retain_graph=True)
 

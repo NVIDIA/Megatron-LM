@@ -312,7 +312,7 @@ class TestCompressor:
         model_parallel_cuda_manual_seed(123)
 
         cls = request.cls
-        cls.config = _make_mla_config(csa_compress_ratios=[4, 128, 4, 128],)
+        cls.config = _make_mla_config(csa_compress_ratios=[4, 128, 4, 128])
         cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
         from megatron.core.models.common.embeddings import RotaryEmbedding
@@ -488,7 +488,7 @@ class TestCSAIndexer:
             seqlen,
             batch_size,
             self.config.dsa_indexer_n_heads,
-            self.config.dsa_indexer_head_dim
+            self.config.dsa_indexer_head_dim,
         )
         n_compressed = seqlen // self.compress_ratio
         assert k.shape == (n_compressed, batch_size, self.config.dsa_indexer_head_dim)
