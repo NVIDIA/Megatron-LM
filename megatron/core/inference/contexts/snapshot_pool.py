@@ -59,6 +59,16 @@ class GpuSnapshotBufferPool:
             )
             for _ in range(self.buffer_count)
         ]
+        # v3 plan §commit 10 — each slot owns its own MHA + Mamba metadata
+        # pair, bound to the slot's _buf. With max_concurrent_steps=1 the
+        # same slot's metadata is reused every step (identity vs the prior
+        # singleton); commit 18 starts rotating slots and the per-slot
+        # binding becomes load-bearing. Populated post-construction via
+        # ``set_slot_attn_metadata`` / ``set_slot_mamba_metadata`` because
+        # the metadata classes need block-count totals known only on the
+        # context.
+        self._slot_attn_metadata: List[Optional[dict]] = [None] * self.buffer_count
+        self._slot_mamba_metadata: List[Optional[object]] = [None] * self.buffer_count
         # Owning step-id for each slot (None when free).
         self._owning_step_ids: List[Optional[int]] = [None] * self.buffer_count
         # Last GPU read event recorded against each slot. release(slot, event)
@@ -99,6 +109,20 @@ class GpuSnapshotBufferPool:
     def slots(self) -> List["ContextGPUView"]:
         """All slots in pool order."""
         return list(self._slots)
+
+    def set_slot_attn_metadata(self, slot_idx: int, attn_metadata: dict) -> None:
+        """Bind a per-slot attention metadata pair (graphed + non-graphed)."""
+        self._slot_attn_metadata[slot_idx] = attn_metadata
+
+    def set_slot_mamba_metadata(self, slot_idx: int, mamba_metadata: object) -> None:
+        """Bind a per-slot Mamba metadata instance."""
+        self._slot_mamba_metadata[slot_idx] = mamba_metadata
+
+    def slot_attn_metadata(self, slot_idx: int) -> Optional[dict]:
+        return self._slot_attn_metadata[slot_idx]
+
+    def slot_mamba_metadata(self, slot_idx: int) -> Optional[object]:
+        return self._slot_mamba_metadata[slot_idx]
 
     def acquire(self, step_id: int) -> Tuple[int, "ContextGPUView"]:
         """Acquire the lowest-numbered free slot and bind it to ``step_id``.

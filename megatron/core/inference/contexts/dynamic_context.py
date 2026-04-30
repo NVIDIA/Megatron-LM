@@ -1129,10 +1129,42 @@ class DynamicInferenceContext(BaseInferenceContext):
             step_id=-1
         )
 
-        # Bind the shared MHA GPU views to both graph and non-graph metadata;
-        # only one is active per step, so sharing storage is safe.
-        self.graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
-        self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+        # v3 plan §commit 10 — each pool slot owns its own MHA metadata pair
+        # bound to that slot's _buf. The active slot's pair is exposed via
+        # the existing ``graph_attn_metadata`` / ``non_graph_attn_metadata``
+        # attribute names (rebound to slot 0 here, which is the only
+        # acquireable slot at max_concurrent_steps=1).
+        for slot_idx in range(self.snapshot_pool.buffer_count):
+            slot_view = self.snapshot_pool.slot(slot_idx)
+            slot_meta = {
+                "mha_metadata": GraphedMHAMetadata(
+                    block_count_total=self.kv_block_allocator.total_count,
+                    max_kv_block_count=self.max_kv_block_count,
+                    max_requests=self.max_requests,
+                    block_size_tokens=self.block_size_tokens,
+                    max_seqlen=self.max_sequence_length,
+                )
+            }
+            slot_meta["mha_metadata"].bind_gpu_buffers(slot_view)
+            non_graph_slot_meta = {
+                "mha_metadata": NonGraphedMHAMetadata(
+                    block_count_total=self.kv_block_allocator.total_count,
+                    max_kv_block_count=self.max_kv_block_count,
+                    max_requests=self.max_requests,
+                    block_size_tokens=self.block_size_tokens,
+                    max_seqlen=self.max_sequence_length,
+                )
+            }
+            non_graph_slot_meta["mha_metadata"].bind_gpu_buffers(slot_view)
+            self.snapshot_pool.set_slot_attn_metadata(
+                slot_idx,
+                {"graph": slot_meta, "non_graph": non_graph_slot_meta},
+            )
+        # Active slot's pair is rebound to the existing names so the legacy
+        # forward path keeps working unchanged.
+        active_pair = self.snapshot_pool.slot_attn_metadata(self._active_snapshot_slot)
+        self.graph_attn_metadata = active_pair["graph"]
+        self.non_graph_attn_metadata = active_pair["non_graph"]
 
         # Deferred Mamba GPU operations.  Populated by add_request() /
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
