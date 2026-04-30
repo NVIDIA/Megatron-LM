@@ -434,6 +434,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 context.reset()
 
+        # Only need to capture the context bookkeeping graph once.
+        prep_result = controller._dynamic_step_post_sample_bookkeeping()
+        controller._run_update_requests(prep_result)
+
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
@@ -991,7 +995,7 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
         )
         request_block_count = math.ceil(max_request_tokens / self.context.block_size_tokens)
-        total_blocks = self.context.kv_block_allocator.total_count - 1  # -1 for dummy block
+        total_blocks = self.context.kv_block_allocator.total_count
         if request_block_count > total_blocks:
             request.status = Status.FAILED
             request.add_event_error_nontransient(BlockOverflowError(request_id))
@@ -1555,6 +1559,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
+        # Refresh CPU mirrors before the loop reads ``self.context.active_token_count``.
+        # The hot-loop graphs leave the mirrors stale; the first iteration's
+        # ``token_fully_can_be_added`` / ``token_partially_can_be_added`` checks
+        # below would otherwise see pre-step values. Subsequent iterations are
+        # covered by ``add_request``'s own sync.
+        self.context.sync_counters_to_cpu()
+
         prefix_caching_enabled = self.context.enable_prefix_caching
         mamba_caching_enabled = (
             prefix_caching_enabled
@@ -1709,7 +1720,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
-        self.context.prefix_cache_lru_clock += 1
+        self.context.kv_block_allocator.bump_lru_clock()
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
@@ -2361,7 +2372,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            self.context.kv_block_allocator.bump_lru_clock()
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

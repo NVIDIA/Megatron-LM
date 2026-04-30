@@ -236,6 +236,27 @@ def tensor_swap(x, src_idxs, dst_idxs):
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
 
 
+def scatter_pack_valid(values_flat, valid_flat, pack_buf, fill_value, sink_idx_value):
+    """Scatter-pack valid entries of ``values_flat`` into ``pack_buf``.
+
+    Shape-stable and graph-safe. ``pack_buf`` is first overwritten with
+    ``fill_value``; then each entry whose ``valid_flat`` is True is
+    written at its dense prefix-sum index. Invalid entries are routed
+    to ``pack_buf[sink_idx_value]`` and the caller ignores them.
+
+    ``pack_buf`` must have length at least ``sink_idx_value + 1``.
+
+    Returns a 0-d int64 tensor holding the number of valid entries.
+    """
+    valid_i64 = valid_flat.to(torch.int64)
+    prefix = torch.cumsum(valid_i64, dim=0) - valid_i64
+    targets = torch.where(valid_flat, prefix, torch.full_like(prefix, sink_idx_value))
+    pack_buf.fill_(fill_value)
+    pack_buf[targets] = values_flat
+    return valid_i64.sum()
+
+
+
 async def await_process_call(call, process: multiprocessing.Process, timeout: float = 1.0):
     """Repeatedly wait for a multiprocessing callable to resolve, aborting upon process failure.
 
