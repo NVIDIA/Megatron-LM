@@ -15,6 +15,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     parse_hybrid_pattern,
     pattern_from_ratios,
     select_pipeline_segment,
+    select_pipeline_segment_with_logical_offset,
     validate_segment_layers,
 )
 
@@ -71,6 +72,8 @@ class TestValidateSegmentLayers:
         """Test that valid segment patterns produce the correct layer type lists."""
         test_cases = [
             ("M*-M*-M*-", ['M', '*', '-', 'M', '*', '-', 'M', '*', '-']),
+            ("M[M*]-", ['M', ('M', '*'), '-']),
+            ("[M*E]", [('M', '*', 'E')]),
             ("MMMMMMMMM", ['M'] * 9),
             ("MM*-MM*-", ['M', 'M', '*', '-', 'M', 'M', '*', '-']),
             ("E", ['E']),
@@ -99,6 +102,10 @@ class TestValidateSegmentLayers:
         with pytest.raises(ValueError):
             validate_segment_layers("M/M")  # MTP separator not valid in a segment
         with pytest.raises(ValueError):
+            validate_segment_layers("M[[M]]")  # nested groups are not valid
+        with pytest.raises(ValueError):
+            validate_segment_layers("M[EM]")  # MoE must be last in a group
+        with pytest.raises(ValueError):
             # Not allowed to have both standard Attention and MLA/DSA
             validate_segment_layers("MDM*-")
 
@@ -110,6 +117,8 @@ class TestGetHybridTotalLayerCount:
         assert get_hybrid_total_layer_count("M*M*") == 4
         assert get_hybrid_total_layer_count("MMMM") == 4
         assert get_hybrid_total_layer_count("M") == 1
+        assert get_hybrid_total_layer_count("[M*E]") == 3
+        assert get_hybrid_total_layer_count("M[M*]-") == 4
 
     def test_with_pipe_separators(self):
         assert get_hybrid_total_layer_count("M-M-|M-M*-") == 9
@@ -155,6 +164,8 @@ class TestParseHybridPattern:
         """Test patterns without MTP (no / separator)."""
         test_cases = [
             ("M*M*", "M*M*"),
+            ("[M*E]", "[M*E]"),
+            ("M[M*]-", "M[M*]-"),
             ("MMMM", "MMMM"),
             ("*M*M", "*M*M"),
             ("MM-*", "MM-*"),
@@ -231,10 +242,21 @@ class TestParseHybridPattern:
             "M*X*",  # X is not valid
             "MaMM",  # a is not valid
             "M*M*1",  # 1 is not valid
+            "M[M*]X",  # X is not valid after a group
         ]
         for pattern in invalid_patterns:
             with pytest.raises(ValueError, match="not a valid layer symbol"):
                 parse_hybrid_pattern(pattern)
+
+    def test_invalid_group_syntax(self):
+        with pytest.raises(ValueError, match="without a matching"):
+            parse_hybrid_pattern("M[M*")
+        with pytest.raises(ValueError, match="not supported"):
+            parse_hybrid_pattern("M[M[*]]")
+        with pytest.raises(ValueError, match="cannot be empty"):
+            parse_hybrid_pattern("M[]")
+        with pytest.raises(ValueError, match="must be the last"):
+            parse_hybrid_pattern("M[EM]")
 
     def test_invalid_symbols_in_mtp_pattern(self):
         """Test that invalid symbols in MTP pattern raise ValueError."""
@@ -350,6 +372,16 @@ class TestGetHybridLayerCounts:
     def test_moe_pattern(self):
         assert get_hybrid_layer_counts("MEME") == {'*': 0, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 2}
 
+    def test_group_pattern(self):
+        assert get_hybrid_layer_counts("M[M*]E") == {
+            '*': 1,
+            'D': 0,
+            'G': 0,
+            'M': 2,
+            '-': 0,
+            'E': 1,
+        }
+
     def test_mtp_with_attention(self):
         # MTP pattern "*M" repeated 3 depths -> 3 attn + 3 mamba from MTP
         assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {
@@ -413,6 +445,21 @@ class TestSelectPipelineSegment:
             layer_types, offset = select_pipeline_segment(pattern, pp_group=None, vp_stage=vp_stage)
             assert layer_types == expected_layers, f"Failed for vp_stage={vp_stage}"
             assert offset == expected_offset, f"Failed for vp_stage={vp_stage}"
+
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
+    def test_group_segment_offsets(self, mock_log):
+        layer_types, offset = select_pipeline_segment("[M*E]|M-", pp_group=None, vp_stage=1)
+        assert layer_types == ['M', '-']
+        assert offset == 3
+
+    @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
+    def test_group_segment_logical_offsets(self, mock_log):
+        layer_types, physical_offset, logical_offset = select_pipeline_segment_with_logical_offset(
+            "[*-][*-]|[*E][*E]", pp_group=None, vp_stage=1
+        )
+        assert layer_types == [('*', 'E'), ('*', 'E')]
+        assert physical_offset == 4
+        assert logical_offset == 2
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_empty_segment(self, mock_log):
@@ -688,3 +735,12 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mamba_map == {0: 0, 1: 1, 2: 2}
         assert mlp_map == {}
         assert moe_map == {}
+
+    def test_grouped_layers_are_flattened(self):
+        maps = get_layer_maps_from_layer_type_list([("M", "*", "E"), "M"])
+        attention_map, mamba_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MOE
+        )(maps)
+        assert attention_map == {1: 0}
+        assert mamba_map == {0: 0, 3: 1}
+        assert moe_map == {2: 0}

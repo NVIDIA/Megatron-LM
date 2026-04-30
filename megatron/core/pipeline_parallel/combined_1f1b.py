@@ -343,11 +343,9 @@ def combined_forward_backward_step(
             unwrapped_model = get_attr_wrapped_model(
                 f_model, "build_schedule_plan", return_model_obj=True
             )
-            from megatron.core.models.gpt.gpt_model import GPTModel
-
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
+            assert hasattr(unwrapped_model, "build_schedule_plan"), (
+                "The final unwrapped model must implement build_schedule_plan "
+                "to support EP A2A overlapping."
             )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True

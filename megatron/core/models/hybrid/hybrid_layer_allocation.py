@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -22,6 +22,8 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
+    GROUP_START = "["
+    GROUP_END = "]"
     VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
 
     @classmethod
@@ -35,6 +37,57 @@ class Symbols:
                 valid_layer_attrs.append((name, value))
         valid_layer_attrs.sort()
         return [value for (_, value) in valid_layer_attrs]
+
+
+LayerPatternItem = Union[str, Tuple[str, ...]]
+
+
+def is_layer_group(layer_type: LayerPatternItem) -> bool:
+    """Return whether a parsed layer item is a bracketed group."""
+    return isinstance(layer_type, tuple)
+
+
+def flatten_layer_type_list(layer_type_list: List[LayerPatternItem]) -> List[str]:
+    """Flatten bracketed layer groups into their physical layer symbols."""
+    flattened = []
+    for layer_type in layer_type_list:
+        if is_layer_group(layer_type):
+            flattened.extend(layer_type)
+        else:
+            flattened.append(layer_type)
+    return flattened
+
+
+def get_layer_type_physical_count(layer_type: LayerPatternItem) -> int:
+    """Return the number of physical layers represented by a parsed layer item."""
+    return len(layer_type) if is_layer_group(layer_type) else 1
+
+
+def get_layer_type_logical_count(layer_type: LayerPatternItem) -> int:
+    """Return the number of logical layers represented by a parsed layer item."""
+    return 1
+
+
+def get_layer_type_list_physical_count(layer_type_list: List[LayerPatternItem]) -> int:
+    """Return the number of physical layers represented by a parsed layer list."""
+    return sum(get_layer_type_physical_count(layer_type) for layer_type in layer_type_list)
+
+
+def get_layer_type_list_logical_count(layer_type_list: List[LayerPatternItem]) -> int:
+    """Return the number of logical layers represented by a parsed layer list."""
+    return sum(get_layer_type_logical_count(layer_type) for layer_type in layer_type_list)
+
+
+def layer_type_item_to_str(layer_type: LayerPatternItem) -> str:
+    """Render one parsed layer item back to pattern syntax."""
+    if is_layer_group(layer_type):
+        return f"{Symbols.GROUP_START}{''.join(layer_type)}{Symbols.GROUP_END}"
+    return layer_type
+
+
+def layer_type_list_to_str(layer_type_list: List[LayerPatternItem]) -> str:
+    """Render a parsed layer list back to pattern syntax."""
+    return ''.join(layer_type_item_to_str(layer_type) for layer_type in layer_type_list)
 
 
 @dataclass
@@ -138,7 +191,10 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
     """
     main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0]
     _validate_pattern(main_pattern, "main", allow_pipe=True)
-    return len(main_pattern.replace(Symbols.PIPE, ''))
+    return sum(
+        get_layer_type_list_physical_count(validate_segment_layers(segment))
+        for segment in main_pattern.split(Symbols.PIPE)
+    )
 
 
 def get_hybrid_total_pipeline_segment_count(pattern: str) -> int:
@@ -183,15 +239,14 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     # Count main decoder layers (skip '|' pipe separators)
     if parsed.main_pattern:
-        for char in parsed.main_pattern:
-            if char in counts:
+        for segment in parsed.main_pattern.split(Symbols.PIPE):
+            for char in flatten_layer_type_list(validate_segment_layers(segment)):
                 counts[char] += 1
 
     # Count MTP layers (pattern repeated mtp_num_depths times)
     if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-        for char in parsed.mtp_pattern:
-            if char in counts:
-                counts[char] += parsed.mtp_num_depths
+        for char in flatten_layer_type_list(validate_segment_layers(parsed.mtp_pattern)):
+            counts[char] += parsed.mtp_num_depths
 
     return counts
 
@@ -284,20 +339,90 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
     Raises:
         ValueError: If pattern contains invalid symbols
     """
-    valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
-    for char in pattern:
-        if char not in valid_chars:
-            raise ValueError(
-                f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
-                f"Valid symbols are: {valid_chars}"
+    valid_chars = (
+        Symbols.VALID_LAYERS
+        | {Symbols.GROUP_START, Symbols.GROUP_END}
+        | ({Symbols.PIPE} if allow_pipe else set())
+    )
+    if not allow_pipe and Symbols.PIPE in pattern:
+        raise ValueError(
+            f"In {pattern_name} pattern, '{Symbols.PIPE}' is not a valid layer symbol. "
+            f"Valid symbols are: {valid_chars}"
+        )
+    flat_layers = []
+    for segment in pattern.split(Symbols.PIPE):
+        flat_layers.extend(
+            flatten_layer_type_list(
+                _parse_segment_layers(segment, pattern_name, valid_chars=valid_chars)
             )
+        )
 
     # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
+    if Symbols.ATTENTION in flat_layers and Symbols.DS_ATTENTION in flat_layers:
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
 
-def validate_segment_layers(segment: str) -> List[str]:
+def _parse_segment_layers(
+    segment: str, pattern_name: str, valid_chars: Optional[set[str]] = None
+) -> List[LayerPatternItem]:
+    """Parse a pipe-free pattern segment into symbols and bracketed groups."""
+    if valid_chars is None:
+        valid_chars = Symbols.VALID_LAYERS | {Symbols.GROUP_START, Symbols.GROUP_END}
+
+    layer_type_list: List[LayerPatternItem] = []
+    flat_layers = []
+    i = 0
+    while i < len(segment):
+        layer_char = segment[i]
+        if layer_char == Symbols.GROUP_START:
+            group_end = segment.find(Symbols.GROUP_END, i + 1)
+            if group_end == -1:
+                raise ValueError(
+                    f"In {pattern_name} pattern, '[' starts a layer group without a matching ']'."
+                )
+            group = segment[i + 1 : group_end]
+            if group == "":
+                raise ValueError(f"In {pattern_name} pattern, layer groups cannot be empty.")
+            if Symbols.GROUP_START in group or Symbols.GROUP_END in group:
+                raise ValueError(
+                    f"In {pattern_name} pattern, nested layer groups are not supported."
+                )
+            for group_char in group:
+                if group_char not in Symbols.VALID_LAYERS:
+                    raise ValueError(
+                        f"In {pattern_name} pattern, '{group_char}' is not a valid layer symbol. "
+                        f"Valid symbols are: {valid_chars}"
+                    )
+            if Symbols.MOE in group[:-1]:
+                raise ValueError(
+                    f"In {pattern_name} pattern, MoE layer '{Symbols.MOE}' must be the last "
+                    f"symbol inside a layer group."
+                )
+            group_tuple = tuple(group)
+            layer_type_list.append(group_tuple)
+            flat_layers.extend(group_tuple)
+            i = group_end + 1
+            continue
+        if layer_char == Symbols.GROUP_END:
+            raise ValueError(
+                f"In {pattern_name} pattern, ']' closes a layer group that was not opened."
+            )
+        if layer_char not in Symbols.VALID_LAYERS:
+            raise ValueError(
+                f"In {pattern_name} pattern, '{layer_char}' is not a valid layer symbol. "
+                f"Valid symbols are: {valid_chars}"
+            )
+        layer_type_list.append(layer_char)
+        flat_layers.append(layer_char)
+        i += 1
+
+    if Symbols.ATTENTION in flat_layers and Symbols.DS_ATTENTION in flat_layers:
+        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+
+    return layer_type_list
+
+
+def validate_segment_layers(segment: str) -> List[LayerPatternItem]:
     """Validate and convert a single pipeline segment pattern to a layer type list.
 
     This is used after the main pattern has been split by '|' into segments.
@@ -312,19 +437,91 @@ def validate_segment_layers(segment: str) -> List[str]:
     Raises:
         ValueError: If segment contains invalid layer symbols.
     """
-    layer_type_list = list(segment)
-    for layer_char in layer_type_list:
-        if layer_char not in Symbols.VALID_LAYERS:
+    return _parse_segment_layers(segment, "hybrid layer pattern segment")
+
+
+def _slice_layer_type_list_by_physical_range(
+    layer_type_list: List[LayerPatternItem], offset: int, count: int
+) -> List[LayerPatternItem]:
+    """Slice parsed layer items by physical layer range without splitting groups."""
+    selected = []
+    cursor = 0
+    end = offset + count
+    for layer_type in layer_type_list:
+        item_count = get_layer_type_physical_count(layer_type)
+        item_end = cursor + item_count
+        if item_end <= offset:
+            cursor = item_end
+            continue
+        if cursor >= end:
+            break
+        if cursor < offset or item_end > end:
             raise ValueError(
-                f"In hybrid layer pattern segment, '{layer_char}' is not "
-                f"one of {Symbols.VALID_LAYERS}"
+                "Pipeline splitting would split a bracketed hybrid layer group. "
+                "Add pipe ('|') separators around bracketed groups to define valid boundaries."
             )
+        selected.append(layer_type)
+        cursor = item_end
+    return selected
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
-    return layer_type_list
+def _get_logical_offset_from_physical_offset(
+    layer_type_list: List[LayerPatternItem], offset: int
+) -> int:
+    """Return the logical item count before a physical-layer offset."""
+    logical_offset = 0
+    cursor = 0
+    for layer_type in layer_type_list:
+        item_count = get_layer_type_physical_count(layer_type)
+        item_end = cursor + item_count
+        if item_end <= offset:
+            logical_offset += get_layer_type_logical_count(layer_type)
+            cursor = item_end
+            continue
+        if cursor == offset:
+            return logical_offset
+        raise ValueError(
+            "Pipeline splitting would split a bracketed hybrid layer group. "
+            "Add pipe ('|') separators around bracketed groups to define valid boundaries."
+        )
+    if cursor == offset:
+        return logical_offset
+    raise ValueError(f"Physical layer offset {offset} is out of range for hybrid layer pattern.")
+
+
+def select_pipeline_segment_with_logical_offset(
+    main_pattern: str,
+    pp_group: Optional[torch.distributed.ProcessGroup],
+    vp_stage: Optional[int],
+    first_stage_layers: Optional[int] = None,
+    last_stage_layers: Optional[int] = None,
+) -> Tuple[List[LayerPatternItem], int, int]:
+    """Select a pipeline segment and return physical and logical offsets."""
+    layer_type_list, layer_offset = select_pipeline_segment(
+        main_pattern,
+        pp_group,
+        vp_stage,
+        first_stage_layers=first_stage_layers,
+        last_stage_layers=last_stage_layers,
+    )
+
+    segments = main_pattern.split(Symbols.PIPE) if main_pattern else ['']
+    if len(segments) == 1:
+        full_layer_type_list = validate_segment_layers(segments[0])
+        logical_layer_offset = _get_logical_offset_from_physical_offset(
+            full_layer_type_list, layer_offset
+        )
+    else:
+        pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
+        pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1
+        vp_rel = vp_stage if vp_stage is not None else 0
+        segment_index = vp_rel * pp_size + pp_rank
+        logical_layer_offset = sum(
+            get_layer_type_list_logical_count(validate_segment_layers(segments[i]))
+            for i in range(segment_index)
+        )
+
+    return layer_type_list, layer_offset, logical_layer_offset
 
 
 def select_pipeline_segment(
@@ -395,7 +592,7 @@ def select_pipeline_segment(
         )
         full_pattern = segments[0]
         layer_type_list = validate_segment_layers(full_pattern)
-        num_layers = len(layer_type_list)
+        num_layers = get_layer_type_list_physical_count(layer_type_list)
 
         if first_stage_layers is not None or last_stage_layers is not None:
             first = first_stage_layers or 0
@@ -438,12 +635,13 @@ def select_pipeline_segment(
             offset = pp_rank * layers_per_rank
             count = layers_per_rank
 
-        selected = layer_type_list[offset : offset + count]
+        selected = _slice_layer_type_list_by_physical_range(layer_type_list, offset, count)
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,
             f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
-            f"layers='{''.join(selected)}' ({len(selected)} layers), "
+            f"layers='{layer_type_list_to_str(selected)}' "
+            f"({get_layer_type_list_physical_count(selected)} layers), "
             f"layer_offset={offset} (auto-split)",
         )
         return selected, offset
@@ -467,7 +665,10 @@ def select_pipeline_segment(
             f"the current PP/VPP configuration."
         )
 
-    layer_offset = sum(len(segments[i]) for i in range(segment_index))
+    layer_offset = sum(
+        get_layer_type_list_physical_count(validate_segment_layers(segments[i]))
+        for i in range(segment_index)
+    )
     my_segment = segments[segment_index]
 
     layer_type_list = validate_segment_layers(my_segment)
@@ -477,21 +678,23 @@ def select_pipeline_segment(
         logging.INFO,
         f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rel}, "
         f"segment_index={segment_index}/{len(segments)}, "
-        f"layers='{my_segment}' ({len(layer_type_list)} layers), "
+        f"layers='{my_segment}' ({get_layer_type_list_physical_count(layer_type_list)} layers), "
         f"layer_offset={layer_offset}",
     )
 
     return layer_type_list, layer_offset
 
 
-def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str, dict[int, int]]:
+def get_layer_maps_from_layer_type_list(
+    layer_type_list: list[LayerPatternItem],
+) -> dict[str, dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
     for each valid layer type (those in Symbols.VALID_LAYERS) given a layer type list.
     """
     layer_types = [symbol for symbol in Symbols.name_sorted_valid_layer_symbols()]
     layer_maps = {layer_type: {} for layer_type in layer_types}
-    for global_layer_idx, layer_type in enumerate(layer_type_list):
+    for global_layer_idx, layer_type in enumerate(flatten_layer_type_list(layer_type_list)):
         layer_map = layer_maps[layer_type]
         local_layer_idx = len(layer_map)
         layer_map[global_layer_idx] = local_layer_idx

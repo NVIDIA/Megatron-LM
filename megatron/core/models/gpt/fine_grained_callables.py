@@ -204,7 +204,8 @@ class PostProcessNode(ScheduleNode):
         """
 
         empty_decoder = len(self.gpt_model.decoder.layers) == 0
-        layer_norm = self.gpt_model.decoder.final_layernorm
+        layer_norm = getattr(self.gpt_model.decoder, "final_layernorm", None)
+        layer_norm = layer_norm or getattr(self.gpt_model.decoder, "final_norm", None)
         if not self.gpt_model.config.mtp_num_layers and empty_decoder and layer_norm:
             hidden_states = layer_norm(hidden_states)
             hidden_states = make_viewless_tensor(

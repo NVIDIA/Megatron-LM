@@ -198,6 +198,32 @@ class TestHybridModel:
 
         self.model.load_state_dict(torch.load(path))
 
+    def test_grouped_sharded_state_dict_uses_transformer_checkpoint_keys(self):
+        """Grouped HybridModel checkpoints should be load-compatible with GPTModel keys."""
+        model_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="[*-]",
+        )
+
+        sharded_state_dict = model.sharded_state_dict()
+        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+
+        assert "decoder.layers.0.self_attention.linear_qkv.weight" in sharded_keys
+        assert "decoder.layers.0.mlp.linear_fc1.weight" in sharded_keys
+        assert "decoder.layers.1.mlp.linear_fc1.weight" not in sharded_keys
+        assert "decoder.final_layernorm.weight" in sharded_keys
+        assert "decoder.final_norm.weight" not in sharded_keys
+        assert "output_layer._extra_state" not in sharded_state_dict
+
     def test_layer_numbers(self):
         """
         The layer numbers should start at one (for the embedding # layer) and go up

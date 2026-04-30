@@ -19,7 +19,12 @@ from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    LayerPatternItem,
+    Symbols as LayerSymbols,
+    get_layer_type_physical_count,
+    is_layer_group,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -77,8 +82,10 @@ class HybridStack(MegatronModule):
         config: TransformerConfig,
         submodules: HybridStackSubmodules,
         pre_process: bool = True,
-        layer_type_list: Optional[list[str]] = None,
+        layer_type_list: Optional[list[LayerPatternItem]] = None,
         pp_layer_offset: int = 0,
+        logical_layer_offset: int = 0,
+        is_layer_group_stack: bool = False,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
@@ -91,6 +98,8 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        self.logical_layer_offset = logical_layer_offset
+        self.is_layer_group_stack = is_layer_group_stack
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -109,16 +118,39 @@ class HybridStack(MegatronModule):
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
-        for i, layer_type in enumerate(self.layer_type_list):
-            layer_number = i + 1 + pp_layer_offset
-            if self.config.fp8:
-                quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
+        physical_layer_offset = pp_layer_offset
+        for layer_type in self.layer_type_list:
+            layer_number = physical_layer_offset + 1
+            if is_layer_group(layer_type):
+                quant_init_context = nullcontext()
+            elif self.config.fp8:
+                quant_init_context = get_fp8_context(
+                    self.config, physical_layer_offset, is_init=True
+                )
             elif self.config.fp4:
-                quant_init_context = get_fp4_context(self.config, i + pp_layer_offset, is_init=True)
+                quant_init_context = get_fp4_context(
+                    self.config, physical_layer_offset, is_init=True
+                )
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if layer_type == LayerSymbols.MAMBA:
+                if is_layer_group(layer_type):
+                    layer = HybridStack(
+                        config=self.config,
+                        submodules=submodules,
+                        pre_process=True,
+                        layer_type_list=list(layer_type),
+                        pp_layer_offset=physical_layer_offset,
+                        logical_layer_offset=logical_layer_offset + len(self.layers),
+                        is_layer_group_stack=True,
+                        post_layer_norm=False,
+                        post_process=False,
+                        device=device,
+                        dtype=dtype,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                    )
+                elif layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
@@ -174,6 +206,7 @@ class HybridStack(MegatronModule):
                 else:
                     raise ValueError("unexpected layer_type")
             self.layers.append(layer)
+            physical_layer_offset += get_layer_type_physical_count(layer_type)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -202,7 +235,11 @@ class HybridStack(MegatronModule):
         if this block contains Mamba layers (this may not be the case with PP > 1).
         """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
-            if layer_type == LayerSymbols.MAMBA:
+            if is_layer_group(layer_type):
+                shapes = layer.mamba_state_shapes_per_request()
+                if shapes is not None:
+                    return shapes
+            elif layer_type == LayerSymbols.MAMBA:
                 return layer.mamba_state_shapes_per_request()
         return None
 
@@ -212,6 +249,10 @@ class HybridStack(MegatronModule):
         attention_mask: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        sequence_len_offset: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -252,7 +293,9 @@ class HybridStack(MegatronModule):
             inference_context.max_seqlen = inference_context.max_sequence_length
             inference_context.seqlen_offset = inference_context.sequence_len_offset
 
-        if (
+        if sequence_len_offset is not None:
+            pass
+        elif (
             (
                 (
                     self.config.cuda_graph_impl == "local"
@@ -301,14 +344,35 @@ class HybridStack(MegatronModule):
         with outer_fp8_context:
             for layer in self.layers:
                 # Layers have 1-indexed layer numbers attribute.
-                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
+                if isinstance(layer, HybridStack):
+                    inner_quant_context = nullcontext()
+                else:
+                    inner_quant_context = get_inner_quant_context(
+                        self.config, layer.layer_number - 1
+                    )
                 with inner_quant_context:
-                    if isinstance(layer, TransformerLayer):
+                    if isinstance(layer, HybridStack):
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_cos=rotary_pos_cos,
+                            rotary_pos_sin=rotary_pos_sin,
+                            rotary_pos_cos_sin=rotary_pos_cos_sin,
+                            sequence_len_offset=sequence_len_offset,
+                            packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
+                        )
+                    elif isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,
                             rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_cos=rotary_pos_cos,
+                            rotary_pos_sin=rotary_pos_sin,
+                            rotary_pos_cos_sin=rotary_pos_cos_sin,
                             sequence_len_offset=sequence_len_offset,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
@@ -361,17 +425,46 @@ class HybridStack(MegatronModule):
             dict: The sharded state dictionary for the current object.
         """
 
+        return self._sharded_state_dict(
+            prefix=prefix,
+            sharded_offsets=sharded_offsets,
+            metadata=metadata,
+            sharded_layer_prefix=None,
+        )
+
+    def _sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Optional[tuple] = None,
+        metadata: Optional[dict] = None,
+        sharded_layer_prefix: Optional[str] = None,
+    ) -> ShardedStateDict:
+        sharded_offsets = sharded_offsets or ()
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
+        if sharded_layer_prefix is None:
+            sharded_layer_prefix = layer_prefix
 
-        for local_layer_idx, layer in enumerate(self.layers):
-
-            global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
-            state_dict_prefix = (
-                f'{layer_prefix}{local_layer_idx}.'  # module list index in HybridStack
+        for local_layer_idx, (layer_type, layer) in enumerate(zip(self.layer_type_list, self.layers)):
+            state_dict_prefix = f'{layer_prefix}{local_layer_idx}.'
+            logical_layer_idx = (
+                self.logical_layer_offset
+                if self.is_layer_group_stack
+                else self.logical_layer_offset + local_layer_idx
             )
 
-            sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
+            if is_layer_group(layer_type):
+                sharded_state_dict.update(
+                    layer._sharded_state_dict(
+                        state_dict_prefix,
+                        sharded_offsets,
+                        metadata,
+                        sharded_layer_prefix=sharded_layer_prefix,
+                    )
+                )
+                continue
+
+            sharded_prefix = f'{sharded_layer_prefix}{logical_layer_idx}.'
             sharded_pp_offset = []
 
             layer_sharded_state_dict = layer.sharded_state_dict(
@@ -385,15 +478,20 @@ class HybridStack(MegatronModule):
         # Add modules other than self.layers
         for name, module in self.named_children():
             if not module is self.layers:
-                sharded_state_dict.update(
-                    sharded_state_dict_default(
-                        module,
-                        f'{prefix}{name}.',
-                        sharded_offsets,
-                        metadata,
-                        tp_group=self.tp_group,
-                    )
+                module_sharded_state_dict = sharded_state_dict_default(
+                    module,
+                    f'{prefix}{name}.',
+                    sharded_offsets,
+                    metadata,
+                    tp_group=self.tp_group,
                 )
+                if name == "final_norm":
+                    replace_prefix_for_sharding(
+                        module_sharded_state_dict,
+                        f'{prefix}{name}.',
+                        f'{prefix}final_layernorm.',
+                    )
+                sharded_state_dict.update(module_sharded_state_dict)
 
         return sharded_state_dict
 
