@@ -9,8 +9,31 @@ Tests cover:
 - vllm_fused_moe: end-to-end correctness vs sequential reference
 """
 
+import os
+import tempfile
+
+# Redirect Triton cache to /tmp BEFORE triton is imported (at module level) so
+# compiled kernels don't accumulate in ~/.triton/ across test runs.
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(tempfile.gettempdir(), "triton_test_cache"))
+
 import pytest
 import torch
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _single_autotune_config():
+    """Replace the 25-entry autotune config list with a single config.
+
+    Each unique (N, K, BLOCK_SIZE_M) combo triggers a full autotune pass that
+    compiles ALL configs. Tests only need correctness, not peak throughput, so
+    one config is sufficient and cuts compiled-kernel count by ~25x.
+    """
+    from megatron.core.inference.moe.vllm_fused_moe import _fused_moe_kernel
+
+    orig = list(_fused_moe_kernel.configs)
+    _fused_moe_kernel.configs = [orig[0]]
+    yield
+    _fused_moe_kernel.configs = orig
 
 
 def _vt(n):
