@@ -25,7 +25,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import GPUFuture, get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -1803,12 +1803,15 @@ class TextGenerationController:
         }
 
     async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
+        self,
+        skip_bookkeeping: Optional[bool] = False,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+            loop (Optional[asyncio.AbstractEventLoop]): Event loop to use for GPU synchronization.
 
         Return:
             (Optional[Dict]): A dictionary containing:
@@ -1825,6 +1828,9 @@ class TextGenerationController:
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
             return None
+
+        loop = get_asyncio_loop(loop)
+        gpu_done = GPUFuture(loop)
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
@@ -1856,14 +1862,11 @@ class TextGenerationController:
             # Reconstruction happens from blocks at request completion.
             context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
+        # Record after forward pass kernels are enqueued.  Awaiting this
+        # lets other asyncio tasks run while the GPU is busy, and resumes
+        # as soon as the forward pass completes.
+        gpu_done.record()
+        await gpu_done
 
         with torch.inference_mode():
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()

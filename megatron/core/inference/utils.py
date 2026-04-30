@@ -1,10 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import ctypes
 import logging
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
+from typing import Optional
 
 import torch
 
@@ -310,3 +312,149 @@ if sys.version_info < (3, 13):
 else:
     asyncio_QueueShutDown = asyncio.QueueShutDown
     asyncio_Queue = asyncio.Queue
+
+
+_libcudart: Optional[ctypes.CDLL] = None
+_CUDA_HOST_FN_T = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+
+def _get_cudart() -> ctypes.CDLL:
+    """Lazily load and configure the CUDA runtime library."""
+    global _libcudart
+    if _libcudart is None:
+        cuda_major = torch.version.cuda.split('.')[0]
+        _libcudart = ctypes.CDLL(f"libcudart.so.{cuda_major}")
+        _libcudart.cudaLaunchHostFunc.restype = ctypes.c_int
+        _libcudart.cudaLaunchHostFunc.argtypes = [
+            ctypes.c_void_p,  # cudaStream_t
+            _CUDA_HOST_FN_T,  # cudaHostFn_t
+            ctypes.c_void_p,  # void* userData
+        ]
+    return _libcudart
+
+
+class PriorityEventLoop(asyncio.SelectorEventLoop):
+    """Event loop with front-of-queue scheduling for GPU completion callbacks.
+
+    Adds `call_soon_front` and `call_soon_threadsafe_front` which prepend callbacks to the ready
+    queue, as opposed to appending them. This acts as a pseudo-interrupt.
+    """
+
+    def call_soon_front(self, callback, *args, context=None):
+        """Schedule `callback` at the front of the ready queue."""
+        self._check_closed()
+        handle = asyncio.events.Handle(callback, args, self, context)
+        self._ready.appendleft(handle)
+        return handle
+
+    def call_soon_threadsafe_front(self, callback, *args, context=None):
+        """Thread-safe variant of `call_soon_front`."""
+        self._check_closed()
+        handle = asyncio.events.Handle(callback, args, self, context)
+        self._ready.appendleft(handle)
+        self._write_to_self()  # wake select()
+        return handle
+
+
+class GPUFuture:
+    """Awaitable that resolves when all preceding work on a CUDA stream completes.
+
+    Instead of blocking on the CPU thread, this future fires a callback from CUDA's internal thread.
+    When the callback triggers, this class attempts to prepend the task to the event loop queue.
+
+    Usage:
+
+        gpu_done = GPUFuture(loop)
+        # Enqueue the main GPU work.
+        launch_long_gpu_work(...)
+        # Record the callback.
+        gpu_done.record()
+        # Recommendation: enqueue a short GPU workload to cover the latency of the callback.
+        launch_short_gpu_work(...)
+        await gpu_done    # resumes at front of queue as soon as GPU finishes.
+    """
+
+    _prevent_gc: dict = {}
+    _asyncio_future_blocking = False
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+        self._done = False
+        self._callbacks: list = []
+
+    def get_loop(self):
+        return self._loop
+
+    def done(self):
+        return self._done
+
+    def cancelled(self):
+        return False
+
+    def cancel(self, msg=None):
+        return False
+
+    def result(self):
+        if not self._done:
+            raise asyncio.InvalidStateError('not ready')
+        return None
+
+    def add_done_callback(self, fn, *, context=None):
+        if self._done:
+            try:
+                self._loop.call_soon_front(fn, self, context=context)
+            except AttributeError:
+                self._loop.call_soon(fn, self, context=context)
+        else:
+            self._callbacks.append((fn, context))
+
+    def __await__(self):
+        if not self._done:
+            self._asyncio_future_blocking = True
+            yield self
+        if not self._done:
+            raise RuntimeError("await wasn't used with future")
+        return self.result()
+
+    def record(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        """Enqueue a host callback that resolves this future when stream drains.
+
+        Args:
+            stream: CUDA stream to attach to. Defaults to the current stream.
+        """
+        if stream is None:
+            stream = torch.cuda.current_stream()
+
+        prevent_gc_ref: Optional[object] = None
+
+        def _host_fn(_user_data: ctypes.c_void_p) -> None:
+            # Runs on CUDA's internal callback thread; MUST NOT call CUDA API.
+            try:
+                try:
+                    self._loop.call_soon_threadsafe_front(self._resolve)
+                except AttributeError:
+                    self._loop.call_soon_threadsafe(self._resolve)
+            except RuntimeError:
+                pass  # event loop closed
+            GPUFuture._prevent_gc.pop(id(prevent_gc_ref), None)
+
+        c_fn = _CUDA_HOST_FN_T(_host_fn)
+        prevent_gc_ref = c_fn
+        GPUFuture._prevent_gc[id(c_fn)] = c_fn
+
+        err = _get_cudart().cudaLaunchHostFunc(
+            ctypes.c_void_p(stream.cuda_stream), c_fn, ctypes.c_void_p(0)
+        )
+        if err != 0:
+            GPUFuture._prevent_gc.pop(id(c_fn), None)
+            raise RuntimeError(f"cudaLaunchHostFunc failed with CUDA error {err}")
+
+    def _resolve(self):
+        """Mark done and fire callbacks at the front of the ready queue."""
+        self._done = True
+        cbs, self._callbacks = self._callbacks, []
+        for fn, ctx in cbs:
+            try:
+                self._loop.call_soon_front(fn, self, context=ctx)
+            except AttributeError:
+                self._loop.call_soon(fn, self, context=ctx)
