@@ -79,8 +79,6 @@ def _build_model_from_recipe(recipe: HybridModelConfig) -> HybridModel:
         seq_len_interpolation_factor=compiled.seq_len_interpolation_factor,
         layer_type_list=compiled.layer_type_list,
         layer_config_list=compiled.layer_config_list,
-        mtp_layer_pattern=compiled.mtp_layer_pattern,
-        mtp_num_depths=compiled.mtp_num_depths,
     )
 
 

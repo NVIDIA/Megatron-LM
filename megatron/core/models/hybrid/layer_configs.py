@@ -460,44 +460,6 @@ class EmbeddingLayerConfig:
 
 
 @dataclass
-class MTPLayerConfig:
-    """Multi-Token Prediction marker (one instance per MTP depth).
-
-    A pattern with two MTP depths is written as ``[..., MTP, MTP, Loss]`` —
-    each :class:`MTPLayerConfig` instance corresponds to one prediction depth
-    and they all share the same body (the existing
-    :class:`MultiTokenPredictionBlock` infrastructure assumes identical
-    per-depth bodies).
-
-    The recipe author specifies the per-depth body as a (possibly nested)
-    list of decoder :class:`LayerConfig` instances via
-    :attr:`mtp_model_layer`. At compile time, the body is flattened into the
-    same single-character ``mtp_layer_pattern`` string the legacy
-    :func:`parse_hybrid_pattern` produces, and ``mtp_num_depths`` is set to
-    the count of consecutive :class:`MTPLayerConfig` markers in the pattern.
-    """
-
-    common_config: CommonLayerConfig = field(default_factory=CommonLayerConfig)
-
-    mtp_model_layer: list = field(default_factory=list)
-    """Per-depth MTP body — a (possibly nested) list of decoder
-    :class:`LayerConfig` instances."""
-
-    loss_scaling_factor: Optional[float] = None
-    """Scale factor applied to the auxiliary MTP loss before it is added to
-    the main cross-entropy loss. ``None`` keeps the
-    :class:`TransformerConfig` default (``mtp_loss_scaling_factor=0.1``).
-    All :class:`MTPLayerConfig` markers in a recipe must agree on this
-    value — it is a stack-level setting, not per-depth."""
-
-    use_repeated_layer: Optional[bool] = None
-    """Reuse a single MTP transformer layer across all depths instead of
-    instantiating one per depth. ``None`` keeps the
-    :class:`TransformerConfig` default (``mtp_use_repeated_layer=False``).
-    Like :attr:`loss_scaling_factor`, must agree across all markers."""
-
-
-@dataclass
 class CrossEntropyLayerConfig:
     """Output / loss marker (must appear at the end of a layer pattern)."""
 
@@ -541,6 +503,4 @@ class PipelineSplit:
 # ----------------------------------------------------------- type aliases
 
 #: Anything that may legally appear at a leaf of a layer pattern.
-PatternLeaf = Union[
-    LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig, MTPLayerConfig, PipelineSplit
-]
+PatternLeaf = Union[LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig, PipelineSplit]

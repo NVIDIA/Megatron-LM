@@ -41,7 +41,6 @@ from megatron.core.models.hybrid.layer_configs import (
     EmbeddingLayerConfig,
     LayerConfig,
     MoELayerConfig,
-    MTPLayerConfig,
     PipelineSplit,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -87,12 +86,6 @@ class CompiledRecipe:
     share_embeddings_and_output_weights: bool
     fp16_lm_cross_entropy: bool
     parallel_output: bool
-    # MTP plumbing (consumed by the existing MultiTokenPredictionBlock).
-    # ``mtp_layer_pattern`` is the single-character per-depth body string —
-    # the same form :func:`parse_hybrid_pattern` produces from a string DSL
-    # like ``"M*M*/MM/MM"``. ``None`` when the recipe has no MTP markers.
-    mtp_layer_pattern: Optional[str]
-    mtp_num_depths: int
     # Dotted path to a custom HybridStack ``ModuleSpec``; the builder
     # imports it. ``None`` lets the builder auto-pick by ``transformer_impl``.
     stack_spec: Optional[str]
@@ -161,7 +154,7 @@ class HybridModelConfig:
         """
         from megatron.core.models.hybrid.layer_pattern import flatten_decoder_pattern
 
-        embedding, decoder_leaves, mtp_markers, loss = _split_pattern(self.layer_pattern)
+        embedding, decoder_leaves, loss = _split_pattern(self.layer_pattern)
 
         # Auto-inherit the recipe's common_config into any layer/marker that
         # was constructed without an explicit ``common_config=`` argument.
@@ -171,7 +164,6 @@ class HybridModelConfig:
         embedding = _inherit_common_if_default(embedding, self.common_config)
         loss = _inherit_common_if_default(loss, self.common_config)
         decoder_leaves = _inherit_common_in_pattern(decoder_leaves, self.common_config)
-        mtp_markers = [_inherit_common_in_marker(m, self.common_config) for m in mtp_markers]
 
         decoder_flat: List[LayerConfig] = flatten_decoder_pattern(decoder_leaves)
         if not decoder_flat:
@@ -279,19 +271,11 @@ class HybridModelConfig:
 
         _validate_pattern("".join(layer_type_list), "main", allow_pipe=False)
 
-        # MTP: compile the per-depth body (shared across all MTP markers in
-        # the pattern) into the single-character form the existing
-        # MultiTokenPredictionBlock infrastructure consumes.
-        (mtp_layer_pattern, mtp_num_depths, mtp_loss_scaling_factor, mtp_use_repeated_layer) = (
-            _compile_mtp_markers(mtp_markers, self.common_config)
-        )
-
         # Stack-level config: a model-wide topology snapshot used for the
-        # final norm, embedding init, the MTP block construction (when an
-        # MTP body symbol contains ``E``), inference capacity sizing, and
-        # the args projection in ``_apply_model_recipe_to_args``. Carries
-        # EP/ETP because it represents the global topology, even though
-        # non-MoE per-layer TCs do not.
+        # final norm, embedding init, inference capacity sizing, and the
+        # args projection in ``_apply_model_recipe_to_args``. Carries EP/ETP
+        # because it represents the global topology, even though non-MoE
+        # per-layer TCs do not.
         stack_kwargs = embedding.common_config.to_transformer_config_kwargs()
         stack_kwargs.update(parallelism)
         stack_kwargs.update(expert_parallelism)
@@ -327,17 +311,6 @@ class HybridModelConfig:
         stack_kwargs["cross_entropy_loss_fusion"] = loss.loss_fusion
         stack_kwargs["cross_entropy_fusion_impl"] = loss.fusion_impl
         stack_kwargs["calculate_per_token_loss"] = loss.calculate_per_token_loss
-        # MTP plumbing — without ``mtp_num_layers`` set, HybridModel.forward
-        # builds the MTP block but skips ``process_mtp_loss`` entirely (the
-        # gate is ``self.config.mtp_num_layers is not None``), silently
-        # training a model whose MTP head contributes nothing to the
-        # objective. Set it whenever the recipe contains MTP markers.
-        if mtp_num_depths > 0:
-            stack_kwargs["mtp_num_layers"] = mtp_num_depths
-            if mtp_loss_scaling_factor is not None:
-                stack_kwargs["mtp_loss_scaling_factor"] = mtp_loss_scaling_factor
-            if mtp_use_repeated_layer is not None:
-                stack_kwargs["mtp_use_repeated_layer"] = mtp_use_repeated_layer
         # Marker-level passthroughs: Embedding and CrossEntropy markers may
         # set TransformerConfig fields the curated DSL surface doesn't cover.
         # ``extra`` may not name a curated TC field — that would silently shadow
@@ -391,8 +364,6 @@ class HybridModelConfig:
             share_embeddings_and_output_weights=not self.untie_embeddings_and_output_weights,
             fp16_lm_cross_entropy=loss.fp16_lm_cross_entropy,
             parallel_output=loss.parallel_output,
-            mtp_layer_pattern=mtp_layer_pattern,
-            mtp_num_depths=mtp_num_depths,
             stack_spec=self.stack_spec,
         )
 
@@ -424,28 +395,17 @@ def _inherit_common_in_pattern(node: Any, recipe_common: CommonLayerConfig) -> A
     return _inherit_common_if_default(node, recipe_common)
 
 
-def _inherit_common_in_marker(marker: Any, recipe_common: CommonLayerConfig) -> Any:
-    """Apply common-inheritance to an MTP marker and recurse into its
-    ``mtp_model_layer`` body."""
-    marker = _inherit_common_if_default(marker, recipe_common)
-    if hasattr(marker, "mtp_model_layer"):
-        new_body = _inherit_common_in_pattern(marker.mtp_model_layer, recipe_common)
-        marker = dataclasses.replace(marker, mtp_model_layer=new_body)
-    return marker
-
-
 def _split_pattern(pattern: list):
-    """Split ``[Embedding, ...decoder..., MTP*, Loss]`` into its four pieces.
+    """Split ``[Embedding, ...decoder..., Loss]`` into its three pieces.
 
-    Trailing :class:`MTPLayerConfig` markers (zero or more) sit between the
-    decoder body and the :class:`CrossEntropyLayerConfig` marker. The
-    returned tuple is ``(embedding, decoder_body, mtp_markers, loss)``;
-    ``mtp_markers`` is an empty list when the pattern has no MTP.
+    The returned tuple is ``(embedding, decoder_body, loss)``.
 
     Validates that exactly one :class:`EmbeddingLayerConfig` appears at the
     start, exactly one :class:`CrossEntropyLayerConfig` at the end, and
     raises a clear error if a :class:`PipelineSplit` appears (until PP is
-    plumbed through).
+    plumbed through). MTP support is intentionally not part of the recipe
+    DSL today; recipes that need MTP should use the legacy
+    ``hybrid_layer_pattern`` string DSL.
     """
     if not isinstance(pattern, list) or not pattern:
         raise TypeError("layer_pattern must be a non-empty list.")
@@ -463,13 +423,8 @@ def _split_pattern(pattern: list):
 
     body = pattern[1:-1]
 
-    # Pop trailing MTPLayerConfig markers.
-    mtp_markers: list = []
-    while body and isinstance(body[-1], MTPLayerConfig):
-        mtp_markers.insert(0, body.pop())
-
     # PipelineSplit anywhere in the body → not yet supported.
-    # Embedding/Loss/MTP in the decoder body → wrong slot.
+    # Embedding/Loss in the decoder body → wrong slot.
     def _walk(node):
         if isinstance(node, PipelineSplit):
             raise NotImplementedError(
@@ -483,12 +438,6 @@ def _split_pattern(pattern: list):
                 "EmbeddingLayerConfig / CrossEntropyLayerConfig may only appear "
                 "at the start / end of layer_pattern, never in the body."
             )
-        if isinstance(node, MTPLayerConfig):
-            raise TypeError(
-                "MTPLayerConfig markers must form a contiguous trailing run "
-                "immediately before the CrossEntropyLayerConfig — they cannot "
-                "appear earlier in the decoder body."
-            )
         if isinstance(node, (list, tuple)):
             for child in node:
                 _walk(child)
@@ -496,111 +445,7 @@ def _split_pattern(pattern: list):
     for entry in body:
         _walk(entry)
 
-    return pattern[0], body, mtp_markers, pattern[-1]
-
-
-_MTP_OVERRIDE_GUIDANCE = (
-    "MTPLayerConfig only forwards the layer-symbol pattern to "
-    "MultiTokenPredictionBlock today; per-MTP-layer config overrides are not yet "
-    "plumbed through and would be silently ignored. Drop the override or wait for "
-    "the MTP follow-up that wires per-layer configs through."
-)
-
-
-def _ensure_mtp_lc_uses_defaults(lc: LayerConfig, recipe_common: CommonLayerConfig) -> None:
-    """Reject per-MTP-layer LayerConfig overrides that would be silently dropped."""
-    if lc.common_config != recipe_common:
-        raise ValueError(
-            f"{type(lc).__name__} inside an MTPLayerConfig.mtp_model_layer body "
-            f"has a custom common_config. {_MTP_OVERRIDE_GUIDANCE}"
-        )
-    if lc.extra:
-        raise ValueError(
-            f"{type(lc).__name__} inside an MTPLayerConfig.mtp_model_layer body "
-            f"has a non-empty extra={lc.extra!r}. {_MTP_OVERRIDE_GUIDANCE}"
-        )
-    default_lc = type(lc)(common_config=recipe_common)
-    for f in dataclasses.fields(type(lc)):
-        if f.name in ("common_config", "extra"):
-            continue
-        if getattr(lc, f.name) != getattr(default_lc, f.name):
-            raise ValueError(
-                f"{type(lc).__name__}.{f.name}={getattr(lc, f.name)!r} inside an "
-                f"MTPLayerConfig.mtp_model_layer body diverges from the default. "
-                f"{_MTP_OVERRIDE_GUIDANCE}"
-            )
-
-
-def _compile_mtp_markers(mtp_markers: list, recipe_common: CommonLayerConfig):
-    """Compile trailing MTP markers into stack-level MTP plumbing.
-
-    Returns a 4-tuple ``(mtp_layer_pattern, mtp_num_depths, loss_scaling_factor,
-    use_repeated_layer)``. The existing :class:`MultiTokenPredictionBlock`
-    infrastructure assumes all MTP depths share an identical body and
-    stack-level settings; we enforce that here: every
-    :class:`MTPLayerConfig` in ``mtp_markers`` must produce the same
-    flattened symbol string and agree on ``loss_scaling_factor`` /
-    ``use_repeated_layer``. ``loss_scaling_factor`` and
-    ``use_repeated_layer`` are ``None`` when no marker sets them (caller
-    should fall back to the :class:`TransformerConfig` defaults). When
-    ``mtp_markers`` is empty, returns ``(None, 0, None, None)``.
-
-    Also rejects per-MTP-layer config overrides that would otherwise be
-    silently dropped (see :data:`_MTP_OVERRIDE_GUIDANCE`).
-    """
-    from megatron.core.models.hybrid.layer_pattern import flatten_decoder_pattern
-
-    if not mtp_markers:
-        return None, 0, None, None
-
-    bodies: List[str] = []
-    for marker in mtp_markers:
-        if marker.common_config != recipe_common:
-            raise ValueError(
-                f"MTPLayerConfig.common_config diverges from the recipe's "
-                f"common_config. {_MTP_OVERRIDE_GUIDANCE}"
-            )
-        flat = flatten_decoder_pattern(marker.mtp_model_layer)
-        if not flat:
-            raise ValueError(
-                "MTPLayerConfig.mtp_model_layer must contain at least one " "decoder LayerConfig."
-            )
-        for lc in flat:
-            _ensure_mtp_lc_uses_defaults(lc, recipe_common)
-        bodies.append("".join(type(lc).SYMBOL for lc in flat))
-
-    shared = bodies[0]
-    for i, body in enumerate(bodies[1:], start=2):
-        if body != shared:
-            raise ValueError(
-                f"All MTPLayerConfig markers in the pattern must share an "
-                f"identical mtp_model_layer body. Marker 1 compiles to "
-                f"{shared!r} but marker {i} compiles to {body!r}."
-            )
-
-    loss_scaling = _agree_across_mtp_markers(mtp_markers, "loss_scaling_factor")
-    use_repeated = _agree_across_mtp_markers(mtp_markers, "use_repeated_layer")
-    return shared, len(mtp_markers), loss_scaling, use_repeated
-
-
-def _agree_across_mtp_markers(mtp_markers: list, field_name: str) -> Any:
-    """Return the shared value of ``field_name`` across markers, or raise.
-
-    Stack-level MTP settings (``loss_scaling_factor``, ``use_repeated_layer``)
-    cannot meaningfully vary per-depth: there is one
-    :class:`MultiTokenPredictionBlock` and one auxiliary loss term.
-    Either every marker leaves the field at its default ``None`` (in which
-    case we return ``None`` and let TC defaults apply), or every marker
-    that sets it agrees on the value.
-    """
-    values = [getattr(m, field_name) for m in mtp_markers]
-    non_none = {v for v in values if v is not None}
-    if len(non_none) > 1:
-        raise ValueError(
-            f"MTPLayerConfig.{field_name} must be identical across all MTP markers "
-            f"(it is a stack-level setting). Found values: {sorted(non_none)}."
-        )
-    return next(iter(non_none), None)
+    return pattern[0], body, pattern[-1]
 
 
 def _infer_uniform_attention_metadata(decoder_flat: List[LayerConfig]) -> dict[str, Any]:
