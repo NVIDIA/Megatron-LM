@@ -1055,13 +1055,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
+        active_count = self.total_request_count - self.paused_request_count
         lengths = self.request_kv_length_offsets + self.request_query_lengths
-        lengths = lengths[self.paused_request_count : self.total_request_count]
-        return lengths
+        return lengths[:active_count]
 
     def get_max_sequence_lengths(self) -> Tensor:
         """Maximum sequence length for active requests."""
-        return self.request_output_lengths[self.paused_request_count : self.total_request_count]
+        active_count = self.total_request_count - self.paused_request_count
+        return self.request_output_lengths[:active_count]
 
     def get_active_request_count(self):
         """Returns the current number of active requests."""
@@ -2798,12 +2799,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
-                # Clear stale request IDs left behind so that
-                # get_index_of_chunked_prefill_request(safe=False) cannot match them.
+                # Clear stale rows left behind.
                 stale_start = active_request_count + self.paused_request_count
                 stale_end = old_active_count + self.paused_request_count
                 if stale_start < stale_end:
                     self.request_ids[stale_start:stale_end] = -1
+                    self.request_to_kv_block_ids[stale_start:stale_end] = -1
 
         # 5. Identify requests that require a new block and pause them.
         #       a) Partition active region: staying-active on the left, pausing on the right
