@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import types
-import warnings
 
 import torch
 import torch.nn.functional as F
@@ -1011,12 +1010,12 @@ def validate_args(args, defaults={}):
     if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
         try:
             import flashinfer  # noqa: F401
-        except ImportError:
-            warnings.warn(
-                "--inference-dynamic-batching-sampling-backend=flashinfer requested "
-                "but flashinfer is not installed; falling back to 'torch'."
-            )
-            args.inference_dynamic_batching_sampling_backend = 'torch'
+        except ImportError as e:
+            raise ImportError(
+                "--inference-dynamic-batching-sampling-backend=flashinfer requires "
+                "the flashinfer package; install it or pass "
+                "--inference-dynamic-batching-sampling-backend=torch."
+            ) from e
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
