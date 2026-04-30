@@ -68,6 +68,27 @@ class CachedMetadataFileSystemReader(FileSystemReader):
 
         rank = int(os.environ.get('RANK', 0))
 
+        # Per-rank disk-I/O accounting for the local-replica change. The
+        # PR only relocates *which* file each rank reads from, not *how
+        # many* bytes — these counters let an operator confirm exactly
+        # that on a real run by diff'ing two log lines (legacy load vs
+        # local-read load) over the same on-disk checkpoint. We sum the
+        # ``length`` field of every ``_StorageInfo`` we are about to
+        # consume; tensors are counted as one per ``ReadItem`` regardless
+        # of underlying type (BYTE_IO or tensor). No collectives — each
+        # rank prints only what it sees.
+        local_total_bytes = 0
+        local_total_items = 0
+        for read_items in per_file.values():
+            for req in read_items:
+                local_total_bytes += self.storage_data[req.storage_index].length
+                local_total_items += 1
+        print(
+            f"[DEBUG-TP-REP] [Rank {rank}] read_data: "
+            f"items={local_total_items} bytes={local_total_bytes} "
+            f"files={len(per_file)}"
+        )
+
         for relative_path, reqs in per_file.items():
             new_path = self.fs.concat_path(self.path, relative_path)
             # Extract the rank number from the checkpoint shard filename (e.g., "__1_0.distcp" --> 1)
