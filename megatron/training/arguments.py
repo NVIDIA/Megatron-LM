@@ -1005,6 +1005,23 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    # Streaming dequantize is unsafe with tensorwise (current) FP8 scaling.
+    # The streaming planner does a BF16->FP8 ``copy_`` per slice; tensorwise
+    # recomputes the per-tensor scale from each slice's amax, so multi-shard
+    # destinations (e.g. resharded loads) end up with inconsistent scales
+    # across slices and the loaded weights are corrupted. Block-scaled
+    # recipes (mxfp8, blockwise, nvfp4) carry per-block scales and are
+    # unaffected. Force the upfront ``force_all_tensors_to_non_fp8`` path
+    # for tensorwise.
+    if args.fp8 and args.fp8_recipe == "tensorwise" and args.stream_ckpt_dequant:
+        warn_rank_0(
+            "--fp8-recipe=tensorwise is incompatible with the streaming "
+            "checkpoint dequantize path; falling back to the upfront "
+            "dequantize pass. Pass --no-stream-ckpt-dequant to silence "
+            "this warning."
+        )
+        args.stream_ckpt_dequant = False
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
