@@ -8,6 +8,7 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
+    hybrid_inference_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -64,7 +65,9 @@ def get_default_hybrid_stack_spec(config: "HybridModelConfig") -> ModuleSpec:
     Returns:
         ModuleSpec: Appropriate module specification based on config
     """
-    if config.restore_modelopt_state:
+    if config.transformer.transformer_impl == "inference_optimized":
+        return hybrid_inference_stack_spec
+    elif config.restore_modelopt_state:
         return modelopt_hybrid_stack_spec()
     else:
         return transformer_engine_hybrid_stack_spec()
