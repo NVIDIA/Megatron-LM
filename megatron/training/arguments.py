@@ -334,6 +334,17 @@ def _apply_model_recipe_to_args(args):
     """
     from megatron.core.models.hybrid.layer_pattern import load_recipe
 
+    # Reject user-supplied conflicts up front; the projection below sets
+    # ``args.hybrid_layer_pattern`` so ``is_hybrid_model(args)`` recognises
+    # recipe-built models on the existing legacy code path.
+    assert getattr(args, 'hybrid_layer_pattern', None) is None, (
+        '--model-recipe and --hybrid-layer-pattern are mutually exclusive. '
+        'The recipe supplies the layer pattern; remove --hybrid-layer-pattern.'
+    )
+    assert getattr(args, 'hybrid_override_pattern', None) is None, (
+        '--model-recipe and --hybrid-override-pattern are mutually exclusive.'
+    )
+
     compiled = load_recipe(args.model_recipe)
     args._compiled_model_recipe = compiled
 
@@ -383,6 +394,12 @@ def _apply_model_recipe_to_args(args):
         and hasattr(args, "multi_latent_attention")
     ):
         args.multi_latent_attention = True
+
+    # Mark the run as hybrid for downstream metrics. ``is_hybrid_model(args)``
+    # in ``megatron/training/utils.py`` keys off ``args.hybrid_layer_pattern``;
+    # without this, recipe-built hybrid models would silently fall back to GPT
+    # FLOP-accounting and MoE-metric paths.
+    args.hybrid_layer_pattern = "".join(compiled.layer_type_list)
 
 
 def validate_args(args, defaults={}):
@@ -710,17 +727,9 @@ def validate_args(args, defaults={}):
 
     # === Hybrid layer pattern: deprecation handling and validation ===
 
-    # --model-recipe is mutually exclusive with the string-pattern path. The recipe
-    # supplies both the CommonLayerConfig and the layer_pattern; mixing it with
-    # --hybrid-layer-pattern would create two competing sources of truth.
-    if getattr(args, 'model_recipe', None) is not None:
-        assert args.hybrid_layer_pattern is None, (
-            '--model-recipe and --hybrid-layer-pattern are mutually exclusive. '
-            'The recipe supplies the layer pattern; remove --hybrid-layer-pattern.'
-        )
-        assert args.hybrid_override_pattern is None, (
-            '--model-recipe and --hybrid-override-pattern are mutually exclusive.'
-        )
+    # The --model-recipe vs --hybrid-layer-pattern mutex check lives at the
+    # start of _apply_model_recipe_to_args (it must run before projection
+    # populates args.hybrid_layer_pattern internally for is_hybrid_model).
 
     # Backward compat: --hybrid-override-pattern is deprecated in favor of --hybrid-layer-pattern
     used_hybrid_override_pattern = False
