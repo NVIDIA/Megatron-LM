@@ -1,5 +1,5 @@
 ---
-name: testsystem
+name: ci-test-system
 description: Test system, CI pipeline, and CI failure investigation for Megatron-LM. Covers test layout, recipe YAML structure, adding unit and functional tests, CI scope labels, triggering internal GitLab CI, pipeline structure, and debugging CI failures.
 TRIGGER when: user asks to run tests, add a test, investigate a CI failure, understand the CI pipeline, or work with test recipes; user opens or pushes to a PR and needs to know which CI label to attach; user wants to trigger the internal GitLab CI pipeline; user asks to download golden values or references a pipeline/run ID in the context of golden values.
 DO NOT TRIGGER when: user is only setting up the dev environment or managing dependencies (use build-and-dependency instead).
@@ -193,6 +193,7 @@ Apply this logic based on what the PR changes:
 | CI/tooling only (`.github/`, `tools/`, `Makefile`) | _(none)_ |
 | Test files only (`tests/`) — existing tests, no new golden values | `Run tests` |
 | **New test cases added** (no golden values exist yet) | `Run functional tests` |
+| **Re-enabling a disabled test** (scope `-broken` → active) | `Run functional tests` |
 | Non-numerical library code (logging, error handling, CLI flags, refactors) | `Run tests` |
 | Could affect training numerics (model arch, attention, optimizer, distributed, MoE routing) | `Run functional tests` |
 | Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` + `container::lts` |
@@ -244,7 +245,7 @@ Apply this logic based on what the PR changes:
 
 Use `tools/trigger_internal_ci.py` to push the current branch to the internal
 GitLab remote and trigger a pipeline — without touching the GitLab UI.
-Full setup and usage details: `tools/trigger_internal_ci.md`.
+Full setup and usage details: @tools/trigger_internal_ci.md.
 
 **Prerequisites** (one-time):
 
