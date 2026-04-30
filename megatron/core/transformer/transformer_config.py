@@ -1600,19 +1600,6 @@ class TransformerConfig(ModelParallelConfig):
                 "single-stream residual tensors."
             )
 
-        if self.enable_hyper_connections and self.virtual_pipeline_model_parallel_size is not None:
-            # The interleaved schedule allocates a single tensor_shape for all P2P
-            # exchanges per physical rank, but VPP straddles pre/post-process
-            # boundaries on each physical rank — intermediate virtual chunks need
-            # n*C while embedding/loss chunks use C. Block until per-virtual-chunk
-            # shapes are wired through. (A second, layout-derived path is caught
-            # at schedule-execution time in `forward_backward_pipelining_with_interleaving`.)
-            raise ValueError(
-                "enable_hyper_connections is not yet supported with "
-                "virtual_pipeline_model_parallel_size set. Disable VPP or wait for "
-                "per-virtual-chunk shape support."
-            )
-
         if self.enable_hyper_connections and (self.num_moe_experts or 0) > 0:
             raise ValueError(
                 "enable_hyper_connections is not yet supported with MoE layers. "
