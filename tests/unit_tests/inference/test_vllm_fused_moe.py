@@ -974,7 +974,14 @@ class TestVllmFusedMoeCudaGraph:
 # ──────────────────────────────────────────────────────────────────────
 
 
+requires_torch_grouped_mm = pytest.mark.skipif(
+    not hasattr(torch.nn.functional, "grouped_mm"),
+    reason="Requires torch.nn.functional.grouped_mm (PyTorch 2.10+)",
+)
+
+
 @pytest.mark.internal
+@requires_torch_grouped_mm
 class TestVllmVsMcoreFusedMoe:
 
     @pytest.mark.parametrize(
