@@ -72,7 +72,9 @@ class TestHyperConnectionCheckpoint:
         # Forward without checkpoint (reference)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module._forward_normal(hidden_states)
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(
+            hidden_states
+        )
         mixed_ref = module.apply_h_res(h_res_ref, residual)
         loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
@@ -83,8 +85,8 @@ class TestHyperConnectionCheckpoint:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module._forward_with_checkpoint(
-            hidden_states_ckpt, manager
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
+            module._forward_with_checkpoint(hidden_states_ckpt, manager)
         )
         mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
         # Calculate loss before discarding outputs
@@ -181,7 +183,7 @@ class TestHyperConnectionCheckpoint:
         # Reference: forward without manager (uses _forward_normal)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module.forward(
+        aggregated_ref, h_res_ref, h_post_ref, _ = module.forward(
             hidden_states, mhc_recompute_manager=None
         )
         loss_ref = aggregated_ref.sum() + h_res_ref.sum() + h_post_ref.sum()
@@ -192,7 +194,7 @@ class TestHyperConnectionCheckpoint:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, _ = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
         loss_ckpt = aggregated_ckpt.sum() + h_res_ckpt.sum() + h_post_ckpt.sum()
@@ -260,7 +262,7 @@ class TestMHCBlockRecomputeIntegration:
         h = hidden_states_ref
         r = residual_ref
         for module in modules:
-            agg, h_res, h_post = module.forward(h, mhc_recompute_manager=None)
+            agg, h_res, h_post, _ = module.forward(h, mhc_recompute_manager=None)
             agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=None)
             mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
             h = agg + mixed
@@ -280,7 +282,7 @@ class TestMHCBlockRecomputeIntegration:
         h = hidden_states_ckpt
         r = residual_ckpt
         for module in modules:
-            agg, h_res, h_post = module.forward(h, mhc_recompute_manager=manager)
+            agg, h_res, h_post, _ = module.forward(h, mhc_recompute_manager=manager)
             agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=manager)
             mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
             h = agg + mixed
@@ -338,7 +340,7 @@ class TestMHCBlockRecomputeIntegration:
         # Reference
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module.forward(
+        aggregated_ref, h_res_ref, h_post_ref, _ = module.forward(
             hidden_states_ref, mhc_recompute_manager=None
         )
         aggregated_ref, _ = module.apply_h_post(
@@ -357,7 +359,7 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         manager = CheckpointManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, _ = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
 
@@ -402,6 +404,439 @@ class TestTransformerConfigRecomputeMhc:
         )
         assert "mhc" in config.recompute_modules
         assert config.enable_hyper_connections is True
+
+
+class TestHyperConnectionBroadcastCheckpoint:
+    """Test HyperConnectionModule checkpoint with BroadcastTensorFused.
+
+    These tests mirror TestHyperConnectionCheckpoint but use the returned
+    residual (BroadcastTensor view) from forward() for apply_h_res, exercising
+    all 3 gradient paths through a single hidden_states tensor.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _create_hyper_connection_module(self, hidden_size=64, num_residual_streams=4):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_residual_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+        )
+        module = HyperConnectionModule(config=config, layer_number=1)
+        module.cuda()
+        return module
+
+    def test_broadcast_normal_vs_checkpoint_correctness(self):
+        """
+        _forward_normal vs _forward_with_checkpoint using BroadcastTensor residual.
+
+        All 3 gradient paths (compute_mappings, aggregate, apply_h_res) flow
+        through a single hidden_states tensor via BroadcastTensorFused.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        module = self._create_hyper_connection_module(hidden_size, num_streams)
+
+        hidden_states = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+        )
+        hidden_states_ckpt = hidden_states.detach().clone().requires_grad_(True)
+
+        # Reference: normal forward, use returned residual
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(
+            hidden_states
+        )
+        mixed_ref = module.apply_h_res(h_res_ref, residual_ref)
+        loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
+        loss_ref.backward()
+        grad_ref = hidden_states.grad.clone()
+
+        # Checkpoint: use returned residual
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        manager = CheckpointManager()
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt = (
+            module._forward_with_checkpoint(hidden_states_ckpt, manager)
+        )
+        mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
+        loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        loss_ckpt.backward()
+        grad_ckpt = hidden_states_ckpt.grad.clone()
+
+        assert torch.allclose(grad_ckpt, grad_ref, atol=1e-5), (
+            f"Broadcast checkpoint gradients mismatch"
+        )
+
+    def test_broadcast_forward_with_manager(self):
+        """forward() with/without manager using BroadcastTensor residual."""
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        module = self._create_hyper_connection_module(hidden_size, num_streams)
+
+        hidden_states = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+        )
+        hidden_states_ckpt = hidden_states.detach().clone().requires_grad_(True)
+
+        # Reference
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        agg_ref, h_res_ref, h_post_ref, res_ref = module.forward(
+            hidden_states, mhc_recompute_manager=None
+        )
+        loss_ref = agg_ref.sum() + module.apply_h_res(h_res_ref, res_ref).sum() + h_post_ref.sum()
+        loss_ref.backward()
+        grad_ref = hidden_states.grad.clone()
+
+        # With manager
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        manager = CheckpointManager()
+        agg_ckpt, h_res_ckpt, h_post_ckpt, res_ckpt = module.forward(
+            hidden_states_ckpt, mhc_recompute_manager=manager
+        )
+        loss_ckpt = (
+            agg_ckpt.sum() + module.apply_h_res(h_res_ckpt, res_ckpt).sum() + h_post_ckpt.sum()
+        )
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        loss_ckpt.backward()
+        grad_ckpt = hidden_states_ckpt.grad.clone()
+
+        assert torch.allclose(grad_ckpt, grad_ref, atol=1e-5)
+
+    def test_broadcast_fused_h_res_h_post_bda(self):
+        """
+        Full TransformerLayer-like flow: forward() -> simulated layer ->
+        fused_h_res_h_post_bda() using BroadcastTensor residual.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        module = self._create_hyper_connection_module(hidden_size, num_streams)
+
+        hidden_states = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+        )
+        hidden_states_ckpt = hidden_states.detach().clone().requires_grad_(True)
+
+        # Reference
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module.forward(
+            hidden_states, mhc_recompute_manager=None
+        )
+        layer_output = aggregated_ref * 0.1  # simulated layer
+        output_ref = module.fused_h_res_h_post_bda(
+            h_res_ref, residual_ref, h_post_ref,
+            (layer_output, None), 0.0, True, False,
+        )
+        loss_ref = output_ref.sum()
+        loss_ref.backward()
+        grad_ref = hidden_states.grad.clone()
+
+        # With checkpoint manager
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        manager = CheckpointManager()
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt = module.forward(
+            hidden_states_ckpt, mhc_recompute_manager=manager
+        )
+        layer_output_ckpt = aggregated_ckpt * 0.1
+        output_ckpt = module.fused_h_res_h_post_bda(
+            h_res_ckpt, residual_ckpt, h_post_ckpt,
+            (layer_output_ckpt, None), 0.0, True, False, manager,
+        )
+        loss_ckpt = output_ckpt.sum()
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        loss_ckpt.backward()
+        grad_ckpt = hidden_states_ckpt.grad.clone()
+
+        assert torch.allclose(grad_ckpt, grad_ref, atol=1e-5), (
+            f"Broadcast fused_h_res_h_post_bda gradients mismatch"
+        )
+
+
+class TestMHCBroadcastChainIntegration:
+    """Test multiple chained HyperConnectionModules with BroadcastTensor residual."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_chained_broadcast_fwd_bwd(self):
+        """
+        Chain 3 HyperConnectionModules using BroadcastTensor residual throughout.
+        Compare ref (no ckpt) vs checkpoint path.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+        n_channels = num_streams * hidden_size
+
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+        )
+        modules = [
+            HyperConnectionModule(config=config, layer_number=i + 1).cuda() for i in range(3)
+        ]
+
+        hidden_states_ref = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        hidden_states_ckpt = hidden_states_ref.detach().clone().requires_grad_(True)
+
+        # Reference: no checkpoint, use BroadcastTensor residual
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        h = hidden_states_ref
+        for module in modules:
+            agg, h_res, h_post, res = module.forward(h, mhc_recompute_manager=None)
+            layer_out = agg * 0.1
+            h = module.fused_h_res_h_post_bda(
+                h_res, res, h_post, (layer_out, None), 0.0, True, False,
+            )
+
+        loss_ref = h.sum()
+        loss_ref.backward()
+        grad_ref = hidden_states_ref.grad.clone()
+
+        # With checkpoint
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        manager = CheckpointManager()
+        h = hidden_states_ckpt
+        for module in modules:
+            agg, h_res, h_post, res = module.forward(h, mhc_recompute_manager=manager)
+            layer_out = agg * 0.1
+            h = module.fused_h_res_h_post_bda(
+                h_res, res, h_post, (layer_out, None), 0.0, True, False, manager,
+            )
+
+        loss_ckpt = h.sum()
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        loss_ckpt.backward()
+        grad_ckpt = hidden_states_ckpt.grad.clone()
+
+        assert torch.allclose(grad_ckpt, grad_ref, atol=1e-4), (
+            f"Chained broadcast HyperConnection gradients mismatch"
+        )
+
+    def test_partial_checkpoint_broadcast(self):
+        """
+        Last layer not checkpointed, all using BroadcastTensor residual.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+        )
+        module = HyperConnectionModule(config=config, layer_number=1).cuda()
+
+        hidden_states_ref = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+        )
+        hidden_states_ckpt = hidden_states_ref.detach().clone().requires_grad_(True)
+
+        # Reference
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        agg_ref, h_res_ref, h_post_ref, res_ref = module.forward(
+            hidden_states_ref, mhc_recompute_manager=None
+        )
+        layer_out_ref = agg_ref * 0.1
+        output_ref = module.fused_h_res_h_post_bda(
+            h_res_ref, res_ref, h_post_ref, (layer_out_ref, None), 0.0, True, False,
+        )
+        loss_ref = output_ref.sum()
+        loss_ref.backward()
+        grad_ref = hidden_states_ref.grad.clone()
+
+        # With manager, simulate last layer not checkpointed
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        manager = CheckpointManager()
+        agg_ckpt, h_res_ckpt, h_post_ckpt, res_ckpt = module.forward(
+            hidden_states_ckpt, mhc_recompute_manager=manager
+        )
+        layer_out_ckpt = agg_ckpt * 0.1
+        # Last layer: no manager for BDA
+        output_ckpt = module.fused_h_res_h_post_bda(
+            h_res_ckpt, res_ckpt, h_post_ckpt, (layer_out_ckpt, None), 0.0, True, False,
+        )
+        manager.discard_all_outputs_and_register_unified_recompute(output_ckpt)
+        loss_ckpt = output_ckpt.sum()
+        loss_ckpt.backward()
+        grad_ckpt = hidden_states_ckpt.grad.clone()
+
+        assert torch.allclose(grad_ckpt, grad_ref, atol=1e-5), (
+            f"Partial checkpoint broadcast gradients mismatch"
+        )
+
+
+class TestBroadcastTensorFused:
+    """Test BroadcastTensorFused autograd.Function and native_fused_add_3."""
+
+    def test_native_fused_add_3_correctness(self):
+        """Test native_fused_add_3 matches plain addition."""
+        from megatron.core.transformer.hyper_connection import native_fused_add_3
+
+        a = torch.randn(8, 16, device='cuda')
+        b = torch.randn(8, 16, device='cuda')
+        c = torch.randn(8, 16, device='cuda')
+        result = native_fused_add_3(a, b, c)
+        expected = a + b + c
+        assert torch.allclose(result, expected, atol=1e-6)
+
+    def test_native_fused_add_3_gradient(self):
+        """Test native_fused_add_3 produces correct gradients."""
+        from megatron.core.transformer.hyper_connection import native_fused_add_3
+
+        a = torch.randn(4, 8, device='cuda', requires_grad=True)
+        b = torch.randn(4, 8, device='cuda', requires_grad=True)
+        c = torch.randn(4, 8, device='cuda', requires_grad=True)
+        result = native_fused_add_3(a, b, c)
+        result.sum().backward()
+        assert torch.allclose(a.grad, torch.ones_like(a))
+        assert torch.allclose(b.grad, torch.ones_like(b))
+        assert torch.allclose(c.grad, torch.ones_like(c))
+
+    def test_broadcast_tensor_returns_views(self):
+        """Test BroadcastTensorFused forward returns 3 views sharing storage."""
+        from megatron.core.transformer.hyper_connection import (
+            BroadcastTensorFused,
+            native_fused_add_3,
+        )
+
+        x = torch.randn(4, 8, device='cuda', requires_grad=True)
+        a, b, c = BroadcastTensorFused.apply(x, native_fused_add_3)
+        assert a.data_ptr() == x.data_ptr()
+        assert b.data_ptr() == x.data_ptr()
+        assert c.data_ptr() == x.data_ptr()
+
+    def test_broadcast_tensor_gradient_correctness(self):
+        """Test BroadcastTensorFused backward sums gradients correctly."""
+        from megatron.core.transformer.hyper_connection import (
+            BroadcastTensorFused,
+            native_fused_add_3,
+        )
+
+        x = torch.randn(4, 8, device='cuda', requires_grad=True)
+        a, b, c = BroadcastTensorFused.apply(x, native_fused_add_3)
+        # Each branch applies a different scalar: loss = a.sum() + 2*b.sum() + 3*c.sum()
+        loss = a.sum() + 2 * b.sum() + 3 * c.sum()
+        loss.backward()
+        # x.grad should be (1 + 2 + 3) * ones
+        expected = torch.full_like(x, 6.0)
+        assert torch.allclose(x.grad, expected, atol=1e-6), (
+            f"Expected grad {expected}, got {x.grad}"
+        )
+
+    def test_broadcast_tensor_partial_none_grads(self):
+        """Test BroadcastTensorFused handles None gradients from unused branches."""
+        from megatron.core.transformer.hyper_connection import (
+            BroadcastTensorFused,
+            native_fused_add_3,
+        )
+
+        x = torch.randn(4, 8, device='cuda', requires_grad=True)
+        a, b, c = BroadcastTensorFused.apply(x, native_fused_add_3)
+        # Only use one branch
+        loss = a.sum()
+        loss.backward()
+        expected = torch.ones_like(x)
+        assert torch.allclose(x.grad, expected, atol=1e-6)
+
+    def test_broadcast_tensor_end_to_end_with_hyper_connection(self):
+        """
+        End-to-end test: HyperConnectionModule.forward returns 4-tuple and
+        gradients through all 3 paths (compute_mappings, aggregate,
+        fused_h_res_h_post_bda) are correct.
+        """
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        try:
+            hidden_size = 64
+            num_streams = 4
+            seq_len = 8
+            batch_size = 2
+
+            config = TransformerConfig(
+                num_layers=2,
+                hidden_size=hidden_size,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                enable_hyper_connections=True,
+                num_residual_streams=num_streams,
+                mhc_sinkhorn_iterations=5,
+                mhc_init_gating_factor=0.01,
+            )
+            module = HyperConnectionModule(config=config, layer_number=1).cuda()
+
+            hidden_states = torch.randn(
+                seq_len, batch_size, num_streams * hidden_size,
+                device='cuda', requires_grad=True,
+            )
+
+            torch.manual_seed(42)
+            torch.cuda.manual_seed(42)
+
+            # Forward returns 4-tuple now
+            aggregated, h_res, h_post, residual = module.forward(hidden_states)
+
+            # Simulate full flow: aggregate + apply_h_res on residual
+            mixed = module.apply_h_res(h_res, residual)
+            loss = aggregated.sum() + mixed.sum() + h_post.sum()
+            loss.backward()
+
+            # Verify gradient exists and is finite
+            assert hidden_states.grad is not None
+            assert torch.isfinite(hidden_states.grad).all()
+        finally:
+            Utils.destroy_model_parallel()
 
 
 if __name__ == "__main__":
