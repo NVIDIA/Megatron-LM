@@ -244,6 +244,11 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    rotary_base_per_layer: Optional[List[float]] = None
+    """Per-layer RoPE theta values. Length must equal num_layers. When set, each
+    SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
+    the shared model-level rotary_pos_emb is not created."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -2615,6 +2620,12 @@ class TransformerConfig(ModelParallelConfig):
             assert is_te_min_version("2.3.0") or get_te_version() == PkgVersion(
                 "2.3.0.dev0+39c0e70"
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
+
+        if self.rotary_base_per_layer is not None:
+            assert len(self.rotary_base_per_layer) == self.num_layers, (
+                f"rotary_base_per_layer length ({len(self.rotary_base_per_layer)}) "
+                f"must equal num_layers ({self.num_layers})"
+            )
 
         if self.no_rope_freq:
             assert not self.flash_decode, "flash_decode cannot be used with no_rope."
