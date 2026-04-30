@@ -5,7 +5,8 @@
 Only the Triton kernels that are faster than the cuTile implementations are kept
 here:
   - Sinkhorn forward/backward
-  - H_post_bda backward
+  - H_aggregate forward
+  - H_post_bda forward/backward
 
 The public mHC API lives in ``fused_mhc_kernels.py`` and handles fallback.
 """
@@ -185,8 +186,161 @@ def triton_fused_sinkhorn(
 
 
 # ============================================================================
-# H_post BDA backward
+# H_aggregate forward
 # ============================================================================
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_C": bc, "BLOCK_S": bs}, num_warps=nw)
+        for bc in (64, 128, 256, 512)
+        for bs in (1, 2, 4, 8)
+        for nw in (2, 4, 8)
+    ],
+    key=["C", "N"],
+)
+@triton.jit
+def _triton_h_agg_fwd_kernel(
+    x_ptr, h_ptr, out_ptr,
+    sb, C: tl.constexpr, N: tl.constexpr,
+    stride_x_s, stride_x_n, stride_x_c,
+    BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+):
+    """out[s, c] = sum_i x[s, i, c] * h[s, i]."""
+    pid_s = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_s = offs_s < sb
+    mask_c = offs_c < C
+    mask_2d = mask_s[:, None] & mask_c[None, :]
+
+    acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+    for i in tl.static_range(N):
+        x_i = tl.load(
+            x_ptr + offs_s[:, None] * stride_x_s + i * stride_x_n + offs_c[None, :],
+            mask=mask_2d,
+            other=0.0,
+        ).to(tl.float32)
+        h_i = tl.load(h_ptr + offs_s * N + i, mask=mask_s, other=0.0).to(tl.float32)
+        acc += h_i[:, None] * x_i
+    tl.store(
+        out_ptr + offs_s[:, None] * C + offs_c[None, :],
+        acc.to(out_ptr.dtype.element_ty),
+        mask=mask_2d,
+    )
+
+
+def _triton_h_aggregate_fwd(x: Tensor, h_pre: Tensor) -> Tensor:
+    s, b, n, C = x.shape
+    sb = s * b
+    out = torch.empty(sb, C, dtype=x.dtype, device=x.device)
+    x_flat = x.contiguous().view(sb, n, C)
+    h_flat = h_pre.contiguous().view(sb, n)
+
+    grid = lambda META: (triton.cdiv(sb, META["BLOCK_S"]), triton.cdiv(C, META["BLOCK_C"]))
+    _triton_h_agg_fwd_kernel[grid](
+        x_flat, h_flat, out, sb, C, n,
+        x_flat.stride(0), x_flat.stride(1), x_flat.stride(2),
+    )
+    return out.view(s, b, C)
+
+
+# ============================================================================
+# H_post BDA
+# ============================================================================
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_C": bc, "BLOCK_S": bs}, num_warps=nw)
+        for bc in (64, 128, 256, 512)
+        for bs in (1, 2, 4, 8)
+        for nw in (2, 4, 8)
+    ],
+    key=["C", "N"],
+)
+@triton.jit
+def _triton_hpb_fwd_kernel(
+    hr_ptr, orig_ptr, hp_ptr, x_ptr, bias_ptr, out_ptr,
+    sb, C: tl.constexpr, N: tl.constexpr,
+    stride_hr_s, stride_hr_i, stride_hr_j,
+    stride_orig_s, stride_orig_n, stride_orig_c,
+    stride_out_s, stride_out_n, stride_out_c,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_C: tl.constexpr, BLOCK_S: tl.constexpr,
+):
+    """out = hr @ orig + hp * (x + bias)."""
+    pid_s = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask_s = offs_s < sb
+    mask_c = offs_c < C
+    mask_2d = mask_s[:, None] & mask_c[None, :]
+
+    x_tile = tl.load(
+        x_ptr + offs_s[:, None] * C + offs_c[None, :],
+        mask=mask_2d,
+        other=0.0,
+    ).to(tl.float32)
+    if HAS_BIAS:
+        bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        x_tile += bias_tile[None, :]
+
+    for i in tl.static_range(N):
+        hp_i = tl.load(hp_ptr + offs_s * N + i, mask=mask_s, other=0.0).to(tl.float32)
+        out_i = hp_i[:, None] * x_tile
+
+        for j in tl.static_range(N):
+            hr_ij = tl.load(
+                hr_ptr + offs_s * stride_hr_s + i * stride_hr_i + j * stride_hr_j,
+                mask=mask_s,
+                other=0.0,
+            ).to(tl.float32)
+            orig_j = tl.load(
+                orig_ptr
+                + offs_s[:, None] * stride_orig_s
+                + j * stride_orig_n
+                + offs_c[None, :],
+                mask=mask_2d,
+                other=0.0,
+            ).to(tl.float32)
+            out_i += hr_ij[:, None] * orig_j
+
+        tl.store(
+            out_ptr + offs_s[:, None] * stride_out_s + i * stride_out_n + offs_c[None, :],
+            out_i.to(out_ptr.dtype.element_ty),
+            mask=mask_2d,
+        )
+
+
+def _triton_h_post_bda_fwd(
+    h_res: Tensor,
+    original_residual: Tensor,
+    h_post: Tensor,
+    x: Tensor,
+    bias: Optional[Tensor],
+) -> Tensor:
+    s, b, n, C = original_residual.shape
+    sb = s * b
+    dev = h_res.device
+    out = torch.empty(sb, n, C, dtype=h_res.dtype, device=dev)
+    hr_flat = h_res.contiguous().view(sb, n, n)
+    orig_flat = original_residual.contiguous().view(sb, n, C)
+    hp_flat = h_post.contiguous().view(sb, n)
+    x_flat = x.contiguous().view(sb, C)
+
+    grid = lambda META: (triton.cdiv(sb, META["BLOCK_S"]), triton.cdiv(C, META["BLOCK_C"]))
+    _triton_hpb_fwd_kernel[grid](
+        hr_flat, orig_flat, hp_flat, x_flat, bias if bias is not None else x_flat, out,
+        sb, C, n,
+        hr_flat.stride(0), hr_flat.stride(1), hr_flat.stride(2),
+        orig_flat.stride(0), orig_flat.stride(1), orig_flat.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        HAS_BIAS=(bias is not None),
+    )
+    return out.view(s, b, n, C)
 
 
 @triton.autotune(
@@ -390,6 +544,8 @@ def _triton_h_post_bda_bwd(
 
 
 __all__ = [
+    "_triton_h_aggregate_fwd",
+    "_triton_h_post_bda_fwd",
     "_triton_h_post_bda_bwd",
     "triton_fused_sinkhorn",
 ]
