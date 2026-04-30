@@ -11,6 +11,8 @@ import builtins
 import ast
 import enum
 from dataclasses import Field, fields
+import torch.nn.functional as F
+import torch
 
 from megatron.training.config import (
     DistributedInitConfig, 
@@ -259,6 +261,108 @@ class ArgumentGroupFactory:
                 field_docstrings.update(self._get_field_docstrings(base_classes[0]))
 
         return field_docstrings
+
+
+def core_transformer_config_from_args(args, config_class=None):
+    from megatron.core.activations import squared_relu
+    from megatron.core.fusions.fused_bias_geglu import quick_gelu
+    from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+        HeterogeneousTransformerConfig,
+    )
+    from megatron.core.quantization.utils import (
+        kitchen_quantization_recipe_config,
+        load_quantization_recipe,
+    )
+
+    # Config class.
+    config_class = config_class or TransformerConfig
+
+    if args.multi_latent_attention:
+        config_class = MLATransformerConfig
+
+    if args.heterogeneous_layers_config_path is not None:
+        assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
+        config_class = HeterogeneousTransformerConfig
+
+    # Translate args to core transformer configuration
+    kw_args = {}
+    for f in dataclasses.fields(config_class):
+        if hasattr(args, f.name):
+            kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    kw_args['num_moe_experts'] = args.num_experts
+    kw_args['rotary_interleaved'] = args.rotary_interleaved
+    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['fp8_param'] = args.fp8_param_gather
+    kw_args['fp4_param'] = args.fp4_param_gather
+    if args.swiglu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    else:
+        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
+    if args.squared_relu:
+        assert not args.swiglu
+        kw_args['activation_func'] = squared_relu
+    elif args.quick_geglu:
+        assert not args.swiglu
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = quick_gelu
+    if args.init_method_xavier_uniform:
+        kw_args['init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    if args.group_query_attention:
+        kw_args['num_query_groups'] = args.num_query_groups
+    else:
+        kw_args['num_query_groups'] = None
+    kw_args['config_logger_dir'] = args.config_logger_dir
+    if args.rope_type is None:
+        # Pop 'rope_type' to let the config class use the default value.
+        kw_args.pop('rope_type', None)
+    else:
+        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
+            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
+        )
+
+    if len(args.cp_comm_type) == 1:
+        kw_args['cp_comm_type'] = args.cp_comm_type[0]
+    if args.hybrid_layer_pattern is not None:
+        kw_args['is_hybrid_model'] = True
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+            kw_args['experimental_attention_variant'] = 'dsa'
+
+    kw_args['inference_sampling_seed'] = args.seed
+
+    # handle quantization config
+    # NOTE: Kitchen arguments are only added to the namespace when
+    # Kitchen library is available.
+    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
+    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
+
+    kw_args['moe_latent_size'] = args.moe_latent_size
+
+    if args.te_precision_config_file:
+        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
+        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
+        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
+
+    if hasattr(args, "use_kitchen_attention"):
+        kw_args['use_kitchen_attention'] = args.use_kitchen_attention
+    if hasattr(args, "kitchen_attention_backend"):
+        kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
+
+    # Return config.
+    return config_class(**kw_args)
 
 
 def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
