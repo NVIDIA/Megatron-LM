@@ -2044,18 +2044,6 @@ def get_batch_on_this_tp_rank(
             torch.distributed.broadcast(item, broadcast_src_rank, group=broadcast_group)
 
     if tp_rank == 0:
-        # The default DataLoader collate_fn prepends a singleton batch dim to the 1-D
-        # cu_seqlens / cu_seqlens_padded emitted by the dataset. The TP-broadcast wire
-        # protocol below is 1-D, and downstream consumers (PackedSeqParams, TE THD
-        # kernels) also expect 1-D. Normalize the local batch so TP rank 0's view
-        # matches what other TP ranks reconstruct from the broadcast.
-        for _key in ('cu_seqlens', 'cu_seqlens_padded'):
-            _v = batch.get(_key)
-            if _v is not None and _v.dim() == 2:
-                assert (
-                    _v.shape[0] == 1
-                ), f"micro-batch-size must be 1 for packed sequences, got {_v.shape[0]}"
-                batch[_key] = _v[0]
 
         def _broadcast_cu_seqlens(cu_seqlens):
             dev = torch.cuda.current_device()
@@ -2067,9 +2055,6 @@ def get_batch_on_this_tp_rank(
                 assert isinstance(
                     cu_seqlens, torch.Tensor
                 ), f"Expected cu_seqlens to be a torch.Tensor, got {type(cu_seqlens)}"
-                assert (
-                    cu_seqlens.dim() == 1
-                ), f"Expected cu_seqlens to be 1-D, got {cu_seqlens.dim()}-D"
                 assert (
                     cu_seqlens.dtype == torch.int32
                 ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
@@ -2179,8 +2164,17 @@ def get_batch_on_this_tp_rank(
             if n == 0:
                 return None
 
-            cu_seqlens = torch.empty(n, dtype=torch.int32, device=dev)
+            # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim
+            # throughout (mbs=1 for packed sequences). Allocate (1, n) so the
+            # shape on receiving ranks matches the (1, n) tensor TP rank 0 sent.
+            cu_seqlens = torch.empty((1, n), dtype=torch.int32, device=dev)
             _broadcast(cu_seqlens)
+            assert (
+                cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
+            ), f"Expected cu_seqlens shape (1, n), got {tuple(cu_seqlens.shape)}"
+            assert (
+                cu_seqlens.dtype == torch.int32
+            ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
             return cu_seqlens
 
         if pipeline_model_parallel_size == 1 or mtp_on_this_rank:

@@ -226,11 +226,12 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert loss_mask.dtype == torch.float32
         assert position_ids.dtype == torch.int64
 
-        assert cu_seqlens.dim() == 1
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.shape[0] == 1
         assert cu_seqlens.dtype == torch.int32
-        assert cu_seqlens[0].item() == 0
-        assert cu_seqlens[-1].item() == seq_length
-        assert cu_seqlens.shape[0] >= 2
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+        assert cu_seqlens.shape[1] >= 2
 
         assert max_seqlen.shape == (1,)
         assert max_seqlen.dtype == torch.int32
@@ -263,11 +264,12 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert tokens.dtype == torch.int64
         assert position_ids.dtype == torch.int64
 
-        assert cu_seqlens.dim() == 1
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.shape[0] == 1
         assert cu_seqlens.dtype == torch.int32
-        assert cu_seqlens[0].item() == 0
-        assert cu_seqlens[-1].item() == seq_length
-        assert cu_seqlens.shape[0] >= 2
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+        assert cu_seqlens.shape[1] >= 2
 
         assert max_seqlen.shape == (1,)
         assert max_seqlen.dtype == torch.int32
@@ -298,11 +300,12 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert labels.dtype == torch.int64
         assert loss_mask.dtype == torch.float32
 
-        assert cu_seqlens.dim() == 1
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.shape[0] == 1
         assert cu_seqlens.dtype == torch.int32
-        assert cu_seqlens[0].item() == 0
-        assert cu_seqlens[-1].item() == seq_length
-        assert cu_seqlens.shape[0] >= 2
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+        assert cu_seqlens.shape[1] >= 2
 
         assert max_seqlen.shape == (1,)
         assert max_seqlen.dtype == torch.int32
@@ -324,11 +327,12 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert max_seqlen is not None
         assert cu_seqlens_padded is None
 
-        assert cu_seqlens.dim() == 1
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.shape[0] == 1
         assert cu_seqlens.dtype == torch.int32
-        assert cu_seqlens[0].item() == 0
-        assert cu_seqlens[-1].item() == seq_length
-        assert cu_seqlens.shape[0] >= 2
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+        assert cu_seqlens.shape[1] >= 2
 
         assert max_seqlen.shape == (1,)
         assert max_seqlen.dtype == torch.int32
@@ -581,7 +585,7 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
                 torch.int32
             ),
         ]
-    )
+    ).unsqueeze(0)  # (1, n_seqs + 1) — dataloader always carries a batch dim
     max_seqlen = torch.tensor([seq_len_each], dtype=torch.int32)
     local_cp_size_tensor = torch.tensor([cp_size], dtype=torch.int32)
 
@@ -686,13 +690,14 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     # Loss mask is all-ones (no masking in the HybridCP pretrain dataloader)
     assert loss_mask.sum().item() == seq_len_per_rank
 
-    # cu_seqlens: 1D int32, [0, seq_len_each, 2*seq_len_each, ..., total_seq_len]
+    # cu_seqlens: 2D int32 (1, n_seqs + 1), [0, seq_len_each, 2*seq_len_each, ..., total_seq_len]
     assert cu_seqlens.shape == (
+        1,
         n_seqs + 1,
-    ), f"Expected cu_seqlens shape ({n_seqs + 1},), got {cu_seqlens.shape}"
+    ), f"Expected cu_seqlens shape (1, {n_seqs + 1}), got {cu_seqlens.shape}"
     assert cu_seqlens.dtype == torch.int32
-    assert cu_seqlens[0].item() == 0
-    assert cu_seqlens[-1].item() == total_seq_len
+    assert cu_seqlens[0, 0].item() == 0
+    assert cu_seqlens[0, -1].item() == total_seq_len
 
     # max_seqlen: scalar int32 equal to the per-sequence length in the iterator
     assert max_seqlen.shape == (1,)
@@ -706,10 +711,10 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
 
     if cp_size > 1:
         assert cu_seqlens_padded is not None
-        assert cu_seqlens_padded.shape == (n_seqs + 1,)
+        assert cu_seqlens_padded.shape == (1, n_seqs + 1)
         assert cu_seqlens_padded.dtype == torch.int32
-        assert cu_seqlens_padded[0].item() == 0
-        assert cu_seqlens_padded[-1].item() == total_seq_len
+        assert cu_seqlens_padded[0, 0].item() == 0
+        assert cu_seqlens_padded[0, -1].item() == total_seq_len
         assert hybrid_cp_group is not None
     else:
         assert cu_seqlens_padded is None
