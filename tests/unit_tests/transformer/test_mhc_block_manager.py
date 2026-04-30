@@ -503,9 +503,7 @@ class TestTransformerBlockMHCRecompute:
         hidden_states = torch.randn(
             seq_len, batch_size, config.hidden_size, device='cuda', requires_grad=True
         )
-        attention_mask = torch.ones(
-            (1, 1, seq_len, seq_len), dtype=torch.bool, device='cuda'
-        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device='cuda')
 
         out = block(hidden_states=hidden_states, attention_mask=attention_mask)
         assert out.shape == hidden_states.shape, (
