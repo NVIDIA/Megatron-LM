@@ -1490,6 +1490,58 @@ class DynamicInferenceContext(BaseInferenceContext):
         return entry
 
     # ------------------------------------------------------------------
+    # prepare_next_step_optimistic (v3 plan §commit 13)
+    # ------------------------------------------------------------------
+
+    def prepare_next_step_optimistic(self, step_id: int, request_plan=None):
+        """Sample-independent prep for the next step.
+
+        v3 plan §commit 13 first slice: extracts the sample-independent
+        operations that today's ``update_requests`` performs at the top of
+        its body (``num_prefill_requests = 0`` and the
+        prefill→decode-status flip). Commits 14 and 15 layer the journal
+        entry, KV block reservations, paused-request reordering, decode
+        token-destination indices, and snapshot-pool population on top.
+
+        Returns a ``DynamicStepPlan`` carrying the current step's
+        sample-independent metadata. With overlap off the plan's fields
+        below the placeholders set here are populated as the later commits
+        land; today the wrapper consumes only ``step_id``.
+        """
+        from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+        from megatron.core.inference.engines.async_pipeline_types import (
+            DynamicStepPlan,
+            StepInputPlan,
+        )
+
+        # Move the sample-independent header of update_requests here.
+        # ``num_prefill_requests`` resets to zero because every active
+        # request transitions to a decode slot in the next step (chunked
+        # prefill is overwritten by add_request when its next chunk lands).
+        self.num_prefill_requests = 0
+        # All requests that were in prefill become decode requests.
+        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
+
+        return DynamicStepPlan(
+            step_id=step_id,
+            request_slots=tuple(),
+            placeholder_deltas=tuple(),
+            input_plan=StepInputPlan(
+                decode_request_slots=tuple(),
+                decode_token_destination_indices=tuple(),
+                prefill_cpu_token_ranges=tuple(),
+                speculative_width=self.num_speculative_tokens,
+                previous_sample_source_step=None,
+            ),
+            resource_reservation_ids=[],
+            intended_batch_dimensions=InferenceBatchDimensions(
+                token_count=self.active_token_count,
+                prefill_req_count=0,
+                decode_req_count=self.total_request_count - self.paused_request_count,
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # apply_step_corrections (v3 plan §commit 12)
     # ------------------------------------------------------------------
 
@@ -3381,11 +3433,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         if new_speculative_tokens is not None and new_speculative_tokens.is_cuda:
             new_speculative_tokens = new_speculative_tokens.cpu()
 
-        self.num_prefill_requests = 0  # all turns to decode
-        # All request that were in prefill become decode requests.
-        # For the chunked prefill request we will overwrite this the next time add_request
-        # is called on that request.
-        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
+        # v3 plan §commit 13 — the sample-independent header of
+        # update_requests now lives in ``prepare_next_step_optimistic``. With
+        # overlap off the wrapper invokes it inline so the side-effects
+        # (``num_prefill_requests = 0`` and the prefill→decode flip) happen
+        # at the same point as before.
+        self.prepare_next_step_optimistic(step_id=self.step_count)
 
         if (
             chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
