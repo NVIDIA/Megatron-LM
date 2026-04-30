@@ -1672,6 +1672,22 @@ class DynamicInferenceEngine(AbstractEngine):
                         step_spec_tokens_accepted += actual_accepted
 
                     if is_finished:
+                        # Reconstruct routing from per-block storage before popping.
+                        if (
+                            finished_routing_block_ids
+                            and request_id in finished_routing_block_ids
+                            and len(self.requests[request_id].record.requests) == 1
+                        ):
+                            block_ids = finished_routing_block_ids[request_id]
+                            total_tokens = len(request.prompt_tokens) + len(
+                                request.generated_tokens
+                            )
+                            request.routing_indices = (
+                                self.context.kv_block_allocator.reconstruct_routing_from_blocks(
+                                    block_ids, total_tokens - 1
+                                )
+                            )
+
                         request.generated_length = len(request.generated_tokens)
                         request.status = Status.COMPLETED
                         request.add_event_finish(timestamp=sync_time)
@@ -1696,19 +1712,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         request_log_probs = request_log_probs[:-num_stop_word_trim]
                     if top_n_logprobs is not None and req_idx in top_n_logprobs:
                         top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
-
-                # Routing indices concat.
-                if (
-                    routing_indices_per_request is not None
-                    and request_id in routing_indices_per_request
-                ):
-                    step_routing = routing_indices_per_request[request_id]
-                    if request.routing_indices is None:
-                        request.routing_indices = step_routing.clone()
-                    else:
-                        request.routing_indices = torch.cat(
-                            [request.routing_indices, step_routing], dim=0
-                        )
 
                 # Log probs accumulation.
                 if request_log_probs is not None and not is_being_stop_word_finished:

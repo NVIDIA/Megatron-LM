@@ -301,7 +301,7 @@ class InferenceConfig:
     """Whether bookkeeping runs asynchronously, one step behind the forward loop.
     When False, bookkeeping runs synchronously after each forward step."""
 
-    request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
+    request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
     consisting of the string label and the target dtype.
