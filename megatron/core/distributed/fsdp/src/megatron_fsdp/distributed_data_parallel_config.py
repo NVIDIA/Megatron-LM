@@ -151,6 +151,17 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    megatron_fsdp_enable_fine_grained_param_gather: bool = False
+    """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
+      This feature increases the overlap between parameter all-gather and forward computation,
+      at the cost of more frequent communication calls.
+      For MXFP8, this approach helps save memory during fine-grained activation
+      recomputation, because MXFP8 forward and backward passes use different
+      parameter representations (rowwise data for forward, colwise data for backward).
+      In this mode, only the rowwise parameters of modules involved in recomputation
+      will be unsharded.
+    """
+
     def __post_init__(self):
         import os
 
