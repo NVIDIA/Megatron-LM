@@ -6,7 +6,10 @@ import copy
 import functools
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, OrderedDict, Tuple, Union
+
+if TYPE_CHECKING:
+    from megatron.core.inference.engines.async_pipeline_types import AsyncStepOutput
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +56,9 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.text_generation_controllers.async_step_output import (
+    AsyncStepOutputPool,
+)
 
 # ---------------------------------------------------------------------------
 # Per-step carrier types (v3 plan commit 3 — phased controller).
@@ -210,6 +216,17 @@ class TextGenerationController:
         # Last accepted sequence indices for serial MTP computation
         self._last_accepted_seq_indices = None
 
+        # v3 plan §2.6 — dedicated d2h_output stream + pinned destinations for
+        # all CPU-visible per-step outputs. AsyncStepOutput bundles the copy
+        # event and source-tensor lifetime; commit 5 wires it through the
+        # ordered retirement service.
+        spec_tokens = self.num_speculative_tokens or 0
+        self._async_step_output_pool = AsyncStepOutputPool(
+            max_requests=max_requests,
+            num_speculative_tokens=spec_tokens,
+            device=device,
+        )
+
         # Keep track of request metadata.
         self._request_metadata: Dict[str, Tensor] = {}
         for label, dtype, on_gpu in context.request_metadata_types:
@@ -241,6 +258,10 @@ class TextGenerationController:
                 )
                 * -1
             )
+            if getattr(self, "_async_step_output_pool", None) is not None:
+                self._async_step_output_pool.ensure_mtp_buffer(
+                    self.num_speculative_tokens, max_requests
+                )
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -1814,26 +1835,27 @@ class TextGenerationController:
                 )
 
     def _transfer_samples_to_cpu(
-        self, active_request_count: int
-    ) -> tuple:
-        """Batch GPU-to-CPU transfer of sampled tokens.
+        self, active_request_count: int, step_id: int
+    ) -> "AsyncStepOutput":
+        """Enqueue the per-step CPU-visible D2H bundle on the dedicated
+        ``d2h_output`` stream and return the ``AsyncStepOutput`` handle.
 
-        Called at the boundary between GPU sampling and CPU bookkeeping.
-        After this returns, all sampled data is on CPU and the remainder
-        of the step is 100% CPU.
-
-        Returns:
-            tuple: (sampled_tokens_cpu, sampled_mtp_tokens_cpu) where
-                sampled_mtp_tokens_cpu is None when speculative decoding is off.
+        The serial wrapper resolves the bundle synchronously via
+        ``output.cpu_view`` immediately after this call, so the net
+        observable behavior is identical to the prior blocking ``.cpu()``.
+        Commit 5 forwards the bundle to ``StepRetirementService`` and lets
+        consumption straddle a step boundary.
         """
-        sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
+        sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         if self.num_speculative_tokens > 0:
-            sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[
-                :, :active_request_count
-            ].cpu()
+            sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         else:
-            sampled_mtp_tokens_cpu = None
-        return sampled_tokens_cpu, sampled_mtp_tokens_cpu
+            sampled_mtp_tokens_gpu = None
+        return self._async_step_output_pool.begin_copy(
+            step_id=step_id,
+            sampled_tokens_gpu=sampled_tokens_gpu,
+            sampled_mtp_tokens_gpu=sampled_mtp_tokens_gpu,
+        )
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
@@ -1855,11 +1877,14 @@ class TextGenerationController:
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
         step_id = context.step_count
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
+        # Batch GPU-to-CPU transfer of all sampled tokens. The output bundle
+        # is resolved synchronously here for parity with today; commit 5
+        # forwards it to the retirement service for ordered consumption.
         range_push(f"transfer_samples_to_cpu[step={step_id}]")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count,
-        )
+        async_output = self._transfer_samples_to_cpu(active_request_count, step_id)
+        cpu_view = async_output.cpu_view
+        sampled_tokens_cpu = cpu_view[AsyncStepOutputPool.SAMPLED_TOKENS_KEY]
+        sampled_mtp_tokens_cpu = cpu_view.get(AsyncStepOutputPool.SAMPLED_MTP_TOKENS_KEY)
         range_pop()
 
         range_push(f"active_request_mask[step={step_id}]")
@@ -1907,10 +1932,10 @@ class TextGenerationController:
         return {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
-            # Already a CPU tensor (independent of _sampled_tokens_cuda via the
-            # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
-            # the separate new_sample_copy). Returning the CPU copy avoids a
-            # D2H sync when the engine later calls sample.tolist().
+            # Pinned-buffer view from AsyncStepOutput; d2h_done_event already
+            # synchronized in cpu_view above. update_requests mutates only
+            # new_sample_copy, so this slice is stable for the engine's
+            # subsequent sample.tolist().
             "sample": sampled_tokens_cpu,
             **(update_result or {}),
         }
@@ -2048,23 +2073,25 @@ class TextGenerationController:
         sampling_artifacts: _SamplingArtifacts,
         skip_bookkeeping: bool = False,
     ) -> Dict[str, Any]:
-        """Phase 5: D2H of CPU-visible outputs.
+        """Phase 5: D2H of CPU-visible outputs via ``AsyncStepOutput``.
 
-        Today this still runs synchronously; commit 4 rewrites this to
-        populate an ``AsyncStepOutput`` on the dedicated d2h_output stream.
+        The bundle runs on the dedicated ``d2h_output`` stream into pinned
+        destinations owned by ``AsyncStepOutputPool``. Today the serial
+        wrapper resolves it synchronously through ``cpu_view``; commit 5
+        hands the unresolved bundle to ``StepRetirementService`` instead.
         Returns the request_bookkeeping dict the legacy path consumes.
         """
         del sampling_artifacts  # only consumed by collect/commit phases below
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        del snapshot
         if skip_bookkeeping:
-            # _transfer_samples_to_cpu wasn't invoked on this path, so do a
-            # one-shot D2H here to keep "sample" as a CPU tensor for
-            # downstream consumers.
-            return {
-                "sample": self._sampled_tokens_cuda[:active_request_count].cpu(),
-            }
+            # Skip the full bookkeeping path but still publish "sample" via
+            # the same async D2H route, so the d2h_output stream owns every
+            # CPU-visible copy regardless of branch.
+            async_output = self._transfer_samples_to_cpu(active_request_count, snapshot.step_id)
+            sample = async_output.cpu_view[AsyncStepOutputPool.SAMPLED_TOKENS_KEY]
+            return {"sample": sample}
+        del snapshot
         # request_bookkeeping supplies "sample" as the already-CPU tensor
         # produced by _transfer_samples_to_cpu.
         return self._dynamic_step_context_bookkeeping()

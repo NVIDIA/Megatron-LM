@@ -116,12 +116,25 @@ class AsyncStepOutput:
     pinned_destinations: Dict[str, Any] = field(default_factory=dict)
     d2h_done_event: Optional["torch.cuda.Event"] = None
     payload_metadata: Dict[str, bool] = field(default_factory=dict)
-    # `cpu_view` is implemented as a property on AsyncStepOutput in commit 4;
-    # not stored here.
 
     def has_payload(self, name: str) -> bool:
         """True if this output bundle includes the named payload."""
         return self.payload_metadata.get(name, False)
+
+    @property
+    def cpu_view(self) -> Dict[str, "torch.Tensor"]:
+        """Synchronize ``d2h_done_event`` and return the pinned-destination
+        views by name. Blocking; engine-thread only.
+        """
+        if self.d2h_done_event is not None:
+            self.d2h_done_event.synchronize()
+        return dict(self.pinned_destinations)
+
+    def result(self) -> Dict[str, "torch.Tensor"]:
+        """Alias for ``cpu_view`` that names the synchronous-resolve intent
+        used by the serial controller wrapper today.
+        """
+        return self.cpu_view
 
 
 @dataclass
