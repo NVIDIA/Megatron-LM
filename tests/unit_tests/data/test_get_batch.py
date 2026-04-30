@@ -585,7 +585,9 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
                 torch.int32
             ),
         ]
-    ).unsqueeze(0)  # (1, n_seqs + 1) — dataloader always carries a batch dim
+    ).unsqueeze(
+        0
+    )  # (1, n_seqs + 1) — dataloader always carries a batch dim
     max_seqlen = torch.tensor([seq_len_each], dtype=torch.int32)
     local_cp_size_tensor = torch.tensor([cp_size], dtype=torch.int32)
 
