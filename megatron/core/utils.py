@@ -2282,12 +2282,18 @@ def get_sft_batch_on_this_cp_rank(
     cp_rank = torch.distributed.get_rank(cp_group)
 
     if cp_size > 1:
+        # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
+        # tex.thd_get_partitioned_indices expects a 1-D tensor, so squeeze the
+        # batch dim inline without mutating the batch dict.
+        cu_seqlens_for_te = (
+            batch["cu_seqlens_padded"]
+            if batch["cu_seqlens_padded"] is not None
+            else batch["cu_seqlens"]
+        )
+        if cu_seqlens_for_te.dim() == 2:
+            cu_seqlens_for_te = cu_seqlens_for_te[0]
         index = tex.thd_get_partitioned_indices(
-            (
-                batch["cu_seqlens_padded"]
-                if batch["cu_seqlens_padded"] is not None
-                else batch["cu_seqlens"]
-            ),
+            cu_seqlens_for_te,
             (
                 batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
             ),  # NOTE(asolergi-nv): Labels to enable PP!
@@ -2331,13 +2337,20 @@ def get_pretrain_batch_on_this_cp_rank(
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
+    # HybridCP metadata is not partitioned along the sequence dim. cu_seqlens /
+    # cu_seqlens_padded carry the dataloader's batch dim (1, n_seqs+1) so they
+    # would otherwise satisfy the dim-based skip below; skip by key explicitly.
+    METADATA_KEYS = (
+        'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen', 'local_cp_size', 'hybrid_cp_group'
+    )
+
     if cp_size > 1:
         for key, val in batch.items():
+            if key in METADATA_KEYS:
+                continue
             if val is not None:
                 seq_dim = 2 if key == 'attention_mask' else 1
                 if not isinstance(val, torch.Tensor) or val.dim() <= seq_dim:
-                    # NOTE(asolergi-nv): HybridCP includes 1D metadata tensors
-                    # like cu_seqlens, cu_seqlens_padded, max_seqlen, local_cp_size
                     continue
                 val = val.view(
                     *val.shape[0:seq_dim],
