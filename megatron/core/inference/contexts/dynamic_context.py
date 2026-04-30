@@ -1489,6 +1489,97 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_output_placeholders[slot] -= delta
         return entry
 
+    # ------------------------------------------------------------------
+    # apply_step_corrections (v3 plan §commit 12)
+    # ------------------------------------------------------------------
+
+    def apply_step_corrections(
+        self,
+        step_id: int,
+        async_step_output: Optional[object],
+        request_metadata_termination_id: Tensor,
+        stop_word_callback: Optional[object] = None,
+    ) -> dict:
+        """Sample-dependent post-processing for one step.
+
+        Extracted from the legacy ``text_generation_controller`` mask-build
+        +  ``update_requests`` flow. With overlap off the wrapper produces
+        bit-identical state to the prior in-controller implementation;
+        commits 13–15 extend the split with the sample-independent half
+        and tie the journal in.
+
+        Args:
+            step_id: Step ID — recorded for journal commits in commit 14.
+            async_step_output: Optional ``AsyncStepOutput`` to synchronize.
+                When ``None`` the caller has already resolved the bundle and
+                the sampled tensors must be on CPU when this is invoked.
+            request_metadata_termination_id: per-slot termination IDs (CPU).
+            stop_word_callback: optional callable that returns the set of
+                request IDs to mark finished due to stop words.
+
+        Returns:
+            dict with the same shape ``update_requests`` returns plus the
+            constructed ``active_request_ids`` / ``finished_request_ids``
+            tensors.
+        """
+        # 1. Resolve the sampled-token bundle.
+        if async_step_output is not None:
+            event = getattr(async_step_output, "d2h_done_event", None)
+            if event is not None:
+                event.synchronize()
+            cpu_view = async_step_output.cpu_view
+            sampled_tokens_cpu = cpu_view["sampled_tokens"]
+            sampled_mtp_tokens_cpu = cpu_view.get("sampled_mtp_tokens")
+        else:
+            raise ValueError(
+                "apply_step_corrections requires async_step_output; "
+                "use update_requests for the legacy direct-arg path."
+            )
+
+        # 2. Build active_request_mask from sampled_tokens != termination_id
+        # AND length checks. Moved from text_generation_controller.py.
+        active_request_count = self.total_request_count - self.paused_request_count
+        active_request_slice = slice(self.paused_request_count, self.total_request_count)
+        active_request_ids = self.request_ids[active_request_slice].long()
+        active_sequence_lengths = self.get_active_sequence_lengths().clone()
+        active_sequence_lengths += 1
+        max_sequence_lengths = self.get_max_sequence_lengths()
+        active_request_mask = (
+            sampled_tokens_cpu
+            != request_metadata_termination_id[active_request_slice]
+        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+        # 3. Stop-word callback.
+        if stop_word_callback is not None:
+            request_ids_list = active_request_ids.tolist()
+            stop_word_finished_ids = stop_word_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
+                        active_request_mask[idx] = 0
+
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
+            + self.paused_request_count
+        )
+        finished_request_ids = self.request_ids[finished_idxs]
+
+        # 4. Clone for update_requests (which mutates next_tokens in-place).
+        new_sample_copy = sampled_tokens_cpu.clone()
+
+        # 5. Drive the legacy update_requests body. Commits 13–15 split this
+        # further; for commit 12 the call is unchanged.
+        update_result = self.update_requests(
+            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+        )
+
+        return {
+            "active_request_ids": active_request_ids,
+            "finished_request_ids": finished_request_ids,
+            "sample": sampled_tokens_cpu,
+            **(update_result or {}),
+        }
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 

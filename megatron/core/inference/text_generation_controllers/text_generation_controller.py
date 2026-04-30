@@ -1877,68 +1877,25 @@ class TextGenerationController:
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
         step_id = context.step_count
 
-        # Batch GPU-to-CPU transfer of all sampled tokens. The output bundle
-        # is resolved synchronously here for parity with today; commit 5
-        # forwards it to the retirement service for ordered consumption.
+        # v3 plan §commit 12 — sample-dependent post-processing flows
+        # through ``DynamicInferenceContext.apply_step_corrections``: it
+        # syncs the AsyncStepOutput, builds active_request_mask, runs the
+        # stop-word callback, and drives update_requests. With overlap off
+        # the result is bit-identical to the prior in-controller flow.
         range_push(f"transfer_samples_to_cpu[step={step_id}]")
         async_output = self._transfer_samples_to_cpu(active_request_count, step_id)
-        cpu_view = async_output.cpu_view
-        sampled_tokens_cpu = cpu_view[AsyncStepOutputPool.SAMPLED_TOKENS_KEY]
-        sampled_mtp_tokens_cpu = cpu_view.get(AsyncStepOutputPool.SAMPLED_MTP_TOKENS_KEY)
         range_pop()
 
-        range_push(f"active_request_mask[step={step_id}]")
-        # Everything below is 100% CPU.
-        active_request_ids = context.request_ids[active_request_slice].long()
-        active_sequence_lengths = context.get_active_sequence_lengths()
-
-        # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
-        # returns kv_offsets + query_lengths which already includes all accepted
-        # speculative tokens (they were part of the query and survived the rewind).
-        # Only the newly sampled base token is not yet in the KV cache, so add 1.
-        active_sequence_lengths += 1
-        max_sequence_lengths = context.get_max_sequence_lengths()
-
-        # Request finished if termination_id or length >= max_sequence_length.
-        active_request_mask = (
-            sampled_tokens_cpu
-            != self._request_metadata["termination_id"][active_request_slice]
-        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
-
-        if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = active_request_ids.tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
-
-        finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
-        )
-        finished_request_ids = context.request_ids[finished_idxs]
-
-        # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
-        # which would corrupt the reused buffer.
-        new_sample_copy = sampled_tokens_cpu.clone()
-        range_pop()
-
-        range_push(f"update_requests[step={step_id}]")
-        update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+        range_push(f"apply_step_corrections[step={step_id}]")
+        result = context.apply_step_corrections(
+            step_id=step_id,
+            async_step_output=async_output,
+            request_metadata_termination_id=self._request_metadata["termination_id"],
+            stop_word_callback=self._get_stop_word_finished_ids_callback,
         )
         range_pop()
 
-        return {
-            "active_request_ids": active_request_ids,
-            "finished_request_ids": finished_request_ids,
-            # Pinned-buffer view from AsyncStepOutput; d2h_done_event already
-            # synchronized in cpu_view above. update_requests mutates only
-            # new_sample_copy, so this slice is stable for the engine's
-            # subsequent sample.tolist().
-            "sample": sampled_tokens_cpu,
-            **(update_result or {}),
-        }
+        return result
 
     # ------------------------------------------------------------------
     # Phase methods (v3 plan commit 3 — phased controller).
