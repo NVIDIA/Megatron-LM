@@ -221,6 +221,50 @@ class TestCausalConv1dUpdate:
             conv_state_ref[:, :, -1] = x[:, s, :]
             torch.testing.assert_close(int_states[:, s, :, :], conv_state_ref, atol=1e-5, rtol=1e-5)
 
+    @pytest.mark.parametrize("width", [2, 3, 4])
+    def test_state_len_eq_width_fast_path(self, width):
+        """Cover the ``state_len == WIDTH`` fast path (the common Mamba
+        configuration where d_conv == width).
+
+        The other tests use ``state_len = 8`` so they always fall through to
+        the explicit shift loop. Here ``state_len = width`` exercises the
+        register-resident shift and the matching ``HAS_INT_STATE`` branch.
+        """
+        torch.manual_seed(42)
+        B, seq_len, D = 2, 4, 64
+        state_len = width
+        x = torch.randn(B, seq_len, D, device="cuda", dtype=torch.float32)
+        conv_state_initial = torch.randn(B, D, state_len, device="cuda", dtype=torch.float32)
+        weight = torch.randn(D, width, device="cuda", dtype=torch.float32)
+        int_states = torch.zeros(B, seq_len, D, state_len, device="cuda", dtype=torch.float32)
+
+        conv_state_triton = conv_state_initial.clone()
+        conv_state_ref = conv_state_initial.clone()
+
+        result = causal_conv1d_update(
+            x,
+            conv_state_triton,
+            weight,
+            bias=None,
+            silu_activation=False,
+            conv_state_indices=None,
+            intermediate_conv_states=int_states,
+        )
+        expected = causal_conv1d_update_ref(
+            x, conv_state_ref, weight, bias=None, silu_activation=False
+        )
+
+        # Output and final state match the reference.
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(conv_state_triton, conv_state_ref, atol=1e-5, rtol=1e-5)
+
+        # Per-step intermediate states match a manual replay.
+        replay_state = conv_state_initial.clone()
+        for s in range(seq_len):
+            replay_state[:, :, :-1] = replay_state[:, :, 1:].clone()
+            replay_state[:, :, -1] = x[:, s, :]
+            torch.testing.assert_close(int_states[:, s, :, :], replay_state, atol=1e-5, rtol=1e-5)
+
     def test_intermediate_state_with_indices(self):
         """Test intermediate states work correctly with conv_state_indices mapping."""
         torch.manual_seed(42)

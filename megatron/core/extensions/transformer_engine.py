@@ -1924,11 +1924,13 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             return state_serialized
 
         def _decode_extra_state(self, state):
+            from megatron.core.safe_globals import SafeUnpickler
+
             if isinstance(state, torch.Tensor):
                 # No FP8 is indicated by an empty tensor we don't need to unpickle.
                 if state.numel() == 0:
                     return
-                return pickle.loads(state.detach().cpu().numpy().tobytes())
+                return SafeUnpickler(io.BytesIO(state.detach().cpu().numpy().tobytes())).load()
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
                 return torch.load(state, map_location="cuda")
@@ -2557,8 +2559,8 @@ try:
         retain_pinned_cpu_buffers,
     ):
         """Get CPU offload context and sync function."""
-        if is_te_min_version("2.5.0"):
-            # Enables the additional double buffering switch for activations during LLM training
+        if is_te_min_version("2.10.0"):
+            # TE 2.10+ supports retain_pinned_cpu_buffers
             context, sync_func = _get_cpu_offload_context(
                 enabled,
                 num_layers,
@@ -2567,6 +2569,16 @@ try:
                 weight_offloading,
                 double_buffering,
                 retain_pinned_cpu_buffers=retain_pinned_cpu_buffers,
+            )
+        elif is_te_min_version("2.5.0"):
+            # TE 2.5-2.9 supports double_buffering but not retain_pinned_cpu_buffers
+            context, sync_func = _get_cpu_offload_context(
+                enabled,
+                num_layers,
+                model_layers,
+                activation_offloading,
+                weight_offloading,
+                double_buffering,
             )
         elif is_te_min_version("1.10.0.dev0"):
             context, sync_func = _get_cpu_offload_context(

@@ -106,6 +106,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        self.num_moe_experts = getattr(config, "num_moe_experts", None)
+
         self.ddp_config = ddp_config
         log_single_rank(
             logger,
@@ -180,6 +182,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.scale_gradients = self.module.scale_gradients
         self.zero_grad_buffer = self.module.zero_grad_buffer
         self.broadcast_params = self.module.broadcast_params
+        self.synchronize_param_gather = self.module.synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
@@ -341,8 +344,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
             expt_tp_group = single_rank_group
 
+        # Extract AG groups from pg_collection for explicit passing
+        dp_cp_ag = getattr(pg_collection, 'dp_cp_ag', None) if pg_collection is not None else None
+        expt_dp_ag = (
+            getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
+        )
+
         if enable_hsdp:
-            if expt_dp_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_hsdp_tp_mesh(
                     outer_fsdp_group, expt_dp_group, expt_tp_group, ep_size=ep_group.size()
                 )
@@ -369,9 +378,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 hybrid_fsdp_group=hybrid_fsdp_group,
                 hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
                 expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
         else:
-            if ep_group is not None:
+            if self.num_moe_experts is not None:
                 expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
                 expt_device_mesh = DeviceMesh.from_group(
                     [expt_dp_group, expt_tp_group],
@@ -393,6 +404,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
                 expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
 
         self.tp_group = tp_group
