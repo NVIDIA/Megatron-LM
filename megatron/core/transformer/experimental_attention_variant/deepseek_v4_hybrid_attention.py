@@ -17,7 +17,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -34,9 +33,8 @@ except Exception:
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
-    from megatron.core.post_training.modelopt.layers import Linear
 else:
-    (TEColumnParallelLinear, TELinear, Linear, set_save_original_input) = (None, None, None, None)
+    (TEColumnParallelLinear, TELinear, set_save_original_input) = (None, None, None)
 
 
 @torch.compile
