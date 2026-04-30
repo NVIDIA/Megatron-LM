@@ -565,12 +565,13 @@ def get_inference_interface(args, loop, model):
 
 
 _ROLLOUT_GENERATOR = None
+_ROLLOUT_AGENT = None
 
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
-    global _ROLLOUT_GENERATOR
+    global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
     if _ROLLOUT_GENERATOR is None:
-        agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
+        _ROLLOUT_AGENT = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         request = GroupedRolloutRequest(
             num_groups=args.rl_generation_batch_size,
             rollouts_per_group=samples_per_group,
@@ -584,8 +585,32 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
             enforce_order=args.rl_enforce_generation_order,
         )
-        _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
+        _ROLLOUT_GENERATOR = _ROLLOUT_AGENT.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
+
+
+def assert_no_inflight_rollouts(agent):
+    """Verify no rollouts are buffered or in-flight in any layer of the agent tree.
+
+    For non-streaming RL (rl_partial_rollouts=False): under the always-streaming
+    generator, this enforces lag=0, i.e. no rollouts produced under the previous
+    iteration's policy carry over.
+    """
+    if isinstance(agent, WeightedMultiTask):
+        for sub in agent._active_sub_agents:
+            assert_no_inflight_rollouts(sub)
+    qsize = agent._inflight_queue.qsize()
+    assert qsize == 0, (
+        f"Non-streaming RL: {type(agent).__name__} has {qsize} buffered group(s) "
+        f"at iteration boundary. The streaming generator has run ahead under a "
+        f"stale policy."
+    )
+    assert agent._submitted_groups == agent._yielded_groups, (
+        f"Non-streaming RL: {type(agent).__name__} submitted="
+        f"{agent._submitted_groups} but yielded={agent._yielded_groups}; "
+        f"{agent._submitted_groups - agent._yielded_groups} group(s) in flight at "
+        f"iteration boundary."
+    )
 
 
 def get_environment_rollouts(
@@ -671,6 +696,8 @@ def get_environment_rollouts(
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
+                    if not args.rl_partial_rollouts:
+                        assert_no_inflight_rollouts(_ROLLOUT_AGENT)
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]

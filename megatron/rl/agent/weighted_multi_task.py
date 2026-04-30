@@ -218,6 +218,7 @@ class WeightedMultiTask(
 
         # Create tasks for each agent with non-zero groups
         generators = []
+        self._active_sub_agents = []
         for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts, strict=True):
             if num_groups > 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
@@ -235,11 +236,16 @@ class WeightedMultiTask(
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
                 )
                 generators.append(agent.get_grouped_rollouts(agent_request))
+                self._active_sub_agents.append(agent)
             else:
                 generators.append(None)
 
+        self._submitted_groups = 0
+        self._yielded_groups = 0
+        self._inflight_queue = asyncio.Queue()
+
         while any(generators):
-            balanced_rollouts = asyncio.Queue()
+            self._inflight_queue = asyncio.Queue()
 
             async def get_balanced_rollouts_if_remaining(agent_id):
                 generated_rollouts = 0
@@ -247,10 +253,11 @@ class WeightedMultiTask(
                     if generators[agent_id] is None:
                         return
                     try:
-                        await balanced_rollouts.put(await anext(generators[agent_id]))
+                        await self._inflight_queue.put(await anext(generators[agent_id]))
+                        self._submitted_groups += 1
                         generated_rollouts += 1
                     except StopAsyncIteration:
-                        await balanced_rollouts.put(None)
+                        await self._inflight_queue.put(None)
                         generators[agent_id] = None
                         return
 
@@ -260,10 +267,11 @@ class WeightedMultiTask(
             ]
 
             try:
-                while balanced_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                    rollout = await balanced_rollouts.get()
+                while self._inflight_queue.qsize() > 0 or not all(task.done() for task in tasks):
+                    rollout = await self._inflight_queue.get()
                     if rollout is not None:
                         yield rollout
+                        self._yielded_groups += 1
             finally:
                 for task in tasks:
                     task.cancel()
