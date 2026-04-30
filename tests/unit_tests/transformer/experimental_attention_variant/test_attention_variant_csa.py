@@ -556,6 +556,7 @@ class TestCompressedSparseAttentionRatio1:
             attention_type='self',
             pg_collection=cls.pg_collection,
             rotary_pos_emb=rotary_pos_emb,
+            compress_ratio=0,
         )
 
         yield
@@ -670,6 +671,7 @@ class TestCompressedSparseAttentionCompressed:
             attention_type='self',
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=compress_ratio,
         ).cuda()
 
         assert csa.compressor is not None
@@ -695,6 +697,7 @@ class TestCompressedSparseAttentionCompressed:
             attention_type='self',
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=compress_ratio,
         ).cuda()
 
         query = torch.randn(seq_len, batch_size, np_, hn, dtype=torch.bfloat16).cuda()
@@ -725,6 +728,7 @@ class TestCompressedSparseAttentionCompressed:
             attention_type='self',
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=compress_ratio,
         ).cuda()
         csa.train()
 
@@ -768,6 +772,7 @@ class TestCompressedSparseAttentionCompressed:
             attention_type='self',
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=compress_ratio,
         ).cuda()
         csa.eval()
 
@@ -829,6 +834,7 @@ class TestCompressedSparseAttentionDenseMode:
             attention_type='self',
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
         ).cuda()
 
         assert csa.compress_ratio == 4
@@ -851,6 +857,7 @@ class TestCompressedSparseAttentionDenseMode:
             attention_type='self',
             pg_collection=self.pg_collection,
             rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
         ).cuda()
 
         query = torch.randn(seq_len, batch_size, np_, hn, dtype=torch.bfloat16).cuda()

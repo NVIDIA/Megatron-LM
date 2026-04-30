@@ -529,15 +529,20 @@ def bwd_fused_indexer_loss_naive(
         causal_valid_mask = torch.tril(
             torch.ones((sq, sk), device=q.device, dtype=torch.bool)
         )  # [sq, sk]
+
+    if causal_valid_mask.dim() == 2:
+        causal_valid_mask = causal_valid_mask.unsqueeze(0)
+    causal_valid_mask = causal_valid_mask.expand(b, sq, sk)
+
     if sparse_loss:
         # Also apply index mask - only topk positions are valid
         index_valid_mask = index_mask == 0  # [b, sq, sk]
         del index_mask  # Free index_mask immediately after use
-        valid_mask = causal_valid_mask.unsqueeze(0) & index_valid_mask  # [b, sq, sk]
+        valid_mask = causal_valid_mask & index_valid_mask  # [b, sq, sk]
         del index_valid_mask
     else:
         del index_mask  # Free index_mask even if not used for sparse_loss
-        valid_mask = causal_valid_mask.unsqueeze(0).expand(b, sq, sk)  # [b, sq, sk]
+        valid_mask = causal_valid_mask  # [b, sq, sk]
     del causal_valid_mask
 
     grad_index_scores_logits = grad_index_scores_logits * valid_mask.float()
