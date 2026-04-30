@@ -290,6 +290,15 @@ class StepRetirementService:
             'inference/step_time_s': float(step_time),
             'inference/waiting_queue_len': int(len(engine.waiting_request_ids)),
             'inference/total_requests_dict_size': int(len(engine.requests)),
+            'inference/accepted_output_tokens': int(
+                engine.async_overlap_debug_counters.accepted_output_tokens
+            ),
+            'inference/discarded_lookahead_tokens': int(
+                engine.async_overlap_debug_counters.discarded_lookahead_tokens
+            ),
+            'inference/speculative_rejected_tokens': int(
+                engine.async_overlap_debug_counters.speculative_rejected_tokens
+            ),
         }
         for key, value in context_state["kv_stats"].items():
             if 'utilization' in key:
@@ -302,6 +311,9 @@ class StepRetirementService:
             metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
             metrics['inference/spec_decode_tokens_proposed'] = int(engine._spec_tokens_proposed)
             metrics['inference/spec_decode_tokens_accepted'] = int(engine._spec_tokens_accepted)
+            metrics['inference/spec_decode_tokens_rejected'] = int(
+                engine._spec_tokens_proposed - engine._spec_tokens_accepted
+            )
             metrics['inference/spec_decode_num_steps'] = int(engine._spec_steps)
 
         if engine.context.enable_prefix_caching and engine._prefix_cache_hits > 0:

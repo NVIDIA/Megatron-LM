@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -18,6 +19,9 @@ class AsyncStepOutputResult:
     sampled_mtp_tokens_cpu: Optional[torch.Tensor] = None
     accepted_tokens_cpu: Optional[torch.Tensor] = None
     accepted_token_counts_cpu: Optional[torch.Tensor] = None
+    log_probs: Optional[object] = None
+    top_n_logprobs: Optional[object] = None
+    routing_indices_per_request: Optional[object] = None
     output_ready_event: Optional[torch.cuda.Event] = None
 
 
@@ -106,6 +110,10 @@ class AsyncStepOutput:
         sampled_mtp_tokens_source: Optional[torch.Tensor],
         accepted_tokens_source: Optional[torch.Tensor],
         accepted_token_counts_source: Optional[torch.Tensor],
+        log_probs: Optional[object],
+        top_n_logprobs: Optional[object],
+        routing_indices_per_request_cpu: Optional[object],
+        routing_indices_sources: Optional[Dict[int, torch.Tensor]],
     ):
         self._pool = pool
         self._slot = slot
@@ -122,6 +130,10 @@ class AsyncStepOutput:
         self._sampled_mtp_tokens_source = sampled_mtp_tokens_source
         self._accepted_tokens_source = accepted_tokens_source
         self._accepted_token_counts_source = accepted_token_counts_source
+        self._log_probs = log_probs
+        self._top_n_logprobs = top_n_logprobs
+        self._routing_indices_per_request_cpu = routing_indices_per_request_cpu
+        self._routing_indices_sources = routing_indices_sources
 
     @classmethod
     def begin_copy(
@@ -133,6 +145,10 @@ class AsyncStepOutput:
         sampled_mtp_tokens_cuda: Optional[torch.Tensor] = None,
         accepted_tokens_cuda: Optional[torch.Tensor] = None,
         accepted_token_counts_cuda: Optional[torch.Tensor] = None,
+        log_probs: Optional[object] = None,
+        top_n_logprobs: Optional[object] = None,
+        routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
+        routing_step_id: Optional[int] = None,
         compute_stream: Optional[torch.cuda.Stream] = None,
         compute_done_event: Optional[torch.cuda.Event] = None,
     ) -> "AsyncStepOutput":
@@ -157,6 +173,13 @@ class AsyncStepOutput:
         sampled_mtp_copied = sampled_mtp_tokens_cuda is not None
         accepted_tokens_copied = accepted_tokens_cuda is not None
         accepted_token_counts_copied = accepted_token_counts_cuda is not None
+        log_probs = copy.deepcopy(log_probs)
+        top_n_logprobs = cls._clone_top_n_payload(top_n_logprobs)
+        routing_indices_cpu = None
+        routing_indices_sources = None
+        if routing_indices_per_request is not None:
+            routing_indices_cpu = {}
+            routing_indices_sources = {}
 
         with torch.cuda.stream(output_stream):
             slot.sampled_tokens_cpu[:active_request_count].copy_(
@@ -178,12 +201,34 @@ class AsyncStepOutput:
                 if slot.accepted_token_counts_cpu is None:
                     raise RuntimeError(
                         "accepted-token-count output requested without accepted-count buffers"
-                    )
+                )
                 slot.accepted_token_counts_cpu[:active_request_count].copy_(
                     accepted_token_counts_cuda[:active_request_count], non_blocking=True
                 )
+            if routing_indices_per_request is not None:
+                for request_id, routing_indices in routing_indices_per_request.items():
+                    request_id = int(request_id)
+                    if routing_indices.is_cuda:
+                        routing_indices_sources[request_id] = routing_indices
+                        routing_indices_cpu[request_id] = torch.empty(
+                            routing_indices.shape,
+                            dtype=routing_indices.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                        routing_indices_cpu[request_id].copy_(
+                            routing_indices, non_blocking=True
+                        )
+                    else:
+                        routing_indices_cpu[request_id] = routing_indices.detach().clone()
             output_ready_event = torch.cuda.Event()
             output_ready_event.record(output_stream)
+
+        if routing_indices_cpu is not None:
+            routing_indices_cpu = {
+                "step_id": None if routing_step_id is None else int(routing_step_id),
+                "by_request_id": routing_indices_cpu,
+            }
 
         return cls(
             pool=pool,
@@ -197,7 +242,24 @@ class AsyncStepOutput:
             sampled_mtp_tokens_source=sampled_mtp_tokens_cuda,
             accepted_tokens_source=accepted_tokens_cuda,
             accepted_token_counts_source=accepted_token_counts_cuda,
+            log_probs=log_probs,
+            top_n_logprobs=top_n_logprobs,
+            routing_indices_per_request_cpu=routing_indices_cpu,
+            routing_indices_sources=routing_indices_sources,
         )
+
+    @staticmethod
+    def _clone_top_n_payload(top_n_logprobs: Optional[object]) -> Optional[object]:
+        """Clone top-n payload tensors so retirement owns stable CPU objects."""
+        if top_n_logprobs is None:
+            return None
+        cloned = {}
+        for request_id, values in top_n_logprobs.items():
+            cloned[int(request_id)] = [
+                (top_values.detach().cpu().clone(), top_indices.detach().cpu().clone())
+                for top_values, top_indices in values
+            ]
+        return cloned
 
     def is_ready(self) -> bool:
         """Return whether the output-ready event has completed."""
@@ -236,6 +298,9 @@ class AsyncStepOutput:
                 sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
                 accepted_tokens_cpu=accepted_tokens_cpu,
                 accepted_token_counts_cpu=accepted_token_counts_cpu,
+                log_probs=self._log_probs,
+                top_n_logprobs=self._top_n_logprobs,
+                routing_indices_per_request=self._routing_indices_per_request_cpu,
                 output_ready_event=self.output_ready_event,
             )
             self._release_slot()

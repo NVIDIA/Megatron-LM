@@ -165,7 +165,9 @@ class AsyncOverlapDebugCounters:
     snapshot_slot_waits: int = 0
     output_event_waits: int = 0
     fallback_or_queue_depth_one_reasons: Dict[str, int] = field(default_factory=dict)
+    accepted_output_tokens: int = 0
     discarded_lookahead_tokens: int = 0
+    speculative_rejected_tokens: int = 0
     placeholder_count: int = 0
     reservation_commits: int = 0
     reservation_rollbacks: int = 0
@@ -1032,11 +1034,8 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         for request_id in request_ids:
             request = self.get_request(int(request_id))
-            sampling_params = request.sampling_params
             if request.stop_word_ids:
                 return "stop_words"
-            if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
-                return "logprobs"
         return None
 
     def get_request(self, request_id: int) -> DynamicInferenceRequest:
@@ -1254,6 +1253,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         log_probs_iter = log_probs if log_probs else repeat(None)
         block_allocator = self.context.kv_block_allocator
+        if (
+            isinstance(routing_indices_per_request, dict)
+            and "by_request_id" in routing_indices_per_request
+        ):
+            routing_indices_by_request = routing_indices_per_request["by_request_id"]
+        else:
+            routing_indices_by_request = routing_indices_per_request
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
@@ -1292,6 +1298,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Therefore, the newly sampled token must go at the end of the sequence.
                 tokens = accepted_tokens + tokens
 
+            original_token_count = len(tokens)
             num_stop_word_trim = 0
             if request_id not in chunked_prefill_no_output_request_ids:
                 # Skip appending token for requests being finished due to stop words
@@ -1308,8 +1315,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Trim log probs / top-n to match so the counts stay in sync.
                     if request_log_probs is not None:
                         request_log_probs = request_log_probs[:keep]
-                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+                    top_n_key = self._top_n_payload_key(top_n_logprobs, request_id, req_idx)
+                    if top_n_key is not None:
+                        top_n_logprobs[top_n_key] = top_n_logprobs[top_n_key][:keep]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1372,6 +1380,17 @@ class DynamicInferenceEngine(AbstractEngine):
 
                     self._spec_tokens_proposed += actual_proposed
                     self._spec_tokens_accepted += actual_accepted
+                    self.async_overlap_debug_counters.speculative_rejected_tokens += max(
+                        0, actual_proposed - actual_accepted
+                    )
+
+                accepted_output_token_count = max(0, len(tokens) - num_stop_word_trim)
+                self.async_overlap_debug_counters.accepted_output_tokens += (
+                    accepted_output_token_count
+                )
+                self.async_overlap_debug_counters.discarded_lookahead_tokens += max(
+                    0, original_token_count - accepted_output_token_count
+                )
 
                 if request_id in finished_request_ids:
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
@@ -1394,6 +1413,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # A non-final chunked prefill produces useless tokens
                 # so we are not appending them to the generated tokens.
                 # Additionally, chunked prefill requests do not finish.
+                self.async_overlap_debug_counters.discarded_lookahead_tokens += len(tokens)
                 active_request_ids.append(request_id)
 
             # When a stop word was found mid-speculative-batch, trim log probs
@@ -1401,8 +1421,11 @@ class DynamicInferenceEngine(AbstractEngine):
             if num_stop_word_trim > 0:
                 if request_log_probs is not None:
                     request_log_probs = request_log_probs[:-num_stop_word_trim]
-                if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+                top_n_key = self._top_n_payload_key(top_n_logprobs, request_id, req_idx)
+                if top_n_key is not None:
+                    top_n_logprobs[top_n_key] = top_n_logprobs[top_n_key][
+                        :-num_stop_word_trim
+                    ]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not
@@ -1445,9 +1468,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             # Same stop-word guard as log probs above.
+            top_n_key = self._top_n_payload_key(top_n_logprobs, request_id, req_idx)
             if (
                 top_n_logprobs is not None
-                and req_idx in top_n_logprobs
+                and top_n_key is not None
                 and request_id not in self.stop_word_being_finished_ids
             ):
                 # Initialize lists if they don't exist
@@ -1456,7 +1480,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request.generated_top_n_logprobs is None:
                     request.generated_top_n_logprobs = []
 
-                top_n_data_list = top_n_logprobs[req_idx]
+                top_n_data_list = top_n_logprobs[top_n_key]
                 prompt_length = len(request.prompt_tokens)
 
                 # Process each token's top-n logprobs
@@ -1487,10 +1511,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
             # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
             if (
-                routing_indices_per_request is not None
-                and request_id in routing_indices_per_request
+                routing_indices_by_request is not None
+                and request_id in routing_indices_by_request
             ):
-                step_routing = routing_indices_per_request[
+                step_routing = routing_indices_by_request[
                     request_id
                 ]  # [num_tokens, num_layers, topk]
                 if request.routing_indices is None:
@@ -1521,6 +1545,17 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_being_finished_ids.clear()
 
         return active_request_ids, finished_request_records
+
+    @staticmethod
+    def _top_n_payload_key(top_n_logprobs, request_id: int, request_index: int):
+        """Return the top-n payload key for a request in one retired step."""
+        if top_n_logprobs is None:
+            return None
+        if request_id in top_n_logprobs:
+            return request_id
+        if request_index in top_n_logprobs:
+            return request_index
+        return None
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.

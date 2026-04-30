@@ -1465,6 +1465,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_ids = context.request_ids[active_request_slice].tolist()
 
         # Use gpu_view for data consumed by GPU top-n operations.
         request_in_prefill_status_tensor = context.gpu_view.request_in_prefill_status[
@@ -1501,7 +1502,8 @@ class TextGenerationController:
                     top_n = int(top_n_per_request[i].item())
                     if top_n > 0:
                         num_valid = accepted_counts[i].item() + 1
-                        top_n_results[i] = [
+                        request_id = int(active_request_ids[i])
+                        top_n_results[request_id] = [
                             (topk_values_cpu[i, j, :top_n], topk_indices_cpu[i, j, :top_n])
                             for j in range(num_valid)
                         ]
@@ -1530,7 +1532,8 @@ class TextGenerationController:
                         top_n = int(prefill_top_n[i])
                         if top_n > 0:
                             req_idx = num_decode_requests + i
-                            top_n_results[req_idx] = [
+                            request_id = int(active_request_ids[req_idx])
+                            top_n_results[request_id] = [
                                 (topk_vals_cpu[i, :top_n], topk_idxs_cpu[i, :top_n])
                             ]
                 else:
@@ -1548,19 +1551,20 @@ class TextGenerationController:
                         top_n = int(prefill_top_n[i])
                         if top_n > 0:
                             req_idx = num_decode_requests + i
+                            request_id = int(active_request_ids[req_idx])
                             request_lp = prefill_log_probs_per_request[i]
                             skip_prompt = bool(prefill_skip_prompt[i])
 
                             if skip_prompt and request_lp.size(0) > 1:
                                 top_n_logits = torch.topk(request_lp[-1], k=top_n)
-                                top_n_results[req_idx] = [
+                                top_n_results[request_id] = [
                                     (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
                                 ]
                             else:
                                 top_n_logits = torch.topk(request_lp, k=top_n, dim=-1)
                                 top_n_values_cpu = top_n_logits.values.cpu()
                                 top_n_indices_cpu = top_n_logits.indices.cpu()
-                                top_n_results[req_idx] = [
+                                top_n_results[request_id] = [
                                     (top_n_values_cpu[t], top_n_indices_cpu[t])
                                     for t in range(request_lp.size(0))
                                 ]
@@ -1590,6 +1594,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_ids = context.request_ids[active_request_slice].tolist()
 
         # Handle decode-only mode (only last token)
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
@@ -1605,7 +1610,8 @@ class TextGenerationController:
                 if top_n > 0:
                     # Get top-n logprobs and indices for this request (single token)
                     top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
-                    top_n_results[req_idx] = [
+                    request_id = int(active_request_ids[req_idx])
+                    top_n_results[request_id] = [
                         (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
                     ]
             return top_n_results if top_n_results else None
@@ -1636,7 +1642,8 @@ class TextGenerationController:
                 if skip_prompt and request_log_probs.size(0) > 1:
                     # Only compute top-n for the last token (first generated token)
                     top_n_logits = torch.topk(request_log_probs[-1], k=top_n)
-                    top_n_results[req_idx] = [
+                    request_id = int(active_request_ids[req_idx])
+                    top_n_results[request_id] = [
                         (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
                     ]
                 else:
@@ -1647,7 +1654,8 @@ class TextGenerationController:
                         top_n_per_token.append(
                             (top_n_logits.values.cpu(), top_n_logits.indices.cpu())
                         )
-                    top_n_results[req_idx] = top_n_per_token
+                    request_id = int(active_request_ids[req_idx])
+                    top_n_results[request_id] = top_n_per_token
 
         return top_n_results if top_n_results else None
 
@@ -2137,6 +2145,9 @@ class TextGenerationController:
     def begin_dynamic_output_copy(
         self,
         prepared_step: DynamicStepContextSnapshot,
+        log_probs: Optional[object] = None,
+        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]] = None,
+        routing_indices_per_request: Optional[Dict[int, Tensor]] = None,
         skip_bookkeeping: Optional[bool] = False,
     ) -> AsyncStepOutput:
         """Begin the serial sampled-output D2H copy for one dynamic step."""
@@ -2161,6 +2172,10 @@ class TextGenerationController:
                 if self.num_speculative_tokens > 0
                 else None
             ),
+            log_probs=log_probs,
+            top_n_logprobs=top_n_logprobs,
+            routing_indices_per_request=routing_indices_per_request,
+            routing_step_id=prepared_step.step_id.value,
             compute_stream=torch.cuda.current_stream(),
         )
         range_pop()
@@ -2186,6 +2201,9 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         if isinstance(step_output, AsyncStepOutput):
             step_output = self.collect_dynamic_output(step_output)
+        log_probs = step_output.log_probs
+        top_n_logprobs = step_output.top_n_logprobs
+        routing_indices_per_request = step_output.routing_indices_per_request
         context.debug_compare_sampled_tokens_gpu_state(
             sampled_tokens_cpu=step_output.sampled_tokens_cpu,
             active_request_count=prepared_step.active_request_count,
@@ -2210,7 +2228,7 @@ class TextGenerationController:
             ),
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
-            "routing_indices_per_request": gpu_launch.routing_indices_per_request,
+            "routing_indices_per_request": routing_indices_per_request,
             "cuda_graph_request_count": prepared_step.cuda_graph_request_count,
         }
         if self.num_speculative_tokens > 0:
@@ -2256,7 +2274,13 @@ class TextGenerationController:
 
         with torch.inference_mode():
             log_probs, top_n_logprobs = self.launch_dynamic_sampling(gpu_launch)
-            step_output = self.begin_dynamic_output_copy(prepared_step, skip_bookkeeping)
+            step_output = self.begin_dynamic_output_copy(
+                prepared_step,
+                log_probs=log_probs,
+                top_n_logprobs=top_n_logprobs,
+                routing_indices_per_request=gpu_launch.routing_indices_per_request,
+                skip_bookkeeping=skip_bookkeeping,
+            )
             return self.commit_dynamic_bookkeeping(
                 prepared_step,
                 gpu_launch,

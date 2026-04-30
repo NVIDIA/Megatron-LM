@@ -987,6 +987,139 @@ class TestDynamicInferenceEngine:
         assert qd2_finished == qd1_finished
         assert set(qd2_finished) == set(range(len(prompt_lengths)))
 
+    def _run_async_overlap_logprob_case(
+        self, *, queue_depth: int, top_n_logprobs: int
+    ) -> Tuple[Dict[int, Dict[str, object]], DynamicEngineTestEnv]:
+        """Run deterministic logprob/top-n generation and summarize completed requests."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            model_provider="gpt",
+            num_cuda_graphs=None,
+            cuda_graph_scope=[],
+            force_build_cuda_graphs=True,
+            context_max_requests=128,
+            materialize_only_last_token_logits=False,
+            enable_async_overlap_architecture=True,
+            async_overlap_queue_depth=queue_depth,
+        )
+        env = self._build_test_env(test_config)
+        env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{int(tokens[0])}"
+        model = env.engine.controller.inference_wrapped_model.model
+
+        def deterministic_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            batch, sequence = tokens.shape
+            logits = torch.zeros(
+                batch,
+                sequence,
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            next_tokens = (tokens + 1).clamp(max=test_config.vocab_size - 1)
+            logits.scatter_(2, next_tokens.unsqueeze(-1), 100.0)
+            return logits
+
+        model.forward = deterministic_forward
+
+        for request_id, prompt_start in enumerate((0, 10)):
+            prompt_tokens = torch.arange(
+                prompt_start, prompt_start + 4, dtype=torch.int64, device="cuda"
+            )
+            env.engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=4,
+                        termination_id=test_config.vocab_size - 1,
+                        return_log_probs=True,
+                        top_n_logprobs=top_n_logprobs,
+                        top_k=1,
+                    ),
+                    block_size_tokens=env.engine.context.block_size_tokens,
+                )
+            )
+
+        summaries = {}
+        step_count = 0
+        while env.engine.has_unfinished_requests():
+            result = env.engine.step_modern()
+            if result is not None:
+                for record in result["finished_request_records"]:
+                    request = record.merge()
+                    assert request.status == Status.COMPLETED
+                    summaries[int(request.request_id)] = {
+                        "generated_tokens": list(request.generated_tokens),
+                        "prompt_log_probs": [
+                            round(float(value), 5) for value in request.prompt_log_probs
+                        ],
+                        "generated_log_probs": [
+                            round(float(value), 5) for value in request.generated_log_probs
+                        ],
+                        "prompt_top_n": self._summarize_top_n_logprobs(
+                            request.prompt_top_n_logprobs
+                        ),
+                        "generated_top_n": self._summarize_top_n_logprobs(
+                            request.generated_top_n_logprobs
+                        ),
+                    }
+            step_count += 1
+            assert step_count < 32, "Engine did not converge"
+
+        return summaries, env
+
+    @staticmethod
+    def _summarize_top_n_logprobs(top_n_logprobs):
+        if top_n_logprobs is None:
+            return None
+        return [
+            tuple(sorted((key, round(float(value), 5)) for key, value in token_logprobs.items()))
+            for token_logprobs in top_n_logprobs
+        ]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_logprobs_match_queue_depth_one(self) -> None:
+        """Queue-depth-two preserves prompt and generated logprob ordering."""
+        qd1_summary, _ = self._run_async_overlap_logprob_case(
+            queue_depth=1, top_n_logprobs=0
+        )
+        qd2_summary, qd2_env = self._run_async_overlap_logprob_case(
+            queue_depth=2, top_n_logprobs=0
+        )
+
+        assert qd2_summary == qd1_summary
+        counters = qd2_env.engine.async_overlap_debug_counters
+        generated_count = sum(len(item["generated_tokens"]) for item in qd2_summary.values())
+        assert counters.accepted_output_tokens == generated_count
+        assert counters.discarded_lookahead_tokens == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_overlap_queue_depth_two_top_n_logprobs_match_queue_depth_one(self) -> None:
+        """Queue-depth-two preserves request-keyed top-n logprob payloads."""
+        qd1_summary, _ = self._run_async_overlap_logprob_case(
+            queue_depth=1, top_n_logprobs=5
+        )
+        qd2_summary, _ = self._run_async_overlap_logprob_case(
+            queue_depth=2, top_n_logprobs=5
+        )
+
+        assert qd2_summary == qd1_summary
+        for summary in qd2_summary.values():
+            assert len(summary["prompt_top_n"]) == 3
+            assert len(summary["generated_top_n"]) == 4
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
