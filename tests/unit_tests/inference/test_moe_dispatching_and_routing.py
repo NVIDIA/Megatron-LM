@@ -17,6 +17,7 @@ import torch
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -36,7 +37,7 @@ requires_torch_grouped_mm = pytest.mark.skipif(
 # ──────────────────────────────────────────────────────────────────────
 
 NANOV3_BASE = dict(
-    num_layers=1,
+    num_layers=4,
     hidden_size=128,
     ffn_hidden_size=128,
     num_attention_heads=4,
@@ -59,6 +60,16 @@ NANOV3_BASE = dict(
     bf16=True,
     params_dtype=torch.bfloat16,
     transformer_impl="inference_optimized",
+    expert_tensor_parallel_size=1,
+    use_cpu_initialization=True,
+    attention_backend=AttnBackend.local,
+    cuda_graph_impl="local",
+    cuda_graph_scope="full_iteration_inference",
+    moe_pad_experts_for_cuda_graph_inference=False,
+    mamba_state_dim=128,
+    mamba_head_dim=64,
+    mamba_num_groups=8,
+    mamba_num_heads=64
 )
 
 
@@ -126,17 +137,6 @@ class TestInferenceTopKRouter:
         )
         assert router is not None
 
-    def test_set_unset_inference_mode(self):
-        """Toggle is_inference_cuda_graphed_iteration flag."""
-        router = self._make_router()
-        assert not router.is_inference_cuda_graphed_iteration
-
-        router.set_inference_cuda_graphed_iteration()
-        assert router.is_inference_cuda_graphed_iteration
-
-        router.unset_inference_cuda_graphed_iteration()
-        assert not router.is_inference_cuda_graphed_iteration
-
     def test_training_mode_forward_returns_sparse(self):
         """In training mode, forward delegates to parent and returns sparse tensors."""
         router = self._make_router()
@@ -174,7 +174,6 @@ class TestInferenceTopKRouter:
 
         # Inference mode: get top_indices (dense)
         router.eval()
-        router.set_inference_cuda_graphed_iteration()
         _, top_indices = router(input_tensor.clone())
 
         inference_experts = set()
@@ -211,6 +210,7 @@ class TestNCCLAllGatherDispatcher:
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
+        NCCLAllGatherDispatcher.allocate_buffers()
         config_overrides.setdefault("expert_model_parallel_size", Utils.world_size)
         config = _make_base_config(**config_overrides)
         num_local_experts = config.num_moe_experts // Utils.world_size
@@ -221,6 +221,7 @@ class TestNCCLAllGatherDispatcher:
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=get_default_pg_collection(),
+            runs_metadata_sync=True,
         )
 
     def test_init(self):
@@ -238,14 +239,12 @@ class TestNCCLAllGatherDispatcher:
         - dispatch gathers all slices back to the full global tensor
         - combine reduce-scatters the gathered data, giving each rank ep_size * its_slice
         """
-        from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
         if use_allgather_v and Utils.world_size == 1:
             pytest.skip("Variable-token prefill path requires EP > 1")
 
         dispatcher = self._make_dispatcher()
-        ep_group = get_expert_model_parallel_group()
         ep_size = dispatcher.ep_size
         rank = torch.distributed.get_rank() if ep_size > 1 else 0
         hidden_size = NANOV3_BASE["hidden_size"]
@@ -261,9 +260,7 @@ class TestNCCLAllGatherDispatcher:
         local_tokens = tokens_per_rank[rank]
         total_tokens = sum(tokens_per_rank)
 
-        NCCLAllGatherDispatcher.set_step_metadata(
-            local_tokens, ep_group, use_allgather_v=use_allgather_v
-        )
+        NCCLAllGatherDispatcher._use_allgather_v = use_allgather_v
 
         global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
         global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
@@ -336,7 +333,7 @@ class TestNVLSAllGatherVDispatcher:
         ep_group = get_expert_model_parallel_group()
 
         try:
-            NVLSAllGatherVDispatcher.allocate_symmetric_buffers(
+            NVLSAllGatherVDispatcher.allocate_buffers(
                 engine_max_tokens=_NVLS_ENGINE_MAX_TOKENS,
                 topk=NANOV3_BASE["moe_router_topk"],
                 hidden_size=NANOV3_BASE["hidden_size"],
@@ -350,6 +347,7 @@ class TestNVLSAllGatherVDispatcher:
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=get_default_pg_collection(),
+            runs_metadata_sync=True,
         )
 
     def test_init(self):
@@ -373,7 +371,6 @@ class TestNVLSAllGatherVDispatcher:
         Exact match (atol=0) is possible because the NVLS triton kernels
         accumulate in fp32 before writing bf16 output.
         """
-        from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
         )
@@ -389,7 +386,6 @@ class TestNVLSAllGatherVDispatcher:
         rank = torch.distributed.get_rank() if ep_size > 1 else 0
         num_global_tokens = num_local_tokens * ep_size
         global_max = _NVLS_ENGINE_MAX_TOKENS * ep_size
-        ep_group = get_expert_model_parallel_group()
 
         global_hidden = torch.randn(
             num_global_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
@@ -409,8 +405,6 @@ class TestNVLSAllGatherVDispatcher:
 
         if not are_tensors_nvls_eligible(static_hidden, static_probs, static_routing_map):
             pytest.skip("Tensors are not NVLS-eligible (need SM>=9 and 16-byte aligned memory)")
-
-        NVLSAllGatherVDispatcher.set_step_metadata(num_local_tokens, ep_group)
 
         # Warmup on a side stream
         with torch.no_grad():

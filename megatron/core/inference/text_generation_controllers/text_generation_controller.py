@@ -25,7 +25,11 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import (
+    get_attention_mask,
+    set_decode_expert_padding,
+    set_moe_metadata_sync,
+)
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -611,6 +615,7 @@ class TextGenerationController:
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
+        set_moe_metadata_sync(unwrapped_model)
 
         # Derive the MTP padded batch size from the existing padded graph dimensions.
         # For MoE models this is post EP sync. In eager mode MTP uses locally SP-aligned

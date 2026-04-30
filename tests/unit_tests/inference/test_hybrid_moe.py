@@ -25,14 +25,17 @@ from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_fa_min_version
+from tests.unit_tests.inference.test_moe_dispatching_and_routing import (
+    NANOV3_BASE,
+    _make_base_config,
+)
 from tests.unit_tests.test_utilities import Utils
 
 # Request state constants for parametrized tests.
@@ -100,9 +103,6 @@ _STATE_DIMS = {
 @pytest.mark.internal
 class TestDynamicInference:
     """Verify full HybridModel output shapes under EP strict matching scenarios."""
-
-    HIDDEN_SIZE = 256
-    NUM_ATTN_HEADS = 4
     MAX_SEQ_LEN = 512
     VOCAB_SIZE = 128
 
@@ -132,26 +132,17 @@ class TestDynamicInference:
 
     def _build_model(self, inference_moe_token_dispatcher_type='nvls'):
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
-        config = TransformerConfig(
+        config = _make_base_config(
             num_layers=3,
-            mtp_hybrid_override_pattern="ME*",
-            hidden_size=self.HIDDEN_SIZE,
-            num_attention_heads=self.NUM_ATTN_HEADS,
-            use_cpu_initialization=True,
-            params_dtype=torch.bfloat16,
-            bf16=True,
             attention_backend=AttnBackend.fused,
-            num_moe_experts=2,
-            moe_token_dispatcher_type="alltoall",
-            cuda_graph_impl="local",
             inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
         )
         model = HybridModel(
             config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=hybrid_inference_stack_spec,
             vocab_size=self.VOCAB_SIZE,
             max_sequence_length=self.MAX_SEQ_LEN,
-            hybrid_layer_pattern="M*",
+            hybrid_layer_pattern="ME*",
         )
         model.cuda()
         model.eval()
@@ -182,12 +173,12 @@ class TestDynamicInference:
             ),
         )
 
+    @torch.inference_mode()
     def _assert_dynamic_inference_shape(self, model, ctx, rank, state_label):
-        """Run model.forward and assert the logits shape matches
-        padded_batch_dimensions.token_count."""
+        """Run model and assert the logits shape matches padded_batch_dimensions.token_count."""
         padded = ctx.padded_batch_dimensions
         input_ids = torch.randint(0, self.VOCAB_SIZE, (1, padded.token_count), device="cuda")
-        out = model.forward(
+        out = model(
             input_ids=input_ids,
             position_ids=None,
             attention_mask=None,
@@ -305,7 +296,7 @@ class TestDynamicInference:
             )
 
     # ------------------------------------------------------------------
-    # test_dummy_bailout_with_decode_only_cuda_graphs: dedicated bail-out
+    # Cuda-graph bail-out tests for the NCCLAllGatherDispatcher
     # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(

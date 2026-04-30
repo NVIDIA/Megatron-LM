@@ -57,15 +57,9 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     # so that experts.py can always call _valid_tokens() on this base class.
     _valid_tokens_tensor: Optional[torch.Tensor] = None
 
-    # Per-subclass instance counter (shadows via MRO on first mutation, so NCCL
-    # and NVLS each start from 0). The first instance created owns update_metadata.
-    _dispatcher_count: int = 0
-
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, runs_metadata_sync: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        cls = type(self)
-        self._runs_metadata_sync = cls._dispatcher_count == 0
-        cls._dispatcher_count += 1
+        self._runs_metadata_sync = runs_metadata_sync
 
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
@@ -103,12 +97,14 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        runs_metadata_sync: bool = False,
     ) -> None:
         super().__init__(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=pg_collection,
+            runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
 
@@ -402,12 +398,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        runs_metadata_sync: bool = False,
     ) -> None:
         super().__init__(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=pg_collection,
+            runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
