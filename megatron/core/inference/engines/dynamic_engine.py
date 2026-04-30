@@ -170,7 +170,7 @@ class RequestEntry:
 
 @dataclass
 class AsyncOverlapDebugCounters:
-    """Debug counters used by the async-overlap rollout path."""
+    """Debug counters used by the async-overlap architecture."""
 
     queue_depth: int = 1
     snapshot_slot_waits: int = 0
@@ -182,6 +182,8 @@ class AsyncOverlapDebugCounters:
     distributed_consensus_mismatches: int = 0
     distributed_prepare_reconciliations: int = 0
     distributed_prepare_downgrades: int = 0
+    queue_depth_one_downgrades: int = 0
+    downgrade_reasons: Dict[str, int] = field(default_factory=dict)
     speculative_rejected_tokens: int = 0
     placeholder_count: int = 0
     reservation_commits: int = 0
@@ -363,6 +365,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.async_overlap_debug_counters = AsyncOverlapDebugCounters(
             queue_depth=getattr(self, "async_overlap_queue_depth", 1)
         )
+        if self.async_overlap_queue_depth == 1:
+            self.async_overlap_debug_counters.fallback_or_queue_depth_one_reasons[
+                "explicit_queue_depth_one"
+            ] = 1
         self.step_retirement_service = StepRetirementService(self)
         self.async_pipeline = DynamicAsyncPipeline(
             engine=self,
@@ -2495,19 +2501,31 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _downgrade_async_overlap_queue_depth_one(self, reason: str) -> None:
         """Downgrade the new architecture to queue depth one after unsafe divergence."""
-        self.async_overlap_queue_depth = 1
-        if hasattr(self, "async_pipeline"):
-            self.async_pipeline.queue_depth = 1
-        if hasattr(self, "step_retirement_service"):
-            self.step_retirement_service.max_retirement_backlog = 1
-            self.step_retirement_service._update_backlog_counters()
-        counters = getattr(self, "async_overlap_debug_counters", None)
-        if counters is not None:
-            counters.queue_depth = 1
-            counters.distributed_prepare_downgrades += 1
-            counters.fallback_or_queue_depth_one_reasons[reason] = (
-                counters.fallback_or_queue_depth_one_reasons.get(reason, 0) + 1
-            )
+        already_queue_depth_one = int(getattr(self, "async_overlap_queue_depth", 1)) <= 1
+        downgrade_range = self._step_nvtx_label(f"downgrade_async_overlap.{reason}")
+        nvtx_range_push(downgrade_range)
+        try:
+            self.async_overlap_queue_depth = 1
+            if hasattr(self, "async_pipeline"):
+                self.async_pipeline.queue_depth = 1
+            if hasattr(self, "step_retirement_service"):
+                self.step_retirement_service.max_retirement_backlog = 1
+                self.step_retirement_service._update_backlog_counters()
+            counters = getattr(self, "async_overlap_debug_counters", None)
+            if counters is not None:
+                counters.queue_depth = 1
+                counters.fallback_or_queue_depth_one_reasons[reason] = (
+                    counters.fallback_or_queue_depth_one_reasons.get(reason, 0) + 1
+                )
+                if not already_queue_depth_one:
+                    counters.queue_depth_one_downgrades += 1
+                    counters.downgrade_reasons[reason] = (
+                        counters.downgrade_reasons.get(reason, 0) + 1
+                    )
+                    if reason == "distributed_prepare_divergence":
+                        counters.distributed_prepare_downgrades += 1
+        finally:
+            nvtx_range_pop(downgrade_range)
 
     def _run_dummy_forward_launches(self, count: int) -> None:
         """Run dummy forwards so ranks without real work match distributed launches."""

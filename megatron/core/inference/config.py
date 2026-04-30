@@ -304,21 +304,20 @@ class InferenceConfig:
     """
 
     # =================================
-    # Temporary async-overlap rollout config
+    # Async-overlap config
     # =================================
-    enable_async_overlap_architecture: bool = False
-    """Enable the async-overlap architecture rollout path.
+    enable_async_overlap_architecture: bool = True
+    """Deprecated compatibility flag for async-overlap architecture rollout.
 
-    This is temporary scaffolding. Queue depth one is the serial correctness/debug mode;
-    later commits replace the old direct serial path with the new queue-depth-one path
-    before queue-depth-two overlap is enabled.
+    The dynamic engine now always uses the async-overlap architecture. This flag is
+    retained only so older configs continue to load until the rollout cleanup removes it.
     """
 
-    async_overlap_queue_depth: int = 1
-    """Maximum async-overlap pipeline depth. ``1`` is serial debug/correctness mode."""
+    async_overlap_queue_depth: int = 2
+    """Maximum async-overlap pipeline depth. ``1`` is debug/correctness mode."""
 
     async_overlap_debug_checks: bool = False
-    """Enable expensive async-overlap invariant checks while the rollout flag exists."""
+    """Enable expensive async-overlap invariant checks."""
 
     use_synchronous_zmq_collectives: bool = False
     """Whether to use synchronous ZMQ collectives for inference. If True, the
@@ -340,4 +339,9 @@ class InferenceConfig:
         if self.async_overlap_queue_depth < 1:
             raise ValueError(
                 f"async_overlap_queue_depth must be >= 1, got {self.async_overlap_queue_depth}"
+            )
+        if self.async_overlap_queue_depth > 2:
+            raise ValueError(
+                "async_overlap_queue_depth > 2 is not available until wider async-overlap "
+                "pipeline depths are validated"
             )

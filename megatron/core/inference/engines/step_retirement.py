@@ -321,6 +321,12 @@ class StepRetirementService:
             'inference/step_time_s': float(step_time),
             'inference/waiting_queue_len': int(len(engine.waiting_request_ids)),
             'inference/total_requests_dict_size': int(len(engine.requests)),
+            'inference/async_overlap_queue_depth': int(
+                engine.async_overlap_debug_counters.queue_depth
+            ),
+            'inference/async_overlap_queue_depth_two_active': int(
+                engine.async_overlap_debug_counters.queue_depth >= 2
+            ),
             'inference/accepted_output_tokens': int(
                 engine.async_overlap_debug_counters.accepted_output_tokens
             ),
@@ -335,6 +341,9 @@ class StepRetirementService:
             ),
             'inference/distributed_prepare_downgrades': int(
                 engine.async_overlap_debug_counters.distributed_prepare_downgrades
+            ),
+            'inference/queue_depth_one_downgrades': int(
+                engine.async_overlap_debug_counters.queue_depth_one_downgrades
             ),
         }
         for key, value in context_state["kv_stats"].items():
@@ -360,6 +369,12 @@ class StepRetirementService:
             )
         for status, count in engine.async_overlap_debug_counters.rollback_status_counts.items():
             metrics[f'inference/rollback_{status}'] = int(count)
+        for reason, count in (
+            engine.async_overlap_debug_counters.fallback_or_queue_depth_one_reasons.items()
+        ):
+            metrics[f'inference/queue_depth_one_reason_{reason}'] = int(count)
+        for reason, count in engine.async_overlap_debug_counters.downgrade_reasons.items():
+            metrics[f'inference/queue_depth_one_downgrade_{reason}'] = int(count)
 
         if HAVE_WANDB and engine.metrics_writer.__name__ == "wandb":
             engine.metrics_writer.log(metrics, commit=True)

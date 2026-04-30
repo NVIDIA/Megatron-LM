@@ -145,8 +145,8 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
-    enable_async_overlap_architecture: bool = False
-    async_overlap_queue_depth: int = 1
+    enable_async_overlap_architecture: bool = True
+    async_overlap_queue_depth: int = 2
 
     def __post_init__(self):
 
@@ -242,6 +242,8 @@ class TestDynamicInferenceEngine:
         assert counters.distributed_consensus_mismatches == 1
         assert counters.distributed_prepare_reconciliations == 1
         assert counters.distributed_prepare_downgrades == 1
+        assert counters.queue_depth_one_downgrades == 1
+        assert counters.downgrade_reasons == {"distributed_prepare_divergence": 1}
         assert counters.fallback_or_queue_depth_one_reasons == {
             "distributed_prepare_divergence": 1
         }
@@ -800,7 +802,7 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_async_overlap_queue_depth_two_decode_simple(self) -> None:
-        """Queue-depth-two steady-state decode matches the serial GPT output path."""
+        """Default queue-depth-two steady-state decode matches queue-depth-one output."""
         env = self._run_test(
             num_tokens_to_generate=16,
             model_provider="gpt",
@@ -809,8 +811,6 @@ class TestDynamicInferenceEngine:
             force_build_cuda_graphs=True,
             context_max_requests=128,
             num_gap_steps=0,
-            enable_async_overlap_architecture=True,
-            async_overlap_queue_depth=2,
         )
 
         assert env.engine.async_pipeline.pending_launch_count == 0

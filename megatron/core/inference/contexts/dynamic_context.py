@@ -279,10 +279,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_ledgers = DynamicRequestLedgers()
         self.step_journal = StepJournal()
         self.async_overlap_debug_counters = {
-            "queue_depth": 1,
+            "queue_depth": int(inference_config.async_overlap_queue_depth),
             "snapshot_slot_waits": 0,
             "output_event_waits": 0,
             "fallback_or_queue_depth_one_reasons": {},
+            "downgrade_reasons": {},
             "discarded_lookahead_tokens": 0,
             "placeholder_count": 0,
             "reservation_commits": 0,
@@ -2489,10 +2490,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.set_current_dynamic_step_id(-1)
         self.async_overlap_debug_counters.update(
             {
-                "queue_depth": 1,
+                "queue_depth": int(self.config.async_overlap_queue_depth),
                 "snapshot_slot_waits": 0,
                 "output_event_waits": 0,
                 "fallback_or_queue_depth_one_reasons": {},
+                "downgrade_reasons": {},
                 "discarded_lookahead_tokens": 0,
                 "placeholder_count": 0,
                 "reservation_commits": 0,
