@@ -42,6 +42,9 @@ class AsyncStepOutputPool:
 
     SAMPLED_TOKENS_KEY = "sampled_tokens"
     SAMPLED_MTP_TOKENS_KEY = "sampled_mtp_tokens"
+    LOGPROBS_KEY = "logprobs"
+    TOP_N_LOGPROBS_KEY = "top_n_logprobs"
+    ROUTING_INDICES_KEY = "routing_indices_per_request"
 
     def __init__(
         self,
@@ -138,3 +141,36 @@ class AsyncStepOutputPool:
             output.pinned_destinations[self.SAMPLED_MTP_TOKENS_KEY] = mtp_dest
             output.payload_metadata[self.SAMPLED_MTP_TOKENS_KEY] = True
         return output
+
+    def add_payload(
+        self,
+        output: "AsyncStepOutput",
+        name: str,
+        source_gpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """v3 plan §commit 21 — add a CPU-visible payload (logprobs,
+        top-n logprobs, routing records) to an existing AsyncStepOutput.
+
+        Allocates a fresh pinned destination tensor sized to ``source_gpu``,
+        enqueues the D2H on the dedicated d2h_output stream, and re-records
+        ``d2h_done_event`` on that stream so consumers waiting on the
+        bundle's event also see the new payload's copy. Returns the pinned
+        destination view (the caller may keep a handle for downstream
+        retirement-service emission).
+        """
+        # Pinned destinations for these payloads are sized per call rather
+        # than from a fixed pool because logprob shapes vary with request
+        # count + vocab subset. The cost (~MB-scale per step) is negligible
+        # vs. the throughput gain from overlapping with forward.
+        pinned = torch.empty(
+            source_gpu.shape, dtype=source_gpu.dtype, device="cpu", pin_memory=True
+        )
+        with torch.cuda.stream(self._d2h_stream):
+            pinned.copy_(source_gpu, non_blocking=True)
+            new_event = torch.cuda.Event()
+            new_event.record(self._d2h_stream)
+        output.source_gpu_tensors[name] = source_gpu
+        output.pinned_destinations[name] = pinned
+        output.payload_metadata[name] = True
+        output.d2h_done_event = new_event
+        return pinned
