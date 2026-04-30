@@ -9,11 +9,10 @@ common config. Anything derivable from other fields (``num_query_groups``,
 time inside :meth:`LayerConfig.to_transformer_config` rather than required
 from the recipe.
 
-Special pattern markers — :class:`EmbeddingLayerConfig`,
-:class:`CrossEntropyLayerConfig`, :class:`PipelineSplit` — also live here.
-They participate in the layer pattern but are not "layers" the
-:class:`HybridStack` constructs; they encode model-wrapping metadata
-(vocab/sequence shape) or pipeline boundaries.
+Special pattern markers — :class:`EmbeddingLayerConfig` and
+:class:`CrossEntropyLayerConfig` — also live here. They participate in
+the layer pattern but are not "layers" the :class:`HybridStack`
+constructs; they encode model-wrapping metadata (vocab/sequence shape).
 """
 
 from dataclasses import dataclass, field
@@ -69,8 +68,8 @@ class LayerConfig:
         layer pattern, so recipes never need to set it manually.
 
         ``parallelism`` carries the universal model-level parallelism
-        settings (TP/PP/CP, pipeline_dtype) — these **always win** because
-        they're job-level. EP/ETP are MoE-only and are injected into MoE
+        settings (TP/CP) — these **always win** because they're
+        job-level. EP/ETP are MoE-only and are injected into MoE
         per-layer TCs by :meth:`HybridModelConfig.compile`, not via this
         path. ``placeholders`` carries values that satisfy
         :meth:`TransformerConfig.__post_init__` invariants on layers that
@@ -460,44 +459,6 @@ class EmbeddingLayerConfig:
 
 
 @dataclass
-class MTPLayerConfig:
-    """Multi-Token Prediction marker (one instance per MTP depth).
-
-    A pattern with two MTP depths is written as ``[..., MTP, MTP, Loss]`` —
-    each :class:`MTPLayerConfig` instance corresponds to one prediction depth
-    and they all share the same body (the existing
-    :class:`MultiTokenPredictionBlock` infrastructure assumes identical
-    per-depth bodies).
-
-    The recipe author specifies the per-depth body as a (possibly nested)
-    list of decoder :class:`LayerConfig` instances via
-    :attr:`mtp_model_layer`. At compile time, the body is flattened into the
-    same single-character ``mtp_layer_pattern`` string the legacy
-    :func:`parse_hybrid_pattern` produces, and ``mtp_num_depths`` is set to
-    the count of consecutive :class:`MTPLayerConfig` markers in the pattern.
-    """
-
-    common_config: CommonLayerConfig = field(default_factory=CommonLayerConfig)
-
-    mtp_model_layer: list = field(default_factory=list)
-    """Per-depth MTP body — a (possibly nested) list of decoder
-    :class:`LayerConfig` instances."""
-
-    loss_scaling_factor: Optional[float] = None
-    """Scale factor applied to the auxiliary MTP loss before it is added to
-    the main cross-entropy loss. ``None`` keeps the
-    :class:`TransformerConfig` default (``mtp_loss_scaling_factor=0.1``).
-    All :class:`MTPLayerConfig` markers in a recipe must agree on this
-    value — it is a stack-level setting, not per-depth."""
-
-    use_repeated_layer: Optional[bool] = None
-    """Reuse a single MTP transformer layer across all depths instead of
-    instantiating one per depth. ``None`` keeps the
-    :class:`TransformerConfig` default (``mtp_use_repeated_layer=False``).
-    Like :attr:`loss_scaling_factor`, must agree across all markers."""
-
-
-@dataclass
 class CrossEntropyLayerConfig:
     """Output / loss marker (must appear at the end of a layer pattern)."""
 
@@ -524,23 +485,7 @@ class CrossEntropyLayerConfig:
     :attr:`CommonLayerConfig.extra`."""
 
 
-@dataclass
-class PipelineSplit:
-    """Pipeline-stage boundary marker.
-
-    Place between groups of layers in the layer pattern to declare a
-    pipeline split. Pipeline parallelism (PP > 1) for the Python DSL is a
-    follow-up — :func:`compile_pattern` raises :class:`NotImplementedError`
-    when a :class:`PipelineSplit` is encountered today, with a clear
-    pointer to the legacy string-DSL ``|`` form for production PP work.
-    """
-
-    pass
-
-
 # ----------------------------------------------------------- type aliases
 
 #: Anything that may legally appear at a leaf of a layer pattern.
-PatternLeaf = Union[
-    LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig, MTPLayerConfig, PipelineSplit
-]
+PatternLeaf = Union[LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig]

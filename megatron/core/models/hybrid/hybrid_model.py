@@ -74,9 +74,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             ``layer_type_list``. Each layer is constructed from its own
             config; ``config`` is reserved for stack-level concerns
             (final norm, embedding init).
-        mtp_layer_pattern (str, optional): MTP body symbol string (recipe
-            path), e.g. ``"MM"``.
-        mtp_num_depths (int, optional): Number of MTP depths (recipe path).
         hybrid_layer_pattern (str): Legacy string-pattern path. Unified
             hybrid layer pattern with optional MTP and pipeline stage
             boundaries.
@@ -126,8 +123,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_layer_pattern: Optional[str] = None,
         layer_type_list: Optional[list] = None,
         layer_config_list: Optional[list] = None,
-        mtp_layer_pattern: Optional[str] = None,
-        mtp_num_depths: Optional[int] = None,
         hybrid_attention_ratio: Optional[float] = None,
         hybrid_mlp_ratio: Optional[float] = None,
         hybrid_override_pattern: Optional[str] = None,
@@ -254,7 +249,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if recipe_path:
             # Recipe path: layer_type_list and layer_config_list are precomputed
             # by HybridModelConfig.compile() upstream. Pipeline parallelism and
-            # MTP are not yet wired through this path.
+            # MTP are not part of the recipe DSL — recipes that need either
+            # must use the legacy hybrid_layer_pattern string DSL. The PP > 1
+            # check below catches launcher/CLI mismatches where a PP group
+            # was constructed despite the recipe being PP-free.
             pp_size = (
                 torch.distributed.get_world_size(self.pg_collection.pp)
                 if self.pg_collection.pp is not None
@@ -262,15 +260,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             if pp_size > 1:
                 raise NotImplementedError(
-                    "The Python DSL recipe path does not yet support pipeline "
-                    "parallelism (PP > 1). Use hybrid_layer_pattern (string DSL "
+                    "The Python DSL recipe path does not support pipeline "
+                    "parallelism. Use hybrid_layer_pattern (string DSL "
                     "with '|' separators) for PP."
                 )
             layer_offset = 0
-            # MTP plumbing supplied by HybridModelConfig.compile() upstream;
-            # falls back to disabled when the recipe has no MTP markers.
-            self.mtp_pattern = mtp_layer_pattern
-            self.mtp_num_depths = mtp_num_depths or 0
+            self.mtp_pattern = None
+            self.mtp_num_depths = 0
         else:
             # Parse unified pattern to extract main and MTP components, and
             # determine the pipeline segment for this model instance.

@@ -12,8 +12,6 @@ from megatron.core.models.hybrid.layer_configs import (
     MambaLayerConfig,
     MLPLayerConfig,
     MoELayerConfig,
-    MTPLayerConfig,
-    PipelineSplit,
 )
 from megatron.core.models.hybrid.layer_pattern import (
     RECIPE_ENTRY_POINT,
@@ -33,8 +31,6 @@ __all__ = [
     "MambaLayerConfig",
     "MLPLayerConfig",
     "MoELayerConfig",
-    "MTPLayerConfig",
-    "PipelineSplit",
     "RECIPE_ENTRY_POINT",
     "flatten_decoder_pattern",
     "load_recipe",
