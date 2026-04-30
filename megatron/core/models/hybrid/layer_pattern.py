@@ -24,7 +24,6 @@ from megatron.core.models.hybrid.layer_configs import (
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
     LayerConfig,
-    PipelineSplit,
 )
 
 # Canonical recipe entry point. When a recipe module / file omits the
@@ -38,7 +37,7 @@ def flatten_decoder_pattern(pattern: Any) -> List[LayerConfig]:
     The decoder body is everything between the :class:`EmbeddingLayerConfig`
     and :class:`CrossEntropyLayerConfig` markers. Lists and tuples are
     descended into; every leaf must be a :class:`LayerConfig` (Mamba,
-    Attention, MoE, MLP, GDN, DSA). Embedding/Loss/PipelineSplit at this
+    Attention, MoE, MLP, GDN, DSA). Embedding / loss markers at this
     point are an error — they should have been handled earlier.
 
     Raises :class:`TypeError` (with the offending index path) on
@@ -53,12 +52,11 @@ def _flatten_into(node: Any, out: List[LayerConfig], path: tuple) -> None:
     if isinstance(node, LayerConfig):
         out.append(node)
         return
-    if isinstance(node, (EmbeddingLayerConfig, CrossEntropyLayerConfig, PipelineSplit)):
+    if isinstance(node, (EmbeddingLayerConfig, CrossEntropyLayerConfig)):
         raise TypeError(
             f"Encountered {type(node).__name__} at path {list(path)} inside the "
             f"decoder body; embedding/loss markers may only appear at the "
-            f"start/end of layer_pattern, and PipelineSplit is not yet supported "
-            f"in the Python DSL."
+            f"start/end of layer_pattern."
         )
     if isinstance(node, (list, tuple)):
         for i, child in enumerate(node):

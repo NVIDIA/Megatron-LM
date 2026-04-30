@@ -28,7 +28,6 @@ from megatron.core.models.hybrid import (
     HybridModelConfig,
     MambaLayerConfig,
     MLPLayerConfig,
-    PipelineSplit,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -182,19 +181,3 @@ class TestHeterogeneousWithinType:
         assert layer1_cfg.mamba_num_heads == 4
         assert layer1_cfg.mamba_head_dim == 64
         assert layer0_cfg is not layer1_cfg
-
-
-@pytest.mark.internal
-class TestPipelineParallelGuard:
-    """PipelineSplit is intentionally rejected until PP is wired through."""
-
-    def test_pipeline_split_raises(self):
-        common = _make_common()
-        mamba = MambaLayerConfig(common_config=common)
-        att = AttentionLayerConfig(common_config=common, num_attention_heads=4)
-        recipe = HybridModelConfig(
-            common_config=common,
-            layer_pattern=[_embedding(common), mamba, PipelineSplit(), att, _loss()],
-        )
-        with pytest.raises(NotImplementedError, match="pipeline parallelism"):
-            recipe.compile()

@@ -41,7 +41,6 @@ from megatron.core.models.hybrid.layer_configs import (
     EmbeddingLayerConfig,
     LayerConfig,
     MoELayerConfig,
-    PipelineSplit,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -107,8 +106,9 @@ class HybridModelConfig:
     """The layer pattern. Must begin with an :class:`EmbeddingLayerConfig`,
     contain at least one decoder :class:`LayerConfig`, and end with a
     :class:`CrossEntropyLayerConfig`. Decoder layers may be nested in any
-    list/tuple structure; :func:`compile` flattens them. Pipeline splits are
-    declared with :class:`PipelineSplit` markers (PP > 1 not yet supported)."""
+    list/tuple structure; :func:`compile` flattens them. Pipeline parallelism
+    is not part of the recipe DSL — recipes that need PP must use the legacy
+    ``hybrid_layer_pattern`` string DSL."""
 
     untie_embeddings_and_output_weights: bool = False
     """Untie input embedding and output projection weights."""
@@ -118,12 +118,10 @@ class HybridModelConfig:
     # job-/model-level concerns: process groups are constructed once, not
     # per-layer, and they cannot meaningfully vary per layer. ``compile()``
     # injects them into every per-layer TransformerConfig and the
-    # stack-level config.
+    # stack-level config. PP is intentionally absent — the recipe DSL is
+    # PP-free; recipes that need PP must use the legacy string DSL.
     tensor_model_parallel_size: int = 1
     """Tensor-model-parallel world size."""
-
-    pipeline_model_parallel_size: int = 1
-    """Pipeline-model-parallel world size (PP > 1 not yet supported by the DSL)."""
 
     context_parallel_size: int = 1
     """Context-parallel world size."""
@@ -133,9 +131,6 @@ class HybridModelConfig:
 
     expert_tensor_parallel_size: Optional[int] = None
     """Expert tensor-parallel size (defaults to ``tensor_model_parallel_size``)."""
-
-    pipeline_dtype: Optional[str] = None
-    """Pipeline P2P communication dtype name. ``None`` keeps TC default."""
 
     stack_spec: Optional[str] = None
     """Dotted Python path to a custom :class:`ModuleSpec` for
@@ -194,19 +189,15 @@ class HybridModelConfig:
         # this glue block changes.
         # ─────────────────────────────────────────────────────────────────
 
-        # Universal parallelism — flows into every per-layer TC.
+        # Universal parallelism — flows into every per-layer TC. PP is
+        # intentionally absent: the recipe DSL is PP-free. ``is_hybrid_model``
+        # is implicit for any HybridModelConfig recipe; force it on every TC
+        # so users don't carry a redundant ``=True``.
         parallelism: dict = {
             "tensor_model_parallel_size": self.tensor_model_parallel_size,
-            "pipeline_model_parallel_size": self.pipeline_model_parallel_size,
             "context_parallel_size": self.context_parallel_size,
-            # ``is_hybrid_model`` is implicit for any HybridModelConfig recipe;
-            # force it on every TC so users don't carry a redundant ``=True``.
             "is_hybrid_model": True,
         }
-        if self.pipeline_dtype is not None:
-            from megatron.core.models.hybrid.common_layer_config import _resolve_dtype
-
-            parallelism["pipeline_dtype"] = _resolve_dtype(self.pipeline_dtype)
 
         # MoE-only parallelism — applied to MoE per-layer TCs (after their
         # base build) and to the stack-level TC. Non-MoE per-layer TCs do
@@ -401,11 +392,10 @@ def _split_pattern(pattern: list):
     The returned tuple is ``(embedding, decoder_body, loss)``.
 
     Validates that exactly one :class:`EmbeddingLayerConfig` appears at the
-    start, exactly one :class:`CrossEntropyLayerConfig` at the end, and
-    raises a clear error if a :class:`PipelineSplit` appears (until PP is
-    plumbed through). MTP support is intentionally not part of the recipe
-    DSL today; recipes that need MTP should use the legacy
-    ``hybrid_layer_pattern`` string DSL.
+    start and exactly one :class:`CrossEntropyLayerConfig` at the end. MTP
+    and pipeline parallelism are intentionally not part of the recipe DSL;
+    recipes that need either should use the legacy ``hybrid_layer_pattern``
+    string DSL.
     """
     if not isinstance(pattern, list) or not pattern:
         raise TypeError("layer_pattern must be a non-empty list.")
@@ -423,16 +413,8 @@ def _split_pattern(pattern: list):
 
     body = pattern[1:-1]
 
-    # PipelineSplit anywhere in the body → not yet supported.
     # Embedding/Loss in the decoder body → wrong slot.
     def _walk(node):
-        if isinstance(node, PipelineSplit):
-            raise NotImplementedError(
-                "PipelineSplit() in the Python layer_pattern is not yet supported. "
-                "Use the legacy string DSL (hybrid_layer_pattern with '|' separators) "
-                "for pipeline parallelism, or wait for the follow-up that wires "
-                "PipelineSplit through the recipe pipeline."
-            )
         if isinstance(node, (EmbeddingLayerConfig, CrossEntropyLayerConfig)):
             raise TypeError(
                 "EmbeddingLayerConfig / CrossEntropyLayerConfig may only appear "
