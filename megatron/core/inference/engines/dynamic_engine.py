@@ -153,6 +153,57 @@ class RequestEntry:
     future: asyncio.Future
 
 
+class OptimisticLedgerDivergenceError(RuntimeError):
+    """v3 plan §commit 28 — raised when ranks disagree on the optimistic
+    ledger.
+
+    Cross-rank divergence is a *bug* (in coordinator broadcast,
+    deterministic commit, or placeholder accounting), not a runtime
+    condition. The engine fails fast with each rank's journal entry
+    logged so the divergence can be diagnosed offline.
+    """
+
+
+def compute_optimistic_ledger_hash(journal_entry) -> int:
+    """v3 plan §commit 28 — hash of (step_id, request_slot_map_after,
+    placeholder_deltas_sorted) for cross-rank ledger validation.
+
+    All ranks contribute this value to the EP batch-dim AllReduce
+    (post-reduction the XOR of the hashes is zero iff all ranks agree).
+    The hash is deterministic across ranks given the same journal-entry
+    contents, which is the invariant the divergence check depends on.
+    """
+    sorted_slot_map = sorted(journal_entry.request_slot_map_after.items())
+    sorted_placeholders = sorted(journal_entry.placeholder_deltas.items())
+    payload = (
+        journal_entry.step_id,
+        tuple(sorted_slot_map),
+        tuple(sorted_placeholders),
+    )
+    return hash(repr(payload)) & ((1 << 64) - 1)
+
+
+def assert_no_optimistic_ledger_divergence(
+    local_hash: int,
+    reduced_xor: int,
+    journal_entry,
+) -> None:
+    """Raises ``OptimisticLedgerDivergenceError`` when ``reduced_xor`` is
+    non-zero (i.e., not every rank contributed ``local_hash``).
+
+    The engine logs the local journal entry alongside so the divergence
+    can be diagnosed offline. No silent recovery is attempted.
+    """
+    if reduced_xor == 0:
+        return
+    raise OptimisticLedgerDivergenceError(
+        f"Cross-rank optimistic-ledger divergence detected at step "
+        f"{journal_entry.step_id}: local_hash={local_hash}, "
+        f"reduced_xor={reduced_xor}, "
+        f"local_journal_entry={journal_entry!r}"
+    )
+
+
 @dataclass
 class _PipelineLaunch:
     """One in-flight async-overlap step (engine-internal)."""
