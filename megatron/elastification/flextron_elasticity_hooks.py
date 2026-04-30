@@ -1151,8 +1151,16 @@ class FlextronGroupedMLPElasticityManager:
         # Hook 2: Linear FC1 post-hook for router scaling and masking
         def fc1_post_hook(module, input, output):
 
-            # Apply router_emb scaling
-            if self.config.flextron and self.current_router_mlp is not None:
+            # Apply router_emb scaling and MLP masking. Both router_emb and
+            # router_mlp must be set: the body reads current_router_emb[0]
+            # for the emb scaling and current_router_mlp[0] for the mask.
+            # Today they're always set together by update_hook_elasticity_params,
+            # but guarding both makes the precondition explicit.
+            if (
+                self.config.flextron
+                and self.current_router_mlp is not None
+                and self.current_router_emb is not None
+            ):
                 intermediate_parallel, bias_parallel = output
                 if self.config.soft_mask:
                     soft_intermediate_parallel = torch.zeros_like(intermediate_parallel)

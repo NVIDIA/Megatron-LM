@@ -73,7 +73,7 @@ except ImportError:
     # TE isn’t installed or the torch wrapper is missing
     tex = None
 
-from megatron.core.utils import StragglerDetector, is_te_min_version
+from megatron.core.utils import is_te_min_version
 
 _global_choice_counter = 0
 _logged_params_norm = False
