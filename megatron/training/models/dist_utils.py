@@ -57,7 +57,7 @@ def unimodal_build_distributed_models(
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
-    Shared helper for unimodal models (GPT, Mamba, etc.) that share the same procedure
+    Shared helper for unimodal models (GPT, Hybrid, etc.) that share the same procedure
     for distributed model initialization. Performs the following steps in order:
 
     1. Build virtual pipeline stages (one per VP rank, or a single stage if no VP)

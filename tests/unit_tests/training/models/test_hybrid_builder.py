@@ -15,17 +15,16 @@
 from unittest.mock import Mock, call, patch
 
 import pytest
+
 from megatron.core.transformer import ModuleSpec
-
-from megatron.training.models.mamba import (
-    MambaModelBuilder,
-    MambaModelConfig,
-    get_default_mamba_stack_spec,
-    modelopt_mamba_stack_spec,
-    transformer_engine_mamba_stack_spec,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
-
+from megatron.training.models.hybrid import (
+    HybridModelBuilder,
+    HybridModelConfig,
+    get_default_hybrid_stack_spec,
+    modelopt_hybrid_stack_spec,
+    transformer_engine_hybrid_stack_spec,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,10 +37,10 @@ def _make_transformer(**kwargs):
     return TransformerConfig(**defaults)
 
 
-def _make_mamba_config(**kwargs):
+def _make_hybrid_config(**kwargs):
     defaults = dict(transformer=_make_transformer(), vocab_size=32000)
     defaults.update(kwargs)
-    return MambaModelConfig(**defaults)
+    return HybridModelConfig(**defaults)
 
 
 # =============================================================================
@@ -49,54 +48,49 @@ def _make_mamba_config(**kwargs):
 # =============================================================================
 
 
-class TestTransformerEngineMambaStackSpec:
-    """Tests for the transformer_engine_mamba_stack_spec() factory function."""
+class TestTransformerEngineHybridStackSpec:
+    """Tests for the transformer_engine_hybrid_stack_spec() factory function."""
 
     def test_returns_module_spec(self):
-        result = transformer_engine_mamba_stack_spec()
+        result = transformer_engine_hybrid_stack_spec()
         assert isinstance(result, ModuleSpec)
 
     def test_returns_expected_spec_object(self):
-        with patch(
-            "megatron.bridge.models.mamba.mamba_builder.default_mamba_stack_spec"
-        ) as mock_spec:
-            result = transformer_engine_mamba_stack_spec()
+        with patch("megatron.training.models.hybrid.default_hybrid_stack_spec") as mock_spec:
+            result = transformer_engine_hybrid_stack_spec()
         assert result is mock_spec
 
 
-class TestModeloptMambaStackSpec:
-    """Tests for the modelopt_mamba_stack_spec() factory function."""
+class TestModeloptHybridStackSpec:
+    """Tests for the modelopt_hybrid_stack_spec() factory function."""
 
     def test_returns_module_spec(self):
         mock_spec = Mock(spec=ModuleSpec)
         with patch(
-            "megatron.bridge.models.mamba.mamba_builder.get_mamba_stack_modelopt_spec",
-            return_value=mock_spec,
+            "megatron.training.models.hybrid.get_hybrid_stack_modelopt_spec", return_value=mock_spec
         ):
-            result = modelopt_mamba_stack_spec()
+            result = modelopt_hybrid_stack_spec()
         assert result is mock_spec
 
     def test_calls_modelopt_spec_with_correct_args(self):
-        with patch(
-            "megatron.bridge.models.mamba.mamba_builder.get_mamba_stack_modelopt_spec"
-        ) as mock_fn:
+        with patch("megatron.training.models.hybrid.get_hybrid_stack_modelopt_spec") as mock_fn:
             mock_fn.return_value = Mock(spec=ModuleSpec)
-            modelopt_mamba_stack_spec()
+            modelopt_hybrid_stack_spec()
         mock_fn.assert_called_once_with(local_core_attention=False, remap_te_layernorm=False)
 
 
-class TestGetDefaultMambaStackSpec:
-    """Tests for get_default_mamba_stack_spec(), which dispatches on restore_modelopt_state."""
+class TestGetDefaultHybridStackSpec:
+    """Tests for get_default_hybrid_stack_spec(), which dispatches on restore_modelopt_state."""
 
     def test_returns_te_spec_when_restore_modelopt_state_is_false(self):
         mock_spec = Mock(spec=ModuleSpec)
         config = Mock()
         config.restore_modelopt_state = False
         with patch(
-            "megatron.bridge.models.mamba.mamba_builder.transformer_engine_mamba_stack_spec",
+            "megatron.training.models.hybrid.transformer_engine_hybrid_stack_spec",
             return_value=mock_spec,
         ) as mock_fn:
-            result = get_default_mamba_stack_spec(config)
+            result = get_default_hybrid_stack_spec(config)
         mock_fn.assert_called_once()
         assert result is mock_spec
 
@@ -105,27 +99,26 @@ class TestGetDefaultMambaStackSpec:
         config = Mock()
         config.restore_modelopt_state = True
         with patch(
-            "megatron.bridge.models.mamba.mamba_builder.modelopt_mamba_stack_spec",
-            return_value=mock_spec,
+            "megatron.training.models.hybrid.modelopt_hybrid_stack_spec", return_value=mock_spec
         ) as mock_fn:
-            result = get_default_mamba_stack_spec(config)
+            result = get_default_hybrid_stack_spec(config)
         mock_fn.assert_called_once()
         assert result is mock_spec
 
 
 # =============================================================================
-# Section 2 — MambaModelConfig
+# Section 2 — HybridModelConfig
 # =============================================================================
 
 
-class TestMambaModelConfigInitialization:
-    """Tests for MambaModelConfig field defaults and custom initialization."""
+class TestHybridModelConfigInitialization:
+    """Tests for HybridModelConfig field defaults and custom initialization."""
 
     def test_builder_classvar(self):
-        assert MambaModelConfig.builder == "megatron.bridge.models.mamba.MambaModelBuilder"
+        assert HybridModelConfig.builder == "megatron.training.models.hybrid.HybridModelBuilder"
 
     def test_default_values(self):
-        config = MambaModelConfig(transformer=_make_transformer())
+        config = HybridModelConfig(transformer=_make_transformer())
         assert config.fp16_lm_cross_entropy is False
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
@@ -140,7 +133,7 @@ class TestMambaModelConfigInitialization:
         assert config.should_pad_vocab is False
 
     def test_custom_initialization(self):
-        config = MambaModelConfig(
+        config = HybridModelConfig(
             transformer=_make_transformer(),
             fp16_lm_cross_entropy=True,
             parallel_output=False,
@@ -158,26 +151,26 @@ class TestMambaModelConfigInitialization:
         assert config.seq_length == 4096
         assert config.vocab_size == 50000
 
-    def test_mamba_stack_spec_default_is_callable(self):
-        config = _make_mamba_config()
-        assert callable(config.mamba_stack_spec)
-        assert config.mamba_stack_spec is get_default_mamba_stack_spec
+    def test_hybrid_stack_spec_default_is_callable(self):
+        config = _make_hybrid_config()
+        assert callable(config.hybrid_stack_spec)
+        assert config.hybrid_stack_spec is get_default_hybrid_stack_spec
 
 
-class TestMambaModelConfigGetAttr:
-    """Tests for MambaModelConfig.__getattr__ — direct access vs. TransformerConfig proxy."""
+class TestHybridModelConfigGetAttr:
+    """Tests for HybridModelConfig.__getattr__ — direct access vs. TransformerConfig proxy."""
 
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256, num_layers=4)
-        self.config = MambaModelConfig(transformer=self.transformer, vocab_size=32000)
+        self.config = HybridModelConfig(transformer=self.transformer, vocab_size=32000)
 
     def test_own_attribute_not_proxied(self):
-        # vocab_size is defined on MambaModelConfig but not on TransformerConfig;
+        # vocab_size is defined on HybridModelConfig but not on TransformerConfig;
         # it is returned directly from config.__dict__, __getattr__ is never invoked.
         assert self.config.vocab_size == 32000
 
     def test_proxies_transformer_attribute(self):
-        # hidden_size is not a field on MambaModelConfig, so __getattr__ proxies to transformer
+        # hidden_size is not a field on HybridModelConfig, so __getattr__ proxies to transformer
         assert self.config.hidden_size == 256
 
     def test_raises_attribute_error_for_unknown(self):
@@ -196,12 +189,12 @@ class TestMambaModelConfigGetAttr:
             getattr(self.config, attr_name)
 
 
-class TestMambaModelConfigSetAttr:
-    """Tests for MambaModelConfig.__setattr__ — own-field writes vs. TransformerConfig proxy writes."""
+class TestHybridModelConfigSetAttr:
+    """Tests for HybridModelConfig.__setattr__ — own-field writes vs. TransformerConfig proxy writes."""
 
     def setup_method(self):
         self.transformer = _make_transformer(hidden_size=256)
-        self.config = MambaModelConfig(transformer=self.transformer, vocab_size=32000)
+        self.config = HybridModelConfig(transformer=self.transformer, vocab_size=32000)
 
     def test_sets_own_attribute_on_self(self):
         self.config.vocab_size = 50000
@@ -240,65 +233,65 @@ class TestMambaModelConfigSetAttr:
         assert "hidden_size" not in self.config.__dict__
 
 
-class TestMambaModelConfigFinalize:
-    """Tests for MambaModelConfig.finalize() — validation logic."""
+class TestHybridModelConfigFinalize:
+    """Tests for HybridModelConfig.finalize() — validation logic."""
 
     def test_calls_transformer_finalize(self):
-        config = _make_mamba_config()
+        config = _make_hybrid_config()
         with patch.object(config.transformer, "finalize") as mock_finalize:
             config.finalize()
         mock_finalize.assert_called_once()
 
 
 # =============================================================================
-# Section 3 — MambaModelBuilder
+# Section 3 — HybridModelBuilder
 # =============================================================================
 
 
-class TestMambaModelBuilderInit:
-    """Tests for MambaModelBuilder.__init__ — config storage."""
+class TestHybridModelBuilderInit:
+    """Tests for HybridModelBuilder.__init__ — config storage."""
 
     def setup_method(self):
-        self.config = _make_mamba_config()
-        self.builder = MambaModelBuilder(self.config)
+        self.config = _make_hybrid_config()
+        self.builder = HybridModelBuilder(self.config)
 
     def test_stores_model_config(self):
         assert self.builder._model_config is self.config
 
 
-class TestMambaModelBuilderBuildModel:
-    """Tests for MambaModelBuilder.build_model() — spec resolution, vocab padding, pp-stage inference, and MCoreMambaModel kwargs."""
+class TestHybridModelBuilderBuildModel:
+    """Tests for HybridModelBuilder.build_model() — spec resolution, vocab padding, pp-stage inference, and MCoreHybridModel kwargs."""
 
     def setup_method(self):
-        self.config = _make_mamba_config(vocab_size=32000)
-        self.builder = MambaModelBuilder(self.config)
+        self.config = _make_hybrid_config(vocab_size=32000)
+        self.builder = HybridModelBuilder(self.config)
         self.pg = Mock()
         self.pg.pp = Mock()
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_raises_when_vocab_size_none(self, mock_model, *_):
         self.config.vocab_size = None
         with pytest.raises(AssertionError, match="vocab_size"):
             self.builder.build_model(self.pg)
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_spec_already_module_spec_used_directly(self, mock_model, *_):
         module_spec = ModuleSpec(module=object)
-        self.config.__dict__["mamba_stack_spec"] = module_spec
+        self.config.__dict__["hybrid_stack_spec"] = module_spec
         self.builder.build_model(self.pg, pre_process=True, post_process=True)
         call_kwargs = mock_model.call_args.kwargs
-        assert call_kwargs["mamba_stack_spec"] is module_spec
+        assert call_kwargs["hybrid_stack_spec"] is module_spec
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_spec_callable_no_params_called_without_args(self, mock_model, *_):
         returned_spec = ModuleSpec(module=object)
         calls = []
@@ -307,16 +300,16 @@ class TestMambaModelBuilderBuildModel:
             calls.append(True)
             return returned_spec
 
-        self.config.__dict__["mamba_stack_spec"] = zero_param_fn
+        self.config.__dict__["hybrid_stack_spec"] = zero_param_fn
         self.builder.build_model(self.pg, pre_process=True, post_process=True)
         assert calls, "zero_param_fn was not called"
         call_kwargs = mock_model.call_args.kwargs
-        assert call_kwargs["mamba_stack_spec"] is returned_spec
+        assert call_kwargs["hybrid_stack_spec"] is returned_spec
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_spec_callable_with_config_param_called_with_config(self, mock_model, *_):
         returned_spec = ModuleSpec(module=object)
         received = []
@@ -325,16 +318,16 @@ class TestMambaModelBuilderBuildModel:
             received.append(config)
             return returned_spec
 
-        self.config.__dict__["mamba_stack_spec"] = one_param_fn
+        self.config.__dict__["hybrid_stack_spec"] = one_param_fn
         self.builder.build_model(self.pg, pre_process=True, post_process=True)
         assert received == [self.config], "one_param_fn not called with config"
         call_kwargs = mock_model.call_args.kwargs
-        assert call_kwargs["mamba_stack_spec"] is returned_spec
+        assert call_kwargs["hybrid_stack_spec"] is returned_spec
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_no_vocab_padding_uses_vocab_size_directly(
         self, mock_model, mock_first, mock_last, mock_pad
     ):
@@ -344,12 +337,10 @@ class TestMambaModelBuilderBuildModel:
         mock_pad.assert_not_called()
         assert mock_model.call_args.kwargs["vocab_size"] == 32000
 
-    @patch(
-        "megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size", return_value=32128
-    )
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size", return_value=32128)
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_vocab_padding_calls_calculate_padded_vocab_size(
         self, mock_model, mock_first, mock_last, mock_pad
     ):
@@ -361,48 +352,48 @@ class TestMambaModelBuilderBuildModel:
         mock_pad.assert_called_once_with(32000, 128, 2)
         assert mock_model.call_args.kwargs["vocab_size"] == 32128
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_explicit_pre_post_process_passed_through(self, mock_model, *_):
         self.builder.build_model(self.pg, pre_process=False, post_process=True)
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["pre_process"] is False
         assert call_kwargs["post_process"] is True
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=False)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=False)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_infers_pre_process_from_pg(self, mock_model, mock_first, mock_last, *_):
         self.builder.build_model(self.pg)
         mock_first.assert_called_once_with(self.pg.pp)
         assert mock_model.call_args.kwargs["pre_process"] is False
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_infers_post_process_from_pg(self, mock_model, mock_first, mock_last, *_):
         self.builder.build_model(self.pg)
         mock_last.assert_called_once_with(self.pg.pp)
         assert mock_model.call_args.kwargs["post_process"] is True
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_virtual_pipeline_raises(self, mock_model, *_):
         with pytest.raises(AssertionError, match="Virtual pipeline"):
             self.builder.build_model(self.pg, vp_stage=0)
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.calculate_padded_vocab_size")
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_last_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.is_pp_first_stage", return_value=True)
-    @patch("megatron.bridge.models.mamba.mamba_builder.MCoreMambaModel")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_config_params_passed_to_mcore(self, mock_model, *_):
-        config = _make_mamba_config(
+        config = _make_hybrid_config(
             vocab_size=32000,
             seq_length=4096,
             hybrid_layer_pattern="M-A-",
@@ -411,7 +402,7 @@ class TestMambaModelBuilderBuildModel:
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
         )
-        builder = MambaModelBuilder(config)
+        builder = HybridModelBuilder(config)
         pg = Mock()
         pg.pp = Mock()
 
@@ -433,16 +424,16 @@ class TestMambaModelBuilderBuildModel:
         assert kw["vp_stage"] is None
 
 
-class TestMambaModelBuilderBuildDistributedModels:
-    """Tests for MambaModelBuilder.build_distributed_models() — delegation to unimodal helper, hook composition, and default kwargs."""
+class TestHybridModelBuilderBuildDistributedModels:
+    """Tests for HybridModelBuilder.build_distributed_models() — delegation to unimodal helper, hook composition, and default kwargs."""
 
     def setup_method(self):
-        self.config = _make_mamba_config(vocab_size=32000)
-        self.builder = MambaModelBuilder(self.config)
+        self.config = _make_hybrid_config(vocab_size=32000)
+        self.builder = HybridModelBuilder(self.config)
         self.pg = Mock()
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.compose_hooks")
-    @patch("megatron.bridge.models.mamba.mamba_builder.unimodal_build_distributed_models")
+    @patch("megatron.training.models.hybrid.compose_hooks")
+    @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
     def test_delegates_to_unimodal_build_distributed_models(self, mock_unimodal, mock_compose):
         model_list = [Mock()]
         mock_unimodal.return_value = model_list
@@ -452,8 +443,8 @@ class TestMambaModelBuilderBuildDistributedModels:
 
         assert mock_unimodal.called
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.compose_hooks")
-    @patch("megatron.bridge.models.mamba.mamba_builder.unimodal_build_distributed_models")
+    @patch("megatron.training.models.hybrid.compose_hooks")
+    @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
     def test_returns_model_list_from_unimodal(self, mock_unimodal, mock_compose):
         model_list = [Mock(), Mock()]
         mock_unimodal.return_value = model_list
@@ -464,8 +455,8 @@ class TestMambaModelBuilderBuildDistributedModels:
 
         assert result is model_list
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.compose_hooks")
-    @patch("megatron.bridge.models.mamba.mamba_builder.unimodal_build_distributed_models")
+    @patch("megatron.training.models.hybrid.compose_hooks")
+    @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
     def test_pre_wrap_hooks_composed_and_passed(self, mock_unimodal, mock_compose):
         model_list = [Mock()]
         mock_unimodal.return_value = model_list
@@ -483,8 +474,8 @@ class TestMambaModelBuilderBuildDistributedModels:
         unimodal_args = mock_unimodal.call_args.args
         assert unimodal_args[10] is composed_pre
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.compose_hooks")
-    @patch("megatron.bridge.models.mamba.mamba_builder.unimodal_build_distributed_models")
+    @patch("megatron.training.models.hybrid.compose_hooks")
+    @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
     def test_post_wrap_hook_applied_to_results(self, mock_unimodal, mock_compose):
         model_list = [Mock()]
         wrapped_list = [Mock(), Mock()]
@@ -498,8 +489,8 @@ class TestMambaModelBuilderBuildDistributedModels:
         composed_post.assert_called_once_with(model_list)
         assert result is wrapped_list
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.compose_hooks")
-    @patch("megatron.bridge.models.mamba.mamba_builder.unimodal_build_distributed_models")
+    @patch("megatron.training.models.hybrid.compose_hooks")
+    @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
     def test_post_wrap_hook_returning_none_keeps_original_list(self, mock_unimodal, mock_compose):
         model_list = [Mock()]
         mock_unimodal.return_value = model_list
@@ -509,8 +500,8 @@ class TestMambaModelBuilderBuildDistributedModels:
 
         assert result is model_list
 
-    @patch("megatron.bridge.models.mamba.mamba_builder.compose_hooks")
-    @patch("megatron.bridge.models.mamba.mamba_builder.unimodal_build_distributed_models")
+    @patch("megatron.training.models.hybrid.compose_hooks")
+    @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
     def test_default_parameters_forwarded(self, mock_unimodal, mock_compose):
         from megatron.core.enums import ModelType
         from megatron.core.transformer.module import Float16Module

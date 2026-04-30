@@ -31,14 +31,14 @@ class Serializable(Protocol):
 class ModelConfig:
     """Base class for model configurations.
 
-    Each model type (GPT, T5, Mamba, etc.) defines a concrete subclass with its
+    Each model type (GPT, T5, Hybrid, etc.) defines a concrete subclass with its
     own model-specific parameters. This class is a pure data container - all model
     construction logic lives in the corresponding ``ModelBuilder`` subclass.
 
     Subclasses must define:
         - ``builder``: a ``ClassVar[str]`` with the full import path to the
           associated ``ModelBuilder`` (e.g.
-          ``'megatron.bridge.models.mamba.MambaModelBuilder'``).
+          ``'megatron.bridge.models.hybrid.HybridModelBuilder'``).
 
     Subclasses may also embed nested configs (e.g. ``TransformerConfig``) and
     proxy attribute access to them via ``__getattr__``/``__setattr__`` overrides.
