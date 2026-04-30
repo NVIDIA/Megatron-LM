@@ -155,6 +155,11 @@ class DynamicAsyncPipeline:
             result = await self.drain_next()
         return result
 
+    async def drain_for_suspend_barrier(self):
+        """Retire launched steps and clear open retirement work before suspend."""
+        await self.drain_all()
+        self.drain_for_suspend()
+
     def drain_for_shutdown(self) -> None:
         """Validate no launched step is left unretired before shutdown."""
         if self.in_flight_launches:

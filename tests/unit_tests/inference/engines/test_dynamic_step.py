@@ -172,6 +172,25 @@ def test_dynamic_async_pipeline_can_stage_one_launch_per_distributed_tick():
     assert pipeline.pending_launch_count == 0
 
 
+def test_dynamic_async_pipeline_suspend_barrier_retires_pending_launches():
+    engine = FakePipelineEngine(max_launches=2)
+    retirement_service = FakeRetirementService()
+    pipeline = DynamicAsyncPipeline(
+        engine=engine, retirement_service=retirement_service, queue_depth=2
+    )
+
+    first = asyncio.run(pipeline.step(max_forward_launches=1))
+    assert first is None
+    assert pipeline.pending_launch_count == 1
+
+    result = asyncio.run(pipeline.drain_for_suspend_barrier())
+
+    assert result is None
+    assert pipeline.pending_launch_count == 0
+    assert [call[1]["dynamic_step_id"] for call in engine.bookkeep_calls] == [0]
+    assert retirement_service.suspend_drains == 1
+
+
 def test_dynamic_async_pipeline_queue_depth_two_falls_back_when_lookahead_blocked():
     engine = FakePipelineEngine(max_launches=2, lookahead_allowed=False)
     pipeline = DynamicAsyncPipeline(

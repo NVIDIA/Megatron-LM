@@ -776,6 +776,33 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_overlap_queue_depth_two_suspend_resume_during_decode(self) -> None:
+        """Suspend drains a queue-depth-two in-flight step and resumes cleanly."""
+        env = self._run_test(
+            num_requests=2,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            model_provider="gpt",
+            num_cuda_graphs=None,
+            cuda_graph_scope=[],
+            force_build_cuda_graphs=True,
+            context_max_requests=16,
+            num_gap_steps=0,
+            suspend_resume_interval=1,
+            enable_async_overlap_architecture=True,
+            async_overlap_queue_depth=2,
+        )
+
+        assert env.engine.async_pipeline.pending_launch_count == 0
+        assert env.engine.step_retirement_service.pending_count == 0
+        assert not env.engine.context.step_journal.has_open_entries()
+        assert env.engine.context.snapshot_pool.active_slot_ids == ()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @torch.inference_mode()
     def test_async_overlap_queue_depth_two_mixed_prefill_decode(self) -> None:
         """Queue-depth-two matches qd1 when a prefill joins active decode requests."""

@@ -15,9 +15,14 @@ from megatron.core.inference.contexts.snapshot_pool import (
 class FakeEvent:
     def __init__(self, complete: bool):
         self.complete = complete
+        self.synchronize_calls = 0
 
     def query(self):
         return self.complete
+
+    def synchronize(self):
+        self.complete = True
+        self.synchronize_calls += 1
 
 
 def _pool(slot_count: int = 2) -> GpuSnapshotBufferPool:
@@ -140,3 +145,23 @@ def test_snapshot_pool_memory_accounting_includes_graph_captures():
 
     with pytest.raises(RuntimeError, match="exceeded CUDA graph capture budget"):
         pool.register_graph_capture(1, byte_count=1024, cache_key=("shape-b", 1), max_captures=1)
+
+
+def test_snapshot_pool_reset_for_suspend_releases_active_slots_and_graphs():
+    pool = _pool(slot_count=1)
+    held = pool.acquire(step_id=1)
+    read_event = FakeEvent(complete=False)
+    pool.mark_forward_in_flight(held, gpu_read_event=read_event)
+    pool.release(held)
+    pool.register_graph_capture(0, byte_count=1024, cache_key=("shape", 0), max_captures=1)
+
+    pool.reset_for_suspend()
+
+    assert held.state == SNAPSHOT_FREE
+    assert held.owning_step_id is None
+    assert held.last_gpu_read_event is None
+    assert read_event.synchronize_calls == 1
+    assert pool.active_slot_ids == ()
+    accounting = pool.memory_accounting()
+    assert accounting["graph_capture_count"] == 0
+    assert accounting["graph_capture_key_count"] == 0

@@ -2556,6 +2556,47 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._release_deferred_mamba_slots_for_free_snapshots()
         return slot
 
+    def suspend_async_overlap_runtime_state(self) -> None:
+        """Drain transient async-overlap state before inference tensors are suspended."""
+        if hasattr(self, "gpu_bookkeeping_stream"):
+            self.gpu_bookkeeping_stream.synchronize()
+        self.rollback_all_open_step_journals(reason="suspend_runtime")
+        if hasattr(self, "snapshot_pool"):
+            self.snapshot_pool.reset_for_suspend()
+        self._snapshot_metadata_by_slot.clear()
+        self._release_deferred_mamba_slots_for_free_snapshots()
+        if hasattr(self, "gpu_sampled_token_state"):
+            self.gpu_sampled_token_state.last_active_request_count = 0
+        self._clear_pending_gpu_decode_input()
+
+    def rebuild_async_overlap_runtime_state(self) -> None:
+        """Recreate snapshot, stream, and GPU-input runtime objects after resume."""
+        self.gpu_bookkeeping_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+        self._gpu_bookkeeping_complete_event = torch.cuda.Event()
+        self.snapshot_pool = GpuSnapshotBufferPool(
+            slot_count=max(1, int(self.config.async_overlap_queue_depth)),
+            max_requests=self.max_requests,
+            max_tokens=self.max_tokens,
+            max_kv_blocks=self.max_kv_block_count,
+            device=torch.cuda.current_device(),
+            max_mamba_chunks=self._max_mamba_chunks,
+        )
+        self._snapshot_metadata_by_slot = {}
+        self.gpu_sampled_token_state = GpuSampledTokenState(
+            max_requests=self.max_requests,
+            num_speculative_tokens=self.num_speculative_tokens,
+            device=torch.cuda.current_device(),
+            stream=self.gpu_bookkeeping_stream,
+        )
+        self.gpu_input_preparer = GpuInputPreparer(
+            stream=self.gpu_bookkeeping_stream,
+            block_size_tokens=self.block_size_tokens,
+            debug_enabled=self.config.async_overlap_debug_checks,
+        )
+        self._pending_mamba_zeros = []
+        self._pending_mamba_restores = []
+        self._clear_pending_gpu_decode_input()
+
     def _release_deferred_mamba_slots_for_free_snapshots(self) -> None:
         """Release deferred Mamba slots only after their snapshot slot is reusable."""
         if not self.is_hybrid_model:

@@ -790,14 +790,34 @@ class DynamicInferenceEngine(AbstractEngine):
                 f"abs mem usage: {total_mem_str}"
             )
 
-    def suspend(self):
-        """Suspend engine by deallocating context's GPU state."""
+    def _rebuild_async_overlap_pipeline(self) -> None:
+        """Recreate runtime pipeline helpers after suspend/resume."""
+        self.step_retirement_service = StepRetirementService(self)
+        self.async_pipeline = DynamicAsyncPipeline(
+            engine=self,
+            retirement_service=self.step_retirement_service,
+            queue_depth=self.async_overlap_queue_depth,
+        )
+        self._current_dynamic_step_id = -1
+        if hasattr(self.context, "set_current_dynamic_step_id"):
+            self.context.set_current_dynamic_step_id(-1)
 
-        # Skip if already suspended or in the process of suspending.
-        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+    def suspend(self):
+        """Suspend engine by draining the async pipeline and deallocating GPU state."""
+
+        # Skip if already suspended. If the coordinator has already moved the
+        # state to SUSPENDING, this call owns the actual drain barrier.
+        if self.state == EngineState.SUSPENDED:
             return
 
-        self.async_pipeline.drain_for_suspend()
+        if self.state != EngineState.SUSPENDING:
+            self.state = EngineState.SUSPENDING
+        if hasattr(self, "async_pipeline"):
+            self._run_coroutine_sync(self.async_pipeline.drain_for_suspend_barrier())
+        elif hasattr(self, "step_retirement_service"):
+            self.step_retirement_service.drain_for_suspend()
+        if hasattr(self.context, "suspend_async_overlap_runtime_state"):
+            self.context.suspend_async_overlap_runtime_state()
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -857,6 +877,8 @@ class DynamicInferenceEngine(AbstractEngine):
             alloc_time = time.time()
             torch.cuda.synchronize()
             self.context.reinitialize_inference_state_buffers()
+            self.context.rebuild_async_overlap_runtime_state()
+            self._rebuild_async_overlap_pipeline()
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 

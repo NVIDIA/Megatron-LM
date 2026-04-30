@@ -157,6 +157,21 @@ class GpuSnapshotBufferPool:
             if slot.state == SNAPSHOT_RETIRING and self._can_reuse(slot):
                 self._mark_free(slot)
 
+    def reset_for_suspend(self, *, clear_graph_captures: bool = True) -> None:
+        """Synchronize active slots and return the pool to a fully reusable state."""
+        for slot in self.slots:
+            if slot.state != SNAPSHOT_FREE and slot.metadata_ready_event is not None:
+                slot.metadata_ready_event.synchronize()
+            if slot.last_gpu_read_event is not None:
+                slot.last_gpu_read_event.synchronize()
+            self._mark_free(slot)
+            if clear_graph_captures:
+                slot.graph_capture_count = 0
+                slot.graph_capture_bytes = 0
+                slot.graph_capture_keys.clear()
+                slot.graph_cache_hits = 0
+                slot.graph_cache_misses = 0
+
     def get_slot(self, slot_or_id) -> GpuSnapshotSlot:
         """Return a snapshot slot by handle or slot id."""
         if isinstance(slot_or_id, GpuSnapshotSlot):
