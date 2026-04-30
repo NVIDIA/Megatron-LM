@@ -264,8 +264,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
+        None
+    )
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
     ####################
     # DSA
@@ -285,6 +287,22 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    ####################
+    # DeepSeek-v4 hybrid attention
+    ####################
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
 
     ####################
     # linear attention
@@ -1263,6 +1281,22 @@ class TransformerConfig(ModelParallelConfig):
             )
         elif self.experimental_attention_variant == "dsa":
             pass
+        elif self.experimental_attention_variant == "dsv4_hybrid":
+            assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
+            assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
+            mtp_layers = self.mtp_num_layers or 0
+            expected_len = self.num_layers + mtp_layers
+            assert len(self.csa_compress_ratios) == expected_len, (
+                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must equal "
+                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
+            )
+            assert all(
+                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
+            ), "csa_compress_ratios must be 0, 4, or 128"
+            assert (
+                self.tensor_model_parallel_size == 1
+            ), "DSv4 Hybrid Attention only supports TP size 1."
+            assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2696,10 +2730,12 @@ class MLATransformerConfig(TransformerConfig):
     """Rank of Query tensor's low rank representation."""
 
     kv_lora_rank: int = 512
-    """Rank of Key and Value tensors' low rank representation."""
+    """Rank of Key and Value tensors' low rank representation.
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_head_dim: int = 128
-    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim"""
+    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_pos_emb_head_dim: int = 64
     """Dimension of the position embedding in the QK projection."""
@@ -2737,6 +2773,12 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
+    o_groups: int = 8
+    """Number of groups for grouped low-rank output projection (wo_a)."""
+
+    o_lora_rank: int = 1024
+    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
@@ -2754,6 +2796,21 @@ class MLATransformerConfig(TransformerConfig):
 
         if self.attention_output_gate:
             raise NotImplementedError("Output gate is not supported for MLA yet.")
+
+        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            assert (
+                not self.mla_down_proj_fusion
+            ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
+                f"v_head_dim and qk_pos_emb_head_dim",
+            )
+            derived = self.v_head_dim - self.qk_pos_emb_head_dim
+            self.qk_head_dim = derived
+            self.kv_lora_rank = derived
 
         if self.cache_mla_latents:
             assert (

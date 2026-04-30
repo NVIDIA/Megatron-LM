@@ -176,7 +176,7 @@ class GPTModel(LanguageModule):
                 cp_group=self.pg_collection.cp,
             )
 
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -381,7 +381,7 @@ class GPTModel(LanguageModule):
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
