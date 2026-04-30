@@ -208,15 +208,22 @@ class DSALayerConfig(LayerConfig):
     kv_channels: Optional[int] = None
     """KV head dim."""
 
+    add_qkv_bias: Optional[bool] = None
+    """Bias in the QKV projection only, overriding ``add_bias_linear`` for
+    QKV. Mirrors the same field on :class:`AttentionLayerConfig`."""
+
     SYMBOL: ClassVar[str] = Symbols.DS_ATTENTION
 
     def _layer_specific_kwargs(self) -> Dict[str, Any]:
-        return {
+        kwargs: Dict[str, Any] = {
             "num_attention_heads": self.num_attention_heads,
             "num_query_groups": self.num_query_groups,
             "kv_channels": self.kv_channels,
             "multi_latent_attention": True,
         }
+        if self.add_qkv_bias is not None:
+            kwargs["add_qkv_bias"] = self.add_qkv_bias
+        return kwargs
 
 
 @dataclass

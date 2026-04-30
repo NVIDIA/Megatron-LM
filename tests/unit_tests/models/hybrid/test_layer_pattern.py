@@ -63,6 +63,31 @@ class TestCommonLayerConfig:
         "cuda_graph_impl": ("mamba", "attention", "mlp", "moe"),
         "cuda_graph_scope": ("mamba", "attention", "mlp", "moe"),
         "cuda_graph_warmup_steps": ("mamba", "attention", "mlp", "moe"),
+        # TransformerLayer-level wiring — applies wherever the per-layer
+        # type is wrapped in a TransformerLayer (i.e. everywhere).
+        "apply_residual_connection_post_layernorm": (
+            "mamba",
+            "attention",
+            "dsa",
+            "gdn",
+            "mlp",
+            "moe",
+        ),
+        # FP8/FP4/recompute clusters — TC-level concerns that affect every
+        # layer family the recipe builds.
+        "fp8": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "fp8_recipe": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "fp8_param": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "fp8_margin": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "fp8_amax_history_len": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "fp8_dot_product_attention": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "fp4": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "fp4_recipe": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "fp4_param": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "recompute_granularity": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "recompute_method": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "recompute_num_layers": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
+        "distribute_saved_activations": ("mamba", "attention", "dsa", "gdn", "mlp", "moe"),
     }
 
     NON_SHARED_FIELDS = {
@@ -72,7 +97,6 @@ class TestCommonLayerConfig:
         "add_qkv_bias",
         "masked_softmax_fusion",
         "use_fused_weighted_squared_relu",
-        "apply_residual_connection_post_layernorm",
     }
 
     def test_common_fields_are_explicitly_audited_as_shared(self):
@@ -138,6 +162,49 @@ class TestCommonLayerConfig:
         tc = layer.to_transformer_config(num_layers=2)
 
         assert tc.use_fused_weighted_squared_relu is True
+
+    def test_fp8_cluster_propagates(self):
+        """FP8 cluster on CommonLayerConfig flows through to per-layer TC."""
+        common = _make_common(
+            fp8="hybrid",
+            fp8_recipe="delayed",
+            fp8_param=True,
+            fp8_margin=2,
+            fp8_amax_history_len=1024,
+            fp8_dot_product_attention=True,
+        )
+        layer = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        tc = layer.to_transformer_config(num_layers=2)
+        assert tc.fp8 == "hybrid"
+        assert tc.fp8_recipe == "delayed"
+        assert tc.fp8_param is True
+        assert tc.fp8_margin == 2
+        assert tc.fp8_amax_history_len == 1024
+        assert tc.fp8_dot_product_attention is True
+
+    def test_recompute_cluster_propagates(self):
+        common = _make_common(
+            recompute_granularity="full", recompute_method="uniform", recompute_num_layers=4
+        )
+        layer = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        tc = layer.to_transformer_config(num_layers=8)
+        assert tc.recompute_granularity == "full"
+        assert tc.recompute_method == "uniform"
+        assert tc.recompute_num_layers == 4
+
+    def test_apply_residual_connection_post_layernorm_propagates(self):
+        common = _make_common(apply_residual_connection_post_layernorm=True)
+        layer = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        tc = layer.to_transformer_config(num_layers=2)
+        assert tc.apply_residual_connection_post_layernorm is True
+
+    def test_dsa_add_qkv_bias_curated(self):
+        """``add_qkv_bias`` is curated on :class:`DSALayerConfig` (parity with
+        :class:`AttentionLayerConfig`); it should not require ``extra``."""
+        common = _make_common()
+        layer = DSALayerConfig(common_config=common, num_attention_heads=4, add_qkv_bias=True)
+        tc = layer.to_transformer_config(num_layers=2)
+        assert tc.add_qkv_bias is True
 
 
 @pytest.mark.internal
