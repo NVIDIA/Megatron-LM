@@ -62,31 +62,79 @@ def _select_block_size_m(max_tokens: int) -> int:
 # BLOCK_SIZE_M value triggers independent autotuning over these configs.
 _AUTOTUNE_CONFIGS = [
     # GROUP_SIZE_M=1: better when each expert has few tokens (decode, sparse activation).
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=2),
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=3),
-    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=4),
+    triton.Config(
+        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=2
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=4
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=5
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 1}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=3
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 1}, num_warps=8, num_stages=4
+    ),
     # GROUP_SIZE_M=8: better for large batches where experts see many tokens.
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=5),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3),
-    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3),
-    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=4),
-    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=4),
-    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=5),
+    triton.Config(
+        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=4
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=5
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=5
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_warps=4, num_stages=3
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=3
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_warps=8, num_stages=4
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=4
+    ),
+    triton.Config(
+        {'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 4}, num_warps=8, num_stages=5
+    ),
 ]
 
 
@@ -276,8 +324,6 @@ def _fill_expert_block_ids_kernel(
         tl.store(expert_ids_ptr + idxs, e, mask=idxs < end_block)
 
 
-
-
 def _moe_align_block_size_cuda_graphable(
     routing_map: torch.Tensor,
     block_size: int,
@@ -316,12 +362,7 @@ def _moe_align_block_size_cuda_graphable(
     INIT_BLOCK = 1024
     init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
     _init_sorted_ids_kernel[(init_grid,)](
-        sorted_token_ids,
-        expert_ids,
-        max_sorted,
-        max_blocks,
-        SENTINEL=sentinel,
-        BLOCK=INIT_BLOCK,
+        sorted_token_ids, expert_ids, max_sorted, max_blocks, SENTINEL=sentinel, BLOCK=INIT_BLOCK
     )
 
     tokens_per_expert = compute_local_tokens_per_expert(
@@ -332,11 +373,7 @@ def _moe_align_block_size_cuda_graphable(
     )
 
     _fill_expert_block_ids_kernel[(num_local_experts,)](
-        expert_ids,
-        exclusive_offsets,
-        inclusive_offsets,
-        BLOCK_SIZE_M=block_size,
-        BLOCK=128,
+        expert_ids, exclusive_offsets, inclusive_offsets, BLOCK_SIZE_M=block_size, BLOCK=128
     )
 
     max_pairs = max_tokens * topk
@@ -361,6 +398,7 @@ def _moe_align_block_size_cuda_graphable(
 # ---------------------------------------------------------------------------
 # Kernel launcher
 # ---------------------------------------------------------------------------
+
 
 def _invoke_fused_moe_kernel(
     A: torch.Tensor,
@@ -546,19 +584,17 @@ def vllm_fused_moe(
     Returns:
         [max_tokens, hidden_size] BF16 output.
     """
-    assert hidden_states.dtype == torch.bfloat16, (
-        f"vllm_fused_moe requires bf16 input, got {hidden_states.dtype}"
-    )
+    assert (
+        hidden_states.dtype == torch.bfloat16
+    ), f"vllm_fused_moe requires bf16 input, got {hidden_states.dtype}"
 
     max_tokens = hidden_states.size(0)
     topk = routing_map.shape[1]
     effective_tokens = num_tokens_hint if num_tokens_hint is not None else max_tokens
     block_size_m = _select_block_size_m(effective_tokens)
 
-    sorted_token_ids, expert_ids, num_post_padded = (
-        _moe_align_block_size_cuda_graphable(
-            routing_map, block_size_m, num_local_experts, local_expert_start, valid_tokens,
-        )
+    sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
+        routing_map, block_size_m, num_local_experts, local_expert_start, valid_tokens
     )
     num_valid = max_tokens * topk
 
@@ -612,6 +648,14 @@ def vllm_fused_moe(
     # out (if provided), zeros rows beyond valid_tokens, and skips non-local
     # expert slots.
     return _moe_sum(
-        intermediate3, probs, max_tokens, topk, K,
-        valid_tokens, routing_map, local_expert_start, num_local_experts, out=out,
+        intermediate3,
+        probs,
+        max_tokens,
+        topk,
+        K,
+        valid_tokens,
+        routing_map,
+        local_expert_start,
+        num_local_experts,
+        out=out,
     )
