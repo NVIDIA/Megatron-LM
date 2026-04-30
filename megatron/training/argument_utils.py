@@ -1,36 +1,39 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import ast
+import builtins
 import dataclasses
-import typing
-import types
-from typing import Any, Callable, Optional
-from argparse import ArgumentParser, _ArgumentGroup, Namespace
+import enum
 import inspect
 import itertools
-import builtins
-import ast
-import enum
-from dataclasses import Field, fields
+import types
+import typing
 import warnings
-import torch.nn.functional as F
+from argparse import ArgumentParser, Namespace, _ArgumentGroup
+from dataclasses import Field, fields
+from typing import Any, Callable, Optional
+
 import torch
+import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
-
 from megatron.training.config import (
-    DistributedInitConfig, 
-    PretrainConfigContainer, 
-    SchedulerConfig, 
-    TokenizerConfig,
-    TrainingConfig, 
-    ValidationConfig, 
-    RNGConfig, 
+    CheckpointConfig,
+    DistributedInitConfig,
     LoggerConfig,
+    PretrainConfigContainer,
+    ProfilingConfig,
+    RerunStateMachineConfig,
+    RNGConfig,
+    SchedulerConfig,
     StragglerDetectionConfig,
-    RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
+    TokenizerConfig,
+    TrainingConfig,
+    ValidationConfig,
 )
 from megatron.training.models.hybrid import HybridModelConfig
+
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -272,13 +275,13 @@ class ArgumentGroupFactory:
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
-    from megatron.core.transformer import MLATransformerConfig
-    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
-        HeterogeneousTransformerConfig,
-    )
     from megatron.core.quantization.utils import (
         kitchen_quantization_recipe_config,
         load_quantization_recipe,
+    )
+    from megatron.core.transformer import MLATransformerConfig
+    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+        HeterogeneousTransformerConfig,
     )
 
     # Config class.
@@ -301,6 +304,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    kw_args['actual_vocab_size'] = args.padded_vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
