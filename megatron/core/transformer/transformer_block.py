@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple, Union, cast
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -22,7 +23,10 @@ from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    learned_output_contract,
+)
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -381,6 +385,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            if self.config.enable_hyper_connections:
+                hc_mult = self.config.num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+                self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+                self.hc_head_scale = nn.Parameter(torch.ones(1))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -921,10 +936,23 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         intermediate_hidden_states.append(hidden_states)
 
         # Only contract if the final layer norm is in this stage
+        mhc_multistream = None
         if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
-            hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.num_residual_streams
-            )  # [s, b, n*C] -> [s, b, C]
+            # When MTP is enabled, save pre-contraction multi-stream for MTP input.
+            if self.config.mtp_num_layers is not None:
+                assert (
+                    len(extract_layer_indices) == 0
+                ), "Feature extraction is not supported with mHC + MTP."
+                mhc_multistream = hidden_states
+            # [s, b, n*C] -> [s, b, C]
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.num_residual_streams,
+                self.config.layernorm_epsilon,
+            )
 
         # Final layer norm.
         if self.final_layernorm is not None:
@@ -943,6 +971,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states
+
+        # When mHC + MTP, return both contracted [s,b,h] (for lm_head) and
+        # pre-contraction multi-stream [s,b,n*h] (for MTP input).
+        if mhc_multistream is not None:
+            return hidden_states, mhc_multistream
 
         return hidden_states
 

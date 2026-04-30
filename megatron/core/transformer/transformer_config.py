@@ -1695,13 +1695,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.use_fused_mhc = False
 
-        # Validation for hyper_connections with MTP
-        if self.enable_hyper_connections and self.mtp_num_layers is not None:
-            raise ValueError(
-                "enable_hyper_connections is not compatible with Multi-Token Prediction (MTP). "
-                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
-            )
-
         if self.fine_grained_activation_offloading:
             assert (
                 not self.cpu_offloading
