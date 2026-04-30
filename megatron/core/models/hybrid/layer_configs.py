@@ -93,6 +93,19 @@ class LayerConfig:
         kwargs.update(self._layer_specific_kwargs())
         if self.extra:
             validate_extra_kwargs(self.extra, f"{type(self).__name__}.extra")
+            # Reject ``extra`` keys that would shadow model-wide parallelism
+            # values. Process groups are constructed once from the recipe's
+            # topology; a per-layer extra that disagreed would produce a TC
+            # whose sharding claims contradict the live process groups —
+            # invalid sharding or runtime errors. Job-level fields always win.
+            if parallelism:
+                shadowed = set(parallelism) & set(self.extra)
+                if shadowed:
+                    raise ValueError(
+                        f"{type(self).__name__}.extra cannot override model-wide "
+                        f"parallelism fields {sorted(shadowed)}; set them on "
+                        f"HybridModelConfig instead."
+                    )
             kwargs.update(self.extra)
         # Test-friendly fallback: ``compile()`` always supplies a placeholder,
         # but unit tests calling ``lc.to_transformer_config(num_layers=N)``
