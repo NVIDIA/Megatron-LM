@@ -31,6 +31,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.engines.retirement import StepRetirementService
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -229,6 +230,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
         self.reset()
+
+        # v3 plan §2.8 — ordered retirement service. Queue depth at this
+        # commit is 1 (the engine retires each step synchronously inside the
+        # same coroutine that launched it), but the deque-based contract is
+        # established here so commits 18+ can raise the queue depth.
+        self.retirement = StepRetirementService(self._finalize_step)
 
         # Set callback for getting stop word finished request IDs
         self.controller.set_stop_word_finished_ids_callback(
@@ -1732,17 +1739,26 @@ class DynamicInferenceEngine(AbstractEngine):
     ):
         """Uses `asyncio` for continuous bookkeeping.
 
-        Args:
-            step_result (Optional[Dict]): The result of the step.
-            context_state (Dict): is_decode_only, total/paused request count, active token count.
-            step_time (float): How long this step took.
+        Delegates to ``StepRetirementService.retire`` (v3 plan §2.8). At this
+        commit there is no in-flight ``AsyncStepOutput`` to surface to the
+        engine — the controller resolves the bundle synchronously inside
+        ``_dynamic_step_context_bookkeeping`` — so the service receives
+        ``output=None`` and runs the finalization callback immediately.
+        Commit 18 wires the unresolved bundle through the queue.
+        """
+        return await self.retirement.retire(
+            output=None, payload=(step_result, context_state, step_time)
+        )
 
-        Returns:
-            A dictionary containing:
-                active_requests (List): Requests that ran in the last step and are still active.
-                finished_requests (List): Requests that ran in the last step and have now finished.
-                step_time (float): The step time in seconds.
-                cuda_graph_request_count (int): The CUDA graph batch size matching this step.
+    async def _finalize_step(
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float
+    ):
+        """Per-step finalization callback for ``StepRetirementService``.
+
+        This is the body of the legacy ``async_bookkeep`` — it owns
+        post-processing (request finalization, detokenization), coordinator
+        emission, prefix-cache accounting, metrics, and console logging.
+        Returns the public step-result dict the engine's caller consumes.
         """
         # Increment finished_request_count.
         bookkeep_step_id = self.context.step_count
