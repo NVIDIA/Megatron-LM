@@ -211,6 +211,60 @@ class InferenceConfig:
     """
 
     # =================================
+    # Async-overlap pipeline config (v3 plan)
+    # =================================
+    # All knobs default to a value that preserves today's serial behavior; they
+    # are introduced here so commits 3+ can import-without-touching them. The
+    # async pipeline is wired up in commit 18 and remains gated off by default.
+    enable_async_overlap: bool = False
+    """
+    Master switch for the queue-depth-2 async-overlap inference pipeline. When
+    False (default), the legacy synchronous code path is used. When True, the
+    engine holds two steps in flight and step N+1's GPU forward overlaps step
+    N's CPU retirement.
+    """
+
+    async_overlap_queue_size: int = 2
+    """
+    Maximum number of in-flight steps when `enable_async_overlap` is True. The
+    snapshot pool size is `async_overlap_queue_size + 1`. Queue depth 1 is a
+    supported debug mode of the new architecture (serial-equivalent).
+    """
+
+    async_overlap_debug_checks: bool = False
+    """
+    When True, enables runtime invariant assertions across the async pipeline:
+    no leaked output placeholders, no leaked journal entries, no leaked
+    reservations, no out-of-order output, no H2D into a snapshot still
+    referenced by an in-flight launch, no CPU-future await blocking forward
+    kernel launch, etc. Adds overhead; intended for tests and debugging.
+    """
+
+    cuda_graph_memory_budget_bytes: Optional[int] = None
+    """
+    Hard upper bound on total CUDA graph cache memory (in bytes). When set, the
+    cache becomes LRU-bounded and evicts least-recently-used graphs to stay
+    under budget. None disables the budget check. Used by the snapshot-keyed
+    graph cache introduced in commit 11.
+    """
+
+    cuda_graph_capture_mode: str = "warmup_only"
+    """
+    Controls when CUDA graphs may be captured. One of:
+        - "warmup_only" (default): all graphs captured at warmup; mid-run
+          captures are a hard error.
+        - "on_first_use": mid-run capture allowed; logs a warning.
+        - "on_first_use_with_eviction": mid-run capture + LRU eviction under
+          `cuda_graph_memory_budget_bytes`.
+    """
+
+    cuda_graph_max_captures: Optional[int] = None
+    """
+    Numerical cap on the number of CUDA graph captures, applied alongside the
+    byte budget. None disables.
+    """
+
+    # =================================
     # Model config
     # =================================
     max_sequence_length: int = 2560
