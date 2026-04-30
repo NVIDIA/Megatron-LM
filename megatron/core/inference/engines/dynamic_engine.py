@@ -354,8 +354,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # same coroutine that launched it), but the deque-based contract is
         # established here so commits 18+ can raise the queue depth.
         self.retirement = StepRetirementService(self._finalize_step)
-        # v3 plan §commit 18 — async-overlap pipeline. Default off until
-        # commit 30 flips ``enable_async_overlap``.
+        # v3 plan §commit 18 — async-overlap pipeline. Commit 30 flipped
+        # ``enable_async_overlap`` to True; the legacy path remains opt-in
+        # until commit 31 deletes it.
         self.async_pipeline = DynamicAsyncPipeline(self)
         # v3 plan §commit 29 — step-boundary admission gate. The DP
         # coordinator publishes admission sets per step; the engine waits

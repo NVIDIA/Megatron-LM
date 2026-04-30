@@ -1949,12 +1949,12 @@ class TextGenerationController:
         ``prev_sampled_token_ids`` (D2D copy already enqueued in
         ``launch_dynamic_sampling`` by commit 16).
 
-        With ``enable_async_overlap=False`` (today's default) the legacy
+        With ``enable_async_overlap=False`` (legacy opt-in path) the legacy
         serial path is authoritative — ``_dynamic_step_context_init``
         already populated input ids on CPU and the H2D in
         ``transfer_bookkeeping_to_gpu`` carried them to the snapshot's
         buffer. The GPU scatter is a no-op on this path; it is consumed
-        only by commit 18's pipeline when the flag is on.
+        only by commit 18's pipeline when the flag is on (now the default).
         """
         context = self.inference_wrapped_model.inference_context
         config = context.config

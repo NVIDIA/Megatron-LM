@@ -208,9 +208,9 @@ class TestTransactionJournal:
 
 
 class TestInferenceConfigAsyncOverlapKnobs:
-    def test_defaults_preserve_legacy_behavior(self):
+    def test_defaults_select_async_overlap(self):
         cfg = InferenceConfig()
-        assert cfg.enable_async_overlap is False
+        assert cfg.enable_async_overlap is True
         assert cfg.async_overlap_queue_size == 2
         assert cfg.async_overlap_debug_checks is False
         assert cfg.cuda_graph_capture_mode == "warmup_only"

@@ -213,15 +213,15 @@ class InferenceConfig:
     # =================================
     # Async-overlap pipeline config (v3 plan)
     # =================================
-    # All knobs default to a value that preserves today's serial behavior; they
-    # are introduced here so commits 3+ can import-without-touching them. The
-    # async pipeline is wired up in commit 18 and remains gated off by default.
-    enable_async_overlap: bool = False
+    # The async-overlap pipeline is the validated default after commit 30; the
+    # legacy synchronous path remains reachable by setting `enable_async_overlap=False`
+    # until commit 31 deletes it.
+    enable_async_overlap: bool = True
     """
     Master switch for the queue-depth-2 async-overlap inference pipeline. When
-    False (default), the legacy synchronous code path is used. When True, the
-    engine holds two steps in flight and step N+1's GPU forward overlaps step
-    N's CPU retirement.
+    True (default), the engine holds two steps in flight and step N+1's GPU
+    forward overlaps step N's CPU retirement. When False, the legacy
+    synchronous code path is used; the legacy path will be removed in commit 31.
     """
 
     async_overlap_queue_size: int = 2
