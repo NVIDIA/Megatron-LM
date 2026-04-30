@@ -42,11 +42,17 @@ class KVBlockAllocator:
         self.on_blocks_deregistered: Optional[Callable] = None
 
         self.total_count = total_count
-        self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
+        self.total_avail = total_count
         self.paused_count = paused_count
-        self.active_count = total_count - paused_count - 1  # -1 for dummy_block_idx
-        assert self.active_count >= 1  # ensures paused_count < total_count - 1
-        self.dummy_block_idx = self.total_count - 1
+        self.active_count = total_count - paused_count
+        assert self.active_count >= 1  # ensures paused_count < total_count
+        # Dummy sentinel ID. Reserved one past the real block range so the
+        # graphed scatter paths can route invalid lanes to a slot that
+        # never collides with a real block ID. The per-block tracking
+        # tensors (block_hashes / block_ref_counts / block_timestamps,
+        # plus the graphed _pc_released_bitmap) are sized total_count + 1
+        # so this index is always valid.
+        self.dummy_block_idx = self.total_count
 
         # Initialize block pool as a "stack" data structure
         self.block_bag = torch.arange(
@@ -54,9 +60,14 @@ class KVBlockAllocator:
         )
 
         if self.enable_prefix_caching:
-            # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
+            # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash.
+            # Sized total_count + 1 so the slot at ``dummy_block_idx`` is a no-op
+            # target for the graphed scatter paths.
             self.block_hashes = torch.full(
-                (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
+                (self.total_count + 1,),
+                -1,
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
             )
 
             # Hash-to-block mapping for O(1) prefix lookup
@@ -64,14 +75,18 @@ class KVBlockAllocator:
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
-                (self.total_count,), dtype=torch.int32, device=torch.cuda.current_device()
+                (self.total_count + 1,),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
             )
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps = torch.zeros(
-                    (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
+                    (self.total_count + 1,),
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
                 )
 
         # Per-block MoE routing storage (populated when routing replay is enabled)
@@ -79,14 +94,14 @@ class KVBlockAllocator:
 
     def __str__(self):
         return (
-            f"using: total {self.get_total_used()}/{self.total_count - 1}"
+            f"using: total {self.get_total_used()}/{self.total_count}"
             f"; active {self.get_active_used()}/{self.active_count}"
             f"; paused {self.get_paused_used()}/{self.paused_count}"
         )
 
     def get_total_used(self):
         """Compute number of total blocks used."""
-        return self.total_count - self.total_avail - 1
+        return self.total_count - self.total_avail
 
     def get_active_used(self):
         """Compute number of active blocks used."""
@@ -242,7 +257,7 @@ class KVBlockAllocator:
             self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
-        self.total_avail = self.total_count - 1
+        self.total_avail = self.total_count
 
         if self.enable_prefix_caching:
             # Reset all block hashes

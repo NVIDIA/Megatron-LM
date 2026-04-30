@@ -536,7 +536,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
-            self.max_requests = self.kv_block_allocator.total_count - 1  # -1 for dummy block
+            self.max_requests = self.kv_block_allocator.total_count
 
             # Adjust max_requests for Mamba memory constraints if necessary
             if self.is_hybrid_model and mamba_max_requests < self.max_requests:
@@ -3293,12 +3293,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             'gtd_block_count': int,
             }
         """
-        # Total usable blocks exclude the reserved dummy block.
-        total_blocks = max(self.kv_block_allocator.total_count - 1, 1)
+        total_blocks = max(self.kv_block_allocator.total_count, 1)
         block_count_avail = int(self.kv_block_allocator.total_avail)
 
         # Overall allocated blocks in the buffer right now.
-        allocated_blocks = (self.kv_block_allocator.total_count - 1) - block_count_avail
+        allocated_blocks = self.kv_block_allocator.total_count - block_count_avail
         allocated_blocks = int(max(0, allocated_blocks))
 
         # Active unique blocks referenced by current active requests only.
