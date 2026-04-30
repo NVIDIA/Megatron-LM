@@ -96,6 +96,7 @@ def _apply_rotary_pos_emb_bshd(
     mla_rotary_interleaved: bool = False,
     mscale: float = 1.0,
     inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
     multi_latent_attention: Optional[bool] = None,
 ) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
@@ -148,7 +149,7 @@ def _apply_rotary_pos_emb_bshd(
     # Fallback to original permutation
     # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
     # The existing MLA code is safe because the dot product is permutation-invariant.
-    if mla_rotary_interleaved:
+    if mla_rotary_interleaved and mla_output_remove_interleaving:
         x1, x2 = torch.chunk(t, 2, dim=-1)
         t = torch.stack((x1, x2), dim=-1).flatten(start_dim=-2)
 
@@ -212,6 +213,7 @@ def _apply_rotary_pos_emb_thd(
     mla_rotary_interleaved: bool = False,
     mscale: float = 1.0,
     inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
 ) -> Tensor:
@@ -266,6 +268,7 @@ def _apply_rotary_pos_emb_thd(
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         ).squeeze(1)
     else:
         # CASE 2: Traditional mapping without offsets
@@ -283,6 +286,7 @@ def _apply_rotary_pos_emb_thd(
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         ).squeeze(1)
 
 
@@ -295,6 +299,7 @@ def apply_rotary_pos_emb(
     cp_group: torch.distributed.ProcessGroup = None,
     mla_rotary_interleaved: bool = False,
     inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -337,7 +342,12 @@ def apply_rotary_pos_emb(
                 use_unfused = True
             if not use_unfused:
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
-                return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
+                return fused_apply_rotary_pos_emb(
+                    t,
+                    freqs,
+                    interleaved=config.rotary_interleaved,
+                    mla_output_remove_interleaving=mla_output_remove_interleaving,
+                )
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
             return fused_apply_rotary_pos_emb_thd(
@@ -347,6 +357,7 @@ def apply_rotary_pos_emb(
                 cp_size=cp_group.size(),
                 cp_rank=cp_group.rank(),
                 interleaved=config.rotary_interleaved,
+                mla_output_remove_interleaving=mla_output_remove_interleaving,
             )
     # use unfused implementation
     if cu_seqlens is None:
@@ -357,6 +368,7 @@ def apply_rotary_pos_emb(
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         )
     else:
         return _apply_rotary_pos_emb_thd(
@@ -368,6 +380,7 @@ def apply_rotary_pos_emb(
             mscale=mscale,
             cp_group=cp_group,
             inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         )
 
 

@@ -341,6 +341,7 @@ class DSv4HybridAttention(Attention):
                 self.pg_collection.cp.rank(),
                 self.pg_collection.cp.size(),
                 inverse=True,
+                mla_output_remove_interleaving=True,
             )
         else:
             content_part, rot_part = torch.split(
@@ -355,6 +356,7 @@ class DSv4HybridAttention(Attention):
                 cp_group=self.pg_collection.cp,
                 mla_rotary_interleaved=True,
                 inverse=True,
+                mla_output_remove_interleaving=True,
             )
             core_attn_out = torch.cat([content_part, rot_part], dim=-1)
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
@@ -599,6 +601,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cu_seqlens_q,
                     cp_rank,
                     cp_size,
+                    mla_output_remove_interleaving=True,
                 )
                 kv = kv.unsqueeze(-2)
                 kv = fused_mla_rope_inplace(
@@ -610,6 +613,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cu_seqlens_q,
                     cp_rank,
                     cp_size,
+                    mla_output_remove_interleaving=True,
                 )
                 key = kv
                 value = kv
@@ -642,6 +646,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    mla_output_remove_interleaving=True,
                 )
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
@@ -658,6 +663,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    mla_output_remove_interleaving=True,
                 )
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]

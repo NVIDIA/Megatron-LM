@@ -43,7 +43,7 @@ class FakeCPGroup:
         return 0
 
 
-def _test_fused_mla_rope_inplace(input_format, inverse=False):
+def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleaving=False):
     assert fused_mla_rope_inplace is not None
     num_heads = 32
     q_dim = 128
@@ -105,12 +105,20 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False):
         cp_group=FakeCPGroup(),
         mla_rotary_interleaved=True,
         inverse=inverse,
+        mla_output_remove_interleaving=remove_interleaving,
     )
     pytorch_output = torch.concat([no_pe, pe_output], dim=-1)
     pytorch_output.backward(pytorch_bwd_input, retain_graph=True)
 
     fused_output = fused_mla_rope_inplace(
-        fused_fwd_input, cos, sin, q_dim, emb_dim, cu_seqlens_q=cu_seqlens, inverse=inverse
+        fused_fwd_input,
+        cos,
+        sin,
+        q_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=inverse,
+        remove_interleaving=remove_interleaving,
     )
     fused_output.backward(fused_bwd_input, retain_graph=True)
 
@@ -129,7 +137,7 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False):
     )
 
 
-def _test_fused_mla_rope_kv_split(input_format):
+def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
     assert fused_mla_rope_kv_split is not None
     num_heads = 32
     k_dim = 128
@@ -204,6 +212,7 @@ def _test_fused_mla_rope_kv_split(input_format):
         mscale=mscale,
         cp_group=FakeCPGroup(),
         mla_rotary_interleaved=True,
+        mla_output_remove_interleaving=remove_interleaving,
     )
     if input_format == "sbhd":
         pe_output = pe_output.expand(-1, -1, num_heads, -1)
@@ -224,6 +233,7 @@ def _test_fused_mla_rope_kv_split(input_format):
         k_dim,
         v_dim,
         cu_seqlens_kv=cu_seqlens,
+        remove_interleaving=remove_interleaving,
     )
     torch.autograd.backward(
         (fused_k_output, fused_v_output), (fused_bwd_k_input, fused_bwd_v_input)
@@ -262,14 +272,16 @@ def _test_fused_mla_rope_kv_split(input_format):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
 class TestFusedMLARope:
-    def test_inplace_forward_backward(self, input_format):
-        _test_fused_mla_rope_inplace(input_format, inverse=False)
+    @pytest.mark.parametrize("inverse", [False, True])
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    def test_inplace_forward_backward(self, input_format, inverse, remove_interleaving):
+        _test_fused_mla_rope_inplace(
+            input_format, inverse=inverse, remove_interleaving=remove_interleaving
+        )
 
-    def test_inplace_inverse_forward_backward(self, input_format):
-        _test_fused_mla_rope_inplace(input_format, inverse=True)
-
-    def test_kv_split_forward_backward(self, input_format):
-        _test_fused_mla_rope_kv_split(input_format)
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    def test_kv_split_forward_backward(self, input_format, remove_interleaving):
+        _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)
 
 
 class TestApplyRotaryPosEmbMlaFusionConflict:

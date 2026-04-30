@@ -140,6 +140,7 @@ def _apply_rope(
             None,
             cp_group.rank(),
             cp_group.size(),
+            mla_output_remove_interleaving=True,
         )
     else:
         x_nope, x_pe = torch.split(x, [nope_dim, pos_dim], dim=-1)
@@ -151,6 +152,7 @@ def _apply_rope(
             mscale=mscale,
             cp_group=cp_group,
             mla_rotary_interleaved=True,
+            mla_output_remove_interleaving=True,
         )
         out = torch.cat([x_nope, x_pe], dim=-1)
     if squeeze_head:
