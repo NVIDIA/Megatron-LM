@@ -1110,6 +1110,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_last_token_idxs[padding_request_slice].fill_(0)
         self.active_request_metadata["return_log_probs"][padding_request_slice] = False
 
+        # We upsize this tensor by 1 do reserve a permanent sentinel slot. We must pad that slot.
+        self.active_request_last_token_idxs[self.max_requests] = self.padded_active_token_count - 1
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 
