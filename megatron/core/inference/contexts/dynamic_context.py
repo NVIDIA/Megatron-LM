@@ -52,6 +52,7 @@ from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
+from .snapshot_pool import GpuSnapshotBufferPool
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -1111,14 +1112,21 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
-        # GPU view: the single interface for GPU code to read context state.
-        # Populated per-step by transfer_bookkeeping_to_gpu().
-        self.gpu_view = ContextGPUView(
+        # v3 plan §2.5 — GPU snapshot pool. ``max_concurrent_steps=1`` here so
+        # the pool has 2 slots; only one is in flight at a time and the spare
+        # exists so prepare-next-step always has a free slot to populate
+        # (commit 18 raises the queue depth). The existing single-buffer code
+        # paths read ``self.gpu_view`` which is rebound by acquire/release.
+        self.snapshot_pool = GpuSnapshotBufferPool(
+            max_concurrent_steps=1,
             max_requests=self.max_requests,
             max_tokens=self.max_tokens,
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
+        )
+        self._active_snapshot_slot, self.gpu_view = self.snapshot_pool.acquire(
+            step_id=-1
         )
 
         # Bind the shared MHA GPU views to both graph and non-graph metadata;
