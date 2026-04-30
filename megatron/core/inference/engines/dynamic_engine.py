@@ -1566,12 +1566,15 @@ class DynamicInferenceEngine(AbstractEngine):
             if mamba_caching_enabled and not is_continuing_chunked_prefill:
                 req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
 
-            # Use remaining prompt tokens for scheduling decisions
+            # Use remaining prompt tokens for scheduling decisions. The
+            # placeholder-adjusted active-token count keeps us conservative
+            # while a prior step's output is still in flight (v3 plan §2.9).
             remaining_len = len(req.remaining_prompt_tokens)
+            current_token_count = self.context.active_token_count_with_placeholders
             token_fully_can_be_added = (
-                self.context.active_token_count + remaining_len <= self.context.max_tokens
+                current_token_count + remaining_len <= self.context.max_tokens
             )
-            token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
+            token_partially_can_be_added = current_token_count < self.context.max_tokens
             request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
@@ -1605,7 +1608,10 @@ class DynamicInferenceEngine(AbstractEngine):
                                 not in self.context.kv_block_allocator.kv_hash_to_block_id
                             ):
                                 pending_block_hashes.add(block_hash)
-                    prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
+                    prefill_chunk_length = (
+                        self.context.max_tokens
+                        - self.context.active_token_count_with_placeholders
+                    )
 
                     # If this chunk would leave exactly 1 token for the final chunk, reduce
                     # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
@@ -1693,6 +1699,10 @@ class DynamicInferenceEngine(AbstractEngine):
         forward_step_id = self.context.step_count
         forward_range_name = "Prefill" if not is_decode_only else "Decode"
         nvtx_range_push(forward_range_name, suffix=f"step={forward_step_id}")
+        # v3 plan §2.4 — open the journal entry for this step. With overlap
+        # off the entry holds no reservations and is committed empty inside
+        # ``_finalize_step``; commits 7+ start populating it.
+        self.context.begin_step_transaction(forward_step_id)
         # TODO @TDE: Account for this line when overlapping forward and bookkeep.
         self.is_decode_only = is_decode_only
 
@@ -1968,6 +1978,15 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.context.enable_prefix_caching:
                 self._prefix_cache_hits = 0
                 self._prefix_cache_blocks_matched = 0
+
+        # v3 plan §2.4 — commit the journal entry opened in async_forward.
+        # With overlap off the entry is empty (no reservations, no
+        # placeholder deltas) so commit is a no-op on context state.
+        forward_step_id = context_state.get("step_count")
+        if forward_step_id is not None and self.context.journal.has_entry(
+            forward_step_id
+        ):
+            self.context.commit_step_transaction(forward_step_id)
 
         return {
             "active_request_ids": active_request_ids,

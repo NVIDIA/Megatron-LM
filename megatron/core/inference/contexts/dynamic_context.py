@@ -4,7 +4,17 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    # Live runtime imports happen inside ``__init__`` to avoid the
+    # ``engines/__init__.py`` → ``dynamic_engine`` → ``dynamic_context``
+    # circular import.
+    from megatron.core.inference.engines.async_pipeline_types import Reservation
+    from megatron.core.inference.engines.transaction_journal import (
+        JournalEntry,
+        TransactionJournal,
+    )
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -270,6 +280,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
+
+        # v3 plan §2.4 — transaction journal becomes a live consumer of
+        # state changes. Lazy import avoids the engines/__init__.py →
+        # dynamic_engine → dynamic_context circular path.
+        from megatron.core.inference.engines.transaction_journal import TransactionJournal
+
+        self.journal: TransactionJournal = TransactionJournal()
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -843,6 +860,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_query_lengths = torch.empty(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
         )
+        # v3 plan §2.9 — per-slot count of in-flight output placeholders.
+        # Incremented when ``prepare_next_step_optimistic`` schedules a slot
+        # for a step (1 + speculative_width); decremented in
+        # ``commit_step_transaction`` by the actual accepted-token count.
+        # CPU-only int32; defaults to zero so today's serial path is unchanged.
+        self.num_output_placeholders = torch.zeros(
+            self.max_requests, dtype=torch.int32, device='cpu',
+        )
         # True only for a new request , then after a forward pass it is set to False
         self.request_in_prefill_status_tensor = torch.empty(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True,
@@ -1298,6 +1323,111 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_active_request_count(self):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
+
+    # ------------------------------------------------------------------
+    # Transaction journal API (v3 plan §2.4 / §2.9)
+    # ------------------------------------------------------------------
+
+    @property
+    def total_active_placeholders(self) -> int:
+        """Sum of in-flight output placeholders for currently active slots.
+
+        With ``enable_async_overlap=False`` every entry roundtrips to zero
+        within the same step, so this is always 0 today. Schedulers consult
+        it via :py:meth:`active_token_count_with_placeholders`.
+        """
+        if self.total_request_count <= self.paused_request_count:
+            return 0
+        return int(
+            self.num_output_placeholders[
+                self.paused_request_count : self.total_request_count
+            ]
+            .sum()
+            .item()
+        )
+
+    @property
+    def active_token_count_with_placeholders(self) -> int:
+        """``active_token_count`` adjusted for in-flight output placeholders.
+
+        Schedulers use this in place of raw ``active_token_count`` so that
+        admitting a new request never overshoots the token budget when a
+        prior step's output is still in flight.
+        """
+        return self.active_token_count + self.total_active_placeholders
+
+    def begin_step_transaction(self, step_id: int) -> "JournalEntry":
+        """Open (or fetch) the journal entry for ``step_id``.
+
+        Idempotent: callers that need to record into the entry without first
+        knowing whether it has been opened may call this method and then
+        record. The corresponding close is :py:meth:`commit_step_transaction`
+        or :py:meth:`rollback_step_transaction`.
+        """
+        return self.journal.begin_step_transaction(step_id)
+
+    def add_output_placeholders(
+        self, step_id: int, slot_indices: Sequence[int], delta: int
+    ) -> None:
+        """Increment ``num_output_placeholders[slot]`` by ``delta`` for each
+        slot in ``slot_indices`` and journal the change so commit / rollback
+        can undo it.
+        """
+        entry = self.journal.begin_step_transaction(step_id)
+        if isinstance(slot_indices, torch.Tensor):
+            iter_slots: Sequence[int] = slot_indices.tolist()
+        else:
+            iter_slots = list(slot_indices)
+        for slot in iter_slots:
+            self.num_output_placeholders[slot] += delta
+            entry.placeholder_deltas[slot] = (
+                entry.placeholder_deltas.get(slot, 0) + delta
+            )
+
+    def record_resource_reservation(
+        self, step_id: int, reservation: "Reservation"
+    ) -> None:
+        """Append ``reservation`` to the journal entry for ``step_id``."""
+        self.journal.begin_step_transaction(step_id)
+        self.journal.record_resource_reservation(step_id, reservation)
+
+    def record_snapshot_owner(self, step_id: int, snapshot_buffer_id: int) -> None:
+        """Bind the journal entry for ``step_id`` to a snapshot pool slot."""
+        entry = self.journal.begin_step_transaction(step_id)
+        entry.snapshot_buffer_id = snapshot_buffer_id
+
+    def commit_step_transaction(
+        self,
+        step_id: int,
+        accepted_token_counts: Optional[dict] = None,
+    ) -> "JournalEntry":
+        """Commit the entry for ``step_id``.
+
+        ``accepted_token_counts`` maps slot index to the number of tokens
+        this step actually accepted (``1 + accepted_speculative`` for
+        speculative decode); placeholders are decremented by this count
+        instead of the full ``placeholder_deltas`` increment. With overlap
+        off the two are always equal, so the default branch undoes the
+        full delta.
+        """
+        entry = self.journal.commit_step_transaction(step_id)
+        for slot, delta in entry.placeholder_deltas.items():
+            decrement = (
+                accepted_token_counts[slot]
+                if accepted_token_counts is not None and slot in accepted_token_counts
+                else delta
+            )
+            self.num_output_placeholders[slot] -= decrement
+        return entry
+
+    def rollback_step_transaction(self, step_id: int) -> "JournalEntry":
+        """Roll back the entry for ``step_id`` and undo every placeholder
+        increment recorded during the step.
+        """
+        entry = self.journal.rollback_step_transaction(step_id)
+        for slot, delta in entry.placeholder_deltas.items():
+            self.num_output_placeholders[slot] -= delta
+        return entry
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -2231,6 +2361,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.step_count = 0
         self.prefix_cache_lru_clock = 0
 
+        # Reset transaction journal + placeholder accounting (v3 plan §2.4).
+        if hasattr(self, "num_output_placeholders") and self.num_output_placeholders is not None:
+            self.num_output_placeholders.fill_(0)
+        from megatron.core.inference.engines.transaction_journal import TransactionJournal
+
+        self.journal = TransactionJournal()
+
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
@@ -2444,7 +2581,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         request_tokens_can_be_added = (
-            self.active_token_count + effective_prefill_chunk_length <= self.max_tokens
+            self.active_token_count_with_placeholders + effective_prefill_chunk_length
+            <= self.max_tokens
         )
         kv_cache_available = self.kv_block_allocator.is_memory_available(num_blocks_from_pool)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
