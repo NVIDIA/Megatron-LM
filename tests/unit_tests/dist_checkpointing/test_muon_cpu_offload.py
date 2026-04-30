@@ -1,43 +1,22 @@
-"""Standalone tests for Muon CPU offloading in LayerWiseDistributedOptimizer.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-Run with:
-    torchrun --nproc-per-node=4 tests/test_muon_cpu_offload.py
-
-Avoids the pytest conftest circular-import issue by running as a plain script.
-"""
-
-import os
-import sys
-import traceback
-from datetime import timedelta
-
+import pytest
 import torch
-import torch.distributed
 
 from megatron.core import parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
-def init_distributed():
-    rank = int(os.environ['LOCAL_RANK'])
-    world_size = int(os.environ['WORLD_SIZE'])
-    torch.cuda.set_device(rank)
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(
-            backend='nccl', world_size=world_size, rank=rank,
-            timeout=timedelta(minutes=2),
-        )
-    return rank, world_size
-
-
-def create_model(seed, tp, pp):
+def _create_model(seed, tp, pp):
+    """Create a small GPT model for testing."""
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     config = TransformerConfig(
@@ -61,7 +40,8 @@ def create_model(seed, tp, pp):
     return model
 
 
-def create_optimizer_with_cpu_offload(model, cpu_offload=True):
+def _create_optimizer(model, cpu_offload=True):
+    """Create a Muon LayerWise optimizer with optional CPU offloading."""
     config = OptimizerConfig(
         bf16=True,
         params_dtype=torch.bfloat16,
@@ -75,18 +55,20 @@ def create_optimizer_with_cpu_offload(model, cpu_offload=True):
 
     if isinstance(optimizer, LayerWiseDistributedOptimizer):
         for opt in optimizer.chained_optimizers:
-            if getattr(opt, 'init_state_fn', None) is None:
+            init_fn = getattr(opt, 'init_state_fn', None)
+            if init_fn is None:
                 continue
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
+            if hasattr(opt, 'optimizer'):
+                init_fn(opt.optimizer)
             else:
-                opt.init_state_fn(opt.optimizer)
+                init_fn(opt)
         if cpu_offload:
             optimizer.offload_optimizer_states()
     return optimizer
 
 
 def _iter_fp16_opts(optimizer):
+    """Yield Float16OptimizerWithFloat16Params sub-optimizers."""
     for opt in optimizer.chained_optimizers:
         if getattr(opt, 'is_stub_optimizer', False):
             continue
@@ -94,12 +76,24 @@ def _iter_fp16_opts(optimizer):
             yield opt
 
 
-def test_states_on_cpu(rank):
-    """After init with cpu_offload=True, fp32 master weights and state are on CPU."""
-    parallel_state.initialize_model_parallel(2, 2)
-    try:
-        model = create_model(seed=2, tp=2, pp=2)
-        optimizer = create_optimizer_with_cpu_offload(model, cpu_offload=True)
+class TestMuonCPUOffload:
+    """Tests for Muon CPU offloading in LayerWiseDistributedOptimizer."""
+
+    def setup_method(self, method):
+        pass
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('tp,pp', [(2, 2), (1, 4), (4, 1)])
+    def test_states_on_cpu(self, tp, pp):
+        """After init with cpu_offload=True, fp32 master weights and state are on CPU."""
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
+
+        Utils.initialize_model_parallel(tp, pp)
+        model = _create_model(seed=2, tp=tp, pp=pp)
+        optimizer = _create_optimizer(model, cpu_offload=True)
 
         assert isinstance(optimizer, LayerWiseDistributedOptimizer)
         assert optimizer._cpu_offload
@@ -108,28 +102,24 @@ def test_states_on_cpu(rank):
             for group in opt.fp32_from_float16_groups:
                 for param in group:
                     assert not param.data.is_cuda, (
-                        f"[rank {rank}] fp32 master weight should be on CPU, "
-                        f"got {param.data.device}"
+                        f"fp32 master weight should be on CPU, got {param.data.device}"
                     )
             for state_vals in opt.optimizer.state.values():
                 for key, val in state_vals.items():
                     if isinstance(val, torch.Tensor):
                         assert not val.is_cuda, (
-                            f"[rank {rank}] optimizer state '{key}' should be on CPU, "
-                            f"got {val.device}"
+                            f"optimizer state '{key}' should be on CPU, got {val.device}"
                         )
 
-        print(f"  [rank {rank}] PASSED: test_states_on_cpu")
-    finally:
-        parallel_state.destroy_model_parallel()
+    @pytest.mark.parametrize('tp,pp', [(2, 2), (1, 4), (4, 1)])
+    def test_roundtrip_correctness(self, tp, pp):
+        """Offload -> reload preserves fp32 master weight values exactly."""
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
 
-
-def test_roundtrip_correctness(rank):
-    """Offload -> reload preserves fp32 master weight values exactly."""
-    parallel_state.initialize_model_parallel(2, 2)
-    try:
-        model = create_model(seed=2, tp=2, pp=2)
-        optimizer = create_optimizer_with_cpu_offload(model, cpu_offload=True)
+        Utils.initialize_model_parallel(tp, pp)
+        model = _create_model(seed=2, tp=tp, pp=pp)
+        optimizer = _create_optimizer(model, cpu_offload=True)
 
         assert isinstance(optimizer, LayerWiseDistributedOptimizer)
 
@@ -144,12 +134,10 @@ def test_roundtrip_correctness(rank):
         for opt in _iter_fp16_opts(optimizer):
             for gidx, group in enumerate(opt.fp32_from_float16_groups):
                 for pidx, param in enumerate(group):
-                    assert param.data.is_cuda, (
-                        f"[rank {rank}] After reload, param should be on GPU"
-                    )
+                    assert param.data.is_cuda, "After reload, param should be on GPU"
                     expected = snapshots[(id(opt), gidx, pidx)].to(param.data.device)
                     assert torch.equal(param.data, expected), (
-                        f"[rank {rank}] Master weight mismatch after roundtrip"
+                        "Master weight mismatch after offload->reload roundtrip"
                     )
 
         optimizer.offload_optimizer_states()
@@ -157,21 +145,17 @@ def test_roundtrip_correctness(rank):
         for opt in _iter_fp16_opts(optimizer):
             for gidx, group in enumerate(opt.fp32_from_float16_groups):
                 for pidx, param in enumerate(group):
-                    assert not param.data.is_cuda, (
-                        f"[rank {rank}] After offload, param should be on CPU"
-                    )
+                    assert not param.data.is_cuda, "After offload, param should be on CPU"
 
-        print(f"  [rank {rank}] PASSED: test_roundtrip_correctness")
-    finally:
-        parallel_state.destroy_model_parallel()
+    @pytest.mark.parametrize('tp,pp', [(2, 2), (1, 4), (4, 1)])
+    def test_step_runs(self, tp, pp):
+        """A full optimizer.step() succeeds with CPU offloading."""
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
 
-
-def test_step_runs(rank):
-    """A full optimizer.step() succeeds with CPU offloading."""
-    parallel_state.initialize_model_parallel(2, 2)
-    try:
-        model = create_model(seed=2, tp=2, pp=2)
-        optimizer = create_optimizer_with_cpu_offload(model, cpu_offload=True)
+        Utils.initialize_model_parallel(tp, pp)
+        model = _create_model(seed=2, tp=tp, pp=pp)
+        optimizer = _create_optimizer(model, cpu_offload=True)
 
         assert isinstance(optimizer, LayerWiseDistributedOptimizer)
 
@@ -182,34 +166,34 @@ def test_step_runs(rank):
                 param.main_grad = g
 
         update_successful, grad_norm, num_zeros = optimizer.step()
-        assert isinstance(update_successful, bool), (
-            f"[rank {rank}] update_successful should be bool, got {type(update_successful)}"
-        )
+        assert isinstance(update_successful, bool)
 
         for opt in _iter_fp16_opts(optimizer):
             for group in opt.fp32_from_float16_groups:
                 for param in group:
                     assert not param.data.is_cuda, (
-                        f"[rank {rank}] After step, fp32 master weights should be on CPU"
+                        "After step, fp32 master weights should be back on CPU"
                     )
 
-        print(f"  [rank {rank}] PASSED: test_step_runs")
-    finally:
-        parallel_state.destroy_model_parallel()
+    @pytest.mark.parametrize('tp,pp', [(2, 2), (4, 1)])
+    @pytest.mark.parametrize('n_steps', [3, 5])
+    def test_numerical_equivalence(self, tp, pp, n_steps):
+        """Offloaded and non-offloaded optimizers produce identical results."""
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
 
+        Utils.initialize_model_parallel(tp, pp)
 
-def test_numerical_equivalence(rank, n_steps=5):
-    """Offloaded and non-offloaded optimizers produce identical fp32 master weights."""
-    parallel_state.initialize_model_parallel(2, 2)
-    try:
-        model_off = create_model(seed=42, tp=2, pp=2)
-        model_ref = create_model(seed=42, tp=2, pp=2)
+        model_off = _create_model(seed=42, tp=tp, pp=pp)
+        model_ref = _create_model(seed=42, tp=tp, pp=pp)
 
-        opt_off = create_optimizer_with_cpu_offload(model_off, cpu_offload=True)
-        opt_ref = create_optimizer_with_cpu_offload(model_ref, cpu_offload=False)
+        opt_off = _create_optimizer(model_off, cpu_offload=True)
+        opt_ref = _create_optimizer(model_ref, cpu_offload=False)
 
         assert isinstance(opt_off, LayerWiseDistributedOptimizer)
         assert isinstance(opt_ref, LayerWiseDistributedOptimizer)
+
+        rank = torch.distributed.get_rank()
 
         for step_i in range(n_steps):
             torch.manual_seed(1000 + step_i + rank)
@@ -228,17 +212,14 @@ def test_numerical_equivalence(rank, n_steps=5):
 
         opt_off.reload_optimizer_states()
 
-        for opt_o, opt_r in zip(
-            _iter_fp16_opts(opt_off), _iter_fp16_opts(opt_ref)
-        ):
+        for opt_o, opt_r in zip(_iter_fp16_opts(opt_off), _iter_fp16_opts(opt_ref)):
             for grp_o, grp_r in zip(
                 opt_o.fp32_from_float16_groups, opt_r.fp32_from_float16_groups
             ):
                 for pidx, (p_o, p_r) in enumerate(zip(grp_o, grp_r)):
                     p_o_gpu = p_o.data.to('cuda') if not p_o.data.is_cuda else p_o.data
                     assert torch.equal(p_o_gpu, p_r.data), (
-                        f"[rank {rank}] fp32 master weight mismatch at param {pidx} "
-                        f"after {n_steps} steps, "
+                        f"fp32 master weight mismatch at param {pidx} after {n_steps} steps, "
                         f"max diff = {(p_o_gpu - p_r.data).abs().max().item()}"
                     )
 
@@ -252,53 +233,8 @@ def test_numerical_equivalence(rank, n_steps=5):
                         continue
                     v_o_gpu = v_o.to('cuda') if not v_o.is_cuda else v_o
                     assert torch.equal(v_o_gpu, v_r), (
-                        f"[rank {rank}] optimizer state '{skey}' mismatch "
-                        f"after {n_steps} steps, "
+                        f"optimizer state '{skey}' mismatch after {n_steps} steps, "
                         f"max diff = {(v_o_gpu - v_r).abs().max().item()}"
                     )
 
         opt_off.offload_optimizer_states()
-
-        print(f"  [rank {rank}] PASSED: test_numerical_equivalence ({n_steps} steps)")
-    finally:
-        parallel_state.destroy_model_parallel()
-
-
-def main():
-    rank, world_size = init_distributed()
-
-    tests = [
-        ("test_states_on_cpu", test_states_on_cpu),
-        ("test_roundtrip_correctness", test_roundtrip_correctness),
-        ("test_step_runs", test_step_runs),
-        ("test_numerical_equivalence", test_numerical_equivalence),
-    ]
-
-    passed, failed = 0, 0
-    for name, fn in tests:
-        torch.distributed.barrier()
-        if rank == 0:
-            print(f"\n{'='*60}")
-            print(f"Running: {name}")
-            print(f"{'='*60}")
-        try:
-            fn(rank)
-            passed += 1
-        except Exception:
-            failed += 1
-            if rank == 0:
-                traceback.print_exc()
-            print(f"  [rank {rank}] FAILED: {name}")
-
-    torch.distributed.barrier()
-    if rank == 0:
-        print(f"\n{'='*60}")
-        print(f"Results: {passed} passed, {failed} failed out of {len(tests)}")
-        print(f"{'='*60}")
-
-    torch.distributed.destroy_process_group()
-    sys.exit(1 if failed > 0 else 0)
-
-
-if __name__ == '__main__':
-    main()
