@@ -42,24 +42,44 @@ logger = logging.getLogger(__name__)
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
+    A HybridModel is constructed via either of two equivalent paths:
+
+    1. **Recipe path (recommended).** Pass ``layer_type_list`` and
+       ``layer_config_list`` (typically produced by
+       :meth:`HybridModelConfig.compile`) plus the recipe-level kwargs.
+       This is the path used by ``--model-recipe`` and is the supported
+       way to build new HybridModels.
+    2. **Legacy string-pattern path.** Pass ``hybrid_layer_pattern`` (a
+       single-character pattern string). Retained for backwards
+       compatibility; new code should use the recipe path.
+
     Args:
-        config (TransformerConfig): Model config
-        hybrid_stack_spec (ModuleSpec, optional): Specifies the modules to use for the various
-            layer types. Required when using ``hybrid_layer_pattern`` (the legacy string DSL).
-            When using a compiled :class:`HybridModelConfig` recipe through the internal
-            ``layer_type_list_override`` / ``layer_config_list_override`` path, this is
-            auto-populated from the default hybrid_stack_spec in
-            :mod:`megatron.core.models.hybrid.hybrid_layer_specs`.
+        config (TransformerConfig): Model config (the stack-level
+            :class:`TransformerConfig`; per-layer configs flow in via
+            ``layer_config_list`` on the recipe path).
+        hybrid_stack_spec (ModuleSpec, optional): Module specs for the
+            various layer types. Required on the legacy string-pattern path.
+            On the recipe path, defaults to the production
+            ``hybrid_stack_spec`` in
+            :mod:`megatron.core.models.hybrid.hybrid_layer_specs` when not
+            supplied.
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
-        layer_type_list_override (list, optional): Internal compiled recipe output. Recipe
-            authors should use :class:`HybridModelConfig` / ``--model-recipe`` rather than
-            passing this directly.
-        layer_config_list_override (list, optional): Internal compiled recipe output, parallel to
-            ``layer_type_list_override``.
-        hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
-            pipeline stage boundaries.
+        layer_type_list (list, optional): Per-layer symbol list (recipe
+            path). Mutually exclusive with ``hybrid_layer_pattern``. Each
+            entry maps to a layer in :mod:`Symbols.VALID_LAYERS`.
+        layer_config_list (list, optional): Per-layer
+            :class:`TransformerConfig` instances (recipe path), parallel to
+            ``layer_type_list``. Each layer is constructed from its own
+            config; ``config`` is reserved for stack-level concerns
+            (final norm, embedding init).
+        mtp_layer_pattern (str, optional): MTP body symbol string (recipe
+            path), e.g. ``"MM"``.
+        mtp_num_depths (int, optional): Number of MTP depths (recipe path).
+        hybrid_layer_pattern (str): Legacy string-pattern path. Unified
+            hybrid layer pattern with optional MTP and pipeline stage
+            boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
             The main pattern may contain "|" to define pipeline stage boundaries.
             Examples:
@@ -104,10 +124,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         vocab_size: Optional[int] = None,
         max_sequence_length: Optional[int] = None,
         hybrid_layer_pattern: Optional[str] = None,
-        layer_type_list_override: Optional[list] = None,
-        layer_config_list_override: Optional[list] = None,
-        mtp_layer_pattern_override: Optional[str] = None,
-        mtp_num_depths_override: Optional[int] = None,
+        layer_type_list: Optional[list] = None,
+        layer_config_list: Optional[list] = None,
+        mtp_layer_pattern: Optional[str] = None,
+        mtp_num_depths: Optional[int] = None,
         hybrid_attention_ratio: Optional[float] = None,
         hybrid_mlp_ratio: Optional[float] = None,
         hybrid_override_pattern: Optional[str] = None,
@@ -150,7 +170,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
 
-        recipe_path = layer_type_list_override is not None
+        recipe_path = layer_type_list is not None
         if not recipe_path and (vocab_size is None or max_sequence_length is None):
             raise ValueError(
                 "vocab_size and max_sequence_length are required on the legacy "
@@ -160,19 +180,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if recipe_path:
             if hybrid_layer_pattern is not None:
                 raise ValueError(
-                    "layer_type_list_override (Python DSL recipe) and "
+                    "layer_type_list (Python DSL recipe) and "
                     "hybrid_layer_pattern (string DSL) are mutually exclusive; "
                     "pass exactly one."
                 )
-            if layer_config_list_override is None:
+            if layer_config_list is None:
                 raise ValueError(
-                    "layer_type_list_override was passed without layer_config_list_override; "
+                    "layer_type_list was passed without layer_config_list; "
                     "they must be passed together."
                 )
-            if len(layer_config_list_override) != len(layer_type_list_override):
+            if len(layer_config_list) != len(layer_type_list):
                 raise ValueError(
-                    f"layer_type_list_override (len={len(layer_type_list_override)}) and "
-                    f"layer_config_list_override (len={len(layer_config_list_override)}) "
+                    f"layer_type_list (len={len(layer_type_list)}) and "
+                    f"layer_config_list (len={len(layer_config_list)}) "
                     f"must have the same length."
                 )
 
@@ -246,13 +266,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "parallelism (PP > 1). Use hybrid_layer_pattern (string DSL "
                     "with '|' separators) for PP."
                 )
-            layer_type_list = layer_type_list_override
-            layer_config_list = layer_config_list_override
             layer_offset = 0
             # MTP plumbing supplied by HybridModelConfig.compile() upstream;
             # falls back to disabled when the recipe has no MTP markers.
-            self.mtp_pattern = mtp_layer_pattern_override
-            self.mtp_num_depths = mtp_num_depths_override or 0
+            self.mtp_pattern = mtp_layer_pattern
+            self.mtp_num_depths = mtp_num_depths or 0
         else:
             # Parse unified pattern to extract main and MTP components, and
             # determine the pipeline segment for this model instance.
