@@ -1085,7 +1085,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count
 
     def build_active_slices(self):
-        """Copy tensors into active buffers, and pad them with `torch.where`"""
+        """Copy tensors into active buffers, and pad them with `torch.where`."""
         n = self.padded_active_request_count
         self.active_request_ids[:n].copy_(self.request_ids[:n])
         self.active_request_query_lengths[:n].copy_(self.request_query_lengths[:n])
@@ -1097,12 +1097,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Request-level padding.
-        req_pad_mask = self._arange_requests[:n] >= self._real_request_count_gpu
-        self.active_request_query_lengths[:n] = torch.where(
-            req_pad_mask, 0, self.active_request_query_lengths[:n]
-        )
+        arange_n = self._arange_requests[:n]
+        real_req = self._real_request_count_gpu
+        req_pad_mask = arange_n >= real_req
+
         self.active_request_to_kv_block_ids[:n] = torch.where(
-            req_pad_mask.unsqueeze(1), -1, self.active_request_to_kv_block_ids[:n]
+            req_pad_mask.unsqueeze(1),
+            self.kv_block_allocator.dummy_block_idx,
+            self.active_request_to_kv_block_ids[:n],
+        )
+
+        # These query lengths are consumed by the attention kernel.
+        # When we pad them, we must give the kernel correct q lengths.
+        # One entry in the padded region must be an "absorber" that accounts for excess tokens.
+        is_absorber = arange_n == real_req
+        absorber_q_len = self.padded_active_token_count - self._real_token_count_gpu
+        self.active_request_query_lengths[:n] = torch.where(
+            req_pad_mask,
+            torch.where(is_absorber, absorber_q_len, 0),
+            self.active_request_query_lengths[:n],
         )
 
         # Token-level padding.
@@ -1131,14 +1144,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.active_request_last_token_idxs[:n] -= 1
 
-        # query_lengths is already padded, but request_kv_length_offsets is not.
+        # active_sequence_lengths = query + kv_offset for real requests.
+        # For padding the K length matches the Q length: the absorber self-attends within dummies.
         torch.add(
             self.active_request_query_lengths[:n],
             self.request_kv_length_offsets[:n],
             out=self.active_sequence_lengths[:n],
         )
         self.active_sequence_lengths[:n] = torch.where(
-            req_pad_mask, 0, self.active_sequence_lengths[:n]
+            req_pad_mask,
+            self.active_request_query_lengths[:n],
+            self.active_sequence_lengths[:n],
         )
         torch.cumsum(
             self.active_sequence_lengths[:n],
