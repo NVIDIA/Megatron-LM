@@ -40,6 +40,262 @@ def device_memory_summary() -> str:
     )
 
 
+def measure_hbm_bandwidth(device=None, iters=50):
+    """Measure observed GPU HBM bandwidth using L2-cache-busting tensor copies.
+
+    Allocates multiple tensor pairs whose total working set exceeds 2x the L2 cache,
+    then times round-trip copies to measure sustained memory bandwidth.
+
+    Args:
+        device: CUDA device (defaults to current device).
+        iters: Number of copy iterations for timing.
+
+    Returns:
+        Measured bandwidth in bytes per second.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+
+    props = torch.cuda.get_device_properties(device)
+    l2_cache_bytes = getattr(props, 'l2_cache_size', 64 * 1024 * 1024)
+
+    # Use a large tensor (256 MB) to amortize launch overhead and bust L2 cache
+    n = 64 * 1024 * 1024  # 64M float32 elements = 256 MB
+    tensor_bytes = n * 4
+
+    # Enough tensors so total working set > 2x L2 cache
+    k = max(2, int((l2_cache_bytes * 2) // tensor_bytes) + 1)
+
+    xs = [torch.randn(n, dtype=torch.float32, device=device) for _ in range(k)]
+    zs = [torch.empty_like(x) for x in xs]
+
+    # Warmup
+    for i in range(k):
+        zs[i].copy_(xs[i])
+    torch.cuda.synchronize(device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        for i in range(k):
+            zs[i].copy_(xs[i])
+    end.record()
+    torch.cuda.synchronize(device)
+
+    elapsed_s = start.elapsed_time(end) / 1000.0
+    # Each copy reads + writes the tensor: 2 * tensor_bytes per copy
+    total_bytes = iters * k * 2 * tensor_bytes
+    bandwidth_bytes_per_sec = total_bytes / elapsed_s
+
+    del xs, zs
+    torch.cuda.empty_cache()
+
+    return bandwidth_bytes_per_sec
+
+
+def get_model_weight_bytes(model):
+    """Compute total bytes of model weights on GPU.
+
+    Walks all modules checking parameters, buffers, and plain tensor
+    attributes to capture weights that may not be registered as nn.Parameter
+    (e.g., expert weight buffers in MoE inference, MXFP8 quantized weights).
+    Deduplicates by underlying storage to avoid double-counting views.
+
+    Args:
+        model: A PyTorch model (possibly wrapped).
+
+    Returns:
+        Total weight memory in bytes on GPU.
+    """
+    seen_storages = {}  # storage data_ptr -> nbytes
+
+    def _account_tensor(tensor):
+        """Add a CUDA tensor's storage to the seen set."""
+        if tensor.is_cuda:
+            ptr = tensor.untyped_storage().data_ptr()
+            seen_storages[ptr] = tensor.untyped_storage().nbytes()
+
+    for module in model.modules():
+        # nn.Parameter objects
+        for tensor in module._parameters.values():
+            if tensor is not None and tensor.is_cuda:
+                _account_tensor(tensor)
+        # Registered buffers (e.g., concatenated expert weight buffers)
+        for tensor in module._buffers.values():
+            if tensor is not None and tensor.is_cuda:
+                _account_tensor(tensor)
+        # Plain tensor attributes and quantized tensor wrappers.
+        # MXFP8Tensor is not a torch.Tensor subclass — it wraps .data and .scale
+        # tensors and is stored as a plain attribute via setattr().
+        for attr in module.__dict__.values():
+            if isinstance(attr, torch.Tensor):
+                _account_tensor(attr)
+            elif hasattr(attr, 'data') and isinstance(attr.data, torch.Tensor):
+                _account_tensor(attr.data)
+                if hasattr(attr, 'scale') and isinstance(attr.scale, torch.Tensor):
+                    _account_tensor(attr.scale)
+    return sum(seen_storages.values())
+
+
+def measure_allreduce_bandwidth(group, device=None, iters=50):
+    """Measure NCCL allreduce bandwidth for a given process group.
+
+    Uses a large tensor to amortize launch overhead and measure sustained
+    allreduce throughput. Returns *algorithm bandwidth* (message_bytes / time),
+    which is the right divisor when the caller already knows the logical message
+    size it needs to allreduce.
+
+    Args:
+        group: ``torch.distributed.ProcessGroup`` (e.g. the TP group).
+        device: CUDA device (defaults to current device).
+        iters: Number of allreduce iterations for timing.
+
+    Returns:
+        Measured allreduce algorithm bandwidth in bytes per second, or 0 if
+        the group has only one rank.
+    """
+    world = group.size()
+    if world <= 1:
+        return 0
+
+    if device is None:
+        device = torch.cuda.current_device()
+
+    # 64 M float32 elements = 256 MB — same size as HBM bandwidth test.
+    n = 64 * 1024 * 1024
+    tensor_bytes = n * 4
+    buf = torch.randn(n, dtype=torch.float32, device=device)
+
+    # Warmup.
+    for _ in range(3):
+        torch.distributed.all_reduce(buf, group=group)
+    torch.cuda.synchronize(device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        torch.distributed.all_reduce(buf, group=group)
+    end.record()
+    torch.cuda.synchronize(device)
+
+    elapsed_s = start.elapsed_time(end) / 1000.0
+    bandwidth = iters * tensor_bytes / elapsed_s
+
+    del buf
+    torch.cuda.empty_cache()
+    return bandwidth
+
+
+def measure_reduce_scatter_bandwidth(group, device=None, iters=50):
+    """Measure NCCL reduce-scatter bandwidth for a given process group.
+
+    Uses a large tensor to amortize launch overhead and measure sustained
+    reduce-scatter throughput. Returns *algorithm bandwidth*
+    (full_message_bytes / time), matching the NCCL-tests convention where the
+    reported size is the input (pre-scatter) size.
+
+    Args:
+        group: ``torch.distributed.ProcessGroup`` (e.g. the TP group).
+        device: CUDA device (defaults to current device).
+        iters: Number of reduce-scatter iterations for timing.
+
+    Returns:
+        Measured reduce-scatter algorithm bandwidth in bytes per second, or 0
+        if the group has only one rank.
+    """
+    world = group.size()
+    if world <= 1:
+        return 0
+
+    if device is None:
+        device = torch.cuda.current_device()
+
+    # 64 M float32 elements = 256 MB, rounded to a multiple of world.
+    n = 64 * 1024 * 1024
+    n = (n // world) * world
+    tensor_bytes = n * 4
+    input_buf = torch.randn(n, dtype=torch.float32, device=device)
+    output_buf = torch.empty(n // world, dtype=torch.float32, device=device)
+
+    # Warmup.
+    for _ in range(3):
+        torch.distributed.reduce_scatter_tensor(output_buf, input_buf, group=group)
+    torch.cuda.synchronize(device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        torch.distributed.reduce_scatter_tensor(output_buf, input_buf, group=group)
+    end.record()
+    torch.cuda.synchronize(device)
+
+    elapsed_s = start.elapsed_time(end) / 1000.0
+    bandwidth = iters * tensor_bytes / elapsed_s
+
+    del input_buf, output_buf
+    torch.cuda.empty_cache()
+    return bandwidth
+
+
+def measure_alltoall_bandwidth(group, device=None, iters=50):
+    """Measure NCCL all-to-all bandwidth for a given process group.
+
+    Uses ``all_to_all_single`` with a large tensor to measure sustained
+    throughput. Returns algorithm bandwidth (total_bytes_sent / time).
+
+    Args:
+        group: ``torch.distributed.ProcessGroup`` (e.g. the EP group).
+        device: CUDA device (defaults to current device).
+        iters: Number of all-to-all iterations for timing.
+
+    Returns:
+        Measured all-to-all algorithm bandwidth in bytes per second, or 0 if
+        the group has only one rank.
+    """
+    world = group.size()
+    if world <= 1:
+        return 0
+
+    if device is None:
+        device = torch.cuda.current_device()
+
+    # Total tensor: 256 MB, evenly split across ranks.
+    n_total = 64 * 1024 * 1024  # float32 elements
+    # Round down to a multiple of world so the split is even.
+    n_total = (n_total // world) * world
+    tensor_bytes = n_total * 4
+
+    send_buf = torch.randn(n_total, dtype=torch.float32, device=device)
+    recv_buf = torch.empty_like(send_buf)
+
+    # Warmup.
+    for _ in range(3):
+        torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
+    torch.cuda.synchronize(device)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        torch.distributed.all_to_all_single(recv_buf, send_buf, group=group)
+    end.record()
+    torch.cuda.synchronize(device)
+
+    elapsed_s = start.elapsed_time(end) / 1000.0
+    bandwidth = iters * tensor_bytes / elapsed_s
+
+    del send_buf, recv_buf
+    torch.cuda.empty_cache()
+    return bandwidth
+
+
 class Counter:
     """A simple counter class
 

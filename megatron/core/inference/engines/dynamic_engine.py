@@ -46,12 +46,18 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
+    get_model_weight_bytes,
+    measure_allreduce_bandwidth,
+    measure_alltoall_bandwidth,
+    measure_hbm_bandwidth,
+    measure_reduce_scatter_bandwidth,
     set_inference_cuda_graphed_iteration_for_ep_inference,
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -61,6 +67,8 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    is_column_parallel_linear,
+    is_row_parallel_linear,
     nvtx_range_pop,
     nvtx_range_push,
     round_up_to_nearest_multiple,
@@ -139,8 +147,8 @@ class EngineSuspendedError(Exception):
 
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
-    for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
-        suffix_bytes = 1024**power
+    for power, suffix in [(4, "TB"), (3, "GB"), (2, "MB"), (1, "KB"), (0, "bytes")]:
+        suffix_bytes = 1000**power
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
@@ -264,6 +272,83 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Create cuda graphs.
         self.create_cuda_graphs()
+
+        # Measure HBM bandwidth and model weight memory for SOL latency reporting.
+        self._model_weight_bytes = get_model_weight_bytes(
+            self.controller.inference_wrapped_model.model
+        )
+        self._measured_hbm_bandwidth = measure_hbm_bandwidth()
+
+        # Cache model topology fields needed for per-step SOL communication volume.
+        self._model_config = controller.inference_wrapped_model.model.config
+        unwrapped_model = controller.inference_wrapped_model.model
+        tp_size = get_pg_size(self.pg_collection.tp) if self.pg_collection.tp else 1
+        ep_size = self._model_config.expert_model_parallel_size
+        self._tp_sequence_parallel = self._model_config.sequence_parallel
+
+        # Count TP communication ops and MoE layers by inspecting the model.
+        # With sequence_parallel: RowParallel does reduce-scatter, ColumnParallel does all-gather.
+        # Without sequence_parallel: RowParallel does all-reduce, ColumnParallel has no fwd collective.
+        num_row_parallel = len(
+            [m for m in unwrapped_model.modules() if is_row_parallel_linear(m)]
+        )
+        num_col_parallel = len(
+            [m for m in unwrapped_model.modules() if is_column_parallel_linear(m)]
+        )
+        if self._tp_sequence_parallel:
+            self._num_tp_reduce_scatters = num_row_parallel
+            self._num_tp_all_gathers = num_col_parallel
+            self._num_tp_allreduces = 0
+        else:
+            self._num_tp_allreduces = num_row_parallel
+            self._num_tp_reduce_scatters = 0
+            self._num_tp_all_gathers = 0
+        self._num_moe_layers = len(
+            [m for m in unwrapped_model.modules() if isinstance(m, MoELayer)]
+        )
+
+        # Measure TP bandwidth with the collective that the model actually uses.
+        if tp_size > 1 and self.pg_collection.tp is not None:
+            if self._tp_sequence_parallel:
+                self._measured_tp_rs_bw = measure_reduce_scatter_bandwidth(self.pg_collection.tp)
+                self._measured_tp_allreduce_bw = 0
+            else:
+                self._measured_tp_allreduce_bw = measure_allreduce_bandwidth(self.pg_collection.tp)
+                self._measured_tp_rs_bw = 0
+        else:
+            self._measured_tp_allreduce_bw = 0
+            self._measured_tp_rs_bw = 0
+
+        # Measure EP all-to-all bandwidth.
+        if ep_size > 1 and self.context.expert_model_parallel_group is not None:
+            self._measured_ep_alltoall_bw = measure_alltoall_bandwidth(
+                self.context.expert_model_parallel_group
+            )
+        else:
+            self._measured_ep_alltoall_bw = 0
+
+        if torch.distributed.get_rank() == 0:
+            sol_parts = [
+                f"model weights = {self._model_weight_bytes / 1e9:.2f} GB",
+                f"measured HBM bandwidth = {self._measured_hbm_bandwidth / 1e9:.0f} GB/s",
+            ]
+            if self._tp_sequence_parallel and self._measured_tp_rs_bw > 0:
+                sol_parts.append(
+                    f"TP reduce-scatter bandwidth = {self._measured_tp_rs_bw / 1e9:.1f} GB/s "
+                    f"(tp={tp_size}, {self._num_tp_reduce_scatters} RS + "
+                    f"{self._num_tp_all_gathers} AG per step)"
+                )
+            elif self._measured_tp_allreduce_bw > 0:
+                sol_parts.append(
+                    f"TP allreduce bandwidth = {self._measured_tp_allreduce_bw / 1e9:.1f} GB/s "
+                    f"(tp={tp_size}, {self._num_tp_allreduces} allreduces/step)"
+                )
+            if self._measured_ep_alltoall_bw > 0:
+                sol_parts.append(
+                    f"EP all-to-all bandwidth = {self._measured_ep_alltoall_bw / 1e9:.1f} GB/s "
+                    f"(ep={ep_size}, {self._num_moe_layers} MoE layers)"
+                )
+            logging.info(f"SOL latency baseline: {', '.join(sol_parts)}")
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -715,20 +800,20 @@ class DynamicInferenceEngine(AbstractEngine):
             rank_str = torch.distributed.get_rank()
             dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
             relative_time_str = f"{end_time - start_time:.3f} sec"
-            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
+            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1e9:.1f} GB"
 
             if HAVE_PSUTIL:
                 process = psutil.Process()
                 mem_info = process.memory_info()
-                cpu_mem_str = f"{mem_info.rss / 1024**3:.1f} gb"
+                cpu_mem_str = f"{mem_info.rss / 1e9:.1f} GB"
             else:
                 cpu_mem_str = "--"
 
             total_mem_str = ", ".join(
                 (
                     f"cpu: {cpu_mem_str}",
-                    f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
-                    f"res {end_mem_res / 1024**3:.1f} gb",
+                    f"gpu: alloc {end_mem_alloc / 1e9:.1f} GB",
+                    f"res {end_mem_res / 1e9:.1f} GB",
                 )
             )
             logging.info(
@@ -1740,6 +1825,157 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return result, context_state, step_time
 
+    def _compute_sol_metrics(self, context_state, step_time):
+        """Compute SOL (speed-of-light) latency metrics for decode-only steps."""
+        kv_bytes, mamba_bytes = self.context.get_active_state_memory_bytes()
+        state_bytes = kv_bytes + mamba_bytes
+        sol_mem_s = (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
+
+        batch_tokens = context_state["active_token_count"]
+        hidden_bytes = self._model_config.hidden_size * self._model_config.params_dtype.itemsize
+        msg_bytes = batch_tokens * hidden_bytes
+        if self._tp_sequence_parallel:
+            # RS and AG have symmetric bandwidth; use RS measurement for both.
+            num_tp_ops = self._num_tp_reduce_scatters + self._num_tp_all_gathers
+            sol_tp_comm_s = (
+                (num_tp_ops * msg_bytes / self._measured_tp_rs_bw)
+                if self._measured_tp_rs_bw > 0
+                else 0
+            )
+        else:
+            num_tp_ops = self._num_tp_allreduces
+            sol_tp_comm_s = (
+                (num_tp_ops * msg_bytes / self._measured_tp_allreduce_bw)
+                if self._measured_tp_allreduce_bw > 0
+                else 0
+            )
+        moe_topk = self._model_config.moe_router_topk if self._model_config.num_moe_experts else 0
+        a2a_dim = self._model_config.moe_latent_size or self._model_config.hidden_size
+        a2a_token_bytes = a2a_dim * self._model_config.params_dtype.itemsize
+        a2a_vol = 2 * self._num_moe_layers * batch_tokens * moe_topk * a2a_token_bytes
+        sol_ep_comm_s = (
+            (a2a_vol / self._measured_ep_alltoall_bw) if self._measured_ep_alltoall_bw > 0 else 0
+        )
+        sol_latency_s = sol_mem_s + sol_tp_comm_s + sol_ep_comm_s
+        sol_pct = sol_latency_s / step_time * 100.0
+
+        return {
+            "kv_bytes": kv_bytes,
+            "mamba_bytes": mamba_bytes,
+            "state_bytes": state_bytes,
+            "sol_mem_s": sol_mem_s,
+            "sol_tp_comm_s": sol_tp_comm_s,
+            "sol_ep_comm_s": sol_ep_comm_s,
+            "sol_latency_s": sol_latency_s,
+            "sol_pct": sol_pct,
+            "num_tp_ops": num_tp_ops,
+            "msg_bytes": msg_bytes,
+            "a2a_vol": a2a_vol,
+        }
+
+    def _format_sol_log(self, sol):
+        """Format the SOL portion of the step log string."""
+        if sol["mamba_bytes"] > 0:
+            mem_str = (
+                f"({self._model_weight_bytes / 1e9:.2f} GB weights + "
+                f"{sol['kv_bytes'] / 1e9:.2f} GB kv + "
+                f"{sol['mamba_bytes'] / 1e9:.2f} GB mamba) / "
+                f"{self._measured_hbm_bandwidth / 1e9:.0f} GB/s"
+            )
+        else:
+            mem_str = (
+                f"({self._model_weight_bytes / 1e9:.2f} GB weights + "
+                f"{sol['state_bytes'] / 1e9:.2f} GB state) / "
+                f"{self._measured_hbm_bandwidth / 1e9:.0f} GB/s"
+            )
+
+        comm_parts = []
+        if sol["sol_tp_comm_s"] > 0:
+            tp_total_bytes = sol["num_tp_ops"] * sol["msg_bytes"]
+            if self._tp_sequence_parallel:
+                comm_parts.append(
+                    f"tp_rs_ag {sol['sol_tp_comm_s'] * 1000:.3f} ms "
+                    f"({tp_total_bytes / 1e6:.2f} MB / "
+                    f"{self._measured_tp_rs_bw / 1e9:.1f} GB/s)"
+                )
+            else:
+                comm_parts.append(
+                    f"tp_ar {sol['sol_tp_comm_s'] * 1000:.3f} ms "
+                    f"({tp_total_bytes / 1e6:.2f} MB / "
+                    f"{self._measured_tp_allreduce_bw / 1e9:.1f} GB/s)"
+                )
+        if sol["sol_ep_comm_s"] > 0:
+            comm_parts.append(
+                f"ep_a2a {sol['sol_ep_comm_s'] * 1000:.3f} ms "
+                f"({sol['a2a_vol'] / 1e6:.2f} MB / "
+                f"{self._measured_ep_alltoall_bw / 1e9:.1f} GB/s)"
+            )
+
+        if comm_parts:
+            return (
+                f" ... SOL: {sol['sol_pct']:.1f}% "
+                f"(proj {sol['sol_latency_s'] * 1000:.3f} ms = "
+                f"mem {sol['sol_mem_s'] * 1000:.3f} ms [{mem_str}] + "
+                f"comm [{' + '.join(comm_parts)}])"
+            )
+        else:
+            return (
+                f" ... SOL: {sol['sol_pct']:.1f}% "
+                f"(proj {sol['sol_latency_s'] * 1000:.3f} ms = {mem_str})"
+            )
+
+    def _format_step_log(self, context_state, step_time):
+        """Build the per-step console log string."""
+        mem = torch.cuda.memory_stats()
+        step_type = "decode" if context_state["is_decode_only"] else "non-decode"
+        cg_status = (
+            "OFF"
+            if not self.context.using_cuda_graph_this_step()
+            else self.context.padded_batch_dimensions
+        )
+        active_reqs = context_state["total_request_count"] - context_state["paused_request_count"]
+
+        output = (
+            f"* rank {self.rank} | step {self.context.step_count} | "
+            f"{datetime.now().strftime('%H:%M:%S')} ... "
+            f"time: {step_time * 1000:.3f} ms "
+            f"[{step_type} + real config {self.context.batch_dimensions} + "
+            f"cuda graph {cg_status}] ... "
+            f"reqs: a {active_reqs}/{context_state['max_requests']}, "
+            f"p {context_state['paused_request_count']}, "
+            f"w {context_state['waiting_request_count']}, "
+            f"f {context_state['finished_request_count']}, "
+            f"e {context_state['evicted_request_count']} ... "
+            f"blocks: a {context_state['total_active_used_blocks']}"
+            f"/{context_state['total_active_block_count']}, "
+            f"p {context_state['total_paused_used_blocks']}"
+            f"/{context_state['total_paused_block_count']} ... "
+            f"mem: tensors {mem['allocation.all.current']}, "
+            f"alloc {mem['allocated_bytes.all.current'] / 1e9:.1f} GB, "
+            f"res {mem['reserved_bytes.all.current'] / 1e9:.1f} GB."
+        )
+
+        if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+            spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
+            output += (
+                f" ... spec: accept {spec_rate:.1f}% "
+                f"({self._spec_tokens_accepted}/{self._spec_tokens_proposed} "
+                f"in {self._spec_steps} steps)"
+            )
+
+        if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
+            output += (
+                f" ... prefix cache: {self._prefix_cache_hits} hits, "
+                f"{self._prefix_cache_blocks_matched} blocks matched"
+            )
+
+        if context_state["is_decode_only"]:
+            sol = self._compute_sol_metrics(context_state, step_time)
+            output += self._format_sol_log(sol)
+            output = f"\033[94m{output}\033[0m"
+
+        return output
+
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
@@ -1888,6 +2124,33 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_blocks_matched
                 )
 
+            # Add Mamba state metrics.
+            if self.context.is_hybrid_model:
+                metrics['inference/mamba_active_requests'] = int(
+                    context_state["mamba_active_requests"]
+                )
+                metrics['inference/mamba_paused_requests'] = int(
+                    context_state["mamba_paused_requests"]
+                )
+                if "mamba_cache_slots_used" in context_state:
+                    metrics['inference/mamba_cache_slots_used'] = int(
+                        context_state["mamba_cache_slots_used"]
+                    )
+                    metrics['inference/mamba_cache_slots_total'] = int(
+                        context_state["mamba_cache_slots_total"]
+                    )
+
+            # Add SOL latency metrics for decode-only steps.
+            if context_state["is_decode_only"]:
+                sol = self._compute_sol_metrics(context_state, step_time)
+                metrics['inference/sol_latency_pct'] = float(sol["sol_pct"])
+                metrics['inference/sol_latency_ms'] = float(sol["sol_latency_s"] * 1000)
+                metrics['inference/sol_mem_ms'] = float(sol["sol_mem_s"] * 1000)
+                metrics['inference/sol_tp_comm_ms'] = float(sol["sol_tp_comm_s"] * 1000)
+                metrics['inference/sol_ep_comm_ms'] = float(sol["sol_ep_comm_s"] * 1000)
+                metrics['inference/sol_kv_bytes'] = float(sol["kv_bytes"])
+                metrics['inference/sol_mamba_bytes'] = float(sol["mamba_bytes"])
+
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
             else:
@@ -1898,61 +2161,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.logging_step_interval > 0
             and self.context.step_count % self.logging_step_interval == 0
         ):
-            mem = torch.cuda.memory_stats()
-            step_type = "decode" if context_state["is_decode_only"] else "non-decode"
-            output_str = (
-                "* rank %d | step %d | %s ... time: %.3f ms%s ... "
-                "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
-                "blocks: a %d/%d, p %d/%d ... "
-                "mem: tensors %d, alloc %.1f gb, res %.1f gb."
-                % (
-                    self.rank,
-                    self.context.step_count,
-                    datetime.now().strftime("%H:%M:%S"),
-                    step_time * 1000,
-                    (
-                        " [%s + real config %s + cuda graph %s]"
-                        % (
-                            step_type,
-                            self.context.batch_dimensions,
-                            (
-                                "OFF"
-                                if not self.context.using_cuda_graph_this_step()
-                                else self.context.padded_batch_dimensions
-                            ),
-                        )
-                    ),
-                    context_state["total_request_count"] - context_state["paused_request_count"],
-                    context_state["max_requests"],
-                    context_state["paused_request_count"],
-                    context_state["waiting_request_count"],
-                    context_state["finished_request_count"],
-                    context_state["evicted_request_count"],
-                    context_state["total_active_used_blocks"],
-                    context_state["total_active_block_count"],
-                    context_state["total_paused_used_blocks"],
-                    context_state["total_paused_block_count"],
-                    mem["allocation.all.current"],
-                    mem["allocated_bytes.all.current"] / (1024**3),
-                    mem["reserved_bytes.all.current"] / (1024**3),
-                )
-            )
-            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
-                spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
-                output_str += " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
-                    spec_rate,
-                    self._spec_tokens_accepted,
-                    self._spec_tokens_proposed,
-                    self._spec_steps,
-                )
-            if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
-                output_str += " ... prefix cache: %d hits, %d blocks matched" % (
-                    self._prefix_cache_hits,
-                    self._prefix_cache_blocks_matched,
-                )
-            if context_state["is_decode_only"]:
-                output_str = f"\033[94m{output_str}\033[0m"
-            logging.info(output_str)
+            logging.info(self._format_step_log(context_state, step_time))
 
             # Reset speculative decoding accumulators after both wandb and console logging.
             if self.num_speculative_tokens > 0:

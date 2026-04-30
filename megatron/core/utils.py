@@ -631,6 +631,45 @@ def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
+def is_row_parallel_linear(module):
+    """Returns whether the given module is a RowParallelLinear layer.
+
+    Checks for the local ``RowParallelLinear`` as well as the Transformer-Engine
+    variant ``TERowParallelLinear`` (which also covers ``InferenceRowParallelLinear``).
+    """
+    from megatron.core.tensor_parallel.layers import RowParallelLinear
+
+    if isinstance(module, RowParallelLinear):
+        return True
+    try:
+        from megatron.core.extensions.transformer_engine import TERowParallelLinear
+
+        return isinstance(module, TERowParallelLinear)
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
+def is_column_parallel_linear(module):
+    """Returns whether the given module is a ColumnParallelLinear layer.
+
+    Checks for the local ``ColumnParallelLinear`` as well as the Transformer-Engine
+    variants ``TEColumnParallelLinear`` and ``TELayerNormColumnParallelLinear``.
+    """
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+
+    if isinstance(module, ColumnParallelLinear):
+        return True
+    try:
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+        )
+
+        return isinstance(module, (TEColumnParallelLinear, TELayerNormColumnParallelLinear))
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
     Caller should ensure that buffers of the same name
