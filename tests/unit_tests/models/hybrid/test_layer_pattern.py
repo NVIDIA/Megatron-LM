@@ -23,7 +23,6 @@ from megatron.core.models.hybrid.layer_configs import (
     MambaLayerConfig,
     MLPLayerConfig,
     MoELayerConfig,
-    PipelineSplit,
 )
 from megatron.core.models.hybrid.layer_pattern import flatten_decoder_pattern
 
@@ -324,12 +323,6 @@ class TestFlatten:
         loss = CrossEntropyLayerConfig()
         with pytest.raises(TypeError, match="start/end"):
             flatten_decoder_pattern([m, loss, m])
-
-    def test_pipeline_split_in_body_rejected(self):
-        common = _make_common()
-        m = MambaLayerConfig(common_config=common)
-        with pytest.raises(TypeError):
-            flatten_decoder_pattern([m, PipelineSplit(), m])
 
 
 @pytest.mark.internal

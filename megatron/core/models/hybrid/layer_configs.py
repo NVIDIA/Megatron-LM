@@ -9,11 +9,10 @@ common config. Anything derivable from other fields (``num_query_groups``,
 time inside :meth:`LayerConfig.to_transformer_config` rather than required
 from the recipe.
 
-Special pattern markers — :class:`EmbeddingLayerConfig`,
-:class:`CrossEntropyLayerConfig`, :class:`PipelineSplit` — also live here.
-They participate in the layer pattern but are not "layers" the
-:class:`HybridStack` constructs; they encode model-wrapping metadata
-(vocab/sequence shape) or pipeline boundaries.
+Special pattern markers — :class:`EmbeddingLayerConfig` and
+:class:`CrossEntropyLayerConfig` — also live here. They participate in
+the layer pattern but are not "layers" the :class:`HybridStack`
+constructs; they encode model-wrapping metadata (vocab/sequence shape).
 """
 
 from dataclasses import dataclass, field
@@ -69,8 +68,8 @@ class LayerConfig:
         layer pattern, so recipes never need to set it manually.
 
         ``parallelism`` carries the universal model-level parallelism
-        settings (TP/PP/CP, pipeline_dtype) — these **always win** because
-        they're job-level. EP/ETP are MoE-only and are injected into MoE
+        settings (TP/CP) — these **always win** because they're
+        job-level. EP/ETP are MoE-only and are injected into MoE
         per-layer TCs by :meth:`HybridModelConfig.compile`, not via this
         path. ``placeholders`` carries values that satisfy
         :meth:`TransformerConfig.__post_init__` invariants on layers that
@@ -486,21 +485,7 @@ class CrossEntropyLayerConfig:
     :attr:`CommonLayerConfig.extra`."""
 
 
-@dataclass
-class PipelineSplit:
-    """Pipeline-stage boundary marker.
-
-    Place between groups of layers in the layer pattern to declare a
-    pipeline split. Pipeline parallelism (PP > 1) for the Python DSL is a
-    follow-up — :func:`compile_pattern` raises :class:`NotImplementedError`
-    when a :class:`PipelineSplit` is encountered today, with a clear
-    pointer to the legacy string-DSL ``|`` form for production PP work.
-    """
-
-    pass
-
-
 # ----------------------------------------------------------- type aliases
 
 #: Anything that may legally appear at a leaf of a layer pattern.
-PatternLeaf = Union[LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig, PipelineSplit]
+PatternLeaf = Union[LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig]

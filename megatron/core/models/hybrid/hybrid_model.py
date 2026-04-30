@@ -249,7 +249,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if recipe_path:
             # Recipe path: layer_type_list and layer_config_list are precomputed
             # by HybridModelConfig.compile() upstream. Pipeline parallelism and
-            # MTP are not yet wired through this path.
+            # MTP are not part of the recipe DSL — recipes that need either
+            # must use the legacy hybrid_layer_pattern string DSL. The PP > 1
+            # check below catches launcher/CLI mismatches where a PP group
+            # was constructed despite the recipe being PP-free.
             pp_size = (
                 torch.distributed.get_world_size(self.pg_collection.pp)
                 if self.pg_collection.pp is not None
@@ -257,13 +260,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             if pp_size > 1:
                 raise NotImplementedError(
-                    "The Python DSL recipe path does not yet support pipeline "
-                    "parallelism (PP > 1). Use hybrid_layer_pattern (string DSL "
+                    "The Python DSL recipe path does not support pipeline "
+                    "parallelism. Use hybrid_layer_pattern (string DSL "
                     "with '|' separators) for PP."
                 )
             layer_offset = 0
-            # MTP is not part of the recipe DSL today; recipes that need
-            # MTP must use the legacy ``hybrid_layer_pattern`` string DSL.
             self.mtp_pattern = None
             self.mtp_num_depths = 0
         else:
