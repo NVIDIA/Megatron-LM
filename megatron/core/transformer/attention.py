@@ -389,7 +389,6 @@ class Attention(MegatronModule, ABC):
 
         # Per-layer RotaryEmbedding (used when rotary_base_per_layer is set in config).
         self.rotary_pos_emb = None
-        print(f'for debug, in Attention.__init__, rank: {torch.distributed.get_rank()}, self.configr: {type(self.config)}')
         if getattr(self.config, 'rotary_base_per_layer', None):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
@@ -431,7 +430,10 @@ class Attention(MegatronModule, ABC):
                 ),
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
-        elif self.config.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+        elif (
+            self.config.position_embedding_type == 'mrope'
+            and not self.config.multi_latent_attention
+        ):
             self.rotary_pos_emb = MultimodalRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=self.config.rotary_percent,
@@ -1395,11 +1397,9 @@ class Attention(MegatronModule, ABC):
     def _apply_output_gate_per_head(self, x, gate):
         x_dtype = x.dtype
         gate = gate.view(*gate.shape[:2], -1, 1)  # [sq, b, np, 1]
-        x = x.view(*gate.shape[:3], -1)     # [sq, b, np, hn]
-        core_attn_out = (
-            x * torch.sigmoid(gate.float()).to(x.dtype)
-        )
-        x = x.view(*gate.shape[:2], -1)     # [sq, b, np*hn]
+        x = x.view(*gate.shape[:3], -1)  # [sq, b, np, hn]
+        x = x * torch.sigmoid(gate.float()).to(x.dtype)
+        x = x.view(*gate.shape[:2], -1)  # [sq, b, np*hn]
         x = x.to(x_dtype)
         return x
 

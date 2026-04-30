@@ -14,7 +14,6 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from tests.unit_tests.test_utilities import Utils
 
-
 SEQ_LEN = 16
 BATCH_SIZE = 2
 HIDDEN_SIZE = 128
@@ -115,9 +114,7 @@ class TestHeadWiseAttnGateForward:
         out_gated, _ = self._run_forward(use_gate=True)
         torch.manual_seed(0)
         out_plain, _ = self._run_forward(use_gate=False)
-        assert not torch.allclose(out_gated, out_plain), (
-            "Gated and plain outputs should differ"
-        )
+        assert not torch.allclose(out_gated, out_plain), "Gated and plain outputs should differ"
 
     def test_zero_gate_suppresses_attn(self):
         """When g_proj weights are zero the gate is sigmoid(0)=0.5, not zero;
@@ -149,10 +146,7 @@ class TestHeadWiseAttnGateForward:
         # Gate = sigmoid(0) = 0.5; gated output ≈ 0.5 * plain output
         # Use a loose tolerance because of bfloat16 rounding
         torch.testing.assert_close(
-            out_gated.float(),
-            (out_plain * 0.5).float(),
-            atol=1e-2,
-            rtol=1e-2,
+            out_gated.float(), (out_plain * 0.5).float(), atol=1e-2, rtol=1e-2
         )
 
 
@@ -169,9 +163,7 @@ class TestHeadWiseAttnGateNumerics:
         """Replicate the reshape logic and verify sigmoid is applied per-head."""
         sq, b, np, hn = 4, 2, NUM_HEADS, 32
         # Simulate core_attn_out: [sq, b, np*hn]
-        core_attn_out = torch.arange(
-            sq * b * np * hn, dtype=torch.float32
-        ).reshape(sq, b, np * hn)
+        core_attn_out = torch.arange(sq * b * np * hn, dtype=torch.float32).reshape(sq, b, np * hn)
         # Simulate gate_states: [sq, b, np] (pre-sigmoid raw scores)
         gate_scores = torch.zeros(sq, b, np)  # sigmoid(0) = 0.5
 

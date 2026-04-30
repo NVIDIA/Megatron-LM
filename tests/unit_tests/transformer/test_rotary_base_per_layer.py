@@ -12,7 +12,6 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from tests.unit_tests.test_utilities import Utils
 
-
 SEQ_LEN = 16
 BATCH_SIZE = 2
 HIDDEN_SIZE = 128
