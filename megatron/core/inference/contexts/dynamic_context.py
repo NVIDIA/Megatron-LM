@@ -1055,14 +1055,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
-        active_count = self.total_request_count - self.paused_request_count
         lengths = self.request_kv_length_offsets + self.request_query_lengths
-        return lengths[:active_count]
+        lengths = lengths[self.paused_request_count : self.total_request_count]
+        return lengths
 
     def get_max_sequence_lengths(self) -> Tensor:
         """Maximum sequence length for active requests."""
-        active_count = self.total_request_count - self.paused_request_count
-        return self.request_output_lengths[:active_count]
+        return self.request_output_lengths[self.paused_request_count : self.total_request_count]
 
     def get_active_request_count(self):
         """Returns the current number of active requests."""
@@ -1935,7 +1934,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         decode_indices = torch.arange(decode_token_count, device=device)
 
         cumsum = torch.cumsum(query_lengths, dim=0)
-        prefill_last_indices = cumsum[num_decode:] - 1
+        prefill_last_indices = cumsum[num_decode:].sub(1)
 
         return torch.cat([decode_indices, prefill_last_indices])
 
@@ -2210,16 +2209,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.active_token_count + effective_prefill_chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
-        # In the [active | paused | dead] layout, new requests must land at the
-        # right edge of the active region (active_count). When no requests are
-        # paused that coincides with total_request_count, so writing at
-        # active_count naturally extends any hidden chunked-prefill record
-        # sitting at total in place. When paused requests exist (reachable via
-        # the chunked-prefill continuation bypass of check_availability's
-        # paused==0 gate), inserting at total would land past the paused
-        # region; instead we right-rotate [active_count..total] by one slot,
-        # moving the hidden chunked-prefill record from total down into
-        # active_count and shifting each paused entry one slot to the right.
+        # In the [active | paused | dead] layout, new requests must land at right edge of active.
+        # When no requests are paused, that landing point is `total_request_count`.
+        # So writing naturally extends any hidden chunked-prefill record.
+        # When paused requests exist, inserting at total would land past the paused region.
+        # Instead we right-rotate, moving the chunked prefill record by one slot.
         active_count = self.total_request_count - self.paused_request_count
         if self.paused_request_count > 0:
             device = self.request_ids.device
@@ -2504,8 +2498,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_start = active_count
             paused_end = self.total_request_count
             paused_block_counts = self.request_kv_block_counts[paused_start:paused_end]
-            # In the [active | paused] layout, the leftmost paused requests are
-            # the most recently paused (LIFO). Resume from left to right — no flip needed.
+            # In the [active | paused] layout, the leftmost paused requests are the most recent.
 
             # Check which paused requests will actually need a new block upon resuming
             offsets = self.request_last_kv_block_offset[paused_start:paused_end]
@@ -2608,10 +2601,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if overflow_paused_request_count == 0:
             return None
 
-        # Evict request count. In the [active | paused] layout, the oldest
-        # paused requests are at the RIGHT (tail). Evict from the tail.
-        # We flip the overflow portion (rightmost paused) to count evicted
-        # blocks from the rightmost side.
+        # Evict request count.
+        # In the [active | paused] layout, the oldest paused requests are at the RIGHT (tail).
+        # Evict from the tail.
+        # We flip the overflow portion (rightmost paused) to count evicted blocks from the right.
         paused_block_counts_tail = paused_block_counts[-overflow_paused_request_count:].flip(
             dims=[0]
         )
@@ -2637,8 +2630,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Release memory.
         self.release_memory_blocks_from_request_indexes(evict_request_idxs)
 
-        # In the [active | paused] layout, evicted requests are already at the
-        # tail of the buffer. No permutation needed — just shrink the counts.
+        # In the [active | paused] layout, evicted requests are already at the tail of the buffer.
         self.paused_request_count -= evict_request_count
         self.total_request_count -= evict_request_count
 
@@ -2871,9 +2863,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count += active_requests_requiring_new_block_count
             active_request_count -= active_requests_requiring_new_block_count
 
-            # Capture newly paused IDs AFTER the partition swap, in positional
-            # order. This ensures resume_paused_requests truncates the correct
-            # entries: the leftmost paused positions are resumed first (LIFO),
+            # Capture newly paused IDs AFTER the partition swap, in positional order.
+            # This ensures resume_paused_requests truncates the correct entries:
+            # the leftmost paused positions are resumed first (LIFO),
             # so slicing off the first N entries removes exactly the resumed IDs.
             if active_requests_requiring_new_block_count > 0:
                 newly_paused_request_ids = self.request_ids[
