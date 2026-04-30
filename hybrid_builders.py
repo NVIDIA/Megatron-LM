@@ -11,6 +11,7 @@ from model_provider import count_parameters_in_layer
 
 
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+    """Construct a HybridModel from CLI args, dispatching on ``--model-recipe``."""
     print_rank_0('building Hybrid model ...')
     assert args.use_legacy_models is False, "Hybrid model only supported in Mcore!"
 
@@ -25,8 +26,23 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         recipe = getattr(args, '_compiled_model_recipe', None)
         if recipe is None:
             recipe = load_recipe(args.model_recipe)
+
+        # Spec selection precedence: explicit recipe.stack_spec wins over
+        # transformer_impl-based auto-pick. ``None`` falls through to
+        # HybridModel's default hybrid_stack_spec.
+        if recipe.stack_spec is not None:
+            recipe_stack_spec = import_module(recipe.stack_spec)
+        elif recipe.config.transformer_impl == "inference_optimized":
+            assert (
+                not recipe.config.inference_fuse_tp_communication
+            ), "inference_fuse_tp_communication is not supported for HybridModel"
+            recipe_stack_spec = hybrid_inference_stack_spec
+        else:
+            recipe_stack_spec = None
+
         model = HybridModel(
             config=recipe.config,
+            hybrid_stack_spec=recipe_stack_spec,
             vocab_size=recipe.vocab_size,
             max_sequence_length=recipe.max_sequence_length,
             pre_process=pre_process,
