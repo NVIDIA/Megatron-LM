@@ -825,6 +825,93 @@ class TestHeterogeneousMoE:
             assert tc.expert_model_parallel_size == 1
             assert tc.num_moe_experts is None
 
+    def test_homogeneous_moe_stack_num_experts_matches_recipe(self):
+        """Stack TC's ``num_moe_experts`` reflects the recipe's actual MoE
+        configuration — not a magic placeholder. MTP block construction and
+        inference capacity sizing both read this value semantically."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        moe = MoELayerConfig(common_config=common, num_experts=128, top_k=2)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, moe, a, moe, loss],
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        ).compile()
+        assert compiled.config.num_moe_experts == 128
+
+    def test_heterogeneous_moe_stack_num_experts_uses_max(self):
+        """For heterogeneous MoE, the stack TC takes ``max(num_experts)`` —
+        the "widest config" choice. MTP body MoE inherits the largest sane
+        sizing; capacity buffers are sized for the worst case."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        dense = MoELayerConfig(common_config=common, num_experts=128, top_k=2)
+        sparse = MoELayerConfig(common_config=common, num_experts=64, top_k=2)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, dense, a, sparse, loss],
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        ).compile()
+        assert compiled.config.num_moe_experts == 128
+
+    def test_stack_moe_ffn_hidden_size_derived_from_matching_layer(self):
+        """The stack TC's ``moe_ffn_hidden_size`` matches the MoE layer
+        that supplied ``num_moe_experts`` (rather than TC defaulting it
+        from ``ffn_hidden_size``, which is the wrong size for MoE
+        consumers)."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        # The "wide" MoE layer (most experts) supplies the stack values.
+        wide = MoELayerConfig(common_config=common, num_experts=128, top_k=2, ffn_hidden_size=1024)
+        narrow = MoELayerConfig(common_config=common, num_experts=64, top_k=2, ffn_hidden_size=512)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, wide, a, narrow, loss],
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        ).compile()
+        assert compiled.config.num_moe_experts == 128
+        assert compiled.config.moe_ffn_hidden_size == 1024
+
+    def test_no_moe_no_ep_keeps_num_experts_none(self):
+        """A dense recipe (no MoE, EP=1) must leave ``num_moe_experts``
+        unset on the stack TC — TC defaults take over."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        compiled = HybridModelConfig(common_config=common, layer_pattern=[emb, a, loss]).compile()
+        assert compiled.config.num_moe_experts is None
+
+    def test_ep_gt_1_without_moe_layers_rejected(self):
+        """Setting ``expert_model_parallel_size > 1`` without any MoE layer
+        is a recipe misconfiguration — surface it loudly rather than
+        silently filling in a placeholder."""
+        common = _make_common()
+        emb = self._embedding(common)
+        a = AttentionLayerConfig(common_config=common, num_attention_heads=4)
+        loss = CrossEntropyLayerConfig()
+        recipe = HybridModelConfig(
+            common_config=common,
+            layer_pattern=[emb, a, loss],
+            tensor_model_parallel_size=2,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        )
+        with pytest.raises(ValueError, match="requires at least one MoELayerConfig"):
+            recipe.compile()
+
 
 @pytest.mark.internal
 class TestExtraPassthrough:
