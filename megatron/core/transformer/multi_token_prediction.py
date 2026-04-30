@@ -998,20 +998,14 @@ class MultiTokenPredictionLayer(MegatronModule):
             s, b, _ = hidden_states.shape
             hs_streams = hidden_states.view(s, b, n, h)
             hs_streams = apply_module(self.hnorm)(hs_streams)
-            hs_streams = make_viewless_tensor(
-                inp=hs_streams, requires_grad=True, keep_graph=True
-            )
+            hs_streams = make_viewless_tensor(inp=hs_streams, requires_grad=True, keep_graph=True)
             # e_proj: [s, b, h] -> [s, b, h], then broadcast to [s, b, n, h]
             e_out, _ = self.e_proj(decoder_input)
-            e_out = gather_from_tensor_model_parallel_region(
-                e_out, group=self.tp_group
-            )
+            e_out = gather_from_tensor_model_parallel_region(e_out, group=self.tp_group)
             e_out = e_out.unsqueeze(2).expand(s, b, n, h)
             # h_proj: applied per-stream on the h dimension
             h_out, _ = self.h_proj(hs_streams)
-            h_out = gather_from_tensor_model_parallel_region(
-                h_out, group=self.tp_group
-            )
+            h_out = gather_from_tensor_model_parallel_region(h_out, group=self.tp_group)
             # Combine and flatten back to [s, b, n*h]
             hidden_states = (e_out + h_out).reshape(s, b, n * h)
             if self.sequence_parallel:

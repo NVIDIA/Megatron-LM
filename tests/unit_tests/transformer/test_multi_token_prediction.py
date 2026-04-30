@@ -5,6 +5,7 @@ import sys
 
 import pytest
 import torch
+from torch import Tensor
 
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -21,11 +22,13 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     roll_tensor,
 )
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -926,3 +929,275 @@ class TestMultiTokenPredictionHybrid:
                 pytest.fail(f"Attention mask validation failed for Mamba hybrid model: {e}")
             else:
                 raise
+
+
+class TestLearnedOutputContract:
+    """Tests for learned_output_contract: shape, dtype, gradient, and numerical correctness."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(_SEED)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_shape_and_dtype(self):
+        """Output shape is [*, h] from [*, n*h]; dtype matches input after fp32 round-trip."""
+        seq_len, batch_size, hidden_size, n_streams = 16, 2, 64, 4
+        head_fn = torch.randn(n_streams, n_streams * hidden_size, device='cuda')
+        base = torch.zeros(n_streams, device='cuda')
+        scale = torch.ones(1, device='cuda')
+
+        for dtype in [torch.bfloat16, torch.float16]:
+            hidden_states = torch.randn(
+                seq_len, batch_size, n_streams * hidden_size, device='cuda', dtype=dtype
+            )
+            output = learned_output_contract(
+                hidden_states, head_fn, base, scale, n_streams, eps=1e-6
+            )
+            assert output.shape == (seq_len, batch_size, hidden_size)
+            assert output.dtype == dtype
+
+    def test_gradient_and_numerical_correctness(self):
+        """Gradients flow to all inputs; output matches reference implementation."""
+        torch.manual_seed(_SEED)
+        seq_len, batch_size, hidden_size, n_streams = 2, 1, 8, 2
+        eps = 1e-6
+        hidden_states = torch.randn(
+            seq_len,
+            batch_size,
+            n_streams * hidden_size,
+            device='cuda',
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        head_fn = torch.randn(n_streams, n_streams * hidden_size, device='cuda', requires_grad=True)
+        base = torch.zeros(n_streams, device='cuda', requires_grad=True)
+        scale = torch.ones(1, device='cuda', requires_grad=True)
+
+        output = learned_output_contract(hidden_states, head_fn, base, scale, n_streams, eps)
+
+        # Numerical reference
+        hs_fp32 = hidden_states.detach().clone()
+        rsqrt_ref = torch.rsqrt(hs_fp32.square().mean(-1, keepdim=True) + eps)
+        mixes_ref = torch.nn.functional.linear(hs_fp32, head_fn.detach()) * rsqrt_ref
+        pre_ref = torch.sigmoid(mixes_ref * scale.detach() + base.detach()) + 1e-6
+        y_ref = torch.sum(
+            pre_ref.unsqueeze(-1) * hs_fp32.view(*hs_fp32.shape[:-1], n_streams, -1), dim=-2
+        )
+        torch.testing.assert_close(output, y_ref, rtol=1e-4, atol=1e-4)
+
+        # Gradient flow
+        output.sum().backward()
+        for name, tensor in [
+            ("hidden_states", hidden_states),
+            ("head_fn", head_fn),
+            ("base", base),
+            ("scale", scale),
+        ]:
+            assert tensor.grad is not None, f"No gradient for {name}"
+            assert not torch.all(tensor.grad == 0), f"Zero gradient for {name}"
+
+
+class TestMHCMTPIntegration:
+    """Integration tests for mHC + MTP: constructor, TransformerBlock output, E2E."""
+
+    def setup_method(self, method):
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        MTPLossLoggingHelper.tracker = {}
+
+    @pytest.mark.parametrize('tp', [1, 2])
+    def test_mtp_constructor_with_mhc(self, tp):
+        """MTP layers have e_proj/h_proj (not eh_proj) and learned contraction params."""
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            num_residual_streams=4,
+            enable_hyper_connections=True,
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=True if tp > 1 else False,
+        )
+        spec = get_gpt_layer_local_spec(enable_hyper_connection=True)
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=spec, use_transformer_engine=False
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        n, h = config.num_residual_streams, config.hidden_size
+        for i in range(config.mtp_num_layers):
+            layer = mtp.layers[i]
+            assert layer.e_proj is not None and layer.h_proj is not None
+            assert layer.eh_proj is None
+            assert layer.e_proj.weight.shape == (h // tp, h)
+            assert layer.h_proj.weight.shape == (h // tp, h)
+            assert layer.hc_head_fn.shape == (n, n * h)
+            assert layer.hc_head_base.shape == (n,)
+            assert layer.hc_head_scale.shape == (1,)
+            if tp > 1:
+                assert getattr(layer.hc_head_fn, 'sequence_parallel', False)
+
+    def test_transformer_block_returns_tuple(self):
+        """With mHC+MTP the block returns (contracted, multistream); without MTP just a tensor."""
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(_SEED)
+        spec = get_gpt_layer_local_spec(enable_hyper_connection=True)
+
+        seq_len, batch_size, h, n = 16, 2, 64, 4
+
+        # With MTP: should return tuple
+        config_mtp = TransformerConfig(
+            num_layers=2,
+            hidden_size=h,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            num_residual_streams=n,
+            use_cpu_initialization=True,
+            mtp_num_layers=2,
+        )
+        block_mtp = TransformerBlock(config_mtp, spec).cuda()
+        hidden_states = torch.randn(seq_len, batch_size, n * h, device='cuda', requires_grad=True)
+        output = block_mtp(hidden_states=hidden_states, attention_mask=None)
+
+        assert isinstance(output, tuple)
+        contracted, multistream = output
+        assert contracted.shape == (seq_len, batch_size, h)
+        assert multistream.shape == (seq_len, batch_size, n * h)
+
+        (contracted.sum() + multistream.sum()).backward()
+        assert hidden_states.grad is not None
+
+        # Without MTP: should return single tensor
+        config_no_mtp = TransformerConfig(
+            num_layers=2,
+            hidden_size=h,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            num_residual_streams=n,
+            use_cpu_initialization=True,
+            mtp_num_layers=None,
+        )
+        block_no_mtp = TransformerBlock(config_no_mtp, spec).cuda()
+        hs2 = torch.randn(seq_len, batch_size, n * h, device='cuda')
+        output2 = block_no_mtp(hidden_states=hs2, attention_mask=None)
+        assert isinstance(output2, Tensor)
+        assert output2.shape == (seq_len, batch_size, h)
+
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("1.7.0"), reason="TransformerEngine >= 1.7.0 required"
+    )
+    @pytest.mark.parametrize('tp', [1, 2])
+    def test_e2e_forward_backward(self, tp):
+        """GPTModel E2E with mHC + MTP: finite output, MTP loss logged, gradients on HC params."""
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+
+        seq_length, micro_batch_size = 32, 2
+
+        sys.argv = ['test_multi_token_prediction.py']
+        args = parse_args()
+        args.num_layers = 2
+        args.mtp_num_layers = 2
+        args.mtp_loss_scaling_factor = 0.1
+        args.vocab_size = 128800
+        args.hidden_size = 128
+        args.num_attention_heads = 8
+        args.max_position_embeddings = 256
+        args.micro_batch_size = micro_batch_size
+        args.create_attention_mask_in_dataloader = True
+        args.seq_length = seq_length
+        args.tensor_model_parallel_size = tp
+        args.sequence_parallel = tp > 1
+        args.context_parallel_size = 1
+        args.position_embedding_type = 'rope'
+        args.num_experts = None
+        args.moe_grouped_gemm = False
+        args.train_iters = 1
+        args.lr = 3e-5
+        args.attention_dropout = 0.0
+        args.hidden_dropout = 0.0
+        args.add_bias_linear = False
+        args.swiglu = True
+        args.bf16 = True
+        args.enable_hyper_connections = True
+        args.num_residual_streams = 4
+        args.recompute_granularity = None
+
+        validate_args(args)
+        set_global_variables(args, False)
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+
+        def model_provider(
+            pre_process=True,
+            post_process=True,
+            layer_spec_fn=get_gpt_layer_with_transformer_engine_spec,
+        ):
+            model_parallel_cuda_manual_seed(_SEED)
+            a = get_args()
+            config = core_transformer_config_from_args(a)
+            layer_spec = layer_spec_fn(
+                a.num_experts,
+                a.moe_grouped_gemm,
+                a.qk_layernorm,
+                enable_hyper_connection=config.enable_hyper_connections,
+            )
+            mtp_spec = get_gpt_mtp_block_spec(
+                config=config, spec=layer_spec, use_transformer_engine=True
+            )
+            return GPTModel(
+                config=config,
+                transformer_layer_spec=layer_spec,
+                mtp_block_spec=mtp_spec,
+                vocab_size=a.vocab_size,
+                max_sequence_length=a.max_position_embeddings,
+                pre_process=pre_process,
+                post_process=post_process,
+                fp16_lm_cross_entropy=a.fp16_lm_cross_entropy,
+                parallel_output=True,
+                share_embeddings_and_output_weights=not a.untie_embeddings_and_output_weights,
+                position_embedding_type=a.position_embedding_type,
+                rotary_percent=a.rotary_percent,
+            )
+
+        gpt_model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
+
+        data = list(range(seq_length))
+        tokens = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = (1 + torch.tensor(data, dtype=torch.int64)).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, seq_length, seq_length), dtype=bool
+        ).cuda()
+        loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
+
+        output = gpt_model[0].forward(
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
+        assert torch.isfinite(output).all(), f"Non-finite output (TP={tp})"
+
+        tracker = MTPLossLoggingHelper.tracker
+        assert "values" in tracker, f"MTP loss not logged (TP={tp})"
+        assert torch.isfinite(tracker['values']).all()
+        MTPLossLoggingHelper.clean_loss_in_tracker()
+
+        output.mean().backward()
+        hc_param_names = ['hc_head_fn', 'hc_head_base', 'hc_head_scale']
+        for name, param in gpt_model[0].named_parameters():
+            assert param.main_grad is not None, f"No gradient for {name}"
+            if any(n in name for n in hc_param_names):
+                assert not torch.all(param.main_grad == 0), f"Zero gradient for {name}"
