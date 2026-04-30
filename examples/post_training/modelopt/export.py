@@ -15,9 +15,10 @@ import torch
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
 from megatron.training.initialize import initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.utils import unwrap_model
 from model_provider import model_provider
 
@@ -49,14 +50,12 @@ def add_modelopt_export_args(parser):
 
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_modelopt_export_args,
-        args_defaults={
+    parse_and_validate_args(extra_args_provider=add_modelopt_export_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        },
-    )
+        })
+    initialize_megatron()
 
     args = get_args()
 
@@ -74,7 +73,7 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
     )
 
     # Materialize the model from meta device to cpu before loading the checkpoint.
