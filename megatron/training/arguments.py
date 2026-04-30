@@ -1892,6 +1892,10 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-max-tokens',
                        type=int, default=None,
                        help='Override the inference context\'s default `max_tokens`.')
+    group.add_argument('--inference-dynamic-batching-async-overlap-queue-depth',
+                       type=int, default=2, choices=[1, 2],
+                       help='Maximum async-overlap pipeline depth. Use 1 for '
+                       'serial/debug mode and 2 for one-step lookahead overlap.')
     group.add_argument('--inference-dynamic-batching-num-cuda-graphs',
                        type=int, default=16,
                        help='Maximum number of cuda graphs to capture, where the '

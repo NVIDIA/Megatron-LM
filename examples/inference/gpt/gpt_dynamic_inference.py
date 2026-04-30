@@ -491,7 +491,7 @@ def main():
         p_count = len(p_times)
         d_count = len(d_times)
 
-        p_mean = p_total / p_count
+        p_mean = p_total / p_count if p_count != 0 else 0.0
         d_mean = d_total / d_count if d_count != 0 else 0.0
 
         # Commented out for now as the step/add/output times are not calculated correctly.

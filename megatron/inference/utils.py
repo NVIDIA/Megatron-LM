@@ -348,6 +348,9 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,
+        async_overlap_queue_depth=getattr(
+            args, 'inference_dynamic_batching_async_overlap_queue_depth', 2
+        ),
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         materialize_only_last_token_logits=(not args.return_log_probs),
         track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
