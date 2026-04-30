@@ -18,8 +18,6 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-LOG2E = 1.4426950408889634
-
 
 # ============================================================================
 # Sinkhorn-Knopp
@@ -48,7 +46,7 @@ def _triton_sinkhorn_fwd_kernel(
 
     logits = tl.load(inp_ptr + mat_ptrs).to(tl.float32)
     row_max = tl.max(logits, axis=1)
-    M = tl.exp2((logits - row_max[:, None]) * LOG2E)
+    M = tl.exp2((logits - row_max[:, None]) * 1.4426950408889634)
     tl.store(M_init_ptr + mat_ptrs, M.to(M_init_ptr.dtype.element_ty))
 
     for _ in range(NUM_ITERS):
