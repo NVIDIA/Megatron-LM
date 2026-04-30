@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -567,6 +567,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # `finalize_attn_init` (non-graph mode, computed via torch.max + .item()).
         self._max_seqlen_q: int = 0
         self._max_seqlen_k: int = 0
+
+        # Hooks called at the tail of `run_attn_init_graph_body`.
+        self._init_body_hooks: List[Callable[[bool], None]] = []
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
         self.moe_routing_metadata = None
@@ -1164,6 +1167,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def run_attn_init_graph_body(self, eager=False, cache_key=None):
         """Graphable portion of `initialize_attention_state`."""
+        if not eager:
+            # Set max_seqlens at capture time. On replay, this can be safely skipped.
+            # Eager mode falls through to `finalize_attn_init`, which computes precise values.
+            if self.padded_batch_dimensions.prefill_req_count == 0:
+                self._max_seqlen_q = self.num_speculative_tokens + 1
+            else:
+                # Force the prefill kernel to launch for prefill graphs.
+                self._max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
+            self._max_seqlen_k = self.max_sequence_length
+
         self._context_op_metadata_gpu.copy_(self._context_op_metadata_cpu, non_blocking=True)
         self.build_active_slices()
 
@@ -1183,6 +1196,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     slot_alloc._intermediate_counts_gpu if slot_alloc is not None else None
                 ),
             )
+
+        for hook in self._init_body_hooks:
+            hook(not eager)
 
         return self._context_op_metadata_gpu
 
@@ -1791,6 +1807,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             # could not find a compatible cuda graph for the dummy forward step.
             # Now, we need not do the remaining setup. The controller
             # will directly call the model forward pass with a single token.
+            for hook in self._init_body_hooks:
+                hook(False)
             return False
 
         # Add dummy requests AFTER the EP sync so they match the resolved graph.
@@ -1837,18 +1855,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
 
-        # In graph mode, max_seqlen_q is a Python int derived from padded dims; baked in by capture.
-        # In non-graph mode it is recomputed in `finalize_attn_init` from the populated buffers.
-        if self.using_cuda_graph_this_step():
-            if self.padded_batch_dimensions.prefill_req_count == 0:
-                self._max_seqlen_q = self.num_speculative_tokens + 1
-            else:
-                # Force the prefill kernel to launch for prefill graphs.
-                self._max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
-            self._max_seqlen_k = self.max_sequence_length
-
-        self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
-
         # Stage GPU scalar values in the pinned CPU buffer.
         # The actual H2D transfer is captured inside `run_attn_init_graph_body`.
         self._context_op_metadata_cpu[0] = self.total_request_count - self.paused_request_count
@@ -1871,8 +1877,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
         # Non-graph mode: recompute max_seqlen from the just-populated buffers.
-        # Graph mode set these in `prepare_attn_init` from padded dims; the
-        # captured kernel calls already baked those Python ints in.
+        # Graph mode set these in `prepare_attn_init` from padded dims.
         if not self.using_cuda_graph_this_step():
             n = self.padded_active_request_count
             if n > 0:

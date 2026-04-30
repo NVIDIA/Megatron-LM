@@ -181,8 +181,37 @@ class TextGenerationController:
                 inline_capture=True,
                 num_warmup_steps=1,
             )
+        context._init_body_hooks.append(self._apply_bucket_toggles)
+
+        if self.model_config.transformer_impl == "inference_optimized":
+            assert not self.model_config.moe_pad_experts_for_cuda_graph_inference, (
+                "moe_pad_experts_for_cuda_graph_inference cannot be True when "
+                "transformer_impl is 'inference_optimized'"
+            )
 
         self._init_mtp_sampling_tensors()
+
+    def _apply_bucket_toggles(self, using_graph: bool) -> None:
+        """Apply MoE / symmetric-AR toggles for the current bucket.
+
+        Registered as a hook on the inference context so that it runs during graph capture.
+        """
+        cfg = self.model_config
+        context = self.inference_wrapped_model.inference_context
+
+        if cfg.moe_pad_experts_for_cuda_graph_inference:
+            if using_graph:
+                set_decode_expert_padding(
+                    self._unwrapped_model,
+                    True,
+                    capacity_factor=cfg.num_moe_experts / cfg.moe_router_topk,
+                )
+            else:
+                set_decode_expert_padding(self._unwrapped_model, False)
+
+        if cfg.nccl_all_reduce_for_prefill and cfg.symmetric_ar_type is not None:
+            target = cfg.symmetric_ar_type if context.is_decode_only() else None
+            self._unwrapped_model.set_symmetric_ar(target)
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -615,11 +644,6 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
 
-        # Remove Float16Module wrapper if it exists
-        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-        model_config = get_model_config(unwrapped_model)
-
-        # Initialize attention state.
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
@@ -628,7 +652,7 @@ class TextGenerationController:
         # Derive the MTP padded batch size from the existing padded graph dimensions.
         # For MoE models this is post EP sync. In eager mode MTP uses locally SP-aligned
         # batch size instead.
-        if context.using_cuda_graph_this_step():
+        if context.using_cuda_graph_this_step() and self.num_speculative_tokens > 0:
             self._mtp_resolved_padded_count = context.padded_batch_dimensions.req_count
             if self._sp_enabled:
                 self._mtp_resolved_padded_count = round_up_to_nearest_multiple(
@@ -636,35 +660,6 @@ class TextGenerationController:
                 )
         else:
             self._mtp_resolved_padded_count = None
-
-        # If using symmetric kernels and we are using using nccl
-        # for prefill turn off symmetric kernels
-        symmetric_ar_type = self.model_config.symmetric_ar_type
-        nccl_all_reduce_for_prefill = self.model_config.nccl_all_reduce_for_prefill
-        # Turning on/off MoE padding for cuda-graphs
-        moe_pad_experts_for_cuda_graph_inference = (
-            self.model_config.moe_pad_experts_for_cuda_graph_inference
-        )
-        is_inference_optimized = self.model_config.transformer_impl == "inference_optimized"
-        if is_inference_optimized:
-            assert not moe_pad_experts_for_cuda_graph_inference, (
-                "moe_pad_experts_for_cuda_graph_inference cannot be True when "
-                "transformer_impl is 'inference_optimized'"
-            )
-        if moe_pad_experts_for_cuda_graph_inference:
-            if context.using_cuda_graph_this_step():
-                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
-            else:
-                set_decode_expert_padding(unwrapped_model, False)
-
-        if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
-            if context.is_decode_only():
-                # Turn on symmetric all reduce when in decode mode
-                unwrapped_model.set_symmetric_ar(symmetric_ar_type)
-            else:
-                # Turn off symmetric all reduces for prefill
-                unwrapped_model.set_symmetric_ar(None)
 
         # Get flat tokens, position ids.
         # If we are running a dummy forward step we want to use the token count agreed upon

@@ -207,10 +207,9 @@ class MambaMetadata:
                 cu_seqlens[cu_gather_idx] - cu_base
             ).to(self._cu_seqlens_buffer.dtype)
             # Pad: positions beyond real_prefill get the last real cumulative value.
-            cu_mask = arange_buf[:padded_prefill_count] < real_prefill_count_gpu
             last_val = self._cu_seqlens_buffer[real_prefill_count_gpu]  # GPU gather
             self._cu_seqlens_buffer[1 : padded_prefill_count + 1] = torch.where(
-                cu_mask, self._cu_seqlens_buffer[1 : padded_prefill_count + 1], last_val
+                prefill_mask, self._cu_seqlens_buffer[1 : padded_prefill_count + 1], last_val
             )
             self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
 
