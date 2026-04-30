@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -127,7 +127,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # This way each rank do some duplicated work but allgather_v is no longer needed
         # All current distopt optimization can also be potentially applied
 
-    def shard_params(self, optimizers: List[MegatronOptimizer]) -> None:
+    def shard_params(self, optimizers):
         """Shard all params into lists by rank."""
         # list of parameter are sorted by numel and assigned to ranks in ping-pong style
         # example of 4 ranks and 10 parameters p0-p9 after sorting, then dp_cp_params_list will be
@@ -181,7 +181,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
-    def set_bucket_layerwise_params_list(self, model_chunks: List) -> None:
+    def set_bucket_layerwise_params_list(self, model_chunks):
         """Map sharded params to DDP buckets for async all-gather.
 
         For each bucket in each model chunk's bucket groups, build per-rank param lists
@@ -269,8 +269,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             _allgather_helper(self.expt_dp_params_list, self.pg_collection.expt_dp)
 
     @torch.no_grad()
-    def broadcast_params(self) -> None:
-        """Broadcast updated params from owning rank to all other DP ranks."""
+    def broadcast_params(self):
+        """All rank broadcast updated local params."""
         if self.dp_cp_params_list is None:
             return
         for i, params in enumerate(self.dp_cp_params_list):
@@ -285,8 +285,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
 
     @torch.no_grad()
-    def get_grad_norm(self) -> torch.Tensor:
-        """Compute global grad norm aggregated across all DP ranks."""
+    def get_grad_norm(self):
+        # similar to dist opt, always aggregate globally
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_main_grads_for_grad_norm()
@@ -294,8 +294,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         return grad_norm
 
     @torch.no_grad()
-    def count_zeros(self) -> torch.Tensor:
-        """Count zero-valued gradients aggregated across all DP ranks."""
+    def count_zeros(self):
         params = []
         for optimizer in self.chained_optimizers:
             params += optimizer.get_parameters()
@@ -387,7 +386,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty
     # this breaks dist checkpointing assumption since extract_sharded_base drop list structure
     # for now, we convert it to dict with index as key and convert back in load_state_dict
-    def load_state_dict(self, state_dict: Dict) -> None:
+    def load_state_dict(self, state_dict):
         if len(self.chained_optimizers) == 1:
             wrapped_state_dict = {1: state_dict}
         else:
