@@ -77,10 +77,10 @@ def _build_model_from_recipe(recipe: HybridModelConfig) -> HybridModel:
         rotary_base=compiled.rotary_base,
         scatter_embedding_sequence_parallel=compiled.scatter_embedding_sequence_parallel,
         seq_len_interpolation_factor=compiled.seq_len_interpolation_factor,
-        layer_type_list_override=compiled.layer_type_list,
-        layer_config_list_override=compiled.layer_config_list,
-        mtp_layer_pattern_override=compiled.mtp_layer_pattern,
-        mtp_num_depths_override=compiled.mtp_num_depths,
+        layer_type_list=compiled.layer_type_list,
+        layer_config_list=compiled.layer_config_list,
+        mtp_layer_pattern=compiled.mtp_layer_pattern,
+        mtp_num_depths=compiled.mtp_num_depths,
     )
 
 
