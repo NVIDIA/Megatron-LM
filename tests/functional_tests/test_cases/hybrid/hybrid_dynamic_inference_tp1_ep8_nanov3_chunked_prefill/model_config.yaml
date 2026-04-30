@@ -48,8 +48,8 @@ MODEL_ARGS:
   --return-log-probs: true
   --num-tokens-to-generate: 30
   --max-tokens-to-oom: 3600000
-  --inference-dynamic-batching-max-tokens: 16 # kept small to trigger chunked prefill.
-  --inference-dynamic-batching-max-requests: 16
+  --inference-dynamic-batching-max-tokens: 64 # kept small to trigger chunked prefill.
+  --inference-dynamic-batching-max-requests: 32
   --inference-max-seq-length: 4096
   --enable-chunked-prefill: true
   --cuda-graph-scope: full_iteration_inference
