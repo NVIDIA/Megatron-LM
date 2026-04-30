@@ -3132,7 +3132,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
 
         # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0).float()
+        logits_squeezed = logits.squeeze(0)
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
