@@ -623,12 +623,10 @@ jobs:
       unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
     needs:
       - pre-flight
-      - configure
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
       needs.pre-flight.result != 'cancelled'
-      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && (
@@ -643,22 +641,8 @@ jobs:
         uses: actions/checkout@v6
       - name: Parse unit tests
         id: parse-unit-tests
-        env:
-          CADENCE: ${{ needs.configure.outputs.cadence }}
         run: |
-          # When CADENCE is set, drop buckets whose effective cadence list
-          # excludes the current trigger. Effective cadence (mirroring
-          # recipe_parser.flatten_products):
-          #   inner_cadence (.products[0].cadence)
-          #     // outer_cadence (.cadence)
-          #     // default ["pr","nightly","mergegroup"]
-          # Empty CADENCE = bypass (label override path).
-          if [ -n "$CADENCE" ]; then
-            QUERY='[.products[] | select(((.products[0].cadence // .cadence // ["pr","nightly","mergegroup"]) | contains([env(CADENCE)]))) | .test_case[] | { "bucket": . }] | sort_by(.model, .test_case)'
-          else
-            QUERY='[.products[].test_case[] | { "bucket": . }] | sort_by(.model, .test_case)'
-          fi
-          CADENCE="$CADENCE" yq -o json "$QUERY" tests/test_utils/recipes/h100/unit-tests.yaml | jq -c > unit-tests.json
+          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
@@ -669,7 +653,6 @@ jobs:
     needs:
       - is-not-external-contributor
       - pre-flight
-      - configure
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
@@ -679,7 +662,6 @@ jobs:
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
-      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-parse-unit-tests.result != 'cancelled'
@@ -706,7 +688,6 @@ jobs:
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
-          cadence: ${{ needs.configure.outputs.cadence }}
 
   cicd-parse-integration-tests-h100:
     runs-on: ubuntu-latest
