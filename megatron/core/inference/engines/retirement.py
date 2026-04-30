@@ -142,6 +142,22 @@ class StepRetirementService:
             results.append(await self.retire(entry.output, entry.payload))
         return results
 
+    def enqueue_dummy_step(self, step_id: int) -> None:
+        """v3 plan §commit 25 — record a dummy step that occupies one queue
+        slot without any GPU work.
+
+        Used by the PP / EP / coordinator paths where some ranks idle for
+        a step while others run the real forward; the dummy entry keeps
+        the per-rank queue depth synchronized so cross-rank backpressure
+        decisions remain consistent. Retirement of the dummy is a no-op
+        finalize callback invocation.
+        """
+        if self._closed:
+            raise RuntimeError("StepRetirementService is closed; cannot enqueue.")
+        self._inflight.append(
+            _InflightEntry(step_id=step_id, output=None, payload=(None, {}, 0.0))
+        )
+
     async def wait_for_capacity(self, max_inflight: int) -> List[Any]:
         """v3 plan §commit 19 — backpressure rule.
 
