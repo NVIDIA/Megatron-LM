@@ -139,12 +139,14 @@ jobs:
     needs: [pre-flight]
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
-      scope:         ${{ steps.configure.outputs.scope }}
-      n_repeat:      ${{ steps.configure.outputs.n_repeat }}
-      lightweight:   ${{ steps.configure.outputs.lightweight }}
-      lts:           ${{ steps.configure.outputs.lts }}
-      mbridge_suite: ${{ steps.configure.outputs.mbridge_suite }}
-      dev:           ${{ steps.configure.outputs.dev }}
+      scope:          ${{ steps.configure.outputs.scope }}
+      n_repeat:       ${{ steps.configure.outputs.n_repeat }}
+      lightweight:    ${{ steps.configure.outputs.lightweight }}
+      lts:            ${{ steps.configure.outputs.lts }}
+      mbridge_suite:  ${{ steps.configure.outputs.mbridge_suite }}
+      dev:            ${{ steps.configure.outputs.dev }}
+      cadence:        ${{ steps.configure.outputs.cadence }}
+      cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -158,6 +160,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
@@ -169,14 +172,15 @@ jobs:
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
 
-          # Scheduled/CI workloads have no PR — treat as "Run functional tests"
-          [ "$IS_CI_WORKLOAD" == "true" ] && HAS_RUN_FUNCTIONAL=true
-
           if [ "$IS_MERGE_GROUP" == "true" ]; then
             SCOPE=mr-github; N_REPEAT=1; LIGHTWEIGHT=false
           elif [ "$HAS_RUN_TESTS" == "true" ]; then
             SCOPE=mr-github; N_REPEAT=1; LIGHTWEIGHT=true
           elif [ "$HAS_RUN_FUNCTIONAL" == "true" ]; then
+            SCOPE=mr-github; N_REPEAT=5; LIGHTWEIGHT=false
+          elif [ "$IS_CI_WORKLOAD" == "true" ]; then
+            # Scheduled / dispatch / release have no PR labels; default to the
+            # full functional scope so cadence (set below) is the discriminator.
             SCOPE=mr-github; N_REPEAT=5; LIGHTWEIGHT=false
           else
             SCOPE=mr-github-slim; N_REPEAT=5; LIGHTWEIGHT=false
@@ -188,22 +192,48 @@ jobs:
             MBRIDGE_SUITE="unit-only"
           fi
 
+          # Cadence: trigger-driven test selection axis (see filter_by_cadence
+          # in tests/test_utils/python_scripts/recipe_parser.py). PR labels
+          # `Run tests` and `Run functional tests` bypass the cadence filter so
+          # contributors retain a manual override.
+          if [ "$IS_MERGE_GROUP" == "true" ]; then
+            CADENCE=mergegroup
+          elif [ "$EVENT_NAME" == "schedule" ] || [ "$EVENT_NAME" == "workflow_dispatch" ]; then
+            CADENCE=nightly
+          else
+            CADENCE=pr
+          fi
+
+          if [ "$HAS_RUN_TESTS" == "true" ] || [ "$HAS_RUN_FUNCTIONAL" == "true" ]; then
+            CADENCE_BYPASS=true
+            CADENCE_OUTPUT=""
+          else
+            CADENCE_BYPASS=false
+            CADENCE_OUTPUT="$CADENCE"
+          fi
+
           DEV=true
 
-          echo "scope=$SCOPE"                 | tee -a $GITHUB_OUTPUT
-          echo "n_repeat=$N_REPEAT"           | tee -a $GITHUB_OUTPUT
-          echo "lightweight=$LIGHTWEIGHT"     | tee -a $GITHUB_OUTPUT
-          echo "lts=$HAS_LTS"                 | tee -a $GITHUB_OUTPUT
-          echo "mbridge_suite=$MBRIDGE_SUITE" | tee -a $GITHUB_OUTPUT
-          echo "dev=$DEV"                     | tee -a $GITHUB_OUTPUT
+          echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
+          echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
+          echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
+          echo "lts=$HAS_LTS"                   | tee -a $GITHUB_OUTPUT
+          echo "mbridge_suite=$MBRIDGE_SUITE"   | tee -a $GITHUB_OUTPUT
+          echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
+          echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
+          echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
           _RT=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" == "true" ]                                        && echo "**→**" || echo "" )
           _RF=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" == "true" ]  && echo "**→**" || echo "" )
+          _CI=$( [ "$IS_MERGE_GROUP" != "true" ] && [ "$HAS_RUN_TESTS" != "true" ] && [ "$HAS_RUN_FUNCTIONAL" != "true" ] && [ "$IS_CI_WORKLOAD" == "true" ] && echo "**→**" || echo "" )
           _DF=$( [ "$SCOPE" == "mr-github-slim" ]                                                                          && echo "**→**" || echo "" )
           _LTS=$( [ "$HAS_LTS" == "true" ]                                                                                 && echo "**→**" || echo "" )
           _DEV=$( [ "$HAS_LTS" != "true" ]                                                                                 && echo "**→**" || echo "" )
+          _CMG=$( [ "$CADENCE" == "mergegroup" ] && echo "**→**" || echo "" )
+          _CN=$(  [ "$CADENCE" == "nightly" ]    && echo "**→**" || echo "" )
+          _CPR=$( [ "$CADENCE" == "pr" ]         && echo "**→**" || echo "" )
 
           cat <<SUMMARY >> $GITHUB_STEP_SUMMARY
           Beep boop 🤖 I have consulted the labels and decided to run **$SCOPE** $( [ "$LIGHTWEIGHT" == "true" ] && echo "in lightweight mode " || echo "" )against the **$( [ "$HAS_LTS" == "true" ] && echo "lts" || echo "dev" )** container with **$N_REPEAT** repetition(s). You are welcome.
@@ -216,6 +246,8 @@ jobs:
           | \`lts\` | \`$HAS_LTS\` |
           | \`dev\` | \`$DEV\` |
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
+          | \`cadence\` | \`$CADENCE\` |
+          | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
 
           ### Decision tree
 
@@ -225,8 +257,17 @@ jobs:
           |---|---|---|---|---|
           | $_MG | Merge group | \`mr-github\` | \`1\` | \`false\` |
           | $_RT | Label: _Run tests_ | \`mr-github\` | \`1\` | \`true\` |
-          | $_RF | Label: _Run functional tests_ / CI workload | \`mr-github\` | \`5\` | \`false\` |
+          | $_RF | Label: _Run functional tests_ | \`mr-github\` | \`5\` | \`false\` |
+          | $_CI | Schedule / dispatch (CI workload) | \`mr-github\` | \`5\` | \`false\` |
           | $_DF | _(default)_ | \`mr-github-slim\` | \`5\` | \`false\` |
+
+          **Cadence** _(filter bypassed when \`Run tests\` or \`Run functional tests\` label is set)_
+
+          | | Trigger | \`cadence\` |
+          |---|---|---|
+          | $_CMG | Merge group | \`mergegroup\` |
+          | $_CN  | Schedule / dispatch | \`nightly\` |
+          | $_CPR | PR push (default) | \`pr\` |
 
           **Container image**
 
@@ -239,6 +280,7 @@ jobs:
           - **\`lightweight\`**: trains for 4 steps instead of 100 and skips comparison against golden values — faster feedback, no correctness guarantees
           - **\`lts\`**: uses the Long Term Support container base image instead of the latest dev image
           - **\`dev\`**: uses the latest development container base image (default)
+          - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
           SUMMARY
 
   linting:
@@ -581,10 +623,12 @@ jobs:
       unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
     needs:
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
       needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && (
@@ -599,8 +643,22 @@ jobs:
         uses: actions/checkout@v6
       - name: Parse unit tests
         id: parse-unit-tests
+        env:
+          CADENCE: ${{ needs.configure.outputs.cadence }}
         run: |
-          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          # When CADENCE is set, drop buckets whose effective cadence list
+          # excludes the current trigger. Effective cadence (mirroring
+          # recipe_parser.flatten_products):
+          #   inner_cadence (.products[0].cadence)
+          #     // outer_cadence (.cadence)
+          #     // default ["pr","nightly","mergegroup"]
+          # Empty CADENCE = bypass (label override path).
+          if [ -n "$CADENCE" ]; then
+            QUERY='[.products[] | select(((.products[0].cadence // .cadence // ["pr","nightly","mergegroup"]) | contains([env(CADENCE)]))) | .test_case[] | { "bucket": . }] | sort_by(.model, .test_case)'
+          else
+            QUERY='[.products[].test_case[] | { "bucket": . }] | sort_by(.model, .test_case)'
+          fi
+          CADENCE="$CADENCE" yq -o json "$QUERY" tests/test_utils/recipes/h100/unit-tests.yaml | jq -c > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
@@ -611,6 +669,7 @@ jobs:
     needs:
       - is-not-external-contributor
       - pre-flight
+      - configure
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
@@ -620,6 +679,7 @@ jobs:
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-parse-unit-tests.result != 'cancelled'
@@ -646,6 +706,7 @@ jobs:
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          cadence: ${{ needs.configure.outputs.cadence }}
 
   cicd-parse-integration-tests-h100:
     runs-on: ubuntu-latest
@@ -679,11 +740,15 @@ jobs:
         env:
           SCOPE: ${{ needs.configure.outputs.scope }}
           LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
+          CADENCE: ${{ needs.configure.outputs.cadence }}
         run: |
           export PYTHONPATH=$(pwd)
 
           ARGS=(--scope $SCOPE)
           [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+          # CADENCE is empty when label-based bypass is active; pass through
+          # only when set so generate_jet_trigger_job sees None and skips the filter.
+          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
@@ -755,6 +820,7 @@ jobs:
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
+          cadence: ${{ needs.configure.outputs.cadence }}
 
   cicd-parse-integration-tests-gb200:
     runs-on: ubuntu-latest
@@ -790,11 +856,15 @@ jobs:
         env:
           SCOPE: ${{ needs.configure.outputs.scope }}
           LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
+          CADENCE: ${{ needs.configure.outputs.cadence }}
         run: |
           export PYTHONPATH=$(pwd)
 
           ARGS=(--scope $SCOPE)
           [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+          # CADENCE is empty when label-based bypass is active; pass through
+          # only when set so generate_jet_trigger_job sees None and skips the filter.
+          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
@@ -868,6 +938,7 @@ jobs:
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
           platform: dgx_gb200
+          cadence: ${{ needs.configure.outputs.cadence }}
 
   Nemo_CICD_Test:
     needs:

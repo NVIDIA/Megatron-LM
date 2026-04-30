@@ -69,6 +69,7 @@ products:
       - environment: [dev]
         scope: [mr-github, mr-github-slim]
         platforms: [dgx_gb200]
+        cadence: [pr, nightly]
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn_1node]
     products:
       - environment: [dev]
@@ -89,6 +90,7 @@ products:
       - environment: [dev]
         scope: [mr-github, mr-github-slim]
         platforms: [dgx_gb200]
+        cadence: [nightly]
   #######################################################################
   # tp1_pp1 variants                                                    #
   #######################################################################

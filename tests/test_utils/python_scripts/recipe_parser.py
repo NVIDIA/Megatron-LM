@@ -12,6 +12,22 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CADENCE = ["pr", "nightly", "mergegroup"]
+ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE)
+
+
+def _validate_cadence(cadence: List[str], test_case: str) -> None:
+    if not isinstance(cadence, list):
+        raise ValueError(
+            f"cadence for test_case {test_case} must be a list, got {type(cadence).__name__}"
+        )
+    invalid = [c for c in cadence if c not in ALLOWED_CADENCE_VALUES]
+    if invalid:
+        raise ValueError(
+            f"Invalid cadence value(s) {invalid} for test_case {test_case}. "
+            f"Allowed: {sorted(ALLOWED_CADENCE_VALUES)}"
+        )
+
 
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
@@ -47,14 +63,37 @@ def flatten_products(workload_manifest: dotdict) -> dotdict:
             continue
 
         test_case = product["test_case"][0]
+        # Outer-level cadence (next to test_case) acts as a default for every
+        # inner products block under this test_case. Inner cadence wins when
+        # both are present.
+        outer_cadence = product.get("cadence")
+        if outer_cadence is not None:
+            _validate_cadence(outer_cadence, test_case)
+
         for param_dict in product["products"]:
-            # Generate all combinations of parameter values
-            param_combinations = itertools.product(*param_dict.values())
+            # cadence is a list-valued attribute, not a cartesian dimension.
+            # Pull it out of the cartesian product before expansion so a list
+            # like ["pr", "nightly"] doesn't multiply the workload count.
+            inner_cadence = param_dict.get("cadence")
+            if inner_cadence is not None:
+                _validate_cadence(inner_cadence, test_case)
+            cartesian_keys = [k for k in param_dict.keys() if k != "cadence"]
+            cartesian_values = [param_dict[k] for k in cartesian_keys]
+
+            # Resolve effective cadence: inner overrides outer, default loose.
+            effective_cadence = (
+                inner_cadence if inner_cadence is not None else outer_cadence
+            )
+            if effective_cadence is None:
+                effective_cadence = list(DEFAULT_CADENCE)
+
+            param_combinations = itertools.product(*cartesian_values)
 
             for value_combination in param_combinations:
                 # Map parameter names to their values
-                flattened = dict(zip(param_dict.keys(), value_combination))
+                flattened = dict(zip(cartesian_keys, value_combination))
                 flattened["test_case"] = test_case
+                flattened["cadence"] = effective_cadence
                 flattened_products.append(flattened)
 
     workload_manifest.products = flattened_products
@@ -130,6 +169,35 @@ def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdi
         return []
 
     return workload_manifests
+
+
+def filter_by_cadence(
+    workload_manifests: List[dotdict], cadence: Optional[str]
+) -> List[dotdict]:
+    """Returns workloads whose cadence list includes the requested cadence value.
+
+    A cadence of None disables the filter (used for the label-based bypass path).
+    Workloads missing a cadence field default to all triggers (loose default).
+    """
+    if cadence is None:
+        return workload_manifests
+
+    if cadence not in ALLOWED_CADENCE_VALUES:
+        raise ValueError(
+            f"Invalid cadence {cadence!r}. Allowed: {sorted(ALLOWED_CADENCE_VALUES)}"
+        )
+
+    filtered = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        if cadence in workload_manifest.spec.get("cadence", DEFAULT_CADENCE)
+    )
+
+    if len(filtered) == 0:
+        logger.info("No test_case found for cadence %s!", cadence)
+        return []
+
+    return filtered
 
 
 def filter_by_environment(workload_manifests: List[dotdict], environment: str) -> List[dotdict]:
@@ -227,6 +295,7 @@ def load_workloads(
     test_case: Optional[str] = None,
     container_image: Optional[str] = None,
     record_checkpoints: Optional[str] = None,
+    cadence: Optional[str] = None,
 ) -> List[dotdict]:
     """Return all workloads from disk that match scope and platform."""
     recipes_dir = BASE_PATH / ".." / "recipes"
@@ -241,6 +310,10 @@ def load_workloads(
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
+
+    if workloads and cadence:
+        workloads = filter_by_cadence(workload_manifests=workloads, cadence=cadence)
+
     if workloads and environment:
         workloads = filter_by_environment(workload_manifests=workloads, environment=environment)
 
