@@ -2097,7 +2097,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
 
-        This runs at the start of transfer_bookkeeping_to_gpu() so that all GPU
+        This runs at the start of initialize_attention_state() so that all GPU
         Mamba state is correct before the forward pass.
         """
         if not (self._pending_mamba_restores or self._pending_mamba_zeros):
