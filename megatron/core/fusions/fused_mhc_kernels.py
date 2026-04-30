@@ -1304,6 +1304,7 @@ if _CUTILE_AVAILABLE:
         eps: float,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
+        HAS_GRAD_R_EXT: ConstInt,
     ):
         """Precompute grad_h, grad_proj, and grad_r_total for downstream backward kernels.
 
@@ -1365,11 +1366,14 @@ if _CUTILE_AVAILABLE:
             grad_h * proj_tile * scale_2d * (-inv_r_eps * inv_r_eps),
             axis=1, keepdims=True,
         )
-        grad_r_ext_tile = ct.load(
-            GRAD_R_EXT, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1),
-            padding_mode=PAD_ZERO,
-        )
-        grad_r_ext_tile = ct.astype(grad_r_ext_tile, ct.float32)
+        if HAS_GRAD_R_EXT:
+            grad_r_ext_tile = ct.load(
+                GRAD_R_EXT, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1),
+                padding_mode=PAD_ZERO,
+            )
+            grad_r_ext_tile = ct.astype(grad_r_ext_tile, ct.float32)
+        else:
+            grad_r_ext_tile = ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32)
         grad_r_total = grad_r_from_h + grad_r_ext_tile
 
         ct.store(GRAD_H, index=(tile_m_id, 0), tile=grad_h.astype(GRAD_H.dtype))
@@ -1448,14 +1452,14 @@ if _CUTILE_AVAILABLE:
         ct.store(GRAD_WEIGHT, index=(0, tile_k_id), tile=acc_grad_weight.transpose().astype(GRAD_WEIGHT.dtype))
 
     @ct.kernel
-    def _ct_scalar_grads_kernel(
+    def _ct_scalar_grads_partials_kernel(
         GRAD_H,           # [M, TILE_SIZE_N] precomputed
         PROJ,           # [M, N]
         R,              # [M, 1]
-        GRAD_ALPHA_PRE,   # [1] output (atomic)
-        GRAD_ALPHA_POST,  # [1] output (atomic)
-        GRAD_ALPHA_RES,   # [1] output (atomic)
-        GRAD_BIAS,        # [TILE_SIZE_N] output (atomic)
+        GRAD_ALPHA_PRE_PARTIALS,   # [num_m_blocks, 1] output
+        GRAD_ALPHA_POST_PARTIALS,  # [num_m_blocks, 1] output
+        GRAD_ALPHA_RES_PARTIALS,   # [num_m_blocks, 1] output
+        GRAD_BIAS_PARTIALS,        # [num_m_blocks, TILE_SIZE_N] output
         M: int,
         N: int,
         n: int,
@@ -1463,7 +1467,7 @@ if _CUTILE_AVAILABLE:
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
     ):
-        """Compute scalar gradients (grad_alpha_pre/post/res, grad_bias).
+        """Compute per-M-tile scalar-gradient partials.
 
         Grid: (ceil(M / TILE_SIZE_M),).  Each block processes one M-tile.
         """
@@ -1499,11 +1503,68 @@ if _CUTILE_AVAILABLE:
         inv_r_eps = 1.0 / r_eps
 
         ga_all = grad_h * proj_tile * inv_r_eps
-        ct.atomic_add(GRAD_ALPHA_PRE, 0, ct.sum(ga_all * mask_pre_2d).astype(GRAD_ALPHA_PRE.dtype))
-        ct.atomic_add(GRAD_ALPHA_POST, 0, ct.sum(ga_all * mask_post_2d).astype(GRAD_ALPHA_POST.dtype))
-        ct.atomic_add(GRAD_ALPHA_RES, 0, ct.sum(ga_all * mask_res_2d).astype(GRAD_ALPHA_RES.dtype))
+        ga_pre = ct.reshape(ct.sum(ga_all * mask_pre_2d), (1, 1))
+        ga_post = ct.reshape(ct.sum(ga_all * mask_post_2d), (1, 1))
+        ga_res = ct.reshape(ct.sum(ga_all * mask_res_2d), (1, 1))
         partial_gb = ct.sum(grad_h, axis=0, keepdims=False)
-        ct.atomic_add(GRAD_BIAS, offsets, partial_gb.astype(GRAD_BIAS.dtype))
+        ct.store(
+            GRAD_ALPHA_PRE_PARTIALS, index=(bid_m, 0),
+            tile=ga_pre.astype(GRAD_ALPHA_PRE_PARTIALS.dtype),
+        )
+        ct.store(
+            GRAD_ALPHA_POST_PARTIALS, index=(bid_m, 0),
+            tile=ga_post.astype(GRAD_ALPHA_POST_PARTIALS.dtype),
+        )
+        ct.store(
+            GRAD_ALPHA_RES_PARTIALS, index=(bid_m, 0),
+            tile=ga_res.astype(GRAD_ALPHA_RES_PARTIALS.dtype),
+        )
+        ct.store(
+            GRAD_BIAS_PARTIALS, index=(bid_m, 0),
+            tile=ct.reshape(partial_gb, (1, TILE_SIZE_N)).astype(GRAD_BIAS_PARTIALS.dtype),
+        )
+
+    @ct.kernel
+    def _ct_scalar_grads_reduce_kernel(
+        GRAD_ALPHA_PRE_PARTIALS,   # [num_m_blocks, 1]
+        GRAD_ALPHA_POST_PARTIALS,  # [num_m_blocks, 1]
+        GRAD_ALPHA_RES_PARTIALS,   # [num_m_blocks, 1]
+        GRAD_BIAS_PARTIALS,        # [num_m_blocks, TILE_SIZE_N]
+        GRAD_ALPHA_PRE,            # [1, 1] output
+        GRAD_ALPHA_POST,           # [1, 1] output
+        GRAD_ALPHA_RES,            # [1, 1] output
+        GRAD_BIAS,                 # [1, TILE_SIZE_N] output
+        NUM_M_BLOCKS: int,
+        TILE_SIZE_N: ConstInt,
+    ):
+        """Reduce scalar-gradient partials and write final dtype outputs."""
+        acc_pre = ct.full((1, 1), 0.0, dtype=ct.float32)
+        acc_post = ct.full((1, 1), 0.0, dtype=ct.float32)
+        acc_res = ct.full((1, 1), 0.0, dtype=ct.float32)
+        acc_bias = ct.full((1, TILE_SIZE_N), 0.0, dtype=ct.float32)
+
+        for bid_m in range(NUM_M_BLOCKS):
+            acc_pre += ct.load(
+                GRAD_ALPHA_PRE_PARTIALS, index=(bid_m, 0), shape=(1, 1),
+                padding_mode=PAD_ZERO,
+            ).astype(ct.float32)
+            acc_post += ct.load(
+                GRAD_ALPHA_POST_PARTIALS, index=(bid_m, 0), shape=(1, 1),
+                padding_mode=PAD_ZERO,
+            ).astype(ct.float32)
+            acc_res += ct.load(
+                GRAD_ALPHA_RES_PARTIALS, index=(bid_m, 0), shape=(1, 1),
+                padding_mode=PAD_ZERO,
+            ).astype(ct.float32)
+            acc_bias += ct.load(
+                GRAD_BIAS_PARTIALS, index=(bid_m, 0), shape=(1, TILE_SIZE_N),
+                padding_mode=PAD_ZERO,
+            ).astype(ct.float32)
+
+        ct.store(GRAD_ALPHA_PRE, index=(0, 0), tile=acc_pre.astype(GRAD_ALPHA_PRE.dtype))
+        ct.store(GRAD_ALPHA_POST, index=(0, 0), tile=acc_post.astype(GRAD_ALPHA_POST.dtype))
+        ct.store(GRAD_ALPHA_RES, index=(0, 0), tile=acc_res.astype(GRAD_ALPHA_RES.dtype))
+        ct.store(GRAD_BIAS, index=(0, 0), tile=acc_bias.astype(GRAD_BIAS.dtype))
 
     @ct.kernel
     def _ct_fused_compute_h_proj_rms_bwd_small_k_kernel(
@@ -1525,13 +1586,14 @@ if _CUTILE_AVAILABLE:
         n: int,
         eps: float,
         TILE_N_SIZE: ConstInt,
+        HAS_GRAD_R_EXT: ConstInt,
     ):
         """Fused backward (small K path) with work-stealing.
 
         Grid: (num_sms, 2).
         bid(1)==0: grad_weight via work-stealing over K-tiles, loops M.
         bid(1)==1: grad_x via work-stealing over (M×K) tiles.
-        Scalar gradients computed by separate _ct_scalar_grads_kernel.
+        Scalar gradients are computed by the separate partial/reduce kernels.
         """
         zero_pad = ct.PaddingMode.ZERO
 
@@ -1652,11 +1714,14 @@ if _CUTILE_AVAILABLE:
                     grad_h * proj_tile * scale_2d * (-inv_r_eps * inv_r_eps),
                     axis=1, keepdims=True,
                 )
-                grad_r_ext_tile = ct.load(
-                    GRAD_R_EXT, index=(dd_tile_idx, 0),
-                    shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
-                )
-                grad_r_ext_tile = ct.astype(grad_r_ext_tile, ct.float32)
+                if HAS_GRAD_R_EXT:
+                    grad_r_ext_tile = ct.load(
+                        GRAD_R_EXT, index=(dd_tile_idx, 0),
+                        shape=(TILE_DA_SIZE_M, 1), padding_mode=zero_pad,
+                    )
+                    grad_r_ext_tile = ct.astype(grad_r_ext_tile, ct.float32)
+                else:
+                    grad_r_ext_tile = ct.full((TILE_DA_SIZE_M, 1), 0.0, dtype=ct.float32)
                 grad_r_total = grad_r_from_h + grad_r_ext_tile
 
                 x_tile = ct.load(
@@ -1722,13 +1787,9 @@ if _CUTILE_AVAILABLE:
 
         grad_x = torch.empty_like(x)
         grad_weight = torch.empty_like(weight)
-        grad_alpha_pre_acc = torch.zeros(1, dtype=torch.float32, device=dev)
-        grad_alpha_post_acc = torch.zeros(1, dtype=torch.float32, device=dev)
-        grad_alpha_res_acc = torch.zeros(1, dtype=torch.float32, device=dev)
-        grad_bias_acc = torch.zeros(TILE_N, dtype=torch.float32, device=dev)
-
-        if grad_r_ext is None:
-            grad_r_ext = torch.zeros(M, 1, dtype=x.dtype, device=dev)
+        has_grad_r_ext = grad_r_ext is not None
+        has_grad_r_ext_flag = int(has_grad_r_ext)
+        grad_r_ext_arg = grad_r_ext if has_grad_r_ext else r
 
         # 0. Precompute grad_h, grad_proj, grad_r_total
         grad_h_buf = torch.empty(M, TILE_N, dtype=torch.float32, device=dev)
@@ -1741,11 +1802,11 @@ if _CUTILE_AVAILABLE:
             (math.ceil(M / tile_m_precomp),),
             _ct_fused_grad_h_proj_kernel,
             (
-                grad_y, y_activated, proj, r, grad_r_ext,
+                grad_y, y_activated, proj, r, grad_r_ext_arg,
                 alpha_pre, alpha_post, alpha_res,
                 grad_h_buf, grad_proj_buf, grad_r_total_buf,
                 M, N, n, eps,
-                tile_m_precomp, TILE_N,
+                tile_m_precomp, TILE_N, has_grad_r_ext_flag,
             ),
         )
 
@@ -1808,37 +1869,57 @@ if _CUTILE_AVAILABLE:
                 (num_sms, 2, 1),
                 _ct_fused_compute_h_proj_rms_bwd_small_k_kernel,
                 (
-                    x, weight, grad_y, y_activated, proj, r, grad_r_ext,
+                    x, weight, grad_y, y_activated, proj, r, grad_r_ext_arg,
                     alpha_pre, alpha_post, alpha_res,
                     grad_x, grad_weight,
                     M, N, K, n, eps,
-                    TILE_N,
+                    TILE_N, has_grad_r_ext_flag,
                 ),
             )
 
         # 2. Separate lightweight kernel for scalar gradients (grad_alpha, grad_bias)
         tile_m_scalar = min(128, M)
         num_m_blocks = math.ceil(M / tile_m_scalar)
+        grad_alpha_pre_partials = torch.empty(num_m_blocks, 1, dtype=torch.float32, device=dev)
+        grad_alpha_post_partials = torch.empty(num_m_blocks, 1, dtype=torch.float32, device=dev)
+        grad_alpha_res_partials = torch.empty(num_m_blocks, 1, dtype=torch.float32, device=dev)
+        grad_bias_partials = torch.empty(num_m_blocks, TILE_N, dtype=torch.float32, device=dev)
+        grad_alpha_pre = torch.empty(1, 1, dtype=alpha_pre.dtype, device=dev)
+        grad_alpha_post = torch.empty(1, 1, dtype=alpha_post.dtype, device=dev)
+        grad_alpha_res = torch.empty(1, 1, dtype=alpha_res.dtype, device=dev)
+        grad_bias = torch.empty(1, TILE_N, dtype=bias.dtype, device=dev)
+
         ct.launch(
             stream,
             (num_m_blocks,),
-            _ct_scalar_grads_kernel,
+            _ct_scalar_grads_partials_kernel,
             (
                 grad_h_buf, proj, r,
-                grad_alpha_pre_acc, grad_alpha_post_acc, grad_alpha_res_acc,
-                grad_bias_acc,
+                grad_alpha_pre_partials, grad_alpha_post_partials, grad_alpha_res_partials,
+                grad_bias_partials,
                 M, N, n, eps,
                 tile_m_scalar, TILE_N,
+            ),
+        )
+        ct.launch(
+            stream,
+            (1,),
+            _ct_scalar_grads_reduce_kernel,
+            (
+                grad_alpha_pre_partials, grad_alpha_post_partials, grad_alpha_res_partials,
+                grad_bias_partials,
+                grad_alpha_pre, grad_alpha_post, grad_alpha_res, grad_bias,
+                num_m_blocks, TILE_N,
             ),
         )
 
         return (
             grad_x,
             grad_weight,
-            grad_alpha_pre_acc.to(alpha_pre.dtype),
-            grad_alpha_post_acc.to(alpha_post.dtype),
-            grad_alpha_res_acc.to(alpha_res.dtype),
-            grad_bias_acc[:N].to(bias.dtype),
+            grad_alpha_pre.view_as(alpha_pre),
+            grad_alpha_post.view_as(alpha_post),
+            grad_alpha_res.view_as(alpha_res),
+            grad_bias.view(-1)[:N],
         )
 
 
