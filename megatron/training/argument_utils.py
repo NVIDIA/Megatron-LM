@@ -14,6 +14,9 @@ from dataclasses import Field, fields
 import torch.nn.functional as F
 import torch
 
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.spec_utils import import_module
+
 from megatron.training.config import (
     DistributedInitConfig, 
     PretrainConfigContainer, 
@@ -25,6 +28,7 @@ from megatron.training.config import (
     StragglerDetectionConfig,
     RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
 )
+from megatron.training.models.hybrid import HybridModelConfig
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -266,7 +270,7 @@ class ArgumentGroupFactory:
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
-    from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+    from megatron.core.transformer import MLATransformerConfig
     from megatron.core.transformer.heterogeneous.heterogeneous_config import (
         HeterogeneousTransformerConfig,
     )
@@ -380,6 +384,50 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return cls(**kwargs)
     else:
         return kwargs
+
+
+def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
+    """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
+
+    assert args.use_legacy_models is False, "Hybrid model only supported in Mcore!"
+
+    kwargs = {}
+    if config is None:
+        transformer_cfg = core_transformer_config_from_args(args)
+    else:
+        transformer_cfg = config
+    kwargs["transformer"] = transformer_cfg
+
+    if transformer_cfg.transformer_impl == "inference_optimized":
+        assert (
+            not transformer_cfg.inference_fuse_tp_communication
+        ), "inference_fuse_tp_communication is not supported for HybridModel"
+    elif args.spec is not None:
+        kwargs["hybrid_stack_spec"] = import_module(args.spec)
+
+
+    kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
+    kwargs["position_embedding_type"] = args.position_embedding_type
+    kwargs["rotary_percent"] = args.rotary_percent
+    kwargs["rotary_base"] = args.rotary_base
+    kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
+
+    kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
+    kwargs["seq_length"] = args.max_position_embeddings
+    kwargs["share_embeddings_and_output_weights"] = not args.untie_embeddings_and_output_weights
+
+    if args.padded_vocab_size is not None:
+        kwargs["vocab_size"] = args.padded_vocab_size
+    else:
+        # Megatron-Bridge uses an explicit setting "should_pad_vocab" so that 
+        # when converting model configs from HF, we can set a vocab size and disable padding. 
+        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        kwargs["vocab_size"] = args.vocab_size
+        kwargs["should_pad_vocab"] = True
+
+    return HybridModelConfig(**kwargs)
+
 
 def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
