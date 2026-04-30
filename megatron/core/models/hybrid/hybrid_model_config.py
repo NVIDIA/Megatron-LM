@@ -240,14 +240,18 @@ class HybridModelConfig:
         layer_type_list = [type(lc).SYMBOL for lc in decoder_flat]
         layer_config_list: List[TransformerConfig] = []
         for lc in decoder_flat:
-            tc = lc.to_transformer_config(
-                num_layers, parallelism=parallelism, placeholders=placeholders
-            )
+            # Only MoE layers carry expert parallelism; non-MoE TCs default
+            # to EP=1 (TC default), which is what they actually consume at
+            # runtime. Merging into the initial kwargs (rather than via a
+            # follow-up dataclasses.replace) keeps TC.__post_init__'s MoE
+            # cross-checks (e.g. ``add_bias_linear`` requires ``ETP==1``)
+            # validating against the right ETP value the first time around.
+            layer_parallelism = parallelism
             if isinstance(lc, MoELayerConfig):
-                # ``dataclasses.replace`` re-runs TC.__post_init__, so the
-                # EP > 1 / num_moe_experts invariant validates against the
-                # MoE TC (which carries the real ``num_moe_experts``).
-                tc = dataclasses.replace(tc, **expert_parallelism)
+                layer_parallelism = {**parallelism, **expert_parallelism}
+            tc = lc.to_transformer_config(
+                num_layers, parallelism=layer_parallelism, placeholders=placeholders
+            )
             layer_config_list.append(tc)
 
         # Reuse the existing pattern validator for the Attention/DSA mix rule.
