@@ -2537,31 +2537,58 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-    def _execute_pending_mamba_ops(self) -> None:
+    def _execute_pending_mamba_ops(self, gpu_bookkeeping_stream=None) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
 
         This runs at the start of transfer_bookkeeping_to_gpu() so that all GPU
         Mamba state is correct before the forward pass.
+
+        v3 plan §commit 24 — when ``gpu_bookkeeping_stream`` is supplied the
+        zero / restore kernels run on it (waiting on the snapshot's
+        ``metadata_ready_event`` if available) and a ``mamba_ops_done_event``
+        is recorded for the forward stream's stream-wait protocol.
         """
         if not (self._pending_mamba_restores or self._pending_mamba_zeros):
+            self._mamba_ops_done_event = None
             return
 
-        # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
-        for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
-            restored = self.mamba_slot_allocator.restore_to_live(request_idx, block_id)
-            if not restored:
-                self._pending_mamba_zeros.append(mamba_idx)
-        self._pending_mamba_restores.clear()
+        if gpu_bookkeeping_stream is not None:
+            metadata_event = self.snapshot_metadata_event(self._active_snapshot_slot)
+            if metadata_event is not None:
+                gpu_bookkeeping_stream.wait_event(metadata_event)
+            ctx_mgr = torch.cuda.stream(gpu_bookkeeping_stream)
+        else:
+            ctx_mgr = nullcontext()
 
-        # Batch-zero newly allocated Mamba slots.
-        if self._pending_mamba_zeros:
-            device = self.mamba_conv_states.device
-            indices = torch.tensor(
-                self._pending_mamba_zeros, dtype=torch.long, device=device,
-            )
-            self.mamba_conv_states[:, indices] = 0.0
-            self.mamba_ssm_states[:, indices] = 0.0
-            self._pending_mamba_zeros.clear()
+        with ctx_mgr:
+            # Restore cached Mamba state to live buffers.
+            for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
+                restored = self.mamba_slot_allocator.restore_to_live(request_idx, block_id)
+                if not restored:
+                    self._pending_mamba_zeros.append(mamba_idx)
+            self._pending_mamba_restores.clear()
+
+            # Batch-zero newly allocated Mamba slots.
+            if self._pending_mamba_zeros:
+                device = self.mamba_conv_states.device
+                indices = torch.tensor(
+                    self._pending_mamba_zeros, dtype=torch.long, device=device,
+                )
+                self.mamba_conv_states[:, indices] = 0.0
+                self.mamba_ssm_states[:, indices] = 0.0
+                self._pending_mamba_zeros.clear()
+
+            event = torch.cuda.Event()
+            if gpu_bookkeeping_stream is not None:
+                event.record(gpu_bookkeeping_stream)
+            else:
+                event.record()
+        self._mamba_ops_done_event = event
+
+    def mamba_ops_done_event(self):
+        """Return the most recent ``mamba_ops_done_event``, or ``None`` if
+        no pending ops were processed."""
+        return getattr(self, "_mamba_ops_done_event", None)
 
     def transfer_bookkeeping_to_gpu(self, snapshot=None) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
