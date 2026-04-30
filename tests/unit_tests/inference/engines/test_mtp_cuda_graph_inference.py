@@ -25,9 +25,11 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -666,6 +668,101 @@ class TestMTPCudaGraphInference:
 
         assert all(not r.fwd_graph_recorded for r in manager.cudagraph_runners)
         assert all(r.fwd_graph is None for r in manager.cudagraph_runners)
+
+    # ---- Test 8: last_token_logits under CUDA graph padding ---------------- #
+
+    @torch.inference_mode()
+    def test_last_token_logits_cuda_graph_padding(self):
+        """num_last_token_logits returns padded count and last_token_logits
+        produces the correct shape under CUDA graph padding.
+
+        Uses add_request + update_requests to build real decode batches, then
+        verifies that under CUDA graph matching:
+        1. num_last_token_logits uses the padded decode count
+        2. last_token_logits returns the padded number of rows
+        3. The real (unpadded) index positions are sequential 0..N-1
+        """
+        num_spec = 2
+        max_requests = 16
+        engine = self._build_engine(
+            num_speculative_tokens=num_spec,
+            max_requests=max_requests,
+        )
+        context = engine.context
+        tokens_per_decode = num_spec + 1
+
+        # Find decode-only graph dims with room for sub-capacity batches.
+        test_cases = []
+        for graph_dim in context.cuda_graph_batch_dimensions_list:
+            if graph_dim.prefill_req_count > 0:
+                continue
+            padded_decode = graph_dim.decode_req_count
+            for active in range(max(1, padded_decode - 2), padded_decode):
+                if active < padded_decode and active > 0:
+                    test_cases.append((active, graph_dim))
+                    break
+        assert len(test_cases) > 0, "No sub-capacity decode graph dims found"
+
+        for active_decode_count, graph_dim in test_cases[:3]:
+            padded_decode = graph_dim.decode_req_count
+            padded_token_count = graph_dim.token_count
+
+            context.reset()
+
+            # Add prefill requests, then step them into decode state.
+            prompt_length = 10
+            for i in range(active_decode_count):
+                req = DynamicInferenceRequest(
+                    request_id=i,
+                    prompt_tokens=torch.arange(prompt_length, device='cuda'),
+                    sampling_params=SamplingParams(num_tokens_to_generate=100),
+                )
+                context.add_request(req)
+
+            context.initialize_attention_state()
+
+            active_mask = torch.ones(active_decode_count, device='cuda', dtype=torch.int32)
+            new_tokens = torch.arange(active_decode_count, device='cuda')
+            new_spec = torch.arange(
+                num_spec * active_decode_count, device='cuda'
+            ).reshape(num_spec, active_decode_count)
+            context.update_requests(
+                active_requests_mask=active_mask,
+                new_tokens=new_tokens,
+                new_speculative_tokens=new_spec,
+            )
+
+            # Now all requests are decode. initialize_attention_state should match a graph.
+            context.initialize_attention_state()
+
+            assert context.using_cuda_graph_this_step(), (
+                f"Expected CUDA graph for active={active_decode_count}, graph={graph_dim}"
+            )
+
+            expected_padded_logits = padded_decode * tokens_per_decode
+            assert context.num_last_token_logits == expected_padded_logits, (
+                f"num_last_token_logits: expected {expected_padded_logits}, "
+                f"got {context.num_last_token_logits}"
+            )
+
+            # Verify the real decode indices are [0, 1, ..., real_token_count - 1].
+            real_token_count = active_decode_count * tokens_per_decode
+            real_slice = context.active_logit_idxs[:real_token_count]
+            expected_real = torch.arange(real_token_count, dtype=torch.int32, device='cuda')
+            assert torch.equal(real_slice, expected_real), (
+                f"real decode indices: {real_slice.tolist()} vs {expected_real.tolist()}"
+            )
+
+            # Verify last_token_logits produces a tensor with the padded row count.
+            vocab_size = 64
+            fake_logits = torch.randn(
+                1, padded_token_count, vocab_size, device='cuda', dtype=torch.float32
+            )
+            result = context.last_token_logits(fake_logits)
+            assert result.shape == (expected_padded_logits, vocab_size), (
+                f"last_token_logits shape: expected ({expected_padded_logits}, {vocab_size}), "
+                f"got {result.shape}"
+            )
 
 
 # --------------------------------------------------------------------------- #
