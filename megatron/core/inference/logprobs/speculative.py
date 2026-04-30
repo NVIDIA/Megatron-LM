@@ -307,6 +307,7 @@ class LogProbsSpeculative:
             and prefill_top_n_indices is not None
             and num_prefill > 0
         )
+        top_n_per_req_cpu = None
         if need_top_n_per_req:
             top_n_per_req_cpu: List[int] = context.active_request_metadata["top_n_logprobs"][
                 :active_request_count
