@@ -781,6 +781,16 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        # v3 plan §commit 26 — drain the in-flight retirement queue before
+        # we tear down GPU state. Otherwise an in-flight AsyncStepOutput
+        # could be referencing a snapshot pool slot whose backing buffer
+        # the deallocation is about to free.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.retirement.drain())
+        except RuntimeError:
+            self._loop.run_until_complete(self.retirement.drain())
+
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
@@ -841,6 +851,20 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.reinitialize_inference_state_buffers()
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
+
+            # v3 plan §commit 26 — replay any committed-but-unflushed
+            # journal state and clear any rolled-back reservations. With
+            # overlap off the journal is empty after suspend's drain (the
+            # drain triggered finalize callbacks which committed the
+            # entries through commit_step_transaction). For overlap on we
+            # simply discard any open entries — they correspond to
+            # in-flight steps whose snapshot pool slots were also
+            # deallocated.
+            from megatron.core.inference.engines.transaction_journal import TransactionJournal
+
+            self.context.journal = TransactionJournal()
+            if hasattr(self.context, "num_output_placeholders"):
+                self.context.num_output_placeholders.fill_(0)
 
             capture_time = time.time()
             if (
