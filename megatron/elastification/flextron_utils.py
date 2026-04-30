@@ -296,7 +296,13 @@ class FlextronModelManager:
             label_emb[0] = 1.0
             mse_loss_emb = F.mse_loss(flextron_kwargs['router_emb'][0], label_emb)
 
-            diff += 10 * (mse_loss_mamba + mse_loss_mlp + mse_loss_skip + mse_loss_emb)
+            diff += 10 * (
+                mse_loss_mamba
+                + mse_loss_mlp
+                + mse_loss_moe_expert
+                + mse_loss_skip
+                + mse_loss_emb
+            )
 
         if original_model:
             return diff * 0.0, {}

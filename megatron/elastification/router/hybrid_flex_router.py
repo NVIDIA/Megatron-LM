@@ -387,11 +387,16 @@ class FlextronRouter(MegatronModule):
             )
         else:
             if self.config.normalize_router_logits:
-                router_mlp_logits = (
-                    scale
-                    * router_mlp_logits
-                    / router_mlp_logits.std(dim=0, keepdim=True).clamp(min=1e-6)
-                )
+                # Std-normalize only when there's actually >1 choice; with a
+                # single choice the std is 0 and the routing is trivial, so we
+                # skip both the scale and the normalization (consistent with
+                # the no-op semantics of a single-choice axis).
+                if len(self.config.mlp_int_list) > 1:
+                    router_mlp_logits = (
+                        scale
+                        * router_mlp_logits
+                        / router_mlp_logits.std(dim=0, keepdim=True).clamp(min=1e-6)
+                    )
             else:
                 router_mlp_logits = scale * router_mlp_logits
             router_mlp_logits = self._dp_gumbel_softmax(
@@ -431,11 +436,16 @@ class FlextronRouter(MegatronModule):
             )
         else:
             if self.config.normalize_router_logits:
-                router_moe_expert_logits = (
-                    scale
-                    * router_moe_expert_logits
-                    / router_moe_expert_logits.std(dim=0, keepdim=True).clamp(min=1e-6)
-                )
+                # Std-normalize only when there's actually >1 choice; with a
+                # single choice the std is 0 and the routing is trivial, so we
+                # skip both the scale and the normalization (consistent with
+                # the no-op semantics of a single-choice axis).
+                if len(self.config.moe_expert_int_list) > 1:
+                    router_moe_expert_logits = (
+                        scale
+                        * router_moe_expert_logits
+                        / router_moe_expert_logits.std(dim=0, keepdim=True).clamp(min=1e-6)
+                    )
             else:
                 router_moe_expert_logits = scale * router_moe_expert_logits
             router_moe_expert_logits = self._dp_gumbel_softmax(
@@ -538,8 +548,12 @@ class FlextronRouter(MegatronModule):
                 self.budget_map[budget], len(self.config.budget_list)
             ).to(device=device, dtype=dtype)
         elif budget == 1.0:
+            # Requested full model but 1.0 isn't a trained budget — fall back
+            # to the largest configured budget. Using max() instead of [0]
+            # makes this independent of budget_list ordering.
             budget_tensor = torch.nn.functional.one_hot(
-                self.budget_map[list(self.budget_map.keys())[0]], len(self.config.budget_list)
+                self.budget_map[max(self.budget_map.keys())],
+                len(self.config.budget_list),
             ).to(device=device, dtype=dtype)
         else:
             # budgets must be sorted ascending for bucketize

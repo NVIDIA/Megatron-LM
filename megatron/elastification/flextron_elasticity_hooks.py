@@ -1128,8 +1128,11 @@ class FlextronGroupedMLPElasticityManager:
                     masked_input = hidden_states * mask[None, :]
                     masked_input = masked_input * router_emb_logits
 
-                # Process router_mlp logic here
-                router_weights = None
+                # Process router_mlp logic here. Both attributes are read
+                # by fc1_post_hook only when current_router_mlp is not None,
+                # so we only assign them in that branch (avoids
+                # UnboundLocalError on mlp_per when the router produced no
+                # MLP output this step).
                 if self.current_router_mlp is not None:
                     if self.config.flex_hetero_ffn:
                         router_weights = torch.max(self.current_router_mlp[0][self.mlp_idx])
@@ -1139,10 +1142,8 @@ class FlextronGroupedMLPElasticityManager:
                             torch.max(self.current_router_mlp[0]),
                             self.current_router_mlp[1],
                         )
-
-                # Store router info for later hooks
-                module._flextron_router_weights = router_weights
-                module._flextron_mlp_per = mlp_per
+                    module._flextron_router_weights = router_weights
+                    module._flextron_mlp_per = mlp_per
 
                 return tuple([masked_input] + list(input[1:]))
             return input
