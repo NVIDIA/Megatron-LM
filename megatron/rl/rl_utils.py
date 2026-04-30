@@ -57,6 +57,10 @@ from megatron.rl.sequence_packing_utils import (
     get_sequence_packing_tensorboard_metrics,
     get_sequence_packing_log_info,
     get_default_packed_seq_params,
+    get_packing_actual_tokens,
+    get_packing_compute_tokens,
+    get_packing_efficiency,
+    get_packing_avg_seq_length,
     update_microbatch_calculator,
 )
 from megatron.rl.agent.api import (
@@ -302,11 +306,26 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
+        # Per-GPU variants are available via methods that divide by world_size.
+        self.world_size = None
+        # batch_size * seq_length / time: nominal throughput based on batch configuration
+        self.tokens_per_sec = None
+        # Total tokens in packed bins across all DP ranks / time: what the GPU actually processes.
+        self.compute_tokens_per_sec = None
+        # Real non-padding tokens across all DP ranks / time: true useful throughput.
+        self.actual_tokens_per_sec = None
+        # Fraction of bin capacity filled with real tokens (actual / total capacity)
+        self.packing_efficiency = None
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
         self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
+        self.tokens_per_sec = None
+        self.compute_tokens_per_sec = None
+        self.actual_tokens_per_sec = None
+        self.packing_efficiency = None
 
     def increment_sequences(self, count):
         """Increment the sequence counter."""
@@ -321,6 +340,99 @@ _rl_runtime_state = RLRuntimeState()
 def get_rl_runtime_state():
     """Get the global RL runtime state."""
     return _rl_runtime_state
+
+
+def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer):
+    """Compute, log, and store RL token throughput metrics.
+
+    Returns a string fragment to append to the training log line.
+    Also logs metrics to wandb and stores them on RLRuntimeState for
+    downstream consumers (e.g. RLProfiler).
+    """
+    log_string = ''
+    tokens_per_sec = None
+    tokens_per_sec_per_gpu = None
+    compute_tokens_per_sec = None
+    compute_tokens_per_sec_per_gpu = None
+    actual_tokens_per_sec = None
+    actual_tokens_per_sec_per_gpu = None
+    packing_efficiency = None
+
+    if args.seq_length > 0:
+        tokens_per_iteration = batch_size * args.seq_length
+        tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
+        tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+
+        # For sequence packing, break down into compute vs actual tokens
+        if args.rl_use_sequence_packing:
+            runtime_state = get_rl_runtime_state()
+            if runtime_state.packing_context is not None:
+                dp_world_size = mpu.get_data_parallel_world_size()
+
+                compute_tokens = get_packing_compute_tokens(runtime_state.packing_context)
+                all_ranks_compute_tokens = compute_tokens * dp_world_size
+                compute_tokens_per_sec = all_ranks_compute_tokens / elapsed_time_per_iteration
+                compute_tokens_per_sec_per_gpu = compute_tokens_per_sec / args.world_size
+
+                actual_tokens = get_packing_actual_tokens(runtime_state.packing_context)
+                all_ranks_actual_tokens = actual_tokens * dp_world_size
+                actual_tokens_per_sec = all_ranks_actual_tokens / elapsed_time_per_iteration
+                actual_tokens_per_sec_per_gpu = actual_tokens_per_sec / args.world_size
+
+                packing_efficiency = get_packing_efficiency(runtime_state.packing_context)
+
+        # Add tokens/sec to log string
+        log_string += f' toks/s: {tokens_per_sec:.0f} |'
+        log_string += f' toks/s/gpu: {tokens_per_sec_per_gpu:.0f} |'
+        if compute_tokens_per_sec is not None:
+            log_string += f' compute_toks/s: {compute_tokens_per_sec:.0f} |'
+            log_string += f' compute_toks/s/gpu: {compute_tokens_per_sec_per_gpu:.0f} |'
+        if actual_tokens_per_sec is not None:
+            log_string += f' actual_toks/s: {actual_tokens_per_sec:.0f} |'
+            log_string += f' actual_toks/s/gpu: {actual_tokens_per_sec_per_gpu:.0f} |'
+            log_string += f' packing_eff: {packing_efficiency:.1%} |'
+
+    # Log throughput metrics to wandb
+    if wandb_writer is not None:
+        if tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/tokens_per_sec': tokens_per_sec,
+                'throughput/tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
+            }, iteration)
+        if compute_tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/compute_tokens_per_sec': compute_tokens_per_sec,
+                'throughput/compute_tokens_per_sec_per_gpu': compute_tokens_per_sec_per_gpu,
+            }, iteration)
+        if actual_tokens_per_sec is not None:
+            wandb_writer.log({
+                'throughput/actual_tokens_per_sec': actual_tokens_per_sec,
+                'throughput/actual_tokens_per_sec_per_gpu': actual_tokens_per_sec_per_gpu,
+                'throughput/packing_efficiency': packing_efficiency,
+            }, iteration)
+
+    # Store derived throughput metrics on RLRuntimeState so that
+    # downstream consumers (e.g. RLProfiler) can read them.
+    # Per-GPU values are derived via methods on RLRuntimeState.
+    runtime_state = get_rl_runtime_state()
+    runtime_state.world_size = args.world_size
+    runtime_state.tokens_per_sec = tokens_per_sec
+    runtime_state.compute_tokens_per_sec = compute_tokens_per_sec
+    runtime_state.actual_tokens_per_sec = actual_tokens_per_sec
+    runtime_state.packing_efficiency = packing_efficiency
+
+    # Log average sequence length. With packing this shows real sequence
+    # lengths; without packing it equals seq_length as a baseline.
+    packing_ctx = runtime_state.packing_context
+    if args.rl_use_sequence_packing and packing_ctx is not None:
+        avg_seq_length = get_packing_avg_seq_length(packing_ctx)
+        log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
+        if wandb_writer is not None:
+            wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
+    elif args.log_throughput:
+        log_string += f' avg_seq_len: {args.seq_length} |'
+
+    return log_string
 
 
 def update_inference_logprobs_group_stats(
@@ -623,6 +735,8 @@ def get_environment_rollouts(
     n_prompts: int,
     samples_per_group: int,
     run_inference: bool,
+    iteration: int,
+    langrl_env_config: str,
 ):
     """Collect rollouts and broadcast to all ranks.
 
@@ -635,6 +749,8 @@ def get_environment_rollouts(
         n_prompts: Number of prompts to sample for across *all* data parallel workers.
         samples_per_group: Amount of trajectories per prompt.
         run_inference: Whether to run colocated inference or consume buffered rollouts.
+        iteration: Current training iteration (used for log filenames).
+        langrl_env_config: Path to env config (its stem is used in log filenames).
 
     Returns:
         GroupedRollouts object which is a nested list
@@ -661,6 +777,18 @@ def get_environment_rollouts(
     with nvtx_range("rl/sync-rollouts", time=True):
         torch.distributed.broadcast_object_list(rollouts, src=0)
     logger.debug(f"Got rollouts on rank {rank}")
+
+    if lang_rl_log_dir:
+        actual_inference_model = inference_model if inference_model is not None else model
+        inference_pg_collection = get_attr_wrapped_model(actual_inference_model[0], "pg_collection")
+        if rank == get_pg_rank(inference_pg_collection.tp):
+            with open(
+                lang_rl_log_dir
+                + f'/rollouts_rank{rank}_iteration{iteration}_'
+                + f'{Path(langrl_env_config).stem}.json',
+                'w',
+            ) as f:
+                json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -1570,9 +1698,8 @@ def prepare_data_for_update(
                     samples_ratio_per_step=samples_ratio_per_step,
                     num_bins_this_rank = len(packing_context.packed_trajs),
                     bin_seq_indices = packing_context.packing_info.bin_seq_indices,
-                    global_batch_size=args.global_batch_size, 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=args.global_batch_size,
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                )
                 loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
@@ -1597,9 +1724,8 @@ def prepare_data_for_update(
 
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled), 
-                    rampup_batch_size=args.rampup_batch_size, 
-                    micro_batch_size=args.micro_batch_size, 
+                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled),
+                    micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
                 )
@@ -1634,7 +1760,10 @@ def get_grpo_data_iterator(
     global_batch_size: int,
     sequence_packing: bool,
     is_correction: bool,
+    partial_rollouts: bool,
+    langrl_env_config: str,
     buffered_rollouts: RerunDataIterator | None = None,
+    optimizer_is_on_cpu: bool = False,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -1654,6 +1783,7 @@ def get_grpo_data_iterator(
         sequence_packing: Use sequence packing if True.
         is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
+        optimizer_is_on_cpu: If True, the optimizer was offloaded to CPU and must be restored.
 
     Returns:
         RerunDataIterator for the current training step
@@ -1661,7 +1791,6 @@ def get_grpo_data_iterator(
     runtime_state = get_rl_runtime_state()
     tokenizer = get_tokenizer()
 
-    args = get_args()
     need_new_rollouts, need_infer = need_environment_rollouts(
         buffered_rollouts,
         iteration,
@@ -1670,25 +1799,14 @@ def get_grpo_data_iterator(
         grpo_prompts_per_step,
         grpo_group_size,
         global_batch_size,
-        args.rl_partial_rollouts,
+        partial_rollouts,
     )
 
     if need_new_rollouts:
         rollouts = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size, need_infer,
+            iteration=iteration, langrl_env_config=langrl_env_config,
         )
-
-        rank = torch.distributed.get_rank()
-        actual_inference_model = inference_model if inference_model is not None else model
-        inference_pg_collection = get_attr_wrapped_model(actual_inference_model[0], "pg_collection")
-        if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
-            with open(
-                lang_rl_log_dir
-                + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
-                + f'{Path(args.langrl_env_config).stem}.json',
-                'w',
-            ) as f:
-                json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
@@ -1698,6 +1816,13 @@ def get_grpo_data_iterator(
             sequence_packing=sequence_packing,
             is_correction=is_correction,
         )
+        if optimizer_is_on_cpu:
+            nvtx_range = get_nvtx_range()
+            with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
+                    model[0].restore_grad_buffers()
+                with nvtx_range("rl/restore/optimizer-state", time=True):
+                    optimizer.restore_from_cpu()
         runtime_state.group_stats = group_stats
         runtime_state.example_groups = example_groups
         runtime_state.reset_iteration_counters(iteration)
@@ -1948,8 +2073,8 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
-    # Change cudagraph scope for inference (empty list = full-layer capture)
-    model[0].config.cuda_graph_scope = []
+    # Set cudagraph scope for inference.
+    model[0].config.cuda_graph_scope = args.cuda_graph_scope
     model[0].config.cuda_graph_impl = "local"
 
     # If we get a lower precision wrapper, we go one object deeper.
@@ -2006,13 +2131,18 @@ def megatron_rl_inference_mode(
         # Reset drop_and_pad leaked from inference decode
         set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
 
-        # Restore partial capture cudagraph scope for training if this is MoE
+        # Restore cudagraph scope for training.
+        # MoE partial capture requires specific scopes that aren't user-facing.
         if args.num_experts is not None:
             model[0].config.cuda_graph_scope = [
                 CudaGraphScope.mamba,
                 CudaGraphScope.attn,
                 CudaGraphScope.moe_router,
                 CudaGraphScope.moe_preprocess,
+            ]
+        else:
+            model[0].config.cuda_graph_scope = [
+                s for s in args.cuda_graph_scope if s != CudaGraphScope.full_iteration_inference
             ]
 
         # Switch MoE layers to partial CUDA graph capture for training

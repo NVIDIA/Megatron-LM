@@ -203,6 +203,8 @@ class TestGroupedRollouts:
                     n_prompts=n_prompts,
                     samples_per_group=1,
                     run_inference=need_inference,
+                    iteration=1,
+                    langrl_env_config="test.yaml",
                 )
                 assert mock_colocated.called == expect_inference
                 assert len(rollouts) == n_prompts
