@@ -99,6 +99,9 @@ def learned_output_contract(
     """Learned output contraction: n-stream → 1-stream via sigmoid-gated weighted sum."""
     dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)
+    head_fn = head_fn.to(torch.float32)
+    base = base.to(torch.float32)
+    scale = scale.to(torch.float32)
     rsqrt = torch.rsqrt(hidden_states.square().mean(-1, keepdim=True) + eps)
     mixes = F.linear(hidden_states, head_fn) * rsqrt
     pre = torch.sigmoid(mixes * scale + base) + 1e-6
