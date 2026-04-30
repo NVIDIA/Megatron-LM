@@ -1511,6 +1511,10 @@ class TestDynamicContext:
             ctx_g._classify_and_resume_body()
             ctx_g._evict_resume_chunked_tokens_body()
         result_g = ctx_g._finalize_update_requests(has_chunked)
+        # ``_finalize_update_requests`` no longer writes CPU mirrors; the
+        # eager ``update_requests`` wrapper used by ctx_e syncs at the end,
+        # so refresh ctx_g here too for the parity assertion.
+        ctx_g.sync_counters_to_cpu()
 
         # First-step parity: capture executed the bodies once.
         self._assert_ur_state_equal(ctx_e, ctx_g, result_e, result_g, "capture")
@@ -1529,6 +1533,7 @@ class TestDynamicContext:
             has_chunked2 = ctx_g._prepare_update_requests_new_tokens(mask2.clone(), tokens2.clone())
             graph.replay()
             result_g2 = ctx_g._finalize_update_requests(has_chunked2)
+            ctx_g.sync_counters_to_cpu()
 
             self._assert_ur_state_equal(ctx_e, ctx_g, result_e2, result_g2, "replay")
 

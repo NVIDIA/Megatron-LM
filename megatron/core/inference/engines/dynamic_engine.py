@@ -1559,6 +1559,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
+        # Refresh CPU mirrors before the loop reads ``self.context.active_token_count``.
+        # The hot-loop graphs leave the mirrors stale; the first iteration's
+        # ``token_fully_can_be_added`` / ``token_partially_can_be_added`` checks
+        # below would otherwise see pre-step values. Subsequent iterations are
+        # covered by ``add_request``'s own sync.
+        self.context.sync_counters_to_cpu()
+
         prefix_caching_enabled = self.context.enable_prefix_caching
         mamba_caching_enabled = (
             prefix_caching_enabled

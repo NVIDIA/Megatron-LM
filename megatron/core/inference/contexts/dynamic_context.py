@@ -1049,6 +1049,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._total_request_count_gpu = self._context_op_metadata_gpu[4:5]
         self._paused_request_count_gpu = self._context_op_metadata_gpu[5:6]
 
+        # Staleness flag for the CPU counter mirrors. Set True at the end of
+        # ``_finalize_update_requests`` because graph 2 advanced the GPU
+        # bridge scalars (via ``_writeback_gpu_count_mirrors``) without
+        # touching the CPU mirrors. Cleared by ``sync_counters_to_cpu`` (does
+        # the D2H), by ``add_request`` and ``reset_metadata`` (which keep
+        # both sides in sync). The flag dedups back-to-back sync calls in
+        # the engine loop — typically ``has_unfinished_requests`` (between
+        # steps) and ``prepare_attn_init`` (start of step) both want fresh
+        # mirrors but only one of them needs to do the actual D2H.
+        self._counters_stale = False
+
         # Pre-allocated index tensors for graphable ops (static addresses).
         self._arange_requests = torch.arange(
             self.max_requests, dtype=torch.int64, device=torch.cuda.current_device()
@@ -1243,6 +1254,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""
+        # Refresh from the GPU bridge scalars before reading. The engine's
+        # main loop calls this between steps to decide whether to call
+        # ``step_modern`` again; without the sync, a stale mirror would loop
+        # forever after a step that finished all requests (graph 2 wrote
+        # ``_total_request_count_gpu = 0`` but ``_finalize_update_requests``
+        # no longer mirrors that to the CPU side).
+        self.sync_counters_to_cpu()
         return self.total_request_count > 0
 
     def cu_query_lengths(self) -> Tuple[Tensor, int]:
@@ -1965,6 +1983,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         GPU scalars. Returns True if the body + finalize phases should still run, or False for
         the EP-dummy fast-path where no more work is needed.
         """
+        # Refresh CPU counter mirrors from the GPU bridge scalars. The
+        # previous step's ``_finalize_update_requests`` deliberately left the
+        # mirrors stale; we sync here because cuda-graph dimension matching
+        # below needs Python ints (``self.active_token_count``,
+        # ``self.num_decode_requests``, ``self.total_request_count``, ...)
+        # one D2H, vs. the mirror writes the previous version did at the end
+        # of finalize.
+        self.sync_counters_to_cpu()
+
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
             self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
@@ -2144,6 +2171,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = 0
         self.paused_tokens = None
         self.paused_speculative_tokens = None
+
+        # GPU bridge scalars must reset alongside the CPU mirrors. Without
+        # this, the next ``sync_counters_to_cpu`` would read stale GPU values
+        # and clobber the zeroed mirrors above.
+        self._real_request_count_gpu.zero_()
+        self._real_token_count_gpu.zero_()
+        self._real_decode_count_gpu.zero_()
+        self._real_prefill_count_gpu.zero_()
+        self._total_request_count_gpu.zero_()
+        self._paused_request_count_gpu.zero_()
+        # Mirrors and bridge scalars are now in sync (both zero); ensure the
+        # staleness flag agrees so callers don't issue a redundant D2H.
+        self._counters_stale = False
 
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
@@ -2368,6 +2408,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Check if the request can be added to the context.
         """
+        # Refresh CPU mirrors before reading. The hot-loop graphs leave the
+        # mirrors stale; this method is the engine-side admission entry
+        # point, so this is the canonical refresh site for ``add_request``
+        # callers.
+        self.sync_counters_to_cpu()
+
         # Note that for hybrid models checking the total request count is sufficient
         # because we allocate a single set of Mamba state tensors for each request
         request_can_be_added = (
@@ -2446,6 +2492,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # If tensor state is deallocated, do not add request.
         if not self.is_tensor_state_allocated:
             raise TensorStateDeallocatedError(req.request_id)
+
+        # Refresh CPU mirrors before reading. The hot-loop graphs leave the
+        # mirrors stale; ``add_request`` is the canonical cold-path consumer
+        # — slot accounting, the overflow check, and per-request scalar
+        # writes all read CPU mirrors that must reflect post-update state.
+        # When called immediately after ``check_availability`` (the typical
+        # engine flow), this is essentially a no-op because the mirrors were
+        # just refreshed there.
+        self.sync_counters_to_cpu()
 
         # Prefill chunk length.
         if prefill_chunk_length is None:
@@ -2647,6 +2702,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
         self.total_request_count += 1
         self.num_prefill_requests += 1
+
+        # Mirror the CPU increments to the GPU bridge scalars. Without this,
+        # the next step's ``prepare_attn_init.sync_counters_to_cpu`` would
+        # read the pre-add-request bridge values (last written by graph 2 of
+        # the previous step's ``update_requests``) and clobber the mirror
+        # increments above. Pause count is unchanged by ``add_request`` —
+        # the rotation that runs when ``paused_request_count > 0`` keeps the
+        # paused region intact and merely shifts it right by one slot.
+        self._real_request_count_gpu.fill_(self.total_request_count - self.paused_request_count)
+        self._total_request_count_gpu.fill_(self.total_request_count)
+        self._real_token_count_gpu.fill_(self.active_token_count)
 
     def _permute_book_keeping_tensors(
         self, perm: Tensor, next_tokens: Tensor, target: slice = slice(None)
@@ -3365,7 +3431,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._classify_and_resume_body()
         self._evict_resume_chunked_tokens_body()
-        return self._finalize_update_requests(has_chunked)
+        result = self._finalize_update_requests(has_chunked)
+
+        # Refresh CPU mirrors before returning. Test/eager callers expect
+        # ``self.total_request_count`` etc. to reflect post-step state on
+        # return; without this, the staleness flag from finalize would
+        # leave mirrors stale until the next ``has_unfinished_requests``
+        # or ``prepare_attn_init`` call. Production callers (the controller's
+        # ``_run_update_requests``) skip this entry point — the engine's
+        # ``has_unfinished_requests`` does the equivalent sync between steps.
+        self.sync_counters_to_cpu()
+
+        return result
 
     def _prepare_update_requests_metadata(self) -> None:
         """Pre-forward prep: work that depends only on previous-step state.
@@ -3392,19 +3469,42 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._ur.total_pre_gpu.copy_(self._total_request_count_gpu)
         self._ur.chunked_id_gpu.fill_(self.chunked_prefill_request_id)
 
-        # Copy paused tokens into the static buffer.
-        # This is a variable-length copy; CPU ints needed for slicing.
-        active_count = int(self._real_request_count_gpu.item())
-        total_count = int(self._total_request_count_gpu.item())
-        paused_count = total_count - active_count
-        if paused_count > 0:
-            paused_slice = slice(active_count, total_count)
-            self._ur.next_tokens[paused_slice].copy_(self.paused_tokens)
-            if self._ur.spec_tokens is not None and self.paused_speculative_tokens is not None:
-                self._ur.spec_tokens[:, paused_slice].copy_(self.paused_speculative_tokens)
+        # Paused-tokens copy: gather from ``paused_tokens_buf`` (static, written
+        # at the end of the previous step's ``_finalize_update_requests``) into
+        # ``next_tokens`` at slot positions ``[active_count, total_count)``.
+        # The active region of ``next_tokens`` is filled by
+        # ``_prepare_update_requests_new_tokens`` post-sample. Outside the
+        # paused range we keep whatever ``next_tokens`` already held; the mask
+        # in ``torch.where`` ensures only the paused slots take from the buffer.
+        # This is shape-stable (always touches the full ``max_requests`` range)
+        # and reads ``_real_request_count_gpu`` / ``_total_request_count_gpu``
+        # directly, avoiding the two ``.item()`` syncs the previous version
+        # required to size the slice.
+        slot_idx = self._ur.arange_long
+        in_paused = (slot_idx >= self._real_request_count_gpu) & (
+            slot_idx < self._total_request_count_gpu
+        )
+        # ``src_idx`` for slot i is i - active_count, so the j-th paused slot
+        # (i = active + j) reads ``paused_tokens_buf[j]``. For slots outside
+        # the paused range the result is masked away by ``torch.where``; the
+        # ``clamp(min=0)`` only ensures the gather never indexes negatively.
+        src_idx = (slot_idx - self._real_request_count_gpu).clamp(min=0)
+        gathered_tokens = self._ur.paused_tokens_buf[src_idx]
+        self._ur.next_tokens.copy_(
+            torch.where(in_paused, gathered_tokens, self._ur.next_tokens)
+        )
+        if self._ur.spec_tokens is not None and self._ur.paused_spec_tokens_buf is not None:
+            gathered_spec = self._ur.paused_spec_tokens_buf[:, src_idx]
+            self._ur.spec_tokens.copy_(
+                torch.where(in_paused.unsqueeze(0), gathered_spec, self._ur.spec_tokens)
+            )
 
-        # Snapshot request IDs before update_requests permutes them.
-        self.active_request_ids[:active_count].copy_(self.request_ids[:active_count])
+        # Snapshot request IDs before update_requests permutes them. Full
+        # ``max_requests`` copy: post-sample bookkeeping reads back via
+        # ``[:active_request_count]`` so anything past the active region is
+        # ignored anyway, and a shape-stable copy avoids needing ``active_count``
+        # as a Python int.
+        self.active_request_ids.copy_(self.request_ids)
 
     def _prepare_update_requests_new_tokens(
         self,
@@ -3793,28 +3893,96 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return self._ur.combined_sync
 
+    def sync_counters_to_cpu(self) -> None:
+        """Refresh CPU counter mirrors from the GPU bridge scalars (one D2H).
+
+        The graphed ``update_requests`` body keeps the bridge GPU scalars
+        (``_real_request_count_gpu``, ``_total_request_count_gpu``,
+        ``_real_token_count_gpu``, the allocator's ``total_avail_gpu``, and
+        the Mamba ``_free_slot_count_gpu``) authoritative via
+        ``_writeback_gpu_count_mirrors``. The corresponding CPU mirrors used
+        by host-side consumers — ``prepare_attn_init`` for cuda-graph
+        dimension matching, ``add_request`` for slot accounting, and various
+        legacy hot-loop slicing — are intentionally left stale by
+        ``_finalize_update_requests`` so the bookkeeping graphs don't have to
+        block on a host transfer.
+
+        Callers invoke this method to do a deferred refresh: a single
+        batched D2H reads every counter the host needs and writes the
+        corresponding mirror. Idempotent — safe to call back-to-back. Skips
+        the D2H entirely when ``_counters_stale`` is False, which dedups the
+        engine-loop pair (``has_unfinished_requests`` then
+        ``prepare_attn_init``) into a single transfer per step.
+        """
+        if not self._counters_stale:
+            return
+
+        # Stack into one int32 buffer to keep the D2H to a single transfer.
+        # ``_real_request_count_gpu`` etc. are int32 views into
+        # ``_context_op_metadata_gpu``; ``total_avail_gpu`` and the mamba
+        # free-slot count are also int32, so no dtype promotion is needed.
+        parts = [
+            self._real_request_count_gpu.view(()),
+            self._total_request_count_gpu.view(()),
+            self._real_token_count_gpu.view(()),
+            self.kv_block_allocator.total_avail_gpu.view(()),
+        ]
+        if self.is_hybrid_model:
+            parts.append(self.mamba_metadata._free_slot_count_gpu.view(()))
+
+        vals = torch.stack(parts).cpu().tolist()
+        active = int(vals[0])
+        self.total_request_count = int(vals[1])
+        self.paused_request_count = self.total_request_count - active
+        self.active_token_count = int(vals[2])
+        self.kv_block_allocator.total_avail = int(vals[3])
+        if self.is_hybrid_model:
+            self.mamba_metadata.mamba_state_free_slot_count = int(vals[4])
+
+        self._counters_stale = False
+
     def _finalize_update_requests(self, has_chunked: bool) -> Dict:
-        """Phase 3: single GPU->CPU sync, then mirror state to host."""
+        """Phase 3: read sync values for local use; CPU mirrors stay stale.
+
+        The ``.cpu().tolist()`` here used to also write back the per-context
+        CPU mirrors (``total_request_count``, ``paused_request_count``,
+        ``active_token_count``, ``kv_block_allocator.total_avail``,
+        ``mamba_state_free_slot_count``). It no longer does. The graphed
+        bodies' ``_writeback_gpu_count_mirrors`` keeps the GPU bridge scalars
+        authoritative, and host-side consumers refresh the CPU mirrors via
+        ``sync_counters_to_cpu`` exactly when they need Python ints — see
+        ``prepare_attn_init`` and ``add_request``. The ``sv`` ints below are
+        used only locally for variable-length slicing and the survivor
+        formula.
+        """
+        # Graph 2's ``_writeback_gpu_count_mirrors`` already advanced the GPU
+        # bridge scalars beyond the CPU mirrors; mark the mirrors stale so
+        # the next ``sync_counters_to_cpu`` does an actual D2H rather than
+        # the dedup short-circuit.
+        self._counters_stale = True
+
         # THE sync: one .cpu().tolist() consumes everything the graphed bodies
-        # wrote into _ur.combined_sync.
+        # wrote into _ur.combined_sync. Values are consumed locally below.
         sv = UpdateRequestsSyncedCounters.from_buffer(self._ur.combined_sync.cpu().tolist())
 
-        # Pre-step total, captured before the writes below overwrite it.
-        # The graphed bodies only release blocks for finished requests
-        # (bucket4 = total_pre - sum(bucket0..3)) and evicted ones. Used
-        # below to gate the prefix-caching dereg drain so it only fires
-        # when the queue could plausibly hold events.
+        # Pre-step total, captured from the (still-stale) mirror. The mirror
+        # was last refreshed by ``sync_counters_to_cpu`` at the start of
+        # ``prepare_attn_init`` and adjusted incrementally by any in-step
+        # ``add_request`` calls, so it correctly reflects the pre-step total.
+        # Used to gate the prefix-caching dereg drain.
         total_pre = self.total_request_count
 
         self.reset_attention_state()
 
         if sv.total_final == 0 and not has_chunked:
             self.request_to_kv_block_ids.fill_(-1)
-            self.total_request_count = 0
-            self.active_token_count = 0
-            self.paused_request_count = 0
             self.reset_mamba_state()
-            self.kv_block_allocator.total_avail = sv.total_avail
+            # CPU mirrors for total/paused/active/total_avail are NOT written
+            # here. They'll be refreshed by the next ``sync_counters_to_cpu``
+            # call (start of next ``prepare_attn_init``, or when ``add_request``
+            # admits a new request between steps). The GPU bridge scalars and
+            # the allocator's ``total_avail_gpu`` already reflect the empty
+            # state via the graphed body's writeback.
             # Body 1 just released every active request's blocks. If
             # prefix caching is on, that release enqueued dereg events
             # we need to drain so the host-side hash dict stays in sync.
@@ -3823,16 +3991,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.kv_block_allocator.drain_pending_dereg()
             return {"newly_paused_request_ids": None, "evict_request_ids": None}
 
-        # [active | paused]: paused_count = total - active.
+        # [active | paused]: paused_count = total - active. These are kept
+        # as locals; the matching CPU mirrors are NOT written. See class-level
+        # ``sync_counters_to_cpu`` for the refresh contract.
         new_paused_final = sv.total_final - sv.active_final
-        self.paused_request_count = new_paused_final
-        self.total_request_count = sv.total_final
         active_request_count = sv.active_final
         num_gen = self._ur.num_generated_tokens
-        self.active_token_count = active_request_count * num_gen
-        self.kv_block_allocator.total_avail = sv.total_avail
-        if self.is_hybrid_model:
-            self.mamba_metadata.mamba_state_free_slot_count = sv.mamba_free
 
         # The pre-resume newly-paused buffer holds bucket3 entries in slot
         # order; resume eats stayed-paused (bucket2) first from the LEFT
