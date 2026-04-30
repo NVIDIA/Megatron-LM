@@ -1478,6 +1478,31 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_output_placeholders[slot] -= decrement
         return entry
 
+    def record_rejected_speculative_tokens(
+        self, step_id: int, slot_idx: int, num_rejected: int
+    ) -> None:
+        """v3 plan §commit 23 — journal a per-slot rejected-speculative
+        count.
+
+        Stored in the entry's ``placeholder_deltas`` indirectly: the
+        rejected count reduces the slot's accepted total below the
+        prepare-time placeholder delta (= 1 + num_speculative_tokens). The
+        difference is consumed by ``commit_step_transaction``'s
+        ``accepted_token_counts`` argument so the placeholder accounting
+        round-trips correctly without leaking discarded-lookahead tokens
+        as residual placeholders.
+        """
+        if num_rejected <= 0:
+            return
+        entry = self.journal.begin_step_transaction(step_id)
+        # Augment the entry with a discarded-tokens dict so retirement can
+        # surface the count via StepRetirementResult.discarded_lookahead_token_count.
+        if not hasattr(entry, "_discarded_speculative_per_slot"):
+            entry._discarded_speculative_per_slot = {}
+        entry._discarded_speculative_per_slot[slot_idx] = (
+            entry._discarded_speculative_per_slot.get(slot_idx, 0) + num_rejected
+        )
+
     def rollback_step_transaction(self, step_id: int) -> "JournalEntry":
         """Roll back the entry for ``step_id`` and undo every placeholder
         increment recorded during the step.
