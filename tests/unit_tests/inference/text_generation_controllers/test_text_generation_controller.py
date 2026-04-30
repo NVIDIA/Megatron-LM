@@ -354,13 +354,15 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         sampled_l.masked_fill_(top_k_mask, 0.0)
         top_p_mask = sampled_l.cumsum(dim=-1) > top_p_values.unsqueeze(1)
 
+        # When `top_p` is enabled, but the cumulative probs don't actually filter anything,
+        # our constraint reduces to top_k alone.
+        start_idx = torch.clamp(self.vocab_size - top_k_values, min=0).long()
         first_excluded = torch.where(
             top_p_mask.any(dim=-1),
             top_p_mask.float().argmax(dim=-1),
-            torch.full((batch_size,), self.vocab_size, device=top_p_mask.device),
+            start_idx + 1,
         )
         last_included = torch.clamp(first_excluded - 1, min=0)
-        start_idx = torch.clamp(self.vocab_size - top_k_values, min=0).long()
         last_included = torch.max(last_included, start_idx)
         expected_min_values = l.gather(1, last_included.unsqueeze(1)).squeeze(1)
         assert torch.all(
