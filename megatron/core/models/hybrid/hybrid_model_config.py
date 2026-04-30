@@ -287,12 +287,11 @@ class HybridModelConfig:
         )
 
         # Stack-level config: a model-wide topology snapshot used for the
-        # final norm, embedding init, and the args projection in
-        # ``_apply_model_recipe_to_args``. Carries EP/ETP because it
-        # represents the global topology, even though non-MoE per-layer TCs
-        # do not. When EP > 1, TC.__post_init__ requires ``num_moe_experts``
-        # on every TC including this one — the real expert count lives on
-        # the per-layer MoE TCs, so a non-None placeholder is sufficient.
+        # final norm, embedding init, the MTP block construction (when an
+        # MTP body symbol contains ``E``), inference capacity sizing, and
+        # the args projection in ``_apply_model_recipe_to_args``. Carries
+        # EP/ETP because it represents the global topology, even though
+        # non-MoE per-layer TCs do not.
         stack_kwargs = embedding.common_config.to_transformer_config_kwargs()
         stack_kwargs.update(parallelism)
         stack_kwargs.update(expert_parallelism)
@@ -300,8 +299,23 @@ class HybridModelConfig:
             stack_kwargs.setdefault(k, v)
         for k, v in placeholders.items():
             stack_kwargs.setdefault(k, v)
-        if self.expert_model_parallel_size > 1:
-            stack_kwargs.setdefault("num_moe_experts", 1)
+        # Derive stack-level MoE metadata from the recipe's actual MoE
+        # configs rather than using a placeholder. Two consumers read these
+        # fields semantically: the MTP block construction path (when a body
+        # symbol contains ``E``, the MoE layer inside MTP is built from the
+        # stack TC) and the inference capacity-factor calculation
+        # (``capacity_factor = num_moe_experts / moe_router_topk``).
+        stack_moe_experts, stack_moe_ffn_hidden_size = _derive_stack_moe_metadata(decoder_flat)
+        if stack_moe_experts is not None:
+            stack_kwargs["num_moe_experts"] = stack_moe_experts
+            if stack_moe_ffn_hidden_size is not None:
+                stack_kwargs["moe_ffn_hidden_size"] = stack_moe_ffn_hidden_size
+        elif self.expert_model_parallel_size > 1:
+            raise ValueError(
+                "expert_model_parallel_size > 1 requires at least one "
+                "MoELayerConfig in the layer_pattern; the recipe has none. "
+                "Either drop expert parallelism, or add MoE layers."
+            )
         # DSA / MLA layers carry their own decoupled RoPE; HybridModel uses
         # ``self.config.multi_latent_attention`` (the stack TC) to decide
         # whether to construct the global RoPE embedding. Without this flag
@@ -619,6 +633,45 @@ def _infer_uniform_attention_metadata(decoder_flat: List[LayerConfig]) -> dict[s
         if all(v == first for v in values[1:]):
             metadata[field_name] = first
     return metadata
+
+
+def _derive_stack_moe_metadata(
+    decoder_flat: List[LayerConfig],
+) -> tuple[Optional[int], Optional[int]]:
+    """Derive ``(num_moe_experts, moe_ffn_hidden_size)`` for the stack-level TC.
+
+    The stack TC is a model-wide topology snapshot, not a per-layer config,
+    but two consumers read its MoE fields semantically:
+    :class:`MultiTokenPredictionBlock` (when a body symbol contains ``E``,
+    the MoE layer inside MTP is built from the stack TC) and the inference
+    text-generation controller's capacity-factor calculation. Three cases:
+
+    1. No MoELayerConfig in the decoder → ``(None, None)``. The stack TC is
+       dense; the caller is responsible for raising on ``EP > 1``.
+    2. Homogeneous MoE → that value. The stack TC matches what every MoE
+       layer in the recipe actually uses.
+    3. Heterogeneous MoE → ``max`` across MoE layers ("widest config"). An
+       MTP body containing ``E`` inherits the largest sensible MoE sizing,
+       and capacity buffers are sized for the worst case rather than
+       under-provisioned. Recipe authors who want a specific MTP MoE shape
+       should keep main-decoder MoE homogeneous (per-MTP-layer overrides
+       are not yet supported).
+    """
+    moe_layers = [lc for lc in decoder_flat if isinstance(lc, MoELayerConfig)]
+    if not moe_layers:
+        return None, None
+    num_experts = max(lc.num_experts for lc in moe_layers)
+    # Pick the moe_ffn_hidden_size from a layer matching the chosen
+    # num_experts; ``None`` lets TC default it from ``ffn_hidden_size``.
+    ffn_hidden_size = next(
+        (
+            lc.ffn_hidden_size
+            for lc in moe_layers
+            if lc.num_experts == num_experts and lc.ffn_hidden_size is not None
+        ),
+        None,
+    )
+    return num_experts, ffn_hidden_size
 
 
 def _reject_heterogeneous_attention_geometry(
