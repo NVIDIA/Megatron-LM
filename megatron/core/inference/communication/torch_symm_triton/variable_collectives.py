@@ -118,7 +118,7 @@ def _multimem_all_gather_v_kernel(
             if BITS == 128:
                 # Each 128-bit pack occupies 2 uint64 units; output_byte_offset // 8 converts
                 # the tensor's byte offset within the symm-mem buffer to uint64 units.
-                # The global offset is multiplied by 2 to convert from 128-bit 
+                # The global offset is multiplied by 2 to convert from 128-bit
                 # units to uint64 units.
                 multicast_ptrs = (
                     multicast_ptr.to(tl.pointer_type(tl.uint64))
@@ -259,7 +259,7 @@ def multimem_reduce_scatter_v(
     symm_mem_hdl: _SymmetricMemory,
     rank_token_offset: torch.Tensor,
     ep_max_tokens: torch.Tensor,
-    engine_max_tokens: int,
+    per_rank_max_tokens: int,
     input_byte_offset: int = 0,
     **kwargs,
 ) -> torch.Tensor:
@@ -283,8 +283,8 @@ def multimem_reduce_scatter_v(
         ep_max_tokens: pre-allocated scalar int32 CUDA tensor. The dispatcher writes
             the maximum local_tokens across all EP ranks each step. CTAs with
             pid >= ep_max_tokens exit immediately without entering the barrier.
-        engine_max_tokens: static int set at model init. Determines the CTA grid size
-            as min(engine_max_tokens, MAX_NUM_BLOCKS).
+        per_rank_max_tokens: static int set at model init. Determines the CTA grid size
+            as min(per_rank_max_tokens, MAX_NUM_BLOCKS).
         input_byte_offset: byte offset of input_tensor within the symmetric memory
             buffer (for packing multiple tensors into one buffer; 0 otherwise).
 
@@ -331,7 +331,7 @@ def multimem_reduce_scatter_v(
 
     block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
     num_warps = max(1, block_size // WARP_SIZE)
-    num_blocks = min(engine_max_tokens, MAX_NUM_BLOCKS)
+    num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
 
     reduce_f32 = output_tensor.dtype == torch.float32
     _multimem_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
@@ -531,7 +531,7 @@ def multimem_all_gather_v(
     symm_mem_hdl: _SymmetricMemory,
     rank_token_offset: torch.Tensor,
     ep_max_tokens: torch.Tensor,
-    engine_max_tokens: int,
+    per_rank_max_tokens: int,
     output_byte_offset: int = 0,
     **kwargs,
 ) -> torch.Tensor:
@@ -556,8 +556,8 @@ def multimem_all_gather_v(
             the maximum local_tokens across all EP ranks into it each step. CTAs with
             pid >= ep_max_tokens exit immediately — safe because all ranks agree on
             this value, so the corresponding CTAs exit on every rank simultaneously.
-        engine_max_tokens: static int set at model init. Determines the CTA grid size
-            as min(engine_max_tokens, MAX_NUM_BLOCKS). Typically > MAX_NUM_BLOCKS so
+        per_rank_max_tokens: static int set at model init. Determines the CTA grid size
+            as min(per_rank_max_tokens, MAX_NUM_BLOCKS). Typically > MAX_NUM_BLOCKS so
             we always launch MAX_NUM_BLOCKS CTAs.
         output_byte_offset: byte offset of this tensor within the symmetric memory buffer
             (for packing multiple tensors into one buffer; 0 if the buffer holds only
@@ -606,7 +606,7 @@ def multimem_all_gather_v(
 
     # All ranks launch the same fixed number of CTAs. CTAs with
     # pid >= ep_max_tokens exit immediately at kernel entry.
-    num_blocks = min(engine_max_tokens, MAX_NUM_BLOCKS)
+    num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
 
     _multimem_all_gather_v_kernel[(num_blocks, 1, 1)](
         input_tensor.data_ptr(),
@@ -640,7 +640,7 @@ def multimem_all_gatherv_3tensor(
     symm_mem_hdl_2: _SymmetricMemory,
     rank_token_offset: torch.Tensor,
     ep_max_tokens: torch.Tensor,
-    engine_max_tokens: int,
+    per_rank_max_tokens: int,
     output_byte_offset_0: int = 0,
     output_byte_offset_1: int = 0,
     output_byte_offset_2: int = 0,
@@ -673,8 +673,8 @@ def multimem_all_gatherv_3tensor(
         ep_max_tokens: pre-allocated scalar int32 CUDA tensor. The dispatcher writes the
             maximum local_tokens across all EP ranks each step. CTAs with
             pid >= ep_max_tokens exit immediately — safe because all ranks agree.
-        engine_max_tokens: static int set at model init. Determines the CTA grid size as
-            min(engine_max_tokens, MAX_NUM_BLOCKS).
+        per_rank_max_tokens: static int set at model init. Determines the CTA grid size as
+            min(per_rank_max_tokens, MAX_NUM_BLOCKS).
         output_byte_offset_0/1/2: byte offset of each tensor within its symmetric memory
             buffer (for packing multiple tensors into one buffer; 0 otherwise).
 
@@ -742,7 +742,7 @@ def multimem_all_gatherv_3tensor(
     # smaller tensors mask out excess threads via channel_mask inside the kernel.
     block_size = max(block_size_0, block_size_1, block_size_2)
     num_warps = max(1, block_size // WARP_SIZE)
-    num_blocks = min(engine_max_tokens, MAX_NUM_BLOCKS)
+    num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
 
     _multimem_all_gatherv_3tensor_kernel[(num_blocks, 1, 1)](
         input_tensor_0.data_ptr(),

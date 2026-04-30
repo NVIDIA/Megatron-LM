@@ -45,7 +45,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs, graph_capture
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -352,21 +352,8 @@ class DynamicInferenceEngine(AbstractEngine):
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
 
-        # MTP warmup preparation: capture MTP CUDA graphs alongside the
-        # decoder graphs within the same loop rather than in a separate pass.
-        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
-        mtp_warmup_enabled = (
-            controller.num_mtp_heads > 0
-            and (controller.num_speculative_tokens or 0) > 0
-            and hasattr(unwrapped, 'mtp')
-        )
-        if mtp_warmup_enabled:
-            model_config = controller.inference_wrapped_model.model.config
-            tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
-            sp_enabled = model_config.sequence_parallel and tp_size > 1
-            mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
-            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
-            mtp_seen_batch_sizes = set()
+        # Enable inference dispatcher for EP during graph capture
+        model_config = controller.inference_wrapped_model.model.config
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
@@ -401,25 +388,26 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
-            model_config = controller.inference_wrapped_model.model.config
             if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
             # Forward pass -> logits.
-            controller._dynamic_step_forward_logits(input_ids, position_ids)
+            with torch.inference_mode():
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-            # MTP CUDA graph warmup for this batch dimension.
-            if mtp_warmup_enabled:
-                n = cuda_graph_batch_dimension.req_count
-                if sp_enabled:
-                    n = round_up_to_nearest_multiple(n, tp_size)
-                if n > 0 and n not in mtp_seen_batch_sizes:
-                    mtp_seen_batch_sizes.add(n)
-                    device = torch.cuda.current_device()
-                    batch_dim = n // tp_size if sp_enabled else n
-                    # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                    for depth in mtp_warmup_depths:
-                        with graph_capture():
+                # MTP CUDA graph warmup for this batch dimension.
+                if mtp_warmup_enabled:
+                    n = cuda_graph_batch_dimension.req_count
+                    # pylint: disable-next=possibly-used-before-assignment
+                    if sp_enabled:
+                        n = round_up_to_nearest_multiple(n, tp_size)
+                    # pylint: disable-next=possibly-used-before-assignment
+                    if n > 0 and n not in mtp_seen_batch_sizes:
+                        mtp_seen_batch_sizes.add(n)
+                        device = torch.cuda.current_device()
+                        batch_dim = n // tp_size if sp_enabled else n
+                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                        for depth in mtp_warmup_depths:
                             unwrapped.compute_mtp_single_step(
                                 hidden_states=torch.zeros(
                                     (batch_dim, 1, model_config.hidden_size),
@@ -429,16 +417,12 @@ class DynamicInferenceEngine(AbstractEngine):
                                 next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
                                 position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
                                 depth=depth,
+                                cache_key=("mtp", n, depth),
                             )
 
-            context.reset()
+                context.reset()
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
-            controller.has_mtp_cuda_graphs = True
-            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
-
-        if mtp_warmup_enabled and mtp_seen_batch_sizes:
-            controller.has_mtp_cuda_graphs = True
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.

@@ -40,6 +40,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 
 class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
@@ -62,15 +63,9 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     # a device-to-host sync (which would break CUDA graph capture).
     _host_valid_tokens: Optional[int] = None
 
-    # Per-subclass instance counter (shadows via MRO on first mutation, so NCCL
-    # and NVLS each start from 0). The first instance created owns update_metadata.
-    _dispatcher_count: int = 0
-
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, runs_metadata_sync: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        cls = type(self)
-        self._runs_metadata_sync = cls._dispatcher_count == 0
-        cls._dispatcher_count += 1
+        self._runs_metadata_sync = runs_metadata_sync
 
     @classmethod
     def _valid_tokens(cls) -> torch.Tensor:
@@ -112,12 +107,14 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        runs_metadata_sync: bool = True,
     ) -> None:
         super().__init__(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=pg_collection,
+            runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
 
@@ -153,13 +150,13 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
             cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(
-                local_tokens_per_rank.sum()
-            )
-            InferenceAllGatherDispatcherBase._host_valid_tokens = sum(cls._local_tokens_per_rank)
+            total = local_tokens_per_rank.sum()
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.copy_(total)
+            InferenceAllGatherDispatcherBase._host_valid_tokens = int(total.item())
         else:
-            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(ep_size * local_tokens)
-            InferenceAllGatherDispatcherBase._host_valid_tokens = ep_size * local_tokens
+            total = ep_size * local_tokens
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(total)
+            InferenceAllGatherDispatcherBase._host_valid_tokens = total
 
     def token_dispatch(self, hidden_states, probs):
         """Gather hidden_states, probs, and routing_map from all EP ranks.
@@ -262,7 +259,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         # Non-CG path: expand compact → padded, ReduceScatter, truncate.
         tokens_per_rank = self.__class__._local_tokens_per_rank
         max_tokens = max(tokens_per_rank)
-        ep_rank = self.ep_group.rank()
+        ep_rank = get_pg_rank(self.ep_group)
 
         # Expand [total_tokens, H] → [ep_size * max_tokens, H], zeros in padding slots.
         padded_output = hidden_states.new_zeros(self.ep_size * max_tokens, hidden_states.shape[1])
@@ -297,8 +294,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     # _valid_tokens_tensor on the base is pointed at _step_metadata[0:1] on first
     # init, so experts.py can read valid_tokens via the base class interface.
     _step_metadata: Optional[torch.Tensor] = None  # [3] int32
-    _ep_rank: int = 0
-    _engine_max_tokens: int = 2048
+    _per_rank_worst_case_token_count: int = 2048  # round_up_tokens(max_tokens) // tp_size
 
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
     # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=bf16.
@@ -322,9 +318,19 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         return cls._step_metadata[2:3]
 
     @classmethod
+    def _delete_buffers(cls):
+        # needed by CI.
+        cls._step_metadata = None
+        cls._symm_agv_hidden = None
+        cls._symm_agv_routing = None
+        cls._symm_agv_probs = None
+        cls._symm_rsv = None
+        cls._symm_metadata = None
+
+    @classmethod
     def allocate_buffers(
         cls,
-        engine_max_tokens: int,
+        per_rank_worst_case_token_count: int,
         topk: int,
         hidden_size: int,
         ep_group: torch.distributed.ProcessGroup,
@@ -336,14 +342,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         the hot path.
 
         Args:
-            engine_max_tokens: Maximum tokens per EP rank (engine-level cap).
+            per_rank_worst_case_token_count: Max tokens this rank can contribute,
+                computed by the context as round_up_tokens(max_tokens) // tp_size.
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
             ep_group: Expert parallel process group.
         """
-        cls._engine_max_tokens = engine_max_tokens
-        ep_size = dist.get_world_size(group=ep_group)
-        global_max = engine_max_tokens * ep_size
+        ep_size = get_pg_size(ep_group)
+        cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
+        global_max = per_rank_worst_case_token_count * ep_size
         device = torch.cuda.current_device()
 
         cls._symm_agv_hidden = SymmetricMemoryManager.get_buffer(
@@ -388,7 +395,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Initialise step-metadata tensor and wire base class valid_tokens pointer.
         cls._step_metadata = torch.zeros(3, dtype=torch.int32, device=device)
         InferenceAllGatherDispatcherBase._valid_tokens_tensor = cls._step_metadata[0:1]
-        cls._ep_rank = dist.get_rank(group=ep_group)
 
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata update; invoked from the first instance's token_dispatch.
@@ -416,12 +422,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         local_expert_indices: List[int],
         config: TransformerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        runs_metadata_sync: bool = True,
     ) -> None:
         super().__init__(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=pg_collection,
+            runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
@@ -459,8 +467,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         agv_r = self.__class__._symm_agv_routing
         agv_p = self.__class__._symm_agv_probs
 
-        engine_max = self._engine_max_tokens
-        global_max = engine_max * self.ep_size
+        per_rank_max = self._per_rank_worst_case_token_count
+        global_max = per_rank_max * self.ep_size
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
@@ -476,7 +484,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             agv_p["handle"],
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
-            engine_max_tokens=engine_max,
+            per_rank_max_tokens=per_rank_max,
         )
 
         topk = probs.shape[1]
@@ -524,7 +532,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             rsv["handle"],
             rank_token_offset=self._rank_token_offset(),
             ep_max_tokens=self._ep_max_tokens(),
-            engine_max_tokens=self._engine_max_tokens,
+            per_rank_max_tokens=self._per_rank_worst_case_token_count,
         )
         return output.to(torch.bfloat16)
 

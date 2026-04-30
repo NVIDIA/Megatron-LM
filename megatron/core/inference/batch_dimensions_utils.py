@@ -487,7 +487,7 @@ class CUDAGraphBatchDimensionBuilder:
             # no need to match if no cuda graph batch dimensions are provided
             return None
 
-        if match_ep_token_counts and ep_group.size() > 1:
+        if match_ep_token_counts:
             # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
             # across the EP group so graph selection is consistent.
             adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(

@@ -17,6 +17,7 @@ import torch
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -36,7 +37,7 @@ requires_torch_grouped_mm = pytest.mark.skipif(
 # ──────────────────────────────────────────────────────────────────────
 
 NANOV3_BASE = dict(
-    num_layers=1,
+    num_layers=4,
     hidden_size=128,
     ffn_hidden_size=128,
     num_attention_heads=4,
@@ -59,6 +60,16 @@ NANOV3_BASE = dict(
     bf16=True,
     params_dtype=torch.bfloat16,
     transformer_impl="inference_optimized",
+    expert_tensor_parallel_size=1,
+    use_cpu_initialization=True,
+    attention_backend=AttnBackend.local,
+    cuda_graph_impl="local",
+    cuda_graph_scope="full_iteration_inference",
+    moe_pad_experts_for_cuda_graph_inference=False,
+    mamba_state_dim=128,
+    mamba_head_dim=64,
+    mamba_num_groups=8,
+    mamba_num_heads=64,
 )
 
 
@@ -126,17 +137,6 @@ class TestInferenceTopKRouter:
         )
         assert router is not None
 
-    def test_set_unset_inference_mode(self):
-        """Toggle is_inference_cuda_graphed_iteration flag."""
-        router = self._make_router()
-        assert not router.is_inference_cuda_graphed_iteration
-
-        router.set_inference_cuda_graphed_iteration()
-        assert router.is_inference_cuda_graphed_iteration
-
-        router.unset_inference_cuda_graphed_iteration()
-        assert not router.is_inference_cuda_graphed_iteration
-
     def test_training_mode_forward_returns_sparse(self):
         """In training mode, forward delegates to parent and returns sparse tensors."""
         router = self._make_router()
@@ -174,7 +174,6 @@ class TestInferenceTopKRouter:
 
         # Inference mode: get top_indices (dense)
         router.eval()
-        router.set_inference_cuda_graphed_iteration()
         _, top_indices = router(input_tensor.clone())
 
         inference_experts = set()
@@ -203,10 +202,15 @@ class TestNCCLAllGatherDispatcher:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    def teardown_method(self, method):
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def _make_dispatcher(self, **config_overrides):
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
+        NCCLAllGatherDispatcher.allocate_buffers()
         config_overrides.setdefault("expert_model_parallel_size", Utils.world_size)
         config = _make_base_config(**config_overrides)
         num_local_experts = config.num_moe_experts // Utils.world_size
@@ -217,6 +221,7 @@ class TestNCCLAllGatherDispatcher:
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=get_default_pg_collection(),
+            runs_metadata_sync=True,
         )
 
     def test_init(self):
@@ -234,14 +239,12 @@ class TestNCCLAllGatherDispatcher:
         - dispatch gathers all slices back to the full global tensor
         - combine reduce-scatters the gathered data, giving each rank ep_size * its_slice
         """
-        from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
         if use_allgather_v and Utils.world_size == 1:
             pytest.skip("Variable-token prefill path requires EP > 1")
 
         dispatcher = self._make_dispatcher()
-        ep_group = get_expert_model_parallel_group()
         ep_size = dispatcher.ep_size
         rank = torch.distributed.get_rank() if ep_size > 1 else 0
         hidden_size = NANOV3_BASE["hidden_size"]
@@ -257,9 +260,7 @@ class TestNCCLAllGatherDispatcher:
         local_tokens = tokens_per_rank[rank]
         total_tokens = sum(tokens_per_rank)
 
-        NCCLAllGatherDispatcher.set_step_metadata(
-            local_tokens, ep_group, use_allgather_v=use_allgather_v
-        )
+        NCCLAllGatherDispatcher._use_allgather_v = use_allgather_v
 
         global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
         global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
@@ -318,11 +319,8 @@ class TestNVLSAllGatherVDispatcher:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
-    def teardown_method(self, method):
-        gc.collect()
-        torch.cuda.empty_cache()
-
     def _make_dispatcher(self):
+        from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
@@ -334,21 +332,19 @@ class TestNVLSAllGatherVDispatcher:
         local_expert_indices = [ep_rank * num_local_experts + i for i in range(num_local_experts)]
         ep_group = get_expert_model_parallel_group()
 
-        try:
-            NVLSAllGatherVDispatcher.allocate_symmetric_buffers(
-                engine_max_tokens=_NVLS_ENGINE_MAX_TOKENS,
-                topk=NANOV3_BASE["moe_router_topk"],
-                hidden_size=NANOV3_BASE["hidden_size"],
-                ep_group=ep_group,
-            )
-        except RuntimeError:
-            pytest.skip("NVLS symmetric memory not available on this hardware")
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=NANOV3_BASE["moe_router_topk"],
+            hidden_size=NANOV3_BASE["hidden_size"],
+            ep_group=ep_group,
+        )
 
         return NVLSAllGatherVDispatcher(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
             pg_collection=get_default_pg_collection(),
+            runs_metadata_sync=True,
         )
 
     def test_init(self):
@@ -359,23 +355,21 @@ class TestNVLSAllGatherVDispatcher:
 
     @pytest.mark.parametrize("seed", [42, 123, 7])
     @pytest.mark.parametrize(
-        "num_local_tokens",
+        "max_rank_tokens",
         # Covers: small, unaligned, power-of-2, and large up to engine_max
         [1, 7, 16, 24, 64, 128, 256, 512],
     )
-    def test_cuda_graph_dispatch_combine(self, num_local_tokens, seed):
+    def test_cuda_graph_dispatch_combine(self, max_rank_tokens, seed):
         """Dispatch+combine can be captured in a CUDA graph and replayed.
 
-        Creates global buffers, shards per rank, and verifies:
+        Uses uneven token counts across EP ranks (rank r gets
+        max(1, max_rank_tokens + r - (ep_size - 1)) tokens) to exercise the
+        AllGatherV variable-length path. Verifies:
         - AllGatherV output matches the global reference (valid prefix only)
         - ReduceScatterV output matches fp32-accumulated reference
         Exact match (atol=0) is possible because the NVLS triton kernels
         accumulate in fp32 before writing bf16 output.
         """
-        from megatron.core.parallel_state import get_expert_model_parallel_group
-        from megatron.core.transformer.moe.token_dispatcher_inference import (
-            NVLSAllGatherVDispatcher,
-        )
 
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
@@ -386,30 +380,28 @@ class TestNVLSAllGatherVDispatcher:
         topk = NANOV3_BASE["moe_router_topk"]
         num_experts = NANOV3_BASE["num_moe_experts"]
         rank = torch.distributed.get_rank() if ep_size > 1 else 0
-        num_global_tokens = num_local_tokens * ep_size
-        global_max = _NVLS_ENGINE_MAX_TOKENS * ep_size
-        ep_group = get_expert_model_parallel_group()
 
-        global_hidden = torch.randn(
-            num_global_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
-        )
-        global_probs = torch.randn(num_global_tokens, topk, device="cuda", dtype=torch.float32)
-        global_routing_map = torch.randint(0, num_experts, (num_global_tokens, topk), device="cuda")
+        # Uneven token counts: rank r gets max(1, max_rank_tokens + r - (ep_size-1))
+        # so the last rank always has max_rank_tokens (≤ engine_max) and earlier
+        # ranks have fewer, exercising the variable-length AllGatherV path.
+        tokens_per_rank = [max(1, max_rank_tokens + r - (ep_size - 1)) for r in range(ep_size)]
+        local_tokens = tokens_per_rank[rank]
+        total_tokens = sum(tokens_per_rank)
+        global_max = _NVLS_ENGINE_MAX_TOKENS * ep_size
+
+        global_hidden = torch.randn(total_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        global_probs = torch.randn(total_tokens, topk, device="cuda", dtype=torch.float32)
+        global_routing_map = torch.randint(0, num_experts, (total_tokens, topk), device="cuda")
         if ep_size > 1:
             torch.distributed.broadcast(global_hidden, src=0)
             torch.distributed.broadcast(global_probs, src=0)
             torch.distributed.broadcast(global_routing_map, src=0)
 
-        start = rank * num_local_tokens
-        end = start + num_local_tokens
+        start = sum(tokens_per_rank[:rank])
+        end = start + local_tokens
         static_hidden = global_hidden[start:end].contiguous()
         static_probs = global_probs[start:end].contiguous()
         static_routing_map = global_routing_map[start:end].contiguous()
-
-        if not are_tensors_nvls_eligible(static_hidden, static_probs, static_routing_map):
-            pytest.skip("Tensors are not NVLS-eligible (need SM>=9 and 16-byte aligned memory)")
-
-        NVLSAllGatherVDispatcher.set_step_metadata(num_local_tokens, ep_group)
 
         # Warmup on a side stream
         with torch.no_grad():
@@ -418,7 +410,7 @@ class TestNVLSAllGatherVDispatcher:
             with torch.cuda.stream(s):
                 for _ in range(3):
                     dispatcher.routing_map = static_routing_map
-                    dispatcher._local_tokens = num_local_tokens
+                    dispatcher._local_tokens = local_tokens
                     d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
                     dispatcher.token_combine(d_hidden.clone())
             torch.cuda.current_stream().wait_stream(s)
@@ -427,17 +419,17 @@ class TestNVLSAllGatherVDispatcher:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             dispatcher.routing_map = static_routing_map
-            dispatcher._local_tokens = num_local_tokens
+            dispatcher._local_tokens = local_tokens
             d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
-            graph_hidden = d_hidden[:num_global_tokens].clone()
-            graph_probs = d_probs[:num_global_tokens].clone()
-            graph_routing_map = dispatcher.routing_map[:num_global_tokens].clone()
+            graph_hidden = d_hidden[:total_tokens].clone()
+            graph_probs = d_probs[:total_tokens].clone()
+            graph_routing_map = dispatcher.routing_map[:total_tokens].clone()
             graph_combined = dispatcher.token_combine(d_hidden.clone())
 
-        # dispatch output is (global_max, *); only first num_global_tokens are valid
+        # dispatch output is (global_max, *); only first total_tokens are valid
         assert d_hidden.shape == (global_max, hidden_size)
         assert d_probs.shape == (global_max, topk)
-        assert graph_combined.shape == (num_local_tokens, hidden_size)
+        assert graph_combined.shape == (local_tokens, hidden_size)
 
         graph.replay()
 
@@ -447,178 +439,3 @@ class TestNVLSAllGatherVDispatcher:
 
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# vLLM Fused MoE (CUDA-graph-safe indirection table + kernel)
-# ──────────────────────────────────────────────────────────────────────
-
-try:
-    import triton  # noqa: F401
-
-    HAVE_TRITON = True
-except ImportError:
-    HAVE_TRITON = False
-
-requires_triton = pytest.mark.skipif(not HAVE_TRITON, reason="Requires Triton")
-
-
-@pytest.mark.internal
-@requires_triton
-class TestVllmFusedMoe:
-
-    @classmethod
-    def setup_class(cls):
-        Utils.initialize_model_parallel(1, 1)
-        _set_random_seed(seed_=42, data_parallel_random_init=False)
-
-    @classmethod
-    def teardown_class(cls):
-        Utils.destroy_model_parallel()
-
-    @pytest.mark.parametrize("seed", [42, 123])
-    @pytest.mark.parametrize("num_tokens", [1, 7, 16, 64, 128])
-    def test_align_block_size_matches_reference(self, num_tokens, seed):
-        """CUDA-graph-safe _moe_align_block_size_cuda_graphable matches the
-        original _moe_align_block_size on identical inputs."""
-        from megatron.core.inference.moe.vllm_fused_moe import (
-            _moe_align_block_size_cuda_graphable,
-        )
-
-        torch.manual_seed(seed)
-        num_local_experts = NANOV3_BASE["num_moe_experts"]
-        topk = NANOV3_BASE["moe_router_topk"]
-        local_expert_start = 0
-        BLOCK_SIZE_M = 64
-
-        routing_map = torch.randint(
-            0, num_local_experts, (num_tokens, topk), device="cuda"
-        )
-        valid_tokens = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
-
-        sorted_ids, expert_ids, num_post = _moe_align_block_size_cuda_graphable(
-            routing_map, BLOCK_SIZE_M, num_local_experts, local_expert_start, valid_tokens
-        )
-
-        num_post_val = num_post.item()
-        assert num_post_val > 0
-        assert num_post_val % BLOCK_SIZE_M == 0
-
-        # Verify expert_ids: each block within num_post should have a valid expert
-        num_blocks = num_post_val // BLOCK_SIZE_M
-        for b in range(num_blocks):
-            eid = expert_ids[b].item()
-            assert 0 <= eid < num_local_experts, f"Block {b} has invalid expert_id={eid}"
-
-        # Verify sorted_token_ids: valid entries should be in [0, num_tokens*topk)
-        sentinel = num_tokens * topk
-        valid_sorted = sorted_ids[:num_post_val]
-        for b in range(num_blocks):
-            block_start = b * BLOCK_SIZE_M
-            block = valid_sorted[block_start : block_start + BLOCK_SIZE_M]
-            valid_in_block = block[block < sentinel]
-            # Each valid entry should map to the correct expert
-            eid = expert_ids[b].item()
-            for flat_idx in valid_in_block.tolist():
-                tok = flat_idx // topk
-                k = flat_idx % topk
-                assert routing_map[tok, k].item() == eid + local_expert_start
-
-    @pytest.mark.parametrize("seed", [42, 123])
-    @pytest.mark.parametrize("num_tokens", [1, 8, 32, 64])
-    def test_vllm_fused_moe_correctness(self, num_tokens, seed):
-        """vllm_fused_moe produces nonzero output and handles valid_tokens gating."""
-        from megatron.core.inference.moe.fused_moe import ActivationType
-        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
-
-        torch.manual_seed(seed)
-        num_local_experts = NANOV3_BASE["num_moe_experts"]
-        topk = NANOV3_BASE["moe_router_topk"]
-        hidden_size = NANOV3_BASE["hidden_size"]
-        ffn_hidden_size = NANOV3_BASE["moe_ffn_hidden_size"]
-
-        hidden_states = torch.randn(
-            num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
-        )
-        probs = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
-        probs = probs / probs.sum(dim=1, keepdim=True)
-        routing_map = torch.randint(
-            0, num_local_experts, (num_tokens, topk), device="cuda"
-        )
-        fc1_weight = torch.randn(
-            num_local_experts, ffn_hidden_size, hidden_size, device="cuda", dtype=torch.bfloat16
-        ) * 0.02
-        fc2_weight = torch.randn(
-            num_local_experts, hidden_size, ffn_hidden_size, device="cuda", dtype=torch.bfloat16
-        ) * 0.02
-        valid_tokens = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
-
-        output = vllm_fused_moe(
-            hidden_states,
-            probs,
-            fc1_weight,
-            fc2_weight,
-            activation_type=ActivationType.SQUARED_RELU,
-            num_local_experts=num_local_experts,
-            local_expert_start=0,
-            valid_tokens=valid_tokens,
-            routing_map=routing_map,
-        )
-
-        assert output.shape == (num_tokens, hidden_size)
-        assert output.dtype == torch.bfloat16
-        assert output.abs().sum() > 0, "Output is all zeros"
-
-    @pytest.mark.parametrize("num_tokens", [8, 32])
-    def test_vllm_fused_moe_valid_tokens_gating(self, num_tokens):
-        """With a max_tokens buffer, only valid_tokens rows should contribute."""
-        from megatron.core.inference.moe.fused_moe import ActivationType
-        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
-
-        torch.manual_seed(42)
-        max_tokens = 128
-        num_local_experts = NANOV3_BASE["num_moe_experts"]
-        topk = NANOV3_BASE["moe_router_topk"]
-        hidden_size = NANOV3_BASE["hidden_size"]
-        ffn_hidden_size = NANOV3_BASE["moe_ffn_hidden_size"]
-
-        hidden_states = torch.zeros(
-            max_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
-        )
-        hidden_states[:num_tokens] = torch.randn(
-            num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
-        )
-        probs = torch.zeros(max_tokens, topk, device="cuda", dtype=torch.float32)
-        probs[:num_tokens] = torch.rand(
-            num_tokens, topk, device="cuda", dtype=torch.float32
-        )
-        probs[:num_tokens] = probs[:num_tokens] / probs[:num_tokens].sum(dim=1, keepdim=True)
-        routing_map = torch.zeros(max_tokens, topk, device="cuda", dtype=torch.int64)
-        routing_map[:num_tokens] = torch.randint(
-            0, num_local_experts, (num_tokens, topk), device="cuda"
-        )
-        fc1_weight = torch.randn(
-            num_local_experts, ffn_hidden_size, hidden_size, device="cuda", dtype=torch.bfloat16
-        ) * 0.02
-        fc2_weight = torch.randn(
-            num_local_experts, hidden_size, ffn_hidden_size, device="cuda", dtype=torch.bfloat16
-        ) * 0.02
-        valid_tokens_tensor = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
-
-        output = vllm_fused_moe(
-            hidden_states,
-            probs,
-            fc1_weight,
-            fc2_weight,
-            activation_type=ActivationType.SQUARED_RELU,
-            num_local_experts=num_local_experts,
-            local_expert_start=0,
-            valid_tokens=valid_tokens_tensor,
-            routing_map=routing_map,
-        )
-
-        assert output.shape == (max_tokens, hidden_size)
-        # Valid rows should have nonzero output
-        assert output[:num_tokens].abs().sum() > 0
-        # Rows beyond valid_tokens should be zero (no token contributed)
-        assert output[num_tokens:].abs().sum() == 0
