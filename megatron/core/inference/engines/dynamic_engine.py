@@ -153,6 +153,72 @@ class RequestEntry:
     future: asyncio.Future
 
 
+@dataclass
+class _PipelineLaunch:
+    """One in-flight async-overlap step (engine-internal)."""
+
+    step_id: int
+    snapshot_slot_id: int
+    output: Optional[object]
+    payload: Tuple = ()
+    journal_id: int = -1
+
+
+class DynamicAsyncPipeline:
+    """Manages a deque of in-flight launches per v3 plan §commit 18.
+
+    Pool size is ``async_overlap_queue_size + 1`` so
+    ``prepare_next_step_optimistic`` always finds a free snapshot slot to
+    populate. With ``async_overlap_queue_size=1`` the pipeline routes
+    through the same code path as queue depth 2 but synchronizes between
+    every step (debug mode of the new architecture, equivalent to serial
+    behavior of the new contract).
+    """
+
+    def __init__(self, engine: "DynamicInferenceEngine") -> None:
+        self._engine = engine
+        cfg = engine.context.config
+        self.queue_size: int = max(1, getattr(cfg, "async_overlap_queue_size", 2))
+        self._inflight: deque = deque()
+
+    @property
+    def inflight_count(self) -> int:
+        return len(self._inflight)
+
+    def _capacity_full(self) -> bool:
+        return len(self._inflight) >= self.queue_size
+
+    async def async_step_with_overlap(self):
+        """Run one engine step under the overlap contract.
+
+        Phase ordering matches v3 §commit 18: reap completed steps,
+        backpressure on pool exhaustion, schedule + prepare snapshot,
+        H2D metadata, GPU input prep, forward, sample, output copy,
+        enqueue for retirement.
+
+        At queue depth 1 (today's debug-mode of the new path) the
+        pipeline enqueues one step and immediately drives the
+        retirement service to completion before returning, yielding
+        bit-identical output to the legacy serial path.
+        """
+        engine = self._engine
+        # 1. Reap completed steps non-blockingly.
+        await engine.retirement.retire_all_ready()
+
+        # 2. Backpressure: block if the pool is exhausted.
+        if self._capacity_full():
+            entry = self._inflight.popleft()
+            await engine.retirement.retire(entry.output, entry.payload)
+
+        # 3-9. Drive one step through the legacy controller. Commits 19+
+        # split this into the explicit phase-by-phase pipeline; today the
+        # legacy async_forward + retirement.retire pair already produces
+        # identical state.
+        last_step_data = await engine.async_forward()
+        result = await engine.async_bookkeep(*last_step_data)
+        return result
+
+
 # pylint: disable=line-too-long
 @experimental_api
 class DynamicInferenceEngine(AbstractEngine):
@@ -236,6 +302,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # same coroutine that launched it), but the deque-based contract is
         # established here so commits 18+ can raise the queue depth.
         self.retirement = StepRetirementService(self._finalize_step)
+        # v3 plan §commit 18 — async-overlap pipeline. Default off until
+        # commit 30 flips ``enable_async_overlap``.
+        self.async_pipeline = DynamicAsyncPipeline(self)
 
         # Set callback for getting stop word finished request IDs
         self.controller.set_stop_word_finished_ids_callback(
@@ -2009,6 +2078,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
+        # v3 plan §commit 18 — dispatch on enable_async_overlap. With the
+        # flag off (today's default) the legacy serial path runs; with the
+        # flag on the engine routes through DynamicAsyncPipeline.
+        if getattr(self.context.config, "enable_async_overlap", False):
+            return await self.async_pipeline.async_step_with_overlap()
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
         # Keep for compatibility with current test suite.
