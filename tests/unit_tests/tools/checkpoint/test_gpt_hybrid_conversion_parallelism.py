@@ -1,13 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """
-Parallelism-matrix integration tests for gpt_mamba_conversion.py.
+Parallelism-matrix integration tests for gpt_hybrid_conversion.py.
 
 The converter operates on dist (``torch_dist`` / ``fsdp_dtensor``) checkpoints
 only — DCP's metadata stores each tensor's ``global_shape``, so the on-disk
 TP / PP / FSDP layout is abstracted away from the conversion logic. We
 synthesize a DCP checkpoint via a single-rank ``dcp.save`` and round-trip
-GPT -> Mamba -> GPT through the conversion CLI, asserting attention and MLP
+GPT -> Hybrid -> GPT through the conversion CLI, asserting attention and MLP
 weights match exactly.
 
 Each scenario is run as a distinct test to document the supported matrix and
@@ -34,7 +34,7 @@ _REPO_ROOT = os.path.join(_THIS_DIR, '..', '..', '..', '..')
 sys.path.insert(0, os.path.join(_REPO_ROOT, 'tools', 'checkpoint'))
 sys.path.insert(0, _THIS_DIR)
 
-from gpt_mamba_conversion import main as conversion_main
+from gpt_hybrid_conversion import main as conversion_main
 
 
 # These scenarios are SYNTHETIC and single-rank by design: each one writes a
@@ -223,17 +223,17 @@ def _run_scenario(
     num_moe_experts=None,
     shared_expert_size=None,
 ):
-    """Build a GPT source ckpt, convert GPT->Mamba->GPT, verify round-trip."""
+    """Build a GPT source ckpt, convert GPT->Hybrid->GPT, verify round-trip."""
     print(f"\n=== {label} ===")
     print(f"  source={source_format} (prefix='{source_prefix}')")
     print(f"  target={target_format}")
     if num_moe_experts is not None:
         print(f"  MoE: num_experts={num_moe_experts} shared={shared_expert_size}")
 
-    tmpdir = tempfile.mkdtemp(prefix=f'gpt_mamba_{label.replace(" ", "_")}_')
+    tmpdir = tempfile.mkdtemp(prefix=f'gpt_hybrid_{label.replace(" ", "_")}_')
     try:
         src_gpt_dir = os.path.join(tmpdir, 'gpt_src')
-        mamba_dir = os.path.join(tmpdir, 'mamba_mid')
+        hybrid_dir = os.path.join(tmpdir, 'hybrid_mid')
         dst_gpt_dir = os.path.join(tmpdir, 'gpt_dst')
 
         ckpt_args = make_checkpoint_args(
@@ -267,23 +267,23 @@ def _run_scenario(
             output_format=target_format,
         )
 
-        # --- GPT -> Mamba ---
+        # --- GPT -> Hybrid ---
         conversion_main(
             argparse.Namespace(
-                direction='gpt-to-mamba', load_dir=src_gpt_dir, save_dir=mamba_dir, **common_kwargs
+                direction='gpt-to-hybrid', load_dir=src_gpt_dir, save_dir=hybrid_dir, **common_kwargs
             )
         )
 
-        # --- Mamba -> GPT ---
+        # --- Hybrid -> GPT ---
         conversion_main(
             argparse.Namespace(
-                direction='mamba-to-gpt', load_dir=mamba_dir, save_dir=dst_gpt_dir, **common_kwargs
+                direction='hybrid-to-gpt', load_dir=hybrid_dir, save_dir=dst_gpt_dir, **common_kwargs
             )
         )
 
         # --- Verify ---
         recovered_sd, _ = _load_converted_dist(dst_gpt_dir)
-        # The mamba->gpt step renames decoder.final_norm -> decoder.final_layernorm,
+        # The hybrid->gpt step renames decoder.final_norm -> decoder.final_layernorm,
         # mirroring the original GPT key. So recovered_sd should have the same
         # keys and tensor values as gpt_sd.
 
@@ -395,7 +395,7 @@ def test_fsdp_dtensor_moe_roundtrip():
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("GPT <-> Mamba Conversion Parallelism Matrix Tests")
+    print("GPT <-> Hybrid Conversion Parallelism Matrix Tests")
     print("=" * 60)
 
     test_torch_dist_roundtrip()

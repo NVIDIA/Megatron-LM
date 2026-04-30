@@ -1,10 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """
-Multi-rank distributed round-trip test for gpt_mamba_conversion.
+Multi-rank distributed round-trip test for gpt_hybrid_conversion.
 
 Each rank participates in a multi-rank DCP save of a synthetic GPT (or MoE
-GPT) state dict; rank 0 then runs the converter and verifies the GPT->Mamba->
+GPT) state dict; rank 0 then runs the converter and verifies the GPT->Hybrid->
 GPT round-trip exactly.
 
 This test is meant to be launched under SLURM/srun (or torchrun) with
@@ -226,7 +226,7 @@ def main():
         save_dist_checkpoint_full,
         write_latest_iteration_marker,
     )
-    from gpt_mamba_conversion import main as conversion_main
+    from gpt_hybrid_conversion import main as conversion_main
 
     if rank == 0:
         _log(
@@ -246,7 +246,7 @@ def main():
 
     scratch = os.path.join(args.output_root, args.label)
     src_dir = os.path.join(scratch, 'gpt_src')
-    mid_dir = os.path.join(scratch, 'mamba_mid')
+    mid_dir = os.path.join(scratch, 'hybrid_mid')
     dst_dir = os.path.join(scratch, 'gpt_dst')
     iter_subdir = os.path.join(src_dir, 'iter_0000100')
 
@@ -294,13 +294,13 @@ def main():
     t0 = time.time()
     conversion_main(
         argparse.Namespace(
-            direction='gpt-to-mamba', load_dir=src_dir, save_dir=mid_dir, **common_kwargs
+            direction='gpt-to-hybrid', load_dir=src_dir, save_dir=mid_dir, **common_kwargs
         )
     )
     dist.barrier()
     conversion_main(
         argparse.Namespace(
-            direction='mamba-to-gpt', load_dir=mid_dir, save_dir=dst_dir, **common_kwargs
+            direction='hybrid-to-gpt', load_dir=mid_dir, save_dir=dst_dir, **common_kwargs
         )
     )
     dist.barrier()

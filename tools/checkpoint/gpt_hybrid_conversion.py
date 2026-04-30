@@ -1,18 +1,18 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """
-GPT <-> Mamba Checkpoint Conversion Tool
+GPT <-> Hybrid Checkpoint Conversion Tool
 =========================================
 
 Directly converts checkpoints between GPTModel (homogeneous Transformer) and
-MambaModel (hybrid Mamba+Transformer) without going through HuggingFace as an
+HybridModel (hybrid Mamba+Transformer) without going through HuggingFace as an
 intermediary.
 
 Supported directions:
-    gpt-to-mamba : Convert a GPT checkpoint to Mamba hybrid format.
-    mamba-to-gpt : Convert a Mamba hybrid checkpoint to GPT format.
+    gpt-to-hybrid : Convert a GPT checkpoint to Hybrid format.
+    hybrid-to-gpt : Convert a Hybrid checkpoint to GPT format.
 
-How the hybrid layer pattern maps GPT layers (gpt-to-mamba):
+How the hybrid layer pattern maps GPT layers (gpt-to-hybrid):
     - Each GPT layer contains both attention and MLP sub-layers.
     - The target hybrid model's hybrid_layer_pattern specifies per-layer types:
         M = Mamba SSM layer
@@ -41,7 +41,7 @@ How MoE / Expert Parallelism (EP) works through the converter:
     - Use a pattern like 'M*EM*EM*E' to pair Mamba/Attn/MoE-MLP per stage.
 
 What happens to SSM parameters:
-    gpt-to-mamba: SSM layers (M) are initialized from scratch:
+    gpt-to-hybrid: SSM layers (M) are initialized from scratch:
         - A_log:          log(uniform(1, 16))
         - dt_bias:        inverse_softplus(log_uniform(dt_min, dt_max))
         - D:              ones
@@ -51,7 +51,7 @@ What happens to SSM parameters:
         - in_proj.layer_norm_weight: ones
         - out_proj.weight: kaiming_uniform(a=sqrt(5))
         - norm.weight:    ones
-    mamba-to-gpt: SSM layers are discarded with a warning.
+    hybrid-to-gpt: SSM layers are discarded with a warning.
 
 Supported checkpoint formats:
     - torch_dist   : Megatron distributed checkpoint (TP + PP + FSDP).
@@ -87,21 +87,21 @@ GPT compatibility whitelist (safeguard):
     `validate_source_args_gpt_compatible` for the exact rules.
 
 Example commands:
-    # GPT -> Mamba (TP+PP+FSDP dist checkpoint)
-    python tools/checkpoint/gpt_mamba_conversion.py \\
-        --direction gpt-to-mamba \\
+    # GPT -> Hybrid (TP+PP+FSDP dist checkpoint)
+    python tools/checkpoint/gpt_hybrid_conversion.py \\
+        --direction gpt-to-hybrid \\
         --load-dir /path/to/gpt-dist-checkpoint \\
-        --save-dir /path/to/mamba-dist-checkpoint \\
+        --save-dir /path/to/hybrid-dist-checkpoint \\
         --hybrid-layer-pattern "M*-M*-M*-M*-" \\
         --d-model 4096 \\
         --mamba-d-state 128 \\
         --mamba2-n-groups 8 \\
         --mamba2-head-dim 64
 
-    # Mamba -> GPT (dist checkpoint)
-    python tools/checkpoint/gpt_mamba_conversion.py \\
-        --direction mamba-to-gpt \\
-        --load-dir /path/to/mamba-dist-checkpoint \\
+    # Hybrid -> GPT (dist checkpoint)
+    python tools/checkpoint/gpt_hybrid_conversion.py \\
+        --direction hybrid-to-gpt \\
+        --load-dir /path/to/hybrid-dist-checkpoint \\
         --save-dir /path/to/gpt-dist-checkpoint \\
         --hybrid-layer-pattern "M*-M*-M*-M*-" \\
         --d-model 4096 \\
@@ -140,10 +140,10 @@ VALID_LAYER_SYMBOLS = {'M', 'G', '*', '-', 'E'}
 #   '-' : standard (optionally gated) dense MLP layer
 #   'E' : MoE MLP layer. Both sides keep the keys under
 #         decoder.layers.<i>.mlp.{router,experts,shared_experts}.* so MoE
-#         tensors round-trip verbatim (see convert_gpt_to_mamba and
-#         convert_mamba_to_gpt — `is_mlp_param` already matches `mlp.*`).
+#         tensors round-trip verbatim (see convert_gpt_to_hybrid and
+#         convert_hybrid_to_gpt — `is_mlp_param` already matches `mlp.*`).
 # SSM ('M') has no GPT equivalent and is initialized from scratch /
-# discarded (see convert_gpt_to_mamba / convert_mamba_to_gpt).
+# discarded (see convert_gpt_to_hybrid / convert_hybrid_to_gpt).
 # 'G' (GDN) and 'D' (DS-attention) are not currently mapped — they would
 # need separate key-naming work. Reject for now.
 GPT_COMPATIBLE_PATTERN_SYMBOLS = {'M', '*', '-', 'E'}
@@ -183,13 +183,13 @@ _MLP_BEARING_SYMBOLS = ('-', 'E')
 def build_layer_index_mapping(layer_types, direction):
     """Build mapping between GPT layer indices and hybrid-model layer indices.
 
-    For gpt-to-mamba:
+    For gpt-to-hybrid:
         Returns (attn_map, mlp_map, ssm_indices) where:
         - attn_map[gpt_layer_i] = hybrid_layer_j  (j is the index of the i-th '*')
         - mlp_map[gpt_layer_i]  = hybrid_layer_k  (k is the index of the i-th
           MLP-bearing position; either '-' or 'E')
 
-    For mamba-to-gpt:
+    For hybrid-to-gpt:
         Returns (attn_map, mlp_map, ssm_indices) where:
         - attn_map[hybrid_attn_idx] = gpt_layer_i
         - mlp_map[hybrid_mlp_idx]   = gpt_layer_i
@@ -198,20 +198,20 @@ def build_layer_index_mapping(layer_types, direction):
     mlp_indices = [i for i, t in enumerate(layer_types) if t in _MLP_BEARING_SYMBOLS]
     ssm_indices = [i for i, t in enumerate(layer_types) if t == 'M']
 
-    if direction == 'gpt-to-mamba':
+    if direction == 'gpt-to-hybrid':
         if len(attn_indices) != len(mlp_indices):
             raise ValueError(
-                f"For gpt-to-mamba, the number of attention layers ({len(attn_indices)}) "
+                f"For gpt-to-hybrid, the number of attention layers ({len(attn_indices)}) "
                 f"must equal the number of MLP/MoE layers ({len(mlp_indices)}) in the pattern."
             )
         attn_map = {i: attn_indices[i] for i in range(len(attn_indices))}
         mlp_map = {i: mlp_indices[i] for i in range(len(mlp_indices))}
         return attn_map, mlp_map, ssm_indices
 
-    elif direction == 'mamba-to-gpt':
+    elif direction == 'hybrid-to-gpt':
         if len(attn_indices) != len(mlp_indices):
             raise ValueError(
-                f"For mamba-to-gpt, the number of attention layers ({len(attn_indices)}) "
+                f"For hybrid-to-gpt, the number of attention layers ({len(attn_indices)}) "
                 f"must equal the number of MLP/MoE layers ({len(mlp_indices)}) in the pattern."
             )
         attn_map = {attn_indices[i]: i for i in range(len(attn_indices))}
@@ -318,7 +318,7 @@ def validate_pattern_gpt_compatible(layer_types, direction):
 
     Args:
         layer_types: list of layer-type chars from parse_hybrid_layer_pattern().
-        direction: 'gpt-to-mamba' or 'mamba-to-gpt' (for error messages).
+        direction: 'gpt-to-hybrid' or 'hybrid-to-gpt' (for error messages).
 
     Rules:
         * Allowed symbols: 'M', '*', '-', 'E'. 'G' (GDN) and 'D' (DS-attention)
@@ -365,7 +365,7 @@ def validate_source_args_gpt_compatible(source_args, direction):
         source_args: argparse.Namespace (or any attribute-bag) loaded from the
             source checkpoint; may be None, in which case this check is a no-op
             (dist checkpoints without a cached args blob).
-        direction: 'gpt-to-mamba' or 'mamba-to-gpt'.
+        direction: 'gpt-to-hybrid' or 'hybrid-to-gpt'.
 
     Rejects MoE, MLA, MTP, linear / experimental attention, and heterogeneous
     per-layer specs. See the module header for the full list.
@@ -393,12 +393,12 @@ def validate_source_args_gpt_compatible(source_args, direction):
             f"conversion. The following features have no GPTModel equivalent "
             f"and would produce a corrupt target checkpoint:\n{joined}\n"
             f"Remove these features from the model (or use a different "
-            f"conversion tool) before running gpt_mamba_conversion."
+            f"conversion tool) before running gpt_hybrid_conversion."
         )
 
 
 # ---------------------------------------------------------------------------
-# SSM parameter initialization (for gpt-to-mamba)
+# SSM parameter initialization (for gpt-to-hybrid)
 # ---------------------------------------------------------------------------
 
 def initialize_ssm_layer_params(
@@ -528,11 +528,11 @@ def is_layer_norm_for_ssm(key):
 
 
 # ---------------------------------------------------------------------------
-# Core conversion: GPT -> Mamba
+# Core conversion: GPT -> Hybrid
 # ---------------------------------------------------------------------------
 
-def convert_gpt_to_mamba(full_model, layer_types, args):
-    """Convert a GPT state dict to a Mamba hybrid state dict.
+def convert_gpt_to_hybrid(full_model, layer_types, args):
+    """Convert a GPT state dict to a Hybrid state dict.
 
     Args:
         full_model: OrderedDict with globally-indexed GPT state dict keys.
@@ -540,10 +540,10 @@ def convert_gpt_to_mamba(full_model, layer_types, args):
         args: Parsed CLI arguments.
 
     Returns:
-        OrderedDict: Mamba state dict with globally-indexed keys.
+        OrderedDict: Hybrid state dict with globally-indexed keys.
     """
     attn_map, mlp_map, ssm_indices = build_layer_index_mapping(
-        layer_types, 'gpt-to-mamba'
+        layer_types, 'gpt-to-hybrid'
     )
     num_gpt_layers = len(attn_map)
 
@@ -625,14 +625,14 @@ def convert_gpt_to_mamba(full_model, layer_types, args):
 
 
 # ---------------------------------------------------------------------------
-# Core conversion: Mamba -> GPT
+# Core conversion: Hybrid -> GPT
 # ---------------------------------------------------------------------------
 
-def convert_mamba_to_gpt(full_model, layer_types, args):
-    """Convert a Mamba hybrid state dict to a GPT state dict.
+def convert_hybrid_to_gpt(full_model, layer_types, args):
+    """Convert a Hybrid state dict to a GPT state dict.
 
     Args:
-        full_model: OrderedDict with globally-indexed Mamba state dict keys.
+        full_model: OrderedDict with globally-indexed Hybrid state dict keys.
         layer_types: list of layer type chars from hybrid_layer_pattern.
         args: Parsed CLI arguments.
 
@@ -640,7 +640,7 @@ def convert_mamba_to_gpt(full_model, layer_types, args):
         OrderedDict: GPT state dict with globally-indexed keys.
     """
     attn_map, mlp_map, ssm_indices = build_layer_index_mapping(
-        layer_types, 'mamba-to-gpt'
+        layer_types, 'hybrid-to-gpt'
     )
     num_gpt_layers = len(attn_map)
 
@@ -687,7 +687,7 @@ def convert_mamba_to_gpt(full_model, layer_types, args):
 
     if discarded_ssm_keys:
         print(f"\n  WARNING: Discarded {len(discarded_ssm_keys)} SSM parameter tensors "
-              f"from {len(ssm_indices)} Mamba layers (no GPT equivalent).")
+              f"from {len(ssm_indices)} SSM layers (no GPT equivalent).")
         print(f"  First few discarded keys: {discarded_ssm_keys[:5]}")
 
     target = _sort_state_dict(target)
@@ -743,7 +743,7 @@ def _save_dist_full(target_state_dict, common_state, model_prefix, backend,
         ckpt_args = common_state['args']
         ckpt_args.num_layers = args.target_num_layers
         if hasattr(ckpt_args, 'hybrid_layer_pattern'):
-            if args.direction == 'gpt-to-mamba':
+            if args.direction == 'gpt-to-hybrid':
                 ckpt_args.hybrid_layer_pattern = args.hybrid_layer_pattern
             else:
                 ckpt_args.hybrid_layer_pattern = None
@@ -765,7 +765,7 @@ def _save_dist_full(target_state_dict, common_state, model_prefix, backend,
 
 
 def main(args):
-    print("\n====RUNNING GPT <-> MAMBA CHECKPOINT CONVERSION====\n")
+    print("\n====RUNNING GPT <-> Hybrid CHECKPOINT CONVERSION====\n")
     print(f"  Direction:            {args.direction}")
     print(f"  Source:               {args.load_dir}")
     print(f"  Target:               {args.save_dir}")
@@ -777,7 +777,7 @@ def main(args):
 
     # Parse hybrid layer pattern
     layer_types = parse_hybrid_layer_pattern(args.hybrid_layer_pattern)
-    total_mamba_layers = len(layer_types)
+    total_hybrid_layers = len(layer_types)
     attn_count = sum(1 for t in layer_types if t == '*')
     mlp_count = sum(1 for t in layer_types if t == '-')
     ssm_count = sum(1 for t in layer_types if t == 'M')
@@ -824,11 +824,11 @@ def main(args):
 
     # 3. Convert
     print(f"\n[Step 2] Converting ({args.direction})...")
-    if args.direction == 'gpt-to-mamba':
-        target_state_dict = convert_gpt_to_mamba(full_model, layer_types, args)
-        args.target_num_layers = total_mamba_layers
-    elif args.direction == 'mamba-to-gpt':
-        target_state_dict = convert_mamba_to_gpt(full_model, layer_types, args)
+    if args.direction == 'gpt-to-hybrid':
+        target_state_dict = convert_gpt_to_hybrid(full_model, layer_types, args)
+        args.target_num_layers = total_hybrid_layers
+    elif args.direction == 'hybrid-to-gpt':
+        target_state_dict = convert_hybrid_to_gpt(full_model, layer_types, args)
         args.target_num_layers = attn_count
     else:
         raise ValueError(f"Unknown direction: {args.direction}")
@@ -846,13 +846,13 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert checkpoints between GPTModel and MambaModel formats.",
+        description="Convert checkpoints between GPTModel and HybridModel formats.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument(
         '--direction', type=str, required=True,
-        choices=['gpt-to-mamba', 'mamba-to-gpt'],
+        choices=['gpt-to-hybrid', 'hybrid-to-gpt'],
         help='Conversion direction.',
     )
     parser.add_argument('--load-dir', type=str, required=True,

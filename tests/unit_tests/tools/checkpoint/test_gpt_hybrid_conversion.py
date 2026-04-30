@@ -1,15 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """
-Unit tests for the GPT <-> Mamba checkpoint conversion tool.
+Unit tests for the GPT <-> Hybrid checkpoint conversion tool.
 
 These tests validate:
 - Hybrid layer pattern parsing
-- Layer index mapping (GPT <-> Mamba)
+- Layer index mapping (GPT <-> Hybrid)
 - State dict key renaming (final_layernorm <-> final_norm)
 - Shared parameter copying (embeddings, output_layer)
 - SSM parameter initialization shapes and dtypes
-- Round-trip conversion: GPT -> Mamba -> GPT preserves attention and MLP weights
+- Round-trip conversion: GPT -> Hybrid -> GPT preserves attention and MLP weights
 - TP split dimension lookup
 """
 
@@ -28,10 +28,10 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'tools', 'checkpoint')
 )
 
-from gpt_mamba_conversion import (
+from gpt_hybrid_conversion import (
     build_layer_index_mapping,
-    convert_gpt_to_mamba,
-    convert_mamba_to_gpt,
+    convert_gpt_to_hybrid,
+    convert_hybrid_to_gpt,
     get_layer_num_from_key,
     initialize_ssm_layer_params,
     is_attention_param,
@@ -90,18 +90,18 @@ class TestPatternParsing:
 
 
 class TestLayerIndexMapping:
-    def test_gpt_to_mamba_basic(self):
+    def test_gpt_to_hybrid_basic(self):
         # Pattern: M*-M*- (2 attn at pos 1,4; 2 MLP at pos 2,5)
         layer_types = ['M', '*', '-', 'M', '*', '-']
-        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'gpt-to-mamba')
+        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'gpt-to-hybrid')
         # 2 GPT layers -> attn at [1,4], MLP at [2,5]
         assert attn_map == {0: 1, 1: 4}
         assert mlp_map == {0: 2, 1: 5}
         assert ssm_indices == [0, 3]
 
-    def test_mamba_to_gpt_basic(self):
+    def test_hybrid_to_gpt_basic(self):
         layer_types = ['M', '*', '-', 'M', '*', '-']
-        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'mamba-to-gpt')
+        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'hybrid-to-gpt')
         # attn at mamba layer 1 -> GPT layer 0, attn at 4 -> GPT layer 1
         assert attn_map == {1: 0, 4: 1}
         assert mlp_map == {2: 0, 5: 1}
@@ -109,7 +109,7 @@ class TestLayerIndexMapping:
 
     def test_alternating_pattern(self):
         layer_types = ['*', '-', '*', '-', '*', '-']
-        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'gpt-to-mamba')
+        attn_map, mlp_map, ssm_indices = build_layer_index_mapping(layer_types, 'gpt-to-hybrid')
         assert attn_map == {0: 0, 1: 2, 2: 4}
         assert mlp_map == {0: 1, 1: 3, 2: 5}
         assert ssm_indices == []
@@ -118,7 +118,7 @@ class TestLayerIndexMapping:
         # 2 attn but 1 MLP -> should raise
         layer_types = ['*', '*', '-', 'M']
         with pytest.raises(ValueError, match="must equal"):
-            build_layer_index_mapping(layer_types, 'gpt-to-mamba')
+            build_layer_index_mapping(layer_types, 'gpt-to-hybrid')
 
     def test_unknown_direction(self):
         with pytest.raises(ValueError, match="Unknown direction"):
@@ -349,7 +349,7 @@ def make_synthetic_gpt_checkpoint(num_layers, d_model, dtype=torch.float32):
 # ---------------------------------------------------------------------------
 
 
-class TestGPTToMambaConversion:
+class TestGPTToHybridConversion:
     def setup_method(self):
         self.d_model = 64
         self.num_gpt_layers = 2
@@ -369,7 +369,7 @@ class TestGPTToMambaConversion:
 
     def test_shared_params_preserved(self):
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_gpt_to_mamba(self.gpt_state, layer_types, self.args)
+        result = convert_gpt_to_hybrid(self.gpt_state, layer_types, self.args)
 
         # Embeddings should be identical
         assert torch.equal(
@@ -381,7 +381,7 @@ class TestGPTToMambaConversion:
 
     def test_final_norm_renamed(self):
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_gpt_to_mamba(self.gpt_state, layer_types, self.args)
+        result = convert_gpt_to_hybrid(self.gpt_state, layer_types, self.args)
 
         assert 'decoder.final_norm.weight' in result
         assert 'decoder.final_layernorm.weight' not in result
@@ -391,7 +391,7 @@ class TestGPTToMambaConversion:
 
     def test_attention_params_mapped(self):
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_gpt_to_mamba(self.gpt_state, layer_types, self.args)
+        result = convert_gpt_to_hybrid(self.gpt_state, layer_types, self.args)
 
         # GPT layer 0 attn -> Mamba layer 1 (first '*' in M*-M*-)
         assert torch.equal(
@@ -406,7 +406,7 @@ class TestGPTToMambaConversion:
 
     def test_mlp_params_mapped(self):
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_gpt_to_mamba(self.gpt_state, layer_types, self.args)
+        result = convert_gpt_to_hybrid(self.gpt_state, layer_types, self.args)
 
         # GPT layer 0 MLP -> Mamba layer 2 (first '-')
         assert torch.equal(
@@ -421,7 +421,7 @@ class TestGPTToMambaConversion:
 
     def test_ssm_layers_initialized(self):
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_gpt_to_mamba(self.gpt_state, layer_types, self.args)
+        result = convert_gpt_to_hybrid(self.gpt_state, layer_types, self.args)
 
         # SSM layers at index 0 and 3
         for idx in [0, 3]:
@@ -439,10 +439,10 @@ class TestGPTToMambaConversion:
         # Pattern with 3 attn but only 2 GPT layers
         layer_types = parse_hybrid_layer_pattern("M*-*-*-")
         with pytest.raises(ValueError, match="layers"):
-            convert_gpt_to_mamba(self.gpt_state, layer_types, self.args)
+            convert_gpt_to_hybrid(self.gpt_state, layer_types, self.args)
 
 
-class TestMambaToGPTConversion:
+class TestHybridToGPTConversion:
     def setup_method(self):
         self.d_model = 64
         self.pattern = "M*-M*-"
@@ -501,7 +501,7 @@ class TestMambaToGPTConversion:
     def test_final_norm_renamed_back(self):
         mamba_state = self._make_mamba_state()
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_mamba_to_gpt(mamba_state, layer_types, self.args)
+        result = convert_hybrid_to_gpt(mamba_state, layer_types, self.args)
 
         assert 'decoder.final_layernorm.weight' in result
         assert 'decoder.final_norm.weight' not in result
@@ -509,7 +509,7 @@ class TestMambaToGPTConversion:
     def test_ssm_params_discarded(self):
         mamba_state = self._make_mamba_state()
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_mamba_to_gpt(mamba_state, layer_types, self.args)
+        result = convert_hybrid_to_gpt(mamba_state, layer_types, self.args)
 
         # No SSM keys should remain
         for key in result:
@@ -518,7 +518,7 @@ class TestMambaToGPTConversion:
     def test_attention_params_mapped(self):
         mamba_state = self._make_mamba_state()
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_mamba_to_gpt(mamba_state, layer_types, self.args)
+        result = convert_hybrid_to_gpt(mamba_state, layer_types, self.args)
 
         # Mamba layer 1 (first *) -> GPT layer 0
         assert torch.equal(
@@ -534,7 +534,7 @@ class TestMambaToGPTConversion:
     def test_mlp_params_mapped(self):
         mamba_state = self._make_mamba_state()
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_mamba_to_gpt(mamba_state, layer_types, self.args)
+        result = convert_hybrid_to_gpt(mamba_state, layer_types, self.args)
 
         # Mamba layer 2 (first -) -> GPT layer 0
         assert torch.equal(
@@ -545,7 +545,7 @@ class TestMambaToGPTConversion:
     def test_gpt_layer_count(self):
         mamba_state = self._make_mamba_state()
         layer_types = parse_hybrid_layer_pattern(self.pattern)
-        result = convert_mamba_to_gpt(mamba_state, layer_types, self.args)
+        result = convert_hybrid_to_gpt(mamba_state, layer_types, self.args)
 
         # Should have 2 GPT layers (layers 0 and 1)
         layer_nums = set()
@@ -557,13 +557,13 @@ class TestMambaToGPTConversion:
 
 
 # ---------------------------------------------------------------------------
-# Round-trip test: GPT -> Mamba -> GPT
+# Round-trip test: GPT -> Hybrid -> GPT; using Mamba as the example below
 # ---------------------------------------------------------------------------
 
 
 class TestRoundTrip:
-    def test_gpt_mamba_gpt_preserves_weights(self):
-        """Converting GPT -> Mamba -> GPT should preserve all attention & MLP weights."""
+    def test_gpt_hybrid_gpt_preserves_weights(self):
+        """Converting GPT -> Hybrid -> GPT should preserve all attention & MLP weights."""
         d_model = 64
         num_layers = 2
         pattern = "M*-M*-"
@@ -583,11 +583,11 @@ class TestRoundTrip:
         original_gpt = make_synthetic_gpt_checkpoint(num_layers, d_model)
         layer_types = parse_hybrid_layer_pattern(pattern)
 
-        # GPT -> Mamba
-        mamba_state = convert_gpt_to_mamba(original_gpt, layer_types, args)
+        # GPT -> Hybrid
+        mamba_state = convert_gpt_to_hybrid(original_gpt, layer_types, args)
 
-        # Mamba -> GPT
-        recovered_gpt = convert_mamba_to_gpt(mamba_state, layer_types, args)
+        # Hybrid -> GPT
+        recovered_gpt = convert_hybrid_to_gpt(mamba_state, layer_types, args)
 
         # Check all original GPT keys are preserved
         for key in original_gpt:
@@ -626,8 +626,8 @@ class TestRoundTrip:
         original_gpt = make_synthetic_gpt_checkpoint(num_layers, d_model)
         layer_types = parse_hybrid_layer_pattern(pattern)
 
-        mamba_state = convert_gpt_to_mamba(original_gpt, layer_types, args)
-        recovered_gpt = convert_mamba_to_gpt(mamba_state, layer_types, args)
+        mamba_state = convert_gpt_to_hybrid(original_gpt, layer_types, args)
+        recovered_gpt = convert_hybrid_to_gpt(mamba_state, layer_types, args)
 
         for key in original_gpt:
             if 'final_layernorm' in key:
@@ -647,57 +647,57 @@ class TestPatternWhitelist:
     def test_accepts_mamba_attn_mlp(self):
         # Standard hybrid with equal attn/MLP counts.
         layer_types = parse_hybrid_layer_pattern("M*-M*-M*-")
-        validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+        validate_pattern_gpt_compatible(layer_types, 'gpt-to-hybrid')
 
     def test_accepts_pure_transformer_pattern(self):
         layer_types = parse_hybrid_layer_pattern("*-*-*-")
-        validate_pattern_gpt_compatible(layer_types, 'mamba-to-gpt')
+        validate_pattern_gpt_compatible(layer_types, 'hybrid-to-gpt')
 
     def test_accepts_pure_ssm_pattern(self):
         # Pure-SSM models have no attention/MLP, so trivially GPT-compatible
         # in the pattern sense (the GPT side would be empty).
         layer_types = parse_hybrid_layer_pattern("MMMM")
-        validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+        validate_pattern_gpt_compatible(layer_types, 'gpt-to-hybrid')
 
     def test_accepts_moe_pattern(self):
         # MoE layers ('E') round-trip through the converter as long as every
         # MLP-bearing position is the same kind.
         layer_types = parse_hybrid_layer_pattern("M*EM*EM*E")
-        validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+        validate_pattern_gpt_compatible(layer_types, 'gpt-to-hybrid')
 
     def test_accepts_pure_attn_moe_pattern(self):
         # No SSM, alternating attn/MoE — i.e. a Mixtral-like GPT.
         layer_types = parse_hybrid_layer_pattern("*E*E*E")
-        validate_pattern_gpt_compatible(layer_types, 'mamba-to-gpt')
+        validate_pattern_gpt_compatible(layer_types, 'hybrid-to-gpt')
 
     def test_rejects_mixed_dense_and_moe(self):
         # GPT layers must be uniform: '-' (dense) and 'E' (MoE) cannot both
         # appear in the same pattern.
         layer_types = parse_hybrid_layer_pattern("M*-M*E")
         with pytest.raises(ValueError, match="uniform"):
-            validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+            validate_pattern_gpt_compatible(layer_types, 'gpt-to-hybrid')
 
     def test_rejects_gdn_symbol(self):
         layer_types = parse_hybrid_layer_pattern("G*-*-")
         with pytest.raises(ValueError, match="not GPT-compatible"):
-            validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+            validate_pattern_gpt_compatible(layer_types, 'gpt-to-hybrid')
 
     def test_rejects_unequal_attn_mlp(self):
         layer_types = parse_hybrid_layer_pattern("M**-")  # 2 attn, 1 MLP
         with pytest.raises(ValueError, match="pair every attention"):
-            validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+            validate_pattern_gpt_compatible(layer_types, 'gpt-to-hybrid')
 
     def test_unequal_attn_moe_also_rejected(self):
         # Same uniformity check, but with MoE — 2 attn, 1 MoE.
         layer_types = parse_hybrid_layer_pattern("M**E")
         with pytest.raises(ValueError, match="pair every attention"):
-            validate_pattern_gpt_compatible(layer_types, 'gpt-to-mamba')
+            validate_pattern_gpt_compatible(layer_types, 'gpt-to-hybrid')
 
     def test_error_lists_offending_symbols(self):
         # 'G' is still rejected; the error message should mention it.
         layer_types = parse_hybrid_layer_pattern("M*-G")
         with pytest.raises(ValueError) as exc:
-            validate_pattern_gpt_compatible(layer_types, 'mamba-to-gpt')
+            validate_pattern_gpt_compatible(layer_types, 'hybrid-to-gpt')
         assert 'G' in str(exc.value)
 
 
@@ -725,84 +725,84 @@ class TestSourceArgsWhitelist:
         return argparse.Namespace(**base)
 
     def test_accepts_plain_gpt_args(self):
-        validate_source_args_gpt_compatible(self._ok_args(), 'gpt-to-mamba')
+        validate_source_args_gpt_compatible(self._ok_args(), 'gpt-to-hybrid')
 
     def test_none_args_is_noop(self):
         # Dist checkpoints sometimes have no cached args blob.
-        validate_source_args_gpt_compatible(None, 'gpt-to-mamba')
+        validate_source_args_gpt_compatible(None, 'gpt-to-hybrid')
 
     def test_accepts_missing_optional_fields(self):
         # Older checkpoints may not have every field; the validator should
         # silently skip fields it doesn't find.
         minimal = argparse.Namespace(num_moe_experts=None)
-        validate_source_args_gpt_compatible(minimal, 'mamba-to-gpt')
+        validate_source_args_gpt_compatible(minimal, 'hybrid-to-gpt')
 
     def test_accepts_moe_args(self):
         # MoE keys live under decoder.layers.<i>.mlp.* and round-trip as-is.
-        validate_source_args_gpt_compatible(self._ok_args(num_moe_experts=8), 'gpt-to-mamba')
+        validate_source_args_gpt_compatible(self._ok_args(num_moe_experts=8), 'gpt-to-hybrid')
 
     def test_accepts_shared_expert_args(self):
         # Shared experts also live under mlp.shared_experts.* and round-trip.
         validate_source_args_gpt_compatible(
             self._ok_args(num_moe_experts=8, moe_shared_expert_intermediate_size=4096),
-            'gpt-to-mamba',
+            'gpt-to-hybrid',
         )
 
     def test_rejects_moe_layer_freq_list(self):
         # Heterogeneous interleaving (some dense, some MoE) breaks GPT uniformity.
         with pytest.raises(ValueError, match="interleaved"):
             validate_source_args_gpt_compatible(
-                self._ok_args(moe_layer_freq=[1, 0, 1, 0]), 'gpt-to-mamba'
+                self._ok_args(moe_layer_freq=[1, 0, 1, 0]), 'gpt-to-hybrid'
             )
 
     def test_accepts_moe_layer_freq_1(self):
-        validate_source_args_gpt_compatible(self._ok_args(moe_layer_freq=1), 'gpt-to-mamba')
+        validate_source_args_gpt_compatible(self._ok_args(moe_layer_freq=1), 'gpt-to-hybrid')
 
     def test_accepts_moe_layer_freq_all_ones_list(self):
         # An all-1s list is uniform (every layer is the same kind) and accepted.
         validate_source_args_gpt_compatible(
-            self._ok_args(moe_layer_freq=[1, 1, 1, 1]), 'gpt-to-mamba'
+            self._ok_args(moe_layer_freq=[1, 1, 1, 1]), 'gpt-to-hybrid'
         )
 
     def test_rejects_experimental_attention(self):
         with pytest.raises(ValueError, match="experimental attention"):
             validate_source_args_gpt_compatible(
-                self._ok_args(experimental_attention_variant='gated_delta_net'), 'gpt-to-mamba'
+                self._ok_args(experimental_attention_variant='gated_delta_net'), 'gpt-to-hybrid'
             )
 
     def test_rejects_linear_attention(self):
         with pytest.raises(ValueError, match="linear attention"):
             validate_source_args_gpt_compatible(
-                self._ok_args(linear_attention_freq=4), 'gpt-to-mamba'
+                self._ok_args(linear_attention_freq=4), 'gpt-to-hybrid'
             )
 
     def test_rejects_heterogeneous_block_specs(self):
         with pytest.raises(ValueError, match="heterogeneous"):
             validate_source_args_gpt_compatible(
-                self._ok_args(heterogeneous_block_specs=True), 'mamba-to-gpt'
+                self._ok_args(heterogeneous_block_specs=True), 'hybrid-to-gpt'
             )
 
     def test_rejects_heterogeneous_config_path(self):
         with pytest.raises(ValueError, match="heterogeneous"):
             validate_source_args_gpt_compatible(
-                self._ok_args(heterogeneous_layers_config_path='/tmp/x.json'), 'gpt-to-mamba'
+                self._ok_args(heterogeneous_layers_config_path='/tmp/x.json'), 'gpt-to-hybrid'
             )
 
     def test_rejects_mla(self):
         with pytest.raises(ValueError, match="Multi-Latent"):
             validate_source_args_gpt_compatible(
-                self._ok_args(multi_latent_attention=True), 'gpt-to-mamba'
+                self._ok_args(multi_latent_attention=True), 'gpt-to-hybrid'
             )
 
     def test_rejects_mtp(self):
         with pytest.raises(ValueError, match="Multi-Token Prediction"):
-            validate_source_args_gpt_compatible(self._ok_args(mtp_num_layers=2), 'gpt-to-mamba')
+            validate_source_args_gpt_compatible(self._ok_args(mtp_num_layers=2), 'gpt-to-hybrid')
 
     def test_reports_multiple_reasons(self):
         # Both heterogeneous moe_layer_freq and MLA set — both should be reported.
         with pytest.raises(ValueError) as exc:
             validate_source_args_gpt_compatible(
-                self._ok_args(moe_layer_freq=[1, 0], multi_latent_attention=True), 'gpt-to-mamba'
+                self._ok_args(moe_layer_freq=[1, 0], multi_latent_attention=True), 'gpt-to-hybrid'
             )
         msg = str(exc.value)
         assert 'interleaved' in msg
