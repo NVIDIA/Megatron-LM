@@ -31,8 +31,7 @@ class TorchSampling(Sampling):
     ) -> Tensor:
         """Sample tokens from logits with temperature, top-k, and top-p filtering.
 
-        Shared between dynamic batching (`TorchSampling.sample_kernel`) and static
-        batching (`TextGenerationController.sample_from_logits`).
+        Shared between dynamic batching and static batching.
 
         Args:
             last_token_logits: Logits of shape `[batch_size, vocab_size]`.
@@ -73,8 +72,7 @@ class TorchSampling(Sampling):
         if top_k == 1:
             return torch.argmax(last_token_logits, dim=-1)
 
-        # Clone needed: .div_() and masked_fill_() below modify in-place,
-        # which would mutate the caller's tensor without this clone.
+        # Clone needed: .div_() and masked_fill_() below modify in-place.
         last_token_logits = last_token_logits.clone()
         if temperature != 1.0:
             last_token_logits.div_(temperature)
@@ -100,10 +98,10 @@ class TorchSampling(Sampling):
         n: int,
         context,
         *,
-        eager: bool = False,
-        cache_key: Any = None,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
+        eager: bool = False,
+        cache_key: Any = None,
     ) -> Tensor:
         """Bucket active requests by `(temperature, top_k, top_p)` and sample each bucket.
 
@@ -111,11 +109,11 @@ class TorchSampling(Sampling):
             logits: Logits tensor of shape `[>=n, vocab_size]`.
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
-            eager: Accepted for API symmetry; ignored (TorchSampling has no graph wrapper).
-            cache_key: Accepted for API symmetry; ignored.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
+            eager: Accepted for API symmetry; ignored (TorchSampling has no graph wrapper).
+            cache_key: Accepted for API symmetry; ignored.
 
         Returns:
             Sampled token ids of shape `[n]`.
@@ -151,22 +149,19 @@ class TorchSampling(Sampling):
                 row_indices = idx_tensor
             else:
                 row_indices = torch.where(torch.isin(token_to_request_index, idx_tensor))[0]
-            token_list.append(self._sampling_func(logits[row_indices, :], temp, top_k, top_p))
+            token_list.append(
+                TorchSampling.sample_from_logits(
+                    logits[row_indices, :],
+                    temp,
+                    top_k,
+                    top_p,
+                    generator=self._rng,
+                    vocab_size=self._vocab_size,
+                )
+            )
             indices_list.append(row_indices)
 
         sampled_tokens = torch.cat(token_list, dim=0)
         sampled_indices = torch.cat(indices_list, dim=0)
         output[sampled_indices] = sampled_tokens
         return output
-
-    def _sampling_func(
-        self, last_token_logits: Tensor, temperature: float, top_k: int, top_p: float
-    ) -> Tensor:
-        return TorchSampling.sample_from_logits(
-            last_token_logits,
-            temperature,
-            top_k,
-            top_p,
-            generator=self._rng,
-            vocab_size=self._vocab_size,
-        )
