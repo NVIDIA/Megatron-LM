@@ -79,6 +79,7 @@ MODEL_ARGS:
   --bf16: true
   --async-save: true
   --async-strategy: mcore
+  --use-persistent-ckpt-worker: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
 TEST_TYPE: no-nvrx
