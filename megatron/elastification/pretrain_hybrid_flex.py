@@ -40,6 +40,7 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
@@ -528,7 +529,9 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
 
-    pretrain(train_valid_test_datasets_provider,
+    full_config = pretrain_cfg_container_from_args(args)
+    pretrain(full_config,
+             train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,

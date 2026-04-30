@@ -884,11 +884,19 @@ class FlextronTopKRouterElasticityManager:
                     logits[:, expert_threshold:] = float('-inf')
                     logits = logits * router_moe_expert_logits
 
-                    # Also handle expert bias
+                    # Mask the expert_bias on a temporary tensor and restore
+                    # the original after the call so subsequent forwards
+                    # (including full-model passes that bypass this branch)
+                    # don't see a truncated bias.
                     if hasattr(router, 'expert_bias') and router.expert_bias is not None:
-                        router.expert_bias = router.expert_bias.clone()
-                        router.expert_bias[expert_threshold:] = 0
-
+                        original_expert_bias = router.expert_bias
+                        masked_bias = original_expert_bias.clone()
+                        masked_bias[expert_threshold:] = 0
+                        router.expert_bias = masked_bias
+                        try:
+                            return original_routing(logits, **kwargs)
+                        finally:
+                            router.expert_bias = original_expert_bias
                     return original_routing(logits, **kwargs)
 
             else:

@@ -339,6 +339,10 @@ class FlextronRouter(MegatronModule):
             )
         else:
             if self.config.normalize_router_logits:
+                # Std-normalize only when there's actually >1 choice; with a
+                # single choice the std is 0 and the routing is trivial, so we
+                # skip both the scale and the normalization (consistent with
+                # the no-op semantics of a single-choice axis).
                 if len(self.config.mamba_int_list) > 1:
                     router_mamba_logits = (
                         scale

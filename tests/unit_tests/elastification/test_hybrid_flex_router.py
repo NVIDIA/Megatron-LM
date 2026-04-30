@@ -132,7 +132,7 @@ class TestFlextronRouter:
         for p in router.parameters():
             # _mark_router_params_for_pp_sync adds this attribute to every
             # trainable parameter so the PP gradient sync picks them up.
-            assert getattr(p, "pipeline_parallel", False) is True
+            assert getattr(p, "flextron_router_pp_sync", False) is True
 
     def test_forward_returns_five_axis_outputs(self):
         config = _router_config()
