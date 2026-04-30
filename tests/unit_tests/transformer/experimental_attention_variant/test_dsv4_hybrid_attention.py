@@ -80,6 +80,7 @@ def _make_config(
         use_cpu_initialization=True,
         bf16=True,
         params_dtype=torch.bfloat16,
+        add_bias_linear=False,
         tensor_model_parallel_size=tensor_model_parallel_size,
         sequence_parallel=sequence_parallel,
         q_lora_rank=q_lora_rank,
@@ -105,11 +106,12 @@ def _make_config(
 
 def _make_attention_spec(config):
     """Build the full DSv4HybridSelfAttention ModuleSpec using the canonical spec builder."""
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
     from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
         get_dsv4_hybrid_module_spec_for_backend,
     )
 
-    return get_dsv4_hybrid_module_spec_for_backend(config=config)
+    return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
 
 def _build_attention(config, layer_number, pg_collection):
