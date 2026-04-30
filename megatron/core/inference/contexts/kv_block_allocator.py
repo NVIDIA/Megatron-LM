@@ -1,12 +1,29 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from collections import deque
+from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+
+
+class RollbackStatus(Enum):
+    """Outcome of ``KVBlockAllocator.rollback`` (v3 plan §commit 27).
+
+    ``FULLY_RELEASED``: every block in the reservation was returned to
+    the free pool.
+    ``ALREADY_EVICTED``: the reservation's blocks were already released
+    by a prior rollback or eviction cycle; the call is a no-op.
+    ``PARTIALLY_HELD``: some blocks were released but others still hold
+    refcounts (typical when a block is shared via the prefix cache).
+    """
+
+    FULLY_RELEASED = "fully_released"
+    ALREADY_EVICTED = "already_evicted"
+    PARTIALLY_HELD = "partially_held"
 
 if TYPE_CHECKING:
     # Lazy import inside ``reserve`` to avoid the engines/__init__.py
@@ -246,8 +263,17 @@ class KVBlockAllocator:
         )
         reservation.state = ReservationState.COMMITTED
 
-    def rollback(self, reservation: "Reservation") -> None:
-        """Roll back ``reservation`` and release the blocks back to the pool."""
+    def rollback(self, reservation: "Reservation") -> "RollbackStatus":
+        """Roll back ``reservation`` and release the blocks back to the pool.
+
+        v3 plan §commit 27 — returns a ``RollbackStatus`` describing what
+        actually happened. A reservation whose blocks were already released
+        by an earlier rollback or eviction cycle is reported as
+        ``ALREADY_EVICTED`` instead of crashing; reservations whose blocks
+        retain refcounts (prefix-cache sharing) are reported as
+        ``PARTIALLY_HELD``. The contract is that rollback "always succeeds
+        in releasing whatever it can; never crashes."
+        """
         from megatron.core.inference.engines.async_pipeline_types import (
             ReservationState,
             ResourceKind,
@@ -258,9 +284,25 @@ class KVBlockAllocator:
             f"{reservation.resource_kind}"
         )
         _, block_ids = reservation.resource_handle
-        if block_ids is not None and block_ids.numel() > 0:
-            self.release_memory_blocks(block_ids)
+        status = RollbackStatus.FULLY_RELEASED
+        if block_ids is None or block_ids.numel() == 0:
+            status = RollbackStatus.ALREADY_EVICTED
+        else:
+            if self.enable_prefix_caching:
+                # If every block already has zero refcount the rollback is a
+                # no-op; the prefix cache returned them earlier.
+                ref_before = self.block_ref_counts[block_ids]
+                if ref_before.numel() > 0 and bool((ref_before == 0).all().item()):
+                    status = RollbackStatus.ALREADY_EVICTED
+                else:
+                    self.release_memory_blocks(block_ids)
+                    ref_after = self.block_ref_counts[block_ids]
+                    if ref_after.numel() > 0 and bool((ref_after > 0).any().item()):
+                        status = RollbackStatus.PARTIALLY_HELD
+            else:
+                self.release_memory_blocks(block_ids)
         reservation.state = ReservationState.ROLLED_BACK
+        return status
 
     def release_memory_blocks(self, blocks: Tensor) -> None:
         """Release memory blocks by decrementing reference counts.
