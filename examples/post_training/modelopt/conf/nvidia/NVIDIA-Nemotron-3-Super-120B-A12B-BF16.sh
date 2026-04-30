@@ -28,7 +28,7 @@ MODEL_ARGS=" \
     --moe-router-dtype fp32 \
     --moe-router-load-balancing-type seq_aux_loss \
     --moe-shared-expert-intermediate-size 5376 \
-    --moe-token-dispatcher-type alltoall\
+    --moe-token-dispatcher-type alltoall \
     --moe-latent-size 1024 \
     \
     --attention-backend flash \
