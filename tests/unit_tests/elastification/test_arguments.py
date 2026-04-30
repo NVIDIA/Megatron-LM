@@ -49,10 +49,7 @@ class TestConvertPerListsToIntLists:
 
     def test_all_axes_converted_with_correct_ref_dim(self):
         cfg = _make_config(
-            emb_per_list=[1.0],
-            mlp_per_list=[0.5],
-            mamba_per_list=[0.75],
-            moe_expert_per_list=[0.5],
+            emb_per_list=[1.0], mlp_per_list=[0.5], mamba_per_list=[0.75], moe_expert_per_list=[0.5]
         )
         convert_per_lists_to_int_lists(cfg)
         assert cfg.emb_int_list == [1920]

@@ -152,9 +152,7 @@ class TestLossFuncReportingNoKD:
         out = torch.tensor([[5.0, 5.0]])
         mask = torch.tensor([[0.0, 0.0]])
         zero_param = torch.tensor([0.0])
-        _, num_tokens, _ = loss_func(
-            mask, (out, (zero_param, {})), self._model(training=True)
-        )
+        _, num_tokens, _ = loss_func(mask, (out, (zero_param, {})), self._model(training=True))
         # Guard at line 94 clamps to min=1 to avoid divide-by-zero downstream.
         assert num_tokens.item() == 1
 
@@ -164,9 +162,7 @@ class TestLossFuncReportingNoKD:
         out = torch.tensor([[1.0, 1.0]])
         mask = torch.tensor([[1.0, 1.0]])
         zero_param = torch.tensor([0.0])
-        _, _, report = loss_func(
-            mask, (out, (zero_param, {})), self._model(training=True)
-        )
+        _, _, report = loss_func(mask, (out, (zero_param, {})), self._model(training=True))
         for key, val in report.items():
             assert isinstance(val, torch.Tensor), f"report[{key}] not packed"
             assert val.shape == (2,), f"report[{key}] not (value, num_tokens)"
