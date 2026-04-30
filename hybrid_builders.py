@@ -57,8 +57,6 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
             scatter_embedding_sequence_parallel=recipe.scatter_embedding_sequence_parallel,
             layer_type_list=recipe.layer_type_list,
             layer_config_list=recipe.layer_config_list,
-            mtp_layer_pattern=recipe.mtp_layer_pattern,
-            mtp_num_depths=recipe.mtp_num_depths,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )

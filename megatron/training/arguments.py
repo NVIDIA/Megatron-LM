@@ -368,7 +368,6 @@ def _apply_model_recipe_to_args(args):
             not compiled.share_embeddings_and_output_weights
         ),
         "fp16_lm_cross_entropy": compiled.fp16_lm_cross_entropy,
-        "mtp_num_layers": compiled.mtp_num_depths,
     }
     for attr, value in recipe_values.items():
         if value is not None and hasattr(args, attr):
