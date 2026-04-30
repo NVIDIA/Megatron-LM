@@ -421,11 +421,13 @@ class DynamicInferenceEngine(AbstractEngine):
             with torch.inference_mode():
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
 
-                # Capture speculative softmax graph post-forward.
-                controller._post_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(controller._post_forward_bookkeeping_stream):
-                    controller._dynamic_step_log_probs_softmax()
-                    controller._post_forward_bookkeeping_event.record()
+                if controller._has_post_forward_softmax_work:
+                    controller._post_forward_bookkeeping_stream.wait_stream(
+                        torch.cuda.current_stream()
+                    )
+                    with torch.cuda.stream(controller._post_forward_bookkeeping_stream):
+                        controller._dynamic_step_log_probs_softmax()
+                        controller._post_forward_bookkeeping_event.record()
 
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:

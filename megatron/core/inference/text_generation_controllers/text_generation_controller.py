@@ -172,6 +172,8 @@ class TextGenerationController:
         # Side stream for post-forward bookkeeping (e.g. speculative softmax).
         # Runs concurrently with verification/sampling on the main stream.
         self._post_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
+        # Whether any work needs to run on the post-forward stream.
+        self._has_post_forward_softmax_work = self.num_speculative_tokens > 0
         # Side stream for the eager top-n compute hoisted out of `extract`.
         # Runs concurrently with context bookkeeping and initialization.
         self._log_probs_topn_stream = torch.cuda.Stream(device=device)
@@ -1267,8 +1269,6 @@ class TextGenerationController:
             return
 
         context = self.inference_wrapped_model.inference_context
-        if context.num_speculative_tokens == 0:
-            return
 
         logits_seq_len = (
             context.padded_num_last_token_logits
@@ -1655,14 +1655,17 @@ class TextGenerationController:
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
             self._dynamic_step_forward_logits(input_ids, position_ids)
-            self._post_forward_bookkeeping_stream.wait_event(self._pre_forward_bookkeeping_event)
 
-            # Launch speculative softmax on the post-forward stream;
-            # it only needs logits and overlaps with verification/sampling on the main stream.
-            self._post_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._post_forward_bookkeeping_stream):
-                self._dynamic_step_log_probs_softmax()
-                self._post_forward_bookkeeping_event.record()
+            if self._has_post_forward_softmax_work:
+                self._post_forward_bookkeeping_stream.wait_event(
+                    self._pre_forward_bookkeeping_event
+                )
+                # Launch speculative softmax on the post-forward stream;
+                # it only needs logits and overlaps with verification/sampling on the main stream.
+                self._post_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self._post_forward_bookkeeping_stream):
+                    self._dynamic_step_log_probs_softmax()
+                    self._post_forward_bookkeeping_event.record()
 
             # Commit Mamba intermediate states before update_requests, which
             # may swap request indices. The Python lists tracking EOS block IDs
@@ -1715,8 +1718,11 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
-            # GPU-side ordering: main stream waits for post-forward bookkeeping stream.
-            torch.cuda.current_stream().wait_event(self._post_forward_bookkeeping_event)
+            # GPU-side ordering: main stream waits for bookkeeping streams.
+            if self._has_post_forward_softmax_work:
+                torch.cuda.current_stream().wait_event(self._post_forward_bookkeeping_event)
+            else:
+                torch.cuda.current_stream().wait_event(self._pre_forward_bookkeeping_event)
             log_probs_extract = self._dynamic_step_calculate_log_probs()
 
             if skip_bookkeeping:
