@@ -114,6 +114,81 @@ class MambaSlotAllocator:
         )
 
     # =========================================================================
+    # Reservation API (v3 plan commit 8)
+    # =========================================================================
+
+    def reserve(
+        self,
+        slot_idx: int,
+        block_id: int,
+        journal_id: int,
+        must_outlast_snapshot_step_id: int = -1,
+    ) -> "Reservation":
+        """Wrap an already-allocated Mamba slot in a ``Reservation``.
+
+        At commit 8 the slot allocation flow itself
+        (``allocate_slots_batch``) is unchanged; this method exists so the
+        journal can record Mamba-slot ownership and drive
+        commit / rollback in lockstep with KV blocks. Commits 14, 24 fully
+        wire the allocation path through the journal.
+        """
+        from megatron.core.inference.engines.async_pipeline_types import (
+            Reservation,
+            ReservationState,
+            ResourceKind,
+        )
+
+        return Reservation(
+            journal_id=journal_id,
+            resource_kind=ResourceKind.MAMBA_SLOT,
+            resource_handle=(slot_idx, block_id),
+            state=ReservationState.RESERVED,
+            must_outlast_snapshot_step_id=must_outlast_snapshot_step_id,
+        )
+
+    def commit(self, reservation: "Reservation") -> None:
+        """Mark ``reservation`` committed. State-only transition; the slot
+        remains owned by its block."""
+        from megatron.core.inference.engines.async_pipeline_types import (
+            ReservationState,
+            ResourceKind,
+        )
+
+        assert reservation.resource_kind is ResourceKind.MAMBA_SLOT, (
+            "MambaSlotAllocator.commit only handles MAMBA_SLOT reservations; got "
+            f"{reservation.resource_kind}"
+        )
+        reservation.state = ReservationState.COMMITTED
+
+    def rollback(self, reservation: "Reservation") -> None:
+        """Roll back ``reservation`` and return its slot to the free pool.
+
+        Clears the block→slot and slot→block mappings so the slot can be
+        re-allocated by a subsequent step.
+        """
+        from megatron.core.inference.engines.async_pipeline_types import (
+            ReservationState,
+            ResourceKind,
+        )
+
+        assert reservation.resource_kind is ResourceKind.MAMBA_SLOT, (
+            "MambaSlotAllocator.rollback only handles MAMBA_SLOT reservations; got "
+            f"{reservation.resource_kind}"
+        )
+        slot_idx, block_id = reservation.resource_handle
+        if 0 <= slot_idx < self.max_slots:
+            # Detach mapping if present.
+            if 0 <= block_id < self.block_to_slot.numel():
+                if int(self.block_to_slot[block_id].item()) == slot_idx:
+                    self.block_to_slot[block_id] = -1
+            self.slot_to_block[slot_idx] = -1
+            # Return slot to the free pool.
+            if self.free_count < self.max_slots:
+                self.free_slots[self.free_count] = slot_idx
+                self.free_count += 1
+        reservation.state = ReservationState.ROLLED_BACK
+
+    # =========================================================================
     # Slot allocation
     # =========================================================================
 

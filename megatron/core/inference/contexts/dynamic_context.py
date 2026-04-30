@@ -1416,6 +1416,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         for r in entry.reservations:
             if r.resource_kind is ResourceKind.KV_BLOCK:
                 self.kv_block_allocator.commit(r)
+            elif (
+                r.resource_kind is ResourceKind.MAMBA_SLOT
+                and self.mamba_slot_allocator is not None
+            ):
+                self.mamba_slot_allocator.commit(r)
         for slot, delta in entry.placeholder_deltas.items():
             decrement = (
                 accepted_token_counts[slot]
@@ -1435,6 +1440,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         for r in entry.reservations:
             if r.resource_kind is ResourceKind.KV_BLOCK:
                 self.kv_block_allocator.rollback(r)
+            elif (
+                r.resource_kind is ResourceKind.MAMBA_SLOT
+                and self.mamba_slot_allocator is not None
+            ):
+                self.mamba_slot_allocator.rollback(r)
         for slot, delta in entry.placeholder_deltas.items():
             self.num_output_placeholders[slot] -= delta
         return entry
