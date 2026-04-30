@@ -1,6 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
-"""Pretrain GPT loss function(s)."""
+"""Flextron loss function(s).
+
+Combines lm loss with the router's budget loss, optional KD distillation
+loss, and per-budget reporting (full-model vs sub-budget breakdown).
+"""
 
 import torch
 

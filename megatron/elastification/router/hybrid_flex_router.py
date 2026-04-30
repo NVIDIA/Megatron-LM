@@ -122,15 +122,21 @@ class FlextronRouter(MegatronModule):
             + (self.dp_rank + self.fwd_pass_count * self.dp_size) % self.config.router_gbs
             + curr_iteration * 1000
         )
-        # Save and set random state
-        old_state = torch.get_rng_state()
+        # torch.manual_seed seeds both CPU and CUDA generators globally, so we
+        # must save/restore both - otherwise the CUDA RNG leaks the deterministic
+        # state we set here into other CUDA random ops elsewhere in the model.
+        cpu_state = torch.get_rng_state()
+        cuda_state = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
         torch.manual_seed(seed)
 
         try:
-            result = F.gumbel_softmax(logits, tau=tau, hard=hard)
-            return result
+            return F.gumbel_softmax(logits, tau=tau, hard=hard)
         finally:
-            torch.set_rng_state(old_state)
+            torch.set_rng_state(cpu_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
 
     def _create_linear_layer(self, input_size, output_size, bias=False, is_first_layer=True):
         """Helper method to create appropriate linear layer (TE or fallback)"""
