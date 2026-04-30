@@ -13,7 +13,6 @@ def convert_per_lists_to_int_lists(config):
     conversions = [
         ('emb_per_list', 'emb_int_list', config.hidden_size),
         ('mlp_per_list', 'mlp_int_list', config.ffn_hidden_size),
-        ('head_per_list', 'head_int_list', config.num_attention_heads),
         ('mamba_per_list', 'mamba_int_list', config.mamba_num_heads),
         ('moe_expert_per_list', 'moe_expert_int_list', config.num_moe_experts),
     ]
@@ -36,7 +35,6 @@ def validate_flextron_per_int_lists(args):
         ('mamba', 'mamba_per_list', 'mamba_int_list'),
         ('mlp', 'mlp_per_list', 'mlp_int_list'),
         ('emb', 'emb_per_list', 'emb_int_list'),
-        ('head', 'head_per_list', 'head_int_list'),
         ('moe-expert', 'moe_expert_per_list', 'moe_expert_int_list'),
     )
     for cli_name, per_attr, int_attr in pairs:
@@ -84,11 +82,6 @@ def add_flextron_args(parser):
     )
     group.add_argument(
         '--flex-hetero-mamba', action='store_true', help='Use flex hetero Mamba in Flextron.'
-    )
-    group.add_argument(
-        '--flex-hetero-head',
-        action='store_true',
-        help='Use flex hetero attention head in Flextron.',
     )
     group.add_argument(
         '--flex-hetero-moe-expert',
@@ -140,13 +133,6 @@ def add_flextron_args(parser):
     )
     group.add_argument(
         '--force-mlp', nargs='+', type=float, default=None, help='Force MLP for Flextron router.'
-    )
-    group.add_argument(
-        '--force-head',
-        nargs='+',
-        type=float,
-        default=None,
-        help='Force Attn head for Flextron router.',
     )
     group.add_argument(
         '--force-mamba',
@@ -252,13 +238,6 @@ def add_flextron_args(parser):
         help='List of embedding percentage values for Flextron (mutually exclusive with --emb-int-list).',
     )
     group.add_argument(
-        '--head-per-list',
-        nargs='+',
-        type=float,
-        default=None,
-        help='List of head percentage values for Flextron (mutually exclusive with --head-int-list).',
-    )
-    group.add_argument(
         '--moe-expert-per-list',
         nargs='+',
         type=float,
@@ -285,13 +264,6 @@ def add_flextron_args(parser):
         type=int,
         default=None,
         help='List of embedding integer router choices for Flextron (mutually exclusive with --emb-per-list).',
-    )
-    group.add_argument(
-        '--head-int-list',
-        nargs='+',
-        type=int,
-        default=None,
-        help='List of head integer router choices for Flextron (mutually exclusive with --head-per-list).',
     )
     group.add_argument(
         '--moe-expert-int-list',

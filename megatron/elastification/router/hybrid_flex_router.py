@@ -65,7 +65,6 @@ class FlextronRouter(MegatronModule):
         self.add_router_for_mlp()
         self.add_router_for_emb()
         self.add_router_for_mamba()
-        self.add_router_for_head()
         self.add_router_for_moe_expert()
         if self.config.add_skipping:
             self.add_router_for_skipping()
@@ -258,39 +257,6 @@ class FlextronRouter(MegatronModule):
             self._create_linear_layer(self.n_dim, len(emb_list), bias=False, is_first_layer=False),
         ]
         self.gate_emb = nn.Sequential(*gate_emb_layer_list)
-
-    def add_router_for_head(self):
-        head_list = self.config.head_int_list
-        if self.config.flex_hetero_head:
-            num_head = self.config.hybrid_layer_pattern.count("*")
-            gate_head_layer_list = [
-                self._create_linear_layer(
-                    self.input_dim, self.n_dim, bias=False, is_first_layer=True
-                ),
-                nn.LeakyReLU(0.1),
-                self._create_linear_layer(
-                    self.n_dim, len(head_list) * num_head, bias=False, is_first_layer=False
-                ),
-            ]
-            # Set bias for the last layer
-            if (
-                hasattr(gate_head_layer_list[-1], 'bias')
-                and gate_head_layer_list[-1].bias is not None
-            ):
-                last_layer_bias = [0.00 for _ in range(len(head_list))]
-                last_layer_bias[-1] = 1.00
-                gate_head_layer_list[-1].bias.data = torch.tensor(last_layer_bias).repeat(num_head)
-        else:
-            gate_head_layer_list = [
-                self._create_linear_layer(
-                    self.input_dim, self.n_dim, bias=False, is_first_layer=True
-                ),
-                nn.LeakyReLU(0.1),
-                self._create_linear_layer(
-                    self.n_dim, len(head_list), bias=False, is_first_layer=False
-                ),
-            ]
-        self.gate_head = nn.Sequential(*gate_head_layer_list)
 
     def add_router_for_skipping(self):
 
@@ -498,34 +464,6 @@ class FlextronRouter(MegatronModule):
 
         return (router_emb_logits, self.config.emb_int_list[choices_emb.item()])
 
-    def head_forward(self, args, budget_tensor, device, dtype, tau, hard_sample):
-
-        router_head_logits1 = self.gate_head[0](budget_tensor)
-        router_head_logits2 = self.gate_head[1](router_head_logits1[0])
-        router_head_logits = self.gate_head[2](router_head_logits2)[0].flatten()
-        # torch.distributed.all_reduce(router_head_logits, group=get_tensor_model_parallel_group(), op=torch.distributed.ReduceOp.AVG)
-        if self.scaler is not None:
-            scale = self.scaler[args.curr_iteration].to(device=device, dtype=dtype)
-        if self.config.flex_hetero_head:
-            head_n = len(self.config.head_int_list)
-            router_head_logits = router_head_logits.reshape(-1, head_n)
-            router_head_logits = scale * router_head_logits
-            router_head_logits = self._dp_gumbel_softmax(
-                router_head_logits, tau=tau, hard=hard_sample, curr_iteration=args.curr_iteration
-            )
-            _, choices_head = torch.topk(router_head_logits, 1, dim=-1)
-            return (
-                router_head_logits,
-                [self.config.head_int_list[i] for i in choices_head.flatten().tolist()],
-            )
-        else:
-            router_head_logits = scale * router_head_logits
-            router_head_logits = self._dp_gumbel_softmax(
-                router_head_logits, tau=tau, hard=hard_sample, curr_iteration=args.curr_iteration
-            )
-            _, choices_head = torch.topk(router_head_logits, 1, dim=-1)
-            return (router_head_logits, self.config.head_int_list[choices_head.item()])
-
     def skipping_forward(self, args, budget_tensor, device, dtype, tau, hard_sample):
 
         # for layer skipping, skipping MLP layers
@@ -648,15 +586,11 @@ class FlextronRouter(MegatronModule):
             skipping_forward_outputs = None
 
         emb_forward_outputs = self.emb_forward(args, budget_tensor, device, dtype, tau, hard_sample)
-        head_forward_outputs = self.head_forward(
-            args, budget_tensor, device, dtype, tau, hard_sample
-        )
         self.fwd_pass_count += 1
         return (
             mlp_forward_outputs,
             skipping_forward_outputs,
             emb_forward_outputs,
             mamba_forward_outputs,
-            head_forward_outputs,
             moe_expert_forward_outputs,
         )

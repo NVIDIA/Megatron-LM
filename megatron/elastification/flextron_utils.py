@@ -155,9 +155,8 @@ class FlextronModelManager:
         flex_moe_expert = flextron_kwargs['router_moe_expert'][0] @ torch.tensor(
             self.config.moe_expert_int_list, dtype=dtype, device=device
         )
-        num_attention_heads = flextron_kwargs['router_head'][0] @ torch.tensor(
-            self.config.head_int_list, dtype=dtype, device=device
-        )
+        # Attention heads are not router-controlled; pass the parent value through.
+        num_attention_heads = self.config.num_attention_heads
 
         if self.config.add_skipping:
             logit_skip_selected = torch.cumsum(flextron_kwargs['router_skip'][0], 0)[:-1]
@@ -188,8 +187,6 @@ class FlextronModelManager:
             flex_ffn_hidden_size = flex_ffn_hidden_size.unsqueeze(-1)
         if not self.config.flex_hetero_mamba and not self.config.add_skipping:
             flex_mamba_num_head = flex_mamba_num_head.unsqueeze(-1)
-        if not self.config.flex_hetero_head and not self.config.add_skipping:
-            num_attention_heads = num_attention_heads.unsqueeze(-1)
         if not self.config.flex_hetero_moe_expert and not self.config.add_skipping:
             flex_moe_expert = flex_moe_expert.unsqueeze(-1)
 
@@ -198,7 +195,11 @@ class FlextronModelManager:
             mamba_num_heads=flex_mamba_num_head.float(),
             mamba_d_head=self.config.mamba_head_dim,
             mamba_d_state=self.config.mamba_state_dim,
-            num_attention_heads=num_attention_heads.float(),
+            num_attention_heads=(
+                num_attention_heads.float()
+                if isinstance(num_attention_heads, torch.Tensor)
+                else num_attention_heads
+            ),
             num_query_groups=self.config.num_query_groups,
             ffn_hidden_size=flex_ffn_hidden_size.float(),
             hidden_size=flex_hidden_size.unsqueeze(-1).float(),
@@ -224,7 +225,11 @@ class FlextronModelManager:
                 mamba_num_heads=flex_mamba_num_head.float(),
                 mamba_d_head=self.config.mamba_head_dim,
                 mamba_d_state=self.config.mamba_state_dim,
-                num_attention_heads=num_attention_heads.float(),
+                num_attention_heads=(
+                    num_attention_heads.float()
+                    if isinstance(num_attention_heads, torch.Tensor)
+                    else num_attention_heads
+                ),
                 num_query_groups=self.config.num_query_groups,
                 ffn_hidden_size=flex_ffn_hidden_size.float(),
                 hidden_size=flex_hidden_size.unsqueeze(-1).float(),
@@ -309,7 +314,7 @@ class FlextronModelManager:
         if self.router is None:
             return {}, None
 
-        (router_mlp, router_skip, router_emb, router_mamba, router_head, router_moe_expert) = (
+        (router_mlp, router_skip, router_emb, router_mamba, router_moe_expert) = (
             self.router(budget_item)
         )
 
@@ -318,7 +323,6 @@ class FlextronModelManager:
             'router_skip': router_skip,
             'router_emb': router_emb,
             'router_mamba': router_mamba,
-            'router_head': router_head,
             'router_moe_expert': router_moe_expert,
         }
 
@@ -333,7 +337,6 @@ class FlextronModelManager:
         router_emb = flextron_kwargs.get('router_emb')
         router_mamba = flextron_kwargs.get('router_mamba')
         router_mlp = flextron_kwargs.get('router_mlp')
-        router_head = flextron_kwargs.get('router_head')
         router_moe_expert = flextron_kwargs.get('router_moe_expert')
         router_skip = flextron_kwargs.get('router_skip')  # General layer skipping
 
@@ -344,7 +347,6 @@ class FlextronModelManager:
                     router_emb=router_emb,
                     router_mamba=router_mamba,
                     router_mlp=router_mlp,
-                    router_head=router_head,
                     router_moe_expert=router_moe_expert,
                     router_skip=router_skip,
                 )

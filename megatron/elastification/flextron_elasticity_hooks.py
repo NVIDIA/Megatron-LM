@@ -16,7 +16,8 @@ import torch.nn as nn
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.utils import split_tensor_along_last_dim
-from megatron.core.transformer.moe.moe_utils import group_limited_topk, get_capacity
+from megatron.core.transformer.moe.moe_utils import get_capacity, group_limited_topk
+
 
 class FlextronMambaElasticityManager:
     """
@@ -1291,7 +1292,6 @@ class FlextronAttentionElasticityManager:
 
         # Current elasticity parameters - store the full router outputs
         self.current_router_emb = None
-        self.current_router_head = None
 
         # Hook handles for cleanup
         self.hook_handles = []
@@ -1308,23 +1308,6 @@ class FlextronAttentionElasticityManager:
         }
         self.emb_masks = torch.stack(mask_list, dim=0).to(device='cuda').to(dtype=torch.bfloat16)
 
-    def _init_head_masks(self):
-        """Initialize attention head masks."""
-        mask_list = []
-        full_dim = self.attention_module.num_attention_heads_per_partition * self.config.kv_channels
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        for head_int in self.config.head_int_list:
-            # head_int is total heads; convert to per-partition dimension
-            num_heads = (head_int // tp_size) * self.config.kv_channels
-            mask_temp = torch.zeros(full_dim, dtype=torch.bool)
-            mask_temp[:num_heads] = True
-            mask_list.append(mask_temp)
-        self.head_masks_lookup = {
-            head_int: idx for idx, head_int in enumerate(self.config.head_int_list)
-        }
-
-        self.head_masks = torch.stack(mask_list, dim=0).to(device='cuda').to(dtype=torch.bfloat16)
-
     def attach_hooks(self, attention_module):
         """Attach hooks to Attention following the original flextron_os pattern."""
         if not self.enabled:
@@ -1338,16 +1321,13 @@ class FlextronAttentionElasticityManager:
         def setup_masks_hook(module, input):
             if self.config.flextron:
                 self._init_embedding_masks()
-                self._init_head_masks()
             return input
 
         # Cleanup hook - runs last to remove masks after forward pass
         def cleanup_masks_hook(module, input, output):
             if self.config.flextron:
                 self.emb_masks = None
-                self.head_masks = None
                 self.emb_masks_lookup = {}
-                self.head_masks_lookup = {}
             return output
 
         # IMPORTANT: Register setup hook FIRST
@@ -1427,47 +1407,6 @@ class FlextronAttentionElasticityManager:
                 return (scaled_output, bias)
             return output
 
-        # Hook 4: Core attention output masking
-        def core_attention_mask_hook(module, input, output):
-            if self.current_router_head is not None:
-                # Apply head masking
-                if self.config.soft_mask:
-                    soft_mask = torch.zeros(
-                        self.head_masks[0].shape,
-                        dtype=torch.bfloat16,
-                        device=self.head_masks[0].device,
-                    )
-                    if self.config.flex_hetero_head:
-                        head_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('*') - 1
-                        )
-                        for mask, per_logit in zip(
-                            self.head_masks, self.current_router_head[0][head_idx]
-                        ):
-                            soft_mask.add_(mask * per_logit)
-                    else:
-                        for mask, per_logit in zip(self.head_masks, self.current_router_head[0]):
-                            soft_mask.add_(mask * per_logit)
-                    mask = soft_mask
-                    masked_output = output * mask[None, None, :]
-                else:
-                    # Hard masking fallback
-                    if hasattr(attention_module, '_flextron_head_per'):
-                        head_per = attention_module._flextron_head_per
-                        router_head_weights = getattr(
-                            attention_module, '_flextron_router_head_weights', None
-                        )
-                        mask = self.head_masks[self.head_masks_lookup[head_per]]
-                        masked_output = output * mask[None, None, :]
-                        if router_head_weights is not None:
-                            masked_output = masked_output * router_head_weights
-                    else:
-                        masked_output = output
-                        mask = None
-
-                return masked_output
-            return output
-
         # Hook 5: Final output masking
         def output_mask_hook(module, input, output):
             if self.config.flextron and self.current_router_emb is not None:
@@ -1514,13 +1453,10 @@ class FlextronAttentionElasticityManager:
         cleanup_handle = attention_module.register_forward_hook(cleanup_masks_hook)
         self.hook_handles.append(cleanup_handle)
 
-    def set_elasticity_params(self, router_emb=None, router_head=None, **kwargs):
+    def set_elasticity_params(self, router_emb=None, **kwargs):
         """Set current elasticity parameters that will be used by hooks."""
         if router_emb is not None:
             self.current_router_emb = router_emb
-
-        if router_head is not None:
-            self.current_router_head = router_head
 
     def detach_hooks(self):
         """Remove all hooks."""

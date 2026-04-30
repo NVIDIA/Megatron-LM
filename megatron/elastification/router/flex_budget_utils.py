@@ -37,10 +37,12 @@ def get_num_parameters(
     else:
         flex_hetero_mamba = mamba_num_heads.shape[0] != 1
 
+    # Per-layer attention head counts arise only from layer skipping; head
+    # elasticity itself is no longer supported.
     if isinstance(num_attention_heads, int):
-        flex_hetero_head = False
+        per_layer_attn_heads = False
     else:
-        flex_hetero_head = num_attention_heads.shape[0] != 1
+        per_layer_attn_heads = num_attention_heads.shape[0] != 1
 
     if isinstance(num_experts, int):
         flex_hetero_moe_expert = False
@@ -87,7 +89,7 @@ def get_num_parameters(
         moe_active = pre_mlp_ln + linear_fc1_active + linear_fc2_active
 
     # ATT
-    if flex_hetero_head:
+    if per_layer_attn_heads:
         att = []
         for i in range(num_attention_heads.shape[0]):
             input_ln = norm_multiplier * hidden_size
@@ -144,7 +146,7 @@ def get_num_parameters(
                 all_params += mamba_params(mamba_num_heads)
                 active_params += mamba_params(mamba_num_heads)
         elif c == '*':
-            if flex_hetero_head:
+            if per_layer_attn_heads:
                 head_idx = hybrid_pattern[: i + 1].count('*') - 1
                 all_params += att[head_idx]
                 active_params += att[head_idx]
@@ -180,20 +182,20 @@ def get_kv_cache_size(
     mem_batch_size: int = 0,
 ) -> Union[int, torch.Tensor]:
 
+    # Per-layer attention head counts arise only from layer skipping; head
+    # elasticity itself is no longer supported.
     if isinstance(num_attention_heads, int):
-        flex_hetero_head = False
+        per_layer_attn_heads = False
     else:
-        flex_hetero_head = num_attention_heads.shape[0] != 1
+        per_layer_attn_heads = num_attention_heads.shape[0] != 1
 
-    if flex_hetero_head:
+    if per_layer_attn_heads:
         kv_cache_size = 0
         head_idx = 0
 
         for c in hybrid_pattern:
             if c == '*':
-                current_heads = (
-                    num_attention_heads[head_idx] if flex_hetero_head else num_attention_heads
-                )
+                current_heads = num_attention_heads[head_idx]
 
                 kv_cache_size_per_layer = (
                     2.0

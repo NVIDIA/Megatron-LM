@@ -60,7 +60,6 @@ class FlextronConfig:
     # ── Force overrides (eval / frozen-router mode) ───────────────────────────
     force_router_skip: Optional[List[int]] = None
     force_mlp: Optional[List[float]] = None
-    force_head: Optional[List[float]] = None
     force_mamba: Optional[List[float]] = None
     force_emb: Optional[List[float]] = None
 
@@ -68,18 +67,15 @@ class FlextronConfig:
     mamba_per_list: Optional[List[float]] = None
     mlp_per_list: Optional[List[float]] = None
     emb_per_list: Optional[List[float]] = None
-    head_per_list: Optional[List[float]] = None
     moe_expert_per_list: Optional[List[float]] = None
     mamba_int_list: Optional[List[int]] = None
     mlp_int_list: Optional[List[int]] = None
     emb_int_list: Optional[List[int]] = None
-    head_int_list: Optional[List[int]] = None
     moe_expert_int_list: Optional[List[int]] = None
 
     # ── Heterogeneous per-layer routing ───────────────────────────────────────
     flex_hetero_ffn: bool = False
     flex_hetero_mamba: bool = False
-    flex_hetero_head: bool = False
     flex_hetero_moe_expert: bool = False
 
     # ── Memory / inference sizing ─────────────────────────────────────────────
