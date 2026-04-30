@@ -24,7 +24,9 @@ import tempfile
 from collections import OrderedDict
 from types import SimpleNamespace
 
+import pytest
 import torch
+import torch.distributed as dist
 
 # Make the conversion tool importable under both `python <file>` and `pytest`.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,6 +35,34 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, 'tools', 'checkpoint'))
 sys.path.insert(0, _THIS_DIR)
 
 from gpt_mamba_conversion import main as conversion_main
+
+
+# These scenarios are SYNTHETIC and single-rank by design: each one writes a
+# tiny synthetic DCP checkpoint and round-trips it through the converter on
+# rank 0. They share the default torch.distributed process group with whatever
+# harness launched pytest. When that default PG is multi-rank (e.g. Megatron's
+# CI/CD initialises NCCL with world_size>1 before pytest collection), the
+# dcp.save/dcp.load collectives stall: each rank has its own
+# tempfile.mkdtemp() path and its own torch.randn() tensors, so the metadata
+# coordination across ranks never converges and the NCCL watchdog kills the
+# job after 10 minutes (see ProcessGroupNCCL ALLGATHER timeout).
+#
+# Multi-rank coverage lives in test_distributed_round_trip.py, which uses a
+# fresh single-rank gloo subgroup per scenario via SLURM/srun in
+# run_slurm_ckpt_convert_tests.sh. Skip these synthetic tests whenever the
+# default PG is already multi-rank.
+@pytest.fixture(autouse=True)
+def _skip_when_multi_rank_pg():
+    if (
+        dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    ):
+        pytest.skip(
+            "Synthetic single-rank tests skipped under a multi-rank default "
+            "process group; multi-rank coverage is in "
+            "test_distributed_round_trip.py."
+        )
 
 # ---------------------------------------------------------------------------
 # Synthetic-checkpoint helpers
