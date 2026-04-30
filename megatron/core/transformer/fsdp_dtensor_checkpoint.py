@@ -291,7 +291,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
         view_shape = list(data.shape)
         view_shape[swiglu_shard_axis] = -1
-        local_tensor = data.to_local()
+        local_tensor = data.to_local() if isinstance(data, DTensor) else data
         weight_w = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
@@ -339,7 +339,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             if not _key_in_glu_layer(key):
                 _swiglu_skip_count += 1
                 continue
-            dist_param = model.get_parameter(f"module.{key}")
+            dist_param = model.get_parameter(key)
             weight_w, weight_v = split_swiglu_linear_fc1(
                 model_state_dict[key],
                 dist_param,
@@ -365,6 +365,14 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             opt_state_dict = optimizer_state_dict["state"]
             new_opt_state_dict = {}
             for key in list(opt_state_dict.keys()):
+                # Note: unwrap_model returns the original (unwrapped) model.
+                # However, keys in opt_state_dict contain three "module." prefixes due to nested wrapping,
+                # whereas model.state_dict keys follow the native (unwrapped) format.
+                #
+                # opt_state_dict key example:
+                #   "module.module.module.language_model.decoder.layers.0.mlp.experts.linear_fc2.weight0"
+                # model.state_dict key example:
+                #   "language_model.decoder.layers.0.mlp.experts.linear_fc2.weight0"
                 if not is_swiglu_key(key) or not _key_in_glu_layer(key):
                     new_opt_state_dict[key] = opt_state_dict[key]
                     continue
@@ -372,7 +380,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
                     dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
+                        expert_param_local_key(_strip_wrappers(key), num_experts)
                     )
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
@@ -471,7 +479,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         total_split = sum(split_sizes)
         elems_per_unit = data_size // total_split
 
-        local_tensor = data.to_local()
+        local_tensor = data.to_local() if isinstance(data, DTensor) else data
         view_shape = list(data.shape)
 
         per_tp_rank_shape = list(data.shape)
@@ -519,7 +527,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if match is None:
             continue
         sizes, names, dim = match
-        dist_param = model.get_parameter(f"module.{key}")
+        dist_param = model.get_parameter(f"{key}")
         sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
@@ -547,7 +555,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module.") :])
+                    dist_param = model.get_parameter(_strip_wrappers(key))
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor

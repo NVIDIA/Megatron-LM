@@ -1061,6 +1061,12 @@ class TransformerConfig(ModelParallelConfig):
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
 
+    mrope_interleaved: bool = False
+    """When True, use the interleaved T/H/W MRoPE layout (Qwen3.5-VL style) where
+    H freqs occupy stride-3 positions {1,4,7,...} and W freqs occupy {2,5,8,...}.
+    When False (default), use the original section-based layout (Qwen2-VL style)
+    that cycles through T/H/W per mrope_section chunk."""
+
     is_hybrid_model: bool = False
     """ Indicates whether this is a hybrid model. """
 
