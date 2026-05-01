@@ -53,7 +53,6 @@ def _count_local_tokens_kernel(
     num_local_experts: tl.constexpr,  # number of experts on this rank
     num_sms,  # number of SMs (grid size for persistent kernel)
     BLOCK_SIZE: tl.constexpr,  # number of pairs processed per iteration
-    HIST_BINS: tl.constexpr,  # next power-of-2 >= num_local_experts + 1
 ):
     """Count tokens routed to local experts using a persistent grid.
 
@@ -70,7 +69,6 @@ def _count_local_tokens_kernel(
 
     if block_start < total_blocks:
         block_end = tl.minimum(block_start + blocks_per_cta, total_blocks)
-        expert_offs = tl.arange(0, HIST_BINS)
 
         for block_id in tl.range(block_start, block_end):
             offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -78,12 +76,7 @@ def _count_local_tokens_kernel(
             expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
             local_ids = expert_ids - local_expert_start
             is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
-            # Bin non-local pairs into a garbage slot so histogram ignores them.
-            safe_ids = tl.where(is_local, local_ids, num_local_experts)
-            hist = tl.histogram(safe_ids, HIST_BINS)
-            tl.atomic_add(
-                tokens_per_expert_ptr + expert_offs, hist, mask=expert_offs < num_local_experts
-            )
+            tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
 
 
 def compute_local_tokens_per_expert(
@@ -106,7 +99,6 @@ def compute_local_tokens_per_expert(
     tokens_per_expert = torch.zeros(num_local_experts, dtype=torch.int32, device=routing_map.device)
     BLOCK = 1024
     num_sms = _get_num_sms(routing_map.device)
-    hist_bins = triton.next_power_of_2(num_local_experts + 1)
     _count_local_tokens_kernel[(num_sms,)](
         routing_map,
         tokens_per_expert,
@@ -116,7 +108,6 @@ def compute_local_tokens_per_expert(
         num_local_experts,
         num_sms,
         BLOCK_SIZE=BLOCK,
-        HIST_BINS=hist_bins,
     )
     return tokens_per_expert
 
