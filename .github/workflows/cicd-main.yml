@@ -544,15 +544,6 @@ jobs:
           python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
           echo "::endgroup::"
 
-      - name: Install GH CLI
-        shell: bash
-        run: |
-          for i in 1 2 3; do
-            apt-get update && apt-get install -y gh && break
-            echo "apt attempt $i failed, retrying..."
-            sleep 10
-          done
-
       - name: Get last merged PR
         id: cache_from
         env:
