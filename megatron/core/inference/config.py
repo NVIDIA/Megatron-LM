@@ -272,6 +272,13 @@ class InferenceConfig:
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
     block boundaries are cached and reused across requests with matching prefixes."""
 
+    enable_async_scheduling: bool = False
+    """If True, allow forward[N+1] to launch in parallel with bookkeeping[N] on
+    decode-only steps via a side CUDA stream for the sample D2H (the same
+    overlap pattern vLLM v1 uses). Initial scope: decode-only, no speculative
+    MTP, no hybrid (Mamba) models. Those configurations are rejected at engine
+    construction when this flag is True."""
+
     # =================================
     # Logging config
     # =================================
@@ -320,3 +327,15 @@ class InferenceConfig:
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+        if self.enable_async_scheduling:
+            if self.num_speculative_tokens > 0:
+                raise ValueError(
+                    "enable_async_scheduling is incompatible with speculative MTP "
+                    f"(num_speculative_tokens={self.num_speculative_tokens}). "
+                    "Initial async-scheduling scope is decode-only, non-speculative."
+                )
+            if self.mamba_inference_state_config is not None:
+                raise ValueError(
+                    "enable_async_scheduling is incompatible with hybrid (Mamba) "
+                    "models. Initial async-scheduling scope excludes hybrid models."
+                )

@@ -215,6 +215,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 model_config.mtp_use_repeated_layer
                 or self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
+        self.enable_async_scheduling = inference_config.enable_async_scheduling
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill

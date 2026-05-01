@@ -6,46 +6,45 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.argument_utils import ArgumentGroupFactory
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
-
-from megatron.training.argument_utils import ArgumentGroupFactory
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -336,8 +335,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -664,8 +664,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -1992,6 +1994,12 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--enable-async-scheduling',
+                       dest='enable_async_scheduling',
+                       action='store_true', default=False,
+                       help='Allow forward[N+1] to launch in parallel with '
+                            'bookkeeping[N] on decode-only steps. Initial scope: '
+                            'decode-only, no speculative MTP, no hybrid models.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
@@ -2512,8 +2520,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -3375,7 +3382,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
