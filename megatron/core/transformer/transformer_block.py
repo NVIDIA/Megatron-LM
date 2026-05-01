@@ -279,9 +279,7 @@ def checkpoint_with_recipe(
             pg_collection.tp,
             *args,
         )
-    return tensor_parallel.checkpoint(
-        forward_func, config.distribute_saved_activations, *args
-    )
+    return tensor_parallel.checkpoint(forward_func, config.distribute_saved_activations, *args)
 
 
 def iterate_recompute_layers(

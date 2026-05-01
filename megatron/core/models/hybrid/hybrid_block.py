@@ -233,9 +233,7 @@ class HybridStack(MegatronModule):
         """
 
         def custom(start: int, end: int):
-            def custom_forward(
-                hidden_states, attention_mask, rotary_pos_emb, padding_mask
-            ):
+            def custom_forward(hidden_states, attention_mask, rotary_pos_emb, padding_mask):
                 for index in range(start, end):
                     layer = self.layers[index]
 
@@ -283,9 +281,7 @@ class HybridStack(MegatronModule):
             cf = custom(start, end)
             args = (hidden_states, attention_mask, rotary_pos_emb, padding_mask)
             if use_checkpoint:
-                hidden_states = checkpoint_with_recipe(
-                    cf, self.config, self.pg_collection, *args
-                )
+                hidden_states = checkpoint_with_recipe(cf, self.config, self.pg_collection, *args)
             else:
                 hidden_states = cf(*args)
 
