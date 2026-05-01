@@ -14,10 +14,12 @@ from megatron.core.ssm.mamba_mixer import _split_tensor_factory as mamba_split_t
 
 
 @pytest.mark.parametrize(
-    "factory_fn", [gated_delta_split_tensor_factory, mamba_split_tensor_factory]
+    "factory_fn",
+    [gated_delta_split_tensor_factory, mamba_split_tensor_factory],
+    ids=["gated_delta_net", "mamba_mixer"],
 )
 @pytest.mark.internal
-def test_split_tensor_factory_oom_is_handled(factory_fn, caplog):
+def test_ssm_split_tensor_factory_oom_is_handled(factory_fn, caplog):
     original_sh_ten = ShardedTensor.from_rank_offsets(
         'a', torch.arange(12, dtype=torch.float32).reshape(6, 2), (0, 0, 1)
     )
