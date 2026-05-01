@@ -309,6 +309,95 @@ class DynamicInferenceEngine(AbstractEngine):
         # Coordinator state.
         self.use_coordinator = False
 
+        # Async-scheduling pipeline state. When `_async_scheduling_active()` is
+        # True, `_async_step()` keeps a one-iteration-deep pipeline: this
+        # iteration's bookkeeping runs in parallel with the next iteration's
+        # forward+sample GPU work. The pending state holds the prior step's
+        # launched output until its bookkeeping runs.
+        self._async_pending_step_state: Optional[Dict] = None
+        self._async_pending_context_state: Optional[Dict] = None
+        self._async_pending_step_time: float = 0.0
+
+        # Side CUDA stream + event + pinned host buffer for the sample D2H.
+        # When async-scheduling is active, the D2H of sample[N] runs on
+        # `_sample_d2h_stream` after the sample kernel finishes on the
+        # default stream. CPU returns to the caller without waiting; the
+        # next iter calls `_sample_d2h_event.synchronize()` only when it
+        # actually needs to read the values, which by then are typically
+        # already in `_sample_d2h_pinned` because the GPU was busy running
+        # forward[N+1] kernels in the meantime. Same pattern vLLM v1 uses
+        # in `AsyncGPUModelRunnerOutput`.
+        self._sample_d2h_stream: Optional[torch.cuda.Stream] = None
+        self._sample_d2h_event: Optional[torch.cuda.Event] = None
+        self._sample_d2h_pinned: Optional[torch.Tensor] = None
+
+    def _async_scheduling_active(self) -> bool:
+        """Predicate: should this step use the async-scheduling overlap path?
+
+        Async scheduling overlaps GPU forward[N] kernels with CPU bookkeep[N-1]
+        work via a side CUDA stream for the sample D2H. Eligibility:
+        - User opted in via `enable_async_scheduling` config.
+        - Step is decode-only (initial scope; prefill admits new requests
+          which the deferred-bookkeeping path doesn't handle).
+        - num_speculative_tokens == 0 (initial scope; the intra-step
+          verify/rewind path interferes with the overlap design).
+        Hybrid (Mamba) is rejected at config-time, so no runtime check.
+        """
+        return (
+            self.enable_async_scheduling
+            and self.context.is_decode_only()
+            and self.num_speculative_tokens == 0
+        )
+
+    def _ensure_async_overlap_resources(self) -> None:
+        """Lazy-init the side stream, event, and pinned host buffer used by
+        the async-scheduling overlap path. Idempotent."""
+        if self._sample_d2h_stream is None:
+            self._sample_d2h_stream = torch.cuda.Stream()
+            self._sample_d2h_event = torch.cuda.Event()
+            self._sample_d2h_pinned = torch.empty(
+                self.context.max_requests, dtype=torch.int64, device='cpu', pin_memory=True
+            )
+
+    def _build_async_pre_step_context_state(self, will_log_this_step: bool) -> Dict:
+        """Snapshot fields `async_bookkeep` reads from `pre_step_context_state`."""
+        if will_log_this_step:
+            return {
+                "is_decode_only": self.context.is_decode_only(),
+                "max_requests": self.context.max_requests,
+                "total_request_count": self.context.total_request_count,
+                "paused_request_count": self.context.paused_request_count,
+                "active_token_count": self.context.active_token_count,
+                "step_count": self.context.step_count,
+            }
+        return {
+            "active_token_count": self.context.active_token_count,
+            "step_count": self.context.step_count,
+        }
+
+    def _build_async_context_state(
+        self, pre_step_context_state: Dict, will_log_this_step: bool
+    ) -> Dict:
+        """Combine pre-step fields with post-step engine fields."""
+        if will_log_this_step:
+            kvcache_util_stats = (
+                self.context.get_kvcache_utilization_stats()
+                if self.metrics_writer is not None
+                else None
+            )
+            post = {
+                "waiting_request_count": len(self.waiting_request_ids),
+                "finished_request_count": self.finished_request_count,
+                "evicted_request_count": self.evicted_request_count,
+                "kv_stats": kvcache_util_stats,
+                "total_active_block_count": self.context.kv_block_allocator.active_count,
+                "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+                "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+            }
+            return {**pre_step_context_state, **post}
+        return {**pre_step_context_state, "kv_stats": None}
+
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
 
