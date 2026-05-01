@@ -1065,7 +1065,13 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
+    # Determine hidden dimension for P2P communication
+    # For hyper connections with multiple PP stages, use n-stream dimension
     hidden_dim = config.hidden_size
+    if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
+        # For interleaved PP with hyper connections, all intermediate communications use n-stream
+        # Note: This is a simplified approach - proper VPP support may need more complex logic
+        hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
@@ -2039,13 +2045,6 @@ def get_tensor_shapes(
 
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
-
-    if (
-        getattr(config, 'enable_hyper_connections', False)
-        and getattr(config, 'pipeline_model_parallel_size', 1) > 1
-        and pp_group is None
-    ):
-        raise ValueError("pp_group must be provided when enable_hyper_connections=True")
 
     # Determine hidden dimension based on hyper connections and pipeline stage.
     #
