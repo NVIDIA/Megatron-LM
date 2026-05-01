@@ -14,8 +14,7 @@ from megatron.core.ssm.mamba_mixer import _split_tensor_factory as mamba_split_t
 
 
 @pytest.mark.parametrize(
-    "factory_fn",
-    [gated_delta_split_tensor_factory, mamba_split_tensor_factory],
+    "factory_fn", [gated_delta_split_tensor_factory, mamba_split_tensor_factory]
 )
 @pytest.mark.internal
 def test_split_tensor_factory_oom_is_handled(factory_fn, caplog):
