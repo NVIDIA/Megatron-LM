@@ -3,14 +3,15 @@ import torch
 
 from megatron.core.models.huggingface import HuggingFaceModule
 
-# Nemo model loading is very slow so do this global thing to cache it.
-_NEMO_SOUND_MODEL_SINGLETON = None
+# NeMo model loading is slow, so cache the (preprocessor, encoder) tuple per
+# `sound_model_type`. Keying by model id avoids returning a stale cached encoder
+# when the same process constructs more than one Parakeet variant.
+_NEMO_SOUND_MODEL_CACHE: dict[str, tuple] = {}
 
 
 def get_nemo_sound_model(sound_model_type):
     """Load (and cache) a NeMo ASR encoder + preprocessor for the given ``nemo://`` model id."""
-    global _NEMO_SOUND_MODEL_SINGLETON
-    if _NEMO_SOUND_MODEL_SINGLETON is None:
+    if sound_model_type not in _NEMO_SOUND_MODEL_CACHE:
         import nemo.collections.asr as nemo_asr
 
         asr_model = nemo_asr.models.ASRModel.from_pretrained(
@@ -20,8 +21,8 @@ def get_nemo_sound_model(sound_model_type):
         asr_model.encoder.sync_max_audio_length = False
         for layer in asr_model.encoder.layers:
             layer.self_attn.use_pytorch_sdpa = True
-        _NEMO_SOUND_MODEL_SINGLETON = (asr_model.preprocessor, asr_model.encoder)
-    return _NEMO_SOUND_MODEL_SINGLETON
+        _NEMO_SOUND_MODEL_CACHE[sound_model_type] = (asr_model.preprocessor, asr_model.encoder)
+    return _NEMO_SOUND_MODEL_CACHE[sound_model_type]
 
 
 class ParakeetHuggingFaceModel(HuggingFaceModule):
@@ -63,6 +64,16 @@ class ParakeetHuggingFaceModel(HuggingFaceModule):
         else:
             raise ValueError(f"Unknown sound model type: {config.sound_model_type}")
 
+    def _model_dtype(self) -> torch.dtype:
+        """Return the dtype of the encoder's first parameter (defaults to bf16)."""
+        for param in self.model.parameters():
+            return param.dtype
+        return torch.bfloat16
+
+    def _sampling_rate(self) -> int:
+        """Return the sampling rate the feature extractor expects (default 16 kHz)."""
+        return int(getattr(self.feature_extractor, "sampling_rate", 16000))
+
     def forward(self, *args, **kwargs):
         """Forward pass returning (hidden_states, lengths).
 
@@ -83,9 +94,9 @@ class ParakeetHuggingFaceModel(HuggingFaceModule):
                 sound_clips,
                 **kwargs,
                 return_tensors="pt",
-                sampling_rate=16000,
+                sampling_rate=self._sampling_rate(),
                 return_attention_mask=True,
             )
-            y = self.model(features.input_features.to(torch.bfloat16), features.attention_mask)
+            y = self.model(features.input_features.to(self._model_dtype()), features.attention_mask)
             lengths = features.attention_mask.sum(dim=-1).to(y.last_hidden_state.device)
             return y.last_hidden_state, lengths
