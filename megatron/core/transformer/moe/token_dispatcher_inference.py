@@ -62,7 +62,7 @@ class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
     # Computed as local_tokens * ep_size to avoid a device-to-host sync (which
     # would break CUDA graph capture).  This may differ from _valid_tokens_tensor
     # when ranks have unequal token counts.
-    _host_valid_tokens_estimate_estimate: Optional[int] = None
+    _host_valid_tokens_estimate: Optional[int] = None
 
     def __init__(self, *args, runs_metadata_sync: bool = True, **kwargs) -> None:
         super().__init__(*args, **kwargs)
