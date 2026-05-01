@@ -1465,8 +1465,7 @@ def validate_args(args, defaults={}):
             # via `--data-parallel-sharding-strategy`). Layering
             # `LayerWiseDistributedOptimizer` on top would double-shard and,
             # in practice, trips `TypeErrors` in its constructor call from
-            # `_build_megatron_fsdp_emerging_optimizer`. The M-FSDP factory
-            # already handles the "distributed" part via `FSDPMuonChainedOptimizer`.
+            # `_build_megatron_fsdp_emerging_optimizer`.
             if not args.use_megatron_fsdp:
                 args.use_layer_wise_distributed_optimizer = True
                 args.use_distributed_optimizer = False
@@ -1475,10 +1474,6 @@ def validate_args(args, defaults={}):
         if args.use_megatron_fsdp:
             assert args.optimizer == "muon", (
                 "Emerging optimizer with Megatron-FSDP is currently only supported for Muon."
-            )
-            assert args.outer_dp_sharding_strategy == "no_shard", (
-                "Emerging optimizer with Megatron-FSDP does not support HSDP "
-                "(--outer-dp-sharding-strategy != no_shard) yet."
             )
             # Megatron-FSDP itself requires `fsdp_dtensor` (asserted above), so
             # the emerging-optimizer path must accept it here to avoid a

@@ -7,7 +7,7 @@ try:
     from transformers import AutoTokenizer
 
     HAVE_TRANSFORMERS = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     HAVE_TRANSFORMERS = False
 
 from megatron.core.utils import log_single_rank

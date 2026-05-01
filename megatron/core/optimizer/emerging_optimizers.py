@@ -162,67 +162,6 @@ _EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 
 
 # ===========================================================================
-# Megatron-FSDP integration
-# ===========================================================================
-
-
-def _get_mfsdp_models(model_chunks):
-    """Extract list of MegatronFSDP instances from FSDP-wrapped model chunks."""
-    mfsdp_models = []
-    for chunk in model_chunks:
-        # FullyShardedDataParallel delegates finish_grad_sync / start_param_sync
-        # from its .module (MegatronFSDP). install_optimized_model_weights lives
-        # directly on MegatronFSDP, so we need the inner module reference.
-        if hasattr(chunk, "finish_grad_sync") and hasattr(chunk, "module"):
-            mfsdp_models.append(chunk.module)
-    if not mfsdp_models:
-        raise RuntimeError(
-            "Could not find any MegatronFSDP instances in model_chunks. "
-            "Ensure the model is wrapped with FullyShardedDataParallel."
-        )
-    return mfsdp_models
-
-
-class FSDPMuonChainedOptimizer:
-    """Thin FSDP-protocol adapter wrapping a Muon-based MegatronOptimizer.
-
-    Injects the MegatronFSDP step contract around the inner optimizer:
-      1. `finish_grad_sync()` – waits for async grad sync, attaches grads
-         (allreduces for `no_shard`; reduce-scatters for ZeRO-1/2/3).
-      2. `inner_optimizer.step()` – Muon NS + weight update + Adam.
-      3. `install_optimized_model_weights()` – copies fp32 main weights
-         back into the model's bf16 (sharded for ZeRO-3) buffer.
-
-    All other attribute accesses are delegated to the inner optimizer via
-    `__getattr__`, making this class transparent to the training loop.
-    """
-
-    def __init__(self, inner: Any, mfsdp_models: list) -> None:
-        # Use object.__setattr__ to avoid triggering our own __getattr__ during init.
-        object.__setattr__(self, "inner", inner)
-        object.__setattr__(self, "_mfsdp_models", mfsdp_models)
-
-    @torch.no_grad()  # type: ignore[misc]
-    def step(self) -> Any:
-        """FSDP-aware optimizer step: sync grads -> inner step -> install weights."""
-        for mfsdp in self._mfsdp_models:
-            if not mfsdp.model_auto_sync:
-                mfsdp.finish_grad_sync()
-        result = self.inner.step()
-        for mfsdp in self._mfsdp_models:
-            mfsdp.install_optimized_model_weights()
-        return result
-
-    def zero_grad(self, set_to_none: bool = True) -> None:
-        """Zero optimizer gradients. FSDP grad buffer is zeroed by the training loop."""
-        self.inner.zero_grad(set_to_none)
-
-    def __getattr__(self, name: str) -> Any:
-        """Delegate all other attribute accesses to the inner optimizer."""
-        return getattr(object.__getattribute__(self, "inner"), name)
-
-
-# ===========================================================================
 # Muon
 # ===========================================================================
 
@@ -352,14 +291,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return grad
 
 
-class FSDPZeROTensorParallelMuon(TensorParallelMuon):
-    """`TensorParallelMuon` extended for Megatron-FSDP ZeRO-1/2/3.
+class FSDPTensorParallelMuon(TensorParallelMuon):
+    """TensorParallelMuon for Megatron-FSDP ZeRO-1/2/3.
 
-    Megatron-FSDP shards a flat parameter buffer across DP ranks. Most 2D
-    parameters are either fully local on one rank or empty on the others; only
-    rank-boundary parameters are split across two ranks. Muon needs the full
-    matrix for Newton-Schulz, so this class gathers only those boundary
-    parameters and runs local NS for fully-local parameters.
+    M-FSDP shards parameters unevenly across DP ranks; params split at rank
+    boundaries must be gathered before Newton-Schulz orthogonalization. Fully
+    local params are orthogonalized without any collective.
     """
 
     def __init__(
@@ -368,6 +305,10 @@ class FSDPZeROTensorParallelMuon(TensorParallelMuon):
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
         **kwargs: Any,
     ) -> None:
+        assert _HAVE_DTENSOR, (
+            "[Megatron-FSDP] torch.distributed.tensor.DTensor "
+            f"is required to use {type(self).__name__}."
+        )
         self.dp_group = dp_group
         super().__init__(params, **kwargs)
 
@@ -375,42 +316,97 @@ class FSDPZeROTensorParallelMuon(TensorParallelMuon):
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
         """Muon step for Megatron-FSDP ZeRO-1/2/3.
 
-        Ranks must enter collectives in the same order, so local boundary
-        decisions are unioned across the DP group before the parameter loop.
+        Separates collective (AG) and local (NS) work into three phases so that
+        no rank is blocked waiting on another rank computing NS to reach AG:
+          1. Compute momentum updates locally for all params.
+          2. All-gather boundary params — all collectives, no NS interleaved.
+          3. Newton-Schulz + weight update locally for all params.
         """
-        if closure is None:
-            loss = None
-        else:
-            loss = closure()
+        loss = None if closure is None else closure()
 
+        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
+            for group in self.param_groups:
+                self._init_group(group, skip_non_grad_params=False)
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    self._local_muon_update(p, p.grad, group)
+            return loss
+
+        # (param, pre_ns_grad, is_gathered, lr, group_kwargs)
+        all_updates: list = []
+
+        # Phase 1: Compute momentum updates (fully local).
         for group in self.param_groups:
             self._init_group(group, skip_non_grad_params=False)
             gather_param_indices = self._get_boundary_gather_param_indices(group)
+            lr = group["lr"]
+            group_kwargs = {k: v for k, v in group.items() if k != "params"}
 
             for param_idx, p in enumerate(group["params"]):
-                self._muon_step_one(p, group, gather_full=param_idx in gather_param_indices)
+                p_local = p.to_local()
+                needs_gather = param_idx in gather_param_indices
+                if p_local.numel() == 0 and not needs_gather:
+                    continue
+
+                state = self.state[p]
+                mom_local = state["momentum_buffer"].to_local()
+
+                grad = p.grad
+                local_grad = grad.to_local() if grad is not None else torch.zeros_like(mom_local)
+
+                self._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
+                mom_local.lerp_(local_grad, 1 - group["momentum"])
+                if self.nesterov:
+                    pre_ns_grad = local_grad.lerp(mom_local, group["momentum"])
+                else:
+                    pre_ns_grad = mom_local
+
+                all_updates.append((p, pre_ns_grad, needs_gather, lr, group_kwargs))
+
+        # Phase 2: AG all boundary params — all collectives here, no NS interleaved.
+        for i, (p, pre_ns_grad, needs_gather, lr, group_kwargs) in enumerate(all_updates):
+            if not needs_gather:
+                continue
+            if gather_uneven_dtensor_to_full_tensor is None:
+                raise RuntimeError(
+                    "Megatron-FSDP `gather_uneven_dtensor_to_full_tensor` is required "
+                    "to gather un-evenly sharded parameters for Muon step()."
+                )
+            pre_ns_grad_dtensor = self._dtensor_from_local_like(p, pre_ns_grad.contiguous())
+            full_pre_ns_grad = gather_uneven_dtensor_to_full_tensor(pre_ns_grad_dtensor).to_local()
+            all_updates[i] = (p, full_pre_ns_grad, True, lr, group_kwargs)
+
+        # Phase 3: NS orthogonalization and weight update (fully local).
+        from emerging_optimizers import utils
+
+        with utils.fp32_matmul_precision(self.fp32_matmul_prec):
+            for p, pre_ns_grad, is_gathered, lr, group_kwargs in all_updates:
+                p_local = p.to_local()
+                if is_gathered:
+                    orth_update = super(FSDPTensorParallelMuon, self).orthogonalize(
+                        p, pre_ns_grad, **group_kwargs
+                    )
+                    sharded_update = self._reshard_full_update_like(p, orth_update)
+                    self.pre_weight_update_fn_inplace(p, sharded_update)
+                    p.add_(sharded_update, alpha=-lr)
+                    self.post_weight_update_fn_inplace(p)
+                else:
+                    orth_update = (
+                        super(FSDPTensorParallelMuon, self)
+                        .orthogonalize(p, pre_ns_grad, **group_kwargs)
+                        .to(dtype=p_local.dtype)
+                    )
+                    self.pre_weight_update_fn_inplace(p_local, orth_update)
+                    p_local.add_(orth_update, alpha=-lr)
+                    self.post_weight_update_fn_inplace(p_local)
 
         return loss
 
-    def _as_dtensor(self, value: Any):
-        """Return `value` or `value.data` when either is a DTensor."""
-        if not _HAVE_DTENSOR:
-            return None
-        if isinstance(value, _DTensor):
-            return value
-        data = getattr(value, "data", None)
-        if isinstance(data, _DTensor):
-            return data
-        return None
-
-    def _is_nonempty_dtensor_param(self, param: torch.Tensor) -> bool:
-        dtensor = self._as_dtensor(param)
-        return dtensor is not None and dtensor.to_local().numel() > 0
-
-    def _needs_boundary_gather(self, param: torch.Tensor) -> bool:
-        dtensor = self._as_dtensor(param)
-        if dtensor is None:
-            return False
+    def _needs_boundary_gather(self, dtensor: torch.Tensor) -> bool:
+        assert isinstance(
+            dtensor, _DTensor
+        ), f"Detected non-DTensor during {type(self).__name__}: {dtensor}"
         local_tensor = dtensor.to_local()
         return local_tensor.numel() > 0 and tuple(dtensor.shape) != tuple(local_tensor.shape)
 
@@ -464,75 +460,6 @@ class FSDPZeROTensorParallelMuon(TensorParallelMuon):
         )
         local_update = full_update[slices].contiguous().to(dtype=value.to_local().dtype)
         return self._dtensor_from_local_like(value, local_update)
-
-    @torch.no_grad()  # type: ignore[misc]
-    def _muon_step_one(
-        self, p: torch.Tensor, group: Dict[str, Any], gather_full: bool = False
-    ) -> None:
-        """Per-param Muon update that participates in DP collectives on every rank."""
-        # Fall back to the plain parent step for the single-rank / unsharded case.
-        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
-            if p.grad is None:
-                return
-            return self._local_muon_update(p, p.grad, group)
-
-        value = self._as_dtensor(p)
-        if value is None:
-            if p.grad is None:
-                return
-            return self._local_muon_update(p, p.grad, group)
-
-        p_local = value.to_local()
-        if p_local.numel() == 0 and not gather_full:
-            return
-
-        state = self.state[p]
-        mom_buffer = state["momentum_buffer"]
-        mom_dtensor = self._as_dtensor(mom_buffer)
-        mom_local = mom_dtensor.to_local() if mom_dtensor is not None else mom_buffer
-
-        grad = p.grad
-        if grad is None:
-            local_grad = torch.zeros_like(mom_local)
-        else:
-            grad_dtensor = self._as_dtensor(grad)
-            local_grad = grad_dtensor.to_local() if grad_dtensor is not None else grad
-
-        lr = group["lr"]
-        self._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
-
-        mom_local.lerp_(local_grad, 1 - group["momentum"])
-        if self.nesterov:
-            update_local = local_grad.lerp(mom_local, group["momentum"])
-        else:
-            update_local = mom_local
-
-        from emerging_optimizers import utils
-
-        with utils.fp32_matmul_precision(self.fp32_matmul_prec):
-            group_kwargs = {k: v for k, v in group.items() if k != "params"}
-            if gather_full:
-                if gather_uneven_dtensor_to_full_tensor is None:
-                    raise RuntimeError("DTensor support is required for Megatron-FSDP Muon.")
-                update_dtensor = self._dtensor_from_local_like(value, update_local.contiguous())
-                full_update = gather_uneven_dtensor_to_full_tensor(update_dtensor).to_local()
-                orth_full_update = super(FSDPZeROTensorParallelMuon, self).orthogonalize(
-                    p, full_update, **group_kwargs
-                )
-                sharded_update = self._reshard_full_update_like(value, orth_full_update)
-                self.pre_weight_update_fn_inplace(p, sharded_update)
-                update_target = p if isinstance(p, _DTensor) else value
-                update_target.add_(sharded_update, alpha=-lr)
-                self.post_weight_update_fn_inplace(p)
-            else:
-                orth_local_update = (
-                    super(FSDPZeROTensorParallelMuon, self)
-                    .orthogonalize(p, update_local, **group_kwargs)
-                    .to(dtype=p_local.dtype)
-                )
-                self.pre_weight_update_fn_inplace(p_local, orth_local_update)
-                p_local.add_(orth_local_update, alpha=-lr)
-                self.post_weight_update_fn_inplace(p_local)
 
     @torch.no_grad()  # type: ignore[misc]
     def _local_muon_update(

@@ -21,16 +21,17 @@ HAVE_APEX_OR_TE = True
 USING_TE_OPTIMIZER = False
 USING_APEX_OPTIMIZER = False
 try:
+    # pylint: disable=unused-import
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
 
     USING_TE_OPTIMIZER = True
 except ImportError:
     try:
-        from apex.optimizers import FusedAdam as Adam
+        from apex.optimizers import FusedAdam as Adam  # pylint: disable=unused-import
 
         USING_APEX_OPTIMIZER = True
     except ImportError:
-        from torch.optim import Adam as Adam
+        from torch.optim import Adam as Adam  # pylint: disable=unused-import
 
         HAVE_APEX_OR_TE = False
 
@@ -656,14 +657,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
-
-        assert (
-            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
-            or optimizer is None
-        ), (
-            "Only Adam and HybridDeviceOptimizer currently supported, "
-            "due to checkpointing requirements."
-        )
 
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class

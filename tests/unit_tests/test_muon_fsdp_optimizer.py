@@ -10,15 +10,13 @@ import torch
 import torch.nn as nn
 from packaging.version import Version
 
+from megatron.core.optimizer import _get_mfsdp_models
 from megatron.core.optimizer.emerging_optimizers import (
-    FSDPMuonChainedOptimizer,
-    FSDPZeROTensorParallelMuon,
     HAVE_EMERGING_OPTIMIZERS,
+    FSDPTensorParallelMuon,
     TensorParallelMuon,
-    _get_mfsdp_models,
 )
 from tests.unit_tests.test_utilities import Utils
-
 
 pytestmark = [
     pytest.mark.skipif(
@@ -56,7 +54,7 @@ def _make_fsdp_muon(params, dp_group=None, **kwargs):
         split_qkv=False,
     )
     defaults.update(kwargs)
-    return FSDPZeROTensorParallelMuon(params=params, dp_group=dp_group, **defaults)
+    return FSDPTensorParallelMuon(params=params, dp_group=dp_group, **defaults)
 
 
 def _reference_update(full_grad, **kwargs):
@@ -111,60 +109,12 @@ def _make_dtensor(local_tensor, global_shape, device_mesh):
     return dtensor
 
 
-class TestFSDPMuonChainedOptimizer:
-    @staticmethod
-    def _make_mfsdp_mock(model_auto_sync=False):
-        mock = MagicMock()
-        mock.model_auto_sync = model_auto_sync
-        return mock
-
-    @staticmethod
-    def _make_inner_mock():
-        mock = MagicMock()
-        mock.step.return_value = (True, 1.0, 0)
-        return mock
-
-    @pytest.mark.parametrize("model_auto_sync", [True, False])
-    def test_step_protocol(self, model_auto_sync):
-        inner = self._make_inner_mock()
-        mfsdp = self._make_mfsdp_mock(model_auto_sync=model_auto_sync)
-        wrapper = FSDPMuonChainedOptimizer(inner, [mfsdp])
-
-        wrapper.step()
-
-        if model_auto_sync:
-            mfsdp.finish_grad_sync.assert_not_called()
-        else:
-            mfsdp.finish_grad_sync.assert_called_once()
-        inner.step.assert_called_once()
-        mfsdp.install_optimized_model_weights.assert_called_once()
-
-    def test_getattr_delegation(self):
-        inner = self._make_inner_mock()
-        inner.param_groups = [{"lr": 0.01}]
-        inner.state_dict.return_value = {"state": {}, "param_groups": []}
-        wrapper = FSDPMuonChainedOptimizer(inner, [self._make_mfsdp_mock()])
-
-        assert wrapper.param_groups == [{"lr": 0.01}]
-        assert wrapper.state_dict() == {"state": {}, "param_groups": []}
-
-        wrapper.load_state_dict({"state": {}, "param_groups": []})
-        inner.load_state_dict.assert_called_once()
-
-    @pytest.mark.parametrize("set_to_none", [True, False])
-    def test_zero_grad_delegates(self, set_to_none):
-        inner = self._make_inner_mock()
-        wrapper = FSDPMuonChainedOptimizer(inner, [self._make_mfsdp_mock()])
-
-        wrapper.zero_grad(set_to_none=set_to_none)
-
-        inner.zero_grad.assert_called_once_with(set_to_none)
-
-    def test_get_mfsdp_models_error(self):
+class TestGetMFSDPModels:
+    def test_error_on_plain_module(self):
         with pytest.raises(RuntimeError, match="Could not find any MegatronFSDP"):
             _get_mfsdp_models([nn.Module()])
 
-    def test_get_mfsdp_models_success(self):
+    def test_extracts_inner_module(self):
         inner_module = MagicMock()
         chunk = MagicMock()
         chunk.module = inner_module
@@ -172,10 +122,22 @@ class TestFSDPMuonChainedOptimizer:
 
         assert _get_mfsdp_models([chunk]) == [inner_module]
 
+    def test_extracts_from_multiple_chunks(self):
+        chunks, inner_modules = [], []
+        for _ in range(3):
+            inner = MagicMock()
+            chunk = MagicMock()
+            chunk.module = inner
+            chunk.finish_grad_sync = MagicMock()
+            chunks.append(chunk)
+            inner_modules.append(inner)
+
+        assert _get_mfsdp_models(chunks) == inner_modules
+
 
 @_skip_if_single_rank()
 @_skip_if_no_dtensor()
-class TestFSDPZeROTensorParallelMuon:
+class TestFSDPTensorParallelMuon:
     @pytest.fixture(autouse=True)
     def setup_and_teardown(self):
         Utils.initialize_model_parallel()
@@ -184,6 +146,7 @@ class TestFSDPZeROTensorParallelMuon:
 
     def test_step_gathers_only_split_boundary_params(self):
         from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor
 
         from megatron.core.optimizer import emerging_optimizers as eopt_mod
 
@@ -222,6 +185,22 @@ class TestFSDPZeROTensorParallelMuon:
         optimizer = _make_fsdp_muon(params, dp_group=dp_group)
         assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {1}
 
+        # Pre-step: grads are DTensors, non-null, non-zero.
+        for idx, (param, plan) in enumerate(zip(params, plans)):
+            if _local_rows(plan, dp_rank) == 0:
+                continue
+            assert param.grad is not None, f"param {idx} grad should not be None"
+            assert isinstance(param.grad, DTensor), f"param {idx} grad should be a DTensor"
+            local_grad = param.grad.to_local()
+            assert local_grad.numel() > 0, f"param {idx} local grad should be non-empty"
+            assert not torch.all(local_grad == 0), f"param {idx} local grad should be non-zero"
+        # Boundary param (idx=1) spans two ranks: local shape != global shape.
+        if dp_rank in plans[1]:
+            g1 = params[1].grad
+            assert tuple(g1.to_local().shape) != tuple(
+                g1.shape
+            ), "boundary param grad should be unevenly sharded (local != global shape)"
+
         real_gather = eopt_mod.gather_uneven_dtensor_to_full_tensor
         gather_shapes = []
 
@@ -233,6 +212,20 @@ class TestFSDPZeROTensorParallelMuon:
             optimizer.step()
 
         assert gather_shapes == [(6, cols)]
+
+        # Post-step: momentum buffers are DTensors in optimizer state.
+        for idx, (param, plan) in enumerate(zip(params, plans)):
+            if _local_rows(plan, dp_rank) == 0:
+                continue
+            assert (
+                param in optimizer.state and optimizer.state[param]
+            ), f"param {idx} should have optimizer state after step"
+            state = optimizer.state[param]
+            assert "momentum_buffer" in state, f"param {idx} missing momentum_buffer in state"
+            mom = state["momentum_buffer"]
+            assert isinstance(mom, DTensor), f"param {idx} momentum_buffer should be a DTensor"
+            local_mom = mom.to_local()
+            assert local_mom.numel() > 0, f"param {idx} local momentum should be non-empty"
 
         lr = optimizer.param_groups[0]["lr"]
         for idx, (param, full_param, full_grad, plan) in enumerate(
@@ -279,6 +272,123 @@ class TestFSDPZeROTensorParallelMuon:
 
         assert optimizer._get_boundary_gather_param_indices(optimizer.param_groups[0]) == {0, 1, 2}
 
+    def test_step_no_gather_when_all_params_local(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from megatron.core.optimizer import emerging_optimizers as eopt_mod
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+        rows = 4
+
+        # Each param is fully owned by exactly one rank — no boundary splits.
+        plans = [{0: rows}, {1: rows}]
+        params = []
+        for plan in plans:
+            full_param = torch.ones(rows, cols, device="cuda") * 0.1
+            local_p = _local_slice(full_param, plan, dp_rank).contiguous()
+            param = nn.Parameter(_make_dtensor(local_p, full_param.shape, device_mesh))
+            full_grad = torch.ones(rows, cols, device="cuda") * 0.2
+            local_g = _local_slice(full_grad, plan, dp_rank).contiguous()
+            param.grad = _make_dtensor(local_g, full_grad.shape, device_mesh)
+            params.append(param)
+
+        optimizer = _make_fsdp_muon(params, dp_group=dp_group)
+
+        real_gather = eopt_mod.gather_uneven_dtensor_to_full_tensor
+        gather_calls = []
+
+        def counting_gather(value):
+            gather_calls.append(tuple(value.shape))
+            return real_gather(value)
+
+        with patch.object(eopt_mod, "gather_uneven_dtensor_to_full_tensor", counting_gather):
+            optimizer.step()
+
+        assert (
+            gather_calls == []
+        ), f"Expected no all-gathers for fully-local params, got {gather_calls}"
+
+    def test_step_momentum_accumulates_across_steps(self):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+        rows = 4
+        m = 0.95
+
+        plan = {0: rows}
+        full_param = torch.zeros(rows, cols, device="cuda")
+        local_p = _local_slice(full_param, plan, dp_rank).contiguous()
+        param = nn.Parameter(_make_dtensor(local_p, full_param.shape, device_mesh))
+
+        optimizer = _make_fsdp_muon([param], dp_group=dp_group, momentum=m, nesterov=False)
+
+        grad1 = torch.full((rows, cols), 0.5, device="cuda")
+        grad2 = torch.full((rows, cols), 1.0, device="cuda")
+
+        # Step 1.
+        local_g1 = _local_slice(grad1, plan, dp_rank).contiguous()
+        param.grad = _make_dtensor(local_g1, grad1.shape, device_mesh)
+        optimizer.step()
+
+        if local_p.numel() > 0:
+            mom = optimizer.state[param]["momentum_buffer"].to_local()
+            # buf = 0 * m + grad1 * (1 - m)
+            torch.testing.assert_close(mom, (1 - m) * local_g1, atol=1e-6, rtol=0)
+
+        # Step 2 with a different gradient.
+        local_g2 = _local_slice(grad2, plan, dp_rank).contiguous()
+        param.grad = _make_dtensor(local_g2, grad2.shape, device_mesh)
+        optimizer.step()
+
+        if local_p.numel() > 0:
+            mom = optimizer.state[param]["momentum_buffer"].to_local()
+            expected = m * (1 - m) * local_g1 + (1 - m) * local_g2
+            torch.testing.assert_close(mom, expected, atol=1e-6, rtol=0)
+
+    def test_step_none_grad_boundary_param_does_not_crash(self):
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import DTensor
+
+        dp_size = torch.distributed.get_world_size()
+        dp_rank = torch.distributed.get_rank()
+        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        dp_group = device_mesh.get_group("dp")
+        cols = 4
+
+        # param 0: fully local on rank 0; param 1: boundary split across ranks 0 and 1.
+        plans = [{0: 4}, {0: 2, 1: 4}]
+        params = []
+        for plan in plans:
+            rows = sum(plan.values())
+            full_param = torch.ones(rows, cols, device="cuda") * 0.1
+            local_p = _local_slice(full_param, plan, dp_rank).contiguous()
+            params.append(nn.Parameter(_make_dtensor(local_p, full_param.shape, device_mesh)))
+
+        # Give param 0 a gradient; leave param 1 (the boundary param) with grad=None.
+        full_grad0 = torch.ones(4, cols, device="cuda") * 0.3
+        local_g0 = _local_slice(full_grad0, plans[0], dp_rank).contiguous()
+        params[0].grad = _make_dtensor(local_g0, full_grad0.shape, device_mesh)
+        # params[1].grad remains None
+
+        initial_local1 = params[1].data.to_local().clone()
+
+        # Must not raise even though the boundary param has no gradient.
+        optimizer = _make_fsdp_muon(params, dp_group=dp_group)
+        optimizer.step()
+
+        # Boundary param with grad=None should not receive a meaningful weight update
+        # (NS of an all-zeros update produces ~zero; the param is essentially unchanged).
+        final_local1 = params[1].data.to_local()
+        torch.testing.assert_close(final_local1, initial_local1, atol=1e-4, rtol=1e-3)
+
 
 @_skip_if_single_rank()
 class TestFSDPFactoryIntegration:
@@ -290,9 +400,13 @@ class TestFSDPFactoryIntegration:
 
     @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
     def test_factory_dispatches_correct_muon_cls(self, strategy):
-        from megatron.core.optimizer import OptimizerConfig, _build_megatron_fsdp_emerging_optimizer
+        from megatron.core.optimizer import (
+            DistributedOptimizer,
+            OptimizerConfig,
+            _build_megatron_fsdp_emerging_optimizer,
+        )
+        from megatron.core.optimizer.optimizer import ChainedOptimizer
         from megatron.core.process_groups_config import ProcessGroupCollection
-        from megatron.core.optimizer.optimizer import ChainedOptimizer, FP32Optimizer
 
         model_chunk = MagicMock()
         model_chunk.config.num_attention_heads = 8
@@ -354,19 +468,16 @@ class TestFSDPFactoryIntegration:
                         config_overrides={},
                         pg_collection=pg_collection,
                         eopt_name="muon",
-                        use_layer_wise=False,
                     )
 
-        assert isinstance(result, FSDPMuonChainedOptimizer)
-        inner = object.__getattribute__(result, "inner")
-        assert isinstance(inner, ChainedOptimizer)
+        assert isinstance(result, ChainedOptimizer)
 
-        muon_wrapper = inner.chained_optimizers[0]
-        assert isinstance(muon_wrapper, FP32Optimizer)
+        muon_wrapper = result.chained_optimizers[0]
+        assert isinstance(muon_wrapper, DistributedOptimizer)
         base_opt = muon_wrapper.optimizer
         if strategy == "no_shard":
             assert isinstance(base_opt, TensorParallelMuon)
-            assert not isinstance(base_opt, FSDPZeROTensorParallelMuon)
+            assert not isinstance(base_opt, FSDPTensorParallelMuon)
         else:
-            assert isinstance(base_opt, FSDPZeROTensorParallelMuon)
+            assert isinstance(base_opt, FSDPTensorParallelMuon)
             assert base_opt.dp_group is not None

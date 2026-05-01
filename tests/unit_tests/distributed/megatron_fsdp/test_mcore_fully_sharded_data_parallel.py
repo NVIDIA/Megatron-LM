@@ -16,6 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAV
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
@@ -850,11 +851,21 @@ class TestMegatronFSDPE2E:
             ),
             pytest.param(
                 dict(data_parallel_sharding_strategy="optim_grads", fsdp_double_buffer=True),
-                id="optim_grads_no_double_buffer",
+                id="optim_grads_double_buffer",
             ),
             pytest.param(
                 dict(data_parallel_sharding_strategy="optim", fsdp_double_buffer=False),
-                id="optim_double_buffer",
+                id="optim_no_double_buffer",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fsdp_double_buffer=False,
+                    optimizer="muon",
+                    bf16=True,
+                    clip_grad=0.0,
+                ),
+                id="optim_grads_params_muon",
             ),
         ],
     )
@@ -864,11 +875,17 @@ class TestMegatronFSDPE2E:
         ):
             pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
 
+        if spec_configs.get("optimizer") == "muon" and not HAVE_EMERGING_OPTIMIZERS:
+            pytest.skip("Muon requires the emerging-optimizers package")
+
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
-        if nd_topology_str not in ref_cache:
+        # Non-Adam optimizers use their own reference entry so they don't pollute the Adam cache.
+        optimizer = spec_configs.get("optimizer", "adam")
+        cache_key = nd_topology_str if optimizer == "adam" else f"{nd_topology_str}_{optimizer}"
+        if cache_key not in ref_cache:
             distopt_spec_configs = copy.deepcopy(spec_configs)
             distopt_spec_configs["fp8_param_gather"] = False
-            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
+            ref_cache[cache_key] = TestMegatronFSDPE2E._training_loop(
                 use_distributed_optimizer=True, **distopt_spec_configs
             )
 
@@ -879,7 +896,7 @@ class TestMegatronFSDPE2E:
             gradient_accumulation_fusion=False,
             **spec_configs,
         )
-        reference_outputs = ref_cache[nd_topology_str]
+        reference_outputs = ref_cache[cache_key]
 
         if torch.distributed.get_rank() == 0:
             for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):
