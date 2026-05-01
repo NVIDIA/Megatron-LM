@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import weakref
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
@@ -504,7 +505,6 @@ def delete_cuda_graphs():
         runner.bwd_graph_recorded = False
         runner.fwd_graph = None
         runner.bwd_graph = None
-        runner.mempool = None
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -515,7 +515,14 @@ def delete_cuda_graphs():
     gc.collect()
     torch.cuda.empty_cache()
 
+    # Drop the shared default pool and every live manager's cached `self.mempool`.
+    # On the next capture, each manager re-resolves its mempool using its original topology flags
+    # (i.e. a manager constructed with `share_mempool_with` will still obey the argument).
+    # The side stream is intentionally not reset: the next manager construction's
+    # `current_stream() == default_stream()` check decides for itself whether a swap is needed.
     CudaGraphManager.global_mempool = None
+    for mgr in list(CudaGraphManager._live_managers):
+        mgr.mempool = None
 
 
 class _GraphStatus(Enum):
@@ -675,7 +682,7 @@ class _CudaGraphRunner(torch.nn.Module):
     def __init__(
         self,
         base_module: MegatronModule,
-        mempool: int,
+        manager: 'CudaGraphManager',
         fwd_graph_input_args: List[Any],
         fwd_graph_input_kwargs: Dict[str, Any],
         func,
@@ -688,7 +695,7 @@ class _CudaGraphRunner(torch.nn.Module):
         super().__init__()
 
         self.base_module = base_module
-        self.mempool = mempool
+        self._manager = manager
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
         self.fwd_graph_input_kwarg_metas = {
@@ -745,6 +752,12 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+
+    @property
+    def mempool(self):
+        """The mempool this runner captures into. Resolved through the manager so that
+        topology re-resolution after `delete_cuda_graphs` is automatically picked up."""
+        return self._manager._resolve_mempool()
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -982,6 +995,11 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_outputs = fwd_graph_outputs
         self.fwd_graph_output_surface = self.get_tensors(fwd_graph_outputs)
 
+        # Tag outputs with the mempool they were captured into. Downstream consumers in a
+        # different pool use this tag to decide whether weak-refing the input is safe.
+        for t in self.fwd_graph_output_surface:
+            t.cg_mempool = self.mempool
+
         for fwd_graph_out, o in zip(
             self.fwd_graph_output_surface, self.get_arg_metas(self.outputs)
         ):
@@ -1087,6 +1105,10 @@ class _CudaGraphRunner(torch.nn.Module):
         # Pads out the actually-needed grads with Nones in gradient slots for inputs
         # that don't require grad
         grad_inputs = list(grad_inputs)
+        # Tag bwd graph outputs with the mempool they were captured into.
+        for t in grad_inputs:
+            if torch.is_tensor(t):
+                t.cg_mempool = self.mempool
         self.static_grad_inputs = []
         for input_tensor in self.get_arg_metas(self.args, self.kwargs):
             if input_tensor.requires_grad:
@@ -1135,6 +1157,8 @@ class _CudaGraphRunner(torch.nn.Module):
             def replace_with_weak_ref(arg):
                 if not torch.is_tensor(arg):
                     return arg
+                if getattr(arg, "cg_mempool", None) is not self.mempool:
+                    return arg
 
                 try:
                     ref = make_weak_ref(arg)
@@ -1151,6 +1175,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 ref.requires_grad = arg.requires_grad
                 if hasattr(arg, "can_skip_replay_copy"):
                     ref.can_skip_replay_copy = arg.can_skip_replay_copy
+                ref.cg_mempool = getattr(arg, "cg_mempool", None)
                 return ref
 
             # Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
@@ -1408,10 +1433,27 @@ class _CudaGraphRunner(torch.nn.Module):
 
 
 class CudaGraphManager(torch.nn.Module):
-    """Creates and runs cudagraphs for a megatron module"""
+    """Creates and runs cudagraphs for a megatron module.
+
+    Mempool topology is selected by the `new_mempool` and `share_mempool_with`
+    arguments to `__init__`; see those for details. With neither set, the manager
+    uses the process-wide shared default mempool created on first construction.
+
+    Graphs that share a mempool must be replayed in the same order they were captured.
+    The cudagraph allocator decides which slots to alias-share based on the free events it observed
+    during capture; if replay order diverges from capture order, an alias-shared slot can be
+    overwritten by a later graph while an earlier graph still expects to read it.
+
+    With one shared `global_mempool` this is enforced implicitly by the model's fixed
+    forward/backward order; with `share_mempool_with` it becomes the caller's responsibility.
+    """
 
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
+
+    # Live managers, walked by `delete_cuda_graphs` to invalidate cached `self.mempool`,
+    # so the next capture re-resolves through `_resolve_mempool` with the same topology.
+    _live_managers = weakref.WeakSet()
 
     def __init__(
         self,
@@ -1422,8 +1464,9 @@ class CudaGraphManager(torch.nn.Module):
         pg_collection=None,
         inline_capture=False,
         num_warmup_steps=None,
+        new_mempool: bool = False,
+        share_mempool_with: 'CudaGraphManager' = None,
     ):
-        super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
         Args:
@@ -1433,7 +1476,28 @@ class CudaGraphManager(torch.nn.Module):
                 `inference_context` is present in the kwargs of the forward call.
                 Setting this argument to True always forces the inline capture path to be taken.
             num_warmup_steps: If set, overrides the per-runner warmup step count.
+            new_mempool: If True, this manager allocates its own fresh mempool instead of sharing
+                the process-wide `global_mempool`. Captured graphs are isolated from graphs in
+                other managers' pools (no cross-graph slot alias-sharing).
+                Mutually exclusive with `share_mempool_with`.
+            share_mempool_with: Another `CudaGraphManager` whose mempool this manager should
+                reuse. The two managers' graphs alias-share slots within that shared pool.
+                Stored as a weak reference, so passing a manager here does not keep it alive.
+                Mutually exclusive with `new_mempool`.
+
+                See the class docstring for the replay-order invariant the caller is
+                responsible for upholding when sharing a mempool.
         """
+        super().__init__()
+        if new_mempool and share_mempool_with is not None:
+            raise ValueError(
+                "`new_mempool=True` and `share_mempool_with=...` are mutually exclusive."
+            )
+        self._new_mempool = new_mempool
+        # Weak ref so a sharer does not pin its target.
+        self._share_with_ref = (
+            weakref.ref(share_mempool_with) if share_mempool_with is not None else None
+        )
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
         if pg_collection is None:
@@ -1490,11 +1554,62 @@ class CudaGraphManager(torch.nn.Module):
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
-        if CudaGraphManager.global_mempool is None:
-            CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
-            # Cudagraph stream capture requires no operations on the default stream prior to the
-            # capture, so change to a side stream.
+
+        # Cudagraph stream capture requires no operations on the default stream prior to the
+        # capture, so change to a side stream.
+        if torch.cuda.current_stream() == torch.cuda.default_stream():
             torch.cuda.set_stream(torch.cuda.Stream())
+
+        self.mempool = None
+        self._resolve_mempool()
+        CudaGraphManager._live_managers.add(self)
+
+    def _resolve_mempool(self):
+        """Resolves `self.mempool` based on the construction-time topology flags.
+
+        Walks the `share_mempool_with` chain iteratively (rather than recursively) so a
+        cyclic or dead-weakref chain produces a clear error instead of an infinite loop.
+        """
+        if self.mempool is not None:
+            return self.mempool
+
+        # Walk to the chain root (the manager with no `share_mempool_with`), or to the
+        # first manager that already has a resolved mempool.
+        chain: list['CudaGraphManager'] = [self]
+        visited: set[int] = {id(self)}
+        cursor = self
+        while cursor._share_with_ref is not None and cursor.mempool is None:
+            target = cursor._share_with_ref()
+            if target is None:
+                raise RuntimeError(
+                    "`share_mempool_with` target was garbage collected; the upstream "
+                    "manager must outlive any manager that shares its mempool."
+                )
+            if id(target) in visited:
+                raise RuntimeError(
+                    "Cycle detected in `share_mempool_with` chain; managers cannot "
+                    "transitively share a mempool with themselves."
+                )
+            visited.add(id(target))
+            if target.mempool is not None:
+                # Found an already-resolved peer; reuse its pool for the whole chain.
+                pool = target.mempool
+                for m in chain:
+                    m.mempool = pool
+                return pool
+            chain.append(target)
+            cursor = target
+
+        # `cursor` is the chain root: it owns the pool decision via its own flags.
+        if cursor._new_mempool:
+            pool = torch.cuda.graph_pool_handle()
+        else:
+            if CudaGraphManager.global_mempool is None:
+                CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
+            pool = CudaGraphManager.global_mempool
+        for m in chain:
+            m.mempool = pool
+        return pool
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -1516,8 +1631,11 @@ class CudaGraphManager(torch.nn.Module):
         The cudagraph corresponding to this call is the first element of 'self.cudagraph_runners'.
         We iterate through the list by 1 for each call, and the number of calls is equal to the
         length of 'self.cudagraph_runners'.
-        Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
-        over different microbatches by tracking their respective fwd and bwd passes.'''
+
+        After `delete_cuda_graphs`, `self.mempool` is None until the next capture; runners read
+        their pool through the manager's `_resolve_mempool`, so reused runners pick up the new
+        pool automatically.'''
+
         if reuse_cudagraphs:
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
@@ -1547,12 +1665,7 @@ class CudaGraphManager(torch.nn.Module):
                     )
                 else:
                     runner = _CudaGraphRunner(
-                        megatron_module,
-                        CudaGraphManager.global_mempool,
-                        args,
-                        kwargs,
-                        self.func,
-                        self.need_backward,
+                        megatron_module, self, args, kwargs, self.func, self.need_backward
                     )
                     if self._num_warmup_steps is not None:
                         runner.num_warmup_steps = self._num_warmup_steps
@@ -1567,12 +1680,7 @@ class CudaGraphManager(torch.nn.Module):
                 self.cudagraph_runners = self.cudagraph_runners[1:] + self.cudagraph_runners[:1]
             else:
                 runner = _CudaGraphRunner(
-                    megatron_module,
-                    CudaGraphManager.global_mempool,
-                    args,
-                    kwargs,
-                    self.func,
-                    self.need_backward,
+                    megatron_module, self, args, kwargs, self.func, self.need_backward
                 )
                 self.cudagraph_runners.append(runner)
 
