@@ -17,7 +17,12 @@ from tests.unit_tests.test_utilities import Utils
 
 class TestGPTInferenceWrapper:
 
-    def setup_model(self, tensor_parallel_size, pipeline_parallel_size):
+    def setup_model(
+        self,
+        tensor_parallel_size,
+        pipeline_parallel_size,
+        inference_logits_dtype=torch.float32,
+    ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
@@ -27,12 +32,14 @@ class TestGPTInferenceWrapper:
         self.batch_size = 4
         self.sequence_length = 32
         hidden_size = 32
+        self.inference_logits_dtype = inference_logits_dtype
 
         transformer_config = TransformerConfig(
             num_layers=4,
             hidden_size=hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            inference_logits_dtype=inference_logits_dtype,
         )
 
         gpt_model = GPTModel(
@@ -86,6 +93,9 @@ class TestGPTInferenceWrapper:
                 logits_seq_len,
                 self.vocab_size,
             ), f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"
+            assert logits.dtype == self.inference_logits_dtype, (
+                f"Expected logits dtype {self.inference_logits_dtype}, got {logits.dtype}"
+            )
 
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_inference_only_tensor_parallel(self, materialize_only_last_token_logits):
@@ -120,3 +130,47 @@ class TestGPTInferenceWrapper:
             logits_seq_len,
             self.vocab_size,
         ), f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"
+        assert logits.dtype == self.inference_logits_dtype, (
+            f"Expected logits dtype {self.inference_logits_dtype}, got {logits.dtype}"
+        )
+
+    @pytest.mark.parametrize("inference_logits_dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "tp_pp",
+        [
+            pytest.param((2, 2), id="pp"),
+            pytest.param((4, 1), id="tp"),
+        ],
+    )
+    def test_inference_logits_dtype(self, tp_pp, inference_logits_dtype):
+        tp, pp = tp_pp
+        self.setup_model(
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            inference_logits_dtype=inference_logits_dtype,
+        )
+
+        batch_prompt_tokens = (
+            torch.randint(low=0, high=self.vocab_size, size=(self.batch_size, self.sequence_length))
+            .int()
+            .cuda()
+        )
+        self.inference_wrapped_model.prep_model_for_inference()
+
+        inference_input = self.inference_wrapped_model.prep_inference_input(
+            prompts_tokens=batch_prompt_tokens
+        )
+        inference_input_for_context_window = (
+            self.inference_wrapped_model.get_batch_for_context_window(inference_input, 0, 5)
+        )
+
+        logits = self.inference_wrapped_model.run_one_forward_step(
+            inference_input_for_context_window
+        )
+
+        if pp > 1 and not parallel_state.is_pipeline_last_stage():
+            assert logits is None
+        else:
+            assert logits.dtype == inference_logits_dtype, (
+                f"Expected {inference_logits_dtype}, got {logits.dtype}"
+            )

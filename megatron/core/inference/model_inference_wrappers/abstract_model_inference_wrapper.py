@@ -15,6 +15,7 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
 
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
@@ -118,13 +119,14 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
-        return self.model(
-            tokens,
-            position_ids,
-            attention_mask,
+        kwargs = dict(
             inference_context=self.inference_context,
             runtime_gather_output=True,  # Inference should always gather the logits
         )
+        if isinstance(self.model, Float16Module):
+            kwargs["fp32_output"] = self.config.inference_logits_dtype == torch.float32
+        logits = self.model(tokens, position_ids, attention_mask, **kwargs)
+        return logits.to(self.config.inference_logits_dtype)
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
@@ -218,9 +220,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = None
         if is_pipeline_last_stage(self.pp_group):
             logits = output_tensor
-
-            # Explicitly cast logits to expected dtype
-            logits = logits.to(self.config.params_dtype)
+            assert logits.dtype == self.config.inference_logits_dtype, (
+                f"Expected logits dtype {self.config.inference_logits_dtype}, got {logits.dtype}"
+            )
 
         return logits
 

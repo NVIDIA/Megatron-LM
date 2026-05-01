@@ -12,6 +12,7 @@ from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.transformer.module import Float16Module
 
 
 # pylint: disable=line-too-long
@@ -137,20 +138,21 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         position_ids = inference_input["position_ids"]
         num_image_tiles = inference_input["num_tiles"]
 
-        output = self.model(
-            images,
-            tokens,
+        kwargs = dict(
             position_ids=position_ids,
             attention_mask=None,
             inference_context=self.inference_context,
             num_image_tiles=num_image_tiles,
             runtime_gather_output=True,
         )
+        if isinstance(self.model, Float16Module):
+            kwargs["fp32_output"] = self.config.inference_logits_dtype == torch.float32
+        output = self.model(images, tokens, **kwargs)
         if isinstance(output, tuple):
             logits, _ = output
         else:
             logits = output
-        return logits
+        return logits.to(self.config.inference_logits_dtype)
 
     def run_one_forward_step(self, inference_input: Dict[str, Any]) -> torch.Tensor:
         """The forward pass of the model for inference

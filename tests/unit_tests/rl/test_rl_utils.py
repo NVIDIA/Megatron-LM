@@ -48,7 +48,8 @@ class MockModel(LanguageModule):
         self.vocab = vocab
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.config = TransformerConfig(
-            num_attention_heads=8, num_layers=8, pipeline_dtype=torch.bfloat16
+            num_attention_heads=8, num_layers=8, pipeline_dtype=torch.bfloat16,
+            inference_logits_dtype=torch.bfloat16,
         )
         self.model_type = ModelType.encoder_or_decoder
 
@@ -796,6 +797,7 @@ class TestRLUtils:
             use_cpu_initialization=True,
             cuda_graph_impl="local",
             bf16=True,
+            inference_logits_dtype=torch.bfloat16,
         )
         model = GPTModel(
             config=transformer_config,

@@ -797,7 +797,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
-            fp32_output = not (args.fp16 or args.bf16)
+            fp32_output = model.config.inference_logits_dtype == torch.float32
             with torch.no_grad() if no_grad else nullcontext():
                 logits_or_hidden_states = model(
                     tokens,

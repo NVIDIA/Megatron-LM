@@ -121,6 +121,7 @@ MODEL_OPTIONS="\
     --log-num-zeros-in-grad \
     --log-throughput \
     --bf16 \
+    --inference-logits-dtype bf16 \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
     --use-distributed-optimizer \

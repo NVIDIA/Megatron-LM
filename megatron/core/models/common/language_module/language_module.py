@@ -384,6 +384,7 @@ class LanguageModule(MegatronModule):
 
         logits, _ = self.output_layer(mtp_hidden, weight=output_weight, runtime_gather_output=True)
         logits = self._scale_logits(logits)
+        logits = logits.to(self.config.inference_logits_dtype)
 
         return mtp_hidden, logits
 
