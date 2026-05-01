@@ -2201,6 +2201,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
+        padded_active = max(n_active, self.padded_active_request_count)
 
         # Refresh request-level staging slots from the persistent CPU source.
         # CPU-to-CPU slice assignment on pinned memory (~7.5 KB total for 3
@@ -2213,6 +2214,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
             active_slice
         ]
+        # Full-iteration CUDA graphs may have captured GPU consumers with the
+        # padded graph request count. Keep those padded staging rows bounded so
+        # graph replay never builds indices from stale request lengths.
+        if n_active < padded_active:
+            self._staging_request_in_prefill_status[n_active:padded_active] = 0
+            self._staging_request_query_lengths[n_active:padded_active] = 0
+            self._staging_request_kv_length_offsets[n_active:padded_active] = 0
 
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
@@ -2353,11 +2361,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         paused = self.paused_request_count
         total = self.total_request_count
-        query_lengths = self.request_query_lengths[paused:total]
+        active_request_count = total - paused
+        # CUDA graph capture must not bake in a host-to-device copy from a
+        # temporary CPU index tensor. The staged GPU view is refreshed before
+        # forward and has padded rows zeroed for graph replay.
+        if device.type == 'cuda':
+            query_lengths = self.gpu_view.request_query_lengths[:active_request_count]
+        else:
+            query_lengths = self.request_query_lengths[paused:total]
         num_decode = self.num_decode_requests
 
         decode_token_count = num_decode * (self.num_speculative_tokens + 1)
-        decode_indices = torch.arange(decode_token_count, device='cpu')
+        decode_indices = torch.arange(decode_token_count, device=query_lengths.device)
 
         cumsum = torch.cumsum(query_lengths, dim=0)
         prefill_last_indices = cumsum[num_decode:] - 1
@@ -2408,11 +2423,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         paused = self.paused_request_count
         total = self.total_request_count
-        query_lengths = self.request_query_lengths[paused:total]
+        active_request_count = total - paused
+        # See speculative_required_logit_indices(): use GPU-staged lengths for
+        # CUDA graph-safe index construction.
+        if logits.device.type == 'cuda':
+            query_lengths = self.gpu_view.request_query_lengths[:active_request_count]
+        else:
+            query_lengths = self.request_query_lengths[paused:total]
         last_token_idxs = torch.cumsum(query_lengths, dim=0) - 1
         assert last_token_idxs.numel() == self.num_last_token_logits
-        # last_token_idxs is on CPU because request_query_lengths is CPU-resident;
-        # H2D it so we can index the GPU `logits_2d`. Indices are tiny (<= max_requests).
         return logits_2d[last_token_idxs.to(logits.device, non_blocking=True), :]
 
     def _compute_prefix_match(
