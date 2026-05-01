@@ -68,10 +68,18 @@ def get_hf_model_type(model_path):
             "please install it with `pip install transformers`"
         )
 
-    # Parakeet is a special case: its model id may be `nemo://...`, which AutoConfig
-    # cannot resolve, so detect it from the path before touching the HF hub.
-    if "parakeet" in model_path.lower():
-        return "parakeet"
+    # Parakeet is a special case: its model id may be `nemo://...`, which
+    # AutoConfig cannot resolve, so detect it from the prefix. Require the
+    # `nemo://` or `hf://` scheme so unrelated local paths that happen to
+    # contain "parakeet" (e.g. a user directory) don't get misrouted.
+    lowered = model_path.lower()
+    if lowered.startswith(("nemo://", "hf://")):
+        model_id = lowered.split("://", 1)[1]
+        # Match a path segment whose name begins with "parakeet" (e.g.
+        # `nvidia/parakeet-tdt-0.6b-v2`). Substring-anywhere matches like
+        # `myparakeet-clone` are intentionally rejected.
+        if any(seg.startswith("parakeet") for seg in model_id.split("/")):
+            return "parakeet"
 
     hf_config = AutoConfig.from_pretrained(model_path.split("hf://")[1])
     model_type = hf_config.architectures[0].lower()
