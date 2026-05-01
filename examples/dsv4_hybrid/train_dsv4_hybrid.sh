@@ -52,7 +52,6 @@ HYBRID_MODEL_ARGS=(
     --hybrid-layer-pattern $HYBRID_PATTERN
     --hidden-size 2048
     --num-attention-heads 16
-    --group-query-attention
     --num-query-groups 8
     --ffn-hidden-size 8192
     --kv-channels 128

@@ -640,7 +640,7 @@ class TestGetLayerMapsFromLayerTypeList:
         """Standard symbols each produce a single-entry map at local index 0."""
         maps = get_layer_maps_from_layer_type_list(["*", "M", "-", "E"])
         # We always get all symbols returned, not only those contained in the pattern.
-        assert len(maps) == 6
+        assert len(maps) == 8
         attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
             Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
         )(maps)
