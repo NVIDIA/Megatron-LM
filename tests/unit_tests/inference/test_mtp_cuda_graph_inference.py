@@ -840,7 +840,7 @@ class TestMTPCudaGraphExpertParallel:
 
     # ---- helpers ---------------------------------------------------------- #
 
-    def _build_model(self):
+    def _build_model(self, inference_moe_token_dispatcher_type='nccl'):
         """Build a GPT model with MTP + MoE + local CUDA graphs."""
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = TransformerConfig(
@@ -857,6 +857,7 @@ class TestMTPCudaGraphExpertParallel:
             mtp_num_layers=2,
             cuda_graph_impl="local",
             moe_pad_experts_for_cuda_graph_inference=True,
+            inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
         )
         layer_spec = get_gpt_layer_local_spec(num_experts=self.NUM_MOE_EXPERTS)
         mtp_block_spec = get_gpt_mtp_block_spec(
@@ -1042,7 +1043,7 @@ class TestMTPCudaGraphExpertParallel:
     )
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_ep_dummy_bailout_with_decode_only_cuda_graphs(self, peer_state):
+    def test_nccl_ep_dummy_bailout_with_decode_only_cuda_graphs(self, peer_state):
         """Verify the dummy-rank bail-out path when only decode CUDA graphs
         are available.
 
@@ -1054,7 +1055,7 @@ class TestMTPCudaGraphExpertParallel:
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         is_even = ep_rank % 2 == 0
 
-        model = self._build_model()
+        model = self._build_model(inference_moe_token_dispatcher_type='nccl')
         ctx = self._build_context(model, use_cuda_graphs_for_non_decode_steps=False)
 
         # Even ranks are dummy; odd ranks have the peer_state.

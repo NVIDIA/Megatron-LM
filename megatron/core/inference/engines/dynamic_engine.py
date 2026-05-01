@@ -43,12 +43,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import (
-    Counter,
-    await_process_call,
-    set_inference_cuda_graphed_iteration_for_ep_inference,
-    unset_inference_cuda_graphed_iteration_for_ep_inference,
-)
+from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
@@ -359,13 +354,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
-        is_inference_optimized_ep = (
-            model_config.transformer_impl == "inference_optimized"
-            and model_config.expert_model_parallel_size > 1
-        )
-        if is_inference_optimized_ep:
-            unwrapped_model = controller.inference_wrapped_model.model
-            set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
@@ -433,10 +421,6 @@ class DynamicInferenceEngine(AbstractEngine):
                             )
 
                 context.reset()
-
-        # Disable inference dispatcher after graph capture
-        if is_inference_optimized_ep:
-            unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))

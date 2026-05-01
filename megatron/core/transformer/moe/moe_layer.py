@@ -26,7 +26,8 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
-    InferenceCUDAGraphTokenDispatcher,
+    NCCLAllGatherDispatcher,
+    NVLSAllGatherVDispatcher,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -349,24 +350,38 @@ class MoELayer(BaseMoELayer):
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
 
     def _setup_inference_mode(self, pg_collection):
-        """Set up inference-optimized token dispatcher and state.
+        """Set up inference-optimized token dispatcher.
 
         Called from __init__ when config.transformer_impl == "inference_optimized".
-        Creates an InferenceCUDAGraphTokenDispatcher alongside the standard dispatcher,
-        which is swapped in during CUDA-graphed forward passes.
+        Stores the training dispatcher and creates the inference dispatcher selected
+        by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
+        The active dispatcher is swapped automatically via the train() override:
+        eval mode → inference dispatcher, train mode → standard dispatcher.
         """
-
-        assert self.config.moe_token_dispatcher_type == "alltoall", (
-            f"Inference-optimized MoE requires 'alltoall' dispatcher, "
-            f"got '{self.config.moe_token_dispatcher_type}'"
+        dispatcher_type = self.config.inference_moe_token_dispatcher_type
+        dispatcher_cls = (
+            NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
         )
-        self.is_inference_cuda_graphed_iteration = False
-        self._inference_token_dispatcher = InferenceCUDAGraphTokenDispatcher(
+
+        self._training_token_dispatcher = self.token_dispatcher
+        self._inference_token_dispatcher = dispatcher_cls(
             self.num_local_experts,
             self.local_expert_indices,
             config=self.config,
             pg_collection=pg_collection,
         )
+
+    def train(self, mode: bool = True):
+        """Swap token dispatcher when switching between train and eval modes."""
+        super().train(mode)
+        if hasattr(self, "_inference_token_dispatcher"):
+            if mode:
+                self.token_dispatcher = self._training_token_dispatcher
+                self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+            else:
+                self.token_dispatcher = self._inference_token_dispatcher
+                self.shared_expert_overlap = False
+        return self
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
         """Initializes CUDA events and streams for overlapping expert
@@ -377,39 +392,6 @@ class MoELayer(BaseMoELayer):
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
-
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA-graphed iteration mode on this layer, its router, and its experts.
-
-        Swaps in the inference-optimized token dispatcher and disables
-        shared expert overlap.
-        """
-        self.is_inference_cuda_graphed_iteration = True
-        if hasattr(self.router, "set_inference_cuda_graphed_iteration"):
-            self.router.set_inference_cuda_graphed_iteration()
-        if hasattr(self.experts, "set_inference_cuda_graphed_iteration"):
-            self.experts.set_inference_cuda_graphed_iteration()
-
-        if self._inference_token_dispatcher is not None:
-            self._saved_token_dispatcher = self.token_dispatcher
-            self.token_dispatcher = self._inference_token_dispatcher
-            self._saved_shared_expert_overlap = self.shared_expert_overlap
-            self.shared_expert_overlap = False
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA-graphed iteration mode on this layer, its router, and its experts.
-
-        Restores the standard token dispatcher and shared expert overlap setting.
-        """
-        self.is_inference_cuda_graphed_iteration = False
-        if hasattr(self.router, "unset_inference_cuda_graphed_iteration"):
-            self.router.unset_inference_cuda_graphed_iteration()
-        if hasattr(self.experts, "unset_inference_cuda_graphed_iteration"):
-            self.experts.unset_inference_cuda_graphed_iteration()
-
-        if hasattr(self, "_saved_token_dispatcher"):
-            self.token_dispatcher = self._saved_token_dispatcher
-            self.shared_expert_overlap = self._saved_shared_expert_overlap
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -495,10 +477,7 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if (
-            hasattr(self, "_inference_token_dispatcher")
-            and self.is_inference_cuda_graphed_iteration
-        ):
+        if hasattr(self, "_inference_token_dispatcher") and not self.training:
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
