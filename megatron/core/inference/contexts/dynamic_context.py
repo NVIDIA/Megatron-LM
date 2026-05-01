@@ -593,18 +593,30 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
-        # CUDA graph config list.
+        # are we using the inference_optimized nccl ep dispatcher for MoEs?
         self._nccl_ep_dispatcher = (
             get_pg_size(self.expert_model_parallel_group) > 1
-            and getattr(model_config, 'inference_moe_token_dispatcher_type', 'nccl') == 'nccl'
+            and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
-        # We disable non-decode cuda graphs for the nccl dispatcher.
-        # The NCCL dispatcher uses allgathers. Thus there is a need to
-        # run the same sized cuda-graph on every EP rank. This is difficult to
-        # generalize for non-decode steps.
+
+        # are we using the training a2a dispatcher for MoEs?
+        # Note that this is not optimal for speed.
+        self._training_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and model_config.transformer_impl == "transformer_engine"
+        )
+
+        # We only allow non-decode cuda graphs for the nvls dispatcher
+        force_disable_non_decode_cuda_graphs = (
+            self._nccl_ep_dispatcher or self._training_ep_dispatcher
+        )
+
         self.use_cuda_graphs_for_non_decode_steps = (
-            inference_config.use_cuda_graphs_for_non_decode_steps and not self._nccl_ep_dispatcher
+            inference_config.use_cuda_graphs_for_non_decode_steps
+            and not (force_disable_non_decode_cuda_graphs)
         )
+
+        # CUDA graph config list.
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
@@ -1690,7 +1702,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher,
+            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
