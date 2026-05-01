@@ -1,7 +1,7 @@
 ---
 name: testing
-description: Test system for Megatron-LM. Covers test layout, recipe YAML structure, adding unit and functional tests, golden values, and running tests locally.
-when_to_use: Adding a unit or functional test; understanding the test layout; writing a recipe YAML; downloading or updating golden values; reproducing a test failure locally; 'how do I add a test', 'test layout', 'golden values', 'recipe YAML'.
+description: Test system for Megatron-LM. Covers test layout, recipe YAML structure, adding and running unit and functional tests, golden values, marker filters, and CI parity.
+when_to_use: Adding or running a unit or functional test; understanding the test layout; writing a recipe YAML; downloading or updating golden values; reproducing a test failure locally; 'how do I add a test', 'run unit tests', 'pytest fails', 'test layout', 'golden values', 'recipe YAML', 'marker filter'.
 ---
 
 # Testing Guide
@@ -99,6 +99,57 @@ scope: [mr-github-broken]
 
 ---
 
+## Running Unit Tests Locally
+
+All unit tests initialize a `torch.distributed` group, so every invocation
+requires GPU access and must go through `torch.distributed.run`:
+
+```bash
+# Full suite
+uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
+  tests/unit_tests
+
+# Single file
+uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
+  tests/unit_tests/models/test_gpt_model.py
+
+# Single test
+uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
+  tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_constructor
+
+# Filter by name substring
+uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
+  tests/unit_tests -k optimizer
+```
+
+### Marker filters
+
+```bash
+# Exclude flaky tests during development
+uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
+  tests/unit_tests -m "not flaky and not flaky_in_dev"
+
+# Include experimental tests
+uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
+  tests/unit_tests --experimental
+```
+
+### CI parity
+
+Use `tests/unit_tests/run_ci_test.sh` to reproduce a CI bucket failure exactly.
+For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
+
+### Gotchas
+
+- `pyproject.toml` sets `addopts = --durations=15 -s -rA` — stdout is not
+  captured (`-s`), so ranks interleave during multi-rank runs. Override with
+  `--capture=fd` when debugging a specific rank.
+- `tests/unit_tests/conftest.py` looks for test data under `/opt/data` and
+  attempts a download if missing. Supply it manually or skip data-dependent
+  tests when running outside the canonical container.
+
+---
+
 ## Adding a Unit Test
 
 1. Create `tests/unit_tests/<category>/test_<name>.py`.
@@ -107,12 +158,7 @@ scope: [mr-github-broken]
    - `@pytest.mark.internal` — skipped on `legacy` tag
    - `@pytest.mark.flaky` — skipped in `lts` environment
    - `@pytest.mark.experimental` — `latest` tag only
-4. Verify locally inside the container:
-
-   ```bash
-   pytest -xvs tests/unit_tests/<category>/test_<name>.py
-   ```
-
+4. Verify locally (see Running Unit Tests Locally above).
 5. If the test needs a dedicated CI bucket, add an entry to
    `tests/test_utils/recipes/h100/unit-tests.yaml`.
 
