@@ -41,8 +41,13 @@ NONE = "none"  # 0 requests (dummy rank)
 DECODE = "decode"  # >0 decode, 0 prefill
 PREFILL = "prefill"  # 0 decode, >0 prefill
 MIXED = "mixed"  # >0 decode, >0 prefill
+# Non-cuda-graphable states (token_count exceeds the cuda graph capacity
+# of _SWEEP_MAX_REQUESTS, forcing eager fallback for all EP ranks).
+PREFILL_AT_MAX_TOKENS = "prefill_max"  # prefill-only, token_count > graph capacity
+MIXED_GIANT_PREFILL = "mixed_giant"  # mixed with a giant prefill, token_count > graph capacity
 
-ALL_STATES = [NONE, DECODE, PREFILL, MIXED]
+_NO_CUDA_GRAPH_STATES = {PREFILL_AT_MAX_TOKENS, MIXED_GIANT_PREFILL}
+ALL_STATES = [NONE, DECODE, PREFILL, MIXED, PREFILL_AT_MAX_TOKENS, MIXED_GIANT_PREFILL]
 
 # Fixed expert-parallel size. When world_size > _EP_SIZE the remaining
 # ranks form data-parallel replicas, each running the same EP combo
@@ -53,8 +58,13 @@ _EP_SIZE = 4
 # across the EP ranks. Since rank assignment is symmetric (shuffling ranks
 # with the same multiset of states is not a distinct configuration), we use
 # combinations_with_replacement rather than the full Cartesian product.
-# For _EP_SIZE=4 this gives C(4+4-1, 4) = 35 test cases.
 _STATE_COMBOS = list(itertools.combinations_with_replacement(ALL_STATES, _EP_SIZE))
+
+# Cap max_requests for the cross-product sweep so that the cuda graph
+# capacity (max_requests * (num_speculative_tokens + 1) = 64) is small
+# enough that PREFILL_AT_MAX_TOKENS / MIXED_GIANT_PREFILL token counts
+# overflow it (forcing eager fallback), while the other states still fit.
+_SWEEP_MAX_REQUESTS = 64
 
 # Batch dimensions used to set up each non-dummy state via
 # add_dummy_requests_for_cudagraph_capture. These are intentionally small
@@ -66,6 +76,14 @@ _STATE_DIMS = {
     PREFILL: InferenceBatchDimensions(token_count=32, prefill_req_count=2, decode_req_count=0),
     # 4 decode (4 tokens) + 2 prefill (60 tokens) = 64 tokens
     MIXED: InferenceBatchDimensions(token_count=64, prefill_req_count=2, decode_req_count=4),
+    # 1 prefill of 128 tokens (> _SWEEP_MAX_REQUESTS=64, overflows every graph)
+    PREFILL_AT_MAX_TOKENS: InferenceBatchDimensions(
+        token_count=128, prefill_req_count=1, decode_req_count=0
+    ),
+    # 2 decode (2 tokens) + 1 prefill (126 tokens) = 128 tokens (overflows graphs)
+    MIXED_GIANT_PREFILL: InferenceBatchDimensions(
+        token_count=128, prefill_req_count=1, decode_req_count=2
+    ),
 }
 
 
@@ -220,60 +238,71 @@ class TestDynamicInference:
     @torch.inference_mode()
     def test_ep_state_cross_product(self, rank_states):
         """Test all combinatorial (unordered, with repetition) assignments of
-        the four request states across EP ranks.
+        the request states across EP ranks.
 
         The context is built with use_cuda_graphs_for_non_decode_steps=True,
         so the CUDA graph list contains decode-only, mixed, and prefill-only
-        graphs. After the EP all-reduce in match_graph_config, every rank
-        (including dummy ranks) should always find a matching graph.
+        graphs. For combos whose states all fit within the cuda graph capacity
+        (max_requests * (num_speculative_tokens + 1) = _SWEEP_MAX_REQUESTS),
+        every rank — including dummy ranks — must find a matching graph.
 
-        State setup uses add_dummy_requests_for_cudagraph_capture to populate
-        the context directly with the desired request configuration.
+        For combos that include any non-cuda-graphable state
+        (PREFILL_AT_MAX_TOKENS / MIXED_GIANT_PREFILL), match_graph_config
+        returns None on every rank (eager fallback): dummy ranks bail out and
+        run dummy_forward; non-dummy ranks run the eager
+        padded_batch_dimensions path.
         """
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         my_state = rank_states[ep_rank]
         is_dummy = my_state == NONE
+        expect_graph = not any(s in _NO_CUDA_GRAPH_STATES for s in rank_states)
 
         model = self._build_model()
-        ctx = self._build_context(model)
+        ctx = self._build_context(model, max_requests=_SWEEP_MAX_REQUESTS)
 
         # Phase 1: Set up each rank's request state directly.
         if not is_dummy:
             ctx.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[my_state])
 
         # Phase 2: Initialize attention state (EP collective).
-        if is_dummy:
-            ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+        ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=is_dummy)
+
+        # Phase 3: Verify CUDA graph match status agrees with the combo.
+        used_graph = ctx.using_cuda_graph_this_step()
+        assert used_graph == expect_graph, (
+            f"EP rank {ep_rank} (state={my_state}, rank_states={rank_states}): "
+            f"expected using_cuda_graph_this_step={expect_graph}, got {used_graph}"
+        )
+
+        if used_graph:
+            # All EP ranks must agree on padded token count when a graph
+            # was matched. (In eager mode dummy ranks bail out without
+            # setting padded_batch_dimensions, so this only applies here.)
+            padded = ctx.padded_batch_dimensions
+            ep_group = parallel_state.get_expert_model_parallel_group()
+            tc = torch.tensor([padded.token_count], dtype=torch.int32, device="cuda")
+            tc_max = tc.clone()
+            tc_min = tc.clone()
+            dist.all_reduce(tc_max, op=dist.ReduceOp.MAX, group=ep_group)
+            dist.all_reduce(tc_min, op=dist.ReduceOp.MIN, group=ep_group)
+            assert tc_max.item() == tc_min.item(), (
+                f"Padded token count mismatch across EP ranks: "
+                f"min={tc_min.item()}, max={tc_max.item()} "
+                f"(rank_states={rank_states})"
+            )
+            self._assert_dynamic_inference_shape(model, ctx, ep_rank, my_state)
+        elif is_dummy:
+            # Eager fallback, dummy rank: bailed out of
+            # initialize_attention_state, run the dummy_forward path.
+            self._assert_dummy_forward_shape(model, ep_rank)
         else:
-            ctx.initialize_attention_state()
+            # Eager fallback, non-dummy rank: padded_batch_dimensions
+            # set via the eager fallback path inside
+            # initialize_attention_state.
+            self._assert_dynamic_inference_shape(model, ctx, ep_rank, my_state)
 
-        # Phase 3: Verify.
-        # With mixed CUDA graphs available, every rank — including dummy
-        # ranks whose EP-adjusted dimensions inherit prefill/decode counts
-        # from peers — must find a matching graph.
-        assert ctx.using_cuda_graph_this_step(), (
-            f"EP rank {ep_rank} (state={my_state}): expected a CUDA graph match "
-            f"with use_cuda_graphs_for_non_decode_steps=True "
-            f"(rank_states={rank_states})"
-        )
-
-        # All EP ranks must agree on padded token count.
-        padded = ctx.padded_batch_dimensions
-        ep_group = parallel_state.get_expert_model_parallel_group()
-        tc = torch.tensor([padded.token_count], dtype=torch.int32, device="cuda")
-        tc_max = tc.clone()
-        tc_min = tc.clone()
-        dist.all_reduce(tc_max, op=dist.ReduceOp.MAX, group=ep_group)
-        dist.all_reduce(tc_min, op=dist.ReduceOp.MIN, group=ep_group)
-        assert tc_max.item() == tc_min.item(), (
-            f"Padded token count mismatch across EP ranks: "
-            f"min={tc_min.item()}, max={tc_max.item()} "
-            f"(rank_states={rank_states})"
-        )
-
-        self._assert_dynamic_inference_shape(model, ctx, ep_rank, my_state)
         self._assert_cuda_graphs_were_replayed(
-            True, ep_rank, f"state={my_state}, rank_states={rank_states}"
+            used_graph, ep_rank, f"state={my_state}, rank_states={rank_states}"
         )
 
     # ------------------------------------------------------------------
