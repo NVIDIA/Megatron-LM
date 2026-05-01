@@ -76,6 +76,7 @@ def _count_local_tokens_kernel(
             expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
             local_ids = expert_ids - local_expert_start
             is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
+            # TODO(ksanthanam): Explore using tl.histogram to reduce the number of atomic adds
             tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
 
 
