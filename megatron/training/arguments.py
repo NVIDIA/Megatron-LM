@@ -6,46 +6,45 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.training.argument_utils import ArgumentGroupFactory
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.core.quantization.utils import (
-    kitchen_quantization_recipe_config,
-    load_quantization_recipe,
-)
-
-from megatron.training.argument_utils import ArgumentGroupFactory
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -336,8 +335,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -664,8 +664,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -806,8 +808,12 @@ def validate_args(args, defaults={}):
                 args.rank
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    # Infer use of MLA from unified pattern (DSA, CSA and HCA all require MLA config)
+    if args.hybrid_layer_pattern and (
+        Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+        or Symbols.CSA_ATTENTION in args.hybrid_layer_pattern
+        or Symbols.HCA_ATTENTION in args.hybrid_layer_pattern
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -1783,6 +1789,11 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
+        if (
+            Symbols.CSA_ATTENTION in args.hybrid_layer_pattern
+            or Symbols.HCA_ATTENTION in args.hybrid_layer_pattern
+        ):
+            kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -2509,8 +2520,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -3244,6 +3254,35 @@ def _add_experimental_attention_variant_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    # DeepSeek-V4 hybrid (CSA / HCA)
+    group.add_argument('--csa-window-size', type=int, default=128,
+                       help='Sliding-window size for CSA / HCA core attention.')
+    group.add_argument('--csa-compress-ratios', type=la_freq_type, default=None,
+                       help='Per-layer compression ratios for CSA / HCA. Accepts a Python '
+                            'list expression, e.g. "[0,0,4,128,4,128]". The list length must '
+                            'equal num_layers. Valid values: 0 (window only), 4 (CSA), '
+                            '128 (HCA). When omitted in a hybrid model with C/H pattern '
+                            'symbols, it is auto-derived from the pattern.')
+    group.add_argument('--csa-compress-rotary-base', type=float, default=40000.0,
+                       help='RoPE base for compressed KV positions in CSA / HCA.')
+    group.add_argument('--csa-dense-mode', action='store_true',
+                       help='If set, the CSA layer attends to all valid compressed positions '
+                            'and disables the learned indexer (warmup phase).')
+    group.add_argument('--csa-no-attention-sink', dest='csa_attention_sink',
+                       action='store_false',
+                       help='Disable the learnable per-head attention sink in CSA / HCA core '
+                            'attention.')
+    group.set_defaults(csa_attention_sink=True)
+    group.add_argument('--csa-compress-ratio-for-c', type=int, default=4,
+                       help="Compression ratio for layers marked 'C' (CSA) in the hybrid pattern.")
+    group.add_argument('--csa-compress-ratio-for-h', type=int, default=128,
+                       help="Compression ratio for layers marked 'H' (HCA) in the hybrid pattern.")
+    group.add_argument('--o-groups', type=int, default=1,
+                       help='Number of groups for the grouped output projection used by '
+                            'DSv4 hybrid attention.')
+    group.add_argument('--o-lora-rank', type=int, default=128,
+                       help='Per-group lora rank for the grouped output projection used by '
+                            'DSv4 hybrid attention.')
     return parser
 
 def _add_heterogeneous_args(parser):
@@ -3310,10 +3349,10 @@ def _add_experimental_args(parser):
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-                       '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
-                       'stage boundaries for flexible virtual pipeline parallel (fVPP). '
-                       'Use / to separate MTP patterns. '
-                       'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+                       '* (attention), D (dsa), C (DSv4 CSA), H (DSv4 HCA), - (mlp), E (moe). '
+                       'Use | to define pipeline stage boundaries for flexible virtual '
+                       'pipeline parallel (fVPP). Use / to separate MTP patterns. '
+                       'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-MCMHM-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
@@ -3372,7 +3411,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False

@@ -301,78 +301,73 @@ class TestParseHybridPattern:
         assert p1 == p2
 
 
+def _expected_counts(**overrides):
+    """Build the expected ``get_hybrid_layer_counts`` dict.
+
+    All valid layer symbols are present in the result; the keys not given as
+    overrides default to 0.
+    """
+    base = {'*': 0, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 0, '-': 0, 'E': 0}
+    base.update(overrides)
+    return base
+
+
 @pytest.mark.internal
 class TestGetHybridLayerCounts:
 
     def test_simple_pattern(self):
-        assert get_hybrid_layer_counts("M*M*") == {'*': 2, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("M*M*") == _expected_counts(**{'*': 2, 'M': 2})
 
     def test_all_layer_types(self):
         # Not allowed to have both standard Attention and MLA/DSA, so we do separate asserts.
-        assert get_hybrid_layer_counts("MG*-E") == {'*': 1, 'D': 0, 'G': 1, 'M': 1, '-': 1, 'E': 1}
-        assert get_hybrid_layer_counts("MGD-E") == {'*': 0, 'D': 1, 'G': 1, 'M': 1, '-': 1, 'E': 1}
+        assert get_hybrid_layer_counts("MG*-E") == _expected_counts(
+            **{'*': 1, 'G': 1, 'M': 1, '-': 1, 'E': 1}
+        )
+        assert get_hybrid_layer_counts("MGD-E") == _expected_counts(
+            **{'D': 1, 'G': 1, 'M': 1, '-': 1, 'E': 1}
+        )
 
     def test_with_pipes(self):
         # Pipes should be skipped in counting
-        assert get_hybrid_layer_counts("M*|M*") == {'*': 2, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 0}
-        assert get_hybrid_layer_counts("M-M-|M-M*-") == {
-            '*': 1,
-            'D': 0,
-            'G': 0,
-            'M': 4,
-            '-': 4,
-            'E': 0,
-        }
+        assert get_hybrid_layer_counts("M*|M*") == _expected_counts(**{'*': 2, 'M': 2})
+        assert get_hybrid_layer_counts("M-M-|M-M*-") == _expected_counts(**{'*': 1, 'M': 4, '-': 4})
 
     def test_with_mtp(self):
         # MTP pattern "MM" repeated 2 depths -> 4 extra mamba layers
-        assert get_hybrid_layer_counts("M*M*/MM/MM") == {
-            '*': 2,
-            'D': 0,
-            'G': 0,
-            'M': 6,
-            '-': 0,
-            'E': 0,
-        }
+        assert get_hybrid_layer_counts("M*M*/MM/MM") == _expected_counts(**{'*': 2, 'M': 6})
 
     def test_with_pipes_and_mtp(self):
         # Main: M-M-|M-M*- -> 1 attn, 4 mamba, 4 mlp
         # MTP: MM x 2 depths -> +4 mamba
-        assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {
-            '*': 1,
-            'D': 0,
-            'G': 0,
-            'M': 8,
-            '-': 4,
-            'E': 0,
-        }
+        assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == _expected_counts(
+            **{'*': 1, 'M': 8, '-': 4}
+        )
 
     def test_moe_pattern(self):
-        assert get_hybrid_layer_counts("MEME") == {'*': 0, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 2}
+        assert get_hybrid_layer_counts("MEME") == _expected_counts(**{'M': 2, 'E': 2})
 
     def test_mtp_with_attention(self):
         # MTP pattern "*M" repeated 3 depths -> 3 attn + 3 mamba from MTP
-        assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {
-            '*': 3,
-            'D': 0,
-            'G': 0,
-            'M': 7,
-            '-': 0,
-            'E': 0,
-        }
+        assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == _expected_counts(**{'*': 3, 'M': 7})
 
     def test_gdn_pattern(self):
-        assert get_hybrid_layer_counts("GMGM") == {'*': 0, 'D': 0, 'G': 2, 'M': 2, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("GMGM") == _expected_counts(**{'G': 2, 'M': 2})
 
     def test_gdn_hybrid_pattern(self):
         # GDN + Mamba + Attention
-        assert get_hybrid_layer_counts("G*GM*") == {'*': 2, 'D': 0, 'G': 2, 'M': 1, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("G*GM*") == _expected_counts(**{'*': 2, 'G': 2, 'M': 1})
 
     def test_dsa_pattern(self):
-        assert get_hybrid_layer_counts("DMDM") == {'*': 0, 'D': 2, 'G': 0, 'M': 2, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("DMDM") == _expected_counts(**{'D': 2, 'M': 2})
+
+    def test_csa_hca_pattern(self):
+        # CSA + HCA + DSA + Mamba
+        assert get_hybrid_layer_counts("MCMHMD") == _expected_counts(
+            **{'C': 1, 'D': 1, 'H': 1, 'M': 3}
+        )
 
     def test_empty_pattern(self):
-        assert get_hybrid_layer_counts("") == {'*': 0, 'D': 0, 'G': 0, 'M': 0, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("") == _expected_counts()
 
 
 @pytest.mark.internal

@@ -185,6 +185,27 @@ class HybridModel(LanguageModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
+        # If any CSA/HCA layers are present in the global pattern, derive a per-layer
+        # csa_compress_ratios list from the symbol so each layer module can read its
+        # own ratio at construction time. An explicit user-provided ratios list takes
+        # precedence.
+        if parsed.main_pattern is not None and getattr(config, "csa_compress_ratios", None) is None:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+            global_pattern = parsed.main_pattern.replace(Symbols.PIPE, '')
+            if Symbols.CSA_ATTENTION in global_pattern or Symbols.HCA_ATTENTION in global_pattern:
+                ratio_for_c = getattr(config, "csa_compress_ratio_for_c", 4)
+                ratio_for_h = getattr(config, "csa_compress_ratio_for_h", 128)
+                ratios = []
+                for ch in global_pattern:
+                    if ch == Symbols.CSA_ATTENTION:
+                        ratios.append(ratio_for_c)
+                    elif ch == Symbols.HCA_ATTENTION:
+                        ratios.append(ratio_for_h)
+                    else:
+                        ratios.append(0)
+                config.csa_compress_ratios = ratios
+
         layer_type_list, layer_offset = select_pipeline_segment(
             parsed.main_pattern or '',
             self.pg_collection.pp,

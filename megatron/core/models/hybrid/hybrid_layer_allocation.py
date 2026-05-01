@@ -18,11 +18,13 @@ class Symbols:
     GDN = 'G'
     ATTENTION = "*"
     DS_ATTENTION = "D"
+    CSA_ATTENTION = "C"
+    HCA_ATTENTION = "H"
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, CSA_ATTENTION, HCA_ATTENTION, MLP, MOE}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -292,9 +294,12 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # Disallow Attention + MLA/DSA/CSA/HCA hybridity.
+    mla_like = {Symbols.DS_ATTENTION, Symbols.CSA_ATTENTION, Symbols.HCA_ATTENTION}
+    if Symbols.ATTENTION in pattern and any(s in pattern for s in mla_like):
+        raise ValueError(
+            "Not supported to have both standard Attention and MLA/DSA/CSA/HCA in one model"
+        )
 
 
 def validate_segment_layers(segment: str) -> List[str]:
@@ -320,9 +325,12 @@ def validate_segment_layers(segment: str) -> List[str]:
                 f"one of {Symbols.VALID_LAYERS}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # Disallow Attention + MLA/DSA/CSA/HCA hybridity.
+    mla_like = {Symbols.DS_ATTENTION, Symbols.CSA_ATTENTION, Symbols.HCA_ATTENTION}
+    if Symbols.ATTENTION in segment and any(s in segment for s in mla_like):
+        raise ValueError(
+            "Not supported to have both standard Attention and MLA/DSA/CSA/HCA in one model"
+        )
 
     return layer_type_list
 
