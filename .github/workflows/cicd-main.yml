@@ -77,9 +77,10 @@ jobs:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
+          IS_WORKFLOW_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
-          # Skip SSO check for scheduled jobs, main branch, or merge groups
-          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
+          # Skip SSO check for scheduled jobs, main branch, merge groups, or manual dispatches
+          if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ] || [ "${IS_WORKFLOW_DISPATCH}" == "true" ]; then
             echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
             exit 0
           fi
@@ -178,9 +179,13 @@ jobs:
             SCOPE=mr-github; N_REPEAT=1; LIGHTWEIGHT=true
           elif [ "$HAS_RUN_FUNCTIONAL" == "true" ]; then
             SCOPE=mr-github; N_REPEAT=5; LIGHTWEIGHT=false
-          elif [ "$IS_CI_WORKLOAD" == "true" ]; then
+          elif [ "$IS_CI_WORKLOAD" == "true" ] || [ "$EVENT_NAME" == "workflow_dispatch" ]; then
             # Scheduled / dispatch / release have no PR labels; default to the
             # full functional scope so cadence (set below) is the discriminator.
+            # `workflow_dispatch` is forced into this branch because upstream
+            # pre-flight reports is_ci_workload=false when dispatched from a
+            # `pull-request/*` branch, which would otherwise drop us into the
+            # slim scope.
             SCOPE=mr-github; N_REPEAT=5; LIGHTWEIGHT=false
           else
             SCOPE=mr-github-slim; N_REPEAT=5; LIGHTWEIGHT=false
