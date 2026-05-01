@@ -379,7 +379,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         ).maybe_get_tensor(meta_shape, dtype=torch.int32)
 
         failed = [
-            name
+            (name, SymmetricMemoryManager.get_buffer(name).init_failure_reason)
             for name, buf in (
                 ("ep_agv_h", cls._symm_agv_hidden),
                 ("ep_agv_r", cls._symm_agv_routing),
@@ -390,11 +390,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             if buf["handle"] is None
         ]
         if failed:
+            details = "; ".join(f"{name}: {reason or 'unknown'}" for name, reason in failed)
             raise RuntimeError(
-                f"NVLSAllGatherVDispatcher: symmetric memory rendezvous failed for "
-                f"{failed} on the EP process group. This dispatcher requires Hopper+ "
-                f"GPUs fully connected via NVLink, plus a torch build with "
-                f"torch.distributed._symmetric_memory and triton installed. "
+                f"NVLSAllGatherVDispatcher: symmetric memory init failed [{details}]. "
+                f"This dispatcher requires Hopper+ GPUs fully connected via NVLink, and torch built"
+                f"with torch.distributed._symmetric_memory plus triton installed. "
                 f"Use inference_moe_token_dispatcher_type='nccl' on non-NVLS systems."
             )
 
