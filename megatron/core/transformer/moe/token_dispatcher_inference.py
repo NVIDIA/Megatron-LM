@@ -38,8 +38,10 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 
@@ -420,12 +422,25 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         self.topk = config.moe_router_topk
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
+        # When shared_expert_overlap is enabled, the shared expert forward is launched
+        # on SharedExpertMLP.stream in dispatch_preprocess and joined in combine_postprocess.
+        self._shared_expert_output: Optional[torch.Tensor] = None
 
     # ── Dispatch path ─────────────────────────────────────────────────────────────
 
     def dispatch_preprocess(self, hidden_states, routing_map, probs):
-        """Store routing map and local token count; no communication."""
+        """Store routing map and local token count; no inter-rank communication.
+
+        If shared_expert_overlap is enabled (set_shared_experts has been called),
+        launch the entire shared-expert forward on SharedExpertMLP.stream so it
+        runs concurrently with AGV dispatch, expert GEMMs, and RSV combine.
+        """
         self.hidden_shape = hidden_states.shape
+        if self.shared_experts is not None:
+            stream = SharedExpertMLP.stream
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self._shared_expert_output = apply_module(self.shared_experts)(hidden_states)
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self._local_tokens = hidden_states.shape[0]
@@ -458,6 +473,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
+        # Cap AGV CTAs when overlapping the shared expert so the AGV does not
+        # starve the shared-expert GEMMs running on the side stream.
+        agv_kwargs = {"max_num_blocks": 16} if self.shared_experts is not None else {}
         multimem_all_gatherv_3tensor(
             agv_h["tensor"],
             agv_r["tensor"],
@@ -471,6 +489,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             per_rank_max_tokens=per_rank_max,
+            **agv_kwargs,
         )
 
         topk = probs.shape[1]
@@ -523,5 +542,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):
-        """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H])."""
-        return hidden_states.view(self.hidden_shape)
+        """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H]).
+
+        If shared_expert_overlap is enabled, join SharedExpertMLP.stream and add
+        the shared-expert output produced concurrently during dispatch+combine.
+        """
+        output = hidden_states.view(self.hidden_shape)
+        if self._shared_expert_output is not None:
+            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+            output = output + self._shared_expert_output
+            self._shared_expert_output = None
+        return output

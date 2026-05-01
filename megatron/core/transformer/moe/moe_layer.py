@@ -371,6 +371,16 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
+        # Wire shared-expert overlap into the inference dispatcher (NVLS only).
+        # The dispatcher launches the shared-expert forward on SharedExpertMLP.stream
+        # concurrently with AGV+experts+RSV and adds it back in combine_postprocess.
+        if (
+            dispatcher_type == 'nvls'
+            and self.use_shared_expert
+            and self.config.moe_shared_expert_overlap
+        ):
+            self._inference_token_dispatcher.set_shared_experts(self.shared_experts)
+
     def train(self, mode: bool = True):
         """Swap token dispatcher when switching between train and eval modes."""
         super().train(mode)
@@ -380,7 +390,9 @@ class MoELayer(BaseMoELayer):
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
             else:
                 self.token_dispatcher = self._inference_token_dispatcher
-                self.shared_expert_overlap = False
+                self.shared_expert_overlap = (
+                    self._inference_token_dispatcher.shared_experts is not None
+                )
         return self
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
