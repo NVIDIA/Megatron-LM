@@ -323,9 +323,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         self.text_generation_controller._sampling_backend = backend
 
         context.padded_active_token_count = batch_size
-        context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32)
+        context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32, device='cuda')
         context.paused_request_count = 0
         context.total_request_count = batch_size
+        context.num_prefill_requests = 0
+        context.pad_active_slices()
 
         # Bookkeeping.
         self.text_generation_controller._dynamic_step_sample_bookkeeping()
@@ -973,6 +975,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.request_query_lengths = torch.tensor(
             [3, 3], dtype=torch.int32, device='cuda'
         )  # 1 sampled + 2 spec
+        ctx.num_prefill_requests = 0
+        ctx.pad_active_slices()
 
         # Init accepted tokens tensors
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -1218,6 +1222,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )  # Decode requests
         # query lengths for decode with spec tokens is (1 + num_spec) = 4
         ctx.request_query_lengths = torch.tensor([4, 4], dtype=torch.int32, device='cuda')
+        ctx.num_prefill_requests = 0
+        ctx.pad_active_slices()
 
         # Setup inputs
         input_ids = torch.randint(0, self.vocab_size, (1, 8), device='cuda')
