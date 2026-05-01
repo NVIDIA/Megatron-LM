@@ -50,7 +50,7 @@ if HAVE_FLASHINFER:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
 try:
-    import triton  # noqa: F401
+    import triton  # pylint: disable=unused-import
 
     HAVE_TRITON = True
 except ImportError:
