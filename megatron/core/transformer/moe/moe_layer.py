@@ -49,6 +49,13 @@ if HAVE_FLASHINFER:
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
+try:
+    import triton  # noqa: F401
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
@@ -341,13 +348,10 @@ class MoELayer(BaseMoELayer):
                     "torch.nn.functional.grouped_mm (available since PyTorch 2.10)."
                 )
             elif config.inference_grouped_gemm_backend == 'vllm':
-                try:
-                    import triton  # noqa: F401
-                except ImportError as e:
-                    raise ImportError(
-                        "inference_grouped_gemm_backend='vllm' requires Triton. "
-                        "Install triton (pip install triton)."
-                    ) from e
+                assert HAVE_TRITON, (
+                    "inference_grouped_gemm_backend='vllm' requires Triton. "
+                    "Install triton (pip install triton)."
+                )
             self._setup_inference_mode(pg_collection)
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.

@@ -66,15 +66,23 @@ def _count_local_tokens_kernel(
     total_blocks = tl.cdiv(valid_pairs, BLOCK_SIZE)
     blocks_per_cta = tl.cdiv(total_blocks, num_sms)
     block_start = pid * blocks_per_cta
-    block_end = tl.minimum(block_start + blocks_per_cta, total_blocks)
 
-    for block_id in tl.range(block_start, block_end):
-        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < valid_pairs
-        expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
-        local_ids = expert_ids - local_expert_start
-        is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
-        tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
+    if block_start < total_blocks:
+        block_end = tl.minimum(block_start + blocks_per_cta, total_blocks)
+        expert_offs = tl.arange(0, num_local_experts + 1)
+
+        for block_id in tl.range(block_start, block_end):
+            offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < valid_pairs
+            expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
+            local_ids = expert_ids - local_expert_start
+            is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
+            # Bin non-local pairs into a garbage slot so histogram ignores them.
+            safe_ids = tl.where(is_local, local_ids, num_local_experts)
+            hist = tl.histogram(safe_ids, num_local_experts + 1)
+            tl.atomic_add(
+                tokens_per_expert_ptr + expert_offs, hist, mask=expert_offs < num_local_experts
+            )
 
 
 def compute_local_tokens_per_expert(

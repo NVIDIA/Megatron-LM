@@ -264,9 +264,11 @@ def _init_sorted_ids_kernel(
 ):
     """Initialize sorted_token_ids to SENTINEL and expert_ids to -1."""
     pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    tl.store(sorted_token_ids_ptr + offs, SENTINEL, mask=offs < max_sorted)
-    tl.store(expert_ids_ptr + offs, -1, mask=offs < max_blocks)
+    block_start = pid * BLOCK
+    if block_start < max_sorted or block_start < max_blocks:
+        offs = block_start + tl.arange(0, BLOCK)
+        tl.store(sorted_token_ids_ptr + offs, SENTINEL, mask=offs < max_sorted)
+        tl.store(expert_ids_ptr + offs, -1, mask=offs < max_blocks)
 
 
 @triton.jit

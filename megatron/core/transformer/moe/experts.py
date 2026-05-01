@@ -661,7 +661,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
-            num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens(),
+            num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
         )
         return output, None
 
