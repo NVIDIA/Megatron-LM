@@ -468,12 +468,11 @@ def _moe_sum_kernel(
     topk: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_K_BLOCKS: tl.constexpr,
-    STORE_BF16: tl.constexpr,
 ):
     """Reduce topk dimension with valid_tokens gating and routing weight application.
 
     input:  [max_tokens * topk, K] bf16
-    output: [max_tokens, K] fp32 (or bf16 when STORE_BF16=True, e.g. RSV buffer)
+    output: [max_tokens, K] — dtype matches the output buffer (fp32 or bf16)
 
     For token t < valid_tokens: output[t] = sum of input[t*topk+k] * prob[t*topk+k]
     over topk slots k where the expert is local.  Non-local slots are skipped
@@ -501,8 +500,7 @@ def _moe_sum_kernel(
                     w = tl.load(topk_weights_ptr + token_id * topk + t)
                     acc += v.to(tl.float32) * w
 
-        out = acc.to(tl.bfloat16) if STORE_BF16 else acc
-        tl.store(output_ptr + token_id * K + offs_k, out, mask=k_mask)
+        tl.store(output_ptr + token_id * K + offs_k, acc, mask=k_mask)
 
 
 def _moe_sum(
@@ -521,13 +519,12 @@ def _moe_sum(
 
     Applies routing weights and reduces over topk in a single kernel.
     Accumulates in fp32. When `out` is None, allocates and returns an fp32
-    buffer (matching mcore_fused_moe precision). When `out` is provided
-    (e.g. the bf16 RSV symmetric memory tensor), stores in the buffer's dtype
-    to avoid a separate allocation + copy. Rows beyond valid_tokens are zeroed.
-    Only accumulates contributions from local experts; non-local topk slots are
-    skipped (their values in `input` are undefined).
+    buffer. When `out` is provided (e.g. the RSV symmetric memory tensor),
+    writes directly into it — tl.store handles the cast to the buffer's dtype.
+    Rows beyond valid_tokens are zeroed. Only accumulates contributions from
+    local experts; non-local topk slots are skipped (their values in `input`
+    are undefined).
     """
-    store_bf16 = out is not None and out.dtype == torch.bfloat16
     if out is None:
         out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
@@ -544,7 +541,6 @@ def _moe_sum(
         topk=topk,
         BLOCK_K=BLOCK_K,
         NUM_K_BLOCKS=NUM_K_BLOCKS,
-        STORE_BF16=store_bf16,
     )
     return out
 
@@ -583,15 +579,16 @@ def vllm_fused_moe(
         local_expert_start: first global expert index on this rank.
         valid_tokens: scalar int32 CUDA tensor with number of valid tokens.
         routing_map: [max_tokens, topk] int expert assignments.
-        out: optional [max_tokens, hidden_size] output buffer (e.g. bf16 RSV
+        out: optional [max_tokens, hidden_size] output buffer (e.g. the RSV
             symmetric memory tensor). If None, an fp32 buffer is allocated.
-            When provided, stores in the buffer's dtype.
+            When provided, tl.store casts to the buffer's dtype automatically.
         num_tokens_hint: optional host-side int with the expected number of
             valid tokens (e.g. batch_size * ep_size). Used to select a better
             BLOCK_SIZE_M instead of using the worst-case buffer size.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
+        tl.store handles the implicit cast when out is a different dtype.
     """
     assert (
         hidden_states.dtype == torch.bfloat16

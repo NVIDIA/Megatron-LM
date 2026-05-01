@@ -381,7 +381,7 @@ class TestMoeSum:
         topk_weights = torch.rand(max_tokens, topk, device="cuda", dtype=torch.float32)
         routing_map = torch.randint(0, num_experts, (max_tokens, topk), device="cuda")
 
-        out_buf = torch.empty(max_tokens, K, dtype=torch.bfloat16, device="cuda")
+        out_buf = torch.empty(max_tokens, K, dtype=torch.float32, device="cuda")
         result = _moe_sum(
             input,
             topk_weights,
@@ -537,7 +537,7 @@ class TestVllmFusedMoe:
             max_tokens, hidden_size, ffn_hidden, topk, num_experts
         )
 
-        out_buf = torch.empty(max_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        out_buf = torch.empty(max_tokens, hidden_size, dtype=torch.float32, device="cuda")
         result = vllm_fused_moe(
             hidden,
             probs,
@@ -663,7 +663,7 @@ class TestVllmFusedMoeCudaGraph:
             torch.randn(num_experts, hidden_size, ffn_hidden, device="cuda", dtype=torch.bfloat16)
             * 0.01
         )
-        static_out = torch.empty(max_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        static_out = torch.empty(max_tokens, hidden_size, dtype=torch.float32, device="cuda")
 
         # Warmup to trigger Triton autotuning
         s = torch.cuda.Stream()
@@ -704,7 +704,7 @@ class TestVllmFusedMoeCudaGraph:
         expected = _ref_sequential_moe(
             static_hidden, static_probs, fc1, fc2, static_routing_map, num_experts, 0, max_tokens
         )
-        torch.testing.assert_close(static_out.float(), expected, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(static_out, expected, atol=5e-2, rtol=5e-2)
 
     @pytest.mark.parametrize(
         "max_tokens,valid_tokens_list",
@@ -735,7 +735,7 @@ class TestVllmFusedMoeCudaGraph:
             torch.randn(num_experts, hidden_size, ffn_hidden, device="cuda", dtype=torch.bfloat16)
             * 0.01
         )
-        static_out = torch.empty(max_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        static_out = torch.empty(max_tokens, hidden_size, dtype=torch.float32, device="cuda")
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -778,7 +778,7 @@ class TestVllmFusedMoeCudaGraph:
                 static_hidden, static_probs, fc1, fc2, static_routing_map, num_experts, 0, vt
             )
             torch.testing.assert_close(
-                static_out[:vt].float(),
+                static_out[:vt],
                 expected[:vt],
                 atol=5e-2,
                 rtol=5e-2,
@@ -810,7 +810,7 @@ class TestVllmFusedMoeCudaGraph:
             torch.randn(num_experts, hidden_size, ffn_hidden, device="cuda", dtype=torch.bfloat16)
             * 0.01
         )
-        static_out = torch.empty(max_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        static_out = torch.empty(max_tokens, hidden_size, dtype=torch.float32, device="cuda")
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -868,7 +868,7 @@ class TestVllmFusedMoeCudaGraph:
                 max_tokens,
             )
             torch.testing.assert_close(
-                static_out.float(),
+                static_out,
                 expected,
                 atol=5e-2,
                 rtol=5e-2,
@@ -895,7 +895,7 @@ class TestVllmFusedMoeCudaGraph:
             torch.randn(num_experts, hidden_size, ffn_hidden, device="cuda", dtype=torch.bfloat16)
             * 0.01
         )
-        static_out = torch.empty(max_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        static_out = torch.empty(max_tokens, hidden_size, dtype=torch.float32, device="cuda")
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -945,7 +945,7 @@ class TestVllmFusedMoeCudaGraph:
             graph.replay()
             graph_result = static_out[:new_vt].clone()
 
-            eager_out = torch.empty(max_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+            eager_out = torch.empty(max_tokens, hidden_size, dtype=torch.float32, device="cuda")
             vllm_fused_moe(
                 new_hidden,
                 new_probs,

@@ -298,7 +298,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _per_rank_worst_case_token_count: int = 2048  # round_up_tokens(max_tokens) // tp_size
 
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
-    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=bf16.
+    # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=fp32.
     _symm_agv_hidden: Optional[dict] = None  # {"tensor": ..., "handle": ...}
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
@@ -368,7 +368,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
             "ep_rsv", process_group=ep_group
-        ).maybe_get_tensor([global_max, hidden_size], dtype=torch.bfloat16)
+        ).maybe_get_tensor([global_max, hidden_size], dtype=torch.float32)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
@@ -509,7 +509,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
         Args:
-            hidden_states: [global_max, hidden_size] bf16 expert outputs.
+            hidden_states: [global_max, hidden_size] expert outputs (fp32 when
+                written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
