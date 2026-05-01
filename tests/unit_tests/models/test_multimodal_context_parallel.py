@@ -7,9 +7,12 @@ import pytest
 import torch
 
 from megatron.core.models.multimodal.context_parallel import (
+    GatherFromContextParallelRanks,
     _compute_tubelet_aware_split_points,
     _split_num_frames,
+    gather_from_context_parallel_ranks,
     gather_from_context_parallel_ranks_dynamic_res,
+    split_to_context_parallel_ranks,
     split_to_context_parallel_ranks_dynamic_res,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -41,9 +44,9 @@ def _assert_split_point_invariants(split_points, num_frames, temporal_patch_size
         media_start = media_end
 
     for sp in split_points:
-        assert sp in valid_boundaries, (
-            f"split point {sp} is not tubelet-aligned; valid={sorted(valid_boundaries)}"
-        )
+        assert (
+            sp in valid_boundaries
+        ), f"split point {sp} is not tubelet-aligned; valid={sorted(valid_boundaries)}"
 
 
 class TestComputeTubeletAwareSplitPoints:
@@ -145,6 +148,32 @@ class TestSplitNumFrames:
         assert _split_num_frames([], 0, 10) == []
 
 
+class TestSplitToContextParallelRanks:
+    """Single-rank tests for ``split_to_context_parallel_ranks``.
+
+    With ``cp_size=1`` the helper is a no-op pass-through that just returns
+    the original tensor and ``global_pad=0``. We use a single-rank
+    ``Utils.initialize_model_parallel`` setup so we can exercise the public
+    API without spinning up multi-rank CP.
+    """
+
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_cp_size_1_is_passthrough(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        global_t = torch.arange(12, dtype=torch.float32, device="cuda").reshape(4, 3)
+
+        local_t, global_pad = split_to_context_parallel_ranks(global_t)
+
+        assert torch.equal(local_t, global_t)
+        assert global_pad == 0
+
+
 @pytest.mark.skipif(
     int(os.getenv("WORLD_SIZE", "1")) < 2,
     reason="Dynamic-res CP split/gather require WORLD_SIZE >= 2",
@@ -164,9 +193,7 @@ class TestDynamicResCPDistributed:
     @pytest.mark.internal
     def test_gather_dynamic_res_roundtrip(self):
         """Each rank contributes a rank-shaped slice; gather concatenates them in rank order."""
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, context_parallel_size=2
-        )
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
 
         from megatron.core.parallel_state import (
             get_context_parallel_rank,
@@ -201,9 +228,7 @@ class TestDynamicResCPDistributed:
     @pytest.mark.internal
     def test_gather_dynamic_res_drops_padded_ranks(self):
         """``num_padded_imgs`` drops the trailing outputs before concatenation."""
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, context_parallel_size=2
-        )
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
 
         from megatron.core.parallel_state import get_context_parallel_rank
 
@@ -223,9 +248,7 @@ class TestDynamicResCPDistributed:
         With cp_size=2 and 2 equal-sized images, each rank should receive
         exactly one image worth of tokens and an image-size tensor of length 1.
         """
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, context_parallel_size=2
-        )
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
 
         from megatron.core.parallel_state import get_context_parallel_rank
 
@@ -285,3 +308,178 @@ class TestDynamicResCPDistributed:
         assert local_imgs_sizes.shape == (1, 2)
         # The value in local_t identifies which image this rank owns.
         assert torch.all(local_t == float(cp_rank))
+
+    @pytest.mark.internal
+    def test_split_dynamic_res_temporal_aware_tubelets(self):
+        """``temporal_patch_size > 1`` triggers the tubelet-aware split.
+
+        Two videos of 4 and 4 frames each, T=2 ⇒ 4 tubelets total over 2 CP
+        ranks ⇒ each rank owns 2 tubelets. Verify ``local_num_frames`` reflects
+        the per-rank frame counts (not tubelet counts).
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        from megatron.core.parallel_state import get_context_parallel_rank
+
+        cp_rank = get_context_parallel_rank()
+        patch_dim = 16
+        per_img_seq = patch_dim * patch_dim
+        hidden = 3 * patch_dim * patch_dim
+        # 4 frames per video × 2 videos = 8 frames total ⇒ 8 imgs in imgs_sizes.
+        num_videos = 2
+        frames_per_video = 4
+        num_frames_total = num_videos * frames_per_video
+
+        chunks = [
+            torch.full((per_img_seq, hidden), float(i), dtype=torch.float32, device="cuda")
+            for i in range(num_frames_total)
+        ]
+        global_t = torch.cat(chunks, dim=0).unsqueeze(0)
+        global_imgs_sizes = torch.tensor(
+            [[patch_dim, patch_dim]] * num_frames_total, dtype=torch.int32, device="cuda"
+        )
+        cu_seqlens = torch.tensor(
+            [i * per_img_seq for i in range(num_frames_total + 1)], dtype=torch.int32, device="cuda"
+        )
+        global_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=per_img_seq,
+            max_seqlen_kv=per_img_seq,
+        )
+        num_frames = torch.tensor([frames_per_video] * num_videos, dtype=torch.int32, device="cuda")
+
+        (local_t, local_imgs_sizes, _packed, has_padding, num_padded_ranks, local_num_frames) = (
+            split_to_context_parallel_ranks_dynamic_res(
+                global_t,
+                global_imgs_sizes,
+                global_packed_seq_params,
+                patch_dim=patch_dim,
+                num_frames=num_frames,
+                temporal_patch_size=2,
+            )
+        )
+
+        assert has_padding is False
+        assert num_padded_ranks == 0
+        # Per-rank frame counts: 4 tubelets ÷ 2 ranks = 2 tubelets/rank ⇒ 4 frames/rank.
+        assert local_num_frames is not None
+        assert int(local_num_frames.sum().item()) == 4
+        # Each rank owns 2 frames worth of patches.
+        assert local_t.shape == (1, 2 * per_img_seq, hidden)
+        assert local_imgs_sizes.shape == (2, 2)
+
+    @pytest.mark.internal
+    def test_split_dynamic_res_pads_when_too_few_images(self):
+        """``num_padded_imgs`` > 0 path: 1 image with cp_size=2 must pad with a dummy."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        patch_dim = 16
+        per_img_seq = patch_dim * patch_dim
+        hidden = 3 * patch_dim * patch_dim
+        global_t = torch.zeros((1, per_img_seq, hidden), dtype=torch.float32, device="cuda")
+        global_imgs_sizes = torch.tensor([[patch_dim, patch_dim]], dtype=torch.int32, device="cuda")
+        cu_seqlens = torch.tensor([0, per_img_seq], dtype=torch.int32, device="cuda")
+        global_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=per_img_seq,
+            max_seqlen_kv=per_img_seq,
+        )
+
+        _local_t, _local_sizes, _packed, _has_pad, num_padded_ranks, _ = (
+            split_to_context_parallel_ranks_dynamic_res(
+                global_t,
+                global_imgs_sizes,
+                global_packed_seq_params,
+                patch_dim=patch_dim,
+                temporal_patch_size=1,
+            )
+        )
+        # cp_size=2, num_imgs=1 ⇒ one dummy added ⇒ one rank is padded.
+        assert num_padded_ranks == 1
+
+    @pytest.mark.internal
+    def test_split_dynamic_res_asserts_on_wrong_hidden_dim(self):
+        """B10 regression: hidden dim must equal 3*patch_dim*patch_dim."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        patch_dim = 16
+        per_img_seq = patch_dim * patch_dim
+        wrong_hidden = 3 * patch_dim * patch_dim + 1  # off by one
+        global_t = torch.zeros(
+            (1, 2 * per_img_seq, wrong_hidden), dtype=torch.float32, device="cuda"
+        )
+        global_imgs_sizes = torch.tensor(
+            [[patch_dim, patch_dim]] * 2, dtype=torch.int32, device="cuda"
+        )
+        cu_seqlens = torch.tensor(
+            [0, per_img_seq, 2 * per_img_seq], dtype=torch.int32, device="cuda"
+        )
+        global_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=per_img_seq,
+            max_seqlen_kv=per_img_seq,
+        )
+
+        with pytest.raises(AssertionError, match="3\\*patch_dim\\*patch_dim"):
+            split_to_context_parallel_ranks_dynamic_res(
+                global_t,
+                global_imgs_sizes,
+                global_packed_seq_params,
+                patch_dim=patch_dim,
+                temporal_patch_size=1,
+            )
+
+    @pytest.mark.internal
+    def test_gather_from_context_parallel_ranks_drops_global_pad(self):
+        """``gather_from_context_parallel_ranks`` removes the trailing pad columns."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        from megatron.core.parallel_state import get_context_parallel_rank
+
+        cp_rank = get_context_parallel_rank()
+        # Each rank contributes a [batch=1, seq=3, h=4] tensor of value cp_rank.
+        local_t = torch.full((1, 3, 4), float(cp_rank), dtype=torch.float32, device="cuda")
+
+        # Simulate global_pad=2 ⇒ trailing 2 columns of the gathered tensor get dropped.
+        out = gather_from_context_parallel_ranks(local_t, global_pad=2)
+
+        # cp_size * seq - global_pad = 2*3 - 2 = 4 effective columns.
+        assert out.shape == (1, 4, 4)
+
+    @pytest.mark.internal
+    def test_gather_from_context_parallel_ranks_autograd_backward(self):
+        """``GatherFromContextParallelRanks.backward`` must reduce-scatter gradients.
+
+        We feed a ``[1, seq, h]`` tensor on each rank, all-gather along seq,
+        sum the result, and backprop. The autograd backward path should run the
+        reduce-scatter and yield a finite per-rank gradient.
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        from megatron.core.parallel_state import get_context_parallel_rank
+
+        cp_rank = get_context_parallel_rank()
+        local_t = torch.full(
+            (1, 4, 8), float(cp_rank + 1), dtype=torch.float32, device="cuda", requires_grad=True
+        )
+
+        gathered = GatherFromContextParallelRanks.apply(local_t)
+        loss = gathered.sum()
+        loss.backward()
+
+        assert local_t.grad is not None
+        assert local_t.grad.shape == local_t.shape
+        # Reduce-scatter of an all-ones grad gives a positive gradient on every rank.
+        assert torch.all(local_t.grad > 0)
