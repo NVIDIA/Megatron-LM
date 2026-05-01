@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+import gc
+import logging
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -18,6 +20,8 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
+
+logger = logging.getLogger(__name__)
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
@@ -70,6 +74,22 @@ def erf_gelu(x):
     return (
         x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype) + torch.ones_like(x).to(dtype=x.dtype))
     )
+
+
+@torch.no_grad()
+def sh_ten_merge_fn(sub_state_dict):
+    """Merge sharded tensor pieces, falling back to CPU if device-side cat OOMs."""
+    try:
+        return torch.cat(sub_state_dict)
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        logger.warning(
+            f"CUDA OutOfMemoryError encountered during tensors merging."
+            f" Switching to CPU merge. (Error: {e})"
+        )
+        merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
+        gc.collect()
+        torch.cuda.empty_cache()
+        return merged_sub_state_dict
 
 
 def make_sharded_tensors_for_checkpoint(

@@ -1,8 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import gc
-import logging
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,6 +25,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import sh_ten_merge_fn
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
@@ -40,9 +39,6 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
-
-
-logger = logging.getLogger(__name__)
 
 
 class LinearFc1Interface(Protocol):
@@ -426,20 +422,6 @@ def apply_swiglu_sharded_factory(
                 prepend_axis_num=prepend_axis_num,
             ),
         ]
-
-    def sh_ten_merge_fn(sub_state_dict):
-        with torch.no_grad():
-            try:
-                return torch.cat(sub_state_dict)
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                logger.warning(
-                    f"CUDA OutOfMemoryError encountered during tensors merging."
-                    f" Switching to CPU merge. (Error: {e})"
-                )
-                merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
-                gc.collect()
-                torch.cuda.empty_cache()
-                return merged_sub_state_dict
 
     return ShardedTensorFactory(
         original_sh_ten.key,
