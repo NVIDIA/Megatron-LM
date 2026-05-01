@@ -61,7 +61,7 @@ def _ref_sequential_moe(
     max_tokens, topk = routing_map.shape
     hidden_size = hidden_states.shape[1]
 
-    out = torch.zeros(max_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    out = torch.zeros(max_tokens, hidden_size, device="cuda", dtype=torch.float32)
 
     for t in range(vt):
         acc = torch.zeros(hidden_size, device="cuda", dtype=torch.float32)
@@ -74,7 +74,7 @@ def _ref_sequential_moe(
                 activated = torch.clamp(fc1_out, min=0.0) ** 2
                 fc2_out = activated @ fc2_weight[lid].float().T
                 acc += probs[t, k].item() * fc2_out
-        out[t] = acc.bfloat16()
+        out[t] = acc
 
     return out
 
@@ -462,7 +462,7 @@ class TestVllmFusedMoe:
         )
 
         assert result.shape == (max_tokens, hidden_size)
-        assert result.dtype == torch.bfloat16
+        assert result.dtype == torch.float32
         torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
 
     @pytest.mark.parametrize(
