@@ -118,6 +118,7 @@ def create_args():
     args.ckpt_step = None
     args.swiglu = True
     args.num_experts = 1
+    args.verify_integrity = False
 
     yield args
 
@@ -140,6 +141,7 @@ def create_ckpt_load_args(create_args):
     args.ckpt_assume_constant_structure = False
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
+    args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
@@ -152,7 +154,9 @@ def create_ckpt_load_args(create_args):
 def init_model_parallel():
     """Init torch distributed."""
     Utils.initialize_model_parallel(1, 1)
-    init_num_microbatches_calculator(0, 1, 1, 1)
+    init_num_microbatches_calculator(
+        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+    )
     model_parallel_cuda_manual_seed(123)
     yield  # Run the actual test.
     Utils.destroy_model_parallel()

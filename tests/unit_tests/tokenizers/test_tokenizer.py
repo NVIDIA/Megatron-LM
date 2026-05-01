@@ -1,5 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from unittest.mock import MagicMock
+
+import numpy as np
 import pytest
 import torch
 from packaging import version
@@ -275,7 +278,9 @@ def test_null_tokenizer():
     ids = tokenizer.tokenize("11 325 97")
 
     assert ids == [11, 325, 97]
-    assert tokenizer.vocab_size == 131073
+    assert tokenizer.vocab_size == 131072
+    assert tokenizer.eod == 131071
+    assert tokenizer.pad == -1
 
 
 @pytest.mark.parametrize("skip_special_tokens", [True, False])
@@ -460,3 +465,61 @@ def test_sft_tokenizer():
     assert len(conv_tokens) > 0 and len(conv_tokens) == len(
         target_tokens
     ), "failed to tokenize conversation and return target tokens"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for SFTTokenizer._extract_token_ids (no GPU / real tokenizer needed)
+# ---------------------------------------------------------------------------
+
+try:
+    from megatron.core.tokenizers.text.libraries.sft_tokenizer import SFTTokenizer
+
+    HAVE_SFT_TOKENIZER = True
+except Exception:
+    HAVE_SFT_TOKENIZER = False
+
+_IDS = [1, 2, 3, 4, 5]
+
+
+@pytest.mark.skipif(not HAVE_SFT_TOKENIZER, reason="SFTTokenizer not importable")
+class TestExtractTokenIds:
+    """Covers every return-type branch of SFTTokenizer._extract_token_ids."""
+
+    def _check(self, result):
+        arr = SFTTokenizer._extract_token_ids(result)
+        assert isinstance(arr, np.ndarray), "result must be ndarray"
+        assert arr.ndim == 1, f"expected 1D, got shape {arr.shape}"
+        assert arr.tolist() == _IDS
+
+    # --- dict with 1D ids (plain list inside dict) ---
+    def test_dict_1d_list(self):
+        self._check({"input_ids": _IDS})
+
+    # --- dict with 2D ids (transformers return_tensors="np" wrapped in dict) ---
+    def test_dict_2d_ndarray(self):
+        self._check({"input_ids": np.array([_IDS])})  # shape (1, 5)
+
+    # --- BatchEncoding-like object with input_ids attribute, 2D ---
+    def test_object_with_input_ids_attr_2d(self):
+        obj = MagicMock()
+        obj.__getitem__ = lambda self, k: np.array([_IDS]) if k == "input_ids" else None
+        obj.input_ids = np.array([_IDS])
+        self._check(obj)
+
+    # --- Fast-tokenizer Encoding object with .ids attribute ---
+    def test_object_with_ids_attr(self):
+        obj = MagicMock(spec=["ids"])  # no input_ids, no dict behaviour
+        obj.ids = _IDS
+        self._check(obj)
+
+    # --- plain list (transformers default / return_dict=False) ---
+    def test_plain_list(self):
+        self._check(list(_IDS))
+
+    # --- 1D raw ndarray ---
+    def test_1d_ndarray(self):
+        self._check(np.array(_IDS))
+
+    # --- 2D raw ndarray (1, seq_len) — the bug fixed in this PR ---
+    def test_2d_ndarray_batch1(self):
+        self._check(np.array([_IDS]))  # shape (1, 5)
