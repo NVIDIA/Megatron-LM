@@ -77,6 +77,8 @@ class FlashInferSampling(Sampling):
             top_k = md["top_k"][token_to_request_index]
             top_p = md["top_p"][token_to_request_index]
 
+        # Clamp temperature to avoid division by 0.
+        temperature = temperature.clamp(min=1e-6)
         if gather_indices is None:
             scaled = logits[:n] / temperature.unsqueeze(1)
         else:
