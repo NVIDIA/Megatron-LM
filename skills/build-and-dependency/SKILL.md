@@ -27,6 +27,24 @@ dependency.
 
 ---
 
+## dev vs lts
+
+Two image variants exist, controlled by the `IMAGE_TYPE` build arg and the
+`container::lts` PR label:
+
+| Variant | Base image pin | uv group | When used |
+|---------|---------------|----------|-----------|
+| **`dev`** | `docker/.ngc_version.dev` | `dev` | Default — CI, local development, most PRs |
+| **`lts`** | `docker/.ngc_version.lts` | `lts` | Stability testing; excludes ModelOpt and other bleeding-edge extras |
+
+**Use `dev` for everything unless you have a specific reason to test `lts`.**
+CI runs `dev` by default; attach `container::lts` to a PR only when verifying
+compatibility with the stable stack (e.g. a dependency upgrade that must not
+break LTS users). The `@pytest.mark.flaky_in_dev` marker skips tests in the
+`dev` environment; `@pytest.mark.flaky` skips them in `lts`.
+
+---
+
 ## Step 1 — Acquire an Image
 
 **Option A — NVIDIA-internal: pull a CI-built image**
