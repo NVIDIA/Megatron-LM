@@ -6,6 +6,7 @@ import json
 import logging
 import signal
 import socket
+import time
 from collections import deque
 from enum import Enum, auto
 from multiprocessing import Event
@@ -14,7 +15,8 @@ from multiprocessing.connection import Connection
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
-from megatron.core.inference.headers import Headers, UnknownHeaderError
+from megatron.core.inference.coordinator_metrics import CoordinatorMetrics, NoOpMetrics
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -95,6 +97,7 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
+        metrics: CoordinatorMetrics | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -200,6 +203,11 @@ class DataParallelInferenceCoordinator:
             identity: idx for idx, identity in enumerate(sorted_identities)
         }
 
+        # Metrics backend (defaults to no-op when not provided).
+        self.metrics: CoordinatorMetrics = metrics if metrics is not None else NoOpMetrics()
+        # Best-effort gauge update; eventual consistency is sufficient for observability.
+        self.metrics.gauge("coordinator_active_engines", float(len(self.identities_of_data_parallel_ranks)))
+
     def get_next_data_parallel_rank(self):
         """
         Selects the next data parallel rank using round-robin scheduling.
@@ -214,6 +222,28 @@ class DataParallelInferenceCoordinator:
         self._round_robin_idx = idx + 1
         return identities[idx]
 
+    def _log_protocol_error(
+        self, error_type: str, message: str, context: dict | None = None
+    ) -> None:
+        """Observability enhancement that complements (not replaces) PR #4419 robustness.
+
+        Centralizes protocol error classification for structured logging and metrics attribution.
+        """
+        context = context or {}
+        logging.warning(
+            "Coordinator protocol error | type=%s message=%s context=%s",
+            error_type,
+            message,
+            context,
+        )
+
+        metric_name = {
+            "client_error": "coordinator_invalid_message_total",
+            "internal_error": "coordinator_internal_error_total",
+        }.get(error_type)
+        if metric_name is not None:
+            self.metrics.inc(metric_name)
+
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
         self.identities_of_data_parallel_ranks.remove(identity)
@@ -222,6 +252,8 @@ class DataParallelInferenceCoordinator:
             identity,
             len(self.identities_of_data_parallel_ranks),
         )
+        # Best-effort gauge update; eventual consistency is sufficient for observability.
+        self.metrics.gauge("coordinator_active_engines", float(len(self.identities_of_data_parallel_ranks)))
 
     def _send_to_engine(self, identity, payload):
         """Send payload to an engine, removing it from the pool if unreachable.
@@ -233,6 +265,9 @@ class DataParallelInferenceCoordinator:
             self.router_socket.send_multipart([identity, payload])
             return True
         except zmq.error.ZMQError as e:
+            # We treat all send failures as "unreachable" signals for observability
+            # to surface communication reliability issues, without changing behavior
+            self.metrics.inc("coordinator_engine_unreachable_total")
             if e.errno == zmq.EHOSTUNREACH:
                 self._remove_engine(identity)
                 return False
@@ -256,7 +291,7 @@ class DataParallelInferenceCoordinator:
         token_tensor = torch.tensor(tokens, dtype=torch.int64)
         return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
 
-    def get_best_data_parallel_rank(self, request_hashes):
+    def get_best_data_parallel_rank(self, request_hashes, record_metrics: bool = False):
         """Select the best DP rank based on prefix cache affinity.
 
         Iterates request hashes in reverse order and picks the rank that cached
@@ -285,8 +320,17 @@ class DataParallelInferenceCoordinator:
             if rank_info:
                 # Pick the most recently assigned rank.
                 best_rank = max(rank_info, key=rank_info.get)
+                # Detect stale entries: rank matched in hash table but no longer alive.
+                if record_metrics:
+                    if best_rank not in self.identities_of_data_parallel_ranks:
+                        self.metrics.inc("routing_stale_detected_total")
+                    else:
+                        self.metrics.inc("routing_cache_hit_total")
                 return best_rank
 
+        # No hash match — fall back to round-robin.
+        if record_metrics:
+            self.metrics.inc("routing_cache_miss_total")
         return self.get_next_data_parallel_rank()
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
@@ -315,184 +359,229 @@ class DataParallelInferenceCoordinator:
         known_clients = set()
         while True:
             sender_identity, serialized_payload = self.router_socket.recv_multipart()
+            _message_start = time.monotonic()
 
-            # Allow for re-registration if connecting to a running coordinator.
-            if serialized_payload == b"":
-                if sender_identity not in self.identities_of_data_parallel_ranks:
-                    self.identities_of_data_parallel_ranks.append(sender_identity)
-                continue
+            try:
 
-            deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
-            header = Headers(deserialized_payload[0])
-
-            if header == Headers.CONNECT:
-                if sender_identity in known_clients:
-                    logging.info(
-                        f"Client {sender_identity} sent a duplicate connect request. Ignoring .."
-                    )
+                # Allow for re-registration if connecting to a running coordinator.
+                if serialized_payload == b"":
+                    if sender_identity not in self.identities_of_data_parallel_ranks:
+                        self.identities_of_data_parallel_ranks.append(sender_identity)
+                        # Best-effort gauge update; eventual consistency is sufficient for observability.
+                        self.metrics.gauge(
+                            "coordinator_active_engines",
+                            float(len(self.identities_of_data_parallel_ranks)),
+                        )
                     continue
 
-                # print(f"New client connected: {sender_identity}")
-                known_clients.add(sender_identity)
-                self.router_socket.send_multipart(
-                    [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
-                )
+                deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
+                header = Headers(deserialized_payload[0])
 
-            elif header == Headers.SUBMIT_REQUEST:
-                # ToDo [Siddharth]: We might want to tokenize the prompt on the
-                # assigned data parallel rank for this process instead
-                # of the coordinator.
-
-                # Message from a known client
-                if sender_identity not in known_clients:
-                    logging.info(
-                        f"Received message from unknown client {sender_identity}. Ignoring."
-                    )
-                    continue
-                # this is a message from a client.
-                # route it to a data parallel rank
-                client_request_id, prompt, sampling_params = deserialized_payload[1:]
-                # map client request_id to server request_id
-                # necessary because multiple clients might have the same request_id.
-                request_id = self.next_request_id
-                self.next_request_id += 1
-                self.request_id_to_client_id[request_id] = sender_identity
-                self.request_id_to_client_request_id[request_id] = client_request_id
-
-                # Serialize prompt.
-                if isinstance(prompt, (str, list)):
-                    pass
-                elif isinstance(prompt, torch.Tensor):
-                    prompt = prompt.tolist()
-                else:
-                    raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
-
-                payload = msgpack.packb(
-                    [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
-                    use_bin_type=True,
-                )
-
-                request_hashes = self.compute_request_hashes(prompt)
-                if (
-                    self.prefix_caching_coordinator_policy
-                    == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
-                ):
-                    request_hashes = request_hashes[:1]
-
-                # Account for the fact that some engines may have died.
-                for _ in range(len(self.identities_of_data_parallel_ranks)):
-                    next_identity = self.get_best_data_parallel_rank(request_hashes)
-                    if self._send_to_engine(next_identity, payload):
-                        break
-                else:
-                    # If all engines have died, we are in an abnormal state, and must exit cleanly.
-                    logging.error("Coordinator: no reachable engines for request %d", request_id)
-                    del self.request_id_to_client_id[request_id]
-                    del self.request_id_to_client_request_id[request_id]
-                    return
-
-                if request_hashes:
-                    self._update_rank_hashes(next_identity, request_hashes)
-                if self.schedule_records is not None:
-                    self.schedule_records.append(
-                        {
-                            "request_id": request_id,
-                            "rank_index": self.identity_to_rank_index[next_identity],
-                            "num_hashes": len(request_hashes),
-                        }
-                    )
-
-            elif header in (
-                Headers.PAUSE,
-                Headers.UNPAUSE,
-                Headers.SUSPEND,
-                Headers.RESUME,
-                Headers.SET_GENERATION_EPOCH,
-                Headers.STOP,
-            ):
-                # Start by checking the current state against the control signal.
-                if sender_identity not in known_clients:
-                    logging.warning("Coordinator: ignoring signal from unknown client.")
-                    continue
-
-                if header == Headers.PAUSE:
-                    idem_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
-                    if self.state == self.CoordinatorState.RUNNING:
-                        self.state = self.CoordinatorState.PAUSED
-                    elif self.state in idem_states:
-                        # Already paused/suspended, ignore redundant PAUSE.
+                if header == Headers.CONNECT:
+                    if sender_identity in known_clients:
+                        logging.info(
+                            f"Client {sender_identity} sent a duplicate connect request. Ignoring .."
+                        )
                         continue
-                    else:
-                        logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
-                        continue
-                elif header == Headers.UNPAUSE:
-                    if self.state != self.CoordinatorState.PAUSED:
-                        logging.warning("Coordinator: ignoring UNPAUSE in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.RUNNING
-                elif header == Headers.SUSPEND:
-                    if self.state != self.CoordinatorState.PAUSED:
-                        logging.warning("Coordinator: ignoring SUSPEND in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.SUSPENDED
-                elif header == Headers.RESUME:
-                    if self.state != self.CoordinatorState.SUSPENDED:
-                        logging.warning("Coordinator: ignoring RESUME in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.PAUSED
-                elif header == Headers.STOP:
-                    good_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
-                    if self.state not in good_states:
-                        logging.warning("Coordinator: ignoring STOP in state %s", self.state)
-                        continue
-                    self.state = self.CoordinatorState.STOPPING
 
-                # Broadcast the control signal if we're in a good state.
-                # Forward the full deserialized payload so that data-bearing
-                # signals (e.g. SET_GENERATION_EPOCH) retain their arguments.
-                broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
-                for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
-                    self._send_to_engine(data_parallel_rank_id, broadcast_payload)
-
-                # STOP affects engines; reset coordinator to RUNNING to allow future engines.
-                if header == Headers.STOP:
-                    self.state = self.CoordinatorState.RUNNING
-
-            elif header == Headers.ENGINE_REPLY:
-                # This is the output of a single engine step on some data parallel rank.
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                finished_requests = deserialized_payload[1]
-
-                for finished_request in finished_requests:
-                    self.detokenize(finished_request)
-                    fid = finished_request["request_id"]
-                    client_identity = self.request_id_to_client_id[fid]
-                    client_request_identity = self.request_id_to_client_request_id[fid]
-                    del self.request_id_to_client_id[fid]
-                    del self.request_id_to_client_request_id[fid]
-
+                    # print(f"New client connected: {sender_identity}")
+                    known_clients.add(sender_identity)
                     self.router_socket.send_multipart(
                         [
-                            client_identity,
-                            msgpack.packb(
-                                [header.value, client_request_identity, finished_request],
-                                use_bin_type=True,
-                            ),
+                            sender_identity,
+                            msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True),
                         ]
                     )
 
-            elif header == Headers.SHUTDOWN:
-                if sender_identity not in known_clients:
-                    logging.warning("Coordinator: ignoring signal from unknown client.")
+                elif header == Headers.SUBMIT_REQUEST:
+                    # ToDo [Siddharth]: We might want to tokenize the prompt on the
+                    # assigned data parallel rank for this process instead
+                    # of the coordinator.
+
+                    # Message from a known client
+                    if sender_identity not in known_clients:
+                        self.metrics.inc("coordinator_unknown_sender_total")
+                        logging.info(
+                            f"Received message from unknown client {sender_identity}. Ignoring."
+                        )
+                        continue
+                    # this is a message from a client.
+                    # route it to a data parallel rank
+                    client_request_id, prompt, sampling_params = deserialized_payload[1:]
+                    # map client request_id to server request_id
+                    # necessary because multiple clients might have the same request_id.
+                    request_id = self.next_request_id
+                    self.next_request_id += 1
+                    self.request_id_to_client_id[request_id] = sender_identity
+                    self.request_id_to_client_request_id[request_id] = client_request_id
+
+                    # Serialize prompt.
+                    if isinstance(prompt, (str, list)):
+                        pass
+                    elif isinstance(prompt, torch.Tensor):
+                        prompt = prompt.tolist()
+                    else:
+                        raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
+
+                    payload = msgpack.packb(
+                        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
+                        use_bin_type=True,
+                    )
+
+                    _routing_start = time.monotonic()
+                    request_hashes = self.compute_request_hashes(prompt)
+                    if (
+                        self.prefix_caching_coordinator_policy
+                        == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+                    ):
+                        request_hashes = request_hashes[:1]
+
+                    # Metrics are recorded once per request to avoid inflation
+                    record_routing_metrics = True
+                    # Account for the fact that some engines may have died.
+                    for _ in range(len(self.identities_of_data_parallel_ranks)):
+                        next_identity = self.get_best_data_parallel_rank(
+                            request_hashes, record_metrics=record_routing_metrics
+                        )
+                        record_routing_metrics = False
+                        if self._send_to_engine(next_identity, payload):
+                            break
+                    else:
+                        # If all engines have died, we are in an abnormal state, and must exit cleanly.
+                        self.metrics.inc("coordinator_all_engines_exhausted_total")
+                        logging.error("Coordinator: no reachable engines for request %d", request_id)
+                        del self.request_id_to_client_id[request_id]
+                        del self.request_id_to_client_request_id[request_id]
+                        return
+
+                    self.metrics.observe(
+                        "coordinator_routing_latency_seconds", time.monotonic() - _routing_start
+                    )
+
+                    if request_hashes:
+                        self._update_rank_hashes(next_identity, request_hashes)
+                    if self.schedule_records is not None:
+                        self.schedule_records.append(
+                            {
+                                "request_id": request_id,
+                                "rank_index": self.identity_to_rank_index[next_identity],
+                                "num_hashes": len(request_hashes),
+                            }
+                        )
+
+                elif header in (
+                    Headers.PAUSE,
+                    Headers.UNPAUSE,
+                    Headers.SUSPEND,
+                    Headers.RESUME,
+                    Headers.SET_GENERATION_EPOCH,
+                    Headers.STOP,
+                ):
+                    # Start by checking the current state against the control signal.
+                    if sender_identity not in known_clients:
+                        self.metrics.inc("coordinator_unknown_sender_total")
+                        logging.warning("Coordinator: ignoring signal from unknown client.")
+                        continue
+
+                    if header == Headers.PAUSE:
+                        idem_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                        if self.state == self.CoordinatorState.RUNNING:
+                            self.state = self.CoordinatorState.PAUSED
+                        elif self.state in idem_states:
+                            # Already paused/suspended, ignore redundant PAUSE.
+                            continue
+                        else:
+                            logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
+                            continue
+                    elif header == Headers.UNPAUSE:
+                        if self.state != self.CoordinatorState.PAUSED:
+                            logging.warning("Coordinator: ignoring UNPAUSE in state %s", self.state)
+                            continue
+                        self.state = self.CoordinatorState.RUNNING
+                    elif header == Headers.SUSPEND:
+                        if self.state != self.CoordinatorState.PAUSED:
+                            logging.warning("Coordinator: ignoring SUSPEND in state %s", self.state)
+                            continue
+                        self.state = self.CoordinatorState.SUSPENDED
+                    elif header == Headers.RESUME:
+                        if self.state != self.CoordinatorState.SUSPENDED:
+                            logging.warning("Coordinator: ignoring RESUME in state %s", self.state)
+                            continue
+                        self.state = self.CoordinatorState.PAUSED
+                    elif header == Headers.STOP:
+                        good_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                        if self.state not in good_states:
+                            logging.warning("Coordinator: ignoring STOP in state %s", self.state)
+                            continue
+                        self.state = self.CoordinatorState.STOPPING
+
+                    # Broadcast the control signal if we're in a good state.
+                    # Forward the full deserialized payload so that data-bearing
+                    # signals (e.g. SET_GENERATION_EPOCH) retain their arguments.
+                    broadcast_payload = msgpack.packb(deserialized_payload, use_bin_type=True)
+                    for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
+                        self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+
+                    # STOP affects engines; reset coordinator to RUNNING to allow future engines.
+                    if header == Headers.STOP:
+                        self.state = self.CoordinatorState.RUNNING
+
+                elif header == Headers.ENGINE_REPLY:
+                    # This is the output of a single engine step on some data parallel rank.
+                    if sender_identity not in self.identities_of_data_parallel_ranks:
+                        self._log_protocol_error(
+                            "internal_error",
+                            "ENGINE_REPLY from unregistered engine",
+                            context={"sender": repr(sender_identity)},
+                        )
+                    assert sender_identity in self.identities_of_data_parallel_ranks
+                    finished_requests = deserialized_payload[1]
+
+                    for finished_request in finished_requests:
+                        self.detokenize(finished_request)
+                        fid = finished_request["request_id"]
+                        client_identity = self.request_id_to_client_id[fid]
+                        client_request_identity = self.request_id_to_client_request_id[fid]
+                        del self.request_id_to_client_id[fid]
+                        del self.request_id_to_client_request_id[fid]
+
+                        self.router_socket.send_multipart(
+                            [
+                                client_identity,
+                                msgpack.packb(
+                                    [header.value, client_request_identity, finished_request],
+                                    use_bin_type=True,
+                                ),
+                            ]
+                        )
+
+                elif header == Headers.SHUTDOWN:
+                    if sender_identity not in known_clients:
+                        self.metrics.inc("coordinator_unknown_sender_total")
+                        logging.warning("Coordinator: ignoring signal from unknown client.")
+                        continue
+                    break
+
+                elif header == Headers.DISCONNECT:
+                    if sender_identity in self.identities_of_data_parallel_ranks:
+                        self._remove_engine(sender_identity)
+
+                else:
+                    # Unknown headers are treated as client errors and safely ignored
+                    # to preserve coordinator stability (consistent with protocol robustness goals)
+                    self._log_protocol_error(
+                        "client_error",
+                        "Unrecognized message header",
+                        context={"header": repr(header)},
+                    )
                     continue
-                break
-
-            elif header == Headers.DISCONNECT:
-                if sender_identity in self.identities_of_data_parallel_ranks:
-                    self._remove_engine(sender_identity)
-
-            else:
-                raise UnknownHeaderError(header)
+            finally:
+                # Includes full message handling time (routing + processing)
+                # Separate routing latency metric captures hash computation, routing decision, and send overhead
+                self.metrics.observe(
+                    "coordinator_message_processing_latency_seconds",
+                    time.monotonic() - _message_start,
+                )
 
     def detokenize(self, finished_request):
         """
@@ -533,6 +622,7 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         schedule_output_path: str | None = None,
+        metrics: CoordinatorMetrics | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -551,6 +641,7 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching (bool): Whether prefix caching is enabled.
             prefix_caching_coordinator_policy (PrefixCachingCoordinatorPolicy): Routing policy.
             schedule_output_path (Optional[str]): Path to write scheduling decisions JSON.
+            metrics (Optional[CoordinatorMetrics]): Metrics backend.  Defaults to NoOpMetrics.
         """
         coordinator = cls(
             pipe_connection,
@@ -562,6 +653,7 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             schedule_output_path=schedule_output_path,
+            metrics=metrics,
         )
         ready_event.set()
         try:
