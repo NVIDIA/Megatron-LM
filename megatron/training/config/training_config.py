@@ -529,6 +529,11 @@ class CheckpointConfig:
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
+    ckpt_load_validate_sharding_integrity: bool = True
+    """Whether to validate sharding access integrity when loading a distributed checkpoint.
+    When True (default), each tensor shard is checked to be accessed exactly once as main
+    replica by some rank. Disabling skips this validation"""
+
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
@@ -574,14 +579,28 @@ class CheckpointConfig:
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
 
+    verify_integrity: bool = False
+    """Whether to hash checkpointing files during save and validate their integrity during load."""
+
     def __post_init__(self):
-        from megatron.training.utils import has_nvrx_installed
+        from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in ["nvrx", "mcore"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
 
-        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
-            assert has_nvrx_installed(), (
-                "nvidia-resiliency-ext is not installed. "
-                "Please, install nvidia-resiliency-ext to enable async save."
+        if not self.async_save:
+            self.async_strategy = "mcore"
+
+        if (
+            self.async_save
+            and self.async_strategy == "nvrx"
+            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
+        ):
+            assert has_nvrx_checkpointing_async_support(), (
+                "A compatible nvidia-resiliency-ext installation is required to enable "
+                "async save with async_strategy='nvrx'."
             )
+
+        if self.verify_integrity:
+            assert self.ckpt_format == "torch_dist", \
+                f"`verify_integrity` is only supported with torch_dist checkpoint format."

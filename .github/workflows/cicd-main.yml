@@ -972,7 +972,6 @@ jobs:
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
-        || github.event == 'merge_group'
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
@@ -998,6 +997,7 @@ jobs:
     if: |
       (
         (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
+        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
         || success()
       )
       && !cancelled()
@@ -1006,6 +1006,11 @@ jobs:
       matrix:
         flag: [unit-test]
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        uses: nv-gha-runners/get-pr-info@main
+
       - name: Checkout
         uses: actions/checkout@v6
 
@@ -1036,6 +1041,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
+          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
