@@ -778,8 +778,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
-            # Bind the unified CPU/GPU buffers so the 9 per-step Mamba fields
-            # ride along with the single coalesced H2D in
+            # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
+            # fields ride along with the single coalesced H2D in
             # transfer_bookkeeping_to_gpu().
             self.mamba_metadata.bind_cpu_buffers(
                 {
@@ -924,7 +924,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             for label, tensor in self.request_metadata.items()
         }
 
-        # Coalesced pinned CPU buffer for the 9 bookkeeping fields that get
+        # Coalesced pinned CPU buffer for the bookkeeping fields that get
         # transferred to GPU each step via transfer_bookkeeping_to_gpu().
         # Layout matches ContextGPUView._buf so a single cudaMemcpyAsync
         # suffices. Int64 token fields come first (8-byte aligned automatically),

@@ -109,8 +109,8 @@ class MambaMetadata:
             self.conv_gather_offsets = None
 
         # Coalesced production path: pinned CPU views + shared GPU views bound
-        # by DynamicInferenceContext so that the 9 per-step Mamba fields ride
-        # along with the single coalesced H2D in transfer_bookkeeping_to_gpu.
+        # by DynamicInferenceContext so that the per-step Mamba metadata fields
+        # ride along with the single coalesced H2D in transfer_bookkeeping_to_gpu.
         # The legacy update() path above keeps using the standalone _*_buffer
         # tensors (exercised only by unit tests that construct MambaMetadata
         # without a context).
@@ -638,8 +638,8 @@ class MambaMetadata:
     def load_from_cpu(self, d: dict) -> None:
         """Point state attributes at the freshly-transferred shared GPU views.
 
-        No H2D copies happen here: the 9 Mamba fields were transferred as
-        part of the coalesced bookkeeping H2D. This method just slices the
+        No H2D copies happen here: the Mamba metadata fields were transferred
+        as part of the coalesced bookkeeping H2D. This method just slices the
         bound GPU views to the per-step sizes and runs the intermediate
         metadata computation (which reads from the now-valid GPU cu_seqlens).
 
