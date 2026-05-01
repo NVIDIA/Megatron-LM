@@ -9,16 +9,14 @@ common config. Anything derivable from other fields (``num_query_groups``,
 time inside :meth:`LayerConfig.to_transformer_config` rather than required
 from the recipe.
 
-Special pattern markers — :class:`EmbeddingLayerConfig`,
-:class:`CrossEntropyLayerConfig`, :class:`PipelineSplit` — also live here.
-They participate in the layer pattern but are not "layers" the
-:class:`HybridStack` constructs; they encode model-wrapping metadata
-(vocab/sequence shape) or pipeline boundaries.
+Special pattern markers — :class:`EmbeddingLayerConfig` and
+:class:`CrossEntropyLayerConfig` — also live here. They participate in
+the layer pattern but are not "layers" the :class:`HybridStack`
+constructs; they encode model-wrapping metadata (vocab/sequence shape).
 """
 
-import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, Optional, Union
 
 from megatron.core.models.hybrid.common_layer_config import (
     CommonLayerConfig,
@@ -70,8 +68,8 @@ class LayerConfig:
         layer pattern, so recipes never need to set it manually.
 
         ``parallelism`` carries the universal model-level parallelism
-        settings (TP/PP/CP, pipeline_dtype) — these **always win** because
-        they're job-level. EP/ETP are MoE-only and are injected into MoE
+        settings (TP/CP) — these **always win** because they're
+        job-level. EP/ETP are MoE-only and are injected into MoE
         per-layer TCs by :meth:`HybridModelConfig.compile`, not via this
         path. ``placeholders`` carries values that satisfy
         :meth:`TransformerConfig.__post_init__` invariants on layers that
@@ -94,6 +92,19 @@ class LayerConfig:
         kwargs.update(self._layer_specific_kwargs())
         if self.extra:
             validate_extra_kwargs(self.extra, f"{type(self).__name__}.extra")
+            # Reject ``extra`` keys that would shadow model-wide parallelism
+            # values. Process groups are constructed once from the recipe's
+            # topology; a per-layer extra that disagreed would produce a TC
+            # whose sharding claims contradict the live process groups —
+            # invalid sharding or runtime errors. Job-level fields always win.
+            if parallelism:
+                shadowed = set(parallelism) & set(self.extra)
+                if shadowed:
+                    raise ValueError(
+                        f"{type(self).__name__}.extra cannot override model-wide "
+                        f"parallelism fields {sorted(shadowed)}; set them on "
+                        f"HybridModelConfig instead."
+                    )
             kwargs.update(self.extra)
         # Test-friendly fallback: ``compile()`` always supplies a placeholder,
         # but unit tests calling ``lc.to_transformer_config(num_layers=N)``
@@ -209,15 +220,22 @@ class DSALayerConfig(LayerConfig):
     kv_channels: Optional[int] = None
     """KV head dim."""
 
+    add_qkv_bias: Optional[bool] = None
+    """Bias in the QKV projection only, overriding ``add_bias_linear`` for
+    QKV. Mirrors the same field on :class:`AttentionLayerConfig`."""
+
     SYMBOL: ClassVar[str] = Symbols.DS_ATTENTION
 
     def _layer_specific_kwargs(self) -> Dict[str, Any]:
-        return {
+        kwargs: Dict[str, Any] = {
             "num_attention_heads": self.num_attention_heads,
             "num_query_groups": self.num_query_groups,
             "kv_channels": self.kv_channels,
             "multi_latent_attention": True,
         }
+        if self.add_qkv_bias is not None:
+            kwargs["add_qkv_bias"] = self.add_qkv_bias
+        return kwargs
 
 
 @dataclass
@@ -406,41 +424,38 @@ class EmbeddingLayerConfig:
     scatter_embedding_sequence_parallel: bool = True
     """Scatter the embedding output along the sequence-parallel dim."""
 
+    # YARN scaling (consumed only when ``position_embedding_type == "yarn"``).
+    # These are not :class:`TransformerConfig` dataclass fields today; they are
+    # attached as ad-hoc attributes by :meth:`HybridModelConfig.compile` to
+    # match the existing :func:`getattr` lookups in
+    # :class:`HybridModel.__init__`. When upstream lifts them onto
+    # :class:`TransformerConfig`, this block can collapse to plain ``extra``
+    # passthroughs and the setattr loop in ``compile()`` goes away.
+    yarn_rotary_scaling_factor: Optional[float] = None
+    """YARN scaling factor (s)."""
+
+    yarn_original_max_position_embeddings: Optional[int] = None
+    """Original max position embeddings the model was trained with."""
+
+    yarn_beta_fast: Optional[float] = None
+    """YARN beta-fast schedule parameter."""
+
+    yarn_beta_slow: Optional[float] = None
+    """YARN beta-slow schedule parameter."""
+
+    yarn_mscale: Optional[float] = None
+    """YARN m-scale parameter."""
+
+    yarn_mscale_all_dim: Optional[float] = None
+    """YARN m-scale-all-dim parameter."""
+
+    yarn_correction_range_round_to_int: Optional[bool] = None
+    """Round YARN correction range to int."""
+
     extra: Dict[str, Any] = field(default_factory=dict)
     """Passthrough kwargs forwarded to the stack-level
     :class:`TransformerConfig` (used for the embedding init / final norm).
     Same semantics as :attr:`CommonLayerConfig.extra`."""
-
-
-@dataclass
-class MTPLayerConfig:
-    """Multi-Token Prediction marker (one instance per MTP depth).
-
-    A pattern with two MTP depths is written as ``[..., MTP, MTP, Loss]`` —
-    each :class:`MTPLayerConfig` instance corresponds to one prediction depth
-    and they all share the same body (the existing
-    :class:`MultiTokenPredictionBlock` infrastructure assumes identical
-    per-depth bodies).
-
-    The recipe author specifies the per-depth body as a (possibly nested)
-    list of decoder :class:`LayerConfig` instances via
-    :attr:`mtp_model_layer`. At compile time, the body is flattened into the
-    same single-character ``mtp_layer_pattern`` string the legacy
-    :func:`parse_hybrid_pattern` produces, and ``mtp_num_depths`` is set to
-    the count of consecutive :class:`MTPLayerConfig` markers in the pattern.
-    """
-
-    common_config: CommonLayerConfig = field(default_factory=CommonLayerConfig)
-
-    mtp_model_layer: list = field(default_factory=list)
-    """Per-depth MTP body — a (possibly nested) list of decoder
-    :class:`LayerConfig` instances."""
-
-    extra: Dict[str, Any] = field(default_factory=dict)
-    """Passthrough kwargs forwarded to the per-MTP-layer
-    :class:`TransformerConfig`. Same semantics as
-    :attr:`CommonLayerConfig.extra`. Currently unused by
-    :class:`MultiTokenPredictionBlock` — included for forward compatibility."""
 
 
 @dataclass
@@ -470,23 +485,7 @@ class CrossEntropyLayerConfig:
     :attr:`CommonLayerConfig.extra`."""
 
 
-@dataclass
-class PipelineSplit:
-    """Pipeline-stage boundary marker.
-
-    Place between groups of layers in the layer pattern to declare a
-    pipeline split. Pipeline parallelism (PP > 1) for the Python DSL is a
-    follow-up — :func:`compile_pattern` raises :class:`NotImplementedError`
-    when a :class:`PipelineSplit` is encountered today, with a clear
-    pointer to the legacy string-DSL ``|`` form for production PP work.
-    """
-
-    pass
-
-
 # ----------------------------------------------------------- type aliases
 
 #: Anything that may legally appear at a leaf of a layer pattern.
-PatternLeaf = Union[
-    LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig, MTPLayerConfig, PipelineSplit
-]
+PatternLeaf = Union[LayerConfig, EmbeddingLayerConfig, CrossEntropyLayerConfig]

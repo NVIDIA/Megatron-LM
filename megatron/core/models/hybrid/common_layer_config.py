@@ -33,7 +33,6 @@ from typing import Any, Callable, Dict, Optional
 import torch
 
 from megatron.core.activations import squared_relu
-from megatron.core.utils import init_method_normal
 
 # --- string-keyed lookups for human-friendly recipe authoring -------------
 
@@ -158,6 +157,57 @@ class CommonLayerConfig:
     persist_layer_norm: bool = False
     """Use the persistent fused LayerNorm kernel (only supports a fixed set of hidden sizes)."""
 
+    # === Layer wiring ===
+    apply_residual_connection_post_layernorm: bool = False
+    """Apply the residual connection after layernorm (post-LN) instead of before it."""
+
+    # === FP8 quantization ===
+    fp8: Optional[str] = None
+    """FP8 format (``"e4m3"`` / ``"hybrid"``); ``None`` disables FP8."""
+
+    fp8_recipe: Optional[str] = None
+    """FP8 scaling recipe (``"tensorwise"`` / ``"delayed"`` / ``"mxfp8"`` /
+    ``"blockwise"`` / ``"custom"``); ``None`` keeps the TC default."""
+
+    fp8_param: bool = False
+    """Keep parameters in FP8 precision (requires :attr:`fp8` to be set)."""
+
+    fp8_margin: int = 0
+    """Margin used by the FP8 amax history."""
+
+    fp8_amax_history_len: int = 1
+    """Length of the FP8 amax history window."""
+
+    fp8_dot_product_attention: bool = False
+    """Apply FP8 to the dot-product attention kernel."""
+
+    # === FP4 quantization ===
+    fp4: Optional[str] = None
+    """FP4 format (``"e2m1"``); ``None`` disables FP4."""
+
+    fp4_recipe: Optional[str] = None
+    """FP4 scaling recipe (``"nvfp4"`` / ``"custom"``); ``None`` keeps the
+    TC default."""
+
+    fp4_param: bool = False
+    """Keep parameters in FP4 precision (requires :attr:`fp4` to be set)."""
+
+    # === Activation recomputation ===
+    recompute_granularity: Optional[str] = None
+    """``"full"`` recomputes the whole transformer block; ``"selective"``
+    recomputes only the attention activations."""
+
+    recompute_method: Optional[str] = None
+    """``"uniform"`` distributes recomputation evenly; ``"block"`` recomputes
+    a contiguous block."""
+
+    recompute_num_layers: Optional[int] = None
+    """How many layers to recompute (interpretation depends on
+    :attr:`recompute_method`)."""
+
+    distribute_saved_activations: Optional[bool] = False
+    """Distribute saved activations across the tensor-parallel group."""
+
     # === Model family ===
     # ``is_hybrid_model`` is intentionally NOT exposed here — every HybridModel
     # recipe is a hybrid model by construction, so :meth:`HybridModelConfig.compile`
@@ -178,7 +228,8 @@ class CommonLayerConfig:
     # ─────────────────────────────────────────────────────────────────────────
 
     transformer_impl: str = "transformer_engine"
-    """Transformer implementation: ``"transformer_engine"``, ``"local"``, or ``"inference_optimized"``."""
+    """Transformer implementation: ``"transformer_engine"``, ``"local"``, or
+    ``"inference_optimized"``."""
 
     cuda_graph_impl: Optional[str] = None
     """CUDA graph capture implementation: ``"none"``, ``"local"``, or ``"transformer_engine"``."""
@@ -233,9 +284,21 @@ class CommonLayerConfig:
             (``CommonLayerConfig`` fields, ``LayerConfig`` subclasses) is
             preserved. Recipe code does not need to touch this method.
         """
+        # Derive params_dtype from mixed_precision_dtype when the recipe
+        # author left it at the fp32 default. The legacy --bf16 / --fp16 CLI
+        # flags do this same mapping (megatron/training/arguments.py around
+        # ``args.params_dtype = torch.bfloat16``); without this, a recipe with
+        # ``mixed_precision_dtype="bf16"`` and an unset ``params_dtype`` would
+        # produce a TC with ``bf16=True`` but ``params_dtype=torch.float32``,
+        # silently diverging from its legacy-CLI counterpart in memory
+        # footprint and checkpoint shape.
+        params_dtype_resolved = _resolve_dtype(self.params_dtype)
+        if self.params_dtype == "fp32" and self.mixed_precision_dtype in ("bf16", "fp16"):
+            params_dtype_resolved = _resolve_dtype(self.mixed_precision_dtype)
+
         kwargs: Dict[str, Any] = {
             "hidden_size": self.hidden_size,
-            "params_dtype": _resolve_dtype(self.params_dtype),
+            "params_dtype": params_dtype_resolved,
             "sequence_parallel": self.sequence_parallel,
             "init_method_std": self.init_method_std,
             "perform_initialization": self.perform_initialization,
@@ -251,6 +314,15 @@ class CommonLayerConfig:
             "first_last_layers_bf16": self.first_last_layers_bf16,
             "apply_rope_fusion": self.apply_rope_fusion,
             "persist_layer_norm": self.persist_layer_norm,
+            "apply_residual_connection_post_layernorm": (
+                self.apply_residual_connection_post_layernorm
+            ),
+            "fp8_param": self.fp8_param,
+            "fp8_margin": self.fp8_margin,
+            "fp8_amax_history_len": self.fp8_amax_history_len,
+            "fp8_dot_product_attention": self.fp8_dot_product_attention,
+            "fp4_param": self.fp4_param,
+            "distribute_saved_activations": self.distribute_saved_activations,
             "transformer_impl": self.transformer_impl,
             "cuda_graph_scope": self.cuda_graph_scope,
             "cuda_graph_warmup_steps": self.cuda_graph_warmup_steps,
@@ -259,6 +331,18 @@ class CommonLayerConfig:
             kwargs["ffn_hidden_size"] = self.ffn_hidden_size
         if self.cuda_graph_impl is not None:
             kwargs["cuda_graph_impl"] = self.cuda_graph_impl
+        for name in (
+            "fp8",
+            "fp8_recipe",
+            "fp4",
+            "fp4_recipe",
+            "recompute_granularity",
+            "recompute_method",
+            "recompute_num_layers",
+        ):
+            v = getattr(self, name)
+            if v is not None:
+                kwargs[name] = v
         # mixed_precision_dtype → bf16/fp16 booleans expected by TransformerConfig
         mp = self.mixed_precision_dtype
         if mp == "bf16":
