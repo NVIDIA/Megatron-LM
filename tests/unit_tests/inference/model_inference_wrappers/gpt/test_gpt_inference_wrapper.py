@@ -18,10 +18,7 @@ from tests.unit_tests.test_utilities import Utils
 class TestGPTInferenceWrapper:
 
     def setup_model(
-        self,
-        tensor_parallel_size,
-        pipeline_parallel_size,
-        inference_logits_dtype=torch.float32,
+        self, tensor_parallel_size, pipeline_parallel_size, inference_logits_dtype=torch.float32
     ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
@@ -93,9 +90,9 @@ class TestGPTInferenceWrapper:
                 logits_seq_len,
                 self.vocab_size,
             ), f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"
-            assert logits.dtype == self.inference_logits_dtype, (
-                f"Expected logits dtype {self.inference_logits_dtype}, got {logits.dtype}"
-            )
+            assert (
+                logits.dtype == self.inference_logits_dtype
+            ), f"Expected logits dtype {self.inference_logits_dtype}, got {logits.dtype}"
 
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_inference_only_tensor_parallel(self, materialize_only_last_token_logits):
@@ -130,17 +127,13 @@ class TestGPTInferenceWrapper:
             logits_seq_len,
             self.vocab_size,
         ), f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"
-        assert logits.dtype == self.inference_logits_dtype, (
-            f"Expected logits dtype {self.inference_logits_dtype}, got {logits.dtype}"
-        )
+        assert (
+            logits.dtype == self.inference_logits_dtype
+        ), f"Expected logits dtype {self.inference_logits_dtype}, got {logits.dtype}"
 
     @pytest.mark.parametrize("inference_logits_dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
-        "tp_pp",
-        [
-            pytest.param((2, 2), id="pp"),
-            pytest.param((4, 1), id="tp"),
-        ],
+        "tp_pp", [pytest.param((2, 2), id="pp"), pytest.param((4, 1), id="tp")]
     )
     def test_inference_logits_dtype(self, tp_pp, inference_logits_dtype):
         tp, pp = tp_pp
@@ -171,6 +164,6 @@ class TestGPTInferenceWrapper:
         if pp > 1 and not parallel_state.is_pipeline_last_stage():
             assert logits is None
         else:
-            assert logits.dtype == inference_logits_dtype, (
-                f"Expected {inference_logits_dtype}, got {logits.dtype}"
-            )
+            assert (
+                logits.dtype == inference_logits_dtype
+            ), f"Expected {inference_logits_dtype}, got {logits.dtype}"

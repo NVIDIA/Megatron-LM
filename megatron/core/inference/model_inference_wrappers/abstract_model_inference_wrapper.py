@@ -220,9 +220,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = None
         if is_pipeline_last_stage(self.pp_group):
             logits = output_tensor
-            assert logits.dtype == self.config.inference_logits_dtype, (
-                f"Expected logits dtype {self.config.inference_logits_dtype}, got {logits.dtype}"
-            )
+            assert (
+                logits.dtype == self.config.inference_logits_dtype
+            ), f"Expected logits dtype {self.config.inference_logits_dtype}, got {logits.dtype}"
 
         return logits
 
