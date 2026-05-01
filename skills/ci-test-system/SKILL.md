@@ -94,8 +94,9 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | Condition | `scope` | `n_repeat` | `lightweight` | Notes |
 |-----------|---------|-----------|---------------|-------|
 | Merge group | `mr-github` | 1 | false | Automatic, no label needed |
-| Label: **`Run tests`** | `mr-github` | 1 | **true** | Trains 4 steps, no golden-value compare |
-| Label: **`Run functional tests`** | `mr-github` | 5 | **false** | Trains 100 steps, golden-value compare |
+| Label: **`Run tests`** | `mr-github` | 1 | **true** | Trains 4 steps, no golden-value compare; **bypasses cadence filter** |
+| Label: **`Run functional tests`** | `mr-github` | 5 | **false** | Trains 100 steps, golden-value compare; **bypasses cadence filter** |
+| Schedule / `workflow_dispatch` | `mr-github` | 5 | false | No PR labels available |
 | _(no label)_ | `mr-github-slim` | 5 | false | Slim subset only |
 
 **Orthogonal image label:**
@@ -104,6 +105,66 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 |-------|--------|
 | **`container::lts`** | Use the LTS base image instead of `dev` (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
+
+### CI Test Cadence Filter
+
+A second axis, `cadence`, narrows the test set based on the GitHub trigger:
+
+| `github.event_name` | `cadence` value passed to recipe filter |
+|---|---|
+| Pull-request push (`pull-request/*` branch) | `pr` |
+| `merge_group` | `mergegroup` |
+| `schedule` (nightly cron at 00:00 UTC) | `nightly` |
+| `workflow_dispatch` | `nightly` |
+
+The cadence filter runs at stage 0 (in `cicd-parse-*`), so the test matrix
+itself shrinks. **The filter is bypassed entirely when a PR carries the
+`Run tests` or `Run functional tests` label** — those labels signal an
+explicit override, so cadence-restricted tests still run.
+
+**Recipe schema.** `cadence` is a list-valued attribute. Place it inside an
+inner `products:` block alongside `scope`/`platforms`/`environment` (most
+common) or at the outer entry level alongside `test_case` (file-wide
+default). Inner placement wins when both are present.
+
+```yaml
+products:
+  - test_case: [my_pr_only_test]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_h100]
+        cadence: [pr]                    # only runs on PR pushes
+
+  - test_case: [my_nightly_smoke]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_h100]
+        cadence: [nightly, mergegroup]   # skip on PR pushes
+
+  # Outer-level default (applies to every inner block under this test_case
+  # unless an inner block declares its own cadence)
+  - test_case: [my_release_canary]
+    cadence: [nightly]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_h100]
+```
+
+Important: `cadence` is **not cartesian-expanded** — a list like
+`[pr, nightly]` produces a single workload that matches either trigger,
+not two separate workloads. (Contrast with `scope` and `environment`,
+which are cartesian dimensions.)
+
+Allowed values: subset of `{pr, nightly, mergegroup}`. **Missing field
+defaults to all three** — existing recipes therefore behave identically to
+before. Validation is enforced in `recipe_parser.flatten_products`; an
+unknown cadence value raises `ValueError` at parse time.
+
+To make a test run only on schedule, set `cadence: [nightly]`. To exclude
+nightly noise from a flaky test, set `cadence: [pr, mergegroup]`.
 
 ### Disabling a Test Without Deleting It
 
