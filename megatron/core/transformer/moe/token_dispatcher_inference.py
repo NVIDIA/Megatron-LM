@@ -21,6 +21,8 @@ update_metadata method, invoked from the first instance's token_dispatch so the
 per-step metadata kernel is captured inside the CUDA graph.
 """
 
+import operator
+from functools import reduce
 from typing import List, Optional
 
 import torch
@@ -340,26 +342,41 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         global_max = per_rank_worst_case_token_count * ep_size
         device = torch.cuda.current_device()
 
+        # Each buffer self-sizes from its exact tensor footprint so non-default
+        # max_tokens / hidden_size / ep_size combinations don't silently overflow
+        # the symmetric-memory cap.
+        _MB = 1024 * 1024
+
+        def _size_mb(shape, dtype) -> int:
+            nbytes = reduce(operator.mul, shape, 1) * torch.tensor([], dtype=dtype).element_size()
+            return max(1, (nbytes + _MB - 1) // _MB)
+
+        agv_h_shape = [global_max, hidden_size]
+        agv_r_shape = [global_max, topk]
+        agv_p_shape = [global_max, topk]
+        rsv_shape = [global_max, hidden_size]
+        meta_shape = [ep_size]
+
         cls._symm_agv_hidden = SymmetricMemoryManager.get_buffer(
-            "ep_agv_h", process_group=ep_group
-        ).maybe_get_tensor([global_max, hidden_size], dtype=torch.bfloat16)
+            "ep_agv_h", process_group=ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
+        ).maybe_get_tensor(agv_h_shape, dtype=torch.bfloat16)
 
         cls._symm_agv_routing = SymmetricMemoryManager.get_buffer(
-            "ep_agv_r", process_group=ep_group
-        ).maybe_get_tensor([global_max, topk], dtype=torch.int64)
+            "ep_agv_r", process_group=ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
+        ).maybe_get_tensor(agv_r_shape, dtype=torch.int64)
 
         cls._symm_agv_probs = SymmetricMemoryManager.get_buffer(
-            "ep_agv_p", process_group=ep_group
-        ).maybe_get_tensor([global_max, topk], dtype=torch.float32)
+            "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
+        ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group
-        ).maybe_get_tensor([global_max, hidden_size], dtype=torch.bfloat16)
+            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.bfloat16)
+        ).maybe_get_tensor(rsv_shape, dtype=torch.bfloat16)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(
-            "ep_meta", process_group=ep_group
-        ).maybe_get_tensor([ep_size], dtype=torch.int32)
+            "ep_meta", process_group=ep_group, size_mb=_size_mb(meta_shape, torch.int32)
+        ).maybe_get_tensor(meta_shape, dtype=torch.int32)
 
         failed = [
             name
@@ -374,8 +391,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         ]
         if failed:
             raise RuntimeError(
-                f"NVLSAllGatherVDispatcher: symmetric memory allocation failed for "
-                f"{failed}. This dispatcher requires Hopper+ GPUs with NVLink. "
+                f"NVLSAllGatherVDispatcher: symmetric memory rendezvous failed for "
+                f"{failed} on the EP process group. This dispatcher requires Hopper+ "
+                f"GPUs fully connected via NVLink, plus a torch build with "
+                f"torch.distributed._symmetric_memory and triton installed. "
                 f"Use inference_moe_token_dispatcher_type='nccl' on non-NVLS systems."
             )
 

@@ -138,7 +138,7 @@ class SymmetricMemoryManager:
     """
 
     _buffers: dict[str, SymmetricMemoryBuffer] = {}
-    _default_size_mb: int = 256
+    _default_size_mb: int = 512
 
     @classmethod
     def get_buffer(
