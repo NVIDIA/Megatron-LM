@@ -1203,6 +1203,19 @@ class TextGenerationController:
 
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
+        # Async-scheduling primitive: mirror sample[N] into the GPU staging buffer
+        # that forward[N+1]'s CUDA graph reads as input_ids. Only safe on
+        # decode-only, non-speculative steps (one new token per request lines up
+        # with token_to_input_ids[:active_request_count]). Behavior is byte-
+        # identical when async-scheduling is off because transfer_bookkeeping_to_gpu
+        # overwrites this slot at the start of step N+1.
+        context = self.inference_wrapped_model.inference_context
+        if context.is_decode_only() and not self.num_speculative_tokens:
+            active_request_count = context.total_request_count - context.paused_request_count
+            context.gpu_view.token_to_input_ids[:active_request_count].copy_(
+                self._sampled_tokens_cuda[:active_request_count]
+            )
+
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
 
